@@ -19,6 +19,7 @@ import {
 import { getEngineCtx } from '../../state/playerStore';
 import { usePianoRollStore, type PianoNote } from '../../state/pianoRollStore';
 import { InstrumentPicker } from './InstrumentPicker';
+import { KEY_ON, KEY_REST, StripKey } from './midiDockKit';
 
 const KEYS = 'C C# D D# E F F# G G# A A# B'.split(' ');
 const OCTAVES = [2, 3, 4, 5, 6, 7];
@@ -52,16 +53,17 @@ const PatternSvg: React.FC<{ pattern: number[] }> = ({ pattern }) => {
 
 const Section: React.FC<{ title: string; tip?: string; className?: string; children: React.ReactNode }> = ({ title, tip, className, children }) => (
   <section className={`rounded-md border border-white/10 bg-black/30 p-2 ${className ?? ''}`}>
-    <h3 className="text-[10px] font-mono font-bold uppercase tracking-[0.15em] text-purple-300/80 mb-1.5" title={tip}>{title}</h3>
+    <h3 className="text-[10px] font-mono font-bold uppercase tracking-[0.15em] et-ink-3 mb-1.5" title={tip}>{title}</h3>
     {children}
   </section>
 );
 
-// purple accent to match the rest of theDAW (piano roll, MAKE, etc.)
-const cellBase =
-  'text-[11px] font-mono font-semibold uppercase tracking-wide rounded border transition-colors cursor-pointer select-none';
-const cellOn = 'border-purple-400 bg-purple-500 text-white font-bold';
-const cellOff = 'border-white/15 bg-white/8 text-zinc-100 hover:bg-white/15 hover:border-purple-500/40';
+// The MIDI dock's key grammar (midiDockKit): a chosen cell takes the theme
+// accent and its bottom edge, every other cell rests.
+const cellEdge = 'border-b transition-[color,box-shadow,border-color] duration-100 active:shadow-[inset_0_1px_2px_rgba(0,0,0,0.7)]';
+const cellBase = `text-[11px] font-mono font-semibold uppercase tracking-wide rounded-xs ${cellEdge} cursor-pointer select-none`;
+const cellOn = KEY_ON;
+const cellOff = KEY_REST;
 
 export const ArpeggiatorPanel: React.FC<{ playing: boolean }> = ({ playing }) => {
   const engineRef = useRef<ArpPlayerEngine | null>(null);
@@ -176,14 +178,14 @@ export const ArpeggiatorPanel: React.FC<{ playing: boolean }> = ({ playing }) =>
   const qPct = Math.round(cfg.quantize * 100);
   const ragPct = Math.round(cfg.swing * 100);
   // small segmented pill (steps / type)
-  const pill = 'px-2 py-0.5 text-[11px] font-mono font-semibold rounded border transition-colors cursor-pointer select-none';
+  const pill = `px-2 py-0.5 text-[11px] font-mono font-semibold rounded-xs ${cellEdge} cursor-pointer select-none`;
   const fieldBox = 'flex items-center gap-1 px-1.5 py-0.5 bg-black/40 border border-white/5 rounded';
 
   return (
     <div className="h-full w-full flex flex-col bg-[#07050a] text-zinc-100 overflow-hidden">
       {/* toolbar — the arpeggiator's settings; it plays from the strip's PLAY key */}
       <div className="shrink-0 flex flex-wrap items-center gap-2 px-2 py-1 border-b border-white/5 bg-black/40">
-        <span className="text-[11px] font-black uppercase tracking-widest text-purple-300" title="Chord-progression arpeggiator — pick a key, mode and chords; it arpeggiates them live through theDAW's synth.">Arp</span>
+        <span className="text-[11px] font-black uppercase tracking-widest et-ink" title="Chord-progression arpeggiator — pick a key, mode and chords; it arpeggiates them live through theDAW's synth.">Arp</span>
         <span className="text-[10px] font-mono text-zinc-500" title="Current key + scale">{engine.MS.key} {scaleName}</span>
 
         {/* BPM */}
@@ -241,9 +243,9 @@ export const ArpeggiatorPanel: React.FC<{ playing: boolean }> = ({ playing }) =>
           <button type="button" aria-label="Decrease rag" title="−1%" onClick={() => patch({ swing: Math.max(-50, ragPct - 1) / 100 })} className="text-zinc-500 hover:text-zinc-200 leading-none px-0.5">−</button>
           <label htmlFor="arp-rag" className="sr-only">Rag (swing)</label>
           <input id="arp-rag" name="arp-rag" type="range" min={-50} max={50} value={ragPct}
-            onChange={(e) => patch({ swing: (parseInt(e.target.value, 10) || 0) / 100 })} className="w-16 accent-purple-400" />
+            onChange={(e) => patch({ swing: (parseInt(e.target.value, 10) || 0) / 100 })} className="w-16 accent-[rgb(var(--et-accent))]" />
           <button type="button" aria-label="Increase rag" title="+1%" onClick={() => patch({ swing: Math.min(50, ragPct + 1) / 100 })} className="text-zinc-500 hover:text-zinc-200 leading-none px-0.5">+</button>
-          <span className="text-[8px] font-mono text-purple-300 w-8 text-right">{ragPct > 0 ? '+' : ''}{ragPct}%</span>
+          <span className="text-[8px] font-mono text-[rgb(var(--et-accent))] w-8 text-right">{ragPct > 0 ? '+' : ''}{ragPct}%</span>
         </div>
 
         {/* Own id prefix: the arpeggiator and the Piano Roll are both mounted
@@ -261,14 +263,12 @@ export const ArpeggiatorPanel: React.FC<{ playing: boolean }> = ({ playing }) =>
         </button>
 
         <div className="flex-1" />
-        <button
-          type="button"
+        <StripKey
           onClick={sendToRoll}
           title="Render the progression into the piano roll's notes (then morph it with the Virtuoso strip above)"
-          className="flex items-center gap-1 px-2 py-1 text-[10px] font-mono font-semibold uppercase tracking-wide rounded border border-purple-500/40 text-purple-200 hover:bg-purple-500/20 transition-colors"
-        >
-          <Piano className="w-3.5 h-3.5" /> Piano roll
-        </button>
+          icon={<Piano className="w-3 h-3" />}
+          legend="Piano roll"
+        />
       </div>
 
       {/* body: TONIC/MODE (left rail) · CHORDS + OUTPUT (center hero) · STYLES (right rail) */}
@@ -312,7 +312,7 @@ export const ArpeggiatorPanel: React.FC<{ playing: boolean }> = ({ playing }) =>
           <Section title="Chord progression" tip="Eight progression slots, left to right. Each column is one slot — click a scale degree to set which chord plays there. The lit column is playing now." className="flex-1 flex flex-col">
             <div className="flex-1 flex gap-1.5">
               {cfg.chords.map((sel, c) => (
-                <div key={c} className={`flex-1 min-w-0 flex flex-col ${compact ? 'gap-px' : 'gap-1'} rounded ${activeChord === c ? 'ring-2 ring-purple-400' : ''}`}>
+                <div key={c} className={`flex-1 min-w-0 flex flex-col ${compact ? 'gap-px' : 'gap-1'} rounded-xs ${activeChord === c ? 'ring-2 ring-[rgb(var(--et-accent))]' : ''}`}>
                   {INTERVALS.map((_label, i) => {
                     const on = sel === i;
                     const interval = engine.MS.notes[i]?.triad.interval ?? INTERVALS[i];
@@ -328,7 +328,7 @@ export const ArpeggiatorPanel: React.FC<{ playing: boolean }> = ({ playing }) =>
                           patch({ chords });
                         }}
                         title={`Slot ${c + 1}: play the ${interval} chord (scale degree ${i + 1}) here`}
-                        className={`flex-1 font-mono font-bold rounded border transition-colors cursor-pointer ${compact ? 'min-h-4 text-[10px] leading-none' : 'min-h-6 text-[13px]'} ${on ? cellOn : cellOff}`}
+                        className={`flex-1 font-mono font-bold rounded-xs ${cellEdge} cursor-pointer ${compact ? 'min-h-4 text-[10px] leading-none' : 'min-h-6 text-[13px]'} ${on ? cellOn : cellOff}`}
                       >
                         {interval}
                       </button>
@@ -344,8 +344,10 @@ export const ArpeggiatorPanel: React.FC<{ playing: boolean }> = ({ playing }) =>
               {out.map((chord, i) => (
                 <div
                   key={i}
-                  className={`flex-1 min-w-0 text-center px-1 py-1 rounded border text-[11px] font-mono ${
-                    activeChord === i ? 'border-purple-400 bg-purple-500/15 text-purple-200' : 'border-white/10 bg-white/5 text-zinc-200'
+                  className={`flex-1 min-w-0 text-center px-1 py-1 rounded-xs border text-[11px] font-mono ${
+                    activeChord === i
+                      ? 'border-[rgb(var(--et-accent))] bg-[rgb(var(--et-accent)/0.12)] text-[rgb(var(--et-accent))]'
+                      : 'border-white/10 bg-white/5 text-zinc-200'
                   }`}
                   title={`${chord.note}${chord.type} · ${chord.interval}`}
                 >
@@ -371,9 +373,7 @@ export const ArpeggiatorPanel: React.FC<{ playing: boolean }> = ({ playing }) =>
                     aria-pressed={on}
                     onClick={() => patch({ patternId: i })}
                     title={`Note order ${pattern.map((n) => n + 1).join('-')}`}
-                    className={`rounded border p-0.5 transition-colors ${
-                      on ? 'border-purple-400 bg-purple-500/25 text-purple-200' : 'border-white/15 bg-white/8 hover:border-purple-500/40'
-                    }`}
+                    className={`rounded-xs p-0.5 ${cellEdge} ${on ? cellOn : cellOff}`}
                   >
                     <PatternSvg pattern={pattern} />
                   </button>
@@ -397,7 +397,7 @@ export const ArpeggiatorPanel: React.FC<{ playing: boolean }> = ({ playing }) =>
                   key={`${key}${octave}`}
                   aria-hidden="true"
                   className={`${black ? 'flex-2' : 'flex-3'} h-9 ${
-                    on ? (black ? 'bg-purple-500' : 'bg-purple-400') : black ? 'bg-zinc-800' : 'bg-zinc-200/85'
+                    on ? (black ? 'bg-[rgb(var(--et-accent)/0.7)]' : 'bg-[rgb(var(--et-accent))]') : black ? 'bg-zinc-800' : 'bg-zinc-200/85'
                   } transition-colors`}
                 />
               );
