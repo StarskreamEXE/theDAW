@@ -13,6 +13,7 @@
  * No Tone.js, no CDN: pure data + the standard AudioContext surface.
  */
 import { getEngineCtx, getMasterGain } from '../state/playerStore';
+import { DEFAULT_METER_MAP, barAt, stepsPerBar, type MeterSegment } from './meterMap';
 import { triggerActiveVoice } from './midiSynth';
 import { isSoundfontActive, getActiveProgram } from './soundfontEngine';
 import { previewNoteSF } from './soundfontEngine';
@@ -306,6 +307,23 @@ export interface ArpRenderNote {
   velocity: number;
 }
 
+/** The roll's bars for the rag: time signatures by bar and the pickup before bar 0. */
+export interface ArpMeter {
+  meterMap?: MeterSegment[];
+  pickupSteps?: number;
+}
+
+/**
+ * The rag's delay for grid step `step`, in steps: `swing` on the odd 16ths
+ * counted from the start of the step's bar (a pickup counts back from its
+ * end), 0 on the even ones. With no meter the bars are 4/4 from step 0.
+ */
+export function ragOffsetSteps(step: number, swing: number, meter?: ArpMeter): number {
+  const b = barAt(meter?.meterMap ?? DEFAULT_METER_MAP, step, meter?.pickupSteps ?? 0);
+  const inBar = step - b.start + (b.bar < 0 ? stepsPerBar(b.meter) - b.len : 0);
+  return Math.abs(inBar % 2) === 1 ? swing : 0;
+}
+
 const LOOKAHEAD_MS = 25;
 const SCHEDULE_AHEAD = 0.12; // seconds
 
@@ -321,9 +339,15 @@ export class ArpPlayerEngine {
   private step = 0;
   private chordStep = 0;
   private bassActive = false;
+  private meter: ArpMeter | undefined;
 
   onTick: ((t: ArpTick) => void) | null = null;
   onStop: (() => void) | null = null;
+
+  /** Count the rag's odd 16ths from each bar start of `meter`; undefined restores 4/4 from step 0. */
+  setMeter(meter?: ArpMeter): void {
+    this.meter = meter;
+  }
 
   constructor(cfg: Partial<ArpConfig> = {}) {
     this.cfg = { ...DEFAULT_ARP_CONFIG, ...cfg };
@@ -445,9 +469,10 @@ export class ArpPlayerEngine {
     const ctx = getEngineCtx();
     while (this.nextNoteTime < ctx.currentTime + SCHEDULE_AHEAD) {
       const dur = this.stepDur();
-      // Swing delays the off-16ths; lower quantize adds a touch of humanized
-      // jitter. `this.step` is the upcoming step (incremented inside _scheduleStep).
-      const swingOff = this.step % 2 === 1 ? this.cfg.swing * dur : 0;
+      // Swing delays the off-16ths (counted from the bar start); lower quantize
+      // adds a touch of humanized jitter. `this.step` is the upcoming step
+      // (incremented inside _scheduleStep).
+      const swingOff = ragOffsetSteps(this.step, this.cfg.swing, this.meter) * dur;
       const humanize = (1 - this.cfg.quantize) * (Math.random() - 0.5) * dur * 0.5;
       this._scheduleStep(this.nextNoteTime + swingOff + humanize);
       this.nextNoteTime += dur;

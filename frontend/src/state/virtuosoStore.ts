@@ -25,9 +25,20 @@ import {
   type GrooveTemplate,
 } from '../lib/virtuosoTransform';
 import { buildGrooveFromMidiBytes } from '../lib/grooveExtract';
+import type { Meter } from '../lib/colony';
+import { meterEquals, normalizeMeterMap, sanitizeMeter, type MeterSegment } from '../lib/meterMap';
 
 const clamp01 = (v: number): number => Math.max(0, Math.min(1, v));
 const cloneNotes = (notes: PianoNote[]): PianoNote[] => notes.map((n) => ({ ...n }));
+const sameMeterMap = (a: readonly MeterSegment[], b: readonly MeterSegment[]): boolean =>
+  a.length === b.length && a.every((s, i) => s.bar === b[i].bar && meterEquals(s.meter, b[i].meter));
+
+/** A stored section with its meter kept only when it is a valid time signature. */
+const sectionFromStorage = (s: SectionSpec): SectionSpec => {
+  const meter = sanitizeMeter(s.meter);
+  const { meter: _drop, ...rest } = s;
+  return meter ? { ...rest, meter } : rest;
+};
 
 interface VirtuosoState {
   source: PianoNote[] | null;
@@ -53,6 +64,8 @@ interface VirtuosoState {
   effectiveSections: () => SectionSpec[];
   setSectionRole: (index: number, role: Role) => void;
   setSectionBars: (index: number, bars: number) => void;
+  /** Give a section its own time signature, or null to follow the roll's meter map. */
+  setSectionMeter: (index: number, meter: Meter | null) => void;
   addSection: () => void;
   removeSection: (index: number) => void;
   moveSection: (index: number, dir: -1 | 1) => void;
@@ -65,6 +78,14 @@ interface VirtuosoState {
 // Rebuilding a full song on every slider tick is heavy; coalesce drags.
 let _rebuildTimer: number | null = null;
 
+// Build Song writes its own meter map into the roll. `_songBase` is the roll's
+// map from before the song, which sections without a meter follow; `_songMap`
+// is the map the last build wrote. A rebuild adopts the roll's map as the new
+// base only when the roll no longer shows `_songMap`, so a section meter that
+// was removed does not linger through the previous song's map.
+let _songBase: MeterSegment[] | null = null;
+let _songMap: MeterSegment[] | null = null;
+
 export const useVirtuosoStore = create<VirtuosoState>()(
   persist(
     (set, get) => {
@@ -75,29 +96,36 @@ export const useVirtuosoStore = create<VirtuosoState>()(
         mode: string,
       ): void => {
         if (!source || !source.length) return;
-        usePianoRollStore
-          .getState()
-          .replaceAll(renderVirtuoso(source, amounts, { key, mode }, 0, get().groove ?? undefined));
+        const roll = usePianoRollStore.getState();
+        roll.replaceAll(
+          renderVirtuoso(
+            source,
+            amounts,
+            { key, mode, meterMap: roll.meterMap, pickupSteps: roll.pickupSteps },
+            0,
+            get().groove ?? undefined,
+          ),
+        );
       };
 
       const rebuildSongNow = (): void => {
         const s = get();
         if (!s.source || !s.source.length) return;
-        const bpm = usePianoRollStore.getState().bpm;
-        usePianoRollStore
-          .getState()
-          .importNotes(
-            buildSongNotes(s.source, {
-              key: s.key,
-              mode: s.mode,
-              style: s.style,
-              amounts: s.amounts,
-              bpm,
-              sections: s.sections ?? undefined,
-              groove: s.groove ?? undefined,
-            }),
-            bpm,
-          );
+        const roll = usePianoRollStore.getState();
+        if (!_songBase || !_songMap || !sameMeterMap(roll.meterMap, _songMap)) _songBase = roll.meterMap;
+        const song = buildSongNotes(s.source, {
+          key: s.key,
+          mode: s.mode,
+          style: s.style,
+          amounts: s.amounts,
+          bpm: roll.bpm,
+          sections: s.sections ?? undefined,
+          groove: s.groove ?? undefined,
+          meterMap: _songBase,
+          pickupSteps: roll.pickupSteps,
+        });
+        _songMap = normalizeMeterMap(song.meterMap);
+        roll.importNotes(song.notes, roll.bpm, { meterMap: song.meterMap });
       };
 
       const scheduleSongRebuild = (): void => {
@@ -126,6 +154,8 @@ export const useVirtuosoStore = create<VirtuosoState>()(
         groove: null,
 
         captureSource: () => {
+          _songBase = null;
+          _songMap = null;
           set({ source: cloneNotes(usePianoRollStore.getState().notes), songMode: false });
           renderPhrase(get().source, get().amounts, get().key, get().mode);
         },
@@ -159,7 +189,12 @@ export const useVirtuosoStore = create<VirtuosoState>()(
         resetToSource: () => {
           set({ amounts: { ...ZERO_AMOUNTS }, songMode: false });
           const s = get();
-          if (s.source) usePianoRollStore.getState().replaceAll(cloneNotes(s.source));
+          const roll = usePianoRollStore.getState();
+          if (s.source) roll.replaceAll(cloneNotes(s.source));
+          // The source phrase goes back under the map it had before the song.
+          if (_songBase && _songMap && sameMeterMap(roll.meterMap, _songMap)) roll.setMeterMap(_songBase);
+          _songBase = null;
+          _songMap = null;
         },
 
         buildSong: () => {
@@ -184,6 +219,16 @@ export const useVirtuosoStore = create<VirtuosoState>()(
           const secs = get().effectiveSections().map((x) => ({ ...x }));
           if (!secs[index]) return;
           secs[index].bars = Math.max(1, Math.min(16, Math.round(bars)));
+          set({ sections: secs });
+          if (get().songMode) scheduleSongRebuild();
+        },
+
+        setSectionMeter: (index, meter) => {
+          const secs = get().effectiveSections().map((x) => ({ ...x }));
+          if (!secs[index]) return;
+          const clean = sanitizeMeter(meter);
+          if (clean) secs[index].meter = clean;
+          else delete secs[index].meter;
           set({ sections: secs });
           if (get().songMode) scheduleSongRebuild();
         },
@@ -231,6 +276,17 @@ export const useVirtuosoStore = create<VirtuosoState>()(
     },
     {
       name: 'thedaw-virtuoso-v1',
+      // State saved before sync, accent and section meters existed loads with
+      // those amounts at 0 and its sections without a meter.
+      merge: (persisted, current) => {
+        const p = (persisted ?? {}) as Partial<VirtuosoState>;
+        return {
+          ...current,
+          ...p,
+          amounts: { ...ZERO_AMOUNTS, ...p.amounts },
+          sections: Array.isArray(p.sections) ? p.sections.map(sectionFromStorage) : (p.sections ?? current.sections),
+        };
+      },
       partialize: (s) => ({
         amounts: s.amounts,
         key: s.key,
