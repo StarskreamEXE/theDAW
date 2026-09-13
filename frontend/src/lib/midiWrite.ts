@@ -6,7 +6,12 @@
  * than loose notes (SpessaSynth's offline render takes a `BasicMIDI`). Uses a
  * fixed 120 BPM / 480 PPQ grid with a matching tempo meta event, so tick time
  * maps back to the original seconds exactly.
+ *
+ * Time signatures are written only when given (the .mid export);
+ * rollMeterToSmfEvents places the roll's meter on this grid.
  */
+import { meterEventMetas } from './midi';
+import { meterMapToMidiEvents, type MeterEvent, type MeterSegment } from './meterMap';
 import type { RenderNote } from './midiSynth';
 
 const PPQ = 480;
@@ -26,17 +31,38 @@ function pushVlq(out: number[], value: number): void {
 }
 
 /**
+ * The roll's meter map as signatures on this writer's grid: each bar start
+ * converted from roll steps at the roll's `bpm` to seconds, then to ticks. The
+ * pickup text counts this grid's steps (PPQ / 4 ticks), as a reader of the file does.
+ */
+export function rollMeterToSmfEvents(meterMap: readonly MeterSegment[], pickupSteps: number, bpm: number): MeterEvent[] {
+  const stepSec = 60 / Math.max(1, bpm) / 4;
+  const tick = (steps: number): number => Math.max(0, Math.round((steps * stepSec) / SEC_PER_TICK));
+  // At a PPQ of 4 an event's tick is its roll step.
+  return meterMapToMidiEvents(meterMap, 4, pickupSteps).map((e) => ({
+    ...e,
+    tick: tick(e.tick),
+    ...(e.pickupSteps !== undefined ? { pickupSteps: tick(e.pickupSteps) / (PPQ / 4) } : {}),
+  }));
+}
+
+/**
  * Encode absolute-seconds notes as a single-track Standard MIDI File, with a
  * leading program change so the whole part plays on one GM instrument.
+ * `signatures` sit on this writer's 480 PPQ grid (rollMeterToSmfEvents).
  */
-export function notesToSmf(notes: RenderNote[], program = 0, channel = 0): Uint8Array {
+export function notesToSmf(notes: RenderNote[], program = 0, channel = 0, signatures: readonly MeterEvent[] = []): Uint8Array {
   const ch = channel & 0x0f;
   interface Ev {
     tick: number;
-    order: number; // tie-break at equal ticks: note-off (0) before note-on (1)
+    order: number; // tie-break at equal ticks: meta (-1), then note-off (0), then note-on (1)
     data: number[];
   }
   const evs: Ev[] = [{ tick: 0, order: 0, data: [0xc0 | ch, program & 0x7f] }];
+  for (const s of signatures) {
+    const tick = Number.isFinite(s.tick) ? Math.max(0, Math.round(s.tick)) : 0;
+    for (const data of meterEventMetas(s)) evs.push({ tick, order: -1, data });
+  }
   for (const n of notes) {
     const start = Math.max(0, Math.round(n.startSec / SEC_PER_TICK));
     const end = Math.max(start + 1, Math.round((n.startSec + n.durationSec) / SEC_PER_TICK));

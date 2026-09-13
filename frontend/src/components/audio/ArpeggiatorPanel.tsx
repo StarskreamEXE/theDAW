@@ -26,6 +26,8 @@ const INTERVALS = 'i ii iii iv v vi vii'.split(' ');
 const STEP_OPTS = [3, 4, 5, 6];
 const BPM_MIN = 20;
 const BPM_MAX = 300;
+/** Center column px for the full chord-progression keys: 39 of section chrome, 7 keys of 24 with 6 gaps of 4, an 8 gap, 65 of output. */
+const PROGRESSION_FULL_PX = 304;
 
 /** Tiny polyline thumbnail of one arpeggio index pattern (port of _genPatternSvg). */
 const PatternSvg: React.FC<{ pattern: number[] }> = ({ pattern }) => {
@@ -67,6 +69,20 @@ export const ArpeggiatorPanel: React.FC = () => {
 
   const [cfg, setCfg] = useState<ArpConfig>({ ...DEFAULT_ARP_CONFIG });
   const [playing, setPlaying] = useState(false);
+
+  // Below PROGRESSION_FULL_PX of center column (the section's chrome, seven
+  // 24px degree keys with 4px gaps, the output row) the keys go compact: 16px,
+  // 1px gaps, smaller numerals. Measured on the column, whose height the grid
+  // sets, so the switch never changes what it measures.
+  const centerRef = useRef<HTMLDivElement>(null);
+  const [compact, setCompact] = useState(false);
+  useEffect(() => {
+    const el = centerRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => setCompact(el.clientHeight < PROGRESSION_FULL_PX));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   // The rag counts its odd 16ths from the roll's bar lines, so the engine
   // follows the roll's meter map and pickup as they change.
@@ -194,7 +210,7 @@ export const ArpeggiatorPanel: React.FC = () => {
           <input
             id="arp-bpm" name="arp-bpm" type="number" min={BPM_MIN} max={BPM_MAX} value={cfg.bpm}
             onChange={(e) => setBpm(parseInt(e.target.value, 10))}
-            className="bg-transparent border-none outline-none text-[10px] font-mono text-cyan-400 w-9 font-black text-center"
+            className="bg-transparent border-none outline-none text-[10px] font-mono text-[rgb(var(--et-accent))] w-9 font-black text-center"
           />
           <button type="button" aria-label="Increase BPM" title="+5 BPM" onClick={() => setBpm(cfg.bpm + 5)} className="text-zinc-500 hover:text-zinc-200 leading-none px-0.5">+</button>
         </div>
@@ -234,9 +250,9 @@ export const ArpeggiatorPanel: React.FC = () => {
           <button type="button" aria-label="Decrease quantize" title="−1%" onClick={() => patch({ quantize: Math.max(0, qPct - 1) / 100 })} className="text-zinc-500 hover:text-zinc-200 leading-none px-0.5">−</button>
           <label htmlFor="arp-quantize" className="sr-only">Quantize</label>
           <input id="arp-quantize" name="arp-quantize" type="range" min={0} max={100} value={qPct}
-            onChange={(e) => patch({ quantize: (parseInt(e.target.value, 10) || 0) / 100 })} className="w-16 accent-cyan-400" />
+            onChange={(e) => patch({ quantize: (parseInt(e.target.value, 10) || 0) / 100 })} className="w-16 accent-[rgb(var(--et-accent))]" />
           <button type="button" aria-label="Increase quantize" title="+1%" onClick={() => patch({ quantize: Math.min(100, qPct + 1) / 100 })} className="text-zinc-500 hover:text-zinc-200 leading-none px-0.5">+</button>
-          <span className="text-[8px] font-mono text-cyan-300 w-7 text-right">{qPct}%</span>
+          <span className="text-[8px] font-mono text-[rgb(var(--et-accent))] w-7 text-right">{qPct}%</span>
           <span className="text-[7px] font-mono text-zinc-600 uppercase ml-1">Rag</span>
           <button type="button" aria-label="Decrease rag" title="−1%" onClick={() => patch({ swing: Math.max(-50, ragPct - 1) / 100 })} className="text-zinc-500 hover:text-zinc-200 leading-none px-0.5">−</button>
           <label htmlFor="arp-rag" className="sr-only">Rag (swing)</label>
@@ -272,7 +288,7 @@ export const ArpeggiatorPanel: React.FC = () => {
       </div>
 
       {/* body: TONIC/MODE (left rail) · CHORDS + OUTPUT (center hero) · STYLES (right rail) */}
-      <div className="flex-1 min-h-0 p-2 grid gap-2" style={{ gridTemplateColumns: '196px minmax(0,1fr) 196px' }}>
+      <div className="flex-1 min-h-0 p-2 grid grid-rows-1 gap-2" style={{ gridTemplateColumns: '196px minmax(0,1fr) 196px' }}>
         {/* left rail: tonic + mode */}
         <div className="flex flex-col gap-2 min-w-0 min-h-0 overflow-y-auto">
           <Section title="Tonic / root" tip="The key center. Every chord is built from this root note plus the chosen mode.">
@@ -306,11 +322,13 @@ export const ArpeggiatorPanel: React.FC = () => {
 
         {/* center hero: the chord progression fills the space; output aligns
             directly beneath each chord column. */}
-        <div className="flex flex-col gap-2 min-w-0 min-h-0">
-          <Section title="Chord progression" tip="Eight progression slots, left to right. Each column is one slot — click a scale degree to set which chord plays there. The lit column is playing now." className="flex-1 min-h-0 flex flex-col">
-            <div className="flex-1 min-h-0 flex gap-1.5">
+        <div ref={centerRef} className="flex flex-col gap-2 min-w-0 min-h-0 overflow-y-auto">
+          {/* The section and its slots keep their content height as a minimum,
+              so a short column scrolls; the keys never squash into each other. */}
+          <Section title="Chord progression" tip="Eight progression slots, left to right. Each column is one slot — click a scale degree to set which chord plays there. The lit column is playing now." className="flex-1 flex flex-col">
+            <div className="flex-1 flex gap-1.5">
               {cfg.chords.map((sel, c) => (
-                <div key={c} className={`flex-1 min-w-0 flex flex-col gap-1 rounded ${activeChord === c ? 'ring-2 ring-purple-400' : ''}`}>
+                <div key={c} className={`flex-1 min-w-0 flex flex-col ${compact ? 'gap-px' : 'gap-1'} rounded ${activeChord === c ? 'ring-2 ring-purple-400' : ''}`}>
                   {INTERVALS.map((_label, i) => {
                     const on = sel === i;
                     const interval = engine.MS.notes[i]?.triad.interval ?? INTERVALS[i];
@@ -326,7 +344,7 @@ export const ArpeggiatorPanel: React.FC = () => {
                           patch({ chords });
                         }}
                         title={`Slot ${c + 1}: play the ${interval} chord (scale degree ${i + 1}) here`}
-                        className={`flex-1 min-h-0 text-[13px] font-mono font-bold rounded border transition-colors cursor-pointer ${on ? cellOn : cellOff}`}
+                        className={`flex-1 font-mono font-bold rounded border transition-colors cursor-pointer ${compact ? 'min-h-4 text-[10px] leading-none' : 'min-h-6 text-[13px]'} ${on ? cellOn : cellOff}`}
                       >
                         {interval}
                       </button>

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {
   barAt, barLines, bars, barStartStep, beatLines, gridLines, groupLines, lanesRealign, meterFromAnalysis,
   meterMapToMidiEvents, midiEventsToMeterMap, normalizeMeterMap, removeChangeAt, roundUpToBar, segmentBars,
-  setMeterAt, stepsAsMeter, stepsPerBar, unrollLanes, type MeterSegment,
+  setMeterAt, stepsAsMeter, stepsPerBar, takeBarsFrom, unrollLanes, type MeterSegment,
 } from './meterMap.ts';
 
 const M44 = { num: 4, den: 4, groups: [] };
@@ -89,6 +89,37 @@ const MAP: MeterSegment[] = [{ bar: 0, meter: M44 }, { bar: 2, meter: M78 }, { b
   assert.deepEqual(plain, { map: [{ bar: 0, meter: M44 }, { bar: 2, meter: { num: 7, den: 8, groups: [] } }], pickupSteps: 0 });
   assert.deepEqual(midiEventsToMeterMap([{ tick: 96 * 4, num: 3, den: 4 }], 96).map.map((s) => s.bar), [0, 1]);
   assert.deepEqual(midiEventsToMeterMap([], 96), { map: [{ bar: 0, meter: M44 }], pickupSteps: 0 });
+}
+
+// The pickup the tick-0 event carries is read before the guess; events from another app keep the guess.
+{
+  const M24 = { num: 2, den: 4, groups: [] };
+  const M78e = { num: 7, den: 8, groups: [] };
+  const noMark = (events: ReturnType<typeof meterMapToMidiEvents>) => events.map(({ pickupSteps: _drop, ...e }) => e);
+
+  // A 2/4 bar, then 4/4: no pickup, though the first bar is short enough to look like one.
+  const short = meterMapToMidiEvents([{ bar: 0, meter: M24 }, { bar: 1, meter: M44 }], 480, 0);
+  assert.equal(short[0].pickupSteps, 0);
+  assert.deepEqual(midiEventsToMeterMap(short, 480), { map: [{ bar: 0, meter: M24 }, { bar: 1, meter: M44 }], pickupSteps: 0 });
+  assert.deepEqual(midiEventsToMeterMap(noMark(short), 480), { map: [{ bar: 0, meter: M44 }], pickupSteps: 8 });
+
+  // 7/8 after a 20-step pickup, whose partial bar (5/4) is longer than a 7/8 bar.
+  const long = meterMapToMidiEvents([{ bar: 0, meter: M78e }], 480, 20);
+  assert.deepEqual(long.map((e) => [e.tick, e.num, e.den, e.pickupSteps]), [[0, 5, 4, 20], [2400, 7, 8, undefined]]);
+  assert.deepEqual(midiEventsToMeterMap(long, 480), { map: [{ bar: 0, meter: M78e }], pickupSteps: 20 });
+  assert.deepEqual(midiEventsToMeterMap(noMark(long), 480), { map: [{ bar: 0, meter: { num: 5, den: 4, groups: [] } }, { bar: 1, meter: M78e }], pickupSteps: 0 });
+
+  // A mark the signatures contradict (no change where bar 1 would start) falls back to the guess.
+  assert.deepEqual(midiEventsToMeterMap([{ tick: 0, num: 4, den: 4, pickupSteps: 6 }], 480), { map: [{ bar: 0, meter: M44 }], pickupSteps: 0 });
+}
+
+// A song base takes the old base's meter on the bars a section meter owned.
+{
+  const M34 = { num: 3, den: 4, groups: [] };
+  const rollMap: MeterSegment[] = [{ bar: 0, meter: M78 }, { bar: 4, meter: M34 }];
+  assert.deepEqual(takeBarsFrom(rollMap, [{ bar: 0, meter: M44 }], [0, 1, 2, 3]), [{ bar: 0, meter: M44 }, { bar: 4, meter: M34 }]);
+  assert.deepEqual(takeBarsFrom(rollMap, [{ bar: 0, meter: M44 }], []), rollMap);
+  assert.deepEqual(takeBarsFrom([{ bar: 0, meter: M34 }], MAP, [2, 5]), [{ bar: 0, meter: M34 }, { bar: 2, meter: M78 }, { bar: 3, meter: M34 }, { bar: 5, meter: M516 }, { bar: 6, meter: M34 }]);
 }
 
 // Compound meters from the rhythm engine scale their grouping to the numerator.

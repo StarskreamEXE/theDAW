@@ -26,7 +26,7 @@ import {
 } from '../lib/virtuosoTransform';
 import { buildGrooveFromMidiBytes } from '../lib/grooveExtract';
 import type { Meter } from '../lib/colony';
-import { meterEquals, normalizeMeterMap, sanitizeMeter, type MeterSegment } from '../lib/meterMap';
+import { meterEquals, normalizeMeterMap, sanitizeMeter, takeBarsFrom, type MeterSegment } from '../lib/meterMap';
 
 const clamp01 = (v: number): number => Math.max(0, Math.min(1, v));
 const cloneNotes = (notes: PianoNote[]): PianoNote[] => notes.map((n) => ({ ...n }));
@@ -80,11 +80,26 @@ let _rebuildTimer: number | null = null;
 
 // Build Song writes its own meter map into the roll. `_songBase` is the roll's
 // map from before the song, which sections without a meter follow; `_songMap`
-// is the map the last build wrote. A rebuild adopts the roll's map as the new
-// base only when the roll no longer shows `_songMap`, so a section meter that
-// was removed does not linger through the previous song's map.
+// is the map the last build wrote, and `_songOwned` the bars a section meter
+// wrote in it. A rebuild adopts the roll's map as the new base only when the
+// roll no longer shows `_songMap`, so a section meter that was removed does not
+// linger through the previous song's map. The adopted map keeps the old base on
+// the owned bars: the roll shows the section's meter there, not the user's.
 let _songBase: MeterSegment[] | null = null;
 let _songMap: MeterSegment[] | null = null;
+let _songOwned: number[] = [];
+
+/** The bars (0-based) whose meter a section wrote: explicit sections laid end to end, as buildSong lays them. */
+const sectionMeterBars = (sections: SectionSpec[] | null): number[] => {
+  const out: number[] = [];
+  let bar = 0;
+  for (const sec of sections ?? []) {
+    const n = Math.max(1, Math.round(sec.bars));
+    if (sanitizeMeter(sec.meter)) for (let k = 0; k < n; k += 1) out.push(bar + k);
+    bar += n;
+  }
+  return out;
+};
 
 export const useVirtuosoStore = create<VirtuosoState>()(
   persist(
@@ -112,7 +127,8 @@ export const useVirtuosoStore = create<VirtuosoState>()(
         const s = get();
         if (!s.source || !s.source.length) return;
         const roll = usePianoRollStore.getState();
-        if (!_songBase || !_songMap || !sameMeterMap(roll.meterMap, _songMap)) _songBase = roll.meterMap;
+        if (!_songBase || !_songMap) _songBase = roll.meterMap;
+        else if (!sameMeterMap(roll.meterMap, _songMap)) _songBase = takeBarsFrom(roll.meterMap, _songBase, _songOwned);
         const song = buildSongNotes(s.source, {
           key: s.key,
           mode: s.mode,
@@ -125,6 +141,7 @@ export const useVirtuosoStore = create<VirtuosoState>()(
           pickupSteps: roll.pickupSteps,
         });
         _songMap = normalizeMeterMap(song.meterMap);
+        _songOwned = sectionMeterBars(s.sections);
         roll.importNotes(song.notes, roll.bpm, { meterMap: song.meterMap });
       };
 
@@ -156,6 +173,7 @@ export const useVirtuosoStore = create<VirtuosoState>()(
         captureSource: () => {
           _songBase = null;
           _songMap = null;
+          _songOwned = [];
           set({ source: cloneNotes(usePianoRollStore.getState().notes), songMode: false });
           renderPhrase(get().source, get().amounts, get().key, get().mode);
         },
@@ -195,6 +213,7 @@ export const useVirtuosoStore = create<VirtuosoState>()(
           if (_songBase && _songMap && sameMeterMap(roll.meterMap, _songMap)) roll.setMeterMap(_songBase);
           _songBase = null;
           _songMap = null;
+          _songOwned = [];
         },
 
         buildSong: () => {

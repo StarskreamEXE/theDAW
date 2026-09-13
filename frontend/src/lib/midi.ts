@@ -98,6 +98,7 @@ const serializeTrackChunk = (events: RawEvent[], name: string): number[] => {
 };
 
 const GROUPS_TEXT = 'theDAW:groups=';
+const PICKUP_TEXT = 'theDAW:pickup=';
 
 const tempoBytes = (bpm: number): number[] => {
   const microsPerQuarter = Math.min(0xffffff, Math.round(60_000_000 / Math.max(20, bpm)));
@@ -116,9 +117,20 @@ const textBytes = (text: string): number[] => [0xff, 0x01, ...writeVLQ(text.leng
 const tickOf = (tick: number): number => (Number.isFinite(tick) ? Math.max(0, Math.round(tick)) : 0);
 
 /**
+ * One signature's meta events, in the order they sit at its tick: the FF 58,
+ * its groups text, then its pickup text. midiWrite's writer uses the same bytes.
+ */
+export const meterEventMetas = (s: MeterEvent): number[][] => {
+  const out = [signatureBytes(s.num, s.den)];
+  if (s.groups?.length) out.push(textBytes(`${GROUPS_TEXT}${s.groups.join('+')}`));
+  if (typeof s.pickupSteps === 'number' && Number.isFinite(s.pickupSteps) && s.pickupSteps >= 0) out.push(textBytes(`${PICKUP_TEXT}${s.pickupSteps}`));
+  return out;
+};
+
+/**
  * The conductor track: every tempo and time signature at its own tick. At one
- * tick the tempo comes first, then the signature, then its groups text. With
- * no lists it holds one tempo and a 4/4 at tick 0.
+ * tick the tempo comes first, then the signature, its groups text and its
+ * pickup text. With no lists it holds one tempo and a 4/4 at tick 0.
  */
 const buildConductor = (file: MidiFileData): number[] => {
   const tempos = (file.tempos ?? []).map((t) => ({ tick: tickOf(t.tick), bpm: t.bpm }));
@@ -128,8 +140,7 @@ const buildConductor = (file: MidiFileData): number[] => {
   for (const t of tempos) events.push({ tick: t.tick, rank: 0, bytes: tempoBytes(t.bpm) });
   for (const s of signatures) {
     const tick = tickOf(s.tick);
-    events.push({ tick, rank: 1, bytes: signatureBytes(s.num, s.den) });
-    if (s.groups?.length) events.push({ tick, rank: 2, bytes: textBytes(`${GROUPS_TEXT}${s.groups.join('+')}`) });
+    meterEventMetas(s).forEach((bytes, i) => events.push({ tick, rank: 1 + i, bytes }));
   }
   events.sort((a, b) => a.tick - b.tick || a.rank - b.rank);
   const body: number[] = [];
@@ -215,6 +226,8 @@ interface DecodedTrack {
   signatures: MeterEvent[];
   /** `theDAW:groups=` text events, attached to the signature at the same tick by parseMidi. */
   groups: Array<{ tick: number; groups: number[] }>;
+  /** `theDAW:pickup=` text events, attached the same way. */
+  pickups: Array<{ tick: number; steps: number }>;
 }
 
 const decodeTrack = (chunk: Uint8Array, ppq: number): DecodedTrack => {
@@ -225,6 +238,7 @@ const decodeTrack = (chunk: Uint8Array, ppq: number): DecodedTrack => {
   const tempos: MidiTempo[] = [];
   const signatures: MeterEvent[] = [];
   const groups: DecodedTrack['groups'] = [];
+  const pickups: DecodedTrack['pickups'] = [];
   const open = new Map<string, NotePartial>(); // key = `${ch}:${note}`
   const finished: MidiNote[] = [];
 
@@ -251,6 +265,9 @@ const decodeTrack = (chunk: Uint8Array, ppq: number): DecodedTrack => {
         if (text.startsWith(GROUPS_TEXT)) {
           const g = text.slice(GROUPS_TEXT.length).split('+').map(Number);
           if (g.length && g.every((x) => Number.isInteger(x) && x >= 1)) groups.push({ tick, groups: g });
+        } else if (text.startsWith(PICKUP_TEXT)) {
+          const steps = Number(text.slice(PICKUP_TEXT.length));
+          if (Number.isFinite(steps) && steps >= 0) pickups.push({ tick, steps });
         }
       } else if (meta === 0x51 && data.length === 3) {
         const microsPerQuarter = (data[0] << 16) | (data[1] << 8) | data[2];
@@ -309,7 +326,7 @@ const decodeTrack = (chunk: Uint8Array, ppq: number): DecodedTrack => {
   }
 
   finished.sort((a, b) => a.tick - b.tick);
-  return { name, notes: finished, tempos, signatures, groups };
+  return { name, notes: finished, tempos, signatures, groups, pickups };
 };
 
 export const parseMidi = (buf: ArrayBuffer | Uint8Array): MidiFileData => {
@@ -330,6 +347,7 @@ export const parseMidi = (buf: ArrayBuffer | Uint8Array): MidiFileData => {
   const tempos: MidiTempo[] = [];
   const signatures: MeterEvent[] = [];
   const groups: DecodedTrack['groups'] = [];
+  const pickups: DecodedTrack['pickups'] = [];
   for (let i = 0; i < ntrks; i += 1) {
     if (r.str(4) !== 'MTrk') throw new Error(`Track ${i} missing MTrk marker`);
     const len = r.u32();
@@ -338,6 +356,7 @@ export const parseMidi = (buf: ArrayBuffer | Uint8Array): MidiFileData => {
     tempos.push(...t.tempos);
     signatures.push(...t.signatures);
     groups.push(...t.groups);
+    pickups.push(...t.pickups);
     if (t.notes.length > 0) {
       tracks.push({ name: t.name || `Track ${i}`, notes: t.notes });
     }
@@ -347,6 +366,9 @@ export const parseMidi = (buf: ArrayBuffer | Uint8Array): MidiFileData => {
   signatures.sort((a, b) => a.tick - b.tick);
   for (const g of groups) {
     for (const s of signatures) if (s.tick === g.tick) s.groups = [...g.groups];
+  }
+  for (const p of pickups) {
+    for (const s of signatures) if (s.tick === p.tick) s.pickupSteps = p.steps;
   }
   const atZero = tempos.filter((t) => t.tick === 0);
   const bpm = atZero.length ? atZero[atZero.length - 1].bpm : tempos.length ? tempos[0].bpm : 120;

@@ -26,12 +26,42 @@ import { createPortal } from 'react-dom';
 import { X } from 'lucide-react';
 import { useLayoutZoom } from '../lib/layoutScale';
 import { FEATURE_NOTES } from './featureNoteList';
-import { useFeatureNoteStore, type FeatureNoteDef } from './featureNoteStore';
+import { useFeatureNoteStore, type FeatureNoteDef, type NotePlacement } from './featureNoteStore';
 import { SpotlightPointer } from './SpotlightPointer';
 import { CARD_W, placeNote, type Box } from './spotlightGeometry';
 
 /** Fallback card height before the first measurement. */
 const CARD_H = 64;
+
+/**
+ * Elements a card must not cover: the MIDI dock's SHAPE row, whose keys sit
+ * just above the bottom strip the notes point at. A note that overlaps none
+ * stays where placeNote put it.
+ */
+const OBSTACLE_SELECTOR = '[data-note-obstacle]';
+/** Space between a moved card and the obstacle it clears. Viewport px. */
+const OBSTACLE_GAP = 6;
+
+const overlaps = (a: Box, b: Box): boolean =>
+  a.left < b.left + b.width && b.left < a.left + a.width && a.top < b.top + b.height && b.top < a.top + a.height;
+
+/**
+ * `card` moved past each obstacle it covers, along its placement and away from
+ * its target. A card that would leave the viewport or still cover one stays put.
+ */
+const clearObstacles = (card: Box, placement: NotePlacement, obstacles: readonly Box[], viewport: { width: number; height: number }): Box => {
+  let next = card;
+  for (let i = 0; i < obstacles.length; i += 1) {
+    const hit = obstacles.find((o) => overlaps(next, o));
+    if (!hit) break;
+    if (placement === 'top') next = { ...next, top: hit.top - next.height - OBSTACLE_GAP };
+    else if (placement === 'bottom') next = { ...next, top: hit.top + hit.height + OBSTACLE_GAP };
+    else if (placement === 'left') next = { ...next, left: hit.left - next.width - OBSTACLE_GAP };
+    else next = { ...next, left: hit.left + hit.width + OBSTACLE_GAP };
+  }
+  const inside = next.top >= 0 && next.left >= 0 && next.top + next.height <= viewport.height && next.left + next.width <= viewport.width;
+  return inside && !obstacles.some((o) => overlaps(next, o)) ? next : card;
+};
 
 interface NoteGeometry {
   card: Box;
@@ -80,8 +110,10 @@ const Note: React.FC<{ def: FeatureNoteDef; zoom: number; onDismiss: (id: string
     }
     const measured = card.getBoundingClientRect();
     const size = { width: measured.width || CARD_W, height: measured.height || CARD_H };
+    const viewport = { width: window.innerWidth, height: window.innerHeight };
+    const obstacles = Array.from(document.querySelectorAll(OBSTACLE_SELECTOR), readBox).filter((b) => b.width > 0 && b.height > 0);
     const next: NoteGeometry = {
-      card: { ...placeNote(target, def.placement, size, { width: window.innerWidth, height: window.innerHeight }), ...size },
+      card: clearObstacles({ ...placeNote(target, def.placement, size, viewport), ...size }, def.placement, obstacles, viewport),
       target,
     };
     setGeo((prev) => (sameGeometry(prev, next) ? prev : next));
@@ -105,10 +137,25 @@ const Note: React.FC<{ def: FeatureNoteDef; zoom: number; onDismiss: (id: string
     ro.observe(document.body);
     const el = document.querySelector(def.target);
     if (el) ro.observe(el);
+    // An obstacle mounts with its panel (the SHAPE row with the MIDI tab) and
+    // moves no target, so watch obstacles come and go, and each one's size.
+    let obstacles: Element[] = [];
+    const watchObstacles = () => {
+      const now = Array.from(document.querySelectorAll(OBSTACLE_SELECTOR));
+      if (now.length === obstacles.length && now.every((o, i) => o === obstacles[i])) return;
+      for (const o of obstacles) ro.unobserve(o);
+      obstacles = now;
+      for (const o of obstacles) ro.observe(o);
+      schedule();
+    };
+    const mo = new MutationObserver(watchObstacles);
+    mo.observe(document.body, { childList: true, subtree: true });
+    watchObstacles();
     return () => {
       window.removeEventListener('resize', schedule);
       window.removeEventListener('scroll', schedule, true);
       ro.disconnect();
+      mo.disconnect();
       if (frame) cancelAnimationFrame(frame);
     };
   }, [measure, def.target]);

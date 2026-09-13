@@ -453,15 +453,16 @@ export const MidiPanel: React.FC = () => {
   }, [assetId, loadArtifact]);
 
   const exportMidi = useCallback(() => {
-    const { notes, bpm, lanes, totalSteps } = usePianoRollStore.getState();
+    const { notes, bpm, lanes, totalSteps, meterMap, pickupSteps } = usePianoRollStore.getState();
     if (!notes.length) {
       setStatus('no notes to export');
       return;
     }
     // downloadVocalMidi wraps the canonical RenderNote->SMF writer. Export exactly
-    // what the roll plays (post-edit, lane repeats written out), not the stale artifact.
+    // what the roll plays (post-edit, lane repeats written out), not the stale
+    // artifact, with the roll's meter at the ticks its bar starts land on.
     const played = playedRollNotes(notes, lanes, totalSteps);
-    downloadVocalMidi(pianoToArtifact(played, bpm), 'midi');
+    downloadVocalMidi(pianoToArtifact(played, bpm), 'midi', { meterMap, pickupSteps, bpm });
     setStatus(`exported ${played.length} notes to .mid`);
   }, []);
 
@@ -526,6 +527,9 @@ export const MidiPanel: React.FC = () => {
   );
 
   const listOpen = assetOpen && assetMatches.length > 0;
+  // MATCH reads a library song's rhythm analysis, so it gets the field's id only
+  // when that id names an audio entry; typed text that matches none leaves it off.
+  const songEntryId = entries.some((e) => e.kind === 'audio' && e.id === assetId) ? assetId : undefined;
 
   return (
     // data-keyscope: this tab and the EDIT timeline both bind Delete; see
@@ -961,7 +965,7 @@ export const MidiPanel: React.FC = () => {
       </div>
 
       {/* ── SHAPE row ────────────────────────────────────────────────────── */}
-      <VirtuosoControls songEntryId={assetId || undefined} />
+      <VirtuosoControls songEntryId={songEntryId} onStatus={setStatus} />
     </div>
   );
 };

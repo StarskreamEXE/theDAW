@@ -22,7 +22,8 @@ import type { PianoNote } from '../state/pianoRollStore';
 export interface MeterSegment { bar: number; meter: Meter }
 export interface PolyLane { id: number; name: string; cycleSteps: number | null }
 export interface BarSpan { bar: number; start: number; len: number; meter: Meter }
-export interface MeterEvent { tick: number; num: number; den: number; groups?: number[] }
+/** `pickupSteps` rides on theDAW's tick-0 signature: the roll's pickup, so a reader never has to guess it. */
+export interface MeterEvent { tick: number; num: number; den: number; groups?: number[]; pickupSteps?: number }
 export type LaneNote = PianoNote & { lane?: number };
 
 export const DEFAULT_METER_MAP: readonly MeterSegment[] = Object.freeze([{ bar: 0, meter: DEFAULT_METER }]);
@@ -227,7 +228,10 @@ export function stepsAsMeter(steps: number): Meter | null {
   return num <= 64 ? { num, den, groups: [] } : null;
 }
 
-/** MIDI time signature events (FF 58) for the map, a partial bar at tick 0 when there is a pickup. */
+/**
+ * MIDI time signature events (FF 58) for the map, a partial bar at tick 0 when
+ * there is a pickup. The tick-0 event carries the pickup (0 included).
+ */
 export function meterMapToMidiEvents(map: readonly MeterSegment[], ppq: number, pickupSteps = 0): MeterEvent[] {
   const segs = normalizeMeterMap(map);
   const tps = ppq / 4;
@@ -238,28 +242,35 @@ export function meterMapToMidiEvents(map: readonly MeterSegment[], ppq: number, 
   for (const s of segs) {
     out.push({ tick: Math.round(barStartStep(segs, s.bar, partial ? pickup : 0) * tps), num: s.meter.num, den: s.meter.den, groups: [...s.meter.groups] });
   }
+  out[0].pickupSteps = partial ? pickup : 0;
   return out;
 }
 
 /**
  * The inverse of meterMapToMidiEvents. A file with no signature at tick 0 is
- * 4/4 until its first one. A signature at tick 0 that lasts one bar or less,
- * and is shorter than a bar of the signature after it, is a pickup. A change
+ * 4/4 until its first one. A pickup the tick-0 signature carries is read first,
+ * when the next signature starts where it says bar 1 does. Without one (a file
+ * from another app), a signature at tick 0 that lasts one bar or less, and is
+ * shorter than a bar of the signature after it, is taken for a pickup. A change
  * that lands inside a bar moves to the next bar line.
  */
 export function midiEventsToMeterMap(events: readonly MeterEvent[], ppq: number): { map: MeterSegment[]; pickupSteps: number } {
   const tps = ppq / 4;
   const byStep = new Map<number, Meter>();
+  let marked: number | null = null;
   for (const e of events) {
     const meter = sanitizeMeter({ num: e.num, den: e.den, groups: e.groups ?? [] });
     if (!meter || !Number.isFinite(e.tick) || e.tick < 0) continue;
     byStep.set(e.tick / tps, meter);
+    if (e.tick === 0 && typeof e.pickupSteps === 'number' && Number.isFinite(e.pickupSteps) && e.pickupSteps >= 0) marked = e.pickupSteps;
   }
   const evs = [...byStep.entries()].sort((a, b) => a[0] - b[0]).map(([step, meter]) => ({ step, meter }));
   if (!evs.length) return { map: normalizeMeterMap(null), pickupSteps: 0 };
   if (evs[0].step > EPS) evs.unshift({ step: 0, meter: { ...DEFAULT_METER, groups: [] } });
   let pickupSteps = 0;
-  if (evs.length > 1 && evs[1].step <= stepsPerBar(evs[0].meter) + EPS && evs[1].step < stepsPerBar(evs[1].meter) - EPS) {
+  const markHolds = marked !== null && (marked <= EPS || (evs.length > 1 && Math.abs(evs[1].step - marked) <= EPS));
+  const guessed = !markHolds && evs.length > 1 && evs[1].step <= stepsPerBar(evs[0].meter) + EPS && evs[1].step < stepsPerBar(evs[1].meter) - EPS;
+  if ((markHolds && marked! > EPS) || guessed) {
     pickupSteps = evs[1].step;
     evs.shift();
   }
@@ -276,6 +287,19 @@ export function midiEventsToMeterMap(events: readonly MeterEvent[], ppq: number)
     map.push({ bar, meter: current });
   }
   return { map: normalizeMeterMap(map), pickupSteps };
+}
+
+/** `map` with `source`'s meter on each bar in `owned`; every other bar keeps `map`'s meter. */
+export function takeBarsFrom(map: readonly MeterSegment[], source: readonly MeterSegment[], owned: Iterable<number>): MeterSegment[] {
+  const own = new Set([...owned].filter((b) => Number.isInteger(b) && b >= 0));
+  if (!own.size) return normalizeMeterMap(map, false);
+  const a = normalizeMeterMap(map, false);
+  const b = normalizeMeterMap(source, false);
+  // Past the last owned bar and the last change of either map, `map` holds.
+  const end = Math.max(...own, ...a.map((s) => s.bar), ...b.map((s) => s.bar)) + 1;
+  const out: MeterSegment[] = [];
+  for (let bar = 0; bar <= end; bar += 1) out.push({ bar, meter: meterAtBar(own.has(bar) ? b : a, bar) });
+  return normalizeMeterMap(out);
 }
 
 /**

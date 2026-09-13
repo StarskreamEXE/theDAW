@@ -3,35 +3,38 @@
  * polymeter lanes and the syncopation amounts, inline on one row.
  *
  *   BARS    the selected meter change's bars, stepped change to change
- *   BEATS   its numerator; the /4 /8 /16 keys its unit; GROUPS its grouping
- *   ADD     a change at the playhead's bar; the trash key removes the selected one
+ *   BEATS   its numerator; the /4 /8 /16 keys its unit; GROUPS its grouping,
+ *           as keys for three choices or fewer and a menu for more
+ *   ADD     a change at the playhead's bar (off when that bar starts after the
+ *           roll ends); the trash key removes the selected one
  *   LANES   one key per lane in its roll look; + adds a lane, the trash key
  *           removes the active one
  *   LOOP    the active lane's loop in steps (Shift steps a bar)
- *   SYNC / ACCENT  the Virtuoso amounts
+ *   SYNC / ACCENT  the Virtuoso amounts, their ranges widening into spare width
  *   GEN     LOOM's rules written into the active lane, from a flyout
  *   MATCH   the meter map, pickup, tempo and lanes of the song in the strip
  *
- * The logic is lib/meterFace.ts. Meter edits write the store with setState:
- * setMeterMap merges a segment that repeats its neighbour's meter, which would
- * take the selected change away while BEATS steps through that meter.
+ * The logic is lib/meterFace.ts. Meter and lane edits write the store through
+ * applyMeter, which ends the roll on a bar line. Map edits pass merge off:
+ * merging a segment that repeats its neighbour's meter would take the selected
+ * change away while BEATS steps through that meter. GEN and MATCH results go to
+ * the MIDI tab's status line (`onStatus`) and the LOG.
  */
 import React from 'react';
 import { create } from 'zustand';
 import { AudioWaveform, Blocks, ChevronLeft, ChevronRight, Dices, Minus, Plus, Send, Trash2 } from 'lucide-react';
-import { usePianoRollStore } from '../../state/pianoRollStore';
+import { laneName, usePianoRollStore } from '../../state/pianoRollStore';
 import { useVirtuosoStore } from '../../state/virtuosoStore';
-import { useStatusBarStore } from '../../state/statusBarStore';
 import { logError, logInfo, logWarn } from '../../state/logStore';
 import { fetchRhythm } from '../../lib/rhythmSeed';
 import { GEN_RULES } from '../../lib/rollLoom';
 import { GEN_DEFAULT_OPTS, GEN_KINDS, type GenKind, type GenOpts } from '../../lib/loomGen';
 import { normalizeMeterMap, stepsPerBar } from '../../lib/meterMap';
 import {
-  BEATS_MAX, BEATS_MIN, UNITS, addChange, clampSelection, formatOption, genOptionSpecs, genPreview, genStatus, genTarget,
-  genWrite, groupChoices, groupsValue, laneForms, lanePitches, matchApply, matchError, meterLabel, newLaneCycle,
-  parseGroupsValue, removeChange, segmentAtStep, segmentLabel, setBeats, setGroups, setUnit, stepLoop, stepOption,
-  type GateChoice, type GenSettings, type LaneForm, type MeterEdit,
+  BEATS_MAX, BEATS_MIN, UNITS, addChange, addChangeBar, addChangePastEnd, clampSelection, formatOption, genOptionSpecs,
+  genPreview, genStatus, genTarget, genWrite, groupChoices, groupsValue, laneForms, lanePitches, matchApply, matchError,
+  meterLabel, newLaneCycle, parseGroupsValue, removeChange, segmentAtStep, segmentLabel, setBeats, setGroups, setUnit,
+  stepLoop, stepOption, type GateChoice, type GenSettings, type LaneForm, type MeterEdit,
 } from '../../lib/meterFace';
 import {
   DockFlyout, FIELD, FIELD_LEGEND, FIELD_VALUE, FLYOUT_CARD, KEY_REST, MINI_ICON_KEY, MINI_KEY, RANGE, STRIP_ICON_KEY,
@@ -40,14 +43,11 @@ import {
 
 type Level = 'info' | 'warn' | 'error';
 
-/** A result for the status bar and the LOG. */
-const post = (text: string, level: Level = 'info'): void => {
-  useStatusBarStore.getState().setText(text);
-  (level === 'error' ? logError : level === 'warn' ? logWarn : logInfo)('midi', text);
-};
-
 /** MATCH can outlive the face (a flip to SHAPE mid-analysis), so its busy flag is shared. */
 const useMatchBusy = create<{ busy: boolean }>(() => ({ busy: false }));
+
+/** GROUPS draws keys up to this many choices, and a menu past it. */
+const GROUP_KEYS_MAX = 3;
 
 /* ── lane swatches: PianoRoll.tsx's lane forms, in the one accent ─────────── */
 
@@ -147,22 +147,39 @@ const GATE_KEYS: Array<{ kind: GateKind; legend: string; title: string }> = [
   { kind: 'lap', legend: 'Lap', title: 'Lap: only the chosen passes of every period play' },
 ];
 
-const UNIT_TITLES: Record<number, string> = { 4: 'Quarter-note beats', 8: 'Eighth-note beats', 16: 'Sixteenth-note beats' };
+/** Each unit key's accessible name; the key prints "/4". */
+const UNIT_NAMES: Record<number, string> = { 4: 'Quarter-note beat', 8: 'Eighth-note beat', 16: 'Sixteenth-note beat' };
 
 const barsText = (first: number, last: number): string => (first === last ? `${first + 1}` : `${first + 1}-${last + 1}`);
 
-export const MeterFace: React.FC<{ songEntryId?: string }> = ({ songEntryId }) => {
+interface MeterFaceProps {
+  /** The library entry in the strip's song field, whose rhythm analysis MATCH reads. */
+  songEntryId?: string;
+  /** The MIDI tab's status line. */
+  onStatus?: (text: string) => void;
+}
+
+export const MeterFace: React.FC<MeterFaceProps> = ({ songEntryId, onStatus }) => {
   const meterMap = usePianoRollStore((s) => s.meterMap);
   const pickupSteps = usePianoRollStore((s) => s.pickupSteps);
   const totalSteps = usePianoRollStore((s) => s.totalSteps);
   const lanes = usePianoRollStore((s) => s.lanes);
   const activeLane = usePianoRollStore((s) => s.activeLane);
+  // Numbers, so the playhead re-renders the face only when ADD's bar changes.
+  const addBar = usePianoRollStore((s) => addChangeBar(s.meterMap, s.currentStep, s.pickupSteps));
+  const addPastEnd = usePianoRollStore((s) => addChangePastEnd(s.meterMap, s.currentStep, s.pickupSteps, s.totalSteps));
   const sync = useVirtuosoStore((s) => s.amounts.sync);
   const accent = useVirtuosoStore((s) => s.amounts.accent);
   const setAmount = useVirtuosoStore((s) => s.setAmount);
   const keyV = useVirtuosoStore((s) => s.key);
   const modeV = useVirtuosoStore((s) => s.mode);
   const matchBusy = useMatchBusy((s) => s.busy);
+
+  /** A result for the status line and the LOG. */
+  const post = (text: string, level: Level = 'info'): void => {
+    onStatus?.(text);
+    (level === 'error' ? logError : level === 'warn' ? logWarn : logInfo)('midi', text);
+  };
 
   const segs = React.useMemo(() => normalizeMeterMap(meterMap, false), [meterMap]);
   // The selection opens on the segment under the playhead and is clamped on
@@ -178,12 +195,13 @@ export const MeterFace: React.FC<{ songEntryId?: string }> = ({ songEntryId }) =
   const forms = React.useMemo(() => laneForms(lanes, activeLane), [lanes, activeLane]);
 
   const writeMap = (edit: MeterEdit): void => {
-    usePianoRollStore.setState({ meterMap: edit.meterMap });
+    usePianoRollStore.getState().applyMeter({ meterMap: edit.meterMap }, false);
     setSel(edit.selected);
   };
 
   const onAdd = (): void => {
     const r = usePianoRollStore.getState();
+    if (addChangePastEnd(r.meterMap, r.currentStep, r.pickupSteps, r.totalSteps)) return;
     writeMap(addChange(r.meterMap, selected, r.currentStep, r.pickupSteps));
   };
   const onRemove = (): void => {
@@ -193,8 +211,11 @@ export const MeterFace: React.FC<{ songEntryId?: string }> = ({ songEntryId }) =
 
   const onAddLane = (): void => {
     const r = usePianoRollStore.getState();
-    r.setActiveLane(r.addLane(newLaneCycle(r.meterMap)));
+    const id = r.lanes.reduce((m, l) => Math.max(m, l.id), 0) + 1;
+    r.applyMeter({ lanes: [...r.lanes, { id, name: laneName(id), cycleSteps: newLaneCycle(r.meterMap) }] });
+    r.setActiveLane(id);
   };
+  // removeLane also moves the lane's notes into lane A, which applyMeter does not touch.
   const onRemoveLane = (): void => {
     const r = usePianoRollStore.getState();
     if (r.activeLane !== 0) r.removeLane(r.activeLane);
@@ -203,7 +224,8 @@ export const MeterFace: React.FC<{ songEntryId?: string }> = ({ songEntryId }) =
     const r = usePianoRollStore.getState();
     const l = r.lanes.find((x) => x.id === r.activeLane);
     if (!l || l.id === 0) return;
-    r.setLaneCycle(l.id, stepLoop(l.cycleSteps, dir, byBar, stepsPerBar(meter), r.totalSteps));
+    const cycleSteps = stepLoop(l.cycleSteps, dir, byBar, stepsPerBar(meter), r.totalSteps);
+    r.applyMeter({ lanes: r.lanes.map((x) => (x.id === l.id ? { ...x, cycleSteps } : x)) });
   };
 
   /* GEN */
@@ -248,16 +270,15 @@ export const MeterFace: React.FC<{ songEntryId?: string }> = ({ songEntryId }) =
   const onMatch = async (): Promise<void> => {
     if (!songEntryId || useMatchBusy.getState().busy) return;
     useMatchBusy.setState({ busy: true });
-    useStatusBarStore.getState().setText("MATCH IS READING THE SONG'S RHYTHM.");
+    onStatus?.("MATCH IS READING THE SONG'S RHYTHM.");
     try {
       const analysis = await fetchRhythm(songEntryId, { run: true });
       const r = usePianoRollStore.getState();
       const res = matchApply(r, analysis);
       if (res.apply) {
-        r.setMeterMap(res.apply.meterMap);
-        r.setPickupSteps(res.apply.pickupSteps);
-        if (res.apply.bpm != null) r.setBpm(res.apply.bpm);
-        if (res.apply.lanes) r.setLanes(res.apply.lanes);
+        const { meterMap: map, pickupSteps: pickup, bpm, lanes: songLanes } = res.apply;
+        if (bpm != null) r.setBpm(bpm);
+        r.applyMeter({ meterMap: map, pickupSteps: pickup, ...(songLanes ? { lanes: songLanes } : {}) });
         const after = usePianoRollStore.getState();
         setSel(segmentAtStep(after.meterMap, after.currentStep, after.pickupSteps));
       }
@@ -270,6 +291,7 @@ export const MeterFace: React.FC<{ songEntryId?: string }> = ({ songEntryId }) =
   };
 
   const groups = groupChoices(meter);
+  const groupsNow = groupsValue(meter.groups);
   const loopValue = lane.id === 0 || lane.cycleSteps == null ? 'All' : String(lane.cycleSteps);
   const barLen = Math.round(stepsPerBar(meter));
 
@@ -322,32 +344,61 @@ export const MeterFace: React.FC<{ songEntryId?: string }> = ({ songEntryId }) =
             key={d}
             type="button"
             aria-pressed={meter.den === d}
-            title={`Unit: ${UNIT_TITLES[d]}`}
+            aria-label={UNIT_NAMES[d]}
+            title={`Unit: ${UNIT_NAMES[d]}s`}
             className={`${STRIP_KEY} ${keyTone({ on: meter.den === d })}`}
             onClick={() => writeMap(setUnit(segs, selected, d))}
           >
-            <span>/{d}</span>
+            <span aria-hidden="true">/{d}</span>
           </button>
         ))}
       </div>
 
-      <div className={FIELD} title="Groups: how the beats of a bar gather under accents">
-        <label htmlFor="mf-groups" className={FIELD_LEGEND}>Groups</label>
-        <select
-          id="mf-groups"
-          name="mf-groups"
-          value={groupsValue(meter.groups)}
-          onChange={(e) => writeMap(setGroups(segs, selected, parseGroupsValue(e.target.value)))}
-          className="h-4.5 max-w-20 bg-transparent border-none outline-none text-[10px] font-mono et-ink cursor-pointer"
-        >
-          {groups.map((g) => <option key={g.value} value={g.value}>{g.label}</option>)}
-        </select>
-      </div>
+      {groups.length <= GROUP_KEYS_MAX ? (
+        <div className={FIELD} title="Groups: how the beats of a bar gather under accents">
+          <span id="mf-groups-legend" className={FIELD_LEGEND}>Groups</span>
+          <div role="group" aria-labelledby="mf-groups-legend" className="inline-flex gap-px">
+            {groups.map((g) => {
+              const on = groupsNow === g.value;
+              return (
+                <button
+                  key={g.value}
+                  type="button"
+                  aria-pressed={on}
+                  title={g.value ? `Groups ${g.label}: an accent starts each group` : 'Even: the beats carry no grouping'}
+                  className={`${MINI_KEY} ${keyTone({ on })}`}
+                  onClick={() => writeMap(setGroups(segs, selected, parseGroupsValue(g.value)))}
+                >
+                  <span>{g.label}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      ) : (
+        <div className={FIELD} title="Groups: how the beats of a bar gather under accents">
+          <label htmlFor="mf-groups" className={FIELD_LEGEND}>Groups</label>
+          <select
+            id="mf-groups"
+            name="mf-groups"
+            value={groupsNow}
+            onChange={(e) => writeMap(setGroups(segs, selected, parseGroupsValue(e.target.value)))}
+            className="h-4.5 max-w-20 bg-transparent border-none outline-none text-[10px] font-mono et-ink cursor-pointer"
+          >
+            {groups.map((g) => <option key={g.value} value={g.value}>{g.label}</option>)}
+          </select>
+        </div>
+      )}
 
       <StripKey
         onClick={onAdd}
+        disabled={addPastEnd}
         aria-label="Add a meter change at the playhead"
-        title={`Start a change at the playhead's bar with ${meterLabel(meter)}, then edit it.`}
+        title={
+          addPastEnd
+            ? `Bar ${addBar + 1} starts after the roll ends. Lengthen the roll or move the playhead back, then add.`
+            : `Start a change at bar ${addBar + 1} with ${meterLabel(meter)}, then edit it.`
+        }
         icon={<Plus className="w-3 h-3" />}
         legend="Add"
       />
@@ -415,11 +466,13 @@ export const MeterFace: React.FC<{ songEntryId?: string }> = ({ songEntryId }) =
 
       <Sep />
 
+      {/* The ranges take the row's spare width up to the field's cap; GEN's
+          auto margin takes what is left, so GEN and MATCH stay at the end. */}
       {([
-        { k: 'sync', legend: 'Sync', label: 'Syncopation', value: sync, title: 'Syncopation amount: moves strong-beat notes onto the anticipations' },
-        { k: 'accent', legend: 'Accent', label: 'Accent', value: accent, title: 'Accent amount: lifts the notes that start a group' },
-      ] as const).map(({ k, legend, label, value, title }) => (
-        <div key={k} className={FIELD} title={title}>
+        { k: 'sync', legend: 'Sync', value: sync, title: 'Syncopation amount: moves strong-beat notes onto the anticipations' },
+        { k: 'accent', legend: 'Accent', value: accent, title: 'Accent amount: lifts the notes that start a group' },
+      ] as const).map(({ k, legend, value, title }) => (
+        <div key={k} className={`${FIELD} grow max-w-72`} title={title}>
           <label htmlFor={`mf-${k}`} className={FIELD_LEGEND}>{legend}</label>
           <input
             id={`mf-${k}`}
@@ -429,14 +482,11 @@ export const MeterFace: React.FC<{ songEntryId?: string }> = ({ songEntryId }) =
             max={100}
             value={Math.round(value * 100)}
             onChange={(e) => setAmount(k, (parseInt(e.target.value, 10) || 0) / 100)}
-            aria-label={`${label} amount`}
-            className={RANGE}
+            className={`${RANGE} grow`}
           />
           <span className={`${FIELD_VALUE} w-5`}>{Math.round(value * 100)}</span>
         </div>
       ))}
-
-      <span className="flex-1 min-w-1" />
 
       <StripKey
         ref={genKeyRef}
@@ -448,6 +498,7 @@ export const MeterFace: React.FC<{ songEntryId?: string }> = ({ songEntryId }) =
         on={genOpen}
         icon={<Blocks className="w-3 h-3" />}
         legend="Gen"
+        className="ml-auto"
       />
       <StripKey
         onClick={() => void onMatch()}
@@ -457,7 +508,7 @@ export const MeterFace: React.FC<{ songEntryId?: string }> = ({ songEntryId }) =
         title={
           songEntryId
             ? "Match: take the meter map, pickup, tempo and lanes from the song's rhythm analysis (analyzing it first when needed)"
-            : "Pick a song in the strip's song field to match its meter"
+            : "Choose a song from the song field's list to match its meter"
         }
         icon={<AudioWaveform className={`w-3 h-3 ${matchBusy ? 'animate-pulse' : ''}`} />}
         legend="Match"
@@ -589,10 +640,6 @@ export const MeterFace: React.FC<{ songEntryId?: string }> = ({ songEntryId }) =
                 </div>
               </>
             )}
-          </div>
-
-          <div className="flex items-center gap-1">
-            <span className={`${FIELD_LEGEND} w-10 shrink-0`} aria-hidden="true" />
             <div className={FIELD} title="Seed: the same seed writes the same notes">
               <label htmlFor="mf-gen-seed" className={FIELD_LEGEND}>Seed</label>
               <input

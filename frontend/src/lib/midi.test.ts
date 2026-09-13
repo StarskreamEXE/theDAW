@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { encodeMidi, parseMidi, type MidiFileData } from './midi.ts';
 import { meterMapToMidiEvents, midiEventsToMeterMap, normalizeMeterMap, type MeterSegment } from './meterMap.ts';
+import { notesToSmf, rollMeterToSmfEvents } from './midiWrite.ts';
 
 const hex = (b: Uint8Array): string => Buffer.from(b).toString('hex');
 
@@ -125,6 +126,50 @@ const KIT = [
     const back = midiEventsToMeterMap(parsed.timeSignatures ?? [], parsed.ppq);
     assert.deepEqual(back, { map: normalizeMeterMap(MAP), pickupSteps });
   }
+}
+
+// The pickup text survives encode and parse, so a short first bar or a long pickup comes back as written.
+{
+  const M24 = { num: 2, den: 4, groups: [] };
+  const M44 = { num: 4, den: 4, groups: [] };
+  const M78 = { num: 7, den: 8, groups: [] };
+  const roundTrip = (map: MeterSegment[], pickupSteps: number) => {
+    const bytes = encodeMidi({ ppq: 480, bpm: 100, tracks: [{ name: 'Lead', notes: NOTES }], timeSignatures: meterMapToMidiEvents(map, 480, pickupSteps) });
+    const parsed = parseMidi(bytes);
+    return { bytes, parsed, back: midiEventsToMeterMap(parsed.timeSignatures ?? [], parsed.ppq) };
+  };
+
+  const short = roundTrip([{ bar: 0, meter: M24 }, { bar: 1, meter: M44 }], 0);
+  assert.ok(hasBytes(short.bytes, [0xff, 0x01, 15, ...Array.from('theDAW:pickup=0', (c) => c.charCodeAt(0))]));
+  assert.deepEqual(short.parsed.timeSignatures, [{ tick: 0, num: 2, den: 4, pickupSteps: 0 }, { tick: 960, num: 4, den: 4 }]);
+  assert.deepEqual(short.back, { map: [{ bar: 0, meter: M24 }, { bar: 1, meter: M44 }], pickupSteps: 0 });
+
+  const long = roundTrip([{ bar: 0, meter: M78 }], 20);
+  assert.ok(hasBytes(long.bytes, [0xff, 0x01, 16, ...Array.from('theDAW:pickup=20', (c) => c.charCodeAt(0))]));
+  assert.deepEqual(long.back, { map: [{ bar: 0, meter: M78 }], pickupSteps: 20 });
+
+  // The same signatures from another app (no text events) keep the guess.
+  const foreign = parseMidi(smf(480, [0x00, 0xff, 0x58, 0x04, 5, 2, 24, 8, 0x92, 0x60, 0xff, 0x58, 0x04, 7, 3, 12, 8]));
+  assert.deepEqual(midiEventsToMeterMap(foreign.timeSignatures ?? [], foreign.ppq), { map: [{ bar: 0, meter: { num: 5, den: 4, groups: [] } }, { bar: 1, meter: M78 }], pickupSteps: 0 });
+}
+
+// The .mid export's writer: the roll's meter at the ticks its seconds land on, the notes unchanged, nothing added without a meter.
+{
+  const render = [{ midi: 60, startSec: 0.4, durationSec: 0.2, velocity: 90 }];
+  const plain = notesToSmf(render);
+  assert.equal(hex(notesToSmf(render, 0, 0, [])), hex(plain));
+  // 7/8 3+2+2 after a 4-step pickup, then 5/4 from bar 2, at 90 BPM: a step is 1/6 s, which is 160 ticks at 120 BPM / 480 PPQ.
+  const map: MeterSegment[] = [{ bar: 0, meter: { num: 7, den: 8, groups: [3, 2, 2] } }, { bar: 2, meter: { num: 5, den: 4, groups: [] } }];
+  const sigs = rollMeterToSmfEvents(map, 4, 90);
+  assert.deepEqual(sigs.map((e) => [e.tick, e.num, e.den]), [[0, 1, 4], [640, 7, 8], [5120, 5, 4]]);
+  const parsed = parseMidi(notesToSmf(render, 0, 0, sigs));
+  assert.deepEqual(parsed.tracks[0].notes, parseMidi(plain).tracks[0].notes);
+  assert.deepEqual(parsed.timeSignatures, [
+    { tick: 0, num: 1, den: 4, pickupSteps: 640 / 120 },
+    { tick: 640, num: 7, den: 8, groups: [3, 2, 2] },
+    { tick: 5120, num: 5, den: 4 },
+  ]);
+  assert.deepEqual(midiEventsToMeterMap(parsed.timeSignatures ?? [], parsed.ppq).pickupSteps, 640 / 120);
 }
 
 console.log('midi tests passed');

@@ -70,6 +70,11 @@ export function addChangeBar(map: readonly MeterSegment[], step: number, pickupS
   return bar;
 }
 
+/** True when the ADD bar starts at or past the roll's end, where a change holds no steps and GEN writes nothing. */
+export function addChangePastEnd(map: readonly MeterSegment[], step: number, pickupSteps: number, totalSteps: number): boolean {
+  return barStartStep(map, addChangeBar(map, step, pickupSteps), pickupSteps) >= totalSteps - EPS;
+}
+
 /** ADD: a change with the selected segment's meter at the ADD bar, kept apart from its twin, and selected. */
 export function addChange(map: readonly MeterSegment[], selected: number, step: number, pickupSteps = 0): MeterEdit {
   const segs = normalizeMeterMap(map, false);
@@ -127,11 +132,14 @@ export const newLaneCycle = (map: readonly MeterSegment[]): number =>
 /**
  * LOOP: one step, or one bar of `barSteps` with Shift. A lane with no loop
  * counts as the whole roll; reaching the roll's length stops the loop (null).
+ * A shorter loop always loops: from a loop at or past the roll's length it
+ * lands one step inside the roll.
  */
 export function stepLoop(cycle: number | null, dir: -1 | 1, byBar: boolean, barSteps: number, totalSteps: number): number | null {
   const total = Math.max(1, Math.floor(totalSteps));
   const by = byBar ? Math.max(1, Math.round(barSteps)) : 1;
-  const next = clamp(Math.round(cycle ?? total) + dir * by, 1, total);
+  if (dir < 0) return clamp(Math.min(Math.round(cycle ?? total), total) - by, 1, Math.max(1, total - 1));
+  const next = clamp(Math.round(cycle ?? total) + by, 1, total);
   return next >= total ? null : next;
 }
 
@@ -366,7 +374,8 @@ export function matchApply(roll: { lanes: readonly PolyLane[]; bpm: number }, an
   }
   const seed = seedFromRhythm(analysis, roll.bpm);
   if (!seed) return { apply: null, status: 'THE RHYTHM ANALYSIS HAS NO METER. ANALYZE THE SONG AGAIN, THEN PRESS MATCH.', level: 'warn' };
-  const bpm = seed.bpm != null ? clamp(Math.round(seed.bpm * 100) / 100, 40, 240) : null;
+  // A whole number: the BPM field shows and steps whole beats per minute.
+  const bpm = seed.bpm != null ? clamp(Math.round(seed.bpm), 40, 240) : null;
   const addLanes = roll.lanes.length <= 1 && seed.lanes.length > 1;
   const apply: MatchApply = { meterMap: seed.meterMap, pickupSteps: seed.pickupSteps, bpm, lanes: addLanes ? seed.lanes : null };
 
@@ -386,10 +395,17 @@ export function matchApply(roll: { lanes: readonly PolyLane[]; bpm: number }, an
   return { apply, status, level };
 }
 
-/** A failed MATCH as a status line. */
+/**
+ * A failed MATCH as a status line. fetchRhythm's errors carry the HTTP status:
+ * a 404 is a song the library does not hold, and a 502, 503 or 504 is the dev
+ * proxy with no backend behind it.
+ */
 export function matchError(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
   if (/failed to fetch|networkerror|load failed/i.test(msg)) return 'MATCH COULD NOT REACH THE BACKEND. START THE BACKEND AND PRESS MATCH AGAIN.';
+  const code = Number(/failed with (\d{3})/.exec(msg)?.[1] ?? 0);
+  if (code === 404) return 'MATCH FOUND NO SUCH SONG IN THE LIBRARY. CHOOSE THE SONG FROM THE LIST, THEN PRESS MATCH.';
+  if (code === 502 || code === 503 || code === 504) return 'THE BACKEND IS NOT ANSWERING. START THE BACKEND AND PRESS MATCH AGAIN.';
   return `MATCH FAILED: ${msg.replace(/[.\s]+$/, '').toUpperCase()}. ANALYZE THE SONG, THEN PRESS MATCH AGAIN.`;
 }
 

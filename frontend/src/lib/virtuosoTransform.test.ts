@@ -399,6 +399,27 @@ const byPitch = (notes: PianoNote[]): Map<number, PianoNote> => new Map(notes.ma
   assert.deepEqual(roll().meterMap, [{ bar: 0, meter: M78 }, { bar: 3, meter: M516 }]);
   useVirtuosoStore.getState().resetToSource();
   assert.deepEqual(roll().meterMap, [{ bar: 0, meter: M516 }], 'reset puts the source back under its own map');
+
+  // The review's sequence: a 4/4 roll, section 1 = 7/8, SONG, BEATS- on bars 5-, SONG, section 1 = Roll.
+  // The roll edit after the song is kept; the bars section 1 wrote go back to the roll's 4/4.
+  const { setBeats } = await import('./meterFace.ts');
+  const M34 = { num: 3, den: 4, groups: [] };
+  roll().applyMeter({ meterMap: [{ bar: 0, meter: M44 }], pickupSteps: 0 });
+  useVirtuosoStore.setState({ sections: null, style: 'romantic' });
+  useVirtuosoStore.getState().captureSource();
+  useVirtuosoStore.getState().setSectionMeter(0, M78);
+  const firstBars = useVirtuosoStore.getState().effectiveSections()[0].bars;
+  useVirtuosoStore.getState().buildSong();
+  assert.deepEqual(roll().meterMap, [{ bar: 0, meter: M78 }, { bar: firstBars, meter: M44 }]);
+  const edit = setBeats(roll().meterMap, 1, 3);
+  roll().applyMeter({ meterMap: edit.meterMap }, false);
+  assert.deepEqual(roll().meterMap, [{ bar: 0, meter: M78 }, { bar: firstBars, meter: M34 }]);
+  useVirtuosoStore.getState().buildSong();
+  assert.deepEqual(roll().meterMap, [{ bar: 0, meter: M78 }, { bar: firstBars, meter: M34 }]);
+  useVirtuosoStore.getState().setSectionMeter(0, null);
+  await settle();
+  assert.deepEqual(roll().meterMap, [{ bar: 0, meter: M44 }, { bar: firstBars, meter: M34 }], "section 1's bars follow the roll again once its meter is gone");
+  useVirtuosoStore.getState().resetToSource();
 }
 
 console.log('virtuosoTransform: ok');

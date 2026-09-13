@@ -13,7 +13,7 @@
  * orb clearance and its single line on both faces.
  */
 import React from 'react';
-import { Camera, ChevronLeft, ChevronRight, Columns3, ListMusic, Plus, RotateCcw, X } from 'lucide-react';
+import { Camera, ChevronLeft, ChevronRight, Columns3, ListMusic, Plus, RotateCcw, Ruler, Section as SectionGlyph, X } from 'lucide-react';
 import { useVirtuosoStore } from '../../state/virtuosoStore';
 import { LibraryPicker, MIDI_ONLY_TABS } from './LibraryPicker';
 import { MeterFace } from './MeterFace';
@@ -57,8 +57,8 @@ const MODES = [
   'major', 'minor', 'melodic', 'harmonic',
 ];
 
-/** Legend = the one printed word; label = the full name for the tooltip and the
- *  accessible name (which always contains the legend). */
+/** Legend = the one printed word, which names the range through its <label>;
+ *  label = the full name, in the field's tooltip. */
 const SLIDERS: Array<{ k: keyof VirtuosoAmounts; legend: string; label: string }> = [
   { k: 'harmony', legend: 'Harmony', label: 'Harmony' },
   { k: 'ragtime', legend: 'Ragtime', label: 'Ragtime' },
@@ -92,8 +92,18 @@ const SongStructure: React.FC = () => {
     <div className="flex flex-col gap-1.5 p-2">
       <div className="flex items-center gap-2">
         <span className="text-[9px] font-black uppercase tracking-[0.18em] et-ink">Form</span>
-        <span className="text-[8px] font-mono et-ink-3">
-          {sections.length} sections / {totalBars} bars{custom ? '' : ' (style default)'}
+        <span
+          className="inline-flex items-center gap-0.5 text-[10px] font-mono et-ink-2 tabular-nums"
+          title={custom ? `Sections: ${sections.length}` : `Sections: ${sections.length}, the style's default`}
+        >
+          <SectionGlyph aria-hidden="true" className="w-3 h-3 et-ink-3" />
+          <span>{sections.length}</span>
+          <span className="sr-only">sections</span>
+        </span>
+        <span className="inline-flex items-center gap-0.5 text-[10px] font-mono et-ink-2 tabular-nums" title={`Bars: ${totalBars}`}>
+          <Ruler aria-hidden="true" className="w-3 h-3 et-ink-3" />
+          <span>{totalBars}</span>
+          <span className="sr-only">bars</span>
         </span>
         <span className="flex-1" />
         <button
@@ -193,8 +203,9 @@ const SongStructure: React.FC = () => {
 };
 
 /** `songEntryId`: the library entry chosen in the strip's song field, whose
- *  rhythm analysis MATCH reads the meter map from. */
-export const VirtuosoControls: React.FC<{ songEntryId?: string }> = ({ songEntryId }) => {
+ *  rhythm analysis MATCH reads the meter map from. `onStatus`: the MIDI tab's
+ *  status line, where the METER face reports GEN and MATCH. */
+export const VirtuosoControls: React.FC<{ songEntryId?: string; onStatus?: (text: string) => void }> = ({ songEntryId, onStatus }) => {
   const [meterFace, setMeterFace] = useStoredToggle(SHAPE_FACE_KEY, false);
   const amounts = useVirtuosoStore((s) => s.amounts);
   const setAmount = useVirtuosoStore((s) => s.setAmount);
@@ -221,8 +232,10 @@ export const VirtuosoControls: React.FC<{ songEntryId?: string }> = ({ songEntry
 
   return (
     <>
+      {/* data-note-obstacle: the bottom strip's feature notes keep their cards off this row's keys. */}
       <div
         ref={rowRef}
+        data-note-obstacle
         style={orb.left || orb.right ? { paddingLeft: orb.left || undefined, paddingRight: orb.right || undefined } : undefined}
         className="shrink-0 h-7.5 flex flex-nowrap items-center gap-1 px-1.5 border-t border-white/8 bg-black/40"
         role="group"
@@ -252,7 +265,7 @@ export const VirtuosoControls: React.FC<{ songEntryId?: string }> = ({ songEntry
         <Sep />
 
         {meterFace ? (
-          <MeterFace songEntryId={songEntryId} />
+          <MeterFace songEntryId={songEntryId} onStatus={onStatus} />
         ) : (
         <div
           className="contents"
@@ -269,7 +282,6 @@ export const VirtuosoControls: React.FC<{ songEntryId?: string }> = ({ songEntry
               max={100}
               value={Math.round(amounts[k] * 100)}
               onChange={(e) => setAmount(k, (parseInt(e.target.value, 10) || 0) / 100)}
-              aria-label={`${label} amount`}
               className={RANGE}
             />
             <span className={`${FIELD_VALUE} w-5`}>{Math.round(amounts[k] * 100)}</span>

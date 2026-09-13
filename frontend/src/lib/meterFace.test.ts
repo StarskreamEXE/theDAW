@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { euclidPattern, GEN_DEFAULT_OPTS, GEN_KINDS } from './loomGen.ts';
 import { dbToVelocity } from './rollLoom.ts';
-import type { MeterSegment } from './meterMap.ts';
+import { roundUpToBar, type MeterSegment } from './meterMap.ts';
 import type { RhythmAnalysis } from './rhythmSeed.ts';
 import { usePianoRollStore, type PianoNote } from '../state/pianoRollStore.ts';
 import {
-  addChange, addChangeBar, clampSelection, formatOption, genOptionSpecs, genPreview, genStatus, genTarget, genWrite,
+  addChange, addChangeBar, addChangePastEnd, clampSelection, formatOption, genOptionSpecs, genPreview, genStatus, genTarget, genWrite,
   groupChoices, laneForms, lanePitches, matchApply, matchError, meterLabel, newLaneCycle, parseGroupsValue, parseMeterLabel,
   removeChange, replaceLaneNotes, sectionMeterChoices, SECTION_METERS, segmentAtStep, segmentLabel, setBeats, setGroups,
   setUnit, stepLoop, stepOption, type GenSettings,
@@ -48,6 +48,12 @@ const SONG: MeterSegment[] = [{ bar: 0, meter: M78 }, { bar: 4, meter: M54 }, { 
   assert.equal(addChangeBar(SONG, 0), 1, "the playhead in the first segment's first bar starts at bar 2");
   assert.equal(addChangeBar(SONG, 56), 5, 'bar 5 starts the 5/4 change, so ADD goes to bar 6');
   assert.equal(addChangeBar(SONG, 1, 4), 1, 'the pickup counts as bar 1');
+  // A 64-step 4/4 roll whose last bar starts a change: ADD from there goes to bar 5, which starts at the roll's end.
+  const LAST: MeterSegment[] = [{ bar: 0, meter: M44 }, { bar: 3, meter: M44 }];
+  assert.equal(addChangePastEnd(LAST, 48, 0, 64), true);
+  assert.equal(addChangePastEnd(LAST, 32, 0, 64), false, 'ADD from bar 3 goes to bar 3, inside the roll');
+  assert.equal(addChangePastEnd(LAST, 48, 0, 65), false);
+  assert.equal(addChangePastEnd(SONG, 56, 0, 160), false);
   const added = addChange(SONG, 1, 56);
   assert.deepEqual(added.meterMap, [{ bar: 0, meter: M78 }, { bar: 4, meter: M54 }, { bar: 5, meter: M54 }, { bar: 6, meter: M44 }], 'the twin stays apart');
   assert.equal(added.selected, 2);
@@ -86,6 +92,9 @@ const SONG: MeterSegment[] = [{ bar: 0, meter: M78 }, { bar: 4, meter: M54 }, { 
   assert.equal(stepLoop(1, -1, false, 14, 160), 1);
   assert.equal(stepLoop(null, -1, false, 16, 160), 159);
   assert.equal(stepLoop(150, 1, true, 16, 160), null);
+  assert.equal(stepLoop(160, -1, false, 16, 160), 159, 'a loop the length of the roll steps inside it');
+  assert.equal(stepLoop(300, -1, false, 16, 160), 159, 'a loop past the roll steps inside it, never off');
+  assert.equal(stepLoop(300, -1, true, 16, 160), 144, 'Shift steps a bar down from the roll length');
   const forms = laneForms([LANE_A, { id: 1, name: 'B', cycleSteps: 12 }, { id: 2, name: 'C', cycleSteps: 10 }, { id: 3, name: 'D', cycleSteps: 9 }], 1);
   assert.deepEqual([...forms.entries()], [[0, 'outline'], [1, 'solid'], [2, 'stripe'], [3, 'hatch']]);
 }
@@ -167,8 +176,13 @@ const SONG: MeterSegment[] = [{ bar: 0, meter: M78 }, { bar: 4, meter: M54 }, { 
   assert.equal(genStatus(0, 'A'), 'GEN WROTE NO NOTES IN LANE A. ADD HITS OR OPEN THE GATE.');
   assert.equal(matchError(new TypeError('Failed to fetch')), 'MATCH COULD NOT REACH THE BACKEND. START THE BACKEND AND PRESS MATCH AGAIN.');
   assert.equal(
-    matchError(new Error('Reading the rhythm analysis failed with 404: Entry not found')),
-    'MATCH FAILED: READING THE RHYTHM ANALYSIS FAILED WITH 404: ENTRY NOT FOUND. ANALYZE THE SONG, THEN PRESS MATCH AGAIN.',
+    matchError(new Error("Reading the rhythm analysis failed with 404: entry 'not a real song' not found")),
+    'MATCH FOUND NO SUCH SONG IN THE LIBRARY. CHOOSE THE SONG FROM THE LIST, THEN PRESS MATCH.',
+  );
+  assert.equal(matchError(new Error('Reading the rhythm analysis failed with 502')), 'THE BACKEND IS NOT ANSWERING. START THE BACKEND AND PRESS MATCH AGAIN.');
+  assert.equal(
+    matchError(new Error('Analyzing the rhythm failed with 500: rhythm analysis failed: boom')),
+    'MATCH FAILED: ANALYZING THE RHYTHM FAILED WITH 500: RHYTHM ANALYSIS FAILED: BOOM. ANALYZE THE SONG, THEN PRESS MATCH AGAIN.',
   );
 }
 
@@ -198,7 +212,8 @@ const SONG: MeterSegment[] = [{ bar: 0, meter: M78 }, { bar: 4, meter: M54 }, { 
   assert.equal(alone.level, 'info');
   const kept = matchApply({ lanes: [LANE_A, { id: 1, name: 'B', cycleSteps: 12 }], bpm: 90 }, { ...analysis, tempo: { bpm: 97.333, stable: false } });
   assert.equal(kept.apply?.lanes, null);
-  assert.equal(kept.apply?.bpm, 97.33);
+  assert.equal(kept.apply?.bpm, 97, 'the tempo lands on a whole BPM');
+  assert.equal(matchApply({ lanes: [LANE_A], bpm: 90 }, { ...analysis, tempo: { bpm: 101.456, stable: false } }).apply?.bpm, 101);
   assert.equal(kept.level, 'warn');
   assert.match(kept.status, /THE ROLL KEPT ITS OWN LANES\. 2 BARS ARE UNCERTAIN\. THE SONG'S TEMPO MOVES, SO BAR LINES DRIFT FROM THE NOTES\.$/);
   assert.equal(matchApply({ lanes: [LANE_A], bpm: 120 }, { status: 'pending' }).apply, null);
@@ -226,7 +241,7 @@ const SONG: MeterSegment[] = [{ bar: 0, meter: M78 }, { bar: 4, meter: M54 }, { 
 
   // ADD with the playhead in bar 5 (step 64).
   let edit = addChange(st().meterMap, sel, st().currentStep, st().pickupSteps);
-  usePianoRollStore.setState({ meterMap: edit.meterMap });
+  st().applyMeter({ meterMap: edit.meterMap }, false);
   sel = edit.selected;
   assert.deepEqual(st().meterMap, [{ bar: 0, meter: M44 }, { bar: 4, meter: M44 }]);
   assert.equal(sel, 1);
@@ -235,18 +250,18 @@ const SONG: MeterSegment[] = [{ bar: 0, meter: M78 }, { bar: 4, meter: M54 }, { 
   // BEATS + three times: 4 -> 7.
   for (let k = 0; k < 3; k += 1) {
     edit = setBeats(st().meterMap, sel, st().meterMap[sel].meter.num + 1);
-    usePianoRollStore.setState({ meterMap: edit.meterMap });
+    st().applyMeter({ meterMap: edit.meterMap }, false);
     sel = edit.selected;
   }
   assert.deepEqual(st().meterMap, [{ bar: 0, meter: M44 }, { bar: 4, meter: { num: 7, den: 4, groups: [] } }]);
 
   edit = setUnit(st().meterMap, sel, 8);
-  usePianoRollStore.setState({ meterMap: edit.meterMap });
+  st().applyMeter({ meterMap: edit.meterMap }, false);
   assert.deepEqual(st().meterMap[1], { bar: 4, meter: { num: 7, den: 8, groups: [] } });
 
   assert.ok(groupChoices(st().meterMap[sel].meter).some((c) => c.value === '3+2+2'));
   edit = setGroups(st().meterMap, sel, parseGroupsValue('3+2+2'));
-  usePianoRollStore.setState({ meterMap: edit.meterMap });
+  st().applyMeter({ meterMap: edit.meterMap }, false);
   assert.deepEqual(st().meterMap, [{ bar: 0, meter: M44 }, { bar: 4, meter: M78 }]);
 
   // + lane: one bar of the first meter (4/4 = 16 steps), made active.
@@ -279,9 +294,10 @@ const SONG: MeterSegment[] = [{ bar: 0, meter: M78 }, { bar: 4, meter: M54 }, { 
 
   // REMOVE the change at bar 5.
   const removed = removeChange(st().meterMap, sel)!;
-  usePianoRollStore.setState({ meterMap: removed.meterMap });
+  st().applyMeter({ meterMap: removed.meterMap }, false);
   sel = removed.selected;
   assert.deepEqual(st().meterMap, [{ bar: 0, meter: M44 }]);
+  assert.equal(roundUpToBar(st().meterMap, st().totalSteps, st().pickupSteps), st().totalSteps, 'every face write leaves the roll on a bar line');
   assert.equal(sel, 0);
   assert.equal(segmentLabel(st().meterMap, sel, st().totalSteps), '1-');
   assert.deepEqual(st().lanes, [LANE_A, { id: 1, name: 'B', cycleSteps: 12 }]);

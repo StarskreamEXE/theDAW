@@ -9,7 +9,8 @@
  */
 
 import { useGenerateParamsStore } from '../state/generateParamsStore';
-import { notesToSmf } from './midiWrite';
+import type { MeterSegment } from './meterMap';
+import { notesToSmf, rollMeterToSmfEvents } from './midiWrite';
 import type { RenderNote } from './midiSynth';
 import { renderNotesToBlob } from './midiSynth';
 
@@ -70,9 +71,17 @@ const anchorDownload = (blob: Blob, filename: string): void => {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 };
 
-/** Export the artifact notes as a .mid (type-0 SMF) and trigger a download. */
-export const downloadVocalMidi = (notes: ArtifactNote[], baseName = 'vocal'): void => {
-  const bytes = notesToSmf(artifactNotesToRenderNotes(notes));
+/**
+ * Export the artifact notes as a .mid (type-0 SMF) and trigger a download. With
+ * `meter` (the roll's map, pickup and bpm) the file carries its time signatures.
+ */
+export const downloadVocalMidi = (
+  notes: ArtifactNote[],
+  baseName = 'vocal',
+  meter?: { meterMap: MeterSegment[]; pickupSteps: number; bpm: number },
+): void => {
+  const signatures = meter ? rollMeterToSmfEvents(meter.meterMap, meter.pickupSteps, meter.bpm) : [];
+  const bytes = notesToSmf(artifactNotesToRenderNotes(notes), 0, 0, signatures);
   anchorDownload(new Blob([bytes], { type: 'audio/midi' }), `${baseName}.mid`);
 };
 
