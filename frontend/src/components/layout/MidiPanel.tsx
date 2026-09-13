@@ -188,6 +188,7 @@ export const MidiPanel: React.FC = () => {
   const [artifact, setArtifact] = useState<VocalArtifactDoc | null>(null);
   const [validateMsg, setValidateMsg] = useState('');
   const [arpOn, setArpOn] = useState(false);
+  const [arpPlaying, setArpPlaying] = useState(false);
   const [voiceOn, setVoiceOn] = useStoredToggle(VOICE_COLUMN_KEY, true);
   // Step width is shared by the strip's zoom keys and the grid's ctrl+wheel.
   const [stepPx, setStepPx] = useState(16);
@@ -541,9 +542,8 @@ export const MidiPanel: React.FC = () => {
     <div data-keyscope="piano-roll" className="h-full w-full flex flex-col bg-zinc-950 text-zinc-200">
       {/* ── SETTINGS strip ───────────────────────────────────────────────── */}
       <div className="shrink-0 h-7 flex flex-nowrap items-center gap-1 px-1.5 border-b border-white/8 bg-black/40">
-        {/* With the ARP face up the roll is hidden, so PLAY cannot start it
-            (the arpeggiator has its own); a roll already playing can still stop. */}
-        <PianoRollTransport startDisabled={arpOn} />
+        {/* The tab's one PLAY key: the roll, or the arpeggiator while its face is up. */}
+        <PianoRollTransport arpShowing={arpOn} arpPlaying={arpPlaying} onArpPlayingChange={setArpPlaying} />
         <Sep />
         <InstrumentPicker compact />
         <Sep />
@@ -904,7 +904,7 @@ export const MidiPanel: React.FC = () => {
             <PianoRoll stepPx={stepPx} onStepPxChange={setStepPx} />
           </div>
           <div className={arpOn ? 'absolute inset-0' : 'hidden'}>
-            <ArpeggiatorPanel />
+            <ArpeggiatorPanel playing={arpPlaying} />
           </div>
         </div>
 

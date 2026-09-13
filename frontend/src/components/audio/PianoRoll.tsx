@@ -142,10 +142,15 @@ const GLYPH_STOP = 'M2.5 2.5h9v9h-9z';
 
 /**
  * PLAY / STOP, BPM and STEPS. Hosts the roll's playback scheduler: this key is
- * mounted whenever the MIDI tab is, exactly as the roll is. `startDisabled`
- * stops PLAY starting a hidden roll; STOP always works.
+ * mounted whenever the MIDI tab is, exactly as the roll is. It is the tab's one
+ * play key: while `arpShowing` it plays the arpeggiator instead of the hidden
+ * roll, and while either one sounds it reads STOP and stops it.
  */
-export const PianoRollTransport: React.FC<{ startDisabled?: boolean }> = ({ startDisabled = false }) => {
+export const PianoRollTransport: React.FC<{
+  arpShowing?: boolean;
+  arpPlaying?: boolean;
+  onArpPlayingChange?: (playing: boolean) => void;
+}> = ({ arpShowing = false, arpPlaying = false, onArpPlayingChange }) => {
   const bpm = usePianoRollStore((s) => s.bpm);
   const totalSteps = usePianoRollStore((s) => s.totalSteps);
   const meterMap = usePianoRollStore((s) => s.meterMap);
@@ -235,9 +240,17 @@ export const PianoRollTransport: React.FC<{ startDisabled?: boolean }> = ({ star
     };
   }, [isPlaying, setCurrentStep, masterRef]);
 
+  // The arpeggiator keeps running behind the roll face, so the key stops
+  // whichever of the two is sounding before it starts either.
+  const sounding = isPlaying || arpPlaying;
   const handlePlayToggle = () => {
-    if (isPlaying) {
-      stopPlayback();
+    if (sounding) {
+      if (isPlaying) stopPlayback();
+      if (arpPlaying) onArpPlayingChange?.(false);
+      return;
+    }
+    if (arpShowing) {
+      onArpPlayingChange?.(true);
       return;
     }
     // Start from the top; the lookahead scheduler (effect above) fires notes,
@@ -248,6 +261,7 @@ export const PianoRollTransport: React.FC<{ startDisabled?: boolean }> = ({ star
     setPlaying(true);
     logInfo('piano-roll', `Playing ${usePianoRollStore.getState().notes.length} notes at ${bpm} BPM`);
   };
+  const playName = sounding ? 'Stop' : arpShowing ? 'Play the arpeggiator' : 'Play';
 
   // STEPS moves by one bar of the meter the roll ends in, and a new length
   // lands on the next bar line in the direction of the change, whatever the meter.
@@ -271,12 +285,11 @@ export const PianoRollTransport: React.FC<{ startDisabled?: boolean }> = ({ star
       <button
         type="button"
         onClick={handlePlayToggle}
-        disabled={startDisabled && !isPlaying}
-        aria-label={isPlaying ? 'Stop' : 'Play'}
-        title={isPlaying ? 'Stop' : startDisabled ? 'Play: the arpeggiator is showing, and runs from its own Play' : 'Play'}
-        className={`${STRIP_ICON_KEY} w-7 ${isPlaying ? KEY_ON : KEY_PLAY_REST}`}
+        aria-label={playName}
+        title={playName}
+        className={`${STRIP_ICON_KEY} w-7 ${sounding ? KEY_ON : KEY_PLAY_REST}`}
       >
-        <Glyph d={isPlaying ? GLYPH_STOP : GLYPH_PLAY} />
+        <Glyph d={sounding ? GLYPH_STOP : GLYPH_PLAY} />
       </button>
       <div className={FIELD}>
         <label htmlFor="piano-roll-bpm" className={FIELD_LEGEND}>BPM</label>

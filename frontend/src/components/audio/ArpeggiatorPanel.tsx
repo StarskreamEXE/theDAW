@@ -4,10 +4,11 @@
  * rebuild of Jake Albaugh's arpeggiator layout (keyboard strip, chord
  * progression grid, key/mode/steps/type/style selectors, live output) rehosted
  * on the app's Web Audio synth via `ArpPlayerEngine`. The current progression
- * can be dumped into the piano roll's note model with one click.
+ * can be dumped into the piano roll's note model with one click. The MIDI
+ * strip's PLAY key starts and stops it through `playing`.
  */
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Play, Square, Piano, Music4 } from 'lucide-react';
+import { Piano, Music4 } from 'lucide-react';
 import {
   ArpPlayerEngine,
   DEFAULT_ARP_CONFIG,
@@ -62,13 +63,12 @@ const cellBase =
 const cellOn = 'border-purple-400 bg-purple-500 text-white font-bold';
 const cellOff = 'border-white/15 bg-white/8 text-zinc-100 hover:bg-white/15 hover:border-purple-500/40';
 
-export const ArpeggiatorPanel: React.FC = () => {
+export const ArpeggiatorPanel: React.FC<{ playing: boolean }> = ({ playing }) => {
   const engineRef = useRef<ArpPlayerEngine | null>(null);
   if (!engineRef.current) engineRef.current = new ArpPlayerEngine();
   const engine = engineRef.current;
 
   const [cfg, setCfg] = useState<ArpConfig>({ ...DEFAULT_ARP_CONFIG });
-  const [playing, setPlaying] = useState(false);
 
   // Below PROGRESSION_FULL_PX of center column (the section's chrome, seven
   // 24px degree keys with 4px gaps, the output row) the keys go compact: 16px,
@@ -144,15 +144,12 @@ export const ArpeggiatorPanel: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const togglePlay = (): void => {
-    if (playing) {
-      engine.stop();
-      setPlaying(false);
-    } else {
-      engine.start();
-      setPlaying(true);
-    }
-  };
+  // Follow the strip's PLAY key. Declared after the tick handlers, so a start
+  // on mount already has them.
+  useEffect(() => {
+    if (playing) engine.start();
+    else engine.stop();
+  }, [engine, playing]);
 
   const sendToRoll = (): void => {
     const notes = engine.renderProgression();
@@ -184,21 +181,8 @@ export const ArpeggiatorPanel: React.FC = () => {
 
   return (
     <div className="h-full w-full flex flex-col bg-[#07050a] text-zinc-100 overflow-hidden">
-      {/* toolbar — same look/feel as the piano roll's toolbar */}
+      {/* toolbar — the arpeggiator's settings; it plays from the strip's PLAY key */}
       <div className="shrink-0 flex flex-wrap items-center gap-2 px-2 py-1 border-b border-white/5 bg-black/40">
-        <button
-          type="button"
-          onClick={togglePlay}
-          aria-label={playing ? 'Stop arpeggiator' : 'Play arpeggiator'}
-          title={playing ? 'Stop' : 'Play'}
-          className={`p-1 rounded transition-colors ${
-            playing
-              ? 'bg-red-500/20 text-red-300 border border-red-500/40'
-              : 'bg-purple-500/20 text-purple-300 border border-purple-500/40 hover:bg-purple-500/30'
-          }`}
-        >
-          {playing ? <Square className="w-3.5 h-3.5 fill-current" /> : <Play className="w-3.5 h-3.5 fill-current" />}
-        </button>
         <span className="text-[11px] font-black uppercase tracking-widest text-purple-300" title="Chord-progression arpeggiator — pick a key, mode and chords; it arpeggiates them live through theDAW's synth.">Arp</span>
         <span className="text-[10px] font-mono text-zinc-500" title="Current key + scale">{engine.MS.key} {scaleName}</span>
 
