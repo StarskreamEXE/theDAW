@@ -9,6 +9,7 @@ import {
   Volume2,
 } from 'lucide-react';
 import { dawImportAudioUrl } from '../../lib/dawImportClient';
+import { SurfacePlayKey } from '../ui/SurfacePlayKey';
 import type { DawClip, DawProject, DawTrack } from '../../lib/dawImportClient';
 import { performScenes, performSceneCount, performTracks } from '../../lib/performModel';
 import { getEngineCtx, getMasterGain } from '../../state/playerStore';
@@ -970,6 +971,53 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
   return (
     <div className={`border border-white/10 bg-[#2f3238] overflow-hidden ${fill ? 'h-full flex flex-col' : ''}`}>
       <div className="shrink-0 flex items-center gap-1 border-b border-black/70 bg-[#202329] px-2 py-1 text-[10px] font-bold text-zinc-200">
+        {/* Transport leads the row: the surface play key (launch the selected
+            scene, or stop all clips while one plays), then stop, the scene
+            steppers, and record arm last. */}
+        <div className="mr-1 flex items-center gap-1">
+          <SurfacePlayKey
+            size="bar"
+            playing={activeScene != null}
+            onToggle={() => (activeScene == null ? selectAndLaunch(selectedScene) : stopScene())}
+            what="the session"
+            title={activeScene == null ? 'Play selected scene' : 'Stop all clips'}
+          />
+          <button
+            type="button"
+            onClick={stopScene}
+            className="h-7 w-8 grid place-items-center border border-red-900/70 bg-[#3a1719] text-red-200 hover:bg-[#5a2024]"
+            aria-label="Stop session"
+            title="Stop all clips"
+          >
+            <Square className="h-4 w-4 fill-current" />
+          </button>
+          <button
+            type="button"
+            onClick={() => void launchPreviousScene()}
+            className="h-7 w-7 grid place-items-center border border-black/50 bg-[#15171b] text-zinc-300 hover:bg-[#3a3d45] hover:text-white"
+            aria-label="Launch previous scene"
+            title="Previous scene"
+          >
+            <SkipBack className="h-3.5 w-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={() => void launchNextScene()}
+            className="h-7 w-7 grid place-items-center border border-black/50 bg-[#15171b] text-zinc-300 hover:bg-[#3a3d45] hover:text-white"
+            aria-label="Launch next scene"
+            title="Next scene"
+          >
+            <SkipForward className="h-3.5 w-3.5" />
+          </button>
+          <button
+            type="button"
+            className="h-7 w-7 grid place-items-center border border-black/50 bg-[#15171b] text-zinc-400"
+            aria-label="Record arm"
+            title="Record arm placeholder"
+          >
+            <Circle className="h-3.5 w-3.5 fill-current text-zinc-500" />
+          </button>
+        </div>
         <div className="h-6 px-2 grid place-items-center border border-black/50 bg-[#15171b] text-zinc-300">
           {/* Real time signature from the set, not a hardcoded "4 / 4". */}
           {`${project.time_signature?.[0] ?? 4} / ${project.time_signature?.[1] ?? 4}`}
@@ -1003,53 +1051,7 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
             {`Sel ${selectedScene + 1}${lastAction ? ` · ${lastAction}` : ''}`}
           </span>
         </div>
-        <div className="ml-auto flex items-center gap-1">
-          <button
-            type="button"
-            onClick={() => void launchPreviousScene()}
-            className="h-7 w-7 grid place-items-center border border-black/50 bg-[#15171b] text-zinc-300 hover:bg-[#3a3d45] hover:text-white"
-            aria-label="Launch previous scene"
-            title="Previous scene"
-          >
-            <SkipBack className="h-3.5 w-3.5" />
-          </button>
-          <button
-            type="button"
-            onClick={() => selectAndLaunch(activeScene ?? selectedScene)}
-            className="h-7 w-8 grid place-items-center border border-emerald-900/70 bg-[#113525] text-emerald-300 hover:bg-[#185239]"
-            aria-label="Play session"
-            title="Play selected scene"
-          >
-            <Play className="h-4 w-4 fill-current" />
-          </button>
-          <button
-            type="button"
-            onClick={stopScene}
-            className="h-7 w-8 grid place-items-center border border-red-900/70 bg-[#3a1719] text-red-200 hover:bg-[#5a2024]"
-            aria-label="Stop session"
-            title="Stop all clips"
-          >
-            <Square className="h-4 w-4 fill-current" />
-          </button>
-          <button
-            type="button"
-            className="h-7 w-7 grid place-items-center border border-black/50 bg-[#15171b] text-zinc-400"
-            aria-label="Record arm"
-            title="Record arm placeholder"
-          >
-            <Circle className="h-3.5 w-3.5 fill-current text-zinc-500" />
-          </button>
-          <button
-            type="button"
-            onClick={() => void launchNextScene()}
-            className="h-7 w-7 grid place-items-center border border-black/50 bg-[#15171b] text-zinc-300 hover:bg-[#3a3d45] hover:text-white"
-            aria-label="Launch next scene"
-            title="Next scene"
-          >
-            <SkipForward className="h-3.5 w-3.5" />
-          </button>
-        </div>
-        <div className="ml-2 h-7 min-w-32 px-2 flex items-center justify-between border border-black/50 bg-[#15171b] font-mono text-[10px] text-zinc-300">
+        <div className="ml-auto h-7 min-w-32 px-2 flex items-center justify-between border border-black/50 bg-[#15171b] font-mono text-[10px] text-zinc-300">
           <span>{elapsedSeconds.toFixed(1)}</span>
           <span className="text-zinc-500">sec</span>
         </div>

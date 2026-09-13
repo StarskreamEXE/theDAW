@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
-  Scissors, Play, Pause, Square, ZoomIn, ZoomOut,
+  Scissors, Play, Square, ZoomIn, ZoomOut,
   Magnet, Trash2, Move, Plus, Volume2, Upload, Save, Piano, Paintbrush, X, Wand2, Layers,
   SlidersHorizontal, Undo2, Redo2, Gauge, Repeat, Flag, Circle, Copy, Music,
   Plug, Snowflake, Loader2, ChevronUp, ChevronDown, RefreshCw, Blocks,
@@ -64,6 +64,7 @@ import { publishSelectedTracks } from '../../state/editorSelectionBridge';
 import * as liveMixer from '../../state/liveMixer';
 import { useDjAnalysisStore } from '../../state/djAnalysisStore';
 import { ContextMenu, useContextMenu, type ContextMenuItem, type ContextMenuPosition } from '../ui/ContextMenu';
+import { SurfacePlayKey } from '../ui/SurfacePlayKey';
 import { StemsRunModal, type StemsRunOptions } from '../library/StemsRunModal';
 import { EffectWindowsHost, FxChainList, openEffectWindow, type FxScope } from './EffectWindows';
 import { ensureStems } from '../../lib/djStems';
@@ -3635,6 +3636,30 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       {/* Editor Toolbar */}
       <div data-tour="edit-toolbar" className="flex items-center justify-between p-2 border-b border-white/5 bg-black/20 shrink-0">
         <div className="flex items-center gap-3">
+          {/* The surface play key leads the toolbar with stop right after it,
+              the spot every surface that plays keeps its play in. */}
+          <div className="flex items-center gap-1">
+            <SurfacePlayKey
+              size="bar"
+              pauses
+              busy={isRendering}
+              playing={isEditorPlaying}
+              onToggle={() => isEditorPlaying ? pauseEditorPlayback() : void playEditorTimeline()}
+              what="the arrangement"
+              disabled={clips.length === 0 || isRendering}
+              title={isRendering ? 'Rendering…' : isEditorPlaying ? 'Pause (Space)' : 'Play from playhead (Space)'}
+            />
+            <button
+              onClick={stopEditorPlayback}
+              disabled={!isEditorPlaying}
+              aria-label="Stop and return to start"
+              className="h-7 w-8 grid place-items-center hover:bg-white/10 rounded text-zinc-400 disabled:opacity-30"
+              title="Stop and return to start"
+            >
+              <Square className="w-3.5 h-3.5 fill-current" />
+            </button>
+          </div>
+
           <div className="flex bg-black/40 p-0.5 rounded border border-white/5 gap-0.5">
             <button
               onClick={() => setTool('move')}
@@ -3868,26 +3893,6 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
           <span className="text-[9px] font-mono text-zinc-500 tabular-nums">
             <span ref={headerTcRef}>{formatTimecode(playheadSec)}</span> / {formatTimecode(totalDuration)}
           </span>
-          <button
-            onClick={() => isEditorPlaying ? pauseEditorPlayback() : void playEditorTimeline()}
-            disabled={clips.length === 0 || isRendering}
-            className={`p-1.5 rounded transition-colors disabled:opacity-30 ${isEditorPlaying ? 'bg-purple-500/30 text-purple-200 hover:bg-purple-500/20' : 'hover:bg-purple-500/20 text-purple-300'}`}
-            title={isRendering ? 'Rendering…' : isEditorPlaying ? 'Pause (Space)' : 'Play from playhead (Space)'}
-          >
-            {isRendering
-              ? <div className="w-3.5 h-3.5 border-2 border-purple-400/40 border-t-purple-300 rounded-full animate-spin" />
-              : isEditorPlaying
-                ? <Pause className="w-3.5 h-3.5 fill-current" />
-                : <Play className="w-3.5 h-3.5 fill-current" />}
-          </button>
-          <button
-            onClick={stopEditorPlayback}
-            disabled={!isEditorPlaying}
-            className="p-1.5 hover:bg-white/10 rounded text-zinc-400 disabled:opacity-30"
-            title="Stop and return to start"
-          >
-            <Square className="w-3.5 h-3.5 fill-current" />
-          </button>
           <label htmlFor="editor-mixdown-name" className="sr-only">Mixdown filename</label>
           <input
             id="editor-mixdown-name"

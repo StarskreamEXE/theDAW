@@ -231,13 +231,7 @@ export const TabStrip: React.FC<TabStripProps> = ({ artifact, entry }) => {
           style={{ left: nowGeom.offsetPx, backgroundColor: HIGHLIGHT_INKS[ink].color }}
         />
       </div>
-      <PlayAlongTransport
-        entry={entry}
-        isSameTrack={handle.isSameTrack}
-        isPlaying={handle.isPlaying}
-        otherTrackLoaded={handle.otherTrackLoaded}
-        onTransport={handle.onTransport}
-      >
+      <PlayAlongTransport>
         {/* ZoomControls positions itself bottom-right of its nearest positioned
             ancestor; this box gives it one the height of the footer row. */}
         <span className="relative block h-8 w-32 shrink-0">

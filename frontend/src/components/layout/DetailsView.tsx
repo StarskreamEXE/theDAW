@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import { Database, Tag, Star, Calendar, Clock, Music, Disc, Hash, FileAudio, Layers, Send, Download, Scissors, Activity, Wand2, Loader2, MicVocal } from 'lucide-react';
+import { Database, Tag, Star, Calendar, Clock, Music, Hash, FileAudio, Layers, Send, Download, Scissors, Activity, Wand2, Loader2, MicVocal } from 'lucide-react';
 import { RhythmBlock } from './RhythmBlock';
+import { SurfacePlayKey } from '../ui/SurfacePlayKey';
 import { useLibraryStore, type LibraryEntry } from '../../state/libraryStore';
 import { usePlayerStore } from '../../state/playerStore';
 import { useEditorStore, computePeaks } from '../../state/editorStore';
@@ -98,6 +99,10 @@ export const DetailsView: React.FC = () => {
 
   const playerLoad = usePlayerStore((s) => s.load);
   const playerPlay = usePlayerStore((s) => s.play);
+  const playerStop = usePlayerStore((s) => s.stop);
+  // The entry the global player is sounding, so the play key can show that the
+  // selected track is being auditioned and stop it.
+  const playingEntryId = usePlayerStore((s) => (s.isPlaying ? s.currentEntryId : null));
   const getAudioUrl = useLibraryStore((s) => s.getAudioUrl);
   const fetchAudioBlob = useLibraryStore((s) => s.fetchAudioBlob);
 
@@ -265,19 +270,30 @@ export const DetailsView: React.FC = () => {
     );
   }
 
+  const auditioning = playingEntryId === entry.id;
+  const auditionLabel = auditioning ? 'Stop auditioning the selected track' : 'Audition the selected track';
+
   return (
     <div className="h-full overflow-y-auto bg-[#0a080f] p-3">
-      <div className="flex items-start justify-between mb-3 gap-3">
-        <div className="min-w-0">
+      <div className="flex items-start mb-3 gap-3">
+        {/* The play key leads the header, the spot every surface that plays
+            music puts it: it loads the selected track into the global player
+            and plays it, and stops it while it sounds. */}
+        <SurfacePlayKey
+          size="bar"
+          playing={auditioning}
+          onToggle={() => (auditioning ? playerStop() : void handleAuditionInEngine())}
+          what="the selected track"
+          aria-label={auditionLabel}
+          title={auditionLabel}
+        />
+        <div className="min-w-0 flex-1">
           <h3 className="text-[12px] font-bold text-zinc-100 truncate">{entry.title}</h3>
           <p className="text-[9px] font-mono text-zinc-500 truncate">
             {entry.prompt || <em className="text-zinc-700">No prompt</em>}
           </p>
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
-          <button onClick={handleAuditionInEngine} className="btn-ghost text-[9px] py-1 flex items-center gap-1" title="Load + play in global player">
-            <Disc className="w-3 h-3 text-purple-300" /> AUDITION
-          </button>
           <button onClick={handleSendToNewEditorTrack} className="btn-ghost text-[9px] py-1 flex items-center gap-1" title="Create a new editor track for this clip">
             <Scissors className="w-3 h-3 text-purple-300" /> TO EDITOR
           </button>

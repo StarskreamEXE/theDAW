@@ -1,6 +1,4 @@
-import React, { useContext, useState, type ReactNode } from 'react';
-import { Pause, Play } from 'lucide-react';
-import type { LibraryEntry } from '../../../../state/libraryEntry';
+import React, { useState, type ReactNode } from 'react';
 import {
   USER_OFFSET_MAX_MS,
   USER_OFFSET_MIN_MS,
@@ -9,20 +7,15 @@ import {
 import { CALIBRATOR_ID, LatencyCalibrator } from './LatencyCalibrator';
 import { LookControls } from './LookControls';
 
-/** Ambient "a host footer already owns the transport" flag. The SING split
- *  view mounts the whole SCORE tab beside its own footer, so it turns this on
- *  for that subtree rather than threading a prop through four call sites it
- *  doesn't own — and only while that host footer is actually on screen. An
- *  explicit `compact` prop still wins. */
+/** Ambient "a host already owns the play key" flag. The SING split view mounts
+ *  the whole SCORE tab beside its own lyrics, so it turns this on for that
+ *  subtree rather than threading a prop through the call sites it doesn't own
+ *  — and only while SING's play key is actually on screen. ScoreView reads it
+ *  to drop the play key and the OTHER TRACK badge from its header. */
 export const PlayAlongTransportCompact = React.createContext(false);
 
 export interface PlayAlongTransportProps {
-  entry: LibraryEntry | null;
-  isSameTrack: boolean;
-  isPlaying: boolean;
-  otherTrackLoaded: boolean;
-  onTransport: () => void | Promise<void>;
-  /** Mode-specific controls (zoom cluster, skin, …) rendered after the badge. */
+  /** Mode-specific controls (zoom cluster, key/tempo readout, …) rendered first. */
   children?: ReactNode;
   /** Show the OFFSET ms field (and CALIBRATE). Default true. */
   showLatency?: boolean;
@@ -32,38 +25,25 @@ export interface PlayAlongTransportProps {
   onCalibrate?: () => void;
   /** Whether an externally managed calibrator dialog is open. */
   calibratorOpen?: boolean;
-  /** Drop the controls a surrounding footer already provides — play/pause and
-   *  the OTHER TRACK badge — leaving the view's own controls, the look
-   *  preferences and the latency cluster. The OFFSET/CALIBRATE pair is NOT
-   *  dropped: it is this app's only UI for playAlongStore.userOffsetMs (the
-   *  per-device visual latency every play-along clock subtracts, the lyrics'
-   *  included), and it is a different quantity from SING's per-song lyric
-   *  OFFSET, so no host footer replaces it. Defaults to the ambient
-   *  PlayAlongTransportCompact value, which is false outside a split view. */
-  compact?: boolean;
 }
 
-/** The footer every play-along view shares: play/pause for THIS entry, the
- *  OTHER TRACK badge when the engine holds something else, the view's own
- *  controls, and the visual latency offset with its tap calibrator. Same
- *  chrome as the PAGE footer. */
+/** The footer every play-along view shares: the view's own controls, the look
+ *  preferences, and the visual latency offset with its tap calibrator. Play /
+ *  pause and the OTHER TRACK badge are not here: they sit at the left end of
+ *  the Score header (ScoreView), the spot every surface's play key takes, so
+ *  one key serves PAGE, STRIP, CHORDS and HIGHWAY alike. The OFFSET/CALIBRATE
+ *  pair is this app's only UI for playAlongStore.userOffsetMs (the per-device
+ *  visual latency every play-along clock subtracts, the lyrics' included), so
+ *  it stays in the SING split too. Same chrome as the PAGE footer. */
 export const PlayAlongTransport: React.FC<PlayAlongTransportProps> = ({
-  entry,
-  isSameTrack,
-  isPlaying,
-  otherTrackLoaded,
-  onTransport,
   children,
   showLatency = true,
   onCalibrate,
   calibratorOpen = false,
-  compact,
 }) => {
   const userOffsetMs = usePlayAlongStore((s) => s.userOffsetMs);
   const setUserOffsetMs = usePlayAlongStore((s) => s.setUserOffsetMs);
   const [ownCalibratorOpen, setOwnCalibratorOpen] = useState(false);
-  const ambientCompact = useContext(PlayAlongTransportCompact);
-  const isCompact = compact ?? ambientCompact;
 
   const externallyManaged = typeof onCalibrate === 'function';
   const calibratorIsOpen = externallyManaged ? calibratorOpen : ownCalibratorOpen;
@@ -72,45 +52,8 @@ export const PlayAlongTransport: React.FC<PlayAlongTransportProps> = ({
     else setOwnCalibratorOpen((v) => !v);
   };
 
-  const transportLabel = !entry
-    ? 'No track selected'
-    : isSameTrack
-      ? (isPlaying ? `Pause ${entry.title}` : `Play ${entry.title}`)
-      : `Play ${entry.title}`;
-
   return (
     <div className="shrink-0 h-8 border-t border-white/10 bg-[#0a080f] flex items-center gap-2 px-2 text-[10px] font-mono text-zinc-300">
-      {!isCompact && (
-        <button
-          type="button"
-          onClick={() => void onTransport()}
-          disabled={!entry}
-          className="p-1 rounded hover:bg-white/10 disabled:opacity-30"
-          title={transportLabel}
-          aria-label={transportLabel}
-        >
-          {isSameTrack && isPlaying
-            ? <Pause className="w-3.5 h-3.5" />
-            : <Play className="w-3.5 h-3.5 text-emerald-300" />}
-        </button>
-      )}
-      {/* The badge keeps its slot whether or not it is showing: the row is a
-          fixed set of controls, and letting an 11-character word appear and
-          disappear between the play button and the view's own controls shoved
-          them sideways every time the engine changed track. `invisible` is
-          visibility:hidden, so the span is out of the accessibility tree and
-          untabbable (it is not focusable anyway); aria-hidden says so too. */}
-      {!isCompact && (
-        <span
-          className={`text-amber-300/90 whitespace-nowrap ${otherTrackLoaded ? '' : 'invisible'}`}
-          aria-hidden={otherTrackLoaded ? undefined : true}
-          title={otherTrackLoaded
-            ? 'The player is holding a different track, so this view is parked. Press play here to load this track.'
-            : undefined}
-        >
-          OTHER TRACK
-        </span>
-      )}
       {children}
       <span className="ml-auto">
         <LookControls />

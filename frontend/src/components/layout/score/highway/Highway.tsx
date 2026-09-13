@@ -313,7 +313,7 @@ export const Highway: React.FC<HighwayProps> = ({ entry, artifact, artifacts, on
 
   // 7. One frame per clock tick (rAF while playing, store subscription while
   //    paused, so a seek redraws at the scrub head).
-  const handle = usePlayAlong(entry, (sec) => {
+  usePlayAlong(entry, (sec) => {
     lastTimeRef.current = sec;
     sceneRef.current?.frame(sec);
   });
@@ -497,13 +497,7 @@ export const Highway: React.FC<HighwayProps> = ({ entry, artifact, artifacts, on
         )}
       </div>
 
-      <PlayAlongTransport
-        entry={entry}
-        isSameTrack={handle.isSameTrack}
-        isPlaying={handle.isPlaying}
-        otherTrackLoaded={handle.otherTrackLoaded}
-        onTransport={handle.onTransport}
-      />
+      <PlayAlongTransport />
     </div>
   );
 };

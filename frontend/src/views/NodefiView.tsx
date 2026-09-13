@@ -24,6 +24,7 @@ import { nodeDef, type GraphNode, type NodeKind, type NodeRunStatus } from '../l
 import { NodefiPalette } from '../components/nodefi/NodefiPalette';
 import { NodefiInspector } from '../components/nodefi/NodefiInspector';
 import { ContextMenu, useContextMenu, type ContextMenuItem } from '../components/ui/ContextMenu';
+import { SurfacePlayKey } from '../components/ui/SurfacePlayKey';
 import { effectiveZoom } from '../lib/canvasScale';
 import { ownsKey } from '../lib/keyScope';
 import { logInfo } from '../state/logStore';
@@ -964,27 +965,22 @@ export function NodefiView(): React.ReactElement {
           style={{ boxShadow: 'inset 0 0 120px 30px rgb(var(--et-shade, 0 0 0) / 0.45)' }}
         />
 
-        {/* Floating command dock — replaces the old toolbar row. */}
+        {/* The play corner: the surface play key (LIVE) first and Run beside it,
+            floating over the canvas top-left the way the dock floats below. */}
         <div
           onMouseDown={(e) => e.stopPropagation()}
-          data-tour="nodefi-dock"
-          className="absolute bottom-3 left-1/2 -translate-x-1/2 z-20 flex items-center gap-1 pl-1.5 pr-2 py-1 rounded-full border border-white/10 bg-black/60 backdrop-blur-xl shadow-[0_8px_32px_rgba(0,0,0,0.45),0_0_0_1px_rgba(45,212,191,0.08)]"
+          className="absolute top-2 left-2 z-20 flex items-center gap-1 p-1 rounded-md border border-white/10 bg-black/60 backdrop-blur-xl shadow-[0_8px_32px_rgba(0,0,0,0.45)]"
         >
-          {hasLiveNodes ? (
-            <button
-              onClick={() => (liveOn ? stopLive() : void goLive())}
-              disabled={running}
-              title={liveOn ? 'Stop the live performance' : 'Perform the live subgraph in real time (stems + Live FX + LFOs — no AI models)'}
-              className={`flex items-center gap-1.5 px-3 py-1 rounded-full border text-[11px] font-mono font-bold uppercase tracking-wider transition-colors disabled:opacity-40 disabled:pointer-events-none ${
-                liveOn
-                  ? 'border-rose-400/60 bg-rose-500/20 text-rose-100 hover:bg-rose-500/30'
-                  : 'border-teal-400/50 bg-teal-500/15 text-teal-100 hover:bg-teal-500/25'
-              }`}
-            >
-              {liveOn ? <Square className="w-3 h-3" /> : <Play className="w-3 h-3" />}
-              {liveOn ? 'Stop Live' : 'LIVE'}
-            </button>
-          ) : null}
+          <SurfacePlayKey
+            size="bar"
+            playing={liveOn}
+            onToggle={() => (liveOn ? stopLive() : void goLive())}
+            what="the live performance"
+            disabled={running || !hasLiveNodes}
+            title={!hasLiveNodes
+              ? 'Add a Stem, Live FX or LFO node to perform live'
+              : liveOn ? 'Stop the live performance' : 'Perform the live subgraph in real time (stems + Live FX + LFOs — no AI models)'}
+          />
           {running ? (
             <button
               onClick={stop}
@@ -1002,7 +998,14 @@ export function NodefiView(): React.ReactElement {
               <Play className="w-3 h-3" /> Run
             </button>
           )}
-          <div className="w-px h-4 bg-white/10 mx-0.5" />
+        </div>
+
+        {/* Floating command dock — replaces the old toolbar row. */}
+        <div
+          onMouseDown={(e) => e.stopPropagation()}
+          data-tour="nodefi-dock"
+          className="absolute bottom-3 left-1/2 -translate-x-1/2 z-20 flex items-center gap-1 pl-1.5 pr-2 py-1 rounded-full border border-white/10 bg-black/60 backdrop-blur-xl shadow-[0_8px_32px_rgba(0,0,0,0.45),0_0_0_1px_rgba(45,212,191,0.08)]"
+        >
           <button onClick={undo} disabled={!canUndo} title="Undo (Ctrl+Z)" aria-label="Undo" className={toolBtn}>
             <Undo2 className="w-3.5 h-3.5" />
           </button>
