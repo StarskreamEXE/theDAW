@@ -12,8 +12,8 @@
 // knows the app saved, installed, picked or downloaded.
 
 import { getJson } from './apiJson';
-import { basenameOf } from './placesClient';
-import { logError, logInfo } from '../state/logStore';
+import { basenameOf, dirnameOf, pathKey } from './placesClient';
+import { logError, logInfo, logWarn } from '../state/logStore';
 import { useStatusBarStore } from '../state/statusBarStore';
 import { useSwayOpenStore } from '../state/swayOpenStore';
 import { useAppUiStore } from '../state/appUiStore';
@@ -89,8 +89,56 @@ export async function openSwayScene(name: string): Promise<boolean> {
   }
 }
 
+interface ListedScene {
+  name: string;
+  path: string;
+}
+
+/** The scenes GET /api/sway/projects lists; empty when it cannot answer. */
+async function listedScenes(): Promise<ListedScene[]> {
+  try {
+    const data = await getJson<{ projects?: unknown }>('/api/sway/projects');
+    const rows = Array.isArray(data.projects) ? data.projects : [];
+    return rows.filter(
+      (r): r is ListedScene =>
+        !!r && typeof (r as ListedScene).name === 'string' && typeof (r as ListedScene).path === 'string',
+    );
+  } catch (e) {
+    logWarn('sway', `Could not list saved scenes: ${e instanceof Error ? e.message : String(e)}`);
+    return [];
+  }
+}
+
+/** The stem a cockpit save of `stem` writes, lowercased: POST /api/sway/project-save
+ *  drops every character but word characters, spaces, hyphens and dots, then
+ *  trims spaces and dots from the ends. */
+function savedStemKey(stem: string): string {
+  return stem
+    .replace(/[^\p{L}\p{M}\p{N}\p{Pc} .-]+/gu, '')
+    .trim()
+    .replace(/^\.+|\.+$/g, '')
+    .toLowerCase();
+}
+
+/** `stem` when no listed scene has it, else the first of `stem (2)`, `stem (3)`
+ *  ... that no listed scene has, spelled as written or as a save would write
+ *  it. The numbering matches an asset install's. */
+export function freeSceneStem(stem: string, listedStems: string[]): string {
+  const taken = new Set(listedStems.map((s) => s.toLowerCase()));
+  const free = (candidate: string) =>
+    !taken.has(candidate.toLowerCase()) && !taken.has(savedStemKey(candidate));
+  if (free(stem)) return stem;
+  for (let n = 2; n < 1000; n += 1) {
+    const candidate = `${stem} (${n})`;
+    if (free(candidate)) return candidate;
+  }
+  return `${stem} (${Date.now()})`;
+}
+
 /** Load the .sway file at `path` into the SWAY tab. The backend answers only for
- *  a .sway it recorded as saved, installed, picked or downloaded. Resolves true
+ *  a .sway it recorded as saved, installed, picked or downloaded. A file outside
+ *  the scene folder that shares a listed scene's name is handed to the cockpit
+ *  under a free name, so a cockpit save of it writes a new scene. Resolves true
  *  when the tab was pointed at it; failures are logged and shown in the status
  *  bar. */
 export async function openSwaySceneFromPath(path: string): Promise<boolean> {
@@ -99,7 +147,15 @@ export async function openSwaySceneFromPath(path: string): Promise<boolean> {
   try {
     if (!path || !path.trim()) throw new Error('No scene file was named.');
     const data = await getJson<SwayProjectResponse>(`/api/sway/project?path=${encodeURIComponent(path)}`);
-    handToCockpit(data, stem);
+    const returnedStem = (typeof data.name === 'string' && data.name.trim()) || stem;
+    const scenes = await listedScenes();
+    const folder = pathKey(dirnameOf(data.path || path));
+    const inSceneFolder = scenes.some((s) => pathKey(dirnameOf(s.path)) === folder);
+    const sceneStem = inSceneFolder ? returnedStem : freeSceneStem(returnedStem, scenes.map((s) => s.name));
+    if (sceneStem !== returnedStem) {
+      logInfo('sway', `A saved scene is already named ${returnedStem}, so this file opens as ${sceneStem}.`);
+    }
+    handToCockpit({ ...data, name: sceneStem }, stem);
     return true;
   } catch (e) {
     return reportFailure(fileName || path, e);

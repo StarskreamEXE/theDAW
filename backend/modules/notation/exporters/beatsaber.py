@@ -54,6 +54,7 @@ from typing import Any, Optional
 from backend.modules.library import media as _media
 
 from .beatsaber_map import DIFFICULTIES, DIFFICULTY_NAMES, level_index, notes_for_level
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -297,6 +298,7 @@ def encode_song_ogg(audio_path: Path, out: Path) -> bool:
             timeout=FFMPEG_TIMEOUT_SEC,
             shell=False,
             **kwargs,
+            env=child_env(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         log.warning("beatsaber: ffmpeg failed for %s: %s", audio_path, exc)

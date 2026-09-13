@@ -36,6 +36,7 @@ from typing import Any, Optional
 from fastapi import WebSocket
 
 from backend.core.adb import resolve_adb_path
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -232,6 +233,7 @@ def _run_adb_reverse(port: int) -> bool:
             capture_output=True,
             timeout=10,
             check=True,
+            env=child_env(),
         )
         return True
     except Exception as e:  # noqa: BLE001

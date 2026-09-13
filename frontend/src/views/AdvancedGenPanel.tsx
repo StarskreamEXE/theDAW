@@ -38,6 +38,7 @@ import { describeHttpError } from '../lib/httpError';
 import { classifyModelGate } from '../lib/modelDownloadClient';
 import { requireFeature } from '../notices/featureGateStore';
 import { logError, logInfo, logWarn } from '../state/logStore';
+import { useStatusBarStore } from '../state/statusBarStore';
 import { KnownFilesMenu } from '../components/ui/KnownFilesMenu';
 import { AUDIO_EXTS } from '../lib/fileFilters';
 import '../components/layout/track-controls.css';
@@ -508,7 +509,9 @@ export const AdvancedGenPanel: React.FC<{
       path = picked.path;
     } catch (e) {
       if (storageErrorStatus(e) === 501) { chooseLoraInBrowser(i); return; }
-      logError('generate', `LoRA file dialog failed: ${e instanceof Error ? e.message : String(e)}`);
+      const msg = e instanceof Error ? e.message : String(e);
+      logError('generate', `LoRA file dialog failed: ${msg}`);
+      useStatusBarStore.getState().setText(`LORA FILE DIALOG FAILED: ${msg}`);
       return;
     }
     const name = basenameOf(path);

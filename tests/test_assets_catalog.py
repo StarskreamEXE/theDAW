@@ -334,6 +334,60 @@ def test_a_plugin_install_names_the_plugin_to_open(
     assert _row(client, "plugin-shelf-demo")["installed_path"] == str(shelf)
 
 
+def test_a_plugin_install_leaves_the_gan_picker_in_the_users_folder(
+    client: TestClient, gan_catalog: str, tmp_path: Path
+) -> None:
+    """The user opened a .gan from their own folder, then installs a plugin
+    from the library. The install joins Recent, and the next .gan dialog still
+    opens where the user's file is."""
+    mine = tmp_path / "Mine" / "pad.gan"
+    mine.parent.mkdir()
+    mine.write_bytes(
+        (tmp_path / "examples" / "plugins" / "shelf-demo.gan").read_bytes()
+    )
+    known_paths.record(mine, source="pick")
+
+    body = client.post("/api/assets/plugin-shelf-demo/install").json()
+    assert body["installed"] is True
+    assert known_paths.last_folder("gan") == str(mine.parent)
+    assert [e["path"] for e in known_paths.recent(kind="gan")] == [
+        body["path"],
+        str(mine),
+    ]
+
+
+def test_a_scene_install_leaves_the_sway_picker_in_the_users_folder(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A .sway installs into data/sway-projects, theDAW's own folder, so the
+    .sway dialog keeps the folder the user last chose a scene from."""
+    monkeypatch.setenv("theDAW_DATA_DIR", str(tmp_path / "data"))
+    root = tmp_path / "examples"
+    (root / "scenes").mkdir(parents=True)
+    (root / "scenes" / "show.sway").write_text('{"version": 1}', encoding="utf-8")
+    (root / "catalog.json").write_text(
+        json.dumps(
+            {"assets": [{"id": "show", "name": "Show", "file": "scenes/show.sway"}]}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(catalog, "EXAMPLES_DIR", root)
+    monkeypatch.setattr(catalog, "BUNDLED_CATALOG", root / "catalog.json")
+    monkeypatch.setattr(catalog, "user_catalog_dir", lambda: tmp_path / "userdata")
+    mine = tmp_path / "Shows" / "opener.sway"
+    mine.parent.mkdir()
+    mine.write_text("{}", encoding="utf-8")
+    known_paths.record(mine, source="pick")
+
+    body = client.post("/api/assets/show/install").json()
+    assert Path(body["path"]) == tmp_path / "data" / "sway-projects" / "show.sway"
+    assert known_paths.last_folder("sway") == str(mine.parent)
+    assert [e["path"] for e in known_paths.recent(kind="sway")] == [
+        body["path"],
+        str(mine),
+    ]
+
+
 def test_a_plugin_on_the_shelf_is_found_by_its_manifest_id(
     client: TestClient, gan_catalog: str, tmp_path: Path
 ) -> None:

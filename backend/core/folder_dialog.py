@@ -25,6 +25,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from typing import Any, Optional
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -114,6 +115,7 @@ def _run_powershell(script: list[str], what: str) -> Optional[str]:
             encoding="utf-8",
             errors="replace",
             timeout=_DIALOG_TIMEOUT_SEC,
+            env=child_env(),
         )
     except subprocess.TimeoutExpired as e:
         log.warning("folder_dialog: PowerShell %s timed out", what)

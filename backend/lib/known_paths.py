@@ -160,7 +160,14 @@ BLOCKED_SAVE_EXTS = frozenset(
 FOUNDRY_EXPORT_NAME = "project.json"
 
 # A kind with no folder of its own starts where this other kind last was.
-_FOLDER_FALLBACKS = {"foundry-export": "json"}
+_FOLDER_FALLBACKS = {
+    "foundry-export": "json",
+    "nodefi-set": "json",
+    "v2m-recordings": "json",
+    "meter-map": "json",
+    "lineage-json": "json",
+    "library-metadata": "json",
+}
 
 _KIND_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,47}$")
 
@@ -250,6 +257,7 @@ _DOWNLOADS_KINDS = frozenset(
         "zip",
         "apk",
         "download",
+        "meter-report",
     }
 )
 
@@ -590,8 +598,9 @@ def default_folder(kind: str | None) -> str | None:
 def last_folder(kind: str | None) -> str | None:
     """The folder the last path of this kind was in, while it still exists.
 
-    A kind with a fallback kind (``foundry-export`` falls back to ``json``)
-    then takes that kind's last folder; otherwise ``default_folder(kind)``."""
+    A kind with a fallback kind (``foundry-export`` and the JSON export kinds
+    fall back to ``json``) then takes that kind's last folder; otherwise
+    ``default_folder(kind)``."""
     if isinstance(kind, str) and kind:
         folder = _read()["folders"].get(kind)
         if folder and _isdir(folder):

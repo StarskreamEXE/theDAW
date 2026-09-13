@@ -48,6 +48,8 @@ import { ganApi, type GanPluginSummary } from '../lib/ganClient';
 import { AUDIO_EXTS, FOUNDRY_EXPORT_FILTER, GAN_FILTER } from '../lib/fileFilters';
 import { pickFile } from '../lib/storageClient';
 import { saveFile } from '../lib/saveFile';
+import { logError } from '../state/logStore';
+import { useStatusBarStore } from '../state/statusBarStore';
 import { KnownFilesMenu } from '../components/ui/KnownFilesMenu';
 import { Boxes, Headphones, Music } from 'lucide-react';
 import '../components/layout/track-controls.css';
@@ -1527,18 +1529,35 @@ export const MixView: React.FC = () => {
     setActiveMagentaId(useMixStageStore.getState().activeMagentaId === id ? null : id);
   };
   // .gan loader: pick/import sets the active plugin and yields the stage to it.
+  const reportPickFailed = (e: unknown) => {
+    const msg = e instanceof Error ? e.message : String(e);
+    logError('mix', msg);
+    useStatusBarStore.getState().setText(`OPEN FAILED: ${msg}`);
+  };
   const handleOpenGan = async () => {
-    const r = await pickFile({ filter: GAN_FILTER, title: 'Open a .gan plugin', kind: 'gan' });
+    let r: Awaited<ReturnType<typeof pickFile>>;
+    try {
+      r = await pickFile({ filter: GAN_FILTER, title: 'Open a .gan plugin', kind: 'gan' });
+    } catch (e) {
+      reportPickFailed(e);
+      return;
+    }
     if (!r.path) return;
     setActiveModuleId(null); setActiveMagentaId(null);
     await ganOpenPath(r.path);
   };
   const handleImportGan = async () => {
-    const r = await pickFile({
-      filter: FOUNDRY_EXPORT_FILTER,
-      title: 'Select a VST Foundry export (project.json)',
-      kind: 'foundry-export',
-    });
+    let r: Awaited<ReturnType<typeof pickFile>>;
+    try {
+      r = await pickFile({
+        filter: FOUNDRY_EXPORT_FILTER,
+        title: 'Select a VST Foundry export (project.json)',
+        kind: 'foundry-export',
+      });
+    } catch (e) {
+      reportPickFailed(e);
+      return;
+    }
     if (!r.path) return;
     setActiveModuleId(null); setActiveMagentaId(null);
     await ganImportOwl(r.path);

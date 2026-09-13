@@ -617,6 +617,72 @@ def test_a_sent_or_remembered_folder_wins_over_the_checkpoint_fallbacks(
     assert dialog.calls[2]["initial"] == str(remembered)
 
 
+def test_a_first_lora_browse_opens_in_a_model_folder_and_the_next_beside_the_pick(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The LoRA slot's Choose file asks with kind 'lora'. With no LoRA picked
+    yet it opens where checkpoints are; after a pick it opens beside that
+    LoRA."""
+    models = tmp_path / "models"
+    models.mkdir()
+    monkeypatch.setattr(storage_router, "_local_search_dirs", lambda: [models])
+    lora = _touch(tmp_path / "LoRAs" / "tape-hiss.safetensors")
+    dialog = _dialog(monkeypatch, "pick_open_file", str(lora), None)
+
+    first = client.post("/api/storage/pick-file", json={"kind": "lora"})
+    assert first.json() == {"path": str(lora), "cancelled": False}
+    assert dialog.calls[0]["initial_dir"] == str(models)
+    assert [i["path"] for i in known_paths.recent(kind="lora")] == [str(lora)]
+
+    client.post("/api/storage/pick-file", json={"kind": "lora"})
+    assert dialog.calls[1]["initial_dir"] == str(lora.parent)
+
+
+def test_with_no_model_folder_a_lora_browse_opens_beside_the_newest_registered_checkpoint(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    run = tmp_path / "Finetunes" / "run-7"
+    run.mkdir(parents=True)
+    monkeypatch.setattr(
+        storage_router,
+        "get_registry",
+        lambda: _Registry([{"id": "local:1", "path": str(run), "added_at": 5}]),
+    )
+    dialog = _dialog(monkeypatch, "pick_open_file", None)
+
+    client.post("/api/storage/pick-file", json={"kind": "lora"})
+    assert dialog.calls[0]["initial_dir"] == str(run.parent)
+
+
+def test_a_json_export_picker_opens_where_the_last_json_file_was(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """NODEFI's set import asks with kind 'nodefi-set'. With no set picked yet it
+    opens where the last JSON file went; after a pick, beside that set."""
+    chart = _touch(tmp_path / "Charts" / "chart.json")
+    known_paths.record(chart, source="save")
+    saved_set = _touch(tmp_path / "Sets" / "live.json")
+    dialog = _dialog(monkeypatch, "pick_open_file", str(saved_set), None)
+
+    client.post("/api/storage/pick-file", json={"kind": "nodefi-set"})
+    assert dialog.calls[0]["initial_dir"] == str(chart.parent)
+
+    client.post("/api/storage/pick-file", json={"kind": "nodefi-set"})
+    assert dialog.calls[1]["initial_dir"] == str(saved_set.parent)
+    assert known_paths.last_folder("json") == str(chart.parent)
+
+
+def test_a_meter_report_save_opens_in_downloads_with_no_history(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, home: Path
+) -> None:
+    downloads = home / "Downloads"
+    downloads.mkdir()
+    dialog = _dialog(monkeypatch, "pick_save_file", None)
+
+    client.post("/api/storage/pick-save", json={"kind": "meter-report"})
+    assert dialog.calls[0]["initial_dir"] == str(downloads)
+
+
 def test_a_checkpoint_file_pick_moves_only_the_checkpoint_folder(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

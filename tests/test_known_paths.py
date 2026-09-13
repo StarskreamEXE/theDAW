@@ -397,6 +397,7 @@ def test_default_folders(store: Path, tmp_path: Path) -> None:
     assert known_paths.default_folder("checkpoint") is None
     assert known_paths.default_folder("apk") is None
     assert known_paths.default_folder("download") is None
+    assert known_paths.default_folder("meter-report") is None
     assert known_paths.default_folder("foundry-export") is None
     assert known_paths.default_folder(None) is None
 
@@ -408,6 +409,43 @@ def test_default_folders(store: Path, tmp_path: Path) -> None:
     assert known_paths.default_folder("library-folder") == str(home / "Music")
     assert known_paths.default_folder("apk") == str(home / "Downloads")
     assert known_paths.default_folder("download") == str(home / "Downloads")
+    assert known_paths.default_folder("meter-report") == str(home / "Downloads")
+    # The JSON export kinds have no default of their own; they follow json.
+    for kind in JSON_EXPORT_KINDS:
+        assert known_paths.default_folder(kind) is None
+        assert known_paths.last_folder(kind) == str(home / "Downloads")
+
+
+JSON_EXPORT_KINDS = [
+    "nodefi-set",
+    "v2m-recordings",
+    "meter-map",
+    "lineage-json",
+    "library-metadata",
+]
+
+
+@pytest.mark.parametrize("kind", JSON_EXPORT_KINDS)
+def test_a_json_export_kind_follows_json_until_it_has_a_folder_of_its_own(
+    store: Path, tmp_path: Path, kind: str
+) -> None:
+    assert known_paths.last_folder(kind) is None
+
+    chart = _touch(tmp_path / "Charts" / "chart.json")
+    known_paths.record(chart, source="save")
+    assert known_paths.last_folder(kind) == str(chart.parent)
+
+    own = _touch(tmp_path / "Exports" / f"{kind}.json")
+    known_paths.record(own, kind=kind, source="save")
+    assert known_paths.last_folder(kind) == str(own.parent)
+
+    later = _touch(tmp_path / "Later" / "other.json")
+    known_paths.record(later, source="save")
+    assert known_paths.last_folder("json") == str(later.parent)
+    assert known_paths.last_folder(kind) == str(own.parent)
+
+    shutil.rmtree(own.parent)
+    assert known_paths.last_folder(kind) == str(later.parent)
 
 
 def test_record_folder_needs_an_existing_folder(store: Path, tmp_path: Path) -> None:

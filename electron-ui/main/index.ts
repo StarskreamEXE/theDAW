@@ -734,29 +734,41 @@ function sendLoadingStatus(msg: string): void {
 // ---------------------------------------------------------------------------
 
 const PLACES_RECORD_URL = `${BACKEND_BASE}/api/places/record`
+const LAUNCH_TOKEN_CHECK_URL = `${BACKEND_BASE}/api/places/launch-token-check`
+
+/** Record a finished download with the launch token. Resolves once the backend
+ *  answered, failed or timed out; it never rejects, because a backend that is
+ *  down or restarting must not surface as an error for a download that already
+ *  succeeded. */
+async function recordDownload(savePath: string): Promise<void> {
+  try {
+    const res = await globalThis.fetch(PLACES_RECORD_URL, {
+      method: 'POST',
+      // The token tells /api/places/record this path came from Chromium's
+      // download manager, which is what lets the backend serve it back.
+      headers: {
+        'content-type': 'application/json',
+        [LAUNCH_TOKEN_HEADER]: LAUNCH_TOKEN,
+      },
+      body: JSON.stringify({ path: savePath }),
+      signal: AbortSignal.timeout(5000),
+    })
+    if (!res.ok) log(`Recording the download failed: /api/places/record answered ${res.status}.`)
+  } catch (err) {
+    log(`Recording the download failed: ${err instanceof Error ? err.message : String(err)}`)
+  }
+}
 
 function watchDownloads(ses: Electron.Session): void {
   ses.on('will-download', (_event, item) => {
-    item.once('done', (_doneEvent, state) => {
+    item.once('done', async (_doneEvent, state) => {
       const filename = item.getFilename()
       const savePath = state === 'completed' ? item.getSavePath() || null : null
       if (savePath) {
         log(`Download completed: ${savePath}`)
-        // Fire and forget: a backend that is down or restarting must not
-        // surface as an error for a download that already succeeded.
-        globalThis
-          .fetch(PLACES_RECORD_URL, {
-            method: 'POST',
-            // The token tells /api/places/record this path came from Chromium's
-            // download manager, which is what lets the backend serve it back.
-            headers: {
-              'content-type': 'application/json',
-              [LAUNCH_TOKEN_HEADER]: LAUNCH_TOKEN,
-            },
-            body: JSON.stringify({ path: savePath }),
-            signal: AbortSignal.timeout(5000),
-          })
-          .catch(() => {})
+        // Recorded before the renderer hears about it, so the Recent menus it
+        // refetches on 'download-done' already list the file.
+        await recordDownload(savePath)
       } else {
         log(`Download ${state}: ${filename}`)
       }
@@ -765,6 +777,38 @@ function watchDownloads(ses: Electron.Session): void {
       }
     })
   })
+}
+
+/** Ask a backend this process did not spawn whether it holds this session's
+ *  launch token, and log one warning when it does not. Such a backend records
+ *  a finished download as a path a page named. */
+async function warnIfBackendLacksLaunchToken(): Promise<void> {
+  let matches: boolean
+  try {
+    const res = await globalThis.fetch(LAUNCH_TOKEN_CHECK_URL, {
+      headers: { [LAUNCH_TOKEN_HEADER]: LAUNCH_TOKEN },
+      signal: AbortSignal.timeout(5000),
+    })
+    // A backend from before this route has no launch token either.
+    if (res.status === 404) {
+      matches = false
+    } else if (res.ok) {
+      const body = (await res.json()) as { matches?: unknown }
+      matches = body?.matches === true
+    } else {
+      log(`Launch token check answered ${res.status}; skipping it.`)
+      return
+    }
+  } catch (err) {
+    log(`Launch token check failed: ${err instanceof Error ? err.message : String(err)}`)
+    return
+  }
+  if (!matches) {
+    log(
+      'WARNING: The backend on port 8600 was started outside this app, so it does not hold ' +
+        "this session's launch token. Downloads from this session will not appear in Recent menus.",
+    )
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1133,6 +1177,7 @@ if (gotSingleInstanceLock) app.whenReady().then(async () => {
     if (!isQuitting) spawnBackend()
   } else {
     log('Backend already running — skipping spawn.')
+    await warnIfBackendLacksLaunchToken()
   }
 })
 

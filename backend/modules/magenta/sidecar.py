@@ -43,6 +43,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from backend.lib import paths
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -279,6 +280,7 @@ def gpu_info() -> dict:
                 text=True,
                 timeout=12,
                 creationflags=_no_window_flags(),
+                env=child_env(),
             ).stdout
             for line in out.strip().splitlines():
                 parts = [p.strip() for p in line.split(",")]
@@ -386,6 +388,7 @@ def setup_state(refresh: bool = False) -> dict:
             timeout=_SETUP_PROBE_TIMEOUT,
             creationflags=_no_window_flags(),
             shell=False,
+            env=child_env(),
         )
         out = result.stdout or ""
         state["wsl"] = "WSL_OK" in out
@@ -503,6 +506,7 @@ def launch_installer() -> dict:
         cwd=str(_INSTALLER.parent),
         creationflags=subprocess.CREATE_NEW_CONSOLE,
         close_fds=True,
+        env=child_env(),
     )
     log.info("magenta: launched installer %s (pid %s)", _INSTALLER, proc.pid)
     return {"pid": proc.pid, "installer": str(_INSTALLER)}
@@ -601,6 +605,7 @@ def _download_worker(model_id: str, job: dict) -> None:
                 timeout=3 * 3600,
                 creationflags=_no_window_flags(),
                 shell=False,
+                env=child_env(),
             )
     except subprocess.TimeoutExpired:
         error = "the download did not finish within 3 hours"
@@ -715,7 +720,7 @@ def start_engine() -> dict:
         # urlsplit, not rsplit(":"): a SIDECAR_URL without an explicit port
         # would make rsplit yield "//host" and feed the engine a bogus port.
         port = str(urlsplit(SIDECAR_URL).port or 8777)
-        popen_env = os.environ.copy()
+        popen_env = child_env()
         creationflags = _no_window_flags()
 
         if sys.platform == "win32":
@@ -806,6 +811,7 @@ def stop_engine() -> dict:
                 timeout=20,
                 capture_output=True,
                 shell=False,
+                env=child_env(),
             ).returncode
             # native pkill returns 1 when nothing matched (not an error here).
             pkilled = rc == 0

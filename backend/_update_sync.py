@@ -14,12 +14,12 @@ when the venv is half-built.
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import Callable
+from backend.lib.launch_token import child_env
 
 UPDATE_EXIT_CODE = 89
 
@@ -56,7 +56,8 @@ def run_dependency_sync(repo_root: Path, emit: Emit = print) -> int:
     new wheels or npm packages runs on the next spawn. Returns the first
     non-zero exit code, 0 when everything succeeded. Never raises.
     """
-    env = os.environ.copy()
+    # uv and npm run package build scripts, which must not hold the launch token.
+    env = child_env()
     # Keep uv's cache on the repo's drive so wheels hardlink into .venv
     # (same reason theDAW.bat sets it).
     env.setdefault("UV_CACHE_DIR", str(repo_root / ".uv-cache"))

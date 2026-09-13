@@ -57,6 +57,7 @@ from stable_audio_3.model_configs import (
 from .store import get_registry
 from backend.lib import known_paths, paths
 from backend.lib.cross_site import refuse_cross_site
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -160,6 +161,7 @@ def _wsl_location(label: str, key: str, wsl_path: str, refresh: bool) -> dict:
                 capture_output=True,
                 timeout=_WSL_TIMEOUT,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                env=child_env(),
             )
             stdout = result.stdout.decode("utf-8", errors="replace")
             lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
@@ -1122,11 +1124,16 @@ def _checkpoint_start_dir() -> str | None:
     return None
 
 
+# Kinds whose dialog, with no folder of their own yet, opens where the model
+# files are.
+_MODEL_FILE_KINDS = ("checkpoint", "lora")
+
+
 def _start_dir(initial_dir: str | None, kind: str | None) -> str | None:
     """The folder a dialog opens in: ``initial_dir`` when it exists, else the
     folder last used for ``kind`` (or that kind's default), else for a
-    checkpoint the folder ``_checkpoint_start_dir`` finds, else ``initial_dir``
-    as given.
+    checkpoint or LoRA the folder ``_checkpoint_start_dir`` finds, else
+    ``initial_dir`` as given.
 
     An ``initial_dir`` on a share or device path is dropped before anything
     checks it, because the request body names it, and Windows authenticates to
@@ -1140,7 +1147,7 @@ def _start_dir(initial_dir: str | None, kind: str | None) -> str | None:
         folder = known_paths.last_folder(kind)
         if folder:
             return folder
-        if kind == "checkpoint":
+        if kind in _MODEL_FILE_KINDS:
             folder = _checkpoint_start_dir()
             if folder:
                 return folder

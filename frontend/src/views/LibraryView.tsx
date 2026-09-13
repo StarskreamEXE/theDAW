@@ -845,10 +845,9 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
         `Added ${res.entries.length} track${res.entries.length === 1 ? '' : 's'} from ${res.folder}`,
       );
     } catch (e) {
-      logError(
-        'library',
-        `Folder import failed: ${e instanceof Error ? e.message : String(e)}`,
-      );
+      const msg = e instanceof Error ? e.message : String(e);
+      logError('library', `Folder import failed: ${msg}`);
+      useStatusBarStore.getState().setText(`FOLDER IMPORT FAILED: ${msg}`);
     }
   };
 

@@ -65,7 +65,7 @@ def test_the_module_is_mounted() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_a_recorded_path_sets_the_folder_and_joins_recent_unservable(
+def test_a_recorded_path_joins_recent_unservable_and_moves_no_folder(
     client: TestClient, tmp_path: Path
 ) -> None:
     take = _touch(tmp_path / "Downloads" / "take.wav")
@@ -73,13 +73,78 @@ def test_a_recorded_path_sets_the_folder_and_joins_recent_unservable(
     assert resp.json() == {"recorded": True, "kind": "audio"}
 
     folder = client.get("/api/places/folder", params={"kind": "audio"}).json()
-    assert folder == {"kind": "audio", "folder": str(take.parent)}
+    assert folder == {"kind": "audio", "folder": None}
 
     items = client.get("/api/places/recent", params={"kind": "audio"}).json()["items"]
     assert [(i["name"], i["source"], i["servable"]) for i in items] == [
         ("take.wav", "client", False)
     ]
     assert set(items[0]) == {"path", "name", "kind", "source", "at", "servable"}
+
+
+def test_a_request_cannot_move_a_pickers_folder_and_the_desktop_shell_can(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The order the app produces: the user picks a file, a page names another
+    path, then the desktop shell records a download it finished."""
+    monkeypatch.setenv(launch_token.ENV_VAR, "launch-secret")
+    picked = _touch(tmp_path / "Sessions" / "take.wav")
+    known_paths.record(picked, source="pick")
+
+    named = _touch(tmp_path / "Elsewhere" / "planted.wav")
+    for headers in ({}, {TOKEN_HEADER: "wrong-secret"}):
+        client.post("/api/places/record", json={"path": str(named)}, headers=headers)
+        folder = client.get("/api/places/folder", params={"kind": "audio"}).json()
+        assert folder["folder"] == str(picked.parent)
+
+    downloaded = _touch(tmp_path / "Downloads" / "loop.wav")
+    client.post(
+        "/api/places/record",
+        json={"path": str(downloaded)},
+        headers={TOKEN_HEADER: "launch-secret"},
+    )
+    folder = client.get("/api/places/folder", params={"kind": "audio"}).json()
+    assert folder["folder"] == str(downloaded.parent)
+    names = [i["name"] for i in known_paths.recent(kind="audio")]
+    assert names == ["loop.wav", "planted.wav", "take.wav"]
+
+
+@pytest.mark.parametrize(
+    ("env", "header", "matches"),
+    [
+        ("launch-secret", "launch-secret", True),
+        ("launch-secret", "wrong-secret", False),
+        ("launch-secret", None, False),
+        (None, "launch-secret", False),
+    ],
+)
+def test_the_launch_token_check_answers_only_whether_the_header_matches(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    env: str | None,
+    header: str | None,
+    matches: bool,
+) -> None:
+    if env is None:
+        monkeypatch.delenv(launch_token.ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(launch_token.ENV_VAR, env)
+    headers = {TOKEN_HEADER: header} if header is not None else {}
+    resp = client.get("/api/places/launch-token-check", headers=headers)
+    assert resp.status_code == 200
+    assert resp.json() == {"matches": matches}
+    assert "launch-secret" not in resp.text
+
+
+def test_a_page_on_another_site_cannot_ask_about_the_launch_token(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(launch_token.ENV_VAR, "launch-secret")
+    resp = client.get(
+        "/api/places/launch-token-check",
+        headers={TOKEN_HEADER: "launch-secret", "origin": "https://evil.example"},
+    )
+    assert resp.status_code == 403
 
 
 def test_a_download_the_desktop_shell_vouches_for_is_served(
@@ -96,6 +161,8 @@ def test_a_download_the_desktop_shell_vouches_for_is_served(
     assert resp.json() == {"recorded": True, "kind": "audio"}
     [item] = client.get("/api/places/recent", params={"kind": "audio"}).json()["items"]
     assert (item["source"], item["servable"]) == ("download", True)
+    folder = client.get("/api/places/folder", params={"kind": "audio"}).json()
+    assert folder["folder"] == str(loop.parent)
 
     served = client.get("/api/places/file", params={"path": str(loop)})
     assert served.status_code == 200

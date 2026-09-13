@@ -23,6 +23,7 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Any, Optional
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -90,6 +91,7 @@ def _run(cmd: list[str], timeout: float = 30.0) -> subprocess.CompletedProcess[b
         timeout=timeout,
         shell=False,
         stdin=subprocess.DEVNULL,
+        env=child_env(),
     )
 
 

@@ -104,6 +104,10 @@ async function chooseSceneFile(): Promise<void> {
   try {
     const picked = await pickFile({ kind: 'sway', filter: SWAY_FILE_FILTER });
     if (picked.cancelled || !picked.path) return;
+    if (!/\.sway$/i.test(picked.path)) {
+      useStatusBarStore.getState().setText('SCENE OPEN FAILED: Choose a file that ends in .sway.');
+      return;
+    }
     await openSwaySceneFromPath(picked.path);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);

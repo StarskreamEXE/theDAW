@@ -3,6 +3,7 @@
     GET  /api/places/folder?kind=            the folder a picker for this kind starts in
     GET  /api/places/recent?kind=&exts=&limit=  remembered files, newest first
     POST /api/places/record                  remember a path the client knows about
+    GET  /api/places/launch-token-check      does this request carry the launch token
     POST /api/places/reveal                  show a path in the OS file manager
     GET  /api/places/file?path=              a servable remembered file's bytes
     POST /api/places/save                    write an upload to a path a Save dialog granted
@@ -78,11 +79,26 @@ def get_recent(
 def post_record(body: RecordBody, request: Request) -> dict[str, Any]:
     # The body names the path. Only the desktop shell that started this backend
     # holds the launch token, and it sends it for a download it finished, so
-    # that record is servable. Every other call is remembered as 'client', for
-    # pickers and menus, and never served.
-    source = "download" if launch_token.header_matches(request) else "client"
-    entry = known_paths.record(body.path, body.kind, source=source)
+    # that record is servable and its folder becomes where the next picker of
+    # that kind opens. Every other call is remembered as 'client', for Recent
+    # menus only: it is never served and it moves no picker's folder.
+    trusted = launch_token.header_matches(request)
+    entry = known_paths.record(
+        body.path,
+        body.kind,
+        source="download" if trusted else "client",
+        update_folder=trusted,
+    )
     return {"recorded": entry is not None, "kind": entry["kind"] if entry else None}
+
+
+@router.get("/launch-token-check")
+def get_launch_token_check(request: Request) -> dict[str, bool]:
+    """Whether this request carries the launch token this backend was given.
+
+    The desktop shell asks once when it attaches to a backend it did not start.
+    The answer is a boolean and says nothing about the token itself."""
+    return {"matches": launch_token.header_matches(request)}
 
 
 @router.post("/reveal")

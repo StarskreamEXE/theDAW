@@ -66,7 +66,7 @@ import { useFeatureToggleStore } from './state/featureToggleStore';
 import { useGanStore } from './state/ganStore';
 import { useProjectStore } from './state/projectStore';
 import { useAppUiStore } from './state/appUiStore';
-import { placesApi } from './lib/placesClient';
+import { notifyPlacesChanged } from './lib/placesClient';
 
 import './orb-kit/styles/gantasmo-orb.css';
 import './orb-kit/chat/orb-chat.css';
@@ -479,10 +479,9 @@ export default function App() {
       if (state === 'completed' && path) {
         useStatusBarStore.getState().setText(`DOWNLOADED: ${path}`);
         logInfo('files', `Downloaded ${filename} to ${path}`);
-        // The main process records the path as well. Recording it from here
-        // too means the refetch this triggers already sees it, whichever of the
-        // two requests lands first.
-        void placesApi.record(path);
+        // The main process recorded the path before sending this event, so the
+        // Recent menus that refetch now already see it.
+        notifyPlacesChanged();
       } else {
         logWarn('files', `Download ${state}: ${filename}`);
       }

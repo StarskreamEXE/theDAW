@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 from backend.lib.known_paths import is_remote_or_device_path
+from backend.lib.launch_token import child_env
 
 __all__ = ["reveal"]
 
@@ -44,9 +45,9 @@ def reveal(path: str | os.PathLike[str]) -> str:
         raise FileNotFoundError(str(target))
 
     if sys.platform == "win32":
-        subprocess.Popen(["explorer", f"/select,{target}"])
+        subprocess.Popen(["explorer", f"/select,{target}"], env=child_env())
     elif sys.platform == "darwin":
-        subprocess.Popen(["open", "-R", str(target)])
+        subprocess.Popen(["open", "-R", str(target)], env=child_env())
     else:
-        subprocess.Popen(["xdg-open", str(target.parent)])
+        subprocess.Popen(["xdg-open", str(target.parent)], env=child_env())
     return str(target)

@@ -396,6 +396,9 @@ logs/magenta-download-*.log
 # Chimera v2 per-clip analysis cache (sha256-keyed JSON)
 data/cache/
 
+# Rhythm analysis cache the app writes (meter maps per analysed file)
+data/rhythm/
+
 # UNCANNY demo album staging (converted audio + stems; distributed separately)
 data/uncanny/
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -205,11 +206,31 @@ def _row(entry: catalog.AssetEntry) -> dict[str, Any]:
     return payload
 
 
+# Data-root folders theDAW installs into and keeps for itself.
+_APP_DATA_FOLDERS = ("plugins", "sway-projects", "volumetric")
+
+
+def _in_app_folder(dest: Path) -> bool:
+    """True when ``dest`` sits in the plugin shelf, the scene folder or the
+    volumetric folder."""
+    from backend.modules.plugin.router import GAN_DIR
+
+    target = os.path.normcase(os.path.abspath(dest))
+    for root in (GAN_DIR, *(paths.data_path(n) for n in _APP_DATA_FOLDERS)):
+        folder = os.path.normcase(os.path.abspath(root))
+        if target == folder or target.startswith(folder.rstrip(os.sep) + os.sep):
+            return True
+    return False
+
+
 def _remember_install(entry: catalog.AssetEntry, dest: Path) -> None:
     """Record where an install landed, so the library and every picker for
-    that kind of file can find it again."""
+    that kind of file can find it again.
+
+    An install into one of theDAW's own folders joins Recent without moving the
+    picker's folder, which stays where the user last chose a file."""
     known_paths.set_installed_asset(entry.id, dest)
-    known_paths.record(dest, source="install")
+    known_paths.record(dest, source="install", update_folder=not _in_app_folder(dest))
 
 
 @router.get("")

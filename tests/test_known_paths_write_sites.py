@@ -20,6 +20,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from backend.core import folder_dialog
 from backend.lib import known_paths
 from backend.modules.plugin import router as plugin_router
 from backend.modules.plugin.gan_file import GanFile
@@ -248,6 +249,43 @@ def test_a_cockpit_save_is_remembered_and_opens_by_name(
     for name in ("My Scene", "My Scene.sway"):
         body = client.get("/api/sway/project", params={"name": name}).json()
         assert body == {"name": "My Scene", "path": saved["path"], "doc": doc}
+
+
+def test_a_cockpit_save_leaves_the_sway_picker_in_the_users_folder(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The order the SWAY tab produces: the user picks a .sway from their own
+    folder, then the cockpit mirrors a save into the scene folder. The next
+    .sway dialog still opens in the user's folder."""
+    picked = tmp_path / "Shows" / "Opener.sway"
+    picked.parent.mkdir()
+    picked.write_text("{}", encoding="utf-8")
+    calls: list[dict[str, Any]] = []
+    answers = [str(picked), None]
+
+    def pick_open_file(**kwargs: Any) -> str | None:
+        calls.append(kwargs)
+        return answers.pop(0)
+
+    monkeypatch.setattr(folder_dialog, "picker_available", lambda: True)
+    monkeypatch.setattr(folder_dialog, "pick_open_file", pick_open_file)
+
+    chosen = client.post("/api/storage/pick-file", json={"kind": "sway"}).json()
+    assert chosen == {"path": str(picked), "cancelled": False}
+    assert _only("sway")["source"] == "pick"
+
+    saved = client.post(
+        "/api/sway/project-save", json={"name": "Opener", "doc": {"version": 1}}
+    )
+    assert saved.status_code == 200, saved.text
+    assert known_paths.last_folder("sway") == str(picked.parent)
+    assert [Path(e["path"]) for e in known_paths.recent(kind="sway")] == [
+        Path(saved.json()["path"]),
+        picked,
+    ]
+
+    client.post("/api/storage/pick-file", json={"kind": "sway"})
+    assert calls[1]["initial_dir"] == str(picked.parent)
 
 
 def test_an_installed_copy_with_a_numbered_name_opens_by_its_listed_name(

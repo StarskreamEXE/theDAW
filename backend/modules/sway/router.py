@@ -193,7 +193,9 @@ async def sway_project_save(req: SwayProjectSave) -> dict:
         atomic_write(target, json.dumps(req.doc, indent=2))
     except OSError as e:
         raise HTTPException(500, f"Save failed: {e}")
-    known_paths.record(target, kind="sway", source="sway-save")
+    # The scene folder is theDAW's own, so a save leaves the .sway picker's
+    # folder where the user last chose a file.
+    known_paths.record(target, kind="sway", source="sway-save", update_folder=False)
     # Deliberately does NOT call media_access.register_paths(req.doc's media).
     # The server binds 0.0.0.0 with permissive CORS, so this body is
     # attacker-reachable; registering paths from it would turn a save into
@@ -204,7 +206,7 @@ async def sway_project_save(req: SwayProjectSave) -> dict:
     return {"status": "ok", "path": str(target)}
 
 
-_SCENE_NOT_SERVED = "theDAW does not serve that scene."
+_SCENE_NOT_SERVED = "That scene file is gone or was never opened in theDAW."
 
 
 def _servable_scene(path: str) -> dict:

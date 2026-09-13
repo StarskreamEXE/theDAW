@@ -29,6 +29,7 @@ from typing import Optional
 
 from . import sidecar
 from backend.lib import paths
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ def _run_git(args: list[str], timeout: int = 25, cwd: Optional[Path] = None):
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=child_env(),
     )
 
 
@@ -148,7 +150,9 @@ def _find_bash() -> Optional[str]:
     """git-subrepo is a bash tool; find a bash to run it through (Git Bash)."""
     for cand in ("bash", r"C:\Program Files\Git\bin\bash.exe", "/usr/bin/bash"):
         try:
-            r = subprocess.run([cand, "-c", "true"], capture_output=True, timeout=10)
+            r = subprocess.run(
+                [cand, "-c", "true"], capture_output=True, timeout=10, env=child_env()
+            )
             if r.returncode == 0:
                 return cand
         except (OSError, subprocess.SubprocessError):
@@ -185,7 +189,11 @@ def apply() -> dict:
         )
         try:
             r = subprocess.run(
-                [bash, "-c", cmd], capture_output=True, text=True, timeout=300
+                [bash, "-c", cmd],
+                capture_output=True,
+                text=True,
+                timeout=300,
+                env=child_env(),
             )
         except subprocess.SubprocessError as e:
             return {"ok": False, "reason": "exec", "message": str(e)}
