@@ -2,21 +2,44 @@
  * MidiPanel - the unified MIDI tab (merged Piano + Vocal).
  *
  * The shared Piano Roll is the surface; everything else feeds or operates on it.
+ * Top to bottom:
+ *   - the SETTINGS strip: the roll's transport, instrument, zoom and timing
+ *     feel, the library song field with ANALYZE (LOAD / VALIDATE in its menu),
+ *     a status readout, the note count and the MIDI mapper (MAP);
+ *   - the body: the ACTION rail (REC, IMPORT, EXPORT, EDIT, AI, BEAT, ARP,
+ *     VOICE, CLEAR), the roll grid (or the arpeggiator face), the vocal
+ *     artifact rail when an artifact is loaded, and the Vocal2MIDI column when
+ *     VOICE is on;
+ *   - the SHAPE row (VirtuosoControls).
  * Vocal is one INPUT option: a live mic recording is converted to notes through
  * the SAME backend basic-pitch path as "Analyze" (far better than the live YIN),
  * and dropped into the roll without shrinking the grid (the take is highlighted).
- * A mic monitor runs while the tab is open so the input level is always visible.
- * When a vocal artifact is loaded, a right rail shows lyrics + segments (each arms
- * an inpaint guide). Notes export to .mid, drive a drum Beat, or round-trip
- * validate. No synthesis here.
+ * A mic monitor runs while the tab is open so the input level is always visible
+ * inside the REC key. No synthesis here.
  */
 
-import { Activity, Download, Drum, FileCheck2, Loader2, Mic, Music4, Square } from 'lucide-react';
+import {
+  Activity,
+  AudioLines,
+  Brush,
+  ChevronDown,
+  ChevronRight,
+  ChevronUp,
+  Download,
+  Drum,
+  FileCheck2,
+  FolderOpen,
+  Loader2,
+  Mic,
+  MicVocal,
+  Music4,
+  Search,
+  Square,
+} from 'lucide-react';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 
 import { DESKTOP_DROP_ORIGIN, LIBRARY_ID_MIME, dropHasLibraryOrFiles, entriesFromDrop } from '../../lib/libraryDrop';
 import type { RenderNote } from '../../lib/midiSynth';
-import { colorAt, rgb, rgba } from '../../lib/trackColor';
 import { renderDrumBeatBlob, vocalizeEffect } from '../../lib/vocalBeat';
 import {
   armInpaintGuide,
@@ -37,12 +60,47 @@ import { describeMicFailure, shouldAnnounceMicFailure } from '../../lib/micError
 import { usePianoRollStore, type PianoNote } from '../../state/pianoRollStore';
 import { usePlayerStore } from '../../state/playerStore';
 import { useBottomPanelStore } from '../../state/bottomPanelStore';
-import { PianoRoll } from '../audio/PianoRoll';
+import {
+  PianoRoll,
+  PianoRollClearKey,
+  PianoRollEditKey,
+  PianoRollFeel,
+  PianoRollMapKey,
+  PianoRollNoteCount,
+  PianoRollTransport,
+  PianoRollZoom,
+  exportRollMidi,
+  importMidiFileToRoll,
+  importSheetFileToRoll,
+} from '../audio/PianoRoll';
 import { ArpeggiatorPanel } from '../audio/ArpeggiatorPanel';
 import { VirtuosoControls } from '../audio/VirtuosoControls';
 import { Vocal2MidiPanel } from '../audio/vocal2midi/Vocal2MidiPanel';
+import { AiComposePopover } from '../audio/AiComposePopover';
+import { MidiImportPopover } from '../audio/MidiImportPopover';
+import { InstrumentPicker } from '../audio/InstrumentPicker';
+import {
+  CORNER_KEY,
+  DockFlyout,
+  FIELD,
+  FLYOUT_CARD,
+  RailKey,
+  STRIP_ICON_KEY,
+  Sep,
+  StripKey,
+  keyTone,
+  useOrbClearance,
+  useStoredToggle,
+} from '../audio/midiDockKit';
+
+/** The rail's "more keys this way" cue: a thin band over the rail's end. */
+const RAIL_CUE =
+  'absolute inset-x-0 z-20 h-3.5 flex items-center justify-center et-ink-2 hover:et-ink';
 
 const stepSec = (bpm: number): number => 60 / bpm / 4;
+
+/** Where the VOICE key remembers whether the Vocal2MIDI column is shown. */
+const VOICE_COLUMN_KEY = 'thedaw-midi-voice-column-v1';
 
 const artifactToPiano = (notes: ArtifactNote[], bpm: number): PianoNote[] => {
   const ss = stepSec(bpm);
@@ -76,12 +134,14 @@ const pianoToRender = (notes: PianoNote[], bpm: number): RenderNote[] => {
 };
 
 /**
- * Self-contained input-level meter using the SLIDE temperature scale (colorAt).
- * Runs its own rAF so the 60fps level updates never re-render the parent panel
- * (which embeds the Piano Roll).
+ * The input level, drawn as a thin bar up the REC key's left edge while the
+ * monitor is open. Runs its own rAF so the 60fps level updates never re-render
+ * the parent panel (which embeds the Piano Roll). A sibling of the key, not a
+ * child: a meter cannot live inside a button.
  */
-const MicMeter: React.FC<{ monitorRef: React.MutableRefObject<InputMonitor | null> }> = ({
+const RecLevel: React.FC<{ monitorRef: React.MutableRefObject<InputMonitor | null>; recording: boolean }> = ({
   monitorRef,
+  recording,
 }) => {
   const [level, setLevel] = useState(0);
   useEffect(() => {
@@ -93,24 +153,19 @@ const MicMeter: React.FC<{ monitorRef: React.MutableRefObject<InputMonitor | nul
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
   }, [monitorRef]);
-  const col = colorAt(level);
+  const pct = Math.round(level * 100);
   return (
     <div
       role="meter"
       aria-label="Microphone input level"
       aria-valuemin={0}
       aria-valuemax={100}
-      aria-valuenow={Math.round(level * 100)}
-      title={`mic level ${Math.round(level * 100)}%`}
-      className="w-24 h-2.5 shrink-0 rounded-full overflow-hidden border border-white/10 bg-black/50"
+      aria-valuenow={pct}
+      className="pointer-events-none absolute left-0.5 top-1 bottom-1 w-0.5 rounded-full bg-black/50 overflow-hidden flex flex-col justify-end"
     >
       <div
-        className="h-full rounded-full"
-        style={{
-          width: `${Math.max(level * 100, 2)}%`,
-          background: rgb(col),
-          boxShadow: `0 0 8px ${rgba(col, 0.7)}`,
-        }}
+        className={`w-full rounded-full ${recording ? 'bg-red-400' : 'bg-[rgb(var(--et-ink-2))]'}`}
+        style={{ height: `${Math.max(level * 100, 4)}%` }}
       />
     </div>
   );
@@ -126,19 +181,80 @@ export const MidiPanel: React.FC = () => {
   const [recording, setRecording] = useState(false);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState('idle');
+  // ANALYZE's per-second job message. Shown in the readout while it runs, but
+  // kept out of the live region, which announces only `status`.
+  const [progress, setProgress] = useState('');
   const [artifact, setArtifact] = useState<VocalArtifactDoc | null>(null);
   const [validateMsg, setValidateMsg] = useState('');
   const [arpOn, setArpOn] = useState(false);
+  const [voiceOn, setVoiceOn] = useStoredToggle(VOICE_COLUMN_KEY, true);
+  // Step width is shared by the strip's zoom keys and the grid's ctrl+wheel.
+  const [stepPx, setStepPx] = useState(16);
+  const [monitorOpen, setMonitorOpen] = useState(false);
+  const [inputMenuOpen, setInputMenuOpen] = useState(false);
+  const [songMenuOpen, setSongMenuOpen] = useState(false);
+  const [exportMenuOpen, setExportMenuOpen] = useState(false);
+  const rollBpm = usePianoRollStore((s) => s.bpm);
   // The device comes from the global I/O menu (Settings -> Inputs & outputs),
-  // with a per-surface override right here. It used to be a useState seeded
-  // from localStorage with NO try/catch — which threw during render in a
-  // browser with site data blocked — and the SING pitch lane kept a second,
-  // never-reconciled copy of the very same key.
+  // with a per-surface override in the REC key's input menu. It used to be a
+  // useState seeded from localStorage with NO try/catch — which threw during
+  // render in a browser with site data blocked — and the SING pitch lane kept a
+  // second, never-reconciled copy of the very same key.
   const deviceId = useResolvedSurface('midiVocal').deviceId;
   const micPerm = useIoDevicesStore((s) => s.micPermission);
   const monitorRef = useRef<InputMonitor | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recordStartRef = useRef(0);
+  const recWrapRef = useRef<HTMLDivElement>(null);
+  const recInputKeyRef = useRef<HTMLButtonElement>(null);
+  const songMenuKeyRef = useRef<HTMLButtonElement>(null);
+  const exportKeyRef = useRef<HTMLButtonElement>(null);
+  // The rail scrolls when the dock is short; the cues say which way more keys
+  // are. The orb, parked on the bottom-left corner, can cover the rail's foot,
+  // so the rail ends above it.
+  const railRef = useRef<HTMLDivElement>(null);
+  const railScrollRef = useRef<HTMLDivElement>(null);
+  const railContentRef = useRef<HTMLDivElement>(null);
+  const [railMore, setRailMore] = useState({ up: false, down: false });
+  // Keys drop from 24px to 22px (and the gaps to 1px) only when that is what
+  // keeps the whole rail in view without scrolling.
+  const [railCompact, setRailCompact] = useState(false);
+  const railOrb = useOrbClearance(railRef);
+
+  useEffect(() => {
+    const el = railScrollRef.current;
+    if (!el) return;
+    const update = () => {
+      const content = railContentRef.current;
+      if (content) {
+        // Compact iff the full-height rail would not fit. The full height is
+        // derived the same way in both states, so the switch cannot flap.
+        const keys = Array.from(content.children).filter((c) => (c as HTMLElement).offsetHeight > 0).length;
+        const saving = keys * 2 + Math.max(0, keys - 1);
+        setRailCompact((wasCompact) => {
+          const fullHeight = content.offsetHeight + (wasCompact ? saving : 0);
+          return fullHeight > el.clientHeight + 1;
+        });
+      }
+      const up = el.scrollTop > 1;
+      const down = el.scrollTop + el.clientHeight < el.scrollHeight - 1;
+      setRailMore((p) => (p.up === up && p.down === down ? p : { up, down }));
+    };
+    update();
+    el.addEventListener('scroll', update, { passive: true });
+    const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(update);
+    ro?.observe(el);
+    if (railContentRef.current) ro?.observe(railContentRef.current);
+    return () => {
+      el.removeEventListener('scroll', update);
+      ro?.disconnect();
+    };
+  }, []);
+
+  const scrollRail = (dir: 1 | -1) => {
+    const el = railScrollRef.current;
+    if (el) el.scrollBy({ top: dir * Math.max(24, el.clientHeight - 28), behavior: 'smooth' });
+  };
 
   // Default the asset field to the selected library item (override freely). Show
   // the friendly title in the box while keeping the real id for the API.
@@ -182,6 +298,7 @@ export const MidiPanel: React.FC = () => {
           return;
         }
         monitorRef.current = monitor;
+        setMonitorOpen(true);
         void refreshInputs();
       } catch (e) {
         if (!cancelled) {
@@ -208,6 +325,7 @@ export const MidiPanel: React.FC = () => {
       recorderRef.current = null;
       monitorRef.current?.stop();
       monitorRef.current = null;
+      setMonitorOpen(false);
     };
   }, [deviceId, refreshInputs]);
 
@@ -315,7 +433,7 @@ export const MidiPanel: React.FC = () => {
         await new Promise((r) => setTimeout(r, 1000));
         const jr = await fetch(`/api/vocal/jobs/${job.id}`);
         const jd = await jr.json();
-        setStatus(jd.message || jd.status);
+        setProgress(jd.message || jd.status);
         if (jd.status === 'done') {
           await loadArtifact(assetId);
           break;
@@ -328,6 +446,7 @@ export const MidiPanel: React.FC = () => {
     } catch (e) {
       setStatus(`analyze error: ${String(e)}`);
     } finally {
+      setProgress('');
       setBusy(false);
     }
   }, [assetId, loadArtifact]);
@@ -346,13 +465,20 @@ export const MidiPanel: React.FC = () => {
 
   const validate = useCallback(async () => {
     if (!assetId) return;
-    const r = await fetch(`/api/vocal/validate/${assetId}`);
-    const d = await r.json();
-    setValidateMsg(
-      d.ok
+    // The strip's readout carries the result too: the artifact rail that shows
+    // validateMsg exists only once an artifact is loaded.
+    let msg: string;
+    try {
+      const r = await fetch(`/api/vocal/validate/${assetId}`);
+      const d = await r.json();
+      msg = d.ok
         ? `round-trip ${d.count_in} to ${d.count_out}, drift ${d.max_drift_ms}ms`
-        : `validate: ${d.error}`,
-    );
+        : `validate: ${d.error}`;
+    } catch (e) {
+      msg = `validate error: ${String(e)}`;
+    }
+    setValidateMsg(msg);
+    setStatus(msg);
   }, [assetId]);
 
   const makeBeat = useCallback(async () => {
@@ -396,46 +522,31 @@ export const MidiPanel: React.FC = () => {
     [artifact],
   );
 
-  const btn =
-    'flex items-center gap-1 px-2 py-1 text-[10px] font-mono uppercase tracking-wide rounded border transition-colors disabled:opacity-40';
+  const listOpen = assetOpen && assetMatches.length > 0;
 
   return (
-    <div className="h-full w-full flex flex-col bg-zinc-950 text-zinc-200">
-      {/* tools toolbar — vocal recording is the input; the rest operate on the roll */}
-      <div className="shrink-0 flex flex-wrap items-center gap-2 px-2 py-1.5 border-b border-white/8">
-        {/* Vocal input — an override of the global microphone (Settings). */}
-        <IoSurfaceSelect
-          surface="midiVocal"
-          id="midi-input-device"
-          label="Microphone input"
-          className="max-w-40 text-[10px]"
-        />
-        {micPerm === 'denied' && (
-          <span className="text-[9px] font-mono text-rose-400">mic blocked</span>
-        )}
-        <button
-          type="button"
-          onClick={toggleRecord}
-          disabled={busy || micPerm === 'denied'}
-          aria-label={recording ? 'Stop recording' : 'Record vocal to notes'}
-          title={recording ? 'Stop recording' : 'Record (mic -> notes via basic-pitch)'}
-          className={`grid place-items-center w-7 h-7 rounded border transition-colors disabled:opacity-40 ${
-            recording
-              ? 'border-rose-500 text-rose-300 bg-rose-600/25'
-              : 'border-rose-600 text-rose-300 hover:bg-rose-600/15'
-          }`}
-        >
-          {recording ? <Square className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
-        </button>
-        <MicMeter monitorRef={monitorRef} />
-
-        <span className="w-px h-4 bg-white/10" aria-hidden="true" />
+    // data-keyscope: this tab and the EDIT timeline both bind Delete; see
+    // lib/keyScope. The scope is the whole tab, so a hover over the strip, the
+    // rail or the SHAPE row still hands Delete to the roll, as its old toolbar did.
+    <div data-keyscope="piano-roll" className="h-full w-full flex flex-col bg-zinc-950 text-zinc-200">
+      {/* ── SETTINGS strip ───────────────────────────────────────────────── */}
+      <div className="shrink-0 h-7 flex flex-nowrap items-center gap-1 px-1.5 border-b border-white/8 bg-black/40">
+        {/* With the ARP face up the roll is hidden, so PLAY cannot start it
+            (the arpeggiator has its own); a roll already playing can still stop. */}
+        <PianoRollTransport startDisabled={arpOn} />
+        <Sep />
+        <InstrumentPicker compact />
+        <Sep />
+        <PianoRollZoom stepPx={stepPx} onStepPxChange={setStepPx} />
+        <Sep />
+        <PianoRollFeel />
+        <Sep />
 
         {/* Analyze a library vocal into the roll — search by name, drop a
             library item here instead of pasting a raw id, or drop an audio
             file from the desktop (it imports to the library, then lands here). */}
         <div
-          className="relative"
+          className={`${FIELD} relative w-44`}
           onDragOver={(e) => {
             if (dropHasLibraryOrFiles(e.dataTransfer)) {
               e.preventDefault();
@@ -459,6 +570,7 @@ export const MidiPanel: React.FC = () => {
             });
           }}
         >
+          <Search aria-hidden="true" className="w-3 h-3 shrink-0 et-ink-3" />
           <label htmlFor="midi-asset-id" className="sr-only">
             Search library song
           </label>
@@ -466,6 +578,10 @@ export const MidiPanel: React.FC = () => {
             id="midi-asset-id"
             name="midi-asset-id"
             type="text"
+            role="combobox"
+            aria-autocomplete="list"
+            aria-controls="midi-asset-listbox"
+            aria-expanded={listOpen}
             value={assetQuery}
             onChange={(e) => {
               setAssetQuery(e.target.value);
@@ -474,16 +590,16 @@ export const MidiPanel: React.FC = () => {
             }}
             onFocus={() => setAssetOpen(true)}
             onBlur={() => window.setTimeout(() => setAssetOpen(false), 150)}
-            placeholder="search song / drop here"
-            aria-label="Search library song"
-            aria-expanded={assetOpen}
-            title="Type a song name (or drop a library item here). Pick a result to use it — no need to paste a raw id."
-            className="w-44 bg-zinc-800 border border-zinc-500 text-zinc-100 text-[10px] font-mono px-1.5 py-1 rounded"
+            placeholder="Song"
+            title="Type a song name (or drop a library item or an audio file here). Pick a result to use it — no need to paste a raw id."
+            className="flex-1 min-w-0 h-full bg-transparent border-none outline-none text-[10px] font-mono et-ink"
           />
-          {assetOpen && assetMatches.length > 0 && (
+          {listOpen && (
             <div
+              id="midi-asset-listbox"
               role="listbox"
-              className="absolute left-0 top-full mt-1 z-50 w-64 max-h-56 overflow-y-auto rounded border border-zinc-600 bg-zinc-900 shadow-2xl"
+              aria-label="Library songs"
+              className={`absolute left-0 top-full mt-1 z-50 w-64 max-h-56 overflow-y-auto ${FLYOUT_CARD}`}
             >
               {assetMatches.map((e) => (
                 <button
@@ -493,101 +609,289 @@ export const MidiPanel: React.FC = () => {
                   aria-selected={e.id === assetId}
                   onMouseDown={(ev) => ev.preventDefault()}
                   onClick={() => pickAsset(e.id, e.title)}
-                  className={`w-full text-left px-2 py-1.5 text-[10px] border-b border-white/5 last:border-0 hover:bg-purple-500/15 ${
-                    e.id === assetId ? 'bg-purple-500/10 text-purple-200' : 'text-zinc-200'
+                  className={`w-full text-left px-2 py-1.5 text-[10px] border-b border-white/5 last:border-0 transition-shadow hover:shadow-[inset_0_0_0_100px_rgba(255,255,255,0.06)] ${
+                    e.id === assetId ? 'text-[rgb(var(--et-accent))]' : 'text-zinc-200'
                   }`}
                 >
                   <span className="block truncate">{e.title}</span>
-                  <span className="block truncate text-[8px] font-mono text-zinc-500">{e.id}</span>
+                  <span className="block truncate text-[8px] font-mono et-ink-3">{e.id}</span>
                 </button>
               ))}
             </div>
           )}
         </div>
-        <button
-          type="button"
-          onClick={analyze}
+        <StripKey
+          onClick={() => void analyze()}
           disabled={busy}
           title="Detect notes, pitch and lyrics from the library vocal (basic-pitch) and load them into the roll"
-          className={`${btn} border-emerald-600 text-emerald-300 hover:bg-emerald-600/15`}
-        >
-          {busy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Activity className="w-3 h-3" />}
-          Analyze
-        </button>
+          icon={busy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Activity className="w-3 h-3" />}
+          legend="Analyze"
+        />
         <button
+          ref={songMenuKeyRef}
           type="button"
-          onClick={() => assetId && loadArtifact(assetId)}
-          disabled={busy || !assetId}
-          title="Load an already-analyzed artifact's notes + lyrics into the roll without re-detecting"
-          className={`${btn} border-zinc-500 text-zinc-200 hover:bg-white/10`}
+          onClick={() => setSongMenuOpen((v) => !v)}
+          aria-haspopup="menu"
+          aria-expanded={songMenuOpen}
+          aria-controls="midi-song-menu"
+          aria-label="More song actions"
+          title="Load or validate the song's artifact"
+          className={`${STRIP_ICON_KEY} ${keyTone({ on: songMenuOpen })}`}
         >
-          Load
+          <ChevronDown aria-hidden="true" className="w-3 h-3" />
         </button>
+        <DockFlyout
+          open={songMenuOpen}
+          anchorRef={songMenuKeyRef}
+          onClose={() => setSongMenuOpen(false)}
+          placement="below"
+          align="end"
+          id="midi-song-menu"
+          role="menu"
+          aria-label="Song actions"
+          className={`w-32 p-1 flex flex-col gap-0.5 ${FLYOUT_CARD}`}
+        >
+          <StripKey
+            role="menuitem"
+            onClick={() => {
+              setSongMenuOpen(false);
+              if (assetId) void loadArtifact(assetId);
+            }}
+            disabled={busy || !assetId}
+            title="Load an already-analyzed artifact's notes + lyrics into the roll without re-detecting"
+            icon={<FolderOpen className="w-3 h-3" />}
+            legend="Load"
+            className="w-full justify-start"
+          />
+          <StripKey
+            role="menuitem"
+            onClick={() => {
+              setSongMenuOpen(false);
+              void validate();
+            }}
+            disabled={!assetId}
+            title="Check the notes survive a notes -> MIDI -> notes round-trip and report any timing drift"
+            icon={<FileCheck2 className="w-3 h-3" />}
+            legend="Validate"
+            className="w-full justify-start"
+          />
+        </DockFlyout>
 
-        <span className="w-px h-4 bg-white/10" aria-hidden="true" />
-
-        {/* Roll tools */}
-        <button
-          type="button"
-          onClick={exportMidi}
-          title="Download the current roll as a Standard MIDI (.mid) file"
-          className={`${btn} border-zinc-500 text-zinc-200 hover:bg-white/10`}
+        <div
+          className="flex-1 min-w-0 px-1 text-right truncate text-[9px] font-mono et-ink-3"
+          title={progress || (status === 'idle' ? undefined : status)}
         >
-          <Download className="w-3 h-3" />
-          .mid
-        </button>
-        <button
-          type="button"
-          onClick={makeBeat}
-          title="Render a General MIDI drum beat from the notes (low/mid/high -> kick/snare/hat) and play it"
-          className={`${btn} border-amber-600 text-amber-300 hover:bg-amber-600/15`}
-        >
-          <Drum className="w-3 h-3" />
-          Beat
-        </button>
-        <button
-          type="button"
-          onClick={validate}
-          disabled={!assetId}
-          title="Check the notes survive a notes -> MIDI -> notes round-trip and report any timing drift"
-          className={`${btn} border-zinc-500 text-zinc-200 hover:bg-white/10`}
-        >
-          <FileCheck2 className="w-3 h-3" />
-          Validate
-        </button>
-
-        <span className="w-px h-4 bg-white/10" aria-hidden="true" />
-
-        <button
-          type="button"
-          onClick={() => setArpOn((v) => !v)}
-          aria-pressed={arpOn}
-          title={arpOn ? 'Back to the piano roll' : 'Chord-progression arpeggiator'}
-          className={`${btn} ${
-            arpOn
-              ? 'border-amber-400 text-amber-200 bg-amber-400/20'
-              : 'border-amber-600 text-amber-300 hover:bg-amber-600/15'
-          }`}
-        >
-          <Music4 className="w-3 h-3" />
-          Arp
-        </button>
-        <span className="text-[10px] font-mono text-zinc-500 truncate min-w-0 flex-1 text-right">
-          {status}
-        </span>
+          {progress && <span>{progress}</span>}
+          <span role="status" className={progress ? 'sr-only' : undefined}>
+            {status === 'idle' ? '' : status}
+          </span>
+        </div>
+        <PianoRollNoteCount />
+        <PianoRollMapKey />
       </div>
 
-      {/* Virtuoso morph strip — shared across the piano roll and arp faces so the
-          transform amounts are always reachable without switching. */}
-      <VirtuosoControls />
-
-      {/* body: piano roll (or the arpeggiator face), plus a vocal rail only when
-          an artifact is loaded. The arpeggiator stays mounted but hidden so its
-          transport keeps running when toggling back to the roll. */}
+      {/* ── body: ACTION rail · roll (or arpeggiator) · artifact rail · Voice ─ */}
       <div className="flex-1 min-h-0 flex">
+        <div
+          ref={railRef}
+          role="group"
+          aria-label="MIDI actions"
+          className="relative w-10 shrink-0 flex flex-col border-r border-white/8 bg-black/40"
+          style={railOrb.bottom ? { paddingBottom: railOrb.bottom } : undefined}
+        >
+          <div ref={railScrollRef} className="flex-1 min-h-0 overflow-y-auto no-scrollbar scroll-py-4">
+            <div
+              ref={railContentRef}
+              data-compact={railCompact || undefined}
+              className="group/rail flex flex-col gap-0.5 data-compact:gap-px p-0.5"
+            >
+              {/* REC: the always-on monitor records; the corner opens the input. */}
+              <div
+                ref={recWrapRef}
+                className="relative shrink-0"
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setInputMenuOpen(true);
+                }}
+              >
+                <RailKey
+                  onClick={toggleRecord}
+                  disabled={busy || micPerm === 'denied'}
+                  rec={recording}
+                  aria-label={recording ? 'Stop recording' : 'Record vocal to notes'}
+                  title={
+                    recording
+                      ? 'Stop recording'
+                      : micPerm === 'denied'
+                        ? 'Microphone blocked: allow it for this app, then choose the input from the corner menu'
+                        : 'Record (mic -> notes via basic-pitch). Right-click or the corner for the input device.'
+                  }
+                  icon={recording ? <Square className="w-3 h-3" /> : <Mic className="w-3 h-3" />}
+                  legend="Rec"
+                />
+                {monitorOpen && <RecLevel monitorRef={monitorRef} recording={recording} />}
+                <button
+                  ref={recInputKeyRef}
+                  type="button"
+                  onClick={() => setInputMenuOpen((v) => !v)}
+                  aria-haspopup="dialog"
+                  aria-expanded={inputMenuOpen}
+                  aria-controls="midi-rec-input"
+                  aria-label="Recording input device"
+                  title="Microphone input"
+                  className={CORNER_KEY}
+                >
+                  <ChevronRight aria-hidden="true" className="w-2.5 h-2.5" />
+                </button>
+              </div>
+              <DockFlyout
+                open={inputMenuOpen}
+                anchorRef={recWrapRef}
+                returnFocusRef={recInputKeyRef}
+                onClose={() => setInputMenuOpen(false)}
+                placement="right"
+                id="midi-rec-input"
+                role="dialog"
+                aria-label="Microphone input"
+                className={`w-64 p-2 flex flex-col items-start gap-1.5 ${FLYOUT_CARD}`}
+              >
+                {/* Vocal input — an override of the global microphone (Settings).
+                    One printed word; the select's accessible name stays full. */}
+                <IoSurfaceSelect
+                  surface="midiVocal"
+                  id="midi-input-device"
+                  label="Microphone input"
+                  legend="Input"
+                  showLabel
+                  labelClassName="text-[8px] font-mono uppercase tracking-widest et-ink-3"
+                  className="w-full max-w-none text-[10px]"
+                />
+                {micPerm === 'denied' && (
+                  <span className="text-[9px] font-mono text-red-300">mic blocked</span>
+                )}
+              </DockFlyout>
+
+              <MidiImportPopover onImportFile={importMidiFileToRoll} onImportSheetFile={importSheetFileToRoll} />
+
+              <RailKey
+                ref={exportKeyRef}
+                onClick={() => setExportMenuOpen((v) => !v)}
+                aria-haspopup="menu"
+                aria-expanded={exportMenuOpen}
+                aria-controls="midi-export-menu"
+                aria-label="Export MIDI"
+                title="Download the roll as a Standard MIDI (.mid) file"
+                on={exportMenuOpen}
+                icon={<Download className="w-3 h-3" />}
+                legend="Export"
+              />
+              <DockFlyout
+                open={exportMenuOpen}
+                anchorRef={exportKeyRef}
+                onClose={() => setExportMenuOpen(false)}
+                placement="right"
+                id="midi-export-menu"
+                role="menu"
+                aria-label="Export MIDI"
+                className={`w-28 p-1 flex flex-col gap-0.5 ${FLYOUT_CARD}`}
+              >
+                <StripKey
+                  role="menuitem"
+                  onClick={() => {
+                    setExportMenuOpen(false);
+                    exportRollMidi();
+                  }}
+                  title="The roll at its own BPM, one track named Piano Roll (piano-roll.mid)"
+                  icon={<Download className="w-3 h-3" />}
+                  legend="Roll"
+                  className="w-full justify-start"
+                />
+                <StripKey
+                  role="menuitem"
+                  onClick={() => {
+                    setExportMenuOpen(false);
+                    exportMidi();
+                  }}
+                  title="Through the vocal export writer: the same notes, seconds-exact (midi.mid); the status line reports it"
+                  icon={<Download className="w-3 h-3" />}
+                  legend="Vocal"
+                  className="w-full justify-start"
+                />
+              </DockFlyout>
+
+              <PianoRollEditKey />
+
+              <AiComposePopover
+                currentBpm={rollBpm}
+                onGenerated={(result) => usePianoRollStore.getState().importNotes(result.notes, result.bpm)}
+              />
+
+              <RailKey
+                onClick={() => void makeBeat()}
+                aria-label="Beat from the notes"
+                title="Render a General MIDI drum beat from the notes (low/mid/high -> kick/snare/hat) and play it"
+                icon={<Drum className="w-3 h-3" />}
+                legend="Beat"
+              />
+              <RailKey
+                onClick={() => setArpOn((v) => !v)}
+                aria-pressed={arpOn}
+                aria-label="Arp: chord-progression arpeggiator"
+                title={arpOn ? 'Back to the piano roll' : 'Chord-progression arpeggiator'}
+                on={arpOn}
+                icon={<Music4 className="w-3 h-3" />}
+                legend="Arp"
+              />
+              <RailKey
+                onClick={() => setVoiceOn(!voiceOn)}
+                aria-pressed={voiceOn}
+                aria-label="Voice: the Vocal2MIDI column"
+                title={voiceOn ? 'Hide the Vocal2MIDI column' : 'Show the Vocal2MIDI column'}
+                on={voiceOn}
+                icon={<AudioLines className="w-3 h-3" />}
+                legend="Voice"
+              />
+              <PianoRollClearKey />
+            </div>
+          </div>
+          {/* Pointer cues for a rail taller than the dock; keyboard focus
+              scrolls a key into view on its own, so they stay out of Tab. */}
+          {railMore.up && (
+            <button
+              type="button"
+              tabIndex={-1}
+              onClick={() => scrollRail(-1)}
+              aria-label="Scroll the actions up"
+              title="More actions above"
+              className={`${RAIL_CUE} top-0`}
+              style={{ background: 'linear-gradient(to bottom, var(--et-panel, #0c0a12) 45%, transparent)' }}
+            >
+              <ChevronUp aria-hidden="true" className="w-3 h-3" />
+            </button>
+          )}
+          {railMore.down && (
+            <button
+              type="button"
+              tabIndex={-1}
+              onClick={() => scrollRail(1)}
+              aria-label="Scroll the actions down"
+              title="More actions below"
+              className={RAIL_CUE}
+              style={{
+                bottom: railOrb.bottom,
+                background: 'linear-gradient(to top, var(--et-panel, #0c0a12) 45%, transparent)',
+              }}
+            >
+              <ChevronDown aria-hidden="true" className="w-3 h-3" />
+            </button>
+          )}
+        </div>
+
+        {/* The arpeggiator stays mounted but hidden so its transport keeps
+            running when toggling back to the roll. */}
         <div className="flex-1 min-w-0 relative">
           <div className={arpOn ? 'hidden' : 'absolute inset-0'}>
-            <PianoRoll />
+            <PianoRoll stepPx={stepPx} onStepPxChange={setStepPx} />
           </div>
           <div className={arpOn ? 'absolute inset-0' : 'hidden'}>
             <ArpeggiatorPanel />
@@ -597,26 +901,26 @@ export const MidiPanel: React.FC = () => {
         {!arpOn && artifact && (
           <div className="w-64 shrink-0 border-l border-white/8 overflow-y-auto p-2 space-y-3">
             <section>
-              <h3 className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 mb-1">
+              <h3 className="text-[8px] font-mono uppercase tracking-widest et-ink-3 mb-1">
                 Lyrics
               </h3>
               <p className="text-[10px] text-zinc-300 whitespace-pre-wrap wrap-break-word">
                 {artifact.lyrics?.text || (
-                  <span className="text-zinc-600">none (analyze with transcription)</span>
+                  <span className="et-ink-3">none (analyze with transcription)</span>
                 )}
               </p>
-              <button
-                type="button"
-                className="btn-ghost text-[8px] py-0.5 px-1.5 mt-1 text-rose-200"
+              <StripKey
                 onClick={() => useBottomPanelStore.getState().showTab('sing')}
+                aria-label="Sing: open the lyrics in the SING tab"
                 title="Sing along, edit or time the lyrics in the SING tab"
-              >
-                OPEN IN SING
-              </button>
+                icon={<MicVocal className="w-3 h-3" />}
+                legend="Sing"
+                className="mt-1"
+              />
             </section>
 
             <section>
-              <h3 className="text-[8px] font-mono uppercase tracking-widest text-zinc-500 mb-1">
+              <h3 className="text-[8px] font-mono uppercase tracking-widest et-ink-3 mb-1">
                 Segments
               </h3>
               {artifact.segments?.length ? (
@@ -626,18 +930,18 @@ export const MidiPanel: React.FC = () => {
                       <span className="flex-1 min-w-0 truncate text-[10px] font-mono text-zinc-400">
                         {(s.start_ms / 1000).toFixed(2)}-{(s.end_ms / 1000).toFixed(2)}s {s.kind}
                       </span>
-                      <button
-                        type="button"
-                        onClick={() => inpaintSegment(i)}
-                        className="text-[8px] font-mono uppercase px-1 py-0.5 rounded border border-fuchsia-600 text-fuchsia-300 hover:bg-fuchsia-600/15"
-                      >
-                        Inpaint
-                      </button>
+                      <StripKey
+                        onClick={() => void inpaintSegment(i)}
+                        aria-label={`Inpaint segment ${i + 1}`}
+                        title="Arm an inpaint guide for this segment"
+                        icon={<Brush className="w-3 h-3" />}
+                        legend="Inpaint"
+                      />
                     </li>
                   ))}
                 </ul>
               ) : (
-                <p className="text-[10px] text-zinc-600">none</p>
+                <p className="text-[10px] et-ink-3">none</p>
               )}
             </section>
 
@@ -648,9 +952,13 @@ export const MidiPanel: React.FC = () => {
         )}
 
         {/* Vocal2MIDI suite — the full vocal-to-MIDI tool as a collapsible right
-            column. Its recorder/AI/editor write notes into the piano roll above. */}
-        {!arpOn && <Vocal2MidiPanel />}
+            column, shown while VOICE is on. Its recorder/AI/editor write notes
+            into the piano roll. */}
+        {!arpOn && voiceOn && <Vocal2MidiPanel />}
       </div>
+
+      {/* ── SHAPE row ────────────────────────────────────────────────────── */}
+      <VirtuosoControls />
     </div>
   );
 };

@@ -1,7 +1,8 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { Sparkles, Send, X, Play, Square } from 'lucide-react';
+import React, { useState, useRef, useEffect, useId } from 'react';
+import { Sparkles, Send, X } from 'lucide-react';
 import type { ProcessingConfig, NoteEvent, ScaleType } from './types';
-import { askAssistant, type AssistantContext, type AssistantResponse } from './geminiAssistant';
+import { askAssistant, type AssistantContext } from './geminiAssistant';
+import { KEY_ON, KEY_REST, MINI_ICON_KEY, MINI_KEY, keyTone } from '../midiDockKit';
 
 interface PianoRollControls {
     notes: NoteEvent[];
@@ -23,6 +24,21 @@ interface AssistantOrbProps {
     pianoRollControls: PianoRollControls;
 }
 
+/** Canned commands the chips type into the input. */
+const QUICK_COMMANDS: { label: string; command: string }[] = [
+    { label: 'Play', command: 'play the preview' },
+    { label: 'Stop', command: 'stop' },
+    { label: 'Quantize', command: 'quantize to 1/16' },
+    { label: '+Octave', command: 'transpose up one octave' },
+    { label: '140', command: 'set tempo to 140 bpm' },
+    { label: 'Am', command: 'change to A minor' },
+];
+
+/**
+ * The Vocal2MIDI "Architect" assistant. Its trigger is a mini key in the Voice
+ * column header, drawn in the MIDI dock's key grammar (accent while the chat is
+ * open, never a glow); the chat opens as a fixed card over the page.
+ */
 export const AssistantOrb: React.FC<AssistantOrbProps> = ({
     currentConfig,
     onConfigUpdate,
@@ -34,15 +50,26 @@ export const AssistantOrb: React.FC<AssistantOrbProps> = ({
     ]);
     const [input, setInput] = useState('');
     const [isThinking, setIsThinking] = useState(false);
-    const messagesEndRef = useRef<HTMLDivElement>(null);
+    const listRef = useRef<HTMLDivElement>(null);
+    const inputRef = useRef<HTMLInputElement>(null);
+    const triggerRef = useRef<HTMLButtonElement>(null);
+    const panelId = `v2m-assistant-${useId().replace(/:/g, '')}`;
 
-    const scrollToBottom = () => {
-        messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-    };
+    // Keep the newest message in view. Scrolls the list itself: scrollIntoView
+    // would also scroll the dock's own (overflow-hidden) ancestors.
+    useEffect(() => {
+        const list = listRef.current;
+        if (isOpen && list) list.scrollTop = list.scrollHeight;
+    }, [messages, isOpen]);
 
     useEffect(() => {
-        scrollToBottom();
-    }, [messages, isOpen]);
+        if (isOpen) inputRef.current?.focus({ preventScroll: true });
+    }, [isOpen]);
+
+    const close = () => {
+        setIsOpen(false);
+        triggerRef.current?.focus({ preventScroll: true });
+    };
 
     const handleSend = async () => {
         if (!input.trim()) return;
@@ -127,71 +154,80 @@ export const AssistantOrb: React.FC<AssistantOrbProps> = ({
         }
     };
 
-    // Quick action buttons
-    const quickActions = [
-        { label: 'Play', action: 'play the preview', icon: Play },
-        { label: 'Stop', action: 'stop playback', icon: Square },
-    ];
+    const canSend = !!input.trim() && !isThinking;
 
     return (
         <>
-            {/* The Orb Trigger */}
-            <div
-                className={`fixed bottom-8 right-8 z-50 transition-all duration-300 ${isOpen ? 'scale-0 opacity-0' : 'scale-100 opacity-100'}`}
+            {/* The trigger: a mini key in the Voice header */}
+            <button
+                ref={triggerRef}
+                type="button"
+                onClick={() => (isOpen ? close() : setIsOpen(true))}
+                aria-haspopup="dialog"
+                aria-expanded={isOpen}
+                aria-controls={panelId}
+                aria-label="Architect assistant"
+                title="Architect assistant: AI that changes the settings, notes, tempo and key"
+                className={`${MINI_ICON_KEY} ${keyTone({ on: isOpen })}`}
             >
-                <button
-                    onClick={() => setIsOpen(true)}
-                    title="Open AI Assistant"
-                    className="relative w-16 h-16 rounded-full bg-black border border-violet-500 shadow-[0_0_30px_rgba(139,92,246,0.5)] flex items-center justify-center group overflow-hidden"
-                >
-                    <div className="absolute inset-0 bg-linear-to-tr from-violet-500/20 to-cyan-500/20 animate-pulse" />
-                    <Sparkles className="text-violet-400 group-hover:text-white transition-colors relative z-10" size={24} />
-                </button>
-            </div>
+                <Sparkles aria-hidden="true" className="w-3 h-3" />
+            </button>
 
-            {/* Chat Interface */}
+            {/* Chat Interface. `inert` keeps the closed (faded) card out of Tab
+                order and away from assistive tech. */}
             <div
-                className={`fixed bottom-8 right-8 w-80 md:w-96 h-137.5 bg-zinc-900 border border-white/10 rounded-2xl shadow-2xl z-50 flex flex-col transition-all duration-300 origin-bottom-right ${isOpen ? 'scale-100 opacity-100' : 'scale-90 opacity-0 pointer-events-none'
+                id={panelId}
+                role="dialog"
+                aria-label="Architect assistant"
+                inert={!isOpen}
+                onKeyDown={(e) => {
+                    if (e.key === 'Escape') {
+                        e.stopPropagation();
+                        close();
+                    }
+                }}
+                className={`fixed bottom-8 right-8 w-80 md:w-96 h-137.5 bg-zinc-900 border border-white/10 rounded-sm shadow-2xl z-50 flex flex-col transition-all duration-300 origin-bottom-right ${isOpen ? 'scale-100 opacity-100' : 'scale-90 opacity-0 pointer-events-none'
                     }`}
             >
                 {/* Header */}
-                <div className="p-4 border-b border-white/10 flex justify-between items-center bg-black/40 rounded-t-2xl">
+                <div className="px-3 py-2 border-b border-white/10 flex justify-between items-center bg-black/40">
                     <div className="flex items-center gap-2">
-                        <Sparkles size={16} className="text-violet-400" />
-                        <span className="font-bold text-sm tracking-wide">ARCHITECT_AI</span>
-                        <span className="text-[9px] text-gray-500 bg-zinc-950 px-2 py-0.5 rounded">FULL CONTROL</span>
+                        <Sparkles aria-hidden="true" size={14} className="text-[rgb(var(--et-accent))]" />
+                        <span className="text-[10px] font-mono font-semibold uppercase tracking-widest et-ink">Architect</span>
                     </div>
                     <button
-                        onClick={() => setIsOpen(false)}
-                        title="Close assistant"
-                        className="text-gray-500 hover:text-white transition-colors"
+                        type="button"
+                        onClick={close}
+                        aria-label="Close the assistant"
+                        title="Close"
+                        className={`${MINI_ICON_KEY} ${KEY_REST}`}
                     >
-                        <X size={18} />
+                        <X aria-hidden="true" className="w-3 h-3" />
                     </button>
                 </div>
 
                 {/* Status Bar */}
-                <div className="px-4 py-2 bg-black/20 border-b border-white/10 flex items-center justify-between text-[10px] font-mono">
-                    <span className="text-gray-500">
+                <div className="px-3 py-1.5 bg-black/20 border-b border-white/10 flex items-center justify-between text-[10px] font-mono">
+                    <span className="et-ink-3">
                         {pianoRollControls.notes.length} notes | {pianoRollControls.bpm} BPM
                     </span>
-                    <span className={pianoRollControls.isPlaying ? 'text-cyan-400' : 'text-gray-600'}>
+                    <span className={pianoRollControls.isPlaying ? 'text-[rgb(var(--et-accent))]' : 'et-ink-3'}>
                         {pianoRollControls.isPlaying ? '▶ PLAYING' : '■ STOPPED'}
                     </span>
                 </div>
 
                 {/* Messages */}
-                <div className="flex-1 overflow-y-auto p-4 space-y-4">
+                <div ref={listRef} className="flex-1 overflow-y-auto p-3 space-y-3">
                     {messages.map((m, i) => (
                         <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                            <div className={`max-w-[85%] rounded-lg p-3 text-xs leading-relaxed ${m.role === 'user'
-                                    ? 'bg-violet-500/20 text-white border border-violet-500/30'
-                                    : 'bg-black border border-white/10 text-gray-300'
+                            <div className={`max-w-[85%] rounded-xs p-2.5 text-xs leading-relaxed ${m.role === 'user'
+                                    ? 'bg-white/10 et-ink border border-white/10'
+                                    : 'bg-black border border-white/10 et-ink-2'
                                 }`}>
                                 {m.text}
                                 {m.actions && m.actions.length > 0 && (
                                     <div className="mt-2 pt-2 border-t border-white/5">
-                                        <div className="text-[9px] text-cyan-400 font-mono">
+                                        <div className="text-[9px] text-[rgb(var(--et-accent))] font-mono">
                                             {m.actions.map((action, j) => (
                                                 <div key={j}>✓ {action}</div>
                                             ))}
@@ -202,63 +238,38 @@ export const AssistantOrb: React.FC<AssistantOrbProps> = ({
                         </div>
                     ))}
                     {isThinking && (
-                        <div className="flex justify-start">
-                            <div className="bg-black border border-white/10 rounded-lg p-3 flex gap-1">
-                                <div className="w-1.5 h-1.5 bg-violet-500 rounded-full animate-bounce" />
-                                <div className="w-1.5 h-1.5 bg-violet-500 rounded-full animate-bounce delay-150" />
-                                <div className="w-1.5 h-1.5 bg-violet-500 rounded-full animate-bounce delay-300" />
+                        <div className="flex justify-start" role="status" aria-label="Thinking">
+                            <div className="bg-black border border-white/10 rounded-xs p-2.5 flex gap-1">
+                                <div className="w-1.5 h-1.5 bg-[rgb(var(--et-accent))] rounded-full animate-bounce" />
+                                <div className="w-1.5 h-1.5 bg-[rgb(var(--et-accent))] rounded-full animate-bounce delay-150" />
+                                <div className="w-1.5 h-1.5 bg-[rgb(var(--et-accent))] rounded-full animate-bounce delay-300" />
                             </div>
                         </div>
                     )}
-                    <div ref={messagesEndRef} />
                 </div>
 
-                {/* Quick Commands */}
+                {/* Quick Commands: each types its command into the input */}
                 <div className="px-3 py-2 border-t border-white/10 bg-black/20">
                     <div className="flex gap-1 flex-wrap">
-                        <button
-                            onClick={() => { setInput('play the preview'); }}
-                            className="text-[9px] px-2 py-1 bg-zinc-800 hover:bg-cyan-500 hover:text-black rounded transition-colors"
-                        >
-                            ▶ Play
-                        </button>
-                        <button
-                            onClick={() => { setInput('stop'); }}
-                            className="text-[9px] px-2 py-1 bg-zinc-800 hover:bg-cyan-500 hover:text-black rounded transition-colors"
-                        >
-                            ■ Stop
-                        </button>
-                        <button
-                            onClick={() => { setInput('quantize to 1/16'); }}
-                            className="text-[9px] px-2 py-1 bg-zinc-800 hover:bg-cyan-500 hover:text-black rounded transition-colors"
-                        >
-                            Quantize
-                        </button>
-                        <button
-                            onClick={() => { setInput('transpose up one octave'); }}
-                            className="text-[9px] px-2 py-1 bg-zinc-800 hover:bg-cyan-500 hover:text-black rounded transition-colors"
-                        >
-                            +Octave
-                        </button>
-                        <button
-                            onClick={() => { setInput('set tempo to 140 bpm'); }}
-                            className="text-[9px] px-2 py-1 bg-zinc-800 hover:bg-cyan-500 hover:text-black rounded transition-colors"
-                        >
-                            140 BPM
-                        </button>
-                        <button
-                            onClick={() => { setInput('change to A minor'); }}
-                            className="text-[9px] px-2 py-1 bg-zinc-800 hover:bg-cyan-500 hover:text-black rounded transition-colors"
-                        >
-                            A minor
-                        </button>
+                        {QUICK_COMMANDS.map((q) => (
+                            <button
+                                key={q.label}
+                                type="button"
+                                onClick={() => setInput(q.command)}
+                                title={q.command}
+                                className={`${MINI_KEY} ${KEY_REST}`}
+                            >
+                                <span>{q.label}</span>
+                            </button>
+                        ))}
                     </div>
                 </div>
 
                 {/* Input */}
-                <div className="p-3 border-t border-white/10 bg-black/40 rounded-b-2xl">
+                <div className="p-3 border-t border-white/10 bg-black/40">
                     <div className="flex gap-2">
                         <input
+                            ref={inputRef}
                             type="text"
                             id="vocal2midi-assistant-input"
                             name="vocal2midi-assistant-input"
@@ -267,15 +278,17 @@ export const AssistantOrb: React.FC<AssistantOrbProps> = ({
                             onChange={(e) => setInput(e.target.value)}
                             onKeyDown={handleKeyDown}
                             placeholder="Try: 'make it faster' or 'change to E major'"
-                            className="flex-1 bg-zinc-950 border border-white/10 rounded-lg px-3 py-2 text-xs focus:outline-none focus:border-violet-500 transition-colors"
+                            className="flex-1 bg-zinc-950 border border-white/10 rounded-xs px-3 py-2 text-xs et-ink focus:outline-none focus:border-[rgb(var(--et-accent)/0.6)] transition-colors"
                         />
                         <button
+                            type="button"
                             onClick={handleSend}
-                            disabled={!input.trim() || isThinking}
+                            disabled={!canSend}
+                            aria-label="Send"
                             title="Send message"
-                            className="bg-violet-500 hover:bg-violet-400 text-white p-2 rounded-lg transition-colors disabled:opacity-50"
+                            className={`relative h-8 w-8 shrink-0 inline-flex items-center justify-center rounded-xs border-b disabled:cursor-default disabled:*:opacity-40 ${canSend ? KEY_ON : KEY_REST}`}
                         >
-                            <Send size={16} />
+                            <Send aria-hidden="true" className="w-4 h-4" />
                         </button>
                     </div>
                 </div>

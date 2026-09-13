@@ -43,21 +43,26 @@ import { featureById } from '../../onboarding/featureRegistry';
  * The tab row. What each tab IS lives in the feature registry under
  * `panel-<id>`, not here: the hover tooltip reads that entry's `what`, so the
  * sentence the help search returns and the sentence on the tab cannot drift
- * apart. This table keeps only what is the row's own business — order, label,
- * icon and accent colour.
+ * apart. This table keeps only what is the row's own business — order, label
+ * and icon. Every tab lights the same way when selected: the theme's accent
+ * (`--et-accent`), a 2px accent edge and a soft glow.
  */
-const TAB_DEFS: Array<{ id: BottomPanelTab; label: string; icon: React.ComponentType<{ className?: string }>; colorActive: string }> = [
-  { id: 'levels',   label: 'Levels',    icon: Gauge,           colorActive: 'border-teal-500 text-teal-300' },
-  { id: 'spectral', label: 'Visualize', icon: Activity,        colorActive: 'border-purple-500 text-purple-300' },
-  { id: 'midi',     label: 'MIDI',      icon: Piano,           colorActive: 'border-cyan-500 text-cyan-300' },
-  { id: 'step-seq', label: 'Sequence',  icon: Layers,          colorActive: 'border-cyan-500 text-cyan-300' },
-  { id: 'draw',     label: 'DRAW',      icon: Brush,           colorActive: 'border-purple-500 text-purple-300' },
-  { id: 'score',    label: 'Score',     icon: FileMusic,       colorActive: 'border-emerald-500 text-emerald-300' },
-  { id: 'sing',     label: 'Sing',      icon: MicVocal,        colorActive: 'border-rose-500 text-rose-300' },
-  { id: 'lyric',    label: 'Lyric',     icon: NotebookPen,     colorActive: 'border-rose-500 text-rose-300' },
-  { id: 'details',  label: 'Details',   icon: Info,            colorActive: 'border-emerald-500 text-emerald-300' },
-  { id: 'slide',    label: 'SLIDE',     icon: SlidersVertical, colorActive: 'border-pink-500 text-pink-300' },
+const TAB_DEFS: Array<{ id: BottomPanelTab; label: string; icon: React.ComponentType<{ className?: string }> }> = [
+  { id: 'levels',   label: 'Levels',    icon: Gauge },
+  { id: 'spectral', label: 'Visualize', icon: Activity },
+  { id: 'midi',     label: 'MIDI',      icon: Piano },
+  { id: 'step-seq', label: 'Sequence',  icon: Layers },
+  { id: 'draw',     label: 'DRAW',      icon: Brush },
+  { id: 'score',    label: 'Score',     icon: FileMusic },
+  { id: 'sing',     label: 'Sing',      icon: MicVocal },
+  { id: 'lyric',    label: 'Lyric',     icon: NotebookPen },
+  { id: 'details',  label: 'Details',   icon: Info },
+  { id: 'slide',    label: 'SLIDE',     icon: SlidersVertical },
 ];
+
+/** The selected tab: accent ink, accent edge, and a glow the drop-shadow draws
+ *  around the glyph, the label and the edge alike. */
+const TAB_ACTIVE = 'border-[rgb(var(--et-accent))] text-[rgb(var(--et-accent))] drop-shadow-[0_0_6px_rgb(var(--et-accent)/0.55)]';
 
 /** Tab id → display label, for surfaces that name the active tab without
  *  mounting the panel (the dock strip's PANELS toggle). */
@@ -107,9 +112,11 @@ export const BottomMultiTabPanel: React.FC = () => {
             return (
               <button
                 key={t.id}
+                type="button"
                 data-tour={`bottom-tab-${t.id}`}
                 onClick={() => setActiveTab(t.id)}
-                className={`px-3 py-1 flex items-center gap-1.5 border-b-2 text-[9px] uppercase tracking-widest font-black transition-colors whitespace-nowrap ${active ? t.colorActive : 'border-transparent et-ink-2 hover:et-ink'}`}
+                aria-pressed={active}
+                className={`px-3 py-1 flex items-center gap-1.5 border-b-2 text-[9px] uppercase tracking-widest font-black transition-colors whitespace-nowrap ${active ? TAB_ACTIVE : 'border-transparent et-ink-2 hover:et-ink'}`}
                 title={featureById(`panel-${t.id}`)?.what}
               >
                 <Icon className="w-3 h-3" /> {t.label}
@@ -145,9 +152,10 @@ export const BottomMultiTabPanel: React.FC = () => {
           )}
           <button
             onClick={toggleMultiMaximized}
+            type="button"
             className={`p-1 rounded border ${
               multiMaximized
-                ? 'border-purple-500/50 bg-purple-500/15 text-purple-200'
+                ? 'border-[rgb(var(--et-accent)/0.6)] bg-white/10 text-[rgb(var(--et-accent))]'
                 : 'border-white/10 text-zinc-400 hover:text-zinc-100 hover:border-white/25'
             }`}
             title={multiMaximized ? 'Restore panel size' : 'Maximize panel to fill the window'}
