@@ -55,8 +55,19 @@ class Clip(BaseModel):
     audio_file_checksum: str | None = None
     sample_rate: int = 48000
     channels: int = 2
+    # Each note is a dict; a piano-roll note carries note, step, length,
+    # velocity, and "lane" when it sits in one of the clip's polymeter lanes.
     midi_notes: list[dict] | None = None
     midi_file: str | None = None
+    # Piano-roll clips: the grid length in 16th-note steps, the time signatures
+    # by bar ([{bar, meter: {num, den, groups}}]), the steps before bar 0 and
+    # the polymeter lanes ([{id, name, cycle_steps}]) the clip was bounced with.
+    # Defaulted, so .tasmo files written before the roll had a meter still
+    # validate and load with all four as None.
+    total_steps: float | None = None
+    meter_map: list[dict] | None = None
+    pickup_steps: float | None = None
+    lanes: list[dict] | None = None
     # Per-clip mute (the clip is skipped by playback and bounces). Defaulted so
     # .tasmo files written before this field existed still validate.
     muted: bool = False

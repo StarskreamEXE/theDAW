@@ -4,6 +4,32 @@ import type { DawProject } from './dawImportClient';
 import { dawDeviceToEffectNode } from './dawEffectMap';
 import type { SwayBinding, SwayUnattached } from './swayImportResolve';
 import type { PerformRoutingSnapshot } from '../state/performRouting';
+import type { AudioClip } from '../state/editorStore';
+import type { PianoNote } from '../state/pianoRollStore';
+import { normalizeMeterMap } from './meterMap';
+
+// --- Piano-roll meter (mirrors lib/meterMap in the .tasmo JSON shape) ---
+/** A time-signature change: the meter from `bar` until the next change. */
+export interface TasmoMeterSegment {
+  bar: number;
+  meter: { num: number; den: number; groups: number[] };
+}
+
+/** A polymeter lane; `cycle_steps` null means the lane spans the whole clip. */
+export interface TasmoPolyLane {
+  id: number;
+  name: string;
+  cycle_steps: number | null;
+}
+
+/** A piano-roll note as a MIDI clip stores it; `lane` only when the note sits in one. */
+export interface TasmoStepNote {
+  note: number;
+  step: number;
+  length: number;
+  velocity: number;
+  lane?: number;
+}
 
 // --- Effect chain (mirrors backend tasmo_project.py EffectChainNode/VstPluginState) ---
 export interface VstPluginState {
@@ -63,6 +89,12 @@ export interface TasmoClipInput {
   track_index?: number | null;
   scene_index?: number | null;
   slot_index?: number | null;
+  /** Piano-roll clips: the grid length in steps, the time signatures by bar, the
+   *  steps before bar 0 and the polymeter lanes the clip was bounced with. */
+  total_steps?: number | null;
+  meter_map?: TasmoMeterSegment[] | null;
+  pickup_steps?: number | null;
+  lanes?: TasmoPolyLane[] | null;
 }
 
 export interface TasmoTrackInput {
@@ -127,6 +159,12 @@ export interface TasmoLoadedClip {
   track_index?: number | null;
   scene_index?: number | null;
   slot_index?: number | null;
+  /** Piano-roll grid length and meter; absent in .tasmo files written before
+   *  the roll had a meter. */
+  total_steps?: number | null;
+  meter_map?: TasmoMeterSegment[] | null;
+  pickup_steps?: number | null;
+  lanes?: TasmoPolyLane[] | null;
 }
 
 export interface TasmoLoadedTrack {
@@ -175,6 +213,49 @@ export interface RecentItem {
   path: string;
   name: string;
 }
+
+// --- Piano-roll clip fields <-> .tasmo JSON (pure; tested in projectImport.test.ts) ---
+type ClipMeterFields = Pick<AudioClip, 'sourceTotalSteps' | 'sourceMeterMap' | 'sourcePickupSteps' | 'sourceLanes'>;
+type TasmoMeterFields = Pick<TasmoClipInput, 'total_steps' | 'meter_map' | 'pickup_steps' | 'lanes'>;
+
+/** A piano-roll note in the .tasmo shape, carrying `lane` when the note has one. */
+export const pianoNoteToTasmo = (n: PianoNote): TasmoStepNote => ({
+  note: n.note,
+  step: n.step,
+  length: n.length,
+  velocity: n.velocity,
+  ...(n.lane !== undefined ? { lane: n.lane } : {}),
+});
+
+/** A piano-roll clip's grid length and meter in the .tasmo shape. Fields the clip lacks are left out. */
+export const clipMeterToTasmo = (c: ClipMeterFields): TasmoMeterFields => ({
+  ...(c.sourceTotalSteps !== undefined ? { total_steps: c.sourceTotalSteps } : {}),
+  ...(c.sourceMeterMap
+    ? { meter_map: c.sourceMeterMap.map((s) => ({ bar: s.bar, meter: { num: s.meter.num, den: s.meter.den, groups: [...s.meter.groups] } })) }
+    : {}),
+  ...(c.sourcePickupSteps !== undefined ? { pickup_steps: c.sourcePickupSteps } : {}),
+  ...(c.sourceLanes ? { lanes: c.sourceLanes.map((l) => ({ id: l.id, name: l.name, cycle_steps: l.cycleSteps })) } : {}),
+});
+
+const numberAtLeast = (v: unknown, min: number): number | undefined =>
+  typeof v === 'number' && Number.isFinite(v) && v >= min ? v : undefined;
+
+/** The inverse of clipMeterToTasmo. A field that is absent, null or malformed stays
+ *  undefined, so files written before these fields load as they did. */
+export const tasmoMeterToClip = (c: TasmoMeterFields): ClipMeterFields => {
+  const out: ClipMeterFields = {};
+  const total = numberAtLeast(c.total_steps, 1);
+  if (total !== undefined) out.sourceTotalSteps = total;
+  if (Array.isArray(c.meter_map) && c.meter_map.length) out.sourceMeterMap = normalizeMeterMap(c.meter_map);
+  const pickup = numberAtLeast(c.pickup_steps, 0);
+  if (pickup !== undefined) out.sourcePickupSteps = pickup;
+  if (Array.isArray(c.lanes) && c.lanes.length) {
+    out.sourceLanes = c.lanes
+      .filter((l) => l && Number.isInteger(l.id) && l.id >= 0)
+      .map((l) => ({ id: l.id, name: String(l.name ?? ''), cycleSteps: numberAtLeast(l.cycle_steps, 1) ?? null }));
+  }
+  return out;
+};
 
 export const projectApi = {
   save: (project: TasmoProjectInput, path: string, embed_audio: boolean) =>

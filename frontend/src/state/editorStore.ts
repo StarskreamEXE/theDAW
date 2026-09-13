@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { logError, logInfo } from './logStore';
 import type { PianoNote } from './pianoRollStore';
+import type { MeterSegment, PolyLane } from '../lib/meterMap';
 import type { ChainEntry, VstNode } from './effectChainStore';
 import { rackEffectDefaults } from '../lib/rackEffects';
 
@@ -87,6 +88,13 @@ export interface AudioClip {
   sourceBpm?: number;
   /** When sourceKind === 'piano-roll', the grid length at render time. */
   sourceTotalSteps?: number;
+  /** When sourceKind === 'piano-roll', the roll's time signatures by bar at render time. */
+  sourceMeterMap?: MeterSegment[];
+  /** When sourceKind === 'piano-roll', the steps before bar 0 at render time. */
+  sourcePickupSteps?: number;
+  /** When sourceKind === 'piano-roll', the roll's polymeter lanes at render time.
+   *  `sourcePianoRoll` holds the notes already unrolled across those lanes. */
+  sourceLanes?: PolyLane[];
   /** GM program (0-127) this MIDI clip plays through live on the timeline; falls
    *  back to the track default, then the global active instrument. Audio clips: undefined. */
   instrumentProgram?: number;

@@ -27,7 +27,11 @@ import {
   type TasmoClipInput,
   type EffectChainNode,
   type TasmoControllerMappings,
+  clipMeterToTasmo,
+  pianoNoteToTasmo,
+  tasmoMeterToClip,
 } from './projectClient';
+import { roundUpToBar } from './meterMap';
 import { getRackEffect, rackEffectDefaults } from './rackEffects';
 import { EFFECT_LABELS, type ChainEntry } from '../state/effectChainStore';
 import { logError, logInfo } from '../state/logStore';
@@ -96,12 +100,14 @@ const toPianoNotes = (raw: Array<Record<string, number>>, bpm: number): PianoNot
       const step = startSec !== undefined ? Math.round(startSec / stepSec) : (pick(n, 'step') ?? 0);
       const durSec = pick(n, 'duration', 'durationSec', 'dur', 'length_sec');
       const length = durSec !== undefined ? Math.max(1, Math.round(durSec / stepSec)) : (pick(n, 'length') ?? 1);
+      const lane = pick(n, 'lane');
       return {
         id: uid('pn'),
         note: Math.round(note),
         step: Math.max(0, step),
         length: Math.max(1, length),
         velocity: clamp(pick(n, 'velocity', 'vel'), 1, 127, 100),
+        ...(lane !== undefined && Number.isInteger(lane) && lane >= 0 ? { lane } : {}),
       };
     })
     .filter((n): n is PianoNote => n !== null);
@@ -216,11 +222,24 @@ const buildClip = async (
     if (notes.length === 0) return null;
     const rendered = await renderNotesToBlob(notes);
     blob = rendered.blob;
-    sourceKind = 'piano-roll';
-    sourcePianoRoll = toPianoNotes(c.midi_notes, bpm);
   } else {
     return null;
   }
+  // A piano-roll clip saved from EDIT carries its bounce as audio_file AND its
+  // notes; the notes make it a roll clip again whichever one supplied the audio.
+  if (c.midi_notes && c.midi_notes.length) {
+    const pianoNotes = toPianoNotes(c.midi_notes, bpm);
+    if (pianoNotes.length) {
+      sourceKind = 'piano-roll';
+      sourcePianoRoll = pianoNotes;
+    }
+  }
+  const meter = sourcePianoRoll ? tasmoMeterToClip(c) : {};
+  // Files written before total_steps existed: the notes' end, up to a bar line.
+  const sourceTotalSteps = sourcePianoRoll
+    ? meter.sourceTotalSteps ??
+      Math.max(16, roundUpToBar(meter.sourceMeterMap ?? [], Math.max(0, ...sourcePianoRoll.map((n) => n.step + n.length)), meter.sourcePickupSteps ?? 0))
+    : undefined;
 
   const { peaks, duration } = await computePeaks(blob, 240);
   // Respect the clip's real timeline length when the importer provides it
@@ -249,6 +268,10 @@ const buildClip = async (
     sourceKind,
     sourcePianoRoll,
     sourceBpm: sourceKind ? bpm : undefined,
+    sourceTotalSteps,
+    sourceMeterMap: meter.sourceMeterMap,
+    sourcePickupSteps: meter.sourcePickupSteps,
+    sourceLanes: meter.sourceLanes,
     // Restore the per-clip mute; omit the field entirely for unmuted clips so
     // pre-mute projects hydrate exactly as before. Gain and fades follow the same
     // rule: a unity/zero value stays `undefined` rather than being written back.
@@ -428,15 +451,10 @@ export function captureEditorSession(): CapturedSession {
           start_time: c.startSec,
           end_time: c.startSec + c.durationSec,
           audio_file: `audio/${fname}`,
-          midi_notes:
-            isMidi && c.sourcePianoRoll
-              ? c.sourcePianoRoll.map((n) => ({
-                  note: n.note,
-                  step: n.step,
-                  length: n.length,
-                  velocity: n.velocity,
-                }))
-              : null,
+          midi_notes: isMidi && c.sourcePianoRoll ? c.sourcePianoRoll.map(pianoNoteToTasmo) : null,
+          // The roll's grid length, meter map, pickup and lanes, so "Edit in
+          // Piano Roll" after a reload opens the same bars.
+          ...(isMidi ? clipMeterToTasmo(c) : {}),
           // Per-clip mute, gain, fades and the trim point all survive the .tasmo
           // round-trip. offset_into_source is the load-bearing one: the embedded
           // audio is the FULL untrimmed source, so without it a split clip reloads
