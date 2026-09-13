@@ -72,6 +72,7 @@ import {
   exportRollMidi,
   importMidiFileToRoll,
   importSheetFileToRoll,
+  playedRollNotes,
 } from '../audio/PianoRoll';
 import { ArpeggiatorPanel } from '../audio/ArpeggiatorPanel';
 import { VirtuosoControls } from '../audio/VirtuosoControls';
@@ -482,12 +483,13 @@ export const MidiPanel: React.FC = () => {
   }, [assetId]);
 
   const makeBeat = useCallback(async () => {
-    const { notes, bpm } = usePianoRollStore.getState();
+    const { notes, bpm, lanes, totalSteps } = usePianoRollStore.getState();
     if (!notes.length) {
       setStatus('no notes for a beat');
       return;
     }
-    const render = pianoToRender(notes, bpm);
+    // The beat renders once, so it gets the lane repeats written out.
+    const render = pianoToRender(playedRollNotes(notes, lanes, totalSteps), bpm);
     setStatus('rendering beat...');
     try {
       const { blob } = await renderDrumBeatBlob(render);
