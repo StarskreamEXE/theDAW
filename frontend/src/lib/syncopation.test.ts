@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { barSyncopation, metricalWeights, syncopationByBar } from './syncopation.ts';
+import { bars } from './meterMap.ts';
+import { barSyncopation, metricalWeights, stepsPerBeat, syncopationByBar } from './syncopation.ts';
 
 const close = (a: number, b: number, what: string) => assert.ok(Math.abs(a - b) < 1e-9, `${what}: ${a} vs ${b}`);
 
@@ -43,6 +44,53 @@ const close = (a: number, b: number, what: string) => assert.ok(Math.abs(a - b) 
   close(out[1].wnbd, 0.6, 'bar 2 wnbd');
   const withPickup = syncopationByBar([{ step: 2 }, { step: 4 }], [{ bar: 0, meter: { num: 4, den: 4, groups: [] } }], 20, 4);
   assert.deepEqual(withPickup.map((b) => [b.bar, b.onsets]), [[-1, 1], [0, 1]]);
+}
+
+// The one-pass grouping scores every bar as filtering the notes bar by bar does:
+// unsorted input, fractional steps, notes before 0 and past the end, a pickup
+// and bars of 3.5 steps.
+{
+  const map = [
+    { bar: 0, meter: { num: 7, den: 8, groups: [3, 2, 2] } },
+    { bar: 3, meter: { num: 7, den: 32, groups: [] } },
+    { bar: 7, meter: { num: 5, den: 4, groups: [2, 3] } },
+    { bar: 9, meter: { num: 4, den: 4, groups: [] } },
+  ];
+  const pickup = 2.5;
+  const total = 200;
+  const eps = 1e-9;
+  const byFilter = (notes: { step: number; velocity?: number }[]) =>
+    bars(map, total, pickup).map((b) => {
+      const full = metricalWeights(b.meter);
+      const size = Math.max(1, Math.ceil(b.len - eps));
+      const offset = b.bar < 0 ? Math.max(0, full.length - size) : 0;
+      const inBar = notes.filter((nt) => nt.step >= b.start - eps && nt.step < b.start + b.len - eps);
+      const vel = inBar.map((nt) => (typeof nt.velocity === 'number' ? nt.velocity : 127) / 127);
+      const score = barSyncopation(inBar.map((nt) => Math.round(nt.step - b.start)), vel, b.bar < 0 ? full.slice(offset) : full, stepsPerBeat(b.meter));
+      if (offset > 0 && score.onsets > 0) score.wnbd = barSyncopation(inBar.map((nt) => Math.round(nt.step - b.start) + offset), vel, full, stepsPerBeat(b.meter)).wnbd;
+      return { bar: b.bar, start: b.start, len: b.len, ...score };
+    });
+  let seed = 3;
+  const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  const notes: { step: number; velocity?: number }[] = [];
+  for (let i = 0; i < 600; i += 1) {
+    const step = Math.floor(rnd() * 440) / 2 - 10;
+    notes.push(i % 7 === 0 ? { step } : { step, velocity: 1 + Math.floor(rnd() * 127) });
+  }
+  notes.push({ step: pickup }, { step: pickup - 1e-12 }, { step: total }, { step: Number.NaN });
+  const want = byFilter(notes);
+  const got = syncopationByBar(notes, map, total, pickup);
+  assert.equal(got.length, want.length);
+  got.forEach((g, i) => {
+    const w = want[i];
+    assert.deepEqual([g.bar, g.start, g.len, g.onsets], [w.bar, w.start, w.len, w.onsets], `bar ${w.bar}`);
+    close(g.lhl, w.lhl, `bar ${w.bar} lhl`);
+    close(g.wnbd, w.wnbd, `bar ${w.bar} wnbd`);
+    close(g.offbeatRatio, w.offbeatRatio, `bar ${w.bar} offbeat`);
+  });
+  assert.ok(got.some((b) => b.onsets > 1 && b.lhl > 0), 'the case scores some syncopation');
+  const sorted = [...notes].sort((a, b) => a.step - b.step);
+  assert.deepEqual(syncopationByBar(sorted, map, total, pickup), got, 'sorted input scores the same');
 }
 
 console.log('syncopation: ok');

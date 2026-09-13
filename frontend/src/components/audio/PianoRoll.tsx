@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Check, Info, Minus, Plus, Save, Send, Trash2, Unlink } from 'lucide-react';
-import { usePianoRollStore, pianoNotesToMidiNotes, type PianoNote } from '../../state/pianoRollStore';
+import { DEFAULT_LANES, usePianoRollStore, pianoNotesToMidiNotes, type PianoNote } from '../../state/pianoRollStore';
 import { usePlaybackStore } from '../../state/playbackStore';
 import { getEngineCtx } from '../../state/playerStore';
 import { useEditorStore, computePeaks } from '../../state/editorStore';
@@ -52,6 +52,10 @@ const STEP_PX_MAX_BUTTON = 48;
 const STEP_PX_MAX_WHEEL = 64;
 /** Step lines draw only from this step width up; below it the bar, group and beat tiers carry the grid. */
 const STEP_LINES_MIN_PX = 10;
+/** The pickup cell prints its legend from this width (px) up; a narrower one keeps it in its title. */
+const PICKUP_LEGEND_MIN_PX = 36;
+/** Notes and lane repeats draw this far (px) past each side of the view, so a scroll redraws them only after crossing it. */
+const WINDOW_OVERSCAN_PX = 960;
 
 const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
 const isBlackKey = (midi: number) => [1, 3, 6, 8, 10].includes(midi % 12);
@@ -75,21 +79,24 @@ export { playedRollNotes };
  * other lane takes the next form by its rank among the inactive lanes:
  * outlined, striped, then outlined with a sparse hatch and striped the other way.
  * `edge` is the border colour, which a selected note replaces with white.
+ * `minPx` is the narrowest a note of the form draws, so a one-step outlined or
+ * striped note keeps its form at the smallest zoom.
  */
-interface LaneForm { fill: string; edge: string; style?: React.CSSProperties }
+interface LaneForm { fill: string; edge: string; minPx: number; style?: React.CSSProperties }
 const stripes = (angle: number): React.CSSProperties => ({
   backgroundImage: `repeating-linear-gradient(${angle}deg, rgb(var(--et-accent)) 0 2px, rgb(var(--et-accent) / 0.16) 2px 4px)`,
 });
-const SOLID_FORM: LaneForm = { fill: 'bg-[rgb(var(--et-accent))]', edge: 'border-black/40' };
+const SOLID_FORM: LaneForm = { fill: 'bg-[rgb(var(--et-accent))]', edge: 'border-black/40', minPx: 4 };
 const LANE_FORMS: readonly LaneForm[] = [
-  { fill: 'bg-[rgb(var(--et-accent)/0.14)]', edge: 'border-[rgb(var(--et-accent))]' },
-  { fill: '', edge: 'border-[rgb(var(--et-accent)/0.8)]', style: stripes(135) },
+  { fill: 'bg-[rgb(var(--et-accent)/0.14)]', edge: 'border-[rgb(var(--et-accent))]', minPx: 8 },
+  { fill: '', edge: 'border-[rgb(var(--et-accent)/0.8)]', minPx: 8, style: stripes(135) },
   {
     fill: 'bg-[rgb(var(--et-accent)/0.14)]',
     edge: 'border-[rgb(var(--et-accent))]',
+    minPx: 8,
     style: { backgroundImage: 'repeating-linear-gradient(45deg, rgb(var(--et-accent) / 0.55) 0 1px, transparent 1px 5px)' },
   },
-  { fill: '', edge: 'border-[rgb(var(--et-accent)/0.8)]', style: stripes(45) },
+  { fill: '', edge: 'border-[rgb(var(--et-accent)/0.8)]', minPx: 8, style: stripes(45) },
 ];
 
 const ROLL_HELP =
@@ -143,7 +150,6 @@ export const PianoRollTransport: React.FC<{ startDisabled?: boolean }> = ({ star
   const totalSteps = usePianoRollStore((s) => s.totalSteps);
   const meterMap = usePianoRollStore((s) => s.meterMap);
   const pickupSteps = usePianoRollStore((s) => s.pickupSteps);
-  const lanes = usePianoRollStore((s) => s.lanes);
   const isPlaying = usePianoRollStore((s) => s.isPlaying);
   const setBpm = usePianoRollStore((s) => s.setBpm);
   const setTotalSteps = usePianoRollStore((s) => s.setTotalSteps);
@@ -165,42 +171,60 @@ export const PianoRollTransport: React.FC<{ startDisabled?: boolean }> = ({ star
   // micro-timing offsets) play — not just integer 16ths. Loops seamlessly by
   // scheduling each note's next occurrence every `total` steps. It resumes from
   // the store's current step, which every tick writes. It plays the lanes
-  // unrolled, and a change to the meter or the lanes restarts it.
+  // unrolled. Each tick reads the notes, lanes, length and BPM from the store,
+  // so an edit while playing (a note, a meter, a lane's loop) changes what plays
+  // next without a restart, and a step already scheduled is never scheduled again.
   useEffect(() => {
     if (!isPlaying) return;
     const ctx = getEngineCtx();
     if (ctx.state === 'suspended') void ctx.resume();
-    const stepSec = 60 / Math.max(40, bpm) / 4;
     const lookahead = 0.12; // seconds scheduled ahead each tick
-    const startTime = ctx.currentTime + 0.06;
     const startStep = usePianoRollStore.getState().currentStep;
-    const total = Math.max(1, totalSteps);
-    let cursor = startStep - 1e-4; // absolute step scheduled up to (exclusive)
-    // Unroll once per note edit, not once per tick.
-    let source: PianoNote[] | null = null;
+    // Absolute step `clock.step` sounds at `clock.time`; a tempo change re-anchors the clock at the cursor.
+    const clock = { step: startStep, time: ctx.currentTime + 0.06, stepSec: 0 };
+    // Absolute step s is roll step (s - lap.base) mod lap.total; a length change re-anchors the lap at the cursor.
+    const lap = { base: 0, total: 0 };
+    let cursor = startStep - 1e-4; // absolute step scheduled up to (inclusive)
+    // Unroll once per note, lane or length edit, not once per tick.
+    let source: { notes: PianoNote[]; lanes: PolyLane[]; total: number } | null = null;
     let played: PianoNote[] = [];
 
     const tick = () => {
       const now = ctx.currentTime;
-      const targetAbs = startStep + (now + lookahead - startTime) / stepSec;
-      const { notes } = usePianoRollStore.getState();
-      if (notes !== source) {
-        source = notes;
+      const { notes, lanes, totalSteps: steps, bpm: tempo } = usePianoRollStore.getState();
+      const total = Math.max(1, steps);
+      const stepSec = 60 / Math.max(40, tempo) / 4;
+      if (clock.stepSec === 0) clock.stepSec = stepSec;
+      else if (stepSec !== clock.stepSec) {
+        clock.time += (cursor - clock.step) * clock.stepSec;
+        clock.step = cursor;
+        clock.stepSec = stepSec;
+      }
+      if (lap.total === 0) lap.total = total;
+      else if (total !== lap.total) {
+        // The playhead keeps its place, or starts over when the roll now ends before it.
+        const pos = (((cursor - lap.base) % lap.total) + lap.total) % lap.total;
+        lap.base = pos < total ? cursor - pos : cursor + 1e-4;
+        lap.total = total;
+      }
+      if (!source || source.notes !== notes || source.lanes !== lanes || source.total !== total) {
+        source = { notes, lanes, total };
         played = unrollLanes(notes, lanes, total);
       }
+      const targetAbs = clock.step + (now + lookahead - clock.time) / stepSec;
       for (const n of played) {
-        let occ = n.step + Math.ceil((cursor - n.step) / total) * total;
+        const first = lap.base + n.step;
+        let occ = first + Math.ceil((cursor - first) / total) * total;
         if (occ <= cursor) occ += total;
         while (occ <= targetAbs) {
-          const when = startTime + (occ - startStep) * stepSec;
+          const when = clock.time + (occ - clock.step) * stepSec;
           triggerPianoNote(n.note, n.velocity, Math.max(now, when), n.length * stepSec, masterRef.current);
           occ += total;
         }
       }
-      cursor = targetAbs;
-      const elapsedAbs = startStep + (now - startTime) / stepSec;
-      const pos = ((elapsedAbs % total) + total) % total;
-      setCurrentStep(pos);
+      cursor = Math.max(cursor, targetAbs);
+      const elapsedAbs = clock.step + (now - clock.time) / stepSec;
+      setCurrentStep((((elapsedAbs - lap.base) % total) + total) % total);
     };
     playTimerRef.current = window.setInterval(tick, 25);
     return () => {
@@ -209,7 +233,7 @@ export const PianoRollTransport: React.FC<{ startDisabled?: boolean }> = ({ star
         playTimerRef.current = null;
       }
     };
-  }, [isPlaying, bpm, totalSteps, meterMap, pickupSteps, lanes, setCurrentStep, masterRef]);
+  }, [isPlaying, setCurrentStep, masterRef]);
 
   const handlePlayToggle = () => {
     if (isPlaying) {
@@ -227,10 +251,19 @@ export const PianoRollTransport: React.FC<{ startDisabled?: boolean }> = ({ star
 
   // STEPS moves by one bar of the meter the roll ends in, and a new length
   // lands on the next bar line in the direction of the change, whatever the meter.
+  // A step from the arrow keys or the spin buttons applies at once. A typed
+  // length applies on Enter or when the field loses focus, so the store never
+  // rounds a first digit up to a bar line while the rest is still being typed.
   const endBarSteps = barAt(meterMap, Math.max(0, totalSteps - 1e-6), pickupSteps).len;
-  const changeTotalSteps = (raw: number) => {
-    const v = raw || 32;
+  const [stepsDraft, setStepsDraft] = useState<string | null>(null);
+  const changeTotalSteps = (v: number) => {
+    if (!Number.isFinite(v)) return;
     setTotalSteps(v > totalSteps ? roundUpToBar(meterMap, v, pickupSteps) : barAt(meterMap, v, pickupSteps).start);
+  };
+  const commitStepsDraft = () => {
+    if (stepsDraft === null) return;
+    setStepsDraft(null);
+    changeTotalSteps(parseInt(stepsDraft));
   };
 
   return (
@@ -267,8 +300,21 @@ export const PianoRollTransport: React.FC<{ startDisabled?: boolean }> = ({ star
           min={16}
           max={4096}
           step={endBarSteps}
-          value={totalSteps}
-          onChange={(e) => changeTotalSteps(parseInt(e.target.value))}
+          value={stepsDraft ?? totalSteps}
+          onChange={(e) => {
+            // Typing arrives as an InputEvent; a step from the arrows or the spin buttons as a plain Event.
+            if ('inputType' in e.nativeEvent) {
+              setStepsDraft(e.target.value);
+              return;
+            }
+            setStepsDraft(null);
+            changeTotalSteps(parseInt(e.target.value));
+          }}
+          onBlur={commitStepsDraft}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') commitStepsDraft();
+            else if (e.key === 'Escape') setStepsDraft(null);
+          }}
           className={`${FIELD_VALUE} w-11 bg-transparent border-none outline-none`}
         />
       </div>
@@ -641,10 +687,11 @@ export const importMidiFileToRoll = (file: File): void => {
         return;
       }
       flat.sort((a, b) => a.step - b.step);
-      // The file's time signatures and pickup; a file with none is 4/4.
+      // The file's time signatures and pickup; a file with none is 4/4. Its notes
+      // carry no lanes, so the roll's lanes reset to lane A alone.
       const { map, pickupSteps } = midiEventsToMeterMap(data.timeSignatures ?? [], data.ppq);
       // importNotes auto-fits the grid length (to a bar line of that map) AND pitch range to the import.
-      usePianoRollStore.getState().importNotes(flat, data.bpm, { meterMap: map, pickupSteps });
+      usePianoRollStore.getState().importNotes(flat, data.bpm, { meterMap: map, pickupSteps, lanes: [...DEFAULT_LANES] });
       logInfo('piano-roll', `Imported ${flat.length} notes from "${file.name}" at ${Math.round(data.bpm)} BPM in ${meterLabel(map[0].meter)}`);
     } catch (e) {
       logError('piano-roll', `MIDI import failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -676,10 +723,11 @@ export const importSheetFileToRoll = (file: File): void => {
       }
       flat.sort((a, b) => a.step - b.step);
       // The score's first time signature holds for the whole roll; a score with
-      // none, or one the roll cannot draw, is 4/4. Its notes start at step 0.
+      // none, or one the roll cannot draw, is 4/4. Its notes start at step 0 and
+      // carry no lanes, so the roll's lanes reset to lane A alone.
       const [num, den] = score.time_signature ?? [];
       const meterMap = normalizeMeterMap([{ bar: 0, meter: { num: Number(num), den: Number(den), groups: [] } }]);
-      usePianoRollStore.getState().importNotes(flat, score.bpm, { meterMap, pickupSteps: 0 });
+      usePianoRollStore.getState().importNotes(flat, score.bpm, { meterMap, pickupSteps: 0, lanes: [...DEFAULT_LANES] });
       logInfo(
         'piano-roll',
         `Imported ${flat.length} notes from score "${file.name}" (${score.format}) at ${Math.round(score.bpm)} BPM in ${meterLabel(meterMap[0].meter)}`,
@@ -693,44 +741,99 @@ export const importSheetFileToRoll = (file: File): void => {
 /* ── the grid: keyboard column, ruler, notes ──────────────────────────────── */
 
 /**
- * The ruler: one cell per bar, as wide as the bar, with its number (none on a
- * pickup), the meter wherever it changes, group and beat ticks, and a
- * syncopation band along the top. The band's strength is each bar's LHL score
- * over the highest score among the bars in view, so it re-reads as the grid
- * scrolls; only this component re-renders when the bars in view change.
+ * The ruler: one cell per bar, as wide as the bar and clipped at the roll's
+ * end, with its number ("Pickup" on a pickup wide enough to hold it), the meter
+ * wherever it changes, a syncopation band along the top, and over the cells the
+ * bar lines (the grid's own bar tier) with group and beat ticks. The band's
+ * strength is each bar's LHL score over the highest score in the whole roll, so
+ * a bar reads the same at any scroll.
  */
 const RollRuler = React.memo(function RollRuler({
   spans,
   lhl,
-  groupSteps,
-  beatSteps,
+  tiers,
   stepPx,
-  width,
-  scrollRef,
+  totalSteps,
 }: {
   spans: BarSpan[];
   lhl: number[];
-  groupSteps: number[];
-  beatSteps: number[];
+  tiers: { bar: number[]; group: number[]; beat: number[] };
   stepPx: number;
-  width: number;
-  scrollRef: React.RefObject<HTMLDivElement | null>;
+  totalSteps: number;
 }) {
-  const [view, setView] = useState({ first: 0, last: Number.MAX_SAFE_INTEGER });
+  const width = totalSteps * stepPx;
+  const ticks = useMemo(
+    () => ({
+      bar: linesPath(tiers.bar, stepPx, 0, HEADER_HEIGHT),
+      group: linesPath(tiers.group, stepPx, 14, 21),
+      beat: linesPath(tiers.beat, stepPx, 18, 21),
+    }),
+    [tiers, stepPx],
+  );
+  const max = useMemo(() => lhl.reduce((m, v) => Math.max(m, v), 0), [lhl]);
 
+  return (
+    // An opaque ground in the theme's canvas: notes and loop lines scrolled under the ruler stay off its ticks and text.
+    <div className="sticky top-0 z-20 bg-[#07050a] border-b border-white/5" style={{ height: HEADER_HEIGHT, width, minWidth: '100%' }}>
+      {spans.map((b, i) => {
+        const prev = i > 0 ? spans[i - 1] : null;
+        const change = b.bar >= 0 && (!prev || prev.bar < 0 || !meterEquals(prev.meter, b.meter));
+        const score = lhl[i] ?? 0;
+        const alpha = 0.12 + 0.88 * (max > 0 ? Math.min(1, score / max) : 0);
+        const cellPx = Math.max(0, Math.min(b.len, totalSteps - b.start)) * stepPx;
+        return (
+          <div
+            key={b.start}
+            data-ruler-bar="1"
+            className="absolute top-0 bottom-0 overflow-hidden flex items-center gap-1 pl-1 text-[8px] leading-none font-mono text-zinc-500 tabular-nums whitespace-nowrap"
+            style={{ left: b.start * stepPx, width: cellPx }}
+            title={`${b.bar < 0 ? 'Pickup' : `Bar ${b.bar + 1}`} syncopation ${score.toFixed(2)}`}
+          >
+            <div
+              data-sync-band="1"
+              aria-hidden="true"
+              className="absolute inset-x-0 top-0 h-0.75"
+              style={{ backgroundColor: `rgb(var(--et-accent) / ${alpha.toFixed(3)})` }}
+            />
+            {b.bar >= 0 ? b.bar + 1 : cellPx >= PICKUP_LEGEND_MIN_PX ? 'Pickup' : null}
+            {change && <span className="font-semibold et-ink">{meterLabel(b.meter)}</span>}
+          </div>
+        );
+      })}
+      <svg
+        aria-hidden="true"
+        focusable="false"
+        className="absolute top-0 left-0 h-full pointer-events-none"
+        width={width}
+        shapeRendering="crispEdges"
+      >
+        <path d={ticks.beat} fill="none" strokeWidth={1} className="stroke-[rgb(var(--et-line)/0.2)]" />
+        <path d={ticks.group} fill="none" strokeWidth={1} className="stroke-[rgb(var(--et-line)/0.4)]" />
+        <path d={ticks.bar} fill="none" strokeWidth={1} className="stroke-[rgb(var(--et-line)/0.2)]" />
+      </svg>
+    </div>
+  );
+});
+
+/**
+ * The step range the grid shows, widened by the overscan on each side and
+ * snapped out to whole overscan blocks, so a scroll changes it only when it
+ * crosses a block. Until the grid is measured it is the roll's start, one
+ * window wide plus the overscan.
+ */
+function useStepWindow(scrollRef: React.RefObject<HTMLDivElement | null>, stepPx: number): { from: number; to: number } {
+  const [win, setWin] = useState(() => ({ from: 0, to: (window.innerWidth + 2 * WINDOW_OVERSCAN_PX) / stepPx }));
+  // A passive effect: the grid's scroll element takes its ref after this child's layout effects run.
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     let raf = 0;
     const measure = () => {
       raf = 0;
-      const x0 = el.scrollLeft / stepPx;
-      const x1 = (el.scrollLeft + el.clientWidth) / stepPx;
-      let first = 0;
-      while (first < spans.length - 1 && spans[first].start + spans[first].len <= x0) first += 1;
-      let last = first;
-      while (last < spans.length - 1 && spans[last + 1].start < x1) last += 1;
-      setView((v) => (v.first === first && v.last === last ? v : { first, last }));
+      const x0 = Math.floor(el.scrollLeft / WINDOW_OVERSCAN_PX) * WINDOW_OVERSCAN_PX - WINDOW_OVERSCAN_PX;
+      const x1 = Math.ceil((el.scrollLeft + el.clientWidth) / WINDOW_OVERSCAN_PX) * WINDOW_OVERSCAN_PX + WINDOW_OVERSCAN_PX;
+      const next = { from: Math.max(0, x0) / stepPx, to: x1 / stepPx };
+      setWin((w) => (w.from === next.from && w.to === next.to ? w : next));
     };
     const schedule = () => {
       if (!raf) raf = requestAnimationFrame(measure);
@@ -744,56 +847,124 @@ const RollRuler = React.memo(function RollRuler({
       ro?.disconnect();
       if (raf) cancelAnimationFrame(raf);
     };
-  }, [spans, stepPx, scrollRef]);
+  }, [scrollRef, stepPx]);
+  return win;
+}
 
-  const ticks = useMemo(
-    () => ({ group: linesPath(groupSteps, stepPx, 14, 21), beat: linesPath(beatSteps, stepPx, 18, 21) }),
-    [groupSteps, beatSteps, stepPx],
-  );
-
-  let max = 0;
-  for (let i = view.first; i <= Math.min(view.last, lhl.length - 1); i += 1) max = Math.max(max, lhl[i]);
-
+/**
+ * Lane repeats: drawn under the stored notes, never clicked, and out of the
+ * accessibility tree (the stored note speaks for them). Only the repeats inside
+ * `win` (the view and its overscan) render, so a long roll with a short loop
+ * stays light. A repeat keeps its lane's edge at full strength and fades only its fill.
+ */
+const LaneRepeats = React.memo(function LaneRepeats({
+  repeats,
+  laneOf,
+  stepPx,
+  lowestNote,
+  highestNote,
+  win,
+}: {
+  repeats: PianoNote[];
+  laneOf: (lane: number | undefined) => { form: LaneForm; name: string };
+  stepPx: number;
+  lowestNote: number;
+  highestNote: number;
+  win: { from: number; to: number };
+}) {
   return (
-    // An opaque ground: notes and loop lines scrolled under the ruler stay off its ticks and text.
-    <div className="sticky top-0 z-20 bg-[#040306] border-b border-white/5" style={{ height: HEADER_HEIGHT, width, minWidth: '100%' }}>
-      {spans.map((b, i) => {
-        const prev = i > 0 ? spans[i - 1] : null;
-        const change = b.bar >= 0 && (!prev || prev.bar < 0 || !meterEquals(prev.meter, b.meter));
-        const score = lhl[i] ?? 0;
-        const alpha = 0.12 + 0.88 * (max > 0 ? Math.min(1, score / max) : 0);
+    <div aria-hidden="true" className="pointer-events-none">
+      {repeats.map((n) => {
+        if (n.note < lowestNote || n.note > highestNote) return null;
+        if (n.step > win.to || n.step + n.length < win.from) return null;
+        const { form } = laneOf(n.lane);
         return (
           <div
-            key={b.start}
-            data-ruler-bar="1"
-            className="absolute top-0 bottom-0 border-l border-white/15 overflow-hidden flex items-center gap-1 pl-1 text-[8px] leading-none font-mono text-zinc-500 tabular-nums whitespace-nowrap"
-            style={{ left: b.start * stepPx, width: b.len * stepPx }}
-            title={`${b.bar < 0 ? 'Pickup' : `Bar ${b.bar + 1}`} syncopation ${score.toFixed(2)}`}
+            key={n.id}
+            data-lane-repeat="1"
+            className={`absolute rounded-sm border overflow-hidden z-5 ${form.edge}`}
+            style={{
+              left: n.step * stepPx,
+              width: Math.max(form.minPx, n.length * stepPx - 1),
+              top: (highestNote - n.note) * NOTE_HEIGHT + 1,
+              height: NOTE_HEIGHT - 2,
+            }}
           >
-            <div
-              data-sync-band="1"
-              aria-hidden="true"
-              className="absolute inset-x-0 top-0 h-0.75"
-              style={{ backgroundColor: `rgb(var(--et-accent) / ${alpha.toFixed(3)})` }}
-            />
-            {b.bar >= 0 ? b.bar + 1 : null}
-            {change && <span className="font-semibold et-ink">{meterLabel(b.meter)}</span>}
+            <div className={`absolute inset-0 opacity-38 ${form.fill}`} style={form.style} />
           </div>
         );
       })}
-      <svg
-        aria-hidden="true"
-        focusable="false"
-        className="absolute top-0 left-0 h-full pointer-events-none"
-        width={width}
-        shapeRendering="crispEdges"
-      >
-        <path d={ticks.beat} fill="none" strokeWidth={1} className="stroke-white/20" />
-        <path d={ticks.group} fill="none" strokeWidth={1} className="stroke-white/40" />
-      </svg>
     </div>
   );
 });
+
+/** The MIDI notes from the top row down. */
+const rowNotes = (lowestNote: number, highestNote: number): number[] => {
+  const rows: number[] = [];
+  for (let n = highestNote; n >= lowestNote; n -= 1) rows.push(n);
+  return rows;
+};
+
+/** The keyboard column's keys, one per row; a click previews the pitch. Re-renders only when the range changes. */
+const KeyboardKeys = React.memo(function KeyboardKeys({
+  lowestNote,
+  highestNote,
+  masterRef,
+}: {
+  lowestNote: number;
+  highestNote: number;
+  masterRef: { current: number };
+}) {
+  return (
+    <>
+      {rowNotes(lowestNote, highestNote).map((midi) => {
+        const black = isBlackKey(midi);
+        const isC = midi % 12 === 0;
+        return (
+          <div
+            key={midi}
+            onClick={() => triggerPianoNote(midi, 100, getEngineCtx().currentTime + 0.02, 0.25, masterRef.current)}
+            className={`flex items-center justify-end pr-1 text-[8px] font-mono cursor-pointer transition-shadow border-b border-black/40 hover:shadow-[inset_0_0_0_100px_rgb(var(--et-accent)/0.3)] ${black ? 'bg-zinc-900 text-zinc-600' : isC ? 'bg-zinc-200 text-zinc-700' : 'bg-zinc-300 text-zinc-700'}`}
+            style={{ height: NOTE_HEIGHT }}
+            title={`Preview ${noteLabel(midi)}`}
+          >
+            {isC ? noteLabel(midi) : ''}
+          </div>
+        );
+      })}
+    </>
+  );
+});
+
+/** The grid's row backgrounds: alternating black/white key tint and row lines. Re-renders only when the range changes. */
+const RowBackgrounds = React.memo(function RowBackgrounds({ lowestNote, highestNote }: { lowestNote: number; highestNote: number }) {
+  return (
+    <>
+      {rowNotes(lowestNote, highestNote).map((midi, idx) => (
+        <div
+          key={midi}
+          className={`absolute left-0 right-0 border-b ${isBlackKey(midi) ? 'bg-white/2' : 'bg-white/4'} ${midi % 12 === 0 ? 'border-white/10' : 'border-black/30'}`}
+          style={{ top: idx * NOTE_HEIGHT, height: NOTE_HEIGHT }}
+        />
+      ))}
+    </>
+  );
+});
+
+/** The playhead: a 1px line in the theme's primary ink, which holds contrast on
+ *  the grid and across the accent-filled notes. No glow. Only this re-renders
+ *  as the roll plays. */
+const RollPlayhead: React.FC<{ stepPx: number }> = ({ stepPx }) => {
+  const isPlaying = usePianoRollStore((s) => s.isPlaying);
+  const currentStep = usePianoRollStore((s) => s.currentStep);
+  if (!isPlaying) return null;
+  return (
+    <div
+      className="absolute top-0 bottom-0 w-px bg-[rgb(var(--et-ink))] z-30 pointer-events-none"
+      style={{ left: currentStep * stepPx + stepPx / 2 }}
+    />
+  );
+};
 
 export const PianoRoll: React.FC<{ stepPx: number; onStepPxChange: (px: number) => void }> = ({
   stepPx,
@@ -804,8 +975,6 @@ export const PianoRoll: React.FC<{ stepPx: number; onStepPxChange: (px: number) 
   const lowestNote = usePianoRollStore((s) => s.lowestNote);
   const highestNote = usePianoRollStore((s) => s.highestNote);
   const selectedNoteId = usePianoRollStore((s) => s.selectedNoteId);
-  const isPlaying = usePianoRollStore((s) => s.isPlaying);
-  const currentStep = usePianoRollStore((s) => s.currentStep);
   const recordedRange = usePianoRollStore((s) => s.recordedRange);
   const meterMap = usePianoRollStore((s) => s.meterMap);
   const pickupSteps = usePianoRollStore((s) => s.pickupSteps);
@@ -827,16 +996,34 @@ export const PianoRoll: React.FC<{ stepPx: number; onStepPxChange: (px: number) 
   const gridRef = useRef<HTMLDivElement | null>(null);
   const gridScrollRef = useRef<HTMLDivElement | null>(null);
   const keyboardRowsRef = useRef<HTMLDivElement | null>(null);
+  // The steps in view plus the overscan: notes and lane repeats outside it do not render.
+  const view = useStepWindow(gridScrollRef, stepPx);
 
   // The meter as the grid draws it: bars, the three line tiers, the notes as
   // they play (lane repeats written out) and each bar's syncopation score.
   const barSpans = useMemo(() => meterBars(meterMap, totalSteps, pickupSteps), [meterMap, totalSteps, pickupSteps]);
   const tiers = useMemo(() => gridLines(meterMap, totalSteps, pickupSteps), [meterMap, totalSteps, pickupSteps]);
-  const played = useMemo(() => unrollLanes(notes, lanes, totalSteps), [notes, lanes, totalSteps]);
-  const barLhl = useMemo(
-    () => syncopationByBar(played, meterMap, totalSteps, pickupSteps).map((b) => b.lhl),
-    [played, meterMap, totalSteps, pickupSteps],
-  );
+  // The scores read only each note's step, velocity and lane, so an edit that
+  // changes none of them (a resize, a pitch move) keeps the previous note list
+  // here and skips the unroll and the scoring.
+  const onsetRef = useRef<PianoNote[]>(notes);
+  const onsetNotes = useMemo(() => {
+    const prev = onsetRef.current;
+    const same = prev.length === notes.length
+      && prev.every((p, i) => p === notes[i] || (p.step === notes[i].step && p.velocity === notes[i].velocity && p.lane === notes[i].lane));
+    if (!same) onsetRef.current = notes;
+    return onsetRef.current;
+  }, [notes]);
+  // The same scores keep the same array, so the ruler skips an edit that moves no onset.
+  const lhlRef = useRef<number[]>([]);
+  const barLhl = useMemo(() => {
+    const played = unrollLanes(onsetNotes, lanes, totalSteps);
+    const next = syncopationByBar(played, meterMap, totalSteps, pickupSteps).map((b) => b.lhl);
+    const prev = lhlRef.current;
+    if (prev.length === next.length && prev.every((v, i) => v === next[i])) return prev;
+    lhlRef.current = next;
+    return next;
+  }, [onsetNotes, lanes, meterMap, totalSteps, pickupSteps]);
 
   // Each tier is one SVG path, so the grid's node count stays flat at any
   // length. Step lines skip the steps a stronger tier already draws.
@@ -852,18 +1039,28 @@ export const PianoRoll: React.FC<{ stepPx: number; onStepPxChange: (px: number) 
     };
   }, [tiers, stepPx, totalSteps, gridHeight]);
 
-  // A looping lane's repeats: the unrolled notes that are not a stored note at
-  // its stored step. A note placed past its lane's first cycle wraps, so its
-  // first copy is a repeat too.
+  // The notes in looping lanes, kept as the same array while none of them
+  // changes, so an edit in a lane that does not loop leaves the repeats alone.
+  const loopNotesRef = useRef<PianoNote[]>([]);
+  const loopNotes = useMemo(() => {
+    const looping = new Set(lanes.filter((l) => l.cycleSteps != null && l.cycleSteps > 0 && l.cycleSteps < totalSteps).map((l) => l.id));
+    const next = looping.size ? notes.filter((n) => n.lane !== undefined && looping.has(n.lane)) : [];
+    const prev = loopNotesRef.current;
+    if (prev.length === next.length && prev.every((n, i) => n === next[i])) return prev;
+    loopNotesRef.current = next;
+    return next;
+  }, [notes, lanes, totalSteps]);
+
+  // A looping lane's repeats: its notes unrolled, less each copy that sits at
+  // its note's stored step. A note placed past its lane's first cycle wraps, so
+  // its first copy is a repeat too. A copy after the first has the id `<id>~<k>`.
   const repeats = useMemo(() => {
-    const real = new Set(notes);
-    const byId = new Map(notes.map((n) => [n.id, n]));
-    return played.filter((u) => {
-      if (real.has(u)) return false;
-      const src = byId.get(u.id) ?? byId.get(u.id.replace(/~\d+$/, ''));
+    const byId = new Map(loopNotes.map((n) => [n.id, n]));
+    return unrollLanes(loopNotes, lanes, totalSteps).filter((u) => {
+      const src = byId.get(u.id) ?? byId.get(u.id.slice(0, u.id.lastIndexOf('~')));
       return !(src && Math.abs(src.step - u.step) < 1e-6);
     });
-  }, [notes, played]);
+  }, [loopNotes, lanes, totalSteps]);
 
   const loopEnds = useMemo(
     () => lanes.filter((l): l is PolyLane & { cycleSteps: number } => l.cycleSteps != null && l.cycleSteps > 0 && l.cycleSteps < totalSteps),
@@ -899,13 +1096,17 @@ export const PianoRoll: React.FC<{ stepPx: number; onStepPxChange: (px: number) 
     const targetNote = yToNote(y);
     const targetStep = xToStep(x);
     if (targetStep < 0 || targetStep >= totalSteps) return;
-    // If clicked on an existing note → remove or select. Only stored notes
-    // count; a lane repeat is drawn, not stored, and clicks pass through it.
+    // If clicked on an existing note → select it, or remove it when it was
+    // already selected before this press. Only stored notes count; a lane
+    // repeat is drawn, not stored, and clicks pass through it.
     const hit = notes.find(
       (n) => n.note === targetNote && targetStep >= n.step && targetStep < n.step + n.length,
     );
     if (hit) {
-      if (selectedNoteId === hit.id) {
+      const press = pressRef.current;
+      pressRef.current = null;
+      const wasSelected = press ? press.id === hit.id && press.wasSelected : selectedNoteId === hit.id;
+      if (wasSelected) {
         removeNote(hit.id);
       } else {
         setSelectedNote(hit.id);
@@ -917,10 +1118,15 @@ export const PianoRoll: React.FC<{ stepPx: number; onStepPxChange: (px: number) 
     triggerPianoNote(targetNote, 96, getEngineCtx().currentTime + 0.02, 0.2, masterRef.current);
   };
 
+  // A press on a note selects it. The click that ends the press deletes the
+  // note only when it was selected before the press and the press did not
+  // resize it, so the first click selects and a second click deletes.
+  const pressRef = useRef<{ id: string; wasSelected: boolean } | null>(null);
   // Right-drag a note to extend its length.
   const resizeRef = useRef<{ id: string; startX: number; initialLength: number } | null>(null);
   const onNotePointerDown = (e: React.PointerEvent, note: PianoNote, edge: 'right' | 'body') => {
     e.stopPropagation();
+    pressRef.current = { id: note.id, wasSelected: usePianoRollStore.getState().selectedNoteId === note.id };
     setSelectedNote(note.id);
     if (edge === 'right') {
       resizeRef.current = { id: note.id, startX: e.clientX, initialLength: note.length };
@@ -931,6 +1137,7 @@ export const PianoRoll: React.FC<{ stepPx: number; onStepPxChange: (px: number) 
     const op = resizeRef.current;
     if (!op) return;
     const dx = e.clientX - op.startX;
+    if (Math.abs(dx) >= 3 && pressRef.current?.id === op.id) pressRef.current.wasSelected = false;
     const deltaSteps = Math.round(dx / stepPx);
     const newLen = Math.max(1, op.initialLength + deltaSteps);
     updateNote(op.id, { length: newLen });
@@ -1004,10 +1211,6 @@ export const PianoRoll: React.FC<{ stepPx: number; onStepPxChange: (px: number) 
     if (keyboardRowsRef.current) keyboardRowsRef.current.scrollTop = el.scrollTop;
   }, [contentLo, contentHi, highestNote]);
 
-  // Build keyboard rows + grid rows for rendering.
-  const rows: number[] = [];
-  for (let n = highestNote; n >= lowestNote; n -= 1) rows.push(n);
-
   return (
     <div ref={rootRef} className="h-full flex flex-col bg-[#07050a] overflow-hidden relative">
       {/* Body */}
@@ -1024,21 +1227,7 @@ export const PianoRoll: React.FC<{ stepPx: number; onStepPxChange: (px: number) 
           </div>
           <div ref={keyboardRowsRef} className="overflow-hidden" style={{ height: `calc(100% - ${HEADER_HEIGHT}px)` }}>
             <div style={{ height: gridHeight }}>
-              {rows.map((midi) => {
-                const black = isBlackKey(midi);
-                const isC = midi % 12 === 0;
-                return (
-                  <div
-                    key={midi}
-                    onClick={() => triggerPianoNote(midi, 100, getEngineCtx().currentTime + 0.02, 0.25, masterRef.current)}
-                    className={`flex items-center justify-end pr-1 text-[8px] font-mono cursor-pointer transition-shadow border-b border-black/40 hover:shadow-[inset_0_0_0_100px_rgb(var(--et-accent)/0.3)] ${black ? 'bg-zinc-900 text-zinc-600' : isC ? 'bg-zinc-200 text-zinc-700' : 'bg-zinc-300 text-zinc-700'}`}
-                    style={{ height: NOTE_HEIGHT }}
-                    title={`Preview ${noteLabel(midi)}`}
-                  >
-                    {isC ? noteLabel(midi) : ''}
-                  </div>
-                );
-              })}
+              <KeyboardKeys lowestNote={lowestNote} highestNote={highestNote} masterRef={masterRef} />
             </div>
           </div>
         </div>
@@ -1053,30 +1242,17 @@ export const PianoRoll: React.FC<{ stepPx: number; onStepPxChange: (px: number) 
           onWheel={handleGridWheel}
         >
           {/* Ruler */}
-          <RollRuler
-            spans={barSpans}
-            lhl={barLhl}
-            groupSteps={tiers.group}
-            beatSteps={tiers.beat}
-            stepPx={stepPx}
-            width={gridWidth}
-            scrollRef={gridScrollRef}
-          />
+          <RollRuler spans={barSpans} lhl={barLhl} tiers={tiers} stepPx={stepPx} totalSteps={totalSteps} />
 
           <div
             ref={gridRef}
+            // A press that starts off every note clears a note press that ended without a click.
+            onPointerDown={() => { pressRef.current = null; }}
             onClick={handleGridClick}
             className="relative cursor-crosshair"
             style={{ width: gridWidth, height: gridHeight }}
           >
-            {/* Row backgrounds (alternating black/white key tint + row lines) */}
-            {rows.map((midi, idx) => (
-              <div
-                key={midi}
-                className={`absolute left-0 right-0 border-b ${isBlackKey(midi) ? 'bg-white/2' : 'bg-white/4'} ${midi % 12 === 0 ? 'border-white/10' : 'border-black/30'}`}
-                style={{ top: idx * NOTE_HEIGHT, height: NOTE_HEIGHT }}
-              />
-            ))}
+            <RowBackgrounds lowestNote={lowestNote} highestNote={highestNote} />
             {/* Vertical lines: bar lines strongest, then group starts, beats and
                 (when a step is wide enough) steps. */}
             <svg
@@ -1087,10 +1263,10 @@ export const PianoRoll: React.FC<{ stepPx: number; onStepPxChange: (px: number) 
               height={gridHeight}
               shapeRendering="crispEdges"
             >
-              {gridPaths.step && <path d={gridPaths.step} fill="none" strokeWidth={1} className="stroke-white/3" />}
-              <path d={gridPaths.beat} fill="none" strokeWidth={1} className="stroke-white/6" />
-              <path d={gridPaths.group} fill="none" strokeWidth={1} className="stroke-white/12" />
-              <path d={gridPaths.bar} fill="none" strokeWidth={1} className="stroke-white/20" />
+              {gridPaths.step && <path d={gridPaths.step} fill="none" strokeWidth={1} className="stroke-[rgb(var(--et-line)/0.03)]" />}
+              <path d={gridPaths.beat} fill="none" strokeWidth={1} className="stroke-[rgb(var(--et-line)/0.06)]" />
+              <path d={gridPaths.group} fill="none" strokeWidth={1} className="stroke-[rgb(var(--et-line)/0.12)]" />
+              <path d={gridPaths.bar} fill="none" strokeWidth={1} className="stroke-[rgb(var(--et-line)/0.2)]" />
             </svg>
             {/* Recorded-region highlight: marks the last live take without
                 shrinking the grid (the rest of the 256 stays empty). */}
@@ -1104,68 +1280,69 @@ export const PianoRoll: React.FC<{ stepPx: number; onStepPxChange: (px: number) 
               />
             )}
             {/* Loop ends: a dashed line where each looping lane starts over. The
-                tag sticks under the ruler while the grid scrolls; each lane's
-                tag sits a row lower so tags of nearby loops never overlap. */}
-            {loopEnds.map((l, i) => (
-              <div
-                key={l.id}
-                className="absolute top-0 bottom-0 w-0 border-l border-dashed border-[rgb(var(--et-ink)/0.5)] z-15 pointer-events-none"
-                style={{ left: l.cycleSteps * stepPx }}
-              >
-                <span
-                  className="sticky block w-max ml-1 px-1 py-0.5 rounded-sm bg-[#07050a]/90 text-[8px] leading-none font-mono font-semibold tracking-wider et-ink whitespace-nowrap"
-                  style={{ top: HEADER_HEIGHT + 4 + i * 16, marginTop: 4 + i * 16 }}
+                tag, the lane's swatch and its cycle in steps, sticks under the
+                ruler while the grid scrolls and sits between neighbouring loop
+                lines: right of its line, or left of it when the next line is too
+                close on the right and the left has room. Each lane's tag sits a
+                row lower so tags of nearby loops never overlap. Its title and
+                accessible name say it in words. */}
+            {loopEnds.map((l, i) => {
+              const { form } = laneOf(l.id);
+              const name = `Lane ${l.name} loops every ${l.cycleSteps} steps`;
+              const tagPx = 16 + 5 * String(l.cycleSteps).length;
+              const others = loopEnds.map((o) => o.cycleSteps);
+              const roomRight = (Math.min(totalSteps, ...others.filter((c) => c > l.cycleSteps)) - l.cycleSteps) * stepPx;
+              const roomLeft = (l.cycleSteps - Math.max(0, ...others.filter((c) => c < l.cycleSteps))) * stepPx;
+              const onLeft = roomRight < tagPx && roomLeft >= tagPx;
+              return (
+                <div
+                  key={l.id}
+                  className="absolute top-0 bottom-0 w-0 border-l border-dashed border-[rgb(var(--et-ink)/0.5)] z-15 pointer-events-none"
+                  style={{ left: l.cycleSteps * stepPx }}
                 >
-                  {l.name} loops · {l.cycleSteps}
-                </span>
-              </div>
-            ))}
-            {/* Playhead: a 1px line in the theme's primary ink, which holds
-                contrast on the grid and across the accent-filled notes. No glow. */}
-            {isPlaying && (
-              <div
-                className="absolute top-0 bottom-0 w-px bg-[rgb(var(--et-ink))] z-30 pointer-events-none"
-                style={{ left: currentStep * stepPx + stepPx / 2 }}
-              />
-            )}
-            {/* Lane repeats: drawn faint under the stored notes, never clicked,
-                and out of the accessibility tree (the stored note speaks for them). */}
-            <div aria-hidden="true" className="pointer-events-none">
-              {repeats.map((n) => {
-                if (n.note < lowestNote || n.note > highestNote) return null;
-                const { form } = laneOf(n.lane);
-                return (
-                  <div
-                    key={n.id}
-                    data-lane-repeat="1"
-                    className={`absolute rounded-sm border z-5 opacity-38 ${form.fill} ${form.edge}`}
-                    style={{
-                      ...form.style,
-                      left: n.step * stepPx,
-                      width: Math.max(4, n.length * stepPx - 1),
-                      top: (highestNote - n.note) * NOTE_HEIGHT + 1,
-                      height: NOTE_HEIGHT - 2,
-                    }}
-                  />
-                );
-              })}
-            </div>
+                  <span
+                    role="img"
+                    aria-label={name}
+                    title={name}
+                    data-loop-tag="1"
+                    className={`sticky flex w-max items-center gap-0.5 ${onLeft ? '-ml-0.5 -translate-x-full' : 'ml-0.5'} px-0.5 py-0.5 rounded-xs bg-[#0a080f] text-[8px] leading-none font-mono font-semibold et-ink tabular-nums whitespace-nowrap pointer-events-auto`}
+                    style={{ top: HEADER_HEIGHT + 4 + i * 16, marginTop: 4 + i * 16 }}
+                  >
+                    <span className={`w-2 h-2 rounded-xs border ${form.fill} ${form.edge}`} style={form.style} />
+                    {l.cycleSteps}
+                  </span>
+                </div>
+              );
+            })}
+            <RollPlayhead stepPx={stepPx} />
+            <LaneRepeats
+              repeats={repeats}
+              laneOf={laneOf}
+              stepPx={stepPx}
+              lowestNote={lowestNote}
+              highestNote={highestNote}
+              win={view}
+            />
             {/* Notes */}
             {notes.map((n) => {
               if (n.note < lowestNote || n.note > highestNote) return null;
+              if (n.step > view.to || n.step + n.length < view.from) return null;
               const row = highestNote - n.note;
               const left = n.step * stepPx;
-              const width = Math.max(4, n.length * stepPx - 1);
+              const lane = laneOf(n.lane);
+              // The form's minimum drawn width grows the note to the right only; its start and stored length stay.
+              const width = Math.max(lane.form.minPx, n.length * stepPx - 1);
               const top = row * NOTE_HEIGHT;
               const selected = n.id === selectedNoteId;
-              const lane = laneOf(n.lane);
               return (
                 <div
                   key={n.id}
                   data-piano-note="1"
                   onClick={(e) => {
                     e.stopPropagation();
-                    if (selectedNoteId === n.id) removeNote(n.id);
+                    const press = pressRef.current;
+                    pressRef.current = null;
+                    if (press?.id === n.id && press.wasSelected) removeNote(n.id);
                     else setSelectedNote(n.id);
                   }}
                   onPointerDown={(e) => onNotePointerDown(e, n, 'body')}

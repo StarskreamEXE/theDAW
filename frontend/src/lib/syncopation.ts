@@ -78,6 +78,9 @@ export function barSyncopation(positions: readonly number[], saliences: readonly
  * Scores for every bar before `totalSteps`. A note's salience is its velocity
  * over 127 (127 when it has none). Onsets round to the nearest step. The
  * pickup bar is scored against the end of a full bar of its meter.
+ *
+ * The notes go to their bars in one pass: sorted by step (a sorted list is
+ * used as it is), then walked alongside the bars, which are contiguous.
  */
 export function syncopationByBar(
   notes: readonly { step: number; velocity?: number }[],
@@ -85,22 +88,35 @@ export function syncopationByBar(
   totalSteps: number,
   pickupSteps = 0,
 ): BarSyncopation[] {
+  let sorted = notes.filter((nt) => Number.isFinite(nt.step));
+  for (let i = 1; i < sorted.length; i += 1) {
+    if (sorted[i].step < sorted[i - 1].step) {
+      sorted = sorted.sort((a, b) => a.step - b.step);
+      break;
+    }
+  }
+  const weightsOf = new Map<string, number[]>();
+  const salience = (nt: { velocity?: number }) => (typeof nt.velocity === 'number' ? nt.velocity : 127) / 127;
+  let next = 0;
   return bars(map, totalSteps, pickupSteps).map((b) => {
-    const full = metricalWeights(b.meter);
+    const key = `${b.meter.num}/${b.meter.den}/${b.meter.groups.join('+')}`;
+    let full = weightsOf.get(key);
+    if (!full) weightsOf.set(key, (full = metricalWeights(b.meter)));
     const size = Math.max(1, Math.ceil(b.len - EPS));
     const offset = b.bar < 0 ? Math.max(0, full.length - size) : 0;
     const weights = b.bar < 0 ? full.slice(offset) : full;
-    const inBar = notes.filter((nt) => nt.step >= b.start - EPS && nt.step < b.start + b.len - EPS);
-    const score = barSyncopation(
-      inBar.map((nt) => Math.round(nt.step - b.start)),
-      inBar.map((nt) => (typeof nt.velocity === 'number' ? nt.velocity : 127) / 127),
-      weights,
-      stepsPerBeat(b.meter),
-    );
+    while (next < sorted.length && sorted[next].step < b.start - EPS) next += 1;
+    const positions: number[] = [];
+    const saliences: number[] = [];
+    while (next < sorted.length && sorted[next].step < b.start + b.len - EPS) {
+      positions.push(Math.round(sorted[next].step - b.start));
+      saliences.push(salience(sorted[next]));
+      next += 1;
+    }
+    const score = barSyncopation(positions, saliences, weights, stepsPerBeat(b.meter));
     if (offset > 0 && score.onsets > 0) {
       // WNBD measures distance to the beat in full-bar positions.
-      const shifted = barSyncopation(inBar.map((nt) => Math.round(nt.step - b.start) + offset), inBar.map((nt) => (typeof nt.velocity === 'number' ? nt.velocity : 127) / 127), full, stepsPerBeat(b.meter));
-      score.wnbd = shifted.wnbd;
+      score.wnbd = barSyncopation(positions.map((p) => p + offset), saliences, full, stepsPerBeat(b.meter)).wnbd;
     }
     return { bar: b.bar, start: b.start, len: b.len, meter: b.meter, ...score };
   });
