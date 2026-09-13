@@ -203,7 +203,7 @@ function getUvCommand(): string {
 
 /** The venv root. Beside the project when the install dir is writable, in the
  *  per-user runtime dir when it is not. uv is pointed at it with
- *  UV_PROJECT_ENVIRONMENT (buildBackendEnv), which relocates the environment
+ *  UV_PROJECT_ENVIRONMENT (buildBaseEnv), which relocates the environment
  *  without moving the project. */
 function getVenvDir(): string {
   return path.join(getWritableRuntimeDir(), '.venv')
@@ -215,15 +215,19 @@ function venvPython(venvRoot: string): string {
     : path.join(venvRoot, 'bin', 'python')
 }
 
-// Environment for the backend + the uv sync step. Packaged builds prepend the
-// bundled tools dir (uv.exe, ffmpeg.exe, ffprobe.exe) to PATH so the backend's
-// audio I/O resolves ffmpeg without a system install. The PATH key is matched
-// case-insensitively because Windows exposes it as "Path".
-function buildBackendEnv(): NodeJS.ProcessEnv {
+// Environment for every process this main process starts. Packaged builds
+// prepend the bundled tools dir (uv.exe, ffmpeg.exe, ffprobe.exe) to PATH so the
+// backend's audio I/O resolves ffmpeg without a system install. The PATH key is
+// matched case-insensitively because Windows exposes it as "Path".
+//
+// It carries no launch token. uv sync runs package build scripts, so a
+// THEDAW_LAUNCH_TOKEN inherited from the launching shell is removed under every
+// spelling: Windows environment names ignore case.
+function buildBaseEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, SA3_SUPERVISOR_PRESENT: '1' }
-  // Always this process's token. A THEDAW_LAUNCH_TOKEN inherited from the
-  // launching shell is replaced, because the download hook sends LAUNCH_TOKEN.
-  env.THEDAW_LAUNCH_TOKEN = LAUNCH_TOKEN
+  for (const key of Object.keys(env)) {
+    if (key.toUpperCase() === 'THEDAW_LAUNCH_TOKEN') delete env[key]
+  }
   if (app.isPackaged) {
     const toolsDir = getToolsDir()
     const key = Object.keys(env).find((k) => k.toLowerCase() === 'path') ?? 'PATH'
@@ -257,10 +261,19 @@ function buildBackendEnv(): NodeJS.ProcessEnv {
   return env
 }
 
+// The backend's environment: the base plus this process's launch token, which
+// the download hook sends back. Only spawnBackend uses it. The backend starts
+// its own children with child_env (backend/lib/launch_token.py), which leaves
+// the token out.
+function buildBackendEnv(): NodeJS.ProcessEnv {
+  return { ...buildBaseEnv(), THEDAW_LAUNCH_TOKEN: LAUNCH_TOKEN }
+}
+
 function coreImportsOk(py: string): Promise<boolean> {
   return new Promise((resolve) => {
     try {
       const proc = spawn(py, ['-c', 'import uvicorn, fastapi'], {
+        env: buildBaseEnv(),
         stdio: 'ignore',
         windowsHide: true,
       })
@@ -279,9 +292,11 @@ function runUvSync(uvCmd: string, cwd: string): Promise<void> {
     // lock is generated with the build and must not be re-resolved on a user's
     // machine.
     log(`Running ${uvCmd} sync --frozen --group dev in ${cwd}`)
+    // The base environment: package build scripts run in this sync, and none of
+    // them may hold the launch token.
     const proc = spawn(uvCmd, ['sync', '--frozen', '--group', 'dev'], {
       cwd,
-      env: buildBackendEnv(),
+      env: buildBaseEnv(),
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     })
@@ -521,7 +536,7 @@ function killBackend(): Promise<void> {
 
       try {
         if (process.platform === 'win32') {
-          execFile('taskkill', ['/F', '/T', '/PID', String(pid)], (err) => {
+          execFile('taskkill', ['/F', '/T', '/PID', String(pid)], { env: buildBaseEnv() }, (err) => {
             if (err) log(`taskkill error: ${err.message}`)
             else log('taskkill /T completed.')
             settle()

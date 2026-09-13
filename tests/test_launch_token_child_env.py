@@ -13,6 +13,7 @@ import ast
 import asyncio
 import io
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -174,21 +175,26 @@ def _copies_os_environ(node: ast.AST) -> bool:
     return False
 
 
-def test_every_backend_spawn_names_its_environment() -> None:
-    """A spawn with no ``env`` inherits the token. A copy of ``os.environ``
-    carries it too, so the backend builds child environments only through
-    child_env."""
+def _tracked_backend_sources() -> list[str]:
+    """Every tracked .py file under backend/, relative to the repo root."""
     tracked = subprocess.run(
         ["git", "ls-files", "backend"],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
         check=True,
-    ).stdout.split()
+    ).stdout.splitlines()
+    return [rel for rel in tracked if rel.endswith(".py")]
+
+
+def test_every_backend_spawn_names_its_environment() -> None:
+    """A spawn with no ``env`` inherits the token. A copy of ``os.environ``
+    carries it too, so the backend builds child environments only through
+    child_env."""
     missing: list[str] = []
     copies: list[str] = []
-    for rel in tracked:
-        if not rel.endswith(".py") or rel in LAUNCHERS:
+    for rel in _tracked_backend_sources():
+        if rel in LAUNCHERS:
             continue
         tree = ast.parse((REPO_ROOT / rel).read_bytes())
         for call in _spawn_calls(tree):
@@ -199,6 +205,166 @@ def test_every_backend_spawn_names_its_environment() -> None:
                 copies.append(f"{rel}:{node.lineno}")
     assert missing == []
     assert copies == []
+
+
+def _os_startfile_uses(tree: ast.AST) -> list[int]:
+    """The lines that name ``os.startfile``, as an attribute or an import."""
+    lines: list[int] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "startfile"
+            and isinstance(node.value, ast.Name)
+            and node.value.id in {"os", "nt"}
+        ):
+            lines.append(node.lineno)
+        elif (
+            isinstance(node, ast.ImportFrom)
+            and node.module in {"os", "nt"}
+            and any(alias.name == "startfile" for alias in node.names)
+        ):
+            lines.append(node.lineno)
+    return sorted(lines)
+
+
+def test_no_backend_code_opens_a_path_with_os_startfile() -> None:
+    """os.startfile takes no environment, so whatever it launches inherits the
+    token. A route that opens a path starts Explorer, or backend.lib.reveal,
+    with child_env. The launchers are checked too."""
+    sample = "import os\nfrom os import startfile\nos.startfile('x')\n"
+    assert _os_startfile_uses(ast.parse(sample)) == [2, 3]
+
+    found = [
+        f"{rel}:{line}"
+        for rel in _tracked_backend_sources()
+        for line in _os_startfile_uses(ast.parse((REPO_ROOT / rel).read_bytes()))
+    ]
+    assert found == []
+
+
+# ---------------------------------------------------------------------------
+# /api/storage/open
+# ---------------------------------------------------------------------------
+
+
+def _storage_open_under(
+    monkeypatch: pytest.MonkeyPatch, models: Path
+) -> tuple[Any, _Spawns]:
+    """The storage router with ``models`` as its only open root, on Windows, and
+    its spawns recorded."""
+    from backend.modules.storage import router as storage_router
+
+    models.mkdir()
+    root = os.path.normpath(str(models)).lower()
+    monkeypatch.setattr(storage_router, "_allowed_open_roots", lambda: [root])
+    monkeypatch.setattr(storage_router.sys, "platform", "win32")
+    return storage_router, _Spawns().install(monkeypatch, storage_router)
+
+
+def test_opening_a_model_location_starts_explorer_without_the_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    models = tmp_path / "models"
+    storage_router, spawns = _storage_open_under(monkeypatch, models)
+
+    body = storage_router.OpenBody(path=str(models))
+    assert storage_router.storage_open(body) == {"opened": str(models)}
+    assert [(fn, cmd) for fn, cmd, _env in spawns.calls] == [
+        ("Popen", ["explorer", str(models)])
+    ]
+    _assert_clean(spawns.of("Popen"))
+
+
+def test_a_missing_or_escaping_location_starts_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from fastapi import HTTPException
+
+    models = tmp_path / "models"
+    storage_router, spawns = _storage_open_under(monkeypatch, models)
+    (tmp_path / "outside").mkdir()
+
+    answers = {
+        str(models / "gone"): 404,
+        # Under the root as typed, outside it once '..' is resolved.
+        os.path.join(str(models), "..", "outside"): 403,
+    }
+    for path, status in answers.items():
+        with pytest.raises(HTTPException) as refused:
+            storage_router.storage_open(storage_router.OpenBody(path=path))
+        assert refused.value.status_code == status, path
+    assert spawns.calls == []
+
+
+# ---------------------------------------------------------------------------
+# The desktop shell (electron-ui/main/index.ts)
+# ---------------------------------------------------------------------------
+
+ELECTRON_MAIN = REPO_ROOT / "electron-ui" / "main" / "index.ts"
+_TS_SPAWN = re.compile(
+    r"(?<![.\w])(spawn|spawnSync|execFile|execFileSync|exec|execSync|fork)\("
+)
+
+
+def _bracketed(source: str, start: int, opening: str, closing: str) -> str:
+    """The text from the ``opening`` bracket at ``start`` to its match."""
+    depth = 0
+    for i in range(start, len(source)):
+        if source[i] == opening:
+            depth += 1
+        elif source[i] == closing:
+            depth -= 1
+            if depth == 0:
+                return source[start : i + 1]
+    raise AssertionError(f"index.ts: no {closing!r} closes offset {start}")
+
+
+def _ts_function(source: str, name: str) -> tuple[int, int]:
+    """The offsets of the body of ``function name`` in ``source``."""
+    match = re.search(rf"\bfunction {name}\(", source)
+    assert match, f"index.ts has no function {name}"
+    start = source.index("{", match.end())
+    return start, start + len(_bracketed(source, start, "{", "}"))
+
+
+def test_the_desktop_shell_hands_the_token_only_to_the_backend() -> None:
+    """The main process starts uv sync, an import probe and taskkill as well as
+    the backend. uv sync runs package build scripts, so only spawnBackend uses
+    buildBackendEnv, and every other spawn gets buildBaseEnv, which drops an
+    inherited THEDAW_LAUNCH_TOKEN whatever its case."""
+    source = ELECTRON_MAIN.read_text(encoding="utf-8")
+    backend = _ts_function(source, "spawnBackend")
+    with_token = _ts_function(source, "buildBackendEnv")
+    base = _ts_function(source, "buildBaseEnv")
+
+    def within(span: tuple[int, int], offsets: list[int]) -> bool:
+        return bool(offsets) and all(span[0] <= at < span[1] for at in offsets)
+
+    token_set = [
+        m.start()
+        for m in re.finditer(r"THEDAW_LAUNCH_TOKEN\s*[:=]\s*LAUNCH_TOKEN\b", source)
+    ]
+    assert within(with_token, token_set)
+    backend_env_calls = [
+        m.start() for m in re.finditer(r"\bbuildBackendEnv\(\)(?!\s*:)", source)
+    ]
+    assert within(backend, backend_env_calls)
+    assert "const env = buildBackendEnv()" in source[slice(*backend)]
+
+    base_body = source[slice(*base)]
+    assert re.search(r"\.toUpperCase\(\)\s*===\s*'THEDAW_LAUNCH_TOKEN'", base_body)
+    assert "delete env[" in base_body
+    assert "env: buildBaseEnv()" in source[slice(*_ts_function(source, "runUvSync"))]
+
+    spawns = list(_TS_SPAWN.finditer(source))
+    assert spawns
+    for m in spawns:
+        args = _bracketed(source, m.end() - 1, "(", ")")
+        where = f"index.ts:{source.count(chr(10), 0, m.start()) + 1}"
+        if backend[0] <= m.start() < backend[1]:
+            assert re.search(r"\benv\b", args), where
+        else:
+            assert "env: buildBaseEnv()" in args, where
 
 
 # ---------------------------------------------------------------------------

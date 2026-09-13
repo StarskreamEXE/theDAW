@@ -1051,14 +1051,20 @@ def _allowed_open_roots() -> list[str]:
     distro = _wsl_distro()
     if distro:
         roots.append(f"\\\\wsl.localhost\\{distro}")
-    return [r.lower().rstrip("\\/") for r in roots]
+    return [os.path.normpath(r).lower().rstrip("\\/") for r in roots]
 
 
 @router.post("/open", dependencies=[Depends(refuse_cross_site)])
 def storage_open(body: OpenBody) -> dict:
-    """Open a location in Explorer. Only paths under a known location are allowed."""
+    """Open a location in Explorer. Only paths under a known location are allowed.
+
+    The check runs on the normalized path, so a ``..`` segment cannot step out
+    of a known location. Explorer is started with ``child_env``: it launches
+    whatever handles the path, and that program must not inherit the launch
+    token."""
     target = body.path.strip()
-    normalized = target.lower().rstrip("\\/")
+    location = os.path.normpath(target) if target else target
+    normalized = location.lower().rstrip("\\/")
     if not any(
         normalized == root
         or normalized.startswith(root + "\\")
@@ -1068,8 +1074,12 @@ def storage_open(body: OpenBody) -> dict:
         raise HTTPException(403, "That path is not one of theDAW's model locations.")
     if sys.platform != "win32":
         raise HTTPException(501, "Open-in-explorer is implemented for Windows only.")
+    # Explorer handed a missing path opens its default folder and reports
+    # nothing, so a missing location is answered here.
+    if not os.path.exists(location):
+        raise HTTPException(404, f"Could not open {target!r}: nothing is there.")
     try:
-        os.startfile(target)  # noqa: S606 — deliberate, validated against known roots
+        subprocess.Popen(["explorer", location], env=child_env())
     except OSError as e:
         raise HTTPException(404, f"Could not open {target!r}: {e}") from e
     return {"opened": target}

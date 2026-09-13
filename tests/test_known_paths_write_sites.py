@@ -4,8 +4,8 @@ known_paths is only as good as its callers: a project saved, a scene the cockpit
 saved, a plugin installed, a DAW set imported or a VJ take exported must each
 leave its path behind, so the next picker for that kind of file opens in the
 right folder and a Recent menu can hand the file back. A path a request body
-named is remembered as 'client' and never served. Each test drives the route
-the UI calls and then reads the store.
+named is remembered as 'client', never served, and never moves a picker folder.
+Each test drives the route the UI calls and then reads the store.
 """
 
 from __future__ import annotations
@@ -124,11 +124,52 @@ def test_a_saved_project_is_remembered_and_never_served(
         "client",
         False,
     )
-    assert known_paths.last_folder("tasmo") == str(songs)
+    # The body named the folder, so the project picker's folder is not moved.
+    assert "tasmo" not in _stored_folders(tmp_path)
     # A save can embed any file its body names, so its archive is never handed
     # back by /api/places/file.
     served = client.get("/api/places/file", params={"path": saved})
     assert served.status_code == 403
+
+
+def test_a_save_to_a_new_folder_leaves_the_project_picker_where_the_user_left_it(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The order the Session tab produces: the user picks a .tasmo from their
+    own folder, then a save names a folder that did not exist. The next project
+    dialog still opens in the user's folder."""
+    picked = tmp_path / "Gigs" / "Opener.tasmo"
+    picked.parent.mkdir()
+    TasmoFile.save(TasmoProject(project_name="Opener"), str(picked))
+    calls: list[dict[str, Any]] = []
+    answers = [str(picked), None]
+
+    def pick_open_file(**kwargs: Any) -> str | None:
+        calls.append(kwargs)
+        return answers.pop(0)
+
+    monkeypatch.setattr(folder_dialog, "picker_available", lambda: True)
+    monkeypatch.setattr(folder_dialog, "pick_open_file", pick_open_file)
+
+    chosen = client.post("/api/storage/pick-file", json={"kind": "tasmo"}).json()
+    assert chosen == {"path": str(picked), "cancelled": False}
+    assert known_paths.last_folder("tasmo") == str(picked.parent)
+
+    elsewhere = tmp_path / "Brand New" / "Folder"
+    saved = client.post(
+        "/api/project/save",
+        json={"project": _project("Fresh"), "path": str(elsewhere / "fresh")},
+    )
+    assert saved.status_code == 200, saved.text
+    assert (elsewhere / "fresh.tasmo").is_file()
+    assert [Path(e["path"]) for e in known_paths.recent(kind="tasmo")] == [
+        elsewhere / "fresh.tasmo",
+        picked,
+    ]
+    assert known_paths.last_folder("tasmo") == str(picked.parent)
+
+    client.post("/api/storage/pick-file", json={"kind": "tasmo"})
+    assert calls[1]["initial_dir"] == str(picked.parent)
 
 
 def test_an_opened_project_is_remembered_and_never_served(
@@ -512,6 +553,10 @@ def test_an_imported_daw_project_is_remembered_and_never_served(
     monkeypatch.setattr(
         "backend.modules.dawimport.reaper.parse_rpp", lambda path: _FakeProject()
     )
+    # Where the import dialog last landed.
+    picked_folder = tmp_path / "Picked Sets"
+    picked_folder.mkdir()
+    known_paths.record_folder("daw-project", picked_folder)
     rpp = tmp_path / "Sets" / "song.RPP"
     rpp.parent.mkdir()
     rpp.write_text("<REAPER_PROJECT>", encoding="utf-8")
@@ -526,7 +571,8 @@ def test_an_imported_daw_project_is_remembered_and_never_served(
         False,
     )
     assert known_paths.find_servable(rpp) is None
-    assert known_paths.last_folder("daw-project") == str(rpp.parent)
+    # The body named the file, so the import picker's folder is not moved.
+    assert known_paths.last_folder("daw-project") == str(picked_folder)
 
 
 def test_a_failed_import_is_not_remembered(
