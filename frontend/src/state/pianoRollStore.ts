@@ -137,7 +137,7 @@ const fitToNotes = (
   pickupSteps: number,
 ): { totalSteps: number; lowestNote: number; highestNote: number } => {
   const lastStep = notes.reduce((m, n) => Math.max(m, n.step + Math.max(1, n.length)), 0);
-  const totalSteps = Math.max(MIN_STEPS, Math.min(MAX_STEPS, roundUpToBar(meterMap, lastStep, pickupSteps)));
+  const totalSteps = Math.min(MAX_STEPS, roundUpToBar(meterMap, Math.max(MIN_STEPS, lastStep), pickupSteps));
   const lo = Math.max(0, Math.min(FULL_LOW, notes.reduce((m, n) => Math.min(m, n.note), 127) - 2));
   const hi = Math.min(127, Math.max(FULL_HIGH, notes.reduce((m, n) => Math.max(m, n.note), 0) + 2));
   return { totalSteps, lowestNote: lo, highestNote: hi };
@@ -215,9 +215,9 @@ export const usePianoRollStore = create<PianoRollState>()((set, get) => ({
         notes,
         ...m,
         bpm: Math.max(40, Math.min(240, bpm)),
-        totalSteps: Math.max(
-          MIN_STEPS,
-          Math.min(MAX_STEPS, Math.max(totalSteps, fit?.totalSteps ?? MIN_STEPS)),
+        totalSteps: Math.min(
+          MAX_STEPS,
+          roundUpToBar(m.meterMap, Math.max(MIN_STEPS, totalSteps, fit?.totalSteps ?? MIN_STEPS), m.pickupSteps),
         ),
         ...(fit ? { lowestNote: fit.lowestNote, highestNote: fit.highestNote } : {}),
         editingClipId: clipId,

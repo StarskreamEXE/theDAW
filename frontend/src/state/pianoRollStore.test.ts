@@ -55,6 +55,10 @@ const st = () => usePianoRollStore.getState();
   st().loadFromClip('c1', [note(0)], 120, 32);
   assert.deepEqual(st().meterMap, [{ bar: 0, meter: M78 }]);
   assert.equal(st().editingClipId, 'c1');
+  // A 32-step clip in 7/8 ends on the next bar line; a short import never ends mid-bar.
+  assert.equal(st().totalSteps, 42);
+  st().importNotes([note(0, 1)]);
+  assert.equal(st().totalSteps, 28);
   const saved = rollMeterOf(st());
   st().loadFromClip('c2', [note(0, 2, 2)], 120, 16, { meterMap: [{ bar: 0, meter: M44 }], pickupSteps: 0, lanes: [{ id: 2, name: 'C', cycleSteps: 6 }] });
   assert.deepEqual(st().lanes.map((l) => [l.id, l.cycleSteps]), [[0, null], [2, 6]]);
