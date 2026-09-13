@@ -112,10 +112,11 @@ g.document = {
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 
-// 1. Save As, then the bytes to the chosen path, then the status bar.
+// 1. Save As, then the bytes and the dialog's grant to the chosen path, then the
+//    status bar.
 calls = [];
 routes = {
-  '/api/storage/pick-save': () => json({ path: 'D:\\Exports\\riff.mid', cancelled: false }),
+  '/api/storage/pick-save': () => json({ path: 'D:\\Exports\\riff.mid', cancelled: false, grant: 'nonce-riff' }),
   '/api/places/save': () => json({ path: 'D:\\Exports\\riff.mid', kind: 'midi' }),
 };
 const saved = await saveFile({ blob: new Blob([new Uint8Array([1, 2, 3])]), suggestedName: 'riff.mid' });
@@ -126,9 +127,11 @@ assert.equal(pickBody.kind, 'midi');
 assert.equal(pickBody.initial_name, 'riff.mid');
 assert.equal(pickBody.default_ext, 'mid');
 assert.equal(pickBody.filter, 'MID file (*.mid)|*.mid|All files (*.*)|*.*');
+assert.equal(pickBody.initial_dir, undefined, 'no initialDir: the backend picks the last folder for the kind');
 const form = calls[1].init?.body as FormData;
 assert.equal(form.get('path'), 'D:\\Exports\\riff.mid');
 assert.equal(form.get('kind'), 'midi');
+assert.equal(form.get('grant'), 'nonce-riff', 'the write carries the grant the dialog answered with');
 assert.equal((form.get('file') as Blob).size, 3);
 assert.equal(useStatusBarStore.getState().text, 'SAVED: D:\\Exports\\riff.mid');
 
@@ -211,6 +214,38 @@ const remote = await saveFile({ url: '/api/audio/abc', suggestedName: 'take.wav'
 assert.deepEqual(remote, { path: null, cancelled: false, downloaded: true });
 assert.deepEqual(calls, []);
 assert.deepEqual(clickedDownload, { href: '/api/audio/abc', download: 'take.wav' });
+
+// 10. A file type the backend refuses: the dialog route's 400 reason reaches the
+//     status bar, and nothing is written or downloaded.
+(g.window as { location: { hostname: string } }).location.hostname = 'localhost';
+calls = [];
+clickedDownload = null;
+routes = {
+  '/api/storage/pick-save': () => json({ detail: 'That file type cannot be saved from theDAW.' }, 400),
+};
+const blocked = await saveFile({ blob: new Blob(['@echo off']), suggestedName: 'run.cmd' });
+assert.deepEqual(blocked, { path: null, cancelled: false, downloaded: false });
+assert.deepEqual(calls.map((c) => c.url), ['/api/storage/pick-save']);
+assert.equal(clickedDownload, null);
+assert.equal(useStatusBarStore.getState().text, 'SAVE FAILED: That file type cannot be saved from theDAW.');
+
+// 11. initialDir reaches the dialog.
+calls = [];
+routes = { '/api/storage/pick-save': () => json({ path: null, cancelled: true }) };
+await saveFile({ blob: new Blob(['x']), suggestedName: 'scene copy.sway', initialDir: 'C:\\Users\\me\\Downloads' });
+assert.equal(JSON.parse(String(calls[0].init?.body)).initial_dir, 'C:\\Users\\me\\Downloads');
+
+// 12. A dialog answer with no grant still sends the field, empty, so the
+//     backend refuses the write with its own reason.
+calls = [];
+routes = {
+  '/api/storage/pick-save': () => json({ path: 'D:\\Exports\\words.lrc', cancelled: false }),
+  '/api/places/save': () => json({ detail: 'That path was not chosen in a Save dialog.' }, 403),
+};
+const noGrant = await saveFile({ blob: new Blob(['la']), suggestedName: 'words.lrc' });
+assert.deepEqual(noGrant, { path: null, cancelled: false, downloaded: false });
+assert.equal((calls[1].init?.body as FormData).get('grant'), '');
+assert.equal(useStatusBarStore.getState().text, 'SAVE FAILED: That path was not chosen in a Save dialog.');
 
 globalThis.fetch = realFetch;
 delete g.window;

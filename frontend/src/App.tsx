@@ -196,6 +196,16 @@ export default function App() {
     void useModuleStore.getState().load();
   }, [isBackendReady]);
 
+  // Settle the projects folder once the backend first answers: a folder this
+  // browser chose reaches the backend, or the backend's folder replaces it, so
+  // asset installs and backups use the same folder from the start.
+  const projectsDirSettled = useRef(false);
+  useEffect(() => {
+    if (!isBackendReady || projectsDirSettled.current) return;
+    projectsDirSettled.current = true;
+    void useProjectStore.getState().ensureDefaultDir();
+  }, [isBackendReady]);
+
   // ONE device-change subscription for the whole app, plus the boot read of the
   // saved input/output choices. Idempotent — it only ever runs once. Waits for
   // the backend so the first /api/settings round trip lands rather than

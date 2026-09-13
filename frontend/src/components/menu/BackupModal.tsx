@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { Archive, FolderOpen, HardDriveDownload, HardDriveUpload, Loader2, X } from 'lucide-react';
 import { placesApi } from '../../lib/placesClient';
 import { BACKUP_ZIP_FILTER } from '../../lib/fileFilters';
+import { useProjectStore } from '../../state/projectStore';
 import { PathInput } from '../ui/PathInput';
 
 /* ------------------------------------------------------------------ */
@@ -191,6 +192,9 @@ export const BackupModal: React.FC<{ open: boolean; onClose: () => void }> = ({ 
   const loadManifest = useCallback(async () => {
     setManifestError(null);
     setRoots(null);
+    // The projects root is the backend's projects folder, so this browser's
+    // folder is settled with the backend before the manifest lists it.
+    await useProjectStore.getState().ensureDefaultDir();
     try {
       const res = await fetch('/api/backup/manifest');
       if (!res.ok) throw new Error(await errText(res));

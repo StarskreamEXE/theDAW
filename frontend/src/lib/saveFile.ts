@@ -1,10 +1,14 @@
 // Save a file where the user chooses, and remember where it went.
 //
 // On the machine the backend runs on, a save opens the native Save As dialog
-// (it starts in the folder last used for this kind of file), the bytes are
-// written to the chosen path by POST /api/places/save, and the path is shown in
-// the status bar. The backend records the path, so the next import control and
-// picker for that kind already know it.
+// (it starts in `initialDir`, else the folder last used for this kind of file),
+// the bytes are written to the chosen path by POST /api/places/save, and the
+// path is shown in the status bar. The dialog answers with a single-use grant,
+// and the write sends it back with the path. The backend records the path, so
+// the next import control and picker for that kind already know it.
+//
+// A file type the backend refuses to write (a script or an executable) makes
+// the dialog route answer 400, and the status bar shows its reason.
 //
 // A remote browser has no access to the backend machine's disk, and a platform
 // without a native dialog answers 501; both get an ordinary browser download. A
@@ -14,7 +18,7 @@
 // The suggested name is made safe for a Windows file name here, so callers can
 // pass a track title as it is.
 
-import { pickSave, storageErrorStatus } from './storageClient';
+import { pickSave, storageErrorStatus, type SavePickerResult } from './storageClient';
 import { isLocalClient, notifyPlacesChanged, basenameOf } from './placesClient';
 import { describeHttpError } from './httpError';
 import { useStatusBarStore } from '../state/statusBarStore';
@@ -31,6 +35,8 @@ export interface SaveFileOptions {
   /** Windows-style dialog filter, e.g. "MIDI (*.mid)|*.mid|All files (*.*)|*.*". */
   filter?: string;
   title?: string;
+  /** Folder the dialog opens in; the last folder for `kind` when omitted. */
+  initialDir?: string;
 }
 
 export interface SaveFileResult {
@@ -124,7 +130,7 @@ export async function saveFile(options: SaveFileOptions): Promise<SaveFileResult
   const kind = opts.kind ?? kindForName(opts.suggestedName);
   const ext = extOfName(opts.suggestedName);
 
-  let picked: { path: string | null; cancelled: boolean };
+  let picked: SavePickerResult;
   try {
     picked = await pickSave({
       kind,
@@ -132,6 +138,7 @@ export async function saveFile(options: SaveFileOptions): Promise<SaveFileResult
       defaultExt: ext ? ext.slice(1) : undefined,
       filter: opts.filter ?? defaultFilter(ext),
       title: opts.title,
+      initialDir: opts.initialDir || undefined,
     });
   } catch (e) {
     if (storageErrorStatus(e) === 501) return anchorDownload(opts);
@@ -152,6 +159,7 @@ export async function saveFile(options: SaveFileOptions): Promise<SaveFileResult
     form.append('file', blob, opts.suggestedName);
     form.append('path', picked.path);
     form.append('kind', kind);
+    form.append('grant', picked.grant ?? '');
     const res = await fetch('/api/places/save', { method: 'POST', body: form });
     if (res.status === 501 || res.status === 404) return anchorDownload({ ...opts, blob });
     if (!res.ok) throw new Error(await describeHttpError(res));

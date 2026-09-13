@@ -217,7 +217,8 @@ def import_owl(req: ImportOwlRequest) -> dict:
     gan_path = _gan_path(manifest.id)
     manifest_dict = GanFile.save(manifest, assets, str(gan_path))
     _publish_runtime(gan_path, manifest.id)
-    known_paths.record(gan_path, kind="gan", source="gan")
+    # The shelf copy joins Recent, and the .gan picker keeps the user's folder.
+    known_paths.record(gan_path, kind="gan", source="gan", update_folder=False)
 
     return {
         "manifest": manifest_dict,
@@ -297,7 +298,9 @@ def open_plugin(req: OpenRequest) -> dict:
         if src.resolve() != dest.resolve():
             GanFile.install(str(src), str(dest))
         _publish_runtime(dest, pid)
-        known_paths.record(dest, kind="gan", source="gan")
+        # The pick already made the user's folder the .gan folder; the shelf
+        # copy joins Recent without moving it.
+        known_paths.record(dest, kind="gan", source="gan", update_folder=False)
         return {
             "manifest": manifest,
             "entry_url": _entry_url(pid, manifest),
@@ -387,6 +390,9 @@ def reveal_path(req: RevealRequest) -> dict:
         shown = reveal_lib.reveal(req.path)
     except FileNotFoundError:
         raise HTTPException(404, f"Not found: {req.path}")
+    except ValueError as e:
+        # A network share or device path, refused before anything touches it.
+        raise HTTPException(400, str(e))
     except OSError as e:
         raise HTTPException(500, f"Reveal failed: {e}")
     return {"status": "ok", "path": shown}

@@ -25,6 +25,9 @@ import { LyricsEditor } from './LyricsEditor';
 const PitchLane = React.lazy(() => import('./PitchLane'));
 
 const LYRICS_RECENT_EXTS = ['.lrc', '.txt'];
+// The lyrics export saves under this kind, so a saved log or other .txt the
+// app wrote stays out of the list.
+const LYRICS_RECENT_KINDS = ['lyrics'];
 
 /** The export's file name, slugged the way backend/modules/lyrics/service.py
  *  names the download. */
@@ -374,7 +377,7 @@ export const SingView: React.FC = () => {
             <button type="button" className="btn-ghost text-[8px] py-1 px-2 border border-rose-500/40 text-rose-200" onClick={() => void applyImport()} disabled={!importDraft.trim()}>IMPORT PASTED</button>
             <label htmlFor="sing-import-file" className="text-zinc-500">or a file</label>
             <input id="sing-import-file" name="sing-import-file" type="file" accept=".lrc,.txt" className="text-[9px]" onChange={(e) => void onImportFiles(Array.from(e.target.files ?? []))} />
-            <KnownFilesMenu id="sing-import-recent" exts={LYRICS_RECENT_EXTS} label="Recent lyrics" onFiles={(files) => void onImportFiles(files)} />
+            <KnownFilesMenu id="sing-import-recent" exts={LYRICS_RECENT_EXTS} kinds={LYRICS_RECENT_KINDS} label="Recent lyrics" onFiles={(files) => void onImportFiles(files)} />
             <button type="button" className="btn-ghost text-[8px] py-1 px-2 ml-auto" onClick={() => setImportOpen(false)}>CLOSE</button>
           </div>
         </div>

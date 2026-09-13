@@ -8,6 +8,8 @@ import {
   type TasmoTrackInput,
 } from '../lib/projectClient';
 import { placesApi } from '../lib/placesClient';
+import { decideProjectsDir, looksAbsolute, type BackendProjectsDir } from '../lib/projectsDirSync';
+import { mergeRecentProjects } from '../lib/recentProjects';
 import type { PerformRoutingSnapshot } from './performRouting';
 import { logError, logInfo, logWarn } from './logStore';
 import { useStatusBarStore } from './statusBarStore';
@@ -65,8 +67,9 @@ interface ProjectState {
 }
 
 const PROJECTS_DIR_KEY = 'thedaw-projects-dir';
-// Set once this browser's folder has reached the backend. From then on the
-// backend's projects folder is the one every client and asset install uses.
+// Set once this browser's folder has reached the backend, or the backend's
+// folder has replaced it. From then on the backend's projects folder is the one
+// every client and asset install uses.
 const PROJECTS_DIR_SYNCED_KEY = 'thedaw-projects-dir-synced';
 
 const readLocal = (key: string): string => {
@@ -86,9 +89,6 @@ const writeLocal = (key: string, value: string) => {
 };
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
-
-// A drive or UNC path, or a POSIX root. The backend refuses a relative folder.
-const looksAbsolute = (p: string) => /^(?:[a-zA-Z]:[\\/]|[\\/])/.test(p);
 
 const applyDefaultDir = (dir: string) => {
   writeLocal(PROJECTS_DIR_KEY, dir);
@@ -113,6 +113,61 @@ const pushProjectsDir = (dir: string) => {
     );
   }, PUSH_DELAY_MS);
 };
+
+// Boot, an asset install, the backup dialog and a save prefill can all ask at
+// once; they share one read, so a handover is never sent twice.
+let ensureInFlight: Promise<void> | null = null;
+
+// The backend holds the projects folder, so asset installs and every client
+// use the same one. decideProjectsDir says whether this browser shows the
+// backend's folder or hands its own over.
+async function syncProjectsDir(): Promise<void> {
+  const state = () => useProjectStore.getState();
+  const before = state().defaultDir;
+  let backend: BackendProjectsDir;
+  try {
+    const res = await placesApi.projectsDir();
+    backend = {
+      path: typeof res?.path === 'string' ? res.path : '',
+      configured: res?.configured === true,
+    };
+  } catch {
+    // A backend without /api/places: keep this browser's folder, or take the
+    // project module's default.
+    if (state().defaultDir.trim()) return;
+    try {
+      const res = await projectApi.defaultDir();
+      if (res?.path && !state().defaultDir.trim()) applyDefaultDir(res.path);
+    } catch {
+      /* no backend default available */
+    }
+    return;
+  }
+  // The user changed the folder while the request ran; that edit is the one
+  // on its way to the backend.
+  if (state().defaultDir !== before || pushTimer) return;
+  const decision = decideProjectsDir({
+    local: before,
+    backend,
+    synced: Boolean(readLocal(PROJECTS_DIR_SYNCED_KEY)),
+  });
+  if (decision.push) {
+    try {
+      const stored = await placesApi.setProjectsDir(decision.push);
+      writeLocal(PROJECTS_DIR_SYNCED_KEY, '1');
+      if (state().defaultDir === before) applyDefaultDir(stored);
+    } catch (e) {
+      // Keep this browser's folder and try again the next time it is needed.
+      logWarn('project', `Projects folder ${decision.push} was not stored: ${errMsg(e)}`);
+    }
+    return;
+  }
+  if (decision.markSynced) writeLocal(PROJECTS_DIR_SYNCED_KEY, '1');
+  if (decision.show && decision.show !== before) applyDefaultDir(decision.show);
+}
+
+// A slower, older refresh must not replace the list a newer one set.
+let recentSeq = 0;
 
 const status = (text: string) => useStatusBarStore.getState().setText(text);
 
@@ -171,48 +226,15 @@ export const useProjectStore = create<ProjectState>()((set, get) => ({
     pushProjectsDir(defaultDir);
   },
 
-  // The backend holds the projects folder, so asset installs and every client
-  // use the same one. A folder this browser chose before the backend kept one
-  // is handed over once; after that the backend's folder is shown here.
-  ensureDefaultDir: async () => {
-    const before = get().defaultDir;
-    let backendDir: string;
-    try {
-      backendDir = (await placesApi.projectsDir()).trim();
-    } catch {
-      // A backend without /api/places: keep this browser's folder, or take the
-      // project module's default.
-      if (get().defaultDir.trim()) return;
-      try {
-        const res = await projectApi.defaultDir();
-        if (res?.path && !get().defaultDir.trim()) applyDefaultDir(res.path);
-      } catch {
-        /* no backend default available */
-      }
-      return;
+  ensureDefaultDir: () => {
+    if (!ensureInFlight) {
+      ensureInFlight = syncProjectsDir()
+        .catch((e: unknown) => logWarn('project', `Projects folder was not read: ${errMsg(e)}`))
+        .finally(() => {
+          ensureInFlight = null;
+        });
     }
-    // The user changed the folder while the request ran; that edit is the one
-    // on its way to the backend.
-    if (get().defaultDir !== before || pushTimer) return;
-    const localDir = before.trim();
-    if (
-      localDir &&
-      localDir !== backendDir &&
-      looksAbsolute(localDir) &&
-      !readLocal(PROJECTS_DIR_SYNCED_KEY)
-    ) {
-      try {
-        const stored = await placesApi.setProjectsDir(localDir);
-        writeLocal(PROJECTS_DIR_SYNCED_KEY, '1');
-        if (get().defaultDir === before) applyDefaultDir(stored);
-      } catch (e) {
-        // Keep this browser's folder and try again the next time it is needed.
-        logWarn('project', `Projects folder ${localDir} was not stored: ${errMsg(e)}`);
-      }
-      return;
-    }
-    writeLocal(PROJECTS_DIR_SYNCED_KEY, '1');
-    if (backendDir && backendDir !== before) applyDefaultDir(backendDir);
+    return ensureInFlight;
   },
 
   // Prefill the save path from the default folder + project name, so the user can
@@ -229,13 +251,24 @@ export const useProjectStore = create<ProjectState>()((set, get) => ({
     set({ savePath: `${base}${name}.tasmo` });
   },
 
+  // Every .tasmo the app wrote or opened: the project router's list, plus the
+  // .tasmo files known places holds, such as a Save a copy of a project asset.
   refreshRecent: async () => {
-    try {
-      const recent = await projectApi.recent();
-      set({ recent });
-    } catch (e) {
-      logError('project', e instanceof Error ? e.message : 'Failed to list recent projects.');
-    }
+    const seq = ++recentSeq;
+    const [projects, places] = await Promise.all([
+      projectApi.recent().then(
+        (rows) => (Array.isArray(rows) ? rows : []),
+        (e: unknown) => {
+          logError('project', e instanceof Error ? e.message : 'Failed to list recent projects.');
+          return null;
+        },
+      ),
+      placesApi.recent({ exts: ['.tasmo'] }),
+    ]);
+    if (seq !== recentSeq) return;
+    // Neither list answered: keep the rows already shown.
+    if (projects === null && places.length === 0) return;
+    set({ recent: mergeRecentProjects(projects ?? [], places) });
   },
 
   save: async () => {

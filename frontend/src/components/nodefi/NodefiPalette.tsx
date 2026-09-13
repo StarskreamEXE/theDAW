@@ -22,6 +22,12 @@ import { logError, logInfo } from '../../state/logStore';
 import { saveFile } from '../../lib/saveFile';
 import { KnownFilesMenu } from '../ui/KnownFilesMenu';
 
+// A set export is recorded under its own kind, so the Recent list beside
+// Import set offers set files and no other JSON the app saved.
+const NODEFI_SET_KIND = 'nodefi-set';
+const NODEFI_SET_KINDS = [NODEFI_SET_KIND];
+const NODEFI_SET_EXTS = ['.json'];
+
 interface NodefiPaletteProps {
   onAdd: (kind: NodeKind) => void;
   /** Press on a tile — the view takes over pointer tracking + the goo strand. */
@@ -129,7 +135,7 @@ export function NodefiPalette({ onAdd, onOrbDown, onLoadTemplate, onLoadSet }: N
   const exportSet = (s: SavedNodeSet) => {
     const blob = new Blob([JSON.stringify(setToFile(s), null, 2)], { type: 'application/json' });
     const stem = (s.name || 'set').replace(/[^\w \-.]/g, '').trim() || 'set';
-    void saveFile({ blob, suggestedName: `${stem}.nodefi.json`, kind: 'json' });
+    void saveFile({ blob, suggestedName: `${stem}.nodefi.json`, kind: NODEFI_SET_KIND });
   };
 
   // Fed by the file input and the Recent list alike.
@@ -315,7 +321,8 @@ export function NodefiPalette({ onAdd, onOrbDown, onLoadTemplate, onLoadSet }: N
             </button>
             <KnownFilesMenu
               id="nodefi-set-import-recent"
-              exts={['.json']}
+              exts={NODEFI_SET_EXTS}
+              kinds={NODEFI_SET_KINDS}
               label="Recent"
               onFiles={(files) => void importSetFiles(files)}
             />

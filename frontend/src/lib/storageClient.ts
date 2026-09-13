@@ -73,6 +73,11 @@ export interface PathPickerResult {
   cancelled: boolean;
 }
 
+export interface SavePickerResult extends PathPickerResult {
+  /** Single-use nonce POST /api/places/save needs to write the chosen path. */
+  grant?: string | null;
+}
+
 export interface ModelOptionStatus {
   id: string;
   label: string;
@@ -227,9 +232,10 @@ export async function pickSave(opts?: {
   initialName?: string;
   defaultExt?: string;
   kind?: string;
-}): Promise<PathPickerResult> {
+}): Promise<SavePickerResult> {
   // Native Save As dialog. The chosen path is granted one write through
-  // POST /api/places/save, so a save can land where the user pointed it.
+  // POST /api/places/save, and `grant` is the nonce that write must carry. A
+  // file type the backend refuses to write answers 400 with its reason.
   return json(
     await fetch('/api/storage/pick-save', {
       method: 'POST',

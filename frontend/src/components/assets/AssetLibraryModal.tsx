@@ -126,14 +126,48 @@ const DEFAULT_PRIMARY: PrimaryAction = {
   hint: (where) => `INSTALL puts it in ${where} and shows it in its folder.`,
 };
 
-/** The file name Save a copy offers: the installed copy's, else name + format. */
+/** The file name Save a copy offers. An installed asset gets '<stem> copy<ext>',
+ *  so accepting the dialog never overwrites the installed file; any other asset
+ *  gets its name plus its format. */
 const copyName = (asset: Asset, installedPath: string | null): string => {
-  if (installedPath) return basenameOf(installedPath);
+  if (installedPath) {
+    const file = basenameOf(installedPath);
+    const dot = file.lastIndexOf('.');
+    const stem = dot > 0 ? file.slice(0, dot) : file;
+    const ext = dot > 0 ? file.slice(dot) : asset.format;
+    return `${stem} copy${ext}`;
+  }
   const base = asset.name.replace(/[\\/:*?"<>|]+/g, '').trim() || asset.id;
   return `${base}${asset.format}`;
 };
 
 const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+/** Resolves on the next animation frame, or after 100 ms when frames are paused. */
+const nextFrame = (): Promise<void> =>
+  new Promise((resolve) => {
+    const done = () => resolve();
+    requestAnimationFrame(done);
+    window.setTimeout(done, 100);
+  });
+
+/**
+ * Leaving EDIT unmounts its effect windows, and their cleanup closes the gan
+ * session an EDIT insert owns. That cleanup can run after the frame OPEN IN MIX
+ * waits for, so the session is released here before the plugin opens. EDIT's
+ * module is already loaded whenever EDIT is the tab being left.
+ */
+const releaseEditGanSession = async (): Promise<void> => {
+  try {
+    const { useEffectWindowStore } = await import('../audio/EffectWindows');
+    const fx = useEffectWindowStore.getState();
+    if (!fx.aresOwnerEntryId) return;
+    useGanStore.getState().close();
+    fx.setAresOwner(null, null);
+  } catch (e) {
+    logError('assets', `Could not release the EDIT plugin session: ${errText(e)}`);
+  }
+};
 
 interface Rect {
   x: number;
@@ -358,6 +392,9 @@ export const AssetLibraryModal: React.FC<{ open: boolean; onClose: () => void }>
     async (asset: Asset) => {
       setInstalling(true);
       try {
+        // A project installs into the backend's projects folder, so this
+        // browser's folder is settled with the backend first.
+        await useProjectStore.getState().ensureDefaultDir();
         const r = await fetch(`/api/assets/${encodeURIComponent(asset.id)}/install`, {
           method: 'POST',
         });
@@ -388,12 +425,15 @@ export const AssetLibraryModal: React.FC<{ open: boolean; onClose: () => void }>
           const stage = useMixStageStore.getState();
           stage.setActiveModuleId(null);
           stage.setActiveMagentaId(null);
-          // openById marks the plugin active before its first await, so MIX
-          // mounts with it already open.
-          const opening = useGanStore.getState().openById(pluginId);
-          useAppUiStore.getState().setCenterTab('mix');
+          // MIX first. Leaving EDIT unmounts its effect windows, and a plugin
+          // opened before that unmount would be closed by their cleanup.
+          const ui = useAppUiStore.getState();
+          const leavingEdit = ui.centerTab === 'edit';
+          ui.setCenterTab('mix');
           onClose();
-          await opening;
+          await nextFrame();
+          if (leavingEdit) await releaseEditGanSession();
+          await useGanStore.getState().openById(pluginId);
         } else if (assetKind === 'scene') {
           const stem = basenameOf(j.path).replace(/\.sway$/i, '');
           if (await openSwayScene(stem)) onClose();
@@ -414,11 +454,15 @@ export const AssetLibraryModal: React.FC<{ open: boolean; onClose: () => void }>
     const suggestedName = copyName(asset, installedPath);
     setSaving(true);
     try {
+      // A copy of an installed file starts in the downloads folder, away from
+      // the installed copy.
+      const initialDir = installedPath ? ((await placesApi.folder('download')) ?? undefined) : undefined;
       await saveFile({
         url: asset.download_url,
         suggestedName,
         kind: kindForName(suggestedName),
         title: `Save a copy of ${asset.name}`,
+        initialDir,
       });
     } finally {
       setSaving(false);

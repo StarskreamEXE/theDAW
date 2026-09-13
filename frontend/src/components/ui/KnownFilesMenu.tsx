@@ -5,7 +5,8 @@
  * wrote or picked (a save, a finished download, an asset install, a native
  * pick); this lists the ones it will serve that match the input's extensions,
  * and choosing one hands the same handler the input feeds a real File. Each row
- * can also show its file in the OS file manager.
+ * can also show its file in the OS file manager. With several `kinds`, each
+ * kind is fetched and the rows are merged, one per path, newest first.
  *
  * Renders nothing until there is at least one matching file, and refetches
  * when it opens, when the window regains focus, and whenever a save or a
@@ -86,15 +87,9 @@ export const KnownFilesMenu: React.FC<KnownFilesMenuProps> = ({
     const seq = ++seqRef.current;
     const extList = extKey ? extKey.split(',') : [];
     const kindList = kindKey ? kindKey.split(',') : [];
-    const rows = await placesApi.recent({
-      kind: kindList.length === 1 ? kindList[0] : undefined,
-      exts: extList,
-      limit: kindList.length > 1 ? 60 : 30,
-    });
+    const rows = await placesApi.recentOfKinds({ kinds: kindList, exts: extList, limit: 30 });
     if (seq !== seqRef.current) return;
-    const matched = rows
-      .filter((r) => r.servable && (kindList.length === 0 || kindList.includes(r.kind)))
-      .slice(0, MAX_ROWS);
+    const matched = rows.filter((r) => r.servable).slice(0, MAX_ROWS);
     setItems(matched);
     if (matched.length === 0) setOpen(false);
   }, [extKey, kindKey]);
@@ -260,7 +255,7 @@ export const KnownFilesMenu: React.FC<KnownFilesMenuProps> = ({
         aria-expanded={open}
         aria-controls={open ? listId : undefined}
         aria-label={menuName}
-        title="Lists files this app saved or downloaded recently."
+        title="Lists recent files this app saved, installed, opened or downloaded."
         className={`shrink-0 inline-flex items-center justify-center gap-1.5 rounded border border-white/10 bg-white/5 px-2 py-1 text-[9px] font-black uppercase tracking-widest text-zinc-300 hover:border-purple-400/40 hover:bg-purple-500/15 hover:text-purple-100 transition-colors ${className}`}
       >
         <History className="w-3 h-3" />

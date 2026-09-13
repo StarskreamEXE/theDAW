@@ -15,6 +15,9 @@ interface RecordingHistoryProps {
 
 const RECENT_ID = 'vocal2midi-history-recent';
 const RECENT_EXTS = ['.json'];
+// Vocal2MidiPanel saves its recordings export under this kind, so the list
+// offers those files and no other JSON the app saved.
+const RECENT_KINDS = ['v2m-recordings'];
 
 export const RecordingHistory: React.FC<RecordingHistoryProps> = ({
   recordings,
@@ -83,7 +86,7 @@ export const RecordingHistory: React.FC<RecordingHistoryProps> = ({
             <span className="text-xs text-gray-400">Recording History</span>
           </div>
           <div className="flex items-center gap-2">
-            <KnownFilesMenu id={RECENT_ID} exts={RECENT_EXTS} onFiles={(files) => void importFiles(files)} />
+            <KnownFilesMenu id={RECENT_ID} exts={RECENT_EXTS} kinds={RECENT_KINDS} onFiles={(files) => void importFiles(files)} />
             <button
               type="button"
               onClick={handleImportClick}
@@ -116,7 +119,7 @@ export const RecordingHistory: React.FC<RecordingHistoryProps> = ({
         </button>
 
         <div className="flex items-center gap-2">
-          <KnownFilesMenu id={RECENT_ID} exts={RECENT_EXTS} onFiles={(files) => void importFiles(files)} />
+          <KnownFilesMenu id={RECENT_ID} exts={RECENT_EXTS} kinds={RECENT_KINDS} onFiles={(files) => void importFiles(files)} />
           <button
             type="button"
             onClick={handleImportClick}

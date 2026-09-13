@@ -3,8 +3,9 @@
 known_paths is only as good as its callers: a project saved, a scene the cockpit
 saved, a plugin installed, a DAW set imported or a VJ take exported must each
 leave its path behind, so the next picker for that kind of file opens in the
-right folder and a Recent menu can hand the file back. Each test drives the
-route the UI calls and then reads the store.
+right folder and a Recent menu can hand the file back. A path a request body
+named is remembered as 'client' and never served. Each test drives the route
+the UI calls and then reads the store.
 """
 
 from __future__ import annotations
@@ -47,6 +48,8 @@ FOUNDRY_PROJECT = {
     ],
 }
 
+SHARE = "\\\\attacker\\share\\x.gan"
+
 
 @pytest.fixture
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
@@ -81,6 +84,11 @@ def _only(kind: str) -> dict[str, Any]:
     return items[0]
 
 
+def _stored_folders(tmp_path: Path) -> dict[str, str]:
+    store = tmp_path / "state" / "known_paths.json"
+    return json.loads(store.read_text(encoding="utf-8"))["folders"]
+
+
 def _project(name: str) -> dict[str, Any]:
     return TasmoProject(project_name=name, tempo=120.0).model_dump(mode="json")
 
@@ -97,7 +105,9 @@ def _foundry_export(folder: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def test_a_saved_project_is_remembered(client: TestClient, tmp_path: Path) -> None:
+def test_a_saved_project_is_remembered_and_never_served(
+    client: TestClient, tmp_path: Path
+) -> None:
     songs = tmp_path / "Songs"
     resp = client.post(
         "/api/project/save",
@@ -110,20 +120,39 @@ def test_a_saved_project_is_remembered(client: TestClient, tmp_path: Path) -> No
     entry = _only("tasmo")
     assert (entry["path"], entry["source"], entry["servable"]) == (
         str(songs / "kept.tasmo"),
-        "project",
-        True,
+        "client",
+        False,
     )
     assert known_paths.last_folder("tasmo") == str(songs)
+    # A save can embed any file its body names, so its archive is never handed
+    # back by /api/places/file.
+    served = client.get("/api/places/file", params={"path": saved})
+    assert served.status_code == 403
 
 
-def test_an_opened_project_is_remembered(client: TestClient, tmp_path: Path) -> None:
+def test_an_opened_project_is_remembered_and_never_served(
+    client: TestClient, tmp_path: Path
+) -> None:
     path = tmp_path / "Gig" / "set.tasmo"
     path.parent.mkdir()
     TasmoFile.save(TasmoProject(project_name="Set"), str(path))
 
     assert client.post("/api/project/load", json={"path": str(path)}).status_code == 200
-    assert _only("tasmo")["path"] == str(path)
-    assert known_paths.find_servable(path) == str(path)
+    entry = _only("tasmo")
+    assert (entry["path"], entry["source"]) == (str(path), "client")
+    assert known_paths.find_servable(path) is None
+
+
+def test_an_installed_project_stays_servable_after_it_is_opened(
+    client: TestClient, tmp_path: Path
+) -> None:
+    path = tmp_path / "Projects" / "demo.tasmo"
+    path.parent.mkdir()
+    TasmoFile.save(TasmoProject(project_name="Demo"), str(path))
+    known_paths.record(path, source="install")
+
+    assert client.post("/api/project/load", json={"path": str(path)}).status_code == 200
+    assert (_only("tasmo")["source"], _only("tasmo")["servable"]) == ("install", True)
 
 
 def test_a_project_that_fails_to_open_is_not_remembered(
@@ -254,12 +283,79 @@ def test_a_scene_name_cannot_reach_outside_the_scene_folder(
     assert client.get("/api/sway/project").status_code == 422
 
 
+def test_a_scene_theDAW_may_serve_opens_by_path(
+    client: TestClient, tmp_path: Path
+) -> None:
+    doc = {"version": 1, "scenes": [{"name": "Intro"}]}
+    saved = client.post("/api/sway/project-save", json={"name": "Set", "doc": doc})
+    saved_path = saved.json()["path"]
+    body = client.get("/api/sway/project", params={"path": saved_path}).json()
+    assert body == {"name": "Set", "path": saved_path, "doc": doc}
+
+    # A copy the user saved through a Save dialog, outside the scene folder.
+    copy = tmp_path / "Desktop" / "Set copy.sway"
+    copy.parent.mkdir()
+    copy.write_text(json.dumps({"copy": True}), encoding="utf-8")
+    known_paths.record(copy, source="save")
+    body = client.get("/api/sway/project", params={"path": str(copy)}).json()
+    assert body == {"name": "Set copy", "path": str(copy), "doc": {"copy": True}}
+
+
+def test_a_scene_path_theDAW_may_not_serve_is_refused_alike(
+    client: TestClient, tmp_path: Path
+) -> None:
+    def write(path: Path) -> Path:
+        path.write_text('{"secret": "scene"}', encoding="utf-8")
+        return path
+
+    never = write(tmp_path / "never.sway")
+    typed = write(tmp_path / "typed.sway")
+    known_paths.record(typed, source="client")
+    gone = write(tmp_path / "gone.sway")
+    known_paths.record(gone, source="save")
+    gone.unlink()
+    not_a_scene = write(tmp_path / "chart.json")
+    known_paths.record(not_a_scene, source="save")
+
+    answers = [
+        client.get("/api/sway/project", params={"path": str(p)})
+        for p in (never, typed, gone, not_a_scene, tmp_path / "missing.sway", "")
+    ]
+    assert {r.status_code for r in answers} == {403}
+    assert len({r.text for r in answers}) == 1
+    assert "secret" not in answers[0].text
+    assert str(tmp_path) not in answers[0].text
+
+    # A path wins over a name, so a name cannot open what the path may not.
+    (tmp_path / "sway-projects").mkdir()
+    write(tmp_path / "sway-projects" / "Listed.sway")
+    both = client.get(
+        "/api/sway/project", params={"name": "Listed", "path": str(never)}
+    )
+    assert both.status_code == 403
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [{"sec-fetch-site": "cross-site"}, {"origin": "https://evil.example"}],
+)
+def test_a_page_on_another_site_cannot_read_a_scene(
+    client: TestClient, headers: dict[str, str]
+) -> None:
+    doc = {"scenes": [{"name": "Private"}]}
+    saved = client.post("/api/sway/project-save", json={"name": "Set", "doc": doc})
+    for params in ({"name": "Set"}, {"path": saved.json()["path"]}):
+        resp = client.get("/api/sway/project", params=params, headers=headers)
+        assert resp.status_code == 403
+        assert "Private" not in resp.text
+
+
 # ---------------------------------------------------------------------------
 # .gan plugins
 # ---------------------------------------------------------------------------
 
 
-def test_opening_a_gan_by_path_remembers_the_installed_copy(
+def test_opening_a_gan_by_path_remembers_the_shelf_copy_and_keeps_the_folder(
     client: TestClient, tmp_path: Path
 ) -> None:
     manifest, assets = import_vst_foundry(
@@ -268,29 +364,33 @@ def test_opening_a_gan_by_path_remembers_the_installed_copy(
     picked = tmp_path / "Downloads" / "picked.gan"
     picked.parent.mkdir()
     GanFile.save(manifest, assets, str(picked))
+    # The .gan picker records the user's file first.
+    known_paths.record(picked, source="pick")
 
     body = client.post("/api/plugin/open", json={"path": str(picked)}).json()
     installed = tmp_path / "plugins" / f"{manifest.id}.gan"
     assert body["gan_path"] == str(installed)
 
-    entry = _only("gan")
-    assert (entry["path"], entry["source"], entry["servable"]) == (
+    newest = known_paths.recent(kind="gan")[0]
+    assert (newest["path"], newest["source"], newest["servable"]) == (
         str(installed),
         "gan",
         True,
     )
+    assert known_paths.last_folder("gan") == str(picked.parent)
 
     by_id = client.post("/api/plugin/open", json={"id": manifest.id}).json()
     assert by_id["gan_path"] == str(installed)
 
 
-def test_an_imported_foundry_export_is_remembered(
+def test_an_imported_foundry_export_is_remembered_without_moving_the_gan_folder(
     client: TestClient, tmp_path: Path
 ) -> None:
     pj = _foundry_export(tmp_path / "Foundry")
     body = client.post("/api/plugin/import-owl", json={"project_path": str(pj)}).json()
     entry = _only("gan")
     assert (entry["path"], entry["source"]) == (body["gan_path"], "gan")
+    assert "gan" not in _stored_folders(tmp_path)
 
 
 def test_reveal_goes_through_the_shared_helper(
@@ -309,7 +409,7 @@ def test_reveal_goes_through_the_shared_helper(
     assert shown == [str(target)]
 
 
-def test_reveal_answers_404_and_500_apart(
+def test_reveal_answers_404_400_and_500_apart(
     client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     started: list[list[str]] = []
@@ -320,6 +420,8 @@ def test_reveal_answers_404_and_500_apart(
     )
     missing = client.post("/api/plugin/reveal", json={"path": str(tmp_path / "gone")})
     assert missing.status_code == 404
+    share = client.post("/api/plugin/reveal", json={"path": SHARE})
+    assert share.status_code == 400
     assert started == []
 
     def broken(path: str) -> str:
@@ -366,7 +468,7 @@ class _FakeProject:
         return {"name": "fake"}
 
 
-def test_an_imported_daw_project_is_remembered(
+def test_an_imported_daw_project_is_remembered_and_never_served(
     client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
@@ -382,9 +484,10 @@ def test_an_imported_daw_project_is_remembered(
     entry = _only("daw-project")
     assert (entry["path"], entry["source"], entry["servable"]) == (
         str(rpp),
-        "project",
-        True,
+        "client",
+        False,
     )
+    assert known_paths.find_servable(rpp) is None
     assert known_paths.last_folder("daw-project") == str(rpp.parent)
 
 
@@ -406,7 +509,8 @@ def test_a_failed_import_is_not_remembered(
 def test_an_import_of_a_file_without_a_project_extension_is_not_remembered(
     client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A lenient parser accepting some other file must not make it servable."""
+    """A lenient parser accepting some other file keeps it out of the DAW
+    project menus."""
     monkeypatch.setattr(
         "backend.modules.dawimport.audition.parse_sesx", lambda path: _FakeProject()
     )

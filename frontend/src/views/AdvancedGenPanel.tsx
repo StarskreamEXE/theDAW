@@ -30,7 +30,11 @@ import { VisualizerPanel } from '../components/audio/VisualizerPanelLazy';
 import { getMasterGain, usePlayerStore } from '../state/playerStore';
 import { fetchMagentaEngineStatus, installMagentaEngine, swapEngineForModel } from '../lib/magentaEngineClient';
 import { CLOUD_MODELS } from '../lib/cloudModels';
-import { fetchCheckpoints, setLocalOnly, type RegisteredCheckpoint } from '../lib/storageClient';
+import {
+  fetchCheckpoints, pickFile, setLocalOnly, storageErrorStatus, type RegisteredCheckpoint,
+} from '../lib/storageClient';
+import { basenameOf, isLocalClient, placesApi } from '../lib/placesClient';
+import { describeHttpError } from '../lib/httpError';
 import { classifyModelGate } from '../lib/modelDownloadClient';
 import { requireFeature } from '../notices/featureGateStore';
 import { logError, logInfo, logWarn } from '../state/logStore';
@@ -39,6 +43,9 @@ import { AUDIO_EXTS } from '../lib/fileFilters';
 import '../components/layout/track-controls.css';
 
 const RECENT_AUDIO_EXTS = [...AUDIO_EXTS];
+
+const LORA_FILTER = 'LoRA weights (*.safetensors;*.pt;*.bin)|*.safetensors;*.pt;*.bin|All files (*.*)|*.*';
+const LORA_ACCEPT = '.safetensors,.pt,.bin';
 
 /* Local rather than in RICH_TOOLTIPS because the depth choice only makes sense
    next to the format one — the two rules it has to state (FLAC stops at 24,
@@ -61,15 +68,29 @@ function FullAudioPlayer() {
   const fmt = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
   return (
     <div className="flex items-center gap-2 px-1">
-      <button onClick={toggle} title={isPlaying ? 'Pause (footer)' : 'Play (footer)'}
+      <button type="button" onClick={toggle} title={isPlaying ? 'Pause (footer)' : 'Play (footer)'}
+        aria-label={isPlaying ? 'Pause' : 'Play'}
         className="text-purple-400 hover:text-purple-300 cursor-pointer w-6 h-6 rounded-full bg-purple-500/10 flex items-center justify-center shrink-0">
         {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5 ml-0.5" />}
       </button>
-      <button onClick={stop} title="Stop" className="text-zinc-400 hover:text-zinc-200 cursor-pointer shrink-0">
+      <button type="button" onClick={stop} title="Stop" aria-label="Stop" className="text-zinc-400 hover:text-zinc-200 cursor-pointer shrink-0">
         <Square className="w-3.5 h-3.5" />
       </button>
       <span className="text-[10px] font-mono text-zinc-400 tabular-nums shrink-0">{fmt(time)} / {fmt(dur)}</span>
+      {/* Click to seek; arrow keys step five seconds, Home and End jump to the ends. */}
       <div className="flex-1 h-1.5 bg-zinc-800 rounded-full overflow-hidden cursor-pointer"
+        role="slider" tabIndex={0} aria-label="Playback position"
+        aria-valuemin={0} aria-valuemax={Math.round(dur)} aria-valuenow={Math.round(time)}
+        aria-valuetext={`${fmt(time)} of ${fmt(dur)}`}
+        onKeyDown={(e) => {
+          if (!dur) return;
+          const step = e.key === 'ArrowRight' || e.key === 'ArrowUp' ? 5
+            : e.key === 'ArrowLeft' || e.key === 'ArrowDown' ? -5 : 0;
+          const target = e.key === 'Home' ? 0 : e.key === 'End' ? dur : step ? time + step : null;
+          if (target === null) return;
+          e.preventDefault();
+          seekByFraction(Math.min(1, Math.max(0, target / dur)));
+        }}
         onClick={(e) => { if (!dur) return; seekByFraction((e.clientX - e.currentTarget.getBoundingClientRect().left) / e.currentTarget.offsetWidth); }}>
         <div className="h-full bg-purple-500 rounded-full" style={{ width: `${dur ? (time / dur) * 100 : 0}%` }} />
       </div>
@@ -102,25 +123,32 @@ function SavedPromptsDropdown({ type, value, onChange }: {
     if (!trimmed) return;
     if (!saved.includes(trimmed)) setSaved([trimmed, ...saved]);
   };
+  const listId = `gen-saved-prompts-${type}`;
+  const what = type === 'negative' ? 'negative prompt' : 'prompt';
   return (
     <div className="relative flex items-center gap-1" ref={ref}>
-      <button className="btn-ghost flex items-center gap-1 cursor-pointer text-[9px]" onClick={() => setOpen(!open)}>
+      <button type="button" className="btn-ghost flex items-center gap-1 cursor-pointer text-[9px]" onClick={() => setOpen(!open)}
+        aria-expanded={open} aria-controls={open ? listId : undefined}>
         <ChevronDown className="w-3 h-3" /> SAVED ({saved.length})
       </button>
-      <button className="btn-ghost cursor-pointer p-1" onClick={handleSave} title="Save current">
+      <button type="button" className="btn-ghost cursor-pointer p-1" onClick={handleSave} title="Save current"
+        aria-label={`Save the current ${what}`}>
         <Plus className="w-3 h-3" />
       </button>
       {open && (
-        <div className="absolute z-30 top-full right-0 mt-1 bg-(--panel) border border-(--panel-border) rounded shadow-2xl min-w-55 max-h-45 overflow-hidden flex flex-col">
+        <div id={listId} className="absolute z-30 top-full right-0 mt-1 bg-(--panel) border border-(--panel-border) rounded shadow-2xl min-w-55 max-h-45 overflow-hidden flex flex-col">
           <div className="flex-1 overflow-y-auto">
             {saved.length === 0 ? (
               <div className="px-3 py-2 text-[9px] text-zinc-600 text-center">No saved prompts</div>
             ) : saved.map((item, i) => (
-              <div key={i} className="flex items-center gap-2 px-2 py-1.5 hover:bg-white/5 cursor-pointer group"
-                onClick={() => { onChange(item); setOpen(false); }}>
-                <span className="text-[9px] text-zinc-300 truncate flex-1">{item.slice(0, 40)}{item.length > 40 ? '...' : ''}</span>
-                <button className="text-zinc-700 hover:text-red-400 opacity-0 group-hover:opacity-100 cursor-pointer"
-                  onClick={(e) => { e.stopPropagation(); setSaved(saved.filter((s) => s !== item)); }}>
+              <div key={i} className="flex items-center gap-2 pr-2 hover:bg-white/5 group">
+                <button type="button" className="pl-2 py-1.5 text-left text-[9px] text-zinc-300 truncate flex-1 min-w-0 cursor-pointer"
+                  title={item} onClick={() => { onChange(item); setOpen(false); }}>
+                  {item.slice(0, 40)}{item.length > 40 ? '...' : ''}
+                </button>
+                <button type="button" aria-label={`Delete the saved ${what} "${item.slice(0, 40)}"`}
+                  className="text-zinc-700 hover:text-red-400 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 cursor-pointer"
+                  onClick={() => setSaved(saved.filter((s) => s !== item))}>
                   <X className="w-3 h-3" />
                 </button>
               </div>
@@ -168,7 +196,8 @@ function TemplatesPanel() {
     <div className="hardware-card flex flex-col min-h-0 flex-1">
       <div className="flex items-center justify-between mb-1.5">
         <span className="text-[10px] font-black uppercase tracking-widest text-purple-300">TEMPLATES</span>
-        <button className="btn-ghost cursor-pointer p-1" onClick={handleSave} title="Save current">
+        <button type="button" className="btn-ghost cursor-pointer p-1" onClick={handleSave} title="Save current"
+          aria-label="Save the current settings as a template">
           <Plus className="w-3 h-3" />
         </button>
       </div>
@@ -183,10 +212,12 @@ function TemplatesPanel() {
         ) : (
           <div className="space-y-0.5">
             {filtered.map((t) => (
-              <div key={t.id} className="flex items-center gap-1 px-1.5 py-0.5 bg-black/20 rounded hover:bg-white/5 cursor-pointer group">
-                <span className="text-[9px] text-zinc-300 flex-1 truncate" onClick={() => p.patch(t.params)}>{t.name}</span>
-                <button className="text-zinc-700 hover:text-red-400 opacity-0 group-hover:opacity-100 cursor-pointer"
-                  onClick={(e) => { e.stopPropagation(); setTemplates(templates.filter((x) => x.id !== t.id)); }}>
+              <div key={t.id} className="flex items-center gap-1 pr-1.5 bg-black/20 rounded hover:bg-white/5 group">
+                <button type="button" className="pl-1.5 py-0.5 text-left text-[9px] text-zinc-300 flex-1 min-w-0 truncate cursor-pointer"
+                  title="Applies this template's settings." onClick={() => p.patch(t.params)}>{t.name}</button>
+                <button type="button" aria-label={`Delete template ${t.name}`}
+                  className="text-zinc-700 hover:text-red-400 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 cursor-pointer"
+                  onClick={() => setTemplates(templates.filter((x) => x.id !== t.id))}>
                   <X className="w-3 h-3" />
                 </button>
               </div>
@@ -223,14 +254,15 @@ function MagentaNotes() {
           {notes.length ? `${notes.length} pitch${notes.length > 1 ? 'es' : ''} steering the melody` : 'tap keys — or leave blank for free melody'}
         </span>
         {notes.length > 0 && (
-          <button className="btn-ghost cursor-pointer text-[9px] shrink-0" onClick={() => setField('magNotes', [])}>CLEAR</button>
+          <button type="button" className="btn-ghost cursor-pointer text-[9px] shrink-0" onClick={() => setField('magNotes', [])}>CLEAR</button>
         )}
       </div>
       <div className="relative flex-1 min-h-0 rounded overflow-hidden border border-white/5 bg-black/40 flex select-none">
         {whites.map((p) => {
           const on = notes.includes(p);
           return (
-            <button key={p} onClick={() => toggle(p)} title={`${NAMES[((p % 12) + 12) % 12]}${Math.floor(p / 12) - 1}`}
+            <button key={p} type="button" onClick={() => toggle(p)} title={`${NAMES[((p % 12) + 12) % 12]}${Math.floor(p / 12) - 1}`}
+              aria-label={`${NAMES[((p % 12) + 12) % 12]}${Math.floor(p / 12) - 1}`} aria-pressed={on}
               className={`relative flex-1 min-w-0 border-r border-black/40 last:border-r-0 cursor-pointer transition-colors flex items-end justify-center pb-0.5 ${on ? 'bg-purple-500' : 'bg-zinc-200 hover:bg-purple-200'}`}>
               {((p % 12) + 12) % 12 === 0 && <span className={`text-[7px] font-mono ${on ? 'text-white' : 'text-zinc-500'}`}>C{Math.floor(p / 12) - 1}</span>}
             </button>
@@ -244,7 +276,8 @@ function MagentaNotes() {
             return (
               <div key={p} className="flex-1 relative">
                 {hasBlack && (
-                  <button onClick={() => toggle(bp)}
+                  <button type="button" onClick={() => toggle(bp)}
+                    aria-label={`${NAMES[((p % 12) + 12) % 12]} sharp ${Math.floor(bp / 12) - 1}`} aria-pressed={on}
                     className={`pointer-events-auto absolute top-0 z-10 rounded-b border border-black/60 cursor-pointer transition-colors ${on ? 'bg-purple-400' : 'bg-zinc-900 hover:bg-purple-700'}`}
                     style={{ right: '-30%', width: '60%', height: '62%' }} />
                 )}
@@ -444,6 +477,53 @@ export const AdvancedGenPanel: React.FC<{
 
   const [presetsOpen, setPresetsOpen] = useState(false);
   const [lorasOpen, setLorasOpen] = useState(false);
+  const [loraLoadingIdx, setLoraLoadingIdx] = useState<number | null>(null);
+
+  // Puts a chosen file into LoRA slot i. It reads the list when the file
+  // arrives, because the list can change while a dialog is open.
+  const setLoraFile = useCallback((i: number, file: File) => {
+    const loras = useGenerateParamsStore.getState().loras;
+    if (!loras[i]) return;
+    sf('loras', loras.map((l, idx) => (idx === i ? { ...l, file, name: file.name } : l)));
+  }, [sf]);
+
+  const chooseLoraInBrowser = useCallback((i: number) => {
+    const inp = document.createElement('input');
+    inp.type = 'file';
+    inp.accept = LORA_ACCEPT;
+    inp.onchange = () => { const f = inp.files?.[0]; if (f) setLoraFile(i, f); };
+    inp.click();
+  }, [setLoraFile]);
+
+  // On the backend's own machine the native dialog opens in the last LoRA
+  // folder and the pick is remembered; the file is then read back through
+  // /api/places/file. A remote browser, or a machine with no native dialog,
+  // uses the browser's file chooser.
+  const chooseLoraFile = useCallback(async (i: number) => {
+    if (!isLocalClient()) { chooseLoraInBrowser(i); return; }
+    let path: string;
+    try {
+      const picked = await pickFile({ kind: 'lora', filter: LORA_FILTER, title: 'Choose a LoRA file' });
+      if (picked.cancelled || !picked.path) return;
+      path = picked.path;
+    } catch (e) {
+      if (storageErrorStatus(e) === 501) { chooseLoraInBrowser(i); return; }
+      logError('generate', `LoRA file dialog failed: ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+    const name = basenameOf(path);
+    setLoraLoadingIdx(i);
+    try {
+      const res = await fetch(placesApi.fileUrl(path));
+      if (!res.ok) throw new Error(await describeHttpError(res));
+      const blob = await res.blob();
+      setLoraFile(i, new File([blob], name, { type: blob.type || 'application/octet-stream' }));
+    } catch (e) {
+      logError('generate', `Could not load LoRA ${name}: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setLoraLoadingIdx(null);
+    }
+  }, [chooseLoraInBrowser, setLoraFile]);
   const applyPreset = useCallback((preset: GenerationPreset) => {
     patch(preset.params);
     setPresetsOpen(false);
@@ -821,16 +901,17 @@ export const AdvancedGenPanel: React.FC<{
         <div className="flex flex-col gap-1.5 min-h-0 row-span-2">
           {/* Presets — moved here, above Controls */}
           <div className="relative shrink-0">
-            <button onClick={() => setPresetsOpen(!presetsOpen)}
+            <button type="button" onClick={() => setPresetsOpen(!presetsOpen)}
+              aria-expanded={presetsOpen} aria-controls={presetsOpen ? 'gen-presets-panel' : undefined}
               className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 rounded border border-white/10 bg-white/5 hover:bg-purple-500/15 hover:border-purple-500/30 text-zinc-300 hover:text-white transition-colors">
               <BookOpen className="w-3.5 h-3.5" />
               <span className="text-[10px] font-black uppercase tracking-widest">Presets</span>
               <ChevronDown className={`w-3 h-3 transition-transform ${presetsOpen ? 'rotate-180' : ''}`} />
             </button>
             {presetsOpen && (
-              <div className="absolute left-0 top-full mt-1 z-50 w-full max-h-80 overflow-y-auto rounded border border-white/10 bg-[#0c0a12] shadow-2xl">
+              <div id="gen-presets-panel" className="absolute left-0 top-full mt-1 z-50 w-full max-h-80 overflow-y-auto rounded border border-white/10 bg-[#0c0a12] shadow-2xl">
                 {GENERATION_PRESETS.map((preset) => (
-                  <button key={preset.id} onClick={() => applyPreset(preset)}
+                  <button key={preset.id} type="button" onClick={() => applyPreset(preset)}
                     className="w-full text-left px-3 py-2 hover:bg-purple-500/15 border-b border-white/5 last:border-0 transition-colors group">
                     <div className="flex items-center gap-2">
                       <div className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: preset.color }} />
@@ -1017,18 +1098,18 @@ export const AdvancedGenPanel: React.FC<{
             <span className="pointer-events-none absolute left-2 top-1 z-10 text-[8px] font-black uppercase tracking-[0.3em] text-purple-200/40">
               CRISPR
             </span>
-            <button onClick={() => setHeroTab('chimera')} className={`relative z-10 ${tabBtn(heroTab === 'chimera')}`}>
+            <button type="button" aria-pressed={heroTab === 'chimera'} onClick={() => setHeroTab('chimera')} className={`relative z-10 ${tabBtn(heroTab === 'chimera')}`}>
               <Layers className="w-3 h-3" /> Chimera
             </button>
-            <button onClick={() => setHeroTab('synesteez')} className={`relative z-10 ${tabBtn(heroTab === 'synesteez')}`}>
+            <button type="button" aria-pressed={heroTab === 'synesteez'} onClick={() => setHeroTab('synesteez')} className={`relative z-10 ${tabBtn(heroTab === 'synesteez')}`}>
               <Aperture className="w-3 h-3" /> Synesteez
             </button>
-            <button onClick={() => lastAudioUrl && setHeroTab('compare')} disabled={!lastAudioUrl}
+            <button type="button" aria-pressed={heroTab === 'compare'} onClick={() => lastAudioUrl && setHeroTab('compare')} disabled={!lastAudioUrl}
               className={`relative z-10 ${tabBtn(heroTab === 'compare')} disabled:opacity-30 disabled:cursor-not-allowed`}>
               <AudioWaveform className="w-3 h-3" /> Compare
             </button>
             {heroTab === 'compare' && (
-              <button onClick={() => setCmpOverlay((v) => !v)}
+              <button type="button" onClick={() => setCmpOverlay((v) => !v)}
                 className={`absolute right-0 top-1.5 z-10 px-2 py-1 rounded text-[9px] font-bold uppercase tracking-wider transition-colors ${cmpOverlay ? 'bg-purple-600/25 text-purple-200 border border-purple-500/40' : 'text-zinc-500 hover:text-zinc-300 border border-white/10'}`}>
                 {cmpOverlay ? 'Overlay' : 'Stacked'}
               </button>
@@ -1069,7 +1150,7 @@ export const AdvancedGenPanel: React.FC<{
                   { k: 'chromagram', label: 'Chroma', on: true },
                   { k: 'cqt', label: 'CQT', on: true },
                 ] as const).map(({ k, label, on }) => (
-                  <button key={k} disabled={!on} onClick={() => toggleLayer(k)}
+                  <button key={k} type="button" aria-pressed={cmpLayers.has(k)} disabled={!on} onClick={() => toggleLayer(k)}
                     className={`px-1.5 py-0.5 rounded text-[8px] font-bold uppercase tracking-wider transition-colors disabled:opacity-25 disabled:cursor-not-allowed ${cmpLayers.has(k) ? 'bg-purple-600/30 text-purple-200 border border-purple-500/40' : 'text-zinc-500 hover:text-zinc-300 border border-transparent'}`}>
                     {label}
                   </button>
@@ -1127,7 +1208,7 @@ export const AdvancedGenPanel: React.FC<{
               </button>
               {lorasOpen && (
                 <div id="gen-lora-panel" className="absolute left-0 top-full mt-1 z-50 w-full max-h-64 overflow-y-auto rounded border border-white/10 bg-[#0c0a12] shadow-2xl p-1.5 flex flex-col gap-1">
-                  <button
+                  <button type="button"
                     className="flex items-center justify-center gap-1 px-2 py-1 rounded border border-purple-500/30 bg-purple-500/10 hover:bg-purple-500/20 text-[10px] font-bold uppercase tracking-wider text-purple-200 cursor-pointer"
                     onClick={() => sf('loras', [...p.loras, { name: '', weight: 1.0, file: null }])}>
                     <Plus className="w-3 h-3" /> Add LoRA
@@ -1139,15 +1220,16 @@ export const AdvancedGenPanel: React.FC<{
                       {lora.file ? (
                         <span className="text-[9px] text-purple-200 flex-1 truncate" title={lora.file.name}>{lora.file.name}</span>
                       ) : (
-                        <button className="btn-ghost cursor-pointer text-[9px] flex-1 text-left" onClick={() => {
-                          const inp = document.createElement('input'); inp.type = 'file'; inp.accept = '.safetensors,.pt,.bin';
-                          inp.onchange = () => { if (inp.files?.[0]) { const u = p.loras.map((l, idx) => idx === i ? { ...l, file: inp.files![0], name: inp.files![0].name } : l); sf('loras', u); } };
-                          inp.click();
-                        }}>Choose file…</button>
+                        <button type="button" className="btn-ghost cursor-pointer text-[9px] flex-1 text-left disabled:cursor-default"
+                          disabled={loraLoadingIdx === i}
+                          title="Opens a LoRA weights file for this slot."
+                          onClick={() => void chooseLoraFile(i)}>
+                          {loraLoadingIdx === i ? 'Loading…' : 'Choose file…'}
+                        </button>
                       )}
                       <input id={`gen-lora-weight-${i}`} name={`gen-lora-weight-${i}`} aria-label={`LoRA ${i + 1} weight`} type="number" className="compact-input w-10 text-center text-[9px]" value={lora.weight} step={0.05} min={0} max={2}
                         onChange={(e) => { const u = p.loras.map((l, idx) => idx === i ? { ...l, weight: +e.target.value } : l); sf('loras', u); }} />
-                      <button className="text-zinc-500 hover:text-red-400 cursor-pointer" onClick={() => sf('loras', p.loras.filter((_, idx) => idx !== i))}><X className="w-3 h-3" /></button>
+                      <button type="button" aria-label={`Remove LoRA ${i + 1}`} className="text-zinc-500 hover:text-red-400 cursor-pointer" onClick={() => sf('loras', p.loras.filter((_, idx) => idx !== i))}><X className="w-3 h-3" /></button>
                     </div>
                   ))}
                 </div>
@@ -1196,7 +1278,7 @@ export const AdvancedGenPanel: React.FC<{
                   { label: 'Inpaint', icon: Scissors, target: 'inpaint' as QuickTarget, desc: 'Load into Inpainting' },
                   { label: 'Effects', icon: Sliders, target: 'effects' as QuickTarget, desc: 'Send to Effects tab' },
                 ] as const).map(({ label, icon: Icon, target, desc }) => (
-                  <button key={label} disabled={!lastAudioUrl} onClick={() => handleQuickAction(target)} title={desc}
+                  <button key={label} type="button" disabled={!lastAudioUrl} onClick={() => handleQuickAction(target)} title={desc}
                     className={`group flex items-center gap-1.5 px-2 py-1.5 rounded border transition-all ${lastAudioUrl ? 'border-purple-900/40 bg-purple-950/20 hover:bg-purple-900/30 hover:border-purple-700/50 cursor-pointer' : 'border-white/5 bg-white/3 opacity-30 cursor-not-allowed'}`}>
                     <Icon className={`w-3.5 h-3.5 ${lastAudioUrl ? 'text-purple-400' : 'text-zinc-600'}`} />
                     <span className={`text-[10px] font-semibold ${lastAudioUrl ? 'text-zinc-300' : 'text-zinc-600'}`}>{label}</span>
@@ -1241,7 +1323,7 @@ export const AdvancedGenPanel: React.FC<{
                   <span className={`${subTitle} shrink-0`}>SHIFT</span>
                   <div className="grid grid-cols-4 gap-0.5 flex-1">
                     {SHIFT_MODES.map((m) => (
-                      <button key={m} onClick={() => sf('shiftMode', m)}
+                      <button key={m} type="button" aria-pressed={p.shiftMode === m} onClick={() => sf('shiftMode', m)}
                         className={`px-0.5 py-0.5 rounded text-[7px] font-bold uppercase tracking-wide transition-colors ${p.shiftMode === m ? 'bg-purple-600/30 text-purple-200 border border-purple-500/40' : 'text-zinc-500 hover:text-zinc-300 border border-white/10'}`}>
                         {m}
                       </button>
@@ -1270,6 +1352,8 @@ export const AdvancedGenPanel: React.FC<{
             <div className="flex items-center gap-1">
               <SavedPromptsDropdown type="positive" value={p.prompt} onChange={(v) => sf('prompt', v)} />
               <button
+                type="button"
+                aria-label="Enhance the prompt with AI"
                 onClick={async () => {
                   if (enhancingPositive || !p.prompt.trim()) return;
                   setEnhancingPositive(true);
@@ -1309,11 +1393,12 @@ export const AdvancedGenPanel: React.FC<{
               <input id="gen-mag-seed" name="gen-mag-seed" type="number" className="compact-input w-24 text-center tabular-nums" min={-1} max={2147483647} step={1}
                 value={p.magSeed} onChange={(e) => sf('magSeed', Math.floor(+e.target.value))}
                 title="Seed — same seed + same prompt reads the style identically. -1 = fresh each run." />
-              <button className="btn-ghost cursor-pointer p-1 text-zinc-500 hover:text-purple-300" title="Lock a random seed"
+              <button type="button" className="btn-ghost cursor-pointer p-1 text-zinc-500 hover:text-purple-300" title="Lock a random seed"
+                aria-label="Lock a random seed"
                 onClick={() => sf('magSeed', Math.floor(Math.random() * 2147483647))}><Dice5 className="w-3.5 h-3.5" /></button>
-              <button className="btn-ghost cursor-pointer text-[10px]" title="Fresh each run" onClick={() => sf('magSeed', -1)}>{p.magSeed < 0 ? 'random' : 'clear'}</button>
+              <button type="button" className="btn-ghost cursor-pointer text-[10px]" title="Fresh each run" onClick={() => sf('magSeed', -1)}>{p.magSeed < 0 ? 'random' : 'clear'}</button>
               <div className="flex-1" />
-              <button onClick={() => sf('magExtend', !p.magExtend)}
+              <button type="button" aria-pressed={p.magExtend} onClick={() => sf('magExtend', !p.magExtend)}
                 title="Extend — continue the current track seamlessly. Change the prompt to morph it without a cut."
                 className={`flex items-center gap-1 px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider transition-colors ${p.magExtend ? 'bg-purple-600/30 text-purple-200 border border-purple-500/40' : 'text-zinc-500 hover:text-zinc-300 border border-white/10'}`}>
                 <Repeat className="w-3 h-3" /> Extend
@@ -1327,6 +1412,8 @@ export const AdvancedGenPanel: React.FC<{
             <div className="shrink-0 flex items-center gap-1 pt-1">
               <SavedPromptsDropdown type="negative" value={p.negativePrompt} onChange={(v) => sf('negativePrompt', v)} />
               <button
+                type="button"
+                aria-label="Enhance the negative prompt with AI"
                 onClick={async () => {
                   if (enhancingNegative || !p.negativePrompt.trim()) return;
                   setEnhancingNegative(true);

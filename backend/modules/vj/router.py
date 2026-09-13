@@ -24,9 +24,10 @@ import tempfile
 import threading
 from pathlib import Path
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from backend.lib import known_paths
+from backend.lib.cross_site import refuse_cross_site
 
 from . import export, sidecar
 
@@ -200,20 +201,25 @@ def get_export_folder() -> dict:
     }
 
 
-@router.post("/export-folder/pick")
+@router.post("/export-folder/pick", dependencies=[Depends(refuse_cross_site)])
 def post_pick_export_folder() -> dict:
     """Open a native OS folder picker so the user can click-through to an
     output folder instead of typing a path. On confirm, persists the chosen
     absolute path as ``vj.export_root`` and returns it. ``cancelled`` is true
-    when the user dismissed the dialog (the setting is left unchanged)."""
+    when the user dismissed the dialog (the setting is left unchanged). A
+    dialog that failed answers 500, and one that timed out answers 504. A page
+    on another site cannot open the dialog."""
     from ..settings.router import get_store
 
-    from backend.core.folder_dialog import pick_folder
+    from backend.core import folder_dialog
 
-    chosen = pick_folder(
-        title="Choose theDAW VJ export output folder",
-        initial=_resolved_export_root(),
-    )
+    try:
+        chosen = folder_dialog.pick_folder(
+            title="Choose theDAW VJ export output folder",
+            initial=_resolved_export_root(),
+        )
+    except folder_dialog.PickerError as e:
+        raise HTTPException(e.status_code, str(e)) from e
     if not chosen:
         return {"ok": True, "cancelled": True, "path": _resolved_export_root()}
     try:

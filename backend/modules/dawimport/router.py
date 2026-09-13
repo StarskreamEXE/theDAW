@@ -70,13 +70,14 @@ def _remember_source(source_path: str) -> None:
     """Remember the project file an import read, so the next import picker
     opens in its folder and a Recent menu can offer it again.
 
-    Only a path with a DAW project extension is remembered. The path comes from
-    the request body and a remembered project is servable from
-    /api/places/file, so a lenient parser (an XML format, say) accepting some
-    other file must not make that file downloadable.
+    Only a path with a DAW project extension is remembered, so a lenient parser
+    (an XML format, say) accepting some other file keeps it out of the DAW
+    project menus. The path comes from the request body, so it is stored as
+    'client' and never served; the import picker's own record is what makes a
+    picked project servable.
     """
     if known_paths.kind_for_path(source_path) == "daw-project":
-        known_paths.record(source_path, kind="daw-project", source="project")
+        known_paths.record(source_path, kind="daw-project", source="client")
 
 
 @router.post("/detect", response_model=DetectResponse)

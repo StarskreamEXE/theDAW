@@ -388,7 +388,11 @@ def list_audio(path: str):
 
 def _add_recent(path: str, name: str) -> None:
     """Add to recent files list (deduped, most recent first), and remember the
-    file in known_paths so the next project picker opens in its folder."""
+    file in known_paths so the next project picker opens in its folder.
+
+    The path comes from the request body, so known_paths stores it as 'client'
+    and never serves it: a save can embed any file the body names. A Recent
+    .tasmo reopens through /api/project/load by path."""
     global _recent_files, _recent_seen
     with _RECENT_LOCK:
         _sync_recent_locked()
@@ -403,4 +407,4 @@ def _add_recent(path: str, name: str) -> None:
             _recent_seen = _recent_stamp()
         except OSError as e:
             log.warning("project.recent: failed to persist %s: %s", _RECENT_PATH, e)
-    known_paths.record(path, kind="tasmo", source="project")
+    known_paths.record(path, kind="tasmo", source="client")

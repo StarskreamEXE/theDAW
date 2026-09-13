@@ -20,7 +20,13 @@ degrades to ``exists: false`` instead of an error.
 
 The pickers take an optional ``kind`` (see backend/lib/known_paths.py). A
 dialog opens in ``initial_dir`` when that folder exists, else in the folder last
-used for ``kind``, and the path the user chooses is remembered for that kind.
+used for ``kind``, and the path the user chooses is remembered for that kind. A
+checkpoint dialog with neither opens in the first local model folder, else
+beside the newest registered checkpoint.
+
+A dialog that failed answers 500 with its reason, and one that got no answer
+before folder_dialog's timeout answers 504. Only the user's cancel answers
+``cancelled: true``.
 """
 
 from __future__ import annotations
@@ -1082,17 +1088,62 @@ def _require_picker() -> None:
         raise HTTPException(501, "This machine has no native file dialog.")
 
 
+def _picker_failed(error: folder_dialog.PickerError) -> HTTPException:
+    """The answer for a dialog that failed: ``error.status_code`` (504 for a
+    timeout, else 500) with folder_dialog's message."""
+    return HTTPException(error.status_code, str(error))
+
+
+def _checkpoint_start_dir() -> str | None:
+    """Where a checkpoint dialog opens when no folder was sent or remembered:
+    the first local model folder that exists, else the folder holding the
+    newest registered checkpoint whose folder still exists."""
+    try:
+        for folder in _local_search_dirs():
+            if os.path.isdir(folder):
+                return str(folder)
+        registered = get_registry().list_checkpoints()
+    except (OSError, ValueError) as e:
+        log.debug("storage: no checkpoint start folder: %s", e)
+        return None
+
+    def newest(item: tuple[int, dict]) -> tuple[float, int]:
+        at = item[1].get("added_at")
+        number = at if isinstance(at, (int, float)) and not isinstance(at, bool) else 0
+        return (float(number), item[0])
+
+    for _, entry in sorted(enumerate(registered), key=newest, reverse=True):
+        path = entry.get("path")
+        if not isinstance(path, str) or not path.strip():
+            continue
+        parent = os.path.dirname(os.path.abspath(path))
+        if os.path.isdir(parent):
+            return parent
+    return None
+
+
 def _start_dir(initial_dir: str | None, kind: str | None) -> str | None:
     """The folder a dialog opens in: ``initial_dir`` when it exists, else the
-    folder last used for ``kind`` (or that kind's default), else ``initial_dir``
-    as given."""
+    folder last used for ``kind`` (or that kind's default), else for a
+    checkpoint the folder ``_checkpoint_start_dir`` finds, else ``initial_dir``
+    as given.
+
+    An ``initial_dir`` on a share or device path is dropped before anything
+    checks it, because the request body names it, and Windows authenticates to
+    a share's host as soon as a path on it is checked."""
     wanted = (initial_dir or "").strip()
+    if known_paths.is_remote_or_device_path(wanted):
+        wanted = ""
     if wanted and os.path.isdir(wanted):
         return wanted
     if kind:
         folder = known_paths.last_folder(kind)
         if folder:
             return folder
+        if kind == "checkpoint":
+            folder = _checkpoint_start_dir()
+            if folder:
+                return folder
     return wanted or None
 
 
@@ -1102,20 +1153,30 @@ def _remember_pick(path: str, kind: str | None) -> None:
     A file whose extension names a different extension kind is listed under
     its own kind, so a .als picked from the .tasmo field shows in DAW project
     menus. The picker's kind still remembers the folder, so that field's next
-    dialog opens there. A kind no extension produces (``backup-zip``) is kept."""
+    dialog opens there. A kind no extension produces (``backup-zip``) is kept.
+
+    A checkpoint pick is listed without moving the last folder of the kind it
+    is listed under. The folder that holds the picked checkpoint becomes where
+    the next checkpoint dialog opens, among its sibling checkpoints."""
     by_ext = known_paths.kind_for_path(path)
+    listed_as = kind or None
     if (
         kind
         and kind != by_ext
         and kind in known_paths.EXTENSION_KINDS
         and by_ext in known_paths.EXTENSION_KINDS
     ):
-        known_paths.record(path, by_ext, source="pick")
-        known_paths.record_folder(kind, os.path.dirname(os.path.abspath(path)))
+        listed_as = by_ext
+    parent = os.path.dirname(os.path.abspath(path))
+    if kind == "checkpoint":
+        known_paths.record(path, listed_as, source="pick", update_folder=False)
+        known_paths.record_folder("checkpoint", parent)
         return
     # Without a kind the path is remembered under its extension kind, or as a
     # 'folder'.
-    known_paths.record(path, kind or None, source="pick")
+    known_paths.record(path, listed_as, source="pick")
+    if kind and listed_as != kind:
+        known_paths.record_folder(kind, parent)
 
 
 class PickFolderRequest(BaseModel):
@@ -1129,10 +1190,13 @@ class PickFolderRequest(BaseModel):
 def storage_pick_folder(req: PickFolderRequest | None = None) -> dict:
     _require_picker()
     r = req or PickFolderRequest()
-    path = folder_dialog.pick_folder(
-        title=r.title or "Select a folder for theDAW",
-        initial=_start_dir(r.initial_dir, r.kind),
-    )
+    try:
+        path = folder_dialog.pick_folder(
+            title=r.title or "Select a folder for theDAW",
+            initial=_start_dir(r.initial_dir, r.kind),
+        )
+    except folder_dialog.PickerError as e:
+        raise _picker_failed(e) from e
     if not path:
         return {"path": None, "cancelled": True}
     _remember_pick(path, r.kind)
@@ -1153,11 +1217,14 @@ class PickFileRequest(BaseModel):
 def storage_pick_file(req: PickFileRequest | None = None) -> dict:
     _require_picker()
     r = req or PickFileRequest()
-    path = folder_dialog.pick_open_file(
-        title=r.title or "Select a file for theDAW",
-        initial_dir=_start_dir(r.initial_dir, r.kind),
-        filter_spec=r.filter or "All files (*.*)|*.*",
-    )
+    try:
+        path = folder_dialog.pick_open_file(
+            title=r.title or "Select a file for theDAW",
+            initial_dir=_start_dir(r.initial_dir, r.kind),
+            filter_spec=r.filter or "All files (*.*)|*.*",
+        )
+    except folder_dialog.PickerError as e:
+        raise _picker_failed(e) from e
     if not path:
         return {"path": None, "cancelled": True}
     _remember_pick(path, r.kind)
@@ -1176,26 +1243,36 @@ class PickSaveRequest(BaseModel):
 @router.post("/pick-save", dependencies=[Depends(refuse_cross_site)])
 def storage_pick_save(req: PickSaveRequest | None = None) -> dict:
     """Open a native Save As dialog (for .tasmo project saves etc.). Returns
-    ``{cancelled, path}`` like the other pickers.
+    ``{cancelled, path, grant}``.
 
-    The chosen path gets a one-time grant for POST /api/places/save, and its
-    folder becomes where the next Save dialog of this kind opens. The file does
-    not exist yet, so only the folder is remembered here; the save records the
-    file once it is written."""
+    The chosen path gets a one-time grant for POST /api/places/save, and
+    ``grant`` is the nonce that write has to carry. A network share or device
+    path, and a file type theDAW never writes
+    (``known_paths.BLOCKED_SAVE_EXTS``), answer 400 and grant nothing. For a
+    refused file type the chosen folder still becomes where the next Save
+    dialog of this kind opens. The file does not exist yet, so only the folder
+    is remembered here; the save records the file once it is written."""
     _require_picker()
     r = req or PickSaveRequest()
-    path = folder_dialog.pick_save_file(
-        title=r.title or "Save as",
-        initial_dir=_start_dir(r.initial_dir, r.kind),
-        initial_name=r.initial_name,
-        default_ext=r.default_ext,
-        filter_spec=r.filter,
-    )
+    try:
+        path = folder_dialog.pick_save_file(
+            title=r.title or "Save as",
+            initial_dir=_start_dir(r.initial_dir, r.kind),
+            initial_name=r.initial_name,
+            default_ext=r.default_ext,
+            filter_spec=r.filter,
+        )
+    except folder_dialog.PickerError as e:
+        raise _picker_failed(e) from e
     if not path:
         return {"cancelled": True, "path": None}
-    known_paths.grant_save(path)
+    if known_paths.is_remote_or_device_path(path):
+        raise HTTPException(400, "theDAW saves only to folders on this computer.")
     known_paths.record_folder(
         r.kind or known_paths.kind_for_path(path),
         os.path.dirname(os.path.abspath(path)),
     )
-    return {"cancelled": False, "path": path}
+    grant = known_paths.grant_save(path)
+    if grant is None:
+        raise HTTPException(400, "That file type cannot be saved from theDAW.")
+    return {"cancelled": False, "path": path, "grant": grant}

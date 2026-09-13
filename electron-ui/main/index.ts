@@ -11,6 +11,7 @@ import {
 } from 'electron'
 import { ChildProcess, spawn, execFile } from 'child_process'
 import { autoUpdater } from 'electron-updater'
+import * as crypto from 'crypto'
 import * as fs from 'fs'
 import * as path from 'path'
 import { pathToFileURL } from 'url'
@@ -91,6 +92,16 @@ let uvSyncProcess: ChildProcess | null = null
 const BACKEND_BASE = 'http://127.0.0.1:8600'
 const HEALTH_URL = `${BACKEND_BASE}/api/health`
 const SHUTDOWN_URL = `${BACKEND_BASE}/api/admin/shutdown`
+
+// A secret shared by this main process and the backend it spawns, and nothing
+// else. It goes to the backend only through buildBackendEnv
+// (THEDAW_LAUNCH_TOKEN) and comes back only on main-process requests
+// (X-TheDAW-Launch-Token), so the backend can tell a request made here from one
+// a page made. It is never put in process.env, sent over IPC or logged, so the
+// renderer and preload have no way to read it. A backend this process did not
+// spawn has no token and treats every request as coming from a page.
+const LAUNCH_TOKEN = crypto.randomBytes(24).toString('hex')
+const LAUNCH_TOKEN_HEADER = 'X-TheDAW-Launch-Token'
 
 // ---------------------------------------------------------------------------
 // Packaged-app paths + first-run bootstrap
@@ -210,6 +221,9 @@ function venvPython(venvRoot: string): string {
 // case-insensitively because Windows exposes it as "Path".
 function buildBackendEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, SA3_SUPERVISOR_PRESENT: '1' }
+  // Always this process's token. A THEDAW_LAUNCH_TOKEN inherited from the
+  // launching shell is replaced, because the download hook sends LAUNCH_TOKEN.
+  env.THEDAW_LAUNCH_TOKEN = LAUNCH_TOKEN
   if (app.isPackaged) {
     const toolsDir = getToolsDir()
     const key = Object.keys(env).find((k) => k.toLowerCase() === 'path') ?? 'PATH'
@@ -733,7 +747,12 @@ function watchDownloads(ses: Electron.Session): void {
         globalThis
           .fetch(PLACES_RECORD_URL, {
             method: 'POST',
-            headers: { 'content-type': 'application/json' },
+            // The token tells /api/places/record this path came from Chromium's
+            // download manager, which is what lets the backend serve it back.
+            headers: {
+              'content-type': 'application/json',
+              [LAUNCH_TOKEN_HEADER]: LAUNCH_TOKEN,
+            },
             body: JSON.stringify({ path: savePath }),
             signal: AbortSignal.timeout(5000),
           })

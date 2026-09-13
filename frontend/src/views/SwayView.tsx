@@ -32,12 +32,15 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AlertTriangle, ChevronDown, FolderOpen, Loader2, RefreshCw, Waves } from 'lucide-react';
 import { subscribeToMidi } from '../state/midiBus';
 import { getAnalyser } from '../state/playerStore';
-import { logInfo, logWarn } from '../state/logStore';
+import { logError, logInfo, logWarn } from '../state/logStore';
 import { describeHttpError } from '../lib/httpError';
 import { getJson } from '../lib/apiJson';
-import { openSwayScene } from '../lib/swayOpen';
+import { basenameOf, dirnameOf, isLocalClient, pathKey, placesApi, type PlaceItem } from '../lib/placesClient';
+import { pickFile } from '../lib/storageClient';
+import { openSwayScene, openSwaySceneFromPath } from '../lib/swayOpen';
 import { useMidiDevicesStore } from '../state/midiDevicesStore';
 import { useMidiTriggerStore } from '../state/midiTriggerStore';
+import { useStatusBarStore } from '../state/statusBarStore';
 import { useSwayOpenStore } from '../state/swayOpenStore';
 
 /** Where the cockpit is mounted. Must match backend/modules/sway/sidecar.py. */
@@ -84,15 +87,46 @@ interface SwayProjectRow {
 
 const SCENE_MENU_ID = 'sway-open-scene';
 
+const SWAY_FILE_FILTER = 'SwayCommand scene (*.sway)|*.sway|All files (*.*)|*.*';
+
+interface SceneEntry {
+  key: string;
+  label: string;
+  detail: string | null;
+  title: string;
+  action: boolean;
+  choose: () => void;
+}
+
+/** Opens a .sway file picked in the native dialog. A failure is logged and
+ *  shown in the status bar; a cancel does nothing. */
+async function chooseSceneFile(): Promise<void> {
+  try {
+    const picked = await pickFile({ kind: 'sway', filter: SWAY_FILE_FILTER });
+    if (picked.cancelled || !picked.path) return;
+    await openSwaySceneFromPath(picked.path);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    logError('sway', `Could not choose a scene file: ${msg}`);
+    useStatusBarStore.getState().setText(`SCENE OPEN FAILED: ${msg}`);
+  }
+}
+
 /**
- * "Open scene": the .sway scenes saved under data/sway-projects, newest first.
- * Choosing one hands its name to openSwayScene, which boots the cockpit into it.
- * The list is read each time the menu opens, so a scene saved or installed a
- * moment ago is already in it.
+ * "Open scene", in three parts:
+ *   - the .sway scenes saved under data/sway-projects, newest first, opened by
+ *     name through openSwayScene;
+ *   - .sway files elsewhere that known places can serve (a Save a copy, a
+ *     cockpit save that was downloaded), opened by path;
+ *   - on the machine the backend runs on, a row that picks a .sway file in the
+ *     native dialog.
+ * The lists are read each time the menu opens, so a scene saved, installed or
+ * downloaded a moment ago is already in it.
  */
 const SceneMenu: React.FC = () => {
   const [open, setOpen] = useState(false);
   const [rows, setRows] = useState<SwayProjectRow[] | null>(null);
+  const [files, setFiles] = useState<PlaceItem[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [activeIdx, setActiveIdx] = useState(0);
   const wrapRef = useRef<HTMLDivElement | null>(null);
@@ -117,22 +151,31 @@ const SceneMenu: React.FC = () => {
     setOpen(true);
     setActiveIdx(0);
     setRows(null);
+    setFiles([]);
     setError(null);
     focusPendingRef.current = true;
-    getJson<{ projects?: SwayProjectRow[] }>('/api/sway/projects')
-      .then((j) => {
-        if (seq === seqRef.current) setRows(Array.isArray(j.projects) ? j.projects : []);
-      })
-      .catch((e: unknown) => {
+    const saved = getJson<{ projects?: SwayProjectRow[] }>('/api/sway/projects').then(
+      (j) => ({ rows: Array.isArray(j.projects) ? j.projects : [], error: null as string | null }),
+      (e: unknown) => ({
+        rows: [] as SwayProjectRow[],
+        error: e instanceof Error ? e.message : String(e),
+      }),
+    );
+    void Promise.all([saved, placesApi.recent({ kind: 'sway', exts: ['.sway'] })]).then(
+      ([scenes, recent]) => {
         if (seq !== seqRef.current) return;
-        setRows([]);
-        setError(e instanceof Error ? e.message : String(e));
-      });
+        // A scene in data/sway-projects is listed once, by name.
+        const inFolder = new Set(scenes.rows.map((r) => pathKey(r.path)));
+        setFiles(recent.filter((it) => it.servable && !inFolder.has(pathKey(it.path))));
+        setError(scenes.error);
+        setRows(scenes.rows);
+      },
+    );
   };
 
-  // Move focus into the list once it has rows, so arrow keys work at once.
+  // Move focus into the list once it is read, so arrow keys work at once.
   useEffect(() => {
-    if (!open || !rows || rows.length === 0 || !focusPendingRef.current) return;
+    if (!open || !rows || !focusPendingRef.current) return;
     focusPendingRef.current = false;
     optionRefs.current[0]?.focus({ preventScroll: true });
   }, [open, rows]);
@@ -161,13 +204,48 @@ const SceneMenu: React.FC = () => {
     };
   }, [open, close]);
 
-  const choose = (row: SwayProjectRow) => {
+  const entries: SceneEntry[] = rows
+    ? [
+        ...rows.map((row) => ({
+          key: `scene:${row.path}`,
+          label: row.name,
+          detail: new Date(row.mtime * 1000).toLocaleString(),
+          title: row.path,
+          action: false,
+          choose: () => void openSwayScene(row.name),
+        })),
+        ...files.map((it) => ({
+          key: `file:${it.path}`,
+          label: it.name || basenameOf(it.path),
+          detail: dirnameOf(it.path),
+          title: it.path,
+          action: false,
+          choose: () => void openSwaySceneFromPath(it.path),
+        })),
+        // The native dialog opens on the backend's machine, so a browser on
+        // another device gets no row for it.
+        ...(isLocalClient()
+          ? [
+              {
+                key: 'choose-file',
+                label: 'Choose a .sway file',
+                detail: null,
+                title: 'Opens a .sway file you choose and loads it.',
+                action: true,
+                choose: () => void chooseSceneFile(),
+              },
+            ]
+          : []),
+      ]
+    : [];
+
+  const choose = (entry: SceneEntry) => {
     close(false);
-    void openSwayScene(row.name);
+    entry.choose();
   };
 
   const onListKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
-    const n = rows?.length ?? 0;
+    const n = entries.length;
     if (!n) return;
     const current = Math.min(activeIdx, n - 1);
     let next = -1;
@@ -181,9 +259,16 @@ const SceneMenu: React.FC = () => {
     optionRefs.current[next]?.focus();
   };
 
-  const hasRows = Boolean(rows && rows.length > 0);
-  const active = rows ? Math.min(activeIdx, Math.max(0, rows.length - 1)) : 0;
-  if (rows) optionRefs.current.length = rows.length;
+  const loaded = rows !== null;
+  const active = Math.min(activeIdx, Math.max(0, entries.length - 1));
+  optionRefs.current.length = entries.length;
+  const emptyNote = !loaded
+    ? null
+    : error
+      ? `Could not read the saved scenes: ${error}`
+      : rows.length === 0 && files.length === 0
+        ? 'No scenes are saved yet.'
+        : null;
 
   return (
     <div ref={wrapRef} className="relative">
@@ -194,8 +279,8 @@ const SceneMenu: React.FC = () => {
         onClick={toggle}
         aria-haspopup="listbox"
         aria-expanded={open}
-        aria-controls={open && hasRows ? listId : undefined}
-        title="Lists the saved scenes and loads the one you choose."
+        aria-controls={open && entries.length > 0 ? listId : undefined}
+        title="Lists saved and recent scenes and loads the one you choose."
         className="inline-flex items-center gap-1 rounded border border-zinc-800 bg-black/40 px-1.5 py-0.5 text-[9px] font-mono text-zinc-200 outline-none hover:border-fuchsia-500/50 focus-visible:border-fuchsia-500/50"
       >
         <FolderOpen className="h-3 w-3 text-fuchsia-300" />
@@ -204,45 +289,60 @@ const SceneMenu: React.FC = () => {
       </button>
       {open && (
         <div className="absolute left-0 top-full z-20 mt-1 min-w-56 max-w-sm rounded border border-fuchsia-500/30 bg-[#0a080f] shadow-2xl">
-          {rows === null ? (
+          {!loaded ? (
             <p role="status" className="flex items-center gap-1 px-2 py-1.5 text-[9px] font-mono text-zinc-500">
               <Loader2 className="h-3 w-3 animate-spin" /> Reading the saved scenes…
             </p>
-          ) : !hasRows ? (
-            <p role="status" className="px-2 py-1.5 text-[9px] font-mono leading-relaxed text-zinc-500">
-              {error ? `Could not read the saved scenes: ${error}` : 'No scenes are saved yet.'}
-            </p>
           ) : (
-            <div
-              id={listId}
-              role="listbox"
-              aria-label="Saved scenes"
-              onKeyDown={onListKeyDown}
-              className="flex max-h-72 flex-col overflow-y-auto"
-            >
-              {rows.map((row, i) => (
-                <button
-                  key={row.path}
-                  ref={(el) => {
-                    optionRefs.current[i] = el;
-                  }}
-                  id={`${SCENE_MENU_ID}-opt-${i}`}
-                  type="button"
-                  role="option"
-                  aria-selected={i === active}
-                  tabIndex={i === active ? 0 : -1}
-                  onFocus={() => setActiveIdx(i)}
-                  onClick={() => choose(row)}
-                  title={row.path}
-                  className="flex w-full flex-col items-start border-b border-white/5 px-2 py-1 text-left last:border-b-0 hover:bg-fuchsia-500/15 focus:outline-none focus-visible:bg-fuchsia-500/15"
+            <>
+              {emptyNote && (
+                <p
+                  role="status"
+                  className="border-b border-white/5 px-2 py-1.5 text-[9px] font-mono leading-relaxed text-zinc-500"
                 >
-                  <span className="max-w-full truncate text-[10px] font-mono text-zinc-100">{row.name}</span>
-                  <span className="text-[8px] font-mono text-zinc-500">
-                    {new Date(row.mtime * 1000).toLocaleString()}
-                  </span>
-                </button>
-              ))}
-            </div>
+                  {emptyNote}
+                </p>
+              )}
+              {entries.length > 0 && (
+                <div
+                  id={listId}
+                  role="listbox"
+                  aria-label="Scenes"
+                  onKeyDown={onListKeyDown}
+                  className="flex max-h-72 flex-col overflow-y-auto"
+                >
+                  {entries.map((entry, i) => (
+                    <button
+                      key={entry.key}
+                      ref={(el) => {
+                        optionRefs.current[i] = el;
+                      }}
+                      id={`${SCENE_MENU_ID}-opt-${i}`}
+                      type="button"
+                      role="option"
+                      aria-selected={i === active}
+                      tabIndex={i === active ? 0 : -1}
+                      onFocus={() => setActiveIdx(i)}
+                      onClick={() => choose(entry)}
+                      title={entry.title}
+                      className="flex w-full flex-col items-start border-b border-white/5 px-2 py-1 text-left last:border-b-0 hover:bg-fuchsia-500/15 focus:outline-none focus-visible:bg-fuchsia-500/15"
+                    >
+                      {entry.action ? (
+                        <span className="flex max-w-full items-center gap-1 text-[10px] font-mono text-fuchsia-200">
+                          <FolderOpen className="h-3 w-3 shrink-0" aria-hidden="true" />
+                          {entry.label}
+                        </span>
+                      ) : (
+                        <span className="max-w-full truncate text-[10px] font-mono text-zinc-100">{entry.label}</span>
+                      )}
+                      {entry.detail && (
+                        <span className="max-w-full truncate text-[8px] font-mono text-zinc-500">{entry.detail}</span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </>
           )}
         </div>
       )}
@@ -304,10 +404,28 @@ export const SwayView: React.FC = () => {
 
   // --- which project the cockpit boots into ---------------------------------
   // The cockpit reads its boot project only from its URL, so the src is fixed
-  // per open request. Reading recents on every render would change the src,
-  // and reload the cockpit, each time the cockpit saved a project.
+  // per open request and per probe. Reading recents on every render would
+  // change the src, and reload the cockpit, each time the cockpit saved a
+  // project.
+  //
+  // Every probe (the first one and each Retry) bumps `rev`, so an iframe
+  // mounted after it reads recents again. An open request boots its scene
+  // until a probe runs after it; openSwayScene also put that scene at the top
+  // of recents, so the read after a Retry still finds it unless the cockpit
+  // has since loaded or saved another project.
   const openRequest = useSwayOpenStore((s) => s.request);
-  const bootSrc = useMemo(() => swayBootSrc(openRequest?.target ?? null), [openRequest]);
+  const [probeMark, setProbeMark] = useState<{ rev: number; nonce: number | null }>({
+    rev: 0,
+    nonce: null,
+  });
+  const requestedTarget =
+    openRequest && openRequest.nonce !== probeMark.nonce ? openRequest.target : null;
+  const bootSrc = useMemo(
+    () => swayBootSrc(requestedTarget),
+    // probeMark.rev is read by swayBootSrc through localStorage, not as a value.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [requestedTarget, probeMark.rev],
+  );
   // Keyed on the nonce, so a second request for the same scene reloads too.
   const frameKey = openRequest?.nonce ?? 0;
 
@@ -322,6 +440,11 @@ export const SwayView: React.FC = () => {
 
   // --- is there a build to show? -------------------------------------------
   const probe = useCallback(async () => {
+    // The next iframe reads recents again; a request already booted gives way.
+    setProbeMark((p) => ({
+      rev: p.rev + 1,
+      nonce: useSwayOpenStore.getState().request?.nonce ?? null,
+    }));
     setEmbedState('checking');
     try {
       const res = await fetch('/api/sway/url');

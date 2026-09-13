@@ -20,7 +20,8 @@ This module also owns two glue duties the embedded cockpit needs:
   each save to ``POST /api/sway/project-save`` so a real ``.sway`` file lands
   in ``data/sway-projects`` and survives cleared browser storage.
   ``GET /api/sway/project`` reads one back by name, which is how theDAW opens
-  a scene it installed.
+  a scene it installed, or by path, for a .sway theDAW saved, installed,
+  downloaded or was handed in a dialog anywhere on disk.
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ import logging
 import re
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from backend.modules.project import media_access
@@ -38,6 +39,7 @@ from backend.modules.project import media_access
 from . import sidecar
 from backend.lib import known_paths, paths
 from backend.lib.atomic import atomic_write
+from backend.lib.cross_site import refuse_cross_site
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -202,15 +204,51 @@ async def sway_project_save(req: SwayProjectSave) -> dict:
     return {"status": "ok", "path": str(target)}
 
 
-@router.get("/project")
-def sway_project(
-    name: str = Query(..., description="the scene's file stem, as /projects lists"),
-) -> dict:
-    """One saved .sway scene, read back by name so theDAW can hand it to the
-    cockpit. 404 when no scene has that name, 400 when the name is not one.
+_SCENE_NOT_SERVED = "theDAW does not serve that scene."
 
-    A name /projects lists is matched exactly first, so a file whose name holds
-    characters a save would drop (an install's "Scene (2).sway") still opens."""
+
+def _servable_scene(path: str) -> dict:
+    """The .sway at ``path``, when known_paths may serve it.
+
+    One 403 for a path never recorded, recorded but not servable, gone, or not
+    a .sway, so the answer reveals nothing about the filesystem."""
+    served = known_paths.find_servable(path)
+    if served is None or not served.lower().endswith(".sway"):
+        raise HTTPException(403, _SCENE_NOT_SERVED)
+    target = Path(served)
+    try:
+        text = target.read_text(encoding="utf-8")
+    except OSError as e:
+        raise HTTPException(403, _SCENE_NOT_SERVED) from e
+    try:
+        doc = json.loads(text)
+    except ValueError as e:
+        raise HTTPException(500, f"Could not read {target.name}: {e}") from e
+    return {"name": target.stem, "path": served, "doc": doc}
+
+
+@router.get("/project", dependencies=[Depends(refuse_cross_site)])
+def sway_project(
+    name: str | None = Query(
+        None, description="the scene's file stem, as /projects lists"
+    ),
+    path: str | None = Query(
+        None,
+        description="a .sway theDAW saved, installed, downloaded or was handed "
+        "in a dialog",
+    ),
+) -> dict:
+    """One .sway scene, read back so theDAW can hand it to the cockpit.
+
+    By ``path``: only a file known_paths may serve, else 403. By ``name``: a
+    scene in data/sway-projects; 404 when no scene has that name, 400 when the
+    name is not one. A name /projects lists is matched exactly first, so a file
+    whose name holds characters a save would drop (an install's
+    "Scene (2).sway") still opens."""
+    if path is not None:
+        return _servable_scene(path)
+    if name is None:
+        raise HTTPException(422, "Name a scene or give its path.")
     target = _listed_scene(name) or _project_file(name, fallback=None)
     if not target.is_file():
         raise HTTPException(404, f"No saved scene named {name}")

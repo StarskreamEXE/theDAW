@@ -495,10 +495,13 @@ def import_folder(
     if not folder:
         from backend.core import folder_dialog
 
-        folder = folder_dialog.pick_folder(
-            title="Choose a music folder to add as a playlist",
-            initial=known_paths.last_folder("library-folder"),
-        )
+        try:
+            folder = folder_dialog.pick_folder(
+                title="Choose a music folder to add as a playlist",
+                initial=known_paths.last_folder("library-folder"),
+            )
+        except folder_dialog.PickerError as e:
+            raise HTTPException(e.status_code, str(e)) from e
     if not folder:
         return {"cancelled": True, "folder": None, "entries": []}
     root = Path(folder)

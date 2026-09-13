@@ -11,8 +11,10 @@
 
 The server binds 0.0.0.0, so nothing a request body says can make a file
 servable or writable on its own. /record stores what it is given as ``client``,
-which /file never serves; /file serves only paths the backend recorded itself;
-/save writes only to a path the user chose in a native Save dialog, once.
+which /file never serves, unless the request carries the desktop shell's launch
+token (``backend.lib.launch_token``); /file serves only servable sources; /save
+writes only to a path the user chose in a native Save dialog, with the nonce
+that dialog issued, once.
 
 CORS is open on this server, so a page on another site could otherwise list the
 recent files and then read them. Every route refuses a call that the browser
@@ -25,15 +27,16 @@ import logging
 import mimetypes
 import os
 import shutil
+import threading
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request
 from fastapi import UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from backend.lib import known_paths, reveal
+from backend.lib import known_paths, launch_token, reveal
 from backend.lib.atomic import atomic_replace, temp_sibling
 from backend.lib.cross_site import refuse_cross_site
 
@@ -41,6 +44,10 @@ log = logging.getLogger(__name__)
 
 
 router = APIRouter(dependencies=[Depends(refuse_cross_site)])
+
+# One save at a time, from the grant check to spending it, so two requests
+# holding the same grant cannot both write.
+_SAVE_LOCK = threading.Lock()
 
 
 class RecordBody(BaseModel):
@@ -68,10 +75,13 @@ def get_recent(
 
 
 @router.post("/record")
-def post_record(body: RecordBody) -> dict[str, Any]:
-    # Always 'client': the body names the path, so it is remembered for pickers
-    # and menus but never becomes servable through this route.
-    entry = known_paths.record(body.path, body.kind, source="client")
+def post_record(body: RecordBody, request: Request) -> dict[str, Any]:
+    # The body names the path. Only the desktop shell that started this backend
+    # holds the launch token, and it sends it for a download it finished, so
+    # that record is servable. Every other call is remembered as 'client', for
+    # pickers and menus, and never served.
+    source = "download" if launch_token.header_matches(request) else "client"
+    entry = known_paths.record(body.path, body.kind, source=source)
     return {"recorded": entry is not None, "kind": entry["kind"] if entry else None}
 
 
@@ -81,7 +91,9 @@ def post_reveal(body: PathBody) -> dict[str, Any]:
         shown = reveal.reveal(body.path)
     except FileNotFoundError as e:
         raise HTTPException(404, f"Not found: {body.path}") from e
-    except (OSError, ValueError) as e:
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except OSError as e:
         raise HTTPException(500, f"Could not open the file manager: {e}") from e
     return {"status": "ok", "path": shown}
 
@@ -107,26 +119,32 @@ def post_save(
     file: UploadFile = File(...),
     path: str = Form(...),
     kind: str | None = Form(None),
+    grant: str = Form(""),
 ) -> dict[str, Any]:
     """Write the upload to ``path``, which the user chose in a Save dialog.
 
-    The grant is spent before anything is written, so a replayed request cannot
-    write twice."""
-    if not known_paths.consume_save_grant(path):
-        raise HTTPException(403, "Choose where to save in the Save dialog first.")
-    dest = Path(os.path.abspath(os.path.expanduser(path)))
-    tmp = temp_sibling(dest)
-    try:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        with tmp.open("wb") as out:
-            shutil.copyfileobj(file.file, out, 1 << 20)
-        atomic_replace(tmp, dest)
-    except OSError as e:
+    ``grant`` is the nonce /api/storage/pick-save returned for that path. It is
+    spent only after the file is written, so a failed write can be retried with
+    the same grant, and a second write with it is refused."""
+    if known_paths.is_blocked_save_path(path):
+        raise HTTPException(403, "That file type cannot be saved from theDAW.")
+    with _SAVE_LOCK:
+        if not known_paths.peek_save_grant(path, grant):
+            raise HTTPException(403, "Choose where to save in the Save dialog first.")
+        dest = Path(os.path.abspath(os.path.expanduser(path)))
+        tmp = temp_sibling(dest)
         try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            log.debug("places.save: leftover temp file %s", tmp)
-        raise HTTPException(500, f"Could not save {dest.name}: {e}") from e
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with tmp.open("wb") as out:
+                shutil.copyfileobj(file.file, out, 1 << 20)
+            atomic_replace(tmp, dest)
+        except OSError as e:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                log.debug("places.save: leftover temp file %s", tmp)
+            raise HTTPException(500, f"Could not save {dest.name}: {e}") from e
+        known_paths.consume_save_grant(path, grant)
 
     entry = known_paths.record(dest, kind or None, source="save")
     log.info("places: saved %s", dest)
@@ -137,8 +155,11 @@ def post_save(
 
 
 @router.get("/projects-dir")
-def get_projects_dir() -> dict[str, str]:
-    return {"path": str(known_paths.projects_dir())}
+def get_projects_dir() -> dict[str, Any]:
+    return {
+        "path": str(known_paths.projects_dir()),
+        "configured": known_paths.projects_dir_configured(),
+    }
 
 
 @router.put("/projects-dir")

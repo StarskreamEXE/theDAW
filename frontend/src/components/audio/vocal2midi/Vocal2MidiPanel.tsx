@@ -632,7 +632,7 @@ export const Vocal2MidiPanel: React.FC = () => {
             onClearAll={() => setRecordings([])}
             onExportAll={() => {
               const blob = new Blob([JSON.stringify(recordings, null, 2)], { type: 'application/json' });
-              void saveFile({ blob, suggestedName: 'vocal2midi_recordings.json', kind: 'json' });
+              void saveFile({ blob, suggestedName: 'vocal2midi_recordings.json', kind: 'v2m-recordings' });
             }}
             onImport={(recs) => setRecordings((p) => [...recs, ...p])}
           />

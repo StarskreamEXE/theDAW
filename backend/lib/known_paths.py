@@ -11,26 +11,36 @@ and a "Recent" menu can hand a file straight back:
   - one-time save grants for paths the user chose in a native Save dialog.
 
 Everything but the grants persists in one small JSON file under the data root.
-It is read on every call, so a backup restore that rewrites the file, or a test
-that points ``_STORE_PATH`` somewhere else, takes effect at once. Every public
-function swallows its own IO errors: remembering a path must never fail the
-request that produced it.
+It is read on every call, so a test that points ``_STORE_PATH`` somewhere else
+takes effect at once. Every public function swallows its own IO errors:
+remembering a path must never fail the request that produced it.
 
 Security. The server binds 0.0.0.0 and ``/api/places/file`` streams a remembered
-file to whoever asks for it, so a remembered path is servable only when the
-backend recorded it itself from a path the user chose in a native dialog or a
-file the app wrote (``SERVABLE_SOURCES``). A path named in a request body is
-recorded as ``client`` and stays unservable. Writes follow the same rule:
-``/api/places/save`` needs a grant that only a native Save dialog issues, for
-that exact path, once, and grants live in memory only.
+file to whoever asks for it, so a remembered path is servable only when its
+source is in ``SERVABLE_SOURCES``: a path the user chose in a native dialog, a
+file the app wrote or installed, or a download the desktop shell finished and
+vouched for with its launch token. A path named in a request body is recorded
+as ``client`` and stays unservable. The backup module leaves this file out of
+every archive and ignores it in one, so a restore cannot set a source.
+
+Writes follow the same rule: ``/api/places/save`` needs the nonce a native Save
+dialog issued for that exact path, once, and never for a file type that runs as
+a program (``BLOCKED_SAVE_EXTS``). Grants live in memory only.
+
+Network shares and device paths (``\\\\server\\share``, ``//server/share``,
+``\\\\?\\``, ``\\\\.\\``) are never remembered, shown or touched: checking one
+exists reaches another machine, and on Windows it sends the user's credentials
+there.
 """
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 from collections.abc import Iterable
@@ -43,6 +53,7 @@ from backend.lib.atomic import atomic_write
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "BLOCKED_SAVE_EXTS",
     "EXTENSION_KINDS",
     "MAX_PER_KIND",
     "SERVABLE_SOURCES",
@@ -51,9 +62,13 @@ __all__ = [
     "find_servable",
     "grant_save",
     "installed_asset_path",
+    "is_blocked_save_path",
+    "is_remote_or_device_path",
     "kind_for_path",
     "last_folder",
+    "peek_save_grant",
     "projects_dir",
+    "projects_dir_configured",
     "recent",
     "record",
     "record_folder",
@@ -74,24 +89,84 @@ MAX_KINDS = 64
 MAX_RECENT_LIMIT = 200
 MAX_PATH_CHARS = 4096
 SAVE_GRANT_SECONDS = 600.0
+# Two Save dialogs answered with the same path each get a grant; this bounds how
+# many stay live for one path.
+MAX_GRANTS_PER_PATH = 8
 
-# Sources the backend records itself, each from a path the user chose in a
-# native dialog or a file the app wrote. 'client' (a request body) and
-# 'download' (the desktop shell's download hook) are remembered but never served.
+# Sources whose files /api/places/file may serve. Each is a path the user chose
+# in a native dialog ('pick', 'save'), a file the app wrote or installed
+# ('install', 'gan', 'sway-save'), or a finished download the desktop shell
+# vouched for with its launch token ('download'). Every other source, 'client'
+# above all, is remembered for pickers and menus and never served.
 SERVABLE_SOURCES = frozenset(
+    {"install", "save", "pick", "gan", "sway-save", "download"}
+)
+
+# File types /api/places/save never writes: each one runs as a program or
+# script when opened, or when it lands in a Startup folder.
+BLOCKED_SAVE_EXTS = frozenset(
     {
-        "install",
-        "save",
-        "pick",
-        "project",
-        "backup",
-        "sway-save",
-        "gan",
-        "library-folder",
+        ".exe",
+        ".bat",
+        ".cmd",
+        ".com",
+        ".ps1",
+        ".psm1",
+        ".vbs",
+        ".vbe",
+        ".js",
+        ".jse",
+        ".wsf",
+        ".wsh",
+        ".hta",
+        ".lnk",
+        ".scr",
+        ".msi",
+        ".msp",
+        ".dll",
+        ".cpl",
+        ".reg",
+        ".jar",
+        ".sh",
+        ".app",
+        ".desktop",
+        ".url",
+        ".pif",
+        # Windows launchers and script hosts beyond the common ones.
+        ".appref-ms",
+        ".application",
+        ".chm",
+        ".gadget",
+        ".inf",
+        ".msc",
+        ".ps1xml",
+        ".psd1",
+        ".py",
+        ".pyw",
+        ".scf",
+        ".sct",
+        ".settingcontent-ms",
+        ".shb",
+        ".shs",
+        ".ws",
+        ".wsb",
+        ".wsc",
+        ".xll",
     }
 )
 
+# A recorded file with this name is a VST Foundry export, so its folder is also
+# where the Foundry import picker opens.
+FOUNDRY_EXPORT_NAME = "project.json"
+
+# A kind with no folder of its own starts where this other kind last was.
+_FOLDER_FALLBACKS = {"foundry-export": "json"}
+
 _KIND_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,47}$")
+
+# Two leading separators, in any mix: a UNC share, or a Win32 device path
+# (\\?\, \\.\), which are UNC-shaped.
+_REMOTE_RE = re.compile(r"^[\\/]{2}")
 
 _DAW_PROJECT_EXTS = (
     ".als",
@@ -162,15 +237,28 @@ EXTENSION_KINDS = frozenset(kind for kind, _ in _EXT_GROUPS)
 
 # Data-root folders a format installs into (see backend/modules/assets/catalog.py).
 _DATA_FOLDERS = {"gan": "plugins", "sway": "sway-projects", "ares": "volumetric"}
+# Kinds whose picker starts in the user's Downloads folder.
 _DOWNLOADS_KINDS = frozenset(
-    {"audio", "midi", "score", "lyrics", "json", "image", "video", "zip", "apk"}
+    {
+        "audio",
+        "midi",
+        "score",
+        "lyrics",
+        "json",
+        "image",
+        "video",
+        "zip",
+        "apk",
+        "download",
+    }
 )
 
 _LOCK = threading.Lock()
 
-# Normalized path -> monotonic expiry. Memory only: a grant is the user's answer
-# to a dialog shown by this process, and it must not outlive the process.
-_GRANTS: dict[str, float] = {}
+# Normalized path -> [(nonce, monotonic expiry)]. Memory only: a grant is the
+# user's answer to a dialog shown by this process, and it must not outlive the
+# process.
+_GRANTS: dict[str, list[tuple[str, float]]] = {}
 _GRANT_LOCK = threading.Lock()
 
 
@@ -204,8 +292,21 @@ def set_store_path_for_tests(path: str | os.PathLike[str] | None) -> None:
         _GRANTS.clear()
 
 
+def is_remote_or_device_path(path: Any) -> bool:
+    """True for a network share (``\\\\server\\share``, ``//server/share``) or a
+    Windows device path (``\\\\?\\``, ``\\\\.\\``).
+
+    Decided from the text alone, so asking never touches the filesystem."""
+    try:
+        text = os.fspath(path)
+    except TypeError:
+        return False
+    return isinstance(text, str) and bool(_REMOTE_RE.match(text.lstrip()))
+
+
 def _absolute(path: Any) -> str | None:
-    """``path`` as an absolute, normalized string, or None when it cannot be one."""
+    """``path`` as an absolute, normalized string, or None when it cannot be one
+    or names a network share or device path."""
     try:
         text = os.fspath(path)
     except TypeError:
@@ -214,10 +315,15 @@ def _absolute(path: Any) -> str | None:
         return None
     if len(text) > MAX_PATH_CHARS or "\x00" in text:
         return None
+    if is_remote_or_device_path(text):
+        return None
     try:
-        return os.path.abspath(os.path.expanduser(text))
+        absolute = os.path.abspath(os.path.expanduser(text))
     except (OSError, ValueError):
         return None
+    # A home folder or working directory on a share makes a local-looking
+    # spelling remote.
+    return None if is_remote_or_device_path(absolute) else absolute
 
 
 def _key(path: Any) -> str | None:
@@ -291,6 +397,13 @@ def _public(entry: dict[str, Any], servable_keys: set[str] | None = None) -> dic
     return out
 
 
+def _local_text(value: Any) -> bool:
+    """A non-empty string that does not name a share or device path."""
+    return (
+        isinstance(value, str) and bool(value) and not is_remote_or_device_path(value)
+    )
+
+
 # ---------------------------------------------------------------------------
 # The store
 # ---------------------------------------------------------------------------
@@ -306,7 +419,7 @@ def _clean_entry(item: Any, kind: str) -> dict[str, Any] | None:
     path = item.get("path")
     source = item.get("source")
     at = item.get("at")
-    if not isinstance(path, str) or not path or not isinstance(source, str):
+    if not _local_text(path) or not isinstance(source, str):
         return None
     if isinstance(at, bool) or not isinstance(at, (int, float)):
         return None
@@ -321,7 +434,10 @@ def _clean_entry(item: Any, kind: str) -> dict[str, Any] | None:
 
 
 def _load() -> dict[str, Any]:
-    """The persisted store, with malformed parts dropped. Call under ``_LOCK``."""
+    """The persisted store, with malformed parts dropped. Call under ``_LOCK``.
+
+    A share or device path is dropped too, so a store written before this rule
+    existed never makes a later read reach another machine."""
     store = _empty_store()
     target = _store_path()
     try:
@@ -346,9 +462,7 @@ def _load() -> dict[str, Any]:
     folders_raw = raw.get("folders")
     if isinstance(folders_raw, dict):
         store["folders"] = {
-            k: v
-            for k, v in folders_raw.items()
-            if _valid_kind(k) and isinstance(v, str) and v
+            k: v for k, v in folders_raw.items() if _valid_kind(k) and _local_text(v)
         }
 
     settings_raw = raw.get("settings")
@@ -362,7 +476,7 @@ def _load() -> dict[str, Any]:
         store["installed"] = {
             k: v
             for k, v in installed_raw.items()
-            if isinstance(k, str) and k and isinstance(v, str) and v
+            if isinstance(k, str) and k and _local_text(v)
         }
     return store
 
@@ -390,7 +504,7 @@ def kind_for_path(path: str | os.PathLike[str]) -> str:
     """The kind a path belongs to, by extension; ``folder`` for a directory.
 
     A directory with a DAW project extension (a Logic ``.logicx`` bundle) is a
-    ``daw-project``.
+    ``daw-project``. A share or device path is never checked on disk.
     """
     try:
         text = os.fspath(path)
@@ -399,32 +513,50 @@ def kind_for_path(path: str | os.PathLike[str]) -> str:
     if not isinstance(text, str) or not text.strip():
         return "file"
     suffix = _ext(text)
-    if _isdir(text):
+    if not is_remote_or_device_path(text) and _isdir(text):
         return "daw-project" if suffix in _DAW_PROJECT_EXTS else "folder"
     return _KIND_BY_EXT.get(suffix, "file")
 
 
+def _stored_projects_dir(store: dict[str, Any]) -> Path | None:
+    configured = store["settings"].get("projects_dir")
+    if _local_text(configured) and Path(configured).is_absolute():
+        return Path(configured)
+    return None
+
+
 def projects_dir() -> Path:
     """The folder .tasmo projects are saved and installed into."""
-    configured = _read()["settings"].get("projects_dir")
-    if isinstance(configured, str) and configured and Path(configured).is_absolute():
-        return Path(configured)
+    stored = _stored_projects_dir(_read())
+    if stored is not None:
+        return stored
     return Path.home() / "Documents" / "theDAW Projects"
 
 
+def projects_dir_configured() -> bool:
+    """True when ``set_projects_dir`` stored a folder that ``projects_dir``
+    uses; False while the default is in effect."""
+    return _stored_projects_dir(_read()) is not None
+
+
 def set_projects_dir(path: str | os.PathLike[str]) -> Path:
-    """Store the user's projects folder. Raises ValueError unless ``path`` is
-    absolute; a failed write is logged and the folder is still returned."""
+    """Store the user's projects folder. Raises ValueError unless ``path`` is an
+    absolute folder on this computer; a failed write is logged and the folder is
+    still returned."""
     try:
         text = os.fspath(path)
     except TypeError:
         text = ""
     if not isinstance(text, str) or not text.strip() or "\x00" in text:
         raise ValueError("The projects folder must be an absolute path.")
+    if is_remote_or_device_path(text):
+        raise ValueError("The projects folder must be a folder on this computer.")
     candidate = Path(os.path.expanduser(text))
     if not candidate.is_absolute():
         raise ValueError("The projects folder must be an absolute path.")
     chosen = Path(os.path.normpath(candidate))
+    if is_remote_or_device_path(str(chosen)):
+        raise ValueError("The projects folder must be a folder on this computer.")
     with _LOCK:
         store = _load()
         store["settings"]["projects_dir"] = str(chosen)
@@ -456,11 +588,18 @@ def default_folder(kind: str | None) -> str | None:
 
 
 def last_folder(kind: str | None) -> str | None:
-    """The folder the last path of this kind was in, while it still exists;
-    otherwise ``default_folder(kind)``."""
+    """The folder the last path of this kind was in, while it still exists.
+
+    A kind with a fallback kind (``foundry-export`` falls back to ``json``)
+    then takes that kind's last folder; otherwise ``default_folder(kind)``."""
     if isinstance(kind, str) and kind:
         folder = _read()["folders"].get(kind)
         if folder and _isdir(folder):
+            return folder
+    fallback = _FOLDER_FALLBACKS.get(kind) if isinstance(kind, str) else None
+    if fallback is not None:
+        folder = last_folder(fallback)
+        if folder:
             return folder
     return default_folder(kind)
 
@@ -489,16 +628,21 @@ def record(
     path: str | os.PathLike[str],
     kind: str | None = None,
     source: str = "client",
+    update_folder: bool = True,
 ) -> dict[str, Any] | None:
     """Remember a path that exists on disk. Returns the stored entry (with its
-    computed ``servable``), or None when nothing is at ``path``.
+    computed ``servable``), or None when nothing is at ``path`` or it names a
+    share or device path.
 
-    The entry goes to the front of its kind's list and the path's folder
-    becomes that kind's last folder. A kind that is missing or malformed is
-    taken from the extension. Recording a path again moves it to the front;
-    when the earlier entry had a servable source and this one does not, the
-    earlier source is kept, so re-recording a picked file from the client never
-    takes it out of a Recent menu.
+    The entry goes to the front of its kind's list. With ``update_folder`` the
+    path's folder also becomes that kind's last folder, and a file named
+    ``project.json`` makes its folder the ``foundry-export`` folder as well; a
+    copy the app keeps for itself passes False so pickers keep the user's
+    folder. A kind that is missing or malformed is taken from the extension.
+    Recording a path again moves it to the front; when the earlier entry had a
+    servable source and this one does not, the earlier source is kept, so
+    re-recording a picked file from the client never takes it out of a Recent
+    menu.
     """
     absolute = _absolute(path)
     if absolute is None or not _exists(absolute):
@@ -508,7 +652,11 @@ def record(
     if not isinstance(source, str) or not source:
         source = "client"
     key = os.path.normcase(absolute)
-    folder = absolute if _isdir(absolute) else os.path.dirname(absolute)
+    is_dir = _isdir(absolute)
+    folder = absolute if is_dir else os.path.dirname(absolute)
+    foundry_export = (
+        not is_dir and os.path.basename(absolute).lower() == FOUNDRY_EXPORT_NAME
+    )
     entry: dict[str, Any] = {
         "path": absolute,
         "name": os.path.basename(absolute) or absolute,
@@ -531,10 +679,14 @@ def record(
         lists[kind] = [entry, *kept][:MAX_PER_KIND]
         _cap_kinds(lists)
 
-        folders = store["folders"]
-        folders.pop(kind, None)
-        folders[kind] = folder
-        _cap_kinds(folders)
+        if update_folder:
+            folders = store["folders"]
+            folders.pop(kind, None)
+            folders[kind] = folder
+            if foundry_export:
+                folders.pop("foundry-export", None)
+                folders["foundry-export"] = folder
+            _cap_kinds(folders)
         _save(store)
     return _public(entry)
 
@@ -644,30 +796,86 @@ def installed_asset_path(asset_id: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def _prune_grants(now: float) -> None:
-    for key in [k for k, expiry in _GRANTS.items() if expiry <= now]:
-        del _GRANTS[key]
+def is_blocked_save_path(path: str | os.PathLike[str]) -> bool:
+    """True when a file written to ``path`` would be a type in
+    ``BLOCKED_SAVE_EXTS``.
 
-
-def grant_save(path: str | os.PathLike[str]) -> None:
-    """Allow one write to exactly ``path`` within ``SAVE_GRANT_SECONDS``.
-    Issued when the user picks that path in a native Save dialog."""
-    key = _key(path)
-    if key is None:
-        return
-    now = _clock()
-    with _GRANT_LOCK:
-        _prune_grants(now)
-        _GRANTS[key] = now + SAVE_GRANT_SECONDS
-
-
-def consume_save_grant(path: str | os.PathLike[str]) -> bool:
-    """True once for a live grant on ``path``, which is then removed."""
-    key = _key(path)
-    if key is None:
+    The name is judged the way Windows creates the file: trailing dots and
+    spaces are dropped, a name that is only an extension (``.cmd``) has that
+    extension, and a name holding a colon (an NTFS stream spelling such as
+    ``run.cmd::$DATA``) is refused outright. A path that cannot be normalized
+    answers False; no grant can exist for it."""
+    absolute = _absolute(path)
+    if absolute is None:
         return False
+    name = os.path.basename(absolute)
+    if os.name == "nt":
+        if ":" in name:
+            return True
+        name = name.rstrip(" .")
+    dot = name.rfind(".")
+    return dot >= 0 and name[dot:].lower() in BLOCKED_SAVE_EXTS
+
+
+def _prune_grants(now: float) -> None:
+    for key in list(_GRANTS):
+        live = [g for g in _GRANTS[key] if g[1] > now]
+        if live:
+            _GRANTS[key] = live
+        else:
+            del _GRANTS[key]
+
+
+def grant_save(path: str | os.PathLike[str]) -> str | None:
+    """Allow one write to exactly ``path`` within ``SAVE_GRANT_SECONDS``, and
+    return the nonce that write must present.
+
+    Issued when the user picks that path in a native Save dialog. Grants
+    nothing and returns None for a blocked file type or a path that cannot be
+    normalized."""
+    key = _key(path)
+    if key is None or is_blocked_save_path(path):
+        return None
+    nonce = secrets.token_urlsafe(24)
     now = _clock()
     with _GRANT_LOCK:
         _prune_grants(now)
-        expiry = _GRANTS.pop(key, None)
-    return expiry is not None and expiry > now
+        live = _GRANTS.setdefault(key, [])
+        live.append((nonce, now + SAVE_GRANT_SECONDS))
+        del live[:-MAX_GRANTS_PER_PATH]
+    return nonce
+
+
+def _match_grant(path: Any, nonce: Any, consume: bool) -> bool:
+    key = _key(path)
+    if key is None or not isinstance(nonce, str) or not nonce:
+        return False
+    wanted = nonce.encode("utf-8")
+    now = _clock()
+    with _GRANT_LOCK:
+        _prune_grants(now)
+        live = _GRANTS.get(key, [])
+        matched: int | None = None
+        # Every stored nonce is compared in constant time, so the answer's
+        # timing says nothing about how close a guess came.
+        for i, (stored, _expiry) in enumerate(live):
+            if hmac.compare_digest(stored.encode("utf-8"), wanted) and matched is None:
+                matched = i
+        if matched is None:
+            return False
+        if consume:
+            del live[matched]
+            if not live:
+                _GRANTS.pop(key, None)
+    return True
+
+
+def peek_save_grant(path: str | os.PathLike[str], nonce: str) -> bool:
+    """True while a live grant for ``path`` carries ``nonce``. Spends nothing."""
+    return _match_grant(path, nonce, consume=False)
+
+
+def consume_save_grant(path: str | os.PathLike[str], nonce: str) -> bool:
+    """True once for a live grant for ``path`` carrying ``nonce``, which is then
+    removed."""
+    return _match_grant(path, nonce, consume=True)

@@ -904,6 +904,7 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
             )}
           </div>
           <button
+            type="button"
             onClick={() => void abortStems()}
             className="shrink-0 text-[8px] font-mono uppercase tracking-widest px-1.5 py-0.5 rounded border border-red-500/40 text-red-300 hover:bg-red-500/15"
             title="Abort the running stem separation"
@@ -950,14 +951,17 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
           {/* Mic-in toggle removed per spec — the MicRecorder lives
               on EDIT + VJ now, not Library. */}
           <button
+            type="button"
             onClick={() => midiFileInputRef.current?.click()}
             className="p-1 rounded text-zinc-500 hover:text-purple-300"
             title="Import a .mid file → piano roll"
+            aria-label="Import a .mid file into the piano roll"
           >
             <FileMusic className="w-3 h-3" />
           </button>
-          <KnownFilesMenu id="library-import-midi-recent" exts={['.mid', '.midi']} label="MIDI" onFiles={onLoadMidiFiles} />
+          <KnownFilesMenu id="library-import-midi-recent" exts={['.mid', '.midi']} label="Recent MIDI" onFiles={onLoadMidiFiles} />
           <button
+            type="button"
             onClick={() => void handleImportFolder()}
             className="p-1 rounded text-zinc-500 hover:text-purple-300"
             title="Add a folder of audio to the library (files stay where they are)"
@@ -966,6 +970,8 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
             <FolderPlus className="w-3 h-3" />
           </button>
           <button
+            type="button"
+            aria-label="Import from a link"
             onClick={() => setLinkOpen((v) => !v)}
             className={`p-1 rounded ${linkOpen ? 'bg-white/10 text-purple-200' : 'text-zinc-500 hover:text-purple-300'}`}
             title="Import from link: YouTube, SoundCloud, Bandcamp or a direct audio URL"
@@ -974,14 +980,14 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
           >
             <Link2 className="w-3 h-3" />
           </button>
-          <button onClick={() => setViewMode('list')} className={`p-1 rounded ${viewMode === 'list' ? 'bg-white/10 text-white' : 'text-zinc-600'}`} title="List view">
+          <button type="button" aria-label="List view" aria-pressed={viewMode === 'list'} onClick={() => setViewMode('list')} className={`p-1 rounded ${viewMode === 'list' ? 'bg-white/10 text-white' : 'text-zinc-600'}`} title="List view">
             <ListIcon className="w-3 h-3" />
           </button>
-          <button onClick={() => setViewMode('grid')} className={`p-1 rounded ${viewMode === 'grid' ? 'bg-white/10 text-white' : 'text-zinc-600'}`} title="Grid view">
+          <button type="button" aria-label="Grid view" aria-pressed={viewMode === 'grid'} onClick={() => setViewMode('grid')} className={`p-1 rounded ${viewMode === 'grid' ? 'bg-white/10 text-white' : 'text-zinc-600'}`} title="Grid view">
             <LayoutGrid className="w-3 h-3" />
           </button>
           {onExpand && (
-            <button onClick={onExpand} className="p-1 rounded text-zinc-500 hover:text-teal-300" title="Expand to full library">
+            <button type="button" onClick={onExpand} className="p-1 rounded text-zinc-500 hover:text-teal-300" title="Expand to full library" aria-label="Expand to full library">
               <Maximize2 className="w-3 h-3" />
             </button>
           )}
@@ -1004,6 +1010,7 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
                 className="flex-1 min-w-0 bg-transparent text-[9px] font-mono text-zinc-200 py-1 focus:outline-none placeholder:text-zinc-600 disabled:opacity-50"
               />
               <button
+                type="button"
                 onClick={() => void runLinkImport()}
                 disabled={linkBusy || !linkUrl.trim()}
                 className="shrink-0 text-purple-300 hover:text-purple-100 disabled:opacity-30"
@@ -1046,24 +1053,26 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
 
           <div className="flex items-center gap-2 overflow-x-auto no-scrollbar pb-1">
             <button
-              className={`mono-tag flex items-center gap-1 whitespace-nowrap ${onlyFavorites ? 'bg-purple-600/20! text-purple-300! border-purple-500/40!' : 'bg-white/5! text-zinc-400!'}`}
+              type="button"
+              aria-pressed={onlyFavorites}
+              className={`mono-tag flex items-center gap-1 whitespace-nowrap ${onlyFavorites ?'bg-purple-600/20! text-purple-300! border-purple-500/40!' : 'bg-white/5! text-zinc-400!'}`}
               onClick={() => setOnlyFavorites(!onlyFavorites)}
             >
               <Star className="w-2 h-2 fill-current" /> FAVS
             </button>
-            <button className={`mono-tag flex items-center gap-1 whitespace-nowrap ${sortBy === 'newest' ? 'bg-purple-600/20! text-purple-300!' : 'bg-white/5! text-zinc-400!'}`} onClick={() => setSortBy('newest')}>
+            <button type="button" aria-pressed={sortBy === 'newest'} className={`mono-tag flex items-center gap-1 whitespace-nowrap ${sortBy === 'newest' ? 'bg-purple-600/20! text-purple-300!' : 'bg-white/5! text-zinc-400!'}`} onClick={() => setSortBy('newest')}>
               <Clock className="w-2 h-2" /> NEWEST
             </button>
-            <button className={`mono-tag flex items-center gap-1 whitespace-nowrap ${sortBy === 'duration' ? 'bg-purple-600/20! text-purple-300!' : 'bg-white/5! text-zinc-400!'}`} onClick={() => setSortBy('duration')}>
+            <button type="button" aria-pressed={sortBy === 'duration'} className={`mono-tag flex items-center gap-1 whitespace-nowrap ${sortBy === 'duration' ? 'bg-purple-600/20! text-purple-300!' : 'bg-white/5! text-zinc-400!'}`} onClick={() => setSortBy('duration')}>
               <Tag className="w-2 h-2" /> LENGTH
             </button>
-            <button className={`mono-tag flex items-center gap-1 whitespace-nowrap ${sortBy === 'title' ? 'bg-purple-600/20! text-purple-300!' : 'bg-white/5! text-zinc-400!'}`} onClick={() => setSortBy('title')}>
+            <button type="button" aria-pressed={sortBy === 'title'} className={`mono-tag flex items-center gap-1 whitespace-nowrap ${sortBy === 'title' ? 'bg-purple-600/20! text-purple-300!' : 'bg-white/5! text-zinc-400!'}`} onClick={() => setSortBy('title')}>
               <Filter className="w-2 h-2" /> TITLE
             </button>
-            <button className={`mono-tag flex items-center gap-1 whitespace-nowrap ${sortBy === 'plays' ? 'bg-purple-600/20! text-purple-300!' : 'bg-white/5! text-zinc-400!'}`} onClick={() => setSortBy('plays')}>
+            <button type="button" aria-pressed={sortBy === 'plays'} className={`mono-tag flex items-center gap-1 whitespace-nowrap ${sortBy === 'plays' ? 'bg-purple-600/20! text-purple-300!' : 'bg-white/5! text-zinc-400!'}`} onClick={() => setSortBy('plays')}>
               <Play className="w-2 h-2" /> PLAYS
             </button>
-            <button className="mono-tag flex items-center gap-1 whitespace-nowrap bg-purple-600/30! text-purple-200! border border-purple-500/40" onClick={() => setSuggestOpen(true)} title="Suggest a playlist from your library">
+            <button type="button" className="mono-tag flex items-center gap-1 whitespace-nowrap bg-purple-600/30! text-purple-200! border border-purple-500/40" onClick={() => setSuggestOpen(true)} title="Suggest a playlist from your library">
               <Sparkles className="w-2 h-2" /> SUGGEST
             </button>
           </div>
@@ -1155,7 +1164,7 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
           }}
         />
         <div className="flex items-center justify-between px-1 mb-1 text-[8px] font-mono text-zinc-600 uppercase border-b border-white/5 pb-1">
-          <button className="flex items-center gap-1 hover:text-zinc-300" onClick={() => setSortBy('title')}>
+          <button type="button" className="flex items-center gap-1 hover:text-zinc-300" onClick={() => setSortBy('title')}>
             <ArrowUpDown className="w-2 h-2" /> NAME
           </button>
           <div className="flex gap-4">
@@ -1201,7 +1210,9 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
                     className="absolute inset-0 w-full h-full"
                   />
                   <button
-                    className="absolute top-1 right-1 p-1 bg-black/80 rounded opacity-0 group-hover:opacity-100 transition-opacity"
+                    type="button"
+                    className="absolute top-1 right-1 p-1 bg-black/80 rounded opacity-0 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity"
+                    aria-label={engineEntryId === entry.id && engineIsPlaying ? `Pause ${entry.title}` : `Play ${entry.title}`}
                     onClick={() => handlePlay(entry)}
                   >
                     {engineEntryId === entry.id && engineIsPlaying ? <Pause className="w-3 h-3 text-purple-300" /> : <Play className="w-3 h-3 text-zinc-300" />}
@@ -1224,9 +1235,11 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
                     {entry.title}
                   </span>
                   <button
+                    type="button"
                     onClick={(e) => { e.stopPropagation(); void toggleFavorite(entry.id); }}
                     className="shrink-0"
                     title={entry.favorite ? 'Unfavorite' : 'Favorite'}
+                    aria-label={entry.favorite ? `Unfavorite ${entry.title}` : `Favorite ${entry.title}`}
                   >
                     <Star className={`w-2.5 h-2.5 ${entry.favorite ? 'text-yellow-500 fill-current' : 'text-zinc-700'}`} />
                   </button>
@@ -1250,41 +1263,52 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
                     {viewMode === 'list' && (
                       <div className="flex gap-1">
                         <button
+                          type="button"
                           className="p-1 hover:bg-white/10 rounded"
                           onClick={(e) => { e.stopPropagation(); handlePlay(entry); }}
                           title={engineEntryId === entry.id && engineIsPlaying ? 'Pause' : 'Play'}
+                          aria-label={engineEntryId === entry.id && engineIsPlaying ? `Pause ${entry.title}` : `Play ${entry.title}`}
                         >
                           {engineEntryId === entry.id && engineIsPlaying ? <Pause className="w-2.5 h-2.5 text-purple-400" /> : <Play className="w-2.5 h-2.5 text-zinc-400 group-hover:text-purple-400" />}
                         </button>
                         <button
+                          type="button"
                           className="p-1 hover:bg-white/10 rounded"
                           onClick={(e) => { e.stopPropagation(); openDetailsForEntry(entry.id); }}
                           title="Open details (metadata, prompt, analysis)"
+                          aria-label={`Open details for ${entry.title}`}
                         >
                           <Info className="w-2.5 h-2.5 text-zinc-500 hover:text-emerald-300" />
                         </button>
                         <button
+                          type="button"
                           className="p-1 hover:bg-white/10 rounded"
                           onClick={(e) => { e.stopPropagation(); handleSendToNewTrack(entry); }}
                           title="Send to editor as a new track"
+                          aria-label={`Send ${entry.title} to the editor as a new track`}
                         >
                           <Layers className="w-2.5 h-2.5 text-zinc-500 hover:text-purple-300" />
                         </button>
                         <button
+                          type="button"
                           className="p-1 hover:bg-white/10 rounded"
                           onClick={(e) => { e.stopPropagation(); handleSendToInit(entry); }}
                           title="Send to Init audio"
+                          aria-label={`Send ${entry.title} to Init audio`}
                         >
                           <Wand2 className="w-2.5 h-2.5 text-zinc-500 hover:text-purple-300" />
                         </button>
                         <button
+                          type="button"
                           className="p-1 hover:bg-white/10 rounded"
                           onClick={(e) => { e.stopPropagation(); handleSendToInpaint(entry); }}
                           title="Send to Inpaint"
+                          aria-label={`Send ${entry.title} to Inpaint`}
                         >
                           <PenLine className="w-2.5 h-2.5 text-zinc-500 hover:text-purple-300" />
                         </button>
                         <button
+                          type="button"
                           className="p-1 hover:bg-white/10 rounded"
                           onClick={(e) => { e.stopPropagation(); void saveEntryFile(entry, getAudioUrl(entry)); }}
                           title="Save this file to a folder you choose."
@@ -1293,12 +1317,14 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
                           <Download className="w-2.5 h-2.5 text-zinc-600 hover:text-white" />
                         </button>
                         <button
+                          type="button"
                           className="p-1 hover:bg-white/10 rounded"
                           onClick={(e) => {
                             e.stopPropagation();
                             if (confirm(`Delete "${entry.title}"?`)) void removeEntry(entry.id);
                           }}
                           title="Delete"
+                          aria-label={`Delete ${entry.title}`}
                         >
                           <Trash2 className="w-2.5 h-2.5 text-zinc-600 hover:text-red-400" />
                         </button>
@@ -1318,6 +1344,7 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
               <>
                 <p>Library is empty.</p>
                 <button
+                  type="button"
                   className="mono-tag bg-purple-600/20! text-purple-300! border-purple-500/40! cursor-pointer"
                   onClick={() => onSwitchTab?.('create')}
                 >
@@ -1593,7 +1620,7 @@ const LibraryActionsToolbar: React.FC<LibraryActionsToolbarProps> = ({
         result = await saveFile({
           url: `/api/library/${entry.id}/lineage?depth=8`,
           suggestedName: `${fileSafe(entry.title)}-lineage.json`,
-          kind: 'json',
+          kind: 'lineage-json',
         });
       } else {
         // Build a metadata JSON client-side from what the store already
@@ -1602,7 +1629,7 @@ const LibraryActionsToolbar: React.FC<LibraryActionsToolbarProps> = ({
         const blob = new Blob([JSON.stringify(entry, null, 2)], {
           type: 'application/json',
         });
-        result = await saveFile({ blob, suggestedName: withExt(entry.title, '.json'), kind: 'json' });
+        result = await saveFile({ blob, suggestedName: withExt(entry.title, '.json'), kind: 'library-metadata' });
       }
       if (result.cancelled) break;
     }
@@ -1795,6 +1822,8 @@ interface SubTabButtonProps {
 
 const SubTabButton: React.FC<SubTabButtonProps> = ({ active, onClick, icon, children }) => (
   <button
+    type="button"
+    aria-pressed={active}
     onClick={onClick}
     className={`flex items-center gap-1.5 px-2 py-1 rounded text-[9px] font-black uppercase tracking-widest border transition-colors ${
       active
@@ -2495,6 +2524,7 @@ const ScoreList: React.FC<{
   const refreshBtn = (
     <div className="flex justify-end">
       <button
+        type="button"
         onClick={() => void onRefresh()}
         className="p-1 rounded text-zinc-500 hover:text-purple-300"
         title="Refresh scores"

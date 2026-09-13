@@ -8,7 +8,9 @@ All user-data roots worth backing up are enumerated by :func:`user_data_roots`:
 - ``projects`` — the projects folder ``.tasmo`` files are saved into
   (``known_paths.projects_dir()``, ``~/Documents/theDAW Projects`` by default).
 - ``settings`` — the top-level ``data/*.json`` registries (``settings.json``,
-  ``local_checkpoints.json``, ``recent_projects.json``).
+  ``local_checkpoints.json``, ``recent_projects.json``). ``known_paths.json``
+  is left out of every archive and ignored in one, because its sources decide
+  which files /api/places/file serves (``_NEVER_BACKED_UP``).
 
 Export and import both run in daemon threads tracked by an in-memory job
 table so the FastAPI event loop is never blocked; callers poll job status.
@@ -51,6 +53,11 @@ _SKIP_DIR_NAMES = {
     ".cache",
     "thedaw_transcode",
 }
+
+# Settings files never written to an archive and never restored from one,
+# compared case-insensitively. known_paths.json records which files the app may
+# serve; a restored copy would let an archive choose them.
+_NEVER_BACKED_UP = frozenset({"known_paths.json"})
 
 _VERSION_RE = re.compile(r'^version\s*=\s*"([^"]+)"', re.MULTILINE)
 
@@ -113,15 +120,29 @@ def _is_backup_zip(name: str) -> bool:
     return name.startswith(ZIP_PREFIX) and name.lower().endswith(".zip")
 
 
+def _is_restorable_settings_name(name: str) -> bool:
+    """Whether an archive member of a ``files`` root may be restored: a plain
+    top-level ``*.json`` name, as export writes, outside ``_NEVER_BACKED_UP``.
+
+    Judged the way Windows creates the file, so a separator, a colon (an NTFS
+    stream spelling) or trailing dots and spaces cannot reach an excluded
+    file under another spelling."""
+    if not name or "/" in name or "\\" in name or ":" in name:
+        return False
+    plain = name.rstrip(" .")
+    return plain.lower().endswith(".json") and plain.casefold() not in _NEVER_BACKED_UP
+
+
 def _iter_root_files(spec: RootSpec) -> Iterator[tuple[Path, str]]:
     """Yield ``(absolute_path, relative_posix_path)`` for every file in a root,
-    skipping caches/venvs/__pycache__ and previously written backup zips.
-    Missing roots simply yield nothing."""
+    skipping caches/venvs/__pycache__, previously written backup zips and, in a
+    ``files`` root, the settings in ``_NEVER_BACKED_UP``. Missing roots simply
+    yield nothing."""
     base = spec.path
     if spec.kind == "files":
         if base.is_dir():
             for f in sorted(base.glob("*.json")):
-                if f.is_file():
+                if f.is_file() and f.name.casefold() not in _NEVER_BACKED_UP:
                     yield f, f.name
         return
     if not base.is_dir():
@@ -321,9 +342,11 @@ def _run_export(job: _Job, dest: Path, include: Optional[list[str]]) -> None:
                     job.bytes_written = written
                     job.progress = written / total if total else 1.0
         # Remembered before the job reports done, so a client that reads the
-        # recent backups as soon as it sees 'done' finds this zip. Both calls
-        # swallow their own IO errors.
-        known_paths.record(zip_path, "backup-zip", source="backup")
+        # recent backups as soon as it sees 'done' finds this zip. Stored as
+        # 'client': the export is an unauthenticated request and the zip holds
+        # the user's keys, so it is offered for a restore by path and never
+        # served. Both calls swallow their own IO errors.
+        known_paths.record(zip_path, "backup-zip", source="client")
         known_paths.record_folder("backup-dest", dest)
         with _jobs_lock:
             job.zip_path = str(zip_path)
@@ -391,11 +414,8 @@ def start_import(zip_path: str, mode: str) -> str:
 
 def _run_import(job: _Job, zip_path: Path, mode: str) -> None:
     try:
+        # The archive's projects land in the projects folder in use now.
         roots_by_id = {s.id: s for s in user_data_roots()}
-        # The archive's projects land in the folder in use now. The settings
-        # root can restore a known_paths.json whose projects folder is on
-        # another machine; that setting is put back to this folder below.
-        projects_before = roots_by_id["projects"].path
         written = 0
         processed = 0
         with zipfile.ZipFile(zip_path) as zf:
@@ -417,6 +437,11 @@ def _run_import(job: _Job, zip_path: Path, mode: str) -> None:
                         parts[1],
                         m.filename,
                     )
+                    continue
+                if spec.kind == "files" and not _is_restorable_settings_name(parts[2]):
+                    log.warning("backup: not restoring settings member %s", m.filename)
+                    with _jobs_lock:
+                        job.progress = processed / total
                     continue
                 base = spec.path
                 target = base / parts[2]
@@ -446,15 +471,6 @@ def _run_import(job: _Job, zip_path: Path, mode: str) -> None:
                 with _jobs_lock:
                     job.bytes_written = written
                     job.progress = processed / total
-        restored_projects = known_paths.projects_dir()
-        if restored_projects != projects_before and not restored_projects.is_dir():
-            log.info(
-                "backup: restored projects folder %s is not on this machine; "
-                "keeping %s",
-                restored_projects,
-                projects_before,
-            )
-            known_paths.set_projects_dir(projects_before)
         with _jobs_lock:
             job.bytes_written = written
             job.progress = 1.0
