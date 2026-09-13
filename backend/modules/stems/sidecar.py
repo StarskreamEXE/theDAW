@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -89,6 +90,7 @@ def _probe_packages(python_exe: Path) -> dict:
             capture_output=True,
             text=True,
             timeout=30,
+            env=child_env(),
         )
     except (subprocess.TimeoutExpired, OSError) as e:
         return {"_error": repr(e)}
@@ -194,6 +196,7 @@ def _bootstrap_sidecar_venv(cfg: SidecarConfig) -> dict:
             capture_output=True,
             text=True,
             timeout=180,
+            env=child_env(),
         )
         if result.returncode == 0 and cfg.python_exe.is_file():
             return {"ok": True, "created": True, "tool": "uv"}
@@ -206,6 +209,7 @@ def _bootstrap_sidecar_venv(cfg: SidecarConfig) -> dict:
             capture_output=True,
             text=True,
             timeout=180,
+            env=child_env(),
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         return {"ok": False, "created": False, "tool": "venv", "error": repr(e)}
@@ -441,6 +445,7 @@ class StemsSidecar:
                 cwd=str(self.cfg.package_path),
                 stdout=stdout_fp,
                 stderr=stderr_fp,
+                env=child_env(),
             )
         except OSError as e:
             raise RuntimeError(f"failed to spawn stems sidecar: {e}") from e
@@ -659,7 +664,11 @@ def _stems_install_cmd(python_exe: Path, req: Path) -> tuple[list[str], str]:
     # and side-steps pip's classic resolver entirely.
     try:
         uv_check = subprocess.run(
-            ["uv", "--version"], capture_output=True, text=True, timeout=10
+            ["uv", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=child_env(),
         )
         if uv_check.returncode == 0:
             return (
@@ -675,6 +684,7 @@ def _stems_install_cmd(python_exe: Path, req: Path) -> tuple[list[str], str]:
         capture_output=True,
         text=True,
         timeout=15,
+        env=child_env(),
     )
     if pip_check.returncode == 0:
         return ([str(python_exe), "-m", "pip", "install", "-r", str(req)], "pip")
@@ -683,6 +693,7 @@ def _stems_install_cmd(python_exe: Path, req: Path) -> tuple[list[str], str]:
         capture_output=True,
         text=True,
         timeout=120,
+        env=child_env(),
     )
     if ensurepip.returncode == 0:
         return (
@@ -893,6 +904,7 @@ def install_dependencies(cfg: Optional[SidecarConfig] = None) -> dict:
             capture_output=True,
             text=True,
             timeout=15 * 60,
+            env=child_env(),
         )
     except (subprocess.TimeoutExpired, OSError) as e:
         out["error"] = repr(e)

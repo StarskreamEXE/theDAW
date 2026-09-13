@@ -13,6 +13,7 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +66,7 @@ def probe_file(path: Path, timeout_sec: float = 20.0) -> dict[str, Any]:
             text=True,
             timeout=timeout_sec,
             stdin=subprocess.DEVNULL,
+            env=child_env(),
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         log.info("analysis.ffprobe: probe failed for %s: %s", p.name, e)

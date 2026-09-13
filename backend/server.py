@@ -36,6 +36,7 @@ from backend.lib.audio_io import load_audio, load_audio_array, save_audio, save_
 from backend.assistant_routes import router as assistant_router
 from backend.modules.loader import load_modules
 from backend.lib import paths
+from backend.lib.launch_token import child_env
 
 # Heavy imports (torch, torchaudio, matplotlib, and the stable_audio_3 model
 # graph) total ~9.6s and are deliberately kept OFF module scope so uvicorn binds
@@ -1084,6 +1085,7 @@ def _gpu_snapshot() -> list[dict]:
             text=True,
             timeout=2,
             stdin=subprocess.DEVNULL,
+            env=child_env(),
         )
     except Exception:
         return []

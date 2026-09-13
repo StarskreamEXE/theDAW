@@ -36,6 +36,7 @@ from backend.modules.vst.host import (
     list_builtin_effects,
 )
 from backend.lib import paths
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -433,6 +434,7 @@ def open_editor(req: EditorRequest):
             cwd=str(repo_root),
             stdout=log_fh or None,
             stderr=(subprocess.STDOUT if log_fh else None),
+            env=child_env(),
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not launch editor: {e}")

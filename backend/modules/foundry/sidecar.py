@@ -31,6 +31,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Optional
 from backend.lib import paths
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -174,6 +175,7 @@ def _pid_listening_on_port(port: int) -> Optional[int]:
             text=True,
             timeout=5.0,
             shell=False,
+            env=child_env(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -242,7 +244,7 @@ def ensure_running(*, wait_for_ready: bool = True) -> str:
                     "Set THEDAW_FOUNDRY_PROJECT to override."
                 )
 
-            env = os.environ.copy()
+            env = child_env()
             env["THEDAW_FOUNDRY_PORT"] = str(cfg.port)
 
             prod_server = _production_server(cfg)
@@ -272,6 +274,7 @@ def ensure_running(*, wait_for_ready: bool = True) -> str:
                                 stdout=log_fh,
                                 stderr=log_fh,
                                 shell=False,
+                                env=child_env(),
                             )
                     except FileNotFoundError as e:
                         raise RuntimeError(

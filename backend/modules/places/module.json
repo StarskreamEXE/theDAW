@@ -1,0 +1,10 @@
+{
+  "name": "places",
+  "label": "Places",
+  "enabled": true,
+  "icon": "FolderOpen",
+  "sidebar": false,
+  "api_prefix": "/api/places",
+  "backend": true,
+  "description": "Remembers where theDAW installs, saves, downloads and opens files, and the last folder used for each kind of file. Pickers start in that folder, Recent menus hand a remembered file back, Show in folder opens it in the file manager, and a Save dialog's choice is written to disk directly."
+}

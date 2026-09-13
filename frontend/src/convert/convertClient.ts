@@ -3,10 +3,14 @@
  *
  * The catalog (target formats + source-kind -> target-kind rules) is fetched
  * once and cached. Converting a library entry streams the result back as bytes
- * and triggers a download. Large media is read via arrayBuffer() rather than
- * blob() (the latter spills to a disk-backed store that fails under disk
- * pressure — see fetchRetry.ts).
+ * and saves them through saveFile, so the path the user picks is remembered.
+ * Large media is read via arrayBuffer() rather than blob() (the latter spills
+ * to a disk-backed store that fails under disk pressure — see fetchRetry.ts).
+ *
+ * The file-name helpers below name any saved copy of a library entry.
  */
+
+import { extOfName, saveFile, type SaveFileResult } from '../lib/saveFile';
 
 export interface ConvertFormat {
   id: string;
@@ -48,15 +52,33 @@ export function formatsForKind(catalog: ConvertCatalog, kind: string): ConvertFo
 }
 
 /**
- * Convert a library entry to the given format and download the result.
- * Resolves when the download has been triggered; rejects with a readable
- * message on failure.
+ * A file name for a library entry saved as `ext` ('wav' or '.wav'): the title
+ * with the characters Windows refuses in a name replaced by '_', then the
+ * extension unless the title already ends in it.
+ */
+export function entryFileName(title: string, ext: string, fallback = 'track'): string {
+  const dotted = ext ? (ext.startsWith('.') ? ext : `.${ext}`).toLowerCase() : '';
+  const safe = (title || '').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim().slice(0, 120) || fallback;
+  return dotted && !safe.toLowerCase().endsWith(dotted) ? `${safe}${dotted}` : safe;
+}
+
+/** The name a library entry's own audio file is saved under: its title with
+ *  the stored file's extension. */
+export function entryAudioFileName(entry: { title: string; audioFilename?: string }): string {
+  return entryFileName(entry.title, extOfName(entry.audioFilename ?? ''));
+}
+
+/**
+ * Convert a library entry to the given format and save the result.
+ * Resolves with the save's outcome once the file is written, downloaded or the
+ * dialog is cancelled; rejects with a readable message when the conversion
+ * itself fails.
  */
 export async function convertLibraryEntry(
   entryId: string,
   format: ConvertFormat,
   title: string,
-): Promise<void> {
+): Promise<SaveFileResult> {
   const res = await fetch(`/api/convert/library/${encodeURIComponent(entryId)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -75,13 +97,9 @@ export async function convertLibraryEntry(
 
   const buf = await res.arrayBuffer();
   const blob = new Blob([buf], { type: res.headers.get('content-type') ?? format.mime });
-  const url = URL.createObjectURL(blob);
-  const safeTitle = (title || 'converted').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').slice(0, 120);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `${safeTitle}.${format.ext}`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  return saveFile({
+    blob,
+    suggestedName: entryFileName(title, format.ext, 'converted'),
+    kind: format.kind,
+  });
 }

@@ -61,6 +61,7 @@ export const DawImportModal: React.FC = () => {
             name="daw_import_path"
             label="Project file"
             kind="file"
+            pickKind="daw-project"
             fileFilter={DAW_PROJECT_FILTER}
             value={sourcePath}
             onChange={setSourcePath}

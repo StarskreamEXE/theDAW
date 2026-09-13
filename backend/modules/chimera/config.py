@@ -12,6 +12,7 @@ import logging
 import shutil
 import subprocess
 from typing import Optional, TypedDict
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ def _run(cmd: list[str], timeout: float = 5.0) -> tuple[int, str]:
             text=True,
             timeout=timeout,
             stdin=subprocess.DEVNULL,
+            env=child_env(),
         )
         return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:

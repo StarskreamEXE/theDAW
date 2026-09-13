@@ -11,6 +11,7 @@ import { sendSetToVj, isVjSetTargetActive, type VjSetItem } from '../../state/vj
 import { useAppUiStore } from '../../state/appUiStore';
 import { useStatusBarStore } from '../../state/statusBarStore';
 import { useBottomPanelStore } from '../../state/bottomPanelStore';
+import { saveFile } from '../../lib/saveFile';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -100,13 +101,11 @@ const fmtTs = (): string => {
 const entryToLine = (e: LogEntry) =>
   `${new Date(e.ts).toISOString()} [${e.level.toUpperCase().padEnd(5)}] [${e.source}] ${e.msg}`;
 
-const downloadLog = (entries: LogEntry[]) => {
+// Kind 'log' keeps a saved log out of the lyrics folder that .txt maps to.
+const saveLog = (entries: LogEntry[]) => {
   if (!entries.length) return;
   const blob = new Blob([entries.map(entryToLine).join('\n') + '\n'], { type: 'text/plain;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const a = Object.assign(document.createElement('a'), { href: url, download: `thedaw-log-${fmtTs()}.txt` });
-  document.body.appendChild(a); a.click(); document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  void saveFile({ blob, suggestedName: `thedaw-log-${fmtTs()}.txt`, kind: 'log' });
 };
 
 const fmtEst = (ms: number): string => {
@@ -247,10 +246,10 @@ export const LogBody: React.FC = () => {
           </button>
           <button
             type="button"
-            onClick={() => downloadLog(entries)}
-            aria-label="Download log"
+            onClick={() => saveLog(entries)}
+            aria-label="Save log"
             className="p-1 text-zinc-600 hover:text-purple-300 transition-colors"
-            title="Download log"
+            title="Save the log as a text file"
           >
             <Download className="w-3 h-3" />
           </button>

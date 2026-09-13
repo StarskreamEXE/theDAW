@@ -31,6 +31,7 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Literal, Optional
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -101,6 +102,7 @@ def _pip_install_cmd(python_exe: str, packages: list[str]) -> tuple[list[str], s
         text=True,
         timeout=15,
         stdin=subprocess.DEVNULL,
+        env=child_env(),
     )
     if pip_check.returncode == 0:
         return ([python_exe, "-m", "pip", "install", *packages], "pip")
@@ -112,6 +114,7 @@ def _pip_install_cmd(python_exe: str, packages: list[str]) -> tuple[list[str], s
         text=True,
         timeout=120,
         stdin=subprocess.DEVNULL,
+        env=child_env(),
     )
     if ensurepip.returncode == 0:
         return ([python_exe, "-m", "pip", "install", *packages], "pip-after-ensurepip")
@@ -146,6 +149,7 @@ def install_engine(engine: str) -> dict:
             text=True,
             timeout=15 * 60,
             stdin=subprocess.DEVNULL,
+            env=child_env(),
         )
     except (subprocess.TimeoutExpired, OSError) as e:
         out["error"] = repr(e)

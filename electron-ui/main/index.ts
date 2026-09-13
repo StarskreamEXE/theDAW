@@ -11,6 +11,7 @@ import {
 } from 'electron'
 import { ChildProcess, spawn, execFile } from 'child_process'
 import { autoUpdater } from 'electron-updater'
+import * as crypto from 'crypto'
 import * as fs from 'fs'
 import * as path from 'path'
 import { pathToFileURL } from 'url'
@@ -91,6 +92,16 @@ let uvSyncProcess: ChildProcess | null = null
 const BACKEND_BASE = 'http://127.0.0.1:8600'
 const HEALTH_URL = `${BACKEND_BASE}/api/health`
 const SHUTDOWN_URL = `${BACKEND_BASE}/api/admin/shutdown`
+
+// A secret shared by this main process and the backend it spawns, and nothing
+// else. It goes to the backend only through buildBackendEnv
+// (THEDAW_LAUNCH_TOKEN) and comes back only on main-process requests
+// (X-TheDAW-Launch-Token), so the backend can tell a request made here from one
+// a page made. It is never put in process.env, sent over IPC or logged, so the
+// renderer and preload have no way to read it. A backend this process did not
+// spawn has no token and treats every request as coming from a page.
+const LAUNCH_TOKEN = crypto.randomBytes(24).toString('hex')
+const LAUNCH_TOKEN_HEADER = 'X-TheDAW-Launch-Token'
 
 // ---------------------------------------------------------------------------
 // Packaged-app paths + first-run bootstrap
@@ -192,7 +203,7 @@ function getUvCommand(): string {
 
 /** The venv root. Beside the project when the install dir is writable, in the
  *  per-user runtime dir when it is not. uv is pointed at it with
- *  UV_PROJECT_ENVIRONMENT (buildBackendEnv), which relocates the environment
+ *  UV_PROJECT_ENVIRONMENT (buildBaseEnv), which relocates the environment
  *  without moving the project. */
 function getVenvDir(): string {
   return path.join(getWritableRuntimeDir(), '.venv')
@@ -204,12 +215,19 @@ function venvPython(venvRoot: string): string {
     : path.join(venvRoot, 'bin', 'python')
 }
 
-// Environment for the backend + the uv sync step. Packaged builds prepend the
-// bundled tools dir (uv.exe, ffmpeg.exe, ffprobe.exe) to PATH so the backend's
-// audio I/O resolves ffmpeg without a system install. The PATH key is matched
-// case-insensitively because Windows exposes it as "Path".
-function buildBackendEnv(): NodeJS.ProcessEnv {
+// Environment for every process this main process starts. Packaged builds
+// prepend the bundled tools dir (uv.exe, ffmpeg.exe, ffprobe.exe) to PATH so the
+// backend's audio I/O resolves ffmpeg without a system install. The PATH key is
+// matched case-insensitively because Windows exposes it as "Path".
+//
+// It carries no launch token. uv sync runs package build scripts, so a
+// THEDAW_LAUNCH_TOKEN inherited from the launching shell is removed under every
+// spelling: Windows environment names ignore case.
+function buildBaseEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, SA3_SUPERVISOR_PRESENT: '1' }
+  for (const key of Object.keys(env)) {
+    if (key.toUpperCase() === 'THEDAW_LAUNCH_TOKEN') delete env[key]
+  }
   if (app.isPackaged) {
     const toolsDir = getToolsDir()
     const key = Object.keys(env).find((k) => k.toLowerCase() === 'path') ?? 'PATH'
@@ -243,10 +261,19 @@ function buildBackendEnv(): NodeJS.ProcessEnv {
   return env
 }
 
+// The backend's environment: the base plus this process's launch token, which
+// the download hook sends back. Only spawnBackend uses it. The backend starts
+// its own children with child_env (backend/lib/launch_token.py), which leaves
+// the token out.
+function buildBackendEnv(): NodeJS.ProcessEnv {
+  return { ...buildBaseEnv(), THEDAW_LAUNCH_TOKEN: LAUNCH_TOKEN }
+}
+
 function coreImportsOk(py: string): Promise<boolean> {
   return new Promise((resolve) => {
     try {
       const proc = spawn(py, ['-c', 'import uvicorn, fastapi'], {
+        env: buildBaseEnv(),
         stdio: 'ignore',
         windowsHide: true,
       })
@@ -265,9 +292,11 @@ function runUvSync(uvCmd: string, cwd: string): Promise<void> {
     // lock is generated with the build and must not be re-resolved on a user's
     // machine.
     log(`Running ${uvCmd} sync --frozen --group dev in ${cwd}`)
+    // The base environment: package build scripts run in this sync, and none of
+    // them may hold the launch token.
     const proc = spawn(uvCmd, ['sync', '--frozen', '--group', 'dev'], {
       cwd,
-      env: buildBackendEnv(),
+      env: buildBaseEnv(),
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     })
@@ -507,7 +536,7 @@ function killBackend(): Promise<void> {
 
       try {
         if (process.platform === 'win32') {
-          execFile('taskkill', ['/F', '/T', '/PID', String(pid)], (err) => {
+          execFile('taskkill', ['/F', '/T', '/PID', String(pid)], { env: buildBaseEnv() }, (err) => {
             if (err) log(`taskkill error: ${err.message}`)
             else log('taskkill /T completed.')
             settle()
@@ -711,6 +740,93 @@ function sendLoadingStatus(msg: string): void {
 }
 
 // ---------------------------------------------------------------------------
+// Downloads the renderer starts (an <a download>, a blob save)
+//
+// Chromium writes these straight to disk, so the backend never sees where they
+// went. When one finishes, the path goes to /api/places/record so the app's
+// pickers and "Recent" menus can offer that file back, and the renderer hears
+// about it on 'download-done' so it can say where the file landed.
+// ---------------------------------------------------------------------------
+
+const PLACES_RECORD_URL = `${BACKEND_BASE}/api/places/record`
+const LAUNCH_TOKEN_CHECK_URL = `${BACKEND_BASE}/api/places/launch-token-check`
+
+/** Record a finished download with the launch token. Resolves once the backend
+ *  answered, failed or timed out; it never rejects, because a backend that is
+ *  down or restarting must not surface as an error for a download that already
+ *  succeeded. */
+async function recordDownload(savePath: string): Promise<void> {
+  try {
+    const res = await globalThis.fetch(PLACES_RECORD_URL, {
+      method: 'POST',
+      // The token tells /api/places/record this path came from Chromium's
+      // download manager, which is what lets the backend serve it back.
+      headers: {
+        'content-type': 'application/json',
+        [LAUNCH_TOKEN_HEADER]: LAUNCH_TOKEN,
+      },
+      body: JSON.stringify({ path: savePath }),
+      signal: AbortSignal.timeout(5000),
+    })
+    if (!res.ok) log(`Recording the download failed: /api/places/record answered ${res.status}.`)
+  } catch (err) {
+    log(`Recording the download failed: ${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
+function watchDownloads(ses: Electron.Session): void {
+  ses.on('will-download', (_event, item) => {
+    item.once('done', async (_doneEvent, state) => {
+      const filename = item.getFilename()
+      const savePath = state === 'completed' ? item.getSavePath() || null : null
+      if (savePath) {
+        log(`Download completed: ${savePath}`)
+        // Recorded before the renderer hears about it, so the Recent menus it
+        // refetches on 'download-done' already list the file.
+        await recordDownload(savePath)
+      } else {
+        log(`Download ${state}: ${filename}`)
+      }
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('download-done', { path: savePath, filename, state })
+      }
+    })
+  })
+}
+
+/** Ask a backend this process did not spawn whether it holds this session's
+ *  launch token, and log one warning when it does not. Such a backend records
+ *  a finished download as a path a page named. */
+async function warnIfBackendLacksLaunchToken(): Promise<void> {
+  let matches: boolean
+  try {
+    const res = await globalThis.fetch(LAUNCH_TOKEN_CHECK_URL, {
+      headers: { [LAUNCH_TOKEN_HEADER]: LAUNCH_TOKEN },
+      signal: AbortSignal.timeout(5000),
+    })
+    // A backend from before this route has no launch token either.
+    if (res.status === 404) {
+      matches = false
+    } else if (res.ok) {
+      const body = (await res.json()) as { matches?: unknown }
+      matches = body?.matches === true
+    } else {
+      log(`Launch token check answered ${res.status}; skipping it.`)
+      return
+    }
+  } catch (err) {
+    log(`Launch token check failed: ${err instanceof Error ? err.message : String(err)}`)
+    return
+  }
+  if (!matches) {
+    log(
+      'WARNING: The backend on port 8600 was started outside this app, so it does not hold ' +
+        "this session's launch token. Downloads from this session will not appear in Recent menus.",
+    )
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Production: custom protocol for renderer files
 // ---------------------------------------------------------------------------
 
@@ -791,18 +907,43 @@ function registerAppProtocol(): void {
 // IPC handlers for native dialogs
 // ---------------------------------------------------------------------------
 
+/** What the renderer may set on an open dialog: where it starts, what it lists
+ *  and its title. Anything else in the payload is dropped, so the renderer can
+ *  never turn a file picker into a multi-select or a directory picker. */
+function openDialogOptions(raw: unknown): Pick<Electron.OpenDialogOptions, 'defaultPath' | 'filters' | 'title'> {
+  const out: Pick<Electron.OpenDialogOptions, 'defaultPath' | 'filters' | 'title'> = {}
+  if (!raw || typeof raw !== 'object') return out
+  const o = raw as { defaultPath?: unknown; filters?: unknown; title?: unknown }
+  if (typeof o.defaultPath === 'string' && o.defaultPath) out.defaultPath = o.defaultPath
+  if (typeof o.title === 'string' && o.title) out.title = o.title
+  if (Array.isArray(o.filters)) {
+    const filters = o.filters.filter(
+      (f): f is Electron.FileFilter =>
+        !!f &&
+        typeof f === 'object' &&
+        typeof (f as Electron.FileFilter).name === 'string' &&
+        Array.isArray((f as Electron.FileFilter).extensions) &&
+        (f as Electron.FileFilter).extensions.every((e) => typeof e === 'string'),
+    )
+    if (filters.length) out.filters = filters
+  }
+  return out
+}
+
 function registerIpcHandlers(): void {
-  ipcMain.handle('dialog:selectFile', async () => {
+  ipcMain.handle('dialog:selectFile', async (_event, options?: unknown) => {
     if (!mainWindow) return { canceled: true, filePaths: [] }
     const result = await dialog.showOpenDialog(mainWindow, {
+      ...openDialogOptions(options),
       properties: ['openFile'],
     })
     return result
   })
 
-  ipcMain.handle('dialog:selectDirectory', async () => {
+  ipcMain.handle('dialog:selectDirectory', async (_event, options?: unknown) => {
     if (!mainWindow) return { canceled: true, filePaths: [] }
     const result = await dialog.showOpenDialog(mainWindow, {
+      ...openDialogOptions(options),
       properties: ['openDirectory'],
     })
     return result
@@ -1026,6 +1167,7 @@ if (gotSingleInstanceLock) app.whenReady().then(async () => {
   const ses = session.defaultSession
   ses.setPermissionRequestHandler((_wc, _permission, callback) => callback(true))
   ses.setPermissionCheckHandler(() => true)
+  watchDownloads(ses)
 
   registerIpcHandlers()
 
@@ -1050,6 +1192,7 @@ if (gotSingleInstanceLock) app.whenReady().then(async () => {
     if (!isQuitting) spawnBackend()
   } else {
     log('Backend already running — skipping spawn.')
+    await warnIfBackendLacksLaunchToken()
   }
 })
 
