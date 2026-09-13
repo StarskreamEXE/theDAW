@@ -37,6 +37,7 @@ import { Visualizer } from './Visualizer';
 import { BpmTapper } from './BpmTapper';
 import { RecordingHistory } from './RecordingHistory';
 import { AssistantOrb } from './AssistantOrb';
+import { saveFile, type SaveFileResult } from '../../../lib/saveFile';
 
 import { usePianoRollStore, type PianoNote } from '../../../state/pianoRollStore';
 import { encodeWav } from '../../../lib/wavEncode';
@@ -413,14 +414,19 @@ export const Vocal2MidiPanel: React.FC = () => {
     }
   }, [processedNotes, config.prompt, bpm, pushNotes]);
 
-  const handleExportMidi = () => {
+  // What a save did, for the status line: the path when it was written.
+  const savedStatus = (label: string, saved: SaveFileResult): string =>
+    saved.path ? `${label} saved: ${saved.path}`
+      : saved.downloaded ? `${label} exported`
+        : saved.cancelled ? `${label} export cancelled`
+          : `${label} export failed`;
+
+  const handleExportMidi = async () => {
     if (processedNotes.length === 0) return;
     const profile = SOUND_PROFILES[config.activeProfileId] || SOUND_PROFILES['DEFAULT'];
     const blob = generateMidiFile(processedNotes, bpm, profile, { experimentalPitchBend: config.experimentalPitchBend });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = `vocal2midi_${Date.now()}.mid`; a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    const saved = await saveFile({ blob, suggestedName: `vocal2midi_${Date.now()}.mid`, kind: 'midi' });
+    setStatus(savedStatus('MIDI', saved));
   };
 
   const handleExportWav = async () => {
@@ -428,11 +434,8 @@ export const Vocal2MidiPanel: React.FC = () => {
     setStatus('rendering WAV...');
     try {
       const blob = await getMidiSynth().renderToWav(processedNotes);
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url; a.download = `vocal2midi_${Date.now()}.wav`; a.click();
-      setTimeout(() => URL.revokeObjectURL(url), 8000);
-      setStatus('WAV exported');
+      const saved = await saveFile({ blob, suggestedName: `vocal2midi_${Date.now()}.wav`, kind: 'audio' });
+      setStatus(savedStatus('WAV', saved));
     } catch (e) {
       setStatus(`WAV export failed: ${String(e)}`);
     }
@@ -496,11 +499,11 @@ export const Vocal2MidiPanel: React.FC = () => {
             <span className="w-8 text-right text-[9px] font-mono text-cyan-300">{config.sensitivity}%</span>
           </div>
           <label className="flex items-center gap-1.5 text-[10px] text-zinc-300">
-            <input type="checkbox" name="v2m-cleanup" checked={config.enableCleanup} onChange={(e) => patch({ enableCleanup: e.target.checked })} className="accent-cyan-500" />
+            <input type="checkbox" id="v2m-cleanup" name="v2m-cleanup" checked={config.enableCleanup} onChange={(e) => patch({ enableCleanup: e.target.checked })} className="accent-cyan-500" />
             Note cleanup
           </label>
           <label className="flex items-center gap-1.5 text-[10px] text-zinc-300">
-            <input type="checkbox" name="v2m-pitchbend" checked={config.experimentalPitchBend} onChange={(e) => patch({ experimentalPitchBend: e.target.checked })} className="accent-cyan-500" />
+            <input type="checkbox" id="v2m-pitchbend" name="v2m-pitchbend" checked={config.experimentalPitchBend} onChange={(e) => patch({ experimentalPitchBend: e.target.checked })} className="accent-cyan-500" />
             Pitch bend (experimental)
           </label>
           <span className="block text-[9px] font-mono text-zinc-500 truncate" title={status}>{status}</span>
@@ -509,11 +512,11 @@ export const Vocal2MidiPanel: React.FC = () => {
         <Section title="Musical">
           <div className="flex items-center gap-2">
             <label className="flex items-center gap-1.5 text-[10px] text-zinc-300 flex-1">
-              <input type="checkbox" name="v2m-autokey" checked={config.autoKeyDetection} onChange={(e) => patch({ autoKeyDetection: e.target.checked })} className="accent-cyan-500" />
+              <input type="checkbox" id="v2m-autokey" name="v2m-autokey" checked={config.autoKeyDetection} onChange={(e) => patch({ autoKeyDetection: e.target.checked })} className="accent-cyan-500" />
               Auto key
             </label>
             <label className="flex items-center gap-1.5 text-[10px] text-zinc-300 flex-1">
-              <input type="checkbox" name="v2m-autobpm" checked={config.useGeminiForBpm} onChange={(e) => patch({ useGeminiForBpm: e.target.checked })} className="accent-cyan-500" />
+              <input type="checkbox" id="v2m-autobpm" name="v2m-autobpm" checked={config.useGeminiForBpm} onChange={(e) => patch({ useGeminiForBpm: e.target.checked })} className="accent-cyan-500" />
               Auto BPM (AI)
             </label>
           </div>
@@ -597,7 +600,7 @@ export const Vocal2MidiPanel: React.FC = () => {
         </Section>
 
         <Section title="AI">
-          <input name="v2m-prompt" type="text" value={config.prompt} onChange={(e) => patch({ prompt: e.target.value })}
+          <input id="v2m-prompt" name="v2m-prompt" type="text" value={config.prompt} onChange={(e) => patch({ prompt: e.target.value })}
             placeholder="AI context / instruction (optional)" aria-label="AI prompt"
             className="w-full bg-zinc-800 border border-zinc-600 rounded text-[10px] text-zinc-100 px-1.5 py-1" />
           <button type="button" onClick={() => void handleSmartCleanup()} disabled={isSmartCleaning || !lastBlobRef.current || processedNotes.length === 0}
@@ -615,7 +618,7 @@ export const Vocal2MidiPanel: React.FC = () => {
             <BpmTapper currentBpm={bpm} onBpmSet={(b) => { setAudioAnalysis((prev) => prev ? { ...prev, detectedBpm: b } : { detectedBpm: b, timeSignature: '4/4', suggestedInstrument: '', description: 'tap tempo', detectedProfileId: config.activeProfileId }); patch({ manualBpm: b }); if (capturedNotes.length) applyToRoll(processedNotes, b); }} />
           </div>
           <div className="flex items-center gap-1">
-            <button type="button" onClick={handleExportMidi} disabled={processedNotes.length === 0} className={`${chip} ${chipOff} flex items-center gap-1`}><Download className="w-3 h-3" /> MIDI</button>
+            <button type="button" onClick={() => void handleExportMidi()} disabled={processedNotes.length === 0} className={`${chip} ${chipOff} flex items-center gap-1`}><Download className="w-3 h-3" /> MIDI</button>
             <button type="button" onClick={() => void handleExportWav()} disabled={processedNotes.length === 0} className={`${chip} ${chipOff} flex items-center gap-1`}><Music4 className="w-3 h-3" /> WAV</button>
             <button type="button" onClick={() => { setCapturedNotes([]); setProcessedNotes([]); usePianoRollStore.getState().clear(); setStatus('cleared'); }} className={`${chip} ${chipOff} flex items-center gap-1`}><Trash2 className="w-3 h-3" /> Clear</button>
           </div>
@@ -629,9 +632,7 @@ export const Vocal2MidiPanel: React.FC = () => {
             onClearAll={() => setRecordings([])}
             onExportAll={() => {
               const blob = new Blob([JSON.stringify(recordings, null, 2)], { type: 'application/json' });
-              const url = URL.createObjectURL(blob);
-              const a = document.createElement('a'); a.href = url; a.download = 'vocal2midi_recordings.json'; a.click();
-              setTimeout(() => URL.revokeObjectURL(url), 5000);
+              void saveFile({ blob, suggestedName: 'vocal2midi_recordings.json', kind: 'v2m-recordings' });
             }}
             onImport={(recs) => setRecordings((p) => [...recs, ...p])}
           />

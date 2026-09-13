@@ -60,6 +60,7 @@ from pathlib import Path
 from threading import Lock
 from typing import IO, Iterator, Optional
 from backend.lib import paths
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -183,7 +184,7 @@ def _child_env(cfg: LyriaConfig) -> dict[str, str]:
     overrides the keys per-request via x-*-api-key headers, so a user who
     prefers the in-app flow is unaffected.
     """
-    env = os.environ.copy()
+    env = child_env()
     env["PORT"] = str(cfg.port)
     if cfg.mock:
         env["LYRIA_MOCK"] = "1"
@@ -308,6 +309,7 @@ def _ensure_deps(cfg: LyriaConfig) -> None:
                 stderr=subprocess.STDOUT,
                 shell=False,
                 timeout=NPM_INSTALL_TIMEOUT_SEC,
+                env=child_env(),
             )
     except FileNotFoundError as e:
         raise RuntimeError(
@@ -485,6 +487,7 @@ def _install_worker(cfg: LyriaConfig, need_clone: bool, git: str) -> None:
                     shell=False,
                     timeout=GIT_CLONE_TIMEOUT_SEC,
                     creationflags=creationflags,
+                    env=child_env(),
                 )
             if rc != 0:
                 raise RuntimeError(
@@ -670,6 +673,7 @@ def stop() -> bool:
                     ["taskkill", "/PID", str(_proc.pid), "/T", "/F"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    env=child_env(),
                 )
                 _proc.wait(timeout=5.0)
             else:

@@ -46,10 +46,17 @@ import { GanPluginStage, getGanStageFrame } from '../components/audio/GanPluginS
 import { useGanStore } from '../state/ganStore';
 import { useMixStageStore } from '../state/mixStageStore';
 import { ganApi, type GanPluginSummary } from '../lib/ganClient';
-import { GAN_FILTER } from '../lib/fileFilters';
+import { AUDIO_EXTS, FOUNDRY_EXPORT_FILTER, GAN_FILTER } from '../lib/fileFilters';
 import { pickFile } from '../lib/storageClient';
+import { saveFile } from '../lib/saveFile';
+import { logError } from '../state/logStore';
+import { useStatusBarStore } from '../state/statusBarStore';
+import { KnownFilesMenu } from '../components/ui/KnownFilesMenu';
 import { Boxes, Headphones, Music } from 'lucide-react';
 import '../components/layout/track-controls.css';
+
+/** Extensions the MIX source's Recent menu offers. */
+const MIX_SOURCE_EXTS = AUDIO_EXTS.map((e) => `.${e}`);
 
 /* ── Psychoacoustic effects shown as Studio-style tiles ──────────────────────
    The 11 real-time psychoacoustic rack effects, surfaced in the effects library
@@ -415,6 +422,8 @@ interface MixVizRackProps {
   dragOverSource: boolean;
   onDrop: (e: React.DragEvent) => void; onDragOver: (e: React.DragEvent) => void; onDragLeave: () => void;
   onClickUpload: () => void; onClearSource: () => void;
+  /** A file chosen from the source's Recent menu. */
+  onKnownFiles: (files: File[]) => void;
   isChainProcessing: boolean;
   onDownload: () => void; onSendToDAW: () => void; onSendToInpaint: () => void;
 }
@@ -474,6 +483,7 @@ const MixVizRack: React.FC<MixVizRackProps> = (p) => {
             >
               <Upload className="w-3 h-3" />
             </button>
+            <KnownFilesMenu id="mix-source-recent" exts={MIX_SOURCE_EXTS} onFiles={p.onKnownFiles} />
             {p.hasSource && (
               <button type="button" onClick={p.onClearSource} title="Clear source" aria-label="Clear the source audio" className="p-1 rounded text-zinc-500 hover:text-red-400 hover:bg-white/5">
                 <X className="w-3 h-3" />
@@ -1417,10 +1427,11 @@ export const MixView: React.FC = () => {
     }
   };
 
+  // Save As on this machine, so the output's path is remembered; a remote
+  // browser gets a download.
   const handleDownload = () => {
     if (!outputUrl) return;
-    const a = document.createElement('a');
-    a.href = outputUrl; a.download = `mix-output.${outputFormat}`; a.click();
+    void saveFile({ url: outputUrl, suggestedName: `mix-output.${outputFormat}`, kind: 'audio', title: 'Save the MIX output' });
   };
   const handleSendToDAW = async () => {
     if (!outputUrl) return;
@@ -1517,14 +1528,35 @@ export const MixView: React.FC = () => {
     setActiveMagentaId(useMixStageStore.getState().activeMagentaId === id ? null : id);
   };
   // .gan loader: pick/import sets the active plugin and yields the stage to it.
+  const reportPickFailed = (e: unknown) => {
+    const msg = e instanceof Error ? e.message : String(e);
+    logError('mix', msg);
+    useStatusBarStore.getState().setText(`OPEN FAILED: ${msg}`);
+  };
   const handleOpenGan = async () => {
-    const r = await pickFile({ filter: GAN_FILTER, title: 'Open a .gan plugin' });
+    let r: Awaited<ReturnType<typeof pickFile>>;
+    try {
+      r = await pickFile({ filter: GAN_FILTER, title: 'Open a .gan plugin', kind: 'gan' });
+    } catch (e) {
+      reportPickFailed(e);
+      return;
+    }
     if (!r.path) return;
     setActiveModuleId(null); setActiveMagentaId(null);
     await ganOpenPath(r.path);
   };
   const handleImportGan = async () => {
-    const r = await pickFile({ title: 'Select a VST Foundry export (project.json)' });
+    let r: Awaited<ReturnType<typeof pickFile>>;
+    try {
+      r = await pickFile({
+        filter: FOUNDRY_EXPORT_FILTER,
+        title: 'Select a VST Foundry export (project.json)',
+        kind: 'foundry-export',
+      });
+    } catch (e) {
+      reportPickFailed(e);
+      return;
+    }
     if (!r.path) return;
     setActiveModuleId(null); setActiveMagentaId(null);
     await ganImportOwl(r.path);
@@ -1592,6 +1624,7 @@ export const MixView: React.FC = () => {
         onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; setDragOverSource(true); }}
         onDragLeave={() => setDragOverSource(false)}
         onClickUpload={() => fileInputRef.current?.click()}
+        onKnownFiles={(files) => { if (files[0]) setSourceBoth(files[0]); }}
         onClearSource={() => setSourceBoth(null)}
         isChainProcessing={isChainProcessing}
         onDownload={handleDownload} onSendToDAW={() => void handleSendToDAW()} onSendToInpaint={() => void handleSendToInpaint()}

@@ -26,9 +26,9 @@ import * as shards from '../lib/shardEngine';
 import { GEN_BLURB, GEN_GLYPH, GEN_KINDS, type GenKind } from '../lib/loomGen';
 import { DEFAULT_SEED } from '../lib/loomEngine';
 import { ColonyCanvas } from '../components/loom/ColonyCanvas';
-import { SurfacePlayKey } from '../components/ui/SurfacePlayKey';
 import { findNode, GRAINS, graphAt, meterText, parseColony, serializeColony, SPACE_MODES, walkNodes, type ColonyNode, type GateNode, type LoopNode, type Meter, type ModNode, type RuleNode } from '../lib/colony';
 import { cellColor, KIND_COLOR, ROLE_COLOR, rgba } from '../lib/loomPalette';
+import { SurfacePlayKey } from '../components/ui/SurfacePlayKey';
 
 type Pane = 'cell' | 'code' | 'crate';
 

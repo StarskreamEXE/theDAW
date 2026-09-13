@@ -30,6 +30,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -144,6 +145,7 @@ def _probe_packages(
             capture_output=True,
             text=True,
             timeout=30,
+            env=child_env(),
         )
     except (subprocess.TimeoutExpired, OSError) as e:
         return {"_error": repr(e)}
@@ -219,6 +221,7 @@ def _bootstrap_venv(cfg: WhisperConfig) -> dict:
             capture_output=True,
             text=True,
             timeout=180,
+            env=child_env(),
         )
         if result.returncode == 0 and cfg.python_exe.is_file():
             return {"ok": True, "created": True, "tool": "uv"}
@@ -230,6 +233,7 @@ def _bootstrap_venv(cfg: WhisperConfig) -> dict:
             capture_output=True,
             text=True,
             timeout=180,
+            env=child_env(),
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         return {"ok": False, "created": False, "tool": "venv", "error": repr(e)}
@@ -246,7 +250,11 @@ def _install_cmd(python_exe: Path, req: Path) -> tuple[list[str], str]:
     back to the venv's own pip."""
     try:
         uv_check = subprocess.run(
-            ["uv", "--version"], capture_output=True, text=True, timeout=10
+            ["uv", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=child_env(),
         )
         if uv_check.returncode == 0:
             return (
@@ -278,7 +286,11 @@ def install_dependencies(cfg: Optional[WhisperConfig] = None) -> dict:
         argv, mode = _install_cmd(cfg.python_exe, _REQUIREMENTS)
         out["install_mode"] = mode
         result = subprocess.run(
-            argv, capture_output=True, text=True, timeout=_INSTALL_TIMEOUT_SEC
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=_INSTALL_TIMEOUT_SEC,
+            env=child_env(),
         )
     except (subprocess.TimeoutExpired, OSError) as e:
         out["error"] = repr(e)
@@ -304,7 +316,11 @@ def install_cuda_libs(cfg: Optional[WhisperConfig] = None) -> dict:
         argv, mode = _install_cmd(cfg.python_exe, _REQUIREMENTS_CUDA)
         out["install_mode"] = mode
         result = subprocess.run(
-            argv, capture_output=True, text=True, timeout=_INSTALL_TIMEOUT_SEC
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=_INSTALL_TIMEOUT_SEC,
+            env=child_env(),
         )
     except (subprocess.TimeoutExpired, OSError) as e:
         out["error"] = repr(e)
@@ -346,7 +362,11 @@ def cuda_lib_dirs(python_exe: Path) -> list[str]:
     dirs: list[str] = []
     try:
         result = subprocess.run(
-            [str(python_exe), "-c", script], capture_output=True, text=True, timeout=30
+            [str(python_exe), "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=child_env(),
         )
         if result.returncode == 0:
             dirs = [str(d) for d in json.loads(result.stdout.strip().splitlines()[-1])]
@@ -357,10 +377,11 @@ def cuda_lib_dirs(python_exe: Path) -> list[str]:
 
 
 def worker_env(cfg: WhisperConfig) -> dict:
-    """The child environment: the parent's, plus the CUDA library folders
-    (Windows: an env var the worker turns into add_dll_directory calls;
-    POSIX: prepended to LD_LIBRARY_PATH, which the loader reads at start)."""
-    env = dict(os.environ)
+    """The child environment: the parent's without the launch token, plus the
+    CUDA library folders (Windows: an env var the worker turns into
+    add_dll_directory calls; POSIX: prepended to LD_LIBRARY_PATH, which the
+    loader reads at start)."""
+    env = child_env()
     if not cfg.wants_cuda:
         return env
     dirs = cuda_lib_dirs(cfg.python_exe)

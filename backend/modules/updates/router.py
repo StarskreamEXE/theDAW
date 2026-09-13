@@ -45,6 +45,7 @@ from fastapi import APIRouter, HTTPException
 
 from backend._update_sync import UPDATE_EXIT_CODE, run_dependency_sync
 from backend.lib import paths
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -303,6 +304,7 @@ def _run_git(args: list[str], tail: list[str]) -> int:
             bufsize=1,
             encoding="utf-8",
             errors="replace",
+            env=child_env(),
         )
     except OSError as exc:
         _apply_log(tail, f"could not run git: {exc}")
@@ -339,6 +341,7 @@ def _dirty_paths() -> list[str] | None:
             capture_output=True,
             text=True,
             timeout=30,
+            env=child_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return None

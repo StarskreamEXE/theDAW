@@ -26,8 +26,11 @@ import { usePlayerStore } from '../state/playerStore';
 import { useBottomPanelStore } from '../state/bottomPanelStore';
 import { useStatusBarStore } from '../state/statusBarStore';
 import { useFeatureToggleStore } from '../state/featureToggleStore';
-import { logError, logInfo } from '../state/logStore';
+import { logError, logInfo, logWarn } from '../state/logStore';
 import { addBlobsToChimera } from '../lib/chimeraClient';
+import { saveFile, extOfName } from '../lib/saveFile';
+import { basenameOf } from '../lib/placesClient';
+import { KnownFilesMenu } from '../components/ui/KnownFilesMenu';
 import {
   listMedia, importMedia, deleteMedia, MEDIA_ACCEPT, backfillCoverArt, refreshCoverArt,
 } from '../lib/mediaLibrary';
@@ -71,14 +74,45 @@ const formatSize = (bytes: number): string => {
   return `${bytes} B`;
 };
 
-const downloadEntry = (entry: LibraryEntry, url: string) => {
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = entry.title;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
+// Every save in this view goes through saveFile: Save As opens in the folder
+// last used for that kind of file, and the chosen path is remembered.
+
+const EXT_BY_MIME: Record<string, string> = {
+  'audio/wav': '.wav', 'audio/x-wav': '.wav', 'audio/wave': '.wav', 'audio/mpeg': '.mp3',
+  'audio/flac': '.flac', 'audio/x-flac': '.flac', 'audio/ogg': '.ogg', 'audio/mp4': '.m4a',
+  'video/mp4': '.mp4', 'video/webm': '.webm', 'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp',
 };
+
+/** A title as a file name every desktop OS accepts. */
+const fileSafe = (name: string, fallback = 'untitled'): string =>
+  Array.from(name, (c) => (c.charCodeAt(0) < 32 || '<>:"/\\|?*'.includes(c) ? '_' : c)).join('').trim().replace(/[. ]+$/, '') || fallback;
+
+/** `title` as a file name ending in `ext` (lowercase, with its dot). */
+const withExt = (title: string, ext: string): string => {
+  const safe = fileSafe(title);
+  return !ext || safe.toLowerCase().endsWith(ext) ? safe : `${safe}${ext}`;
+};
+
+/** A song title slugged the way backend/modules/notation/router.py names score downloads. */
+const songSlug = (title: string, fallback: string): string => {
+  const cleaned = Array.from(title || '', (c) => (/[\p{L}\p{N} _-]/u.test(c) ? c : '_')).join('');
+  const slug = cleaned.split(/\s+/).filter(Boolean).join('_').replace(/^[_-]+|[_-]+$/g, '');
+  return Array.from(slug).slice(0, 60).join('') || fallback;
+};
+
+/** An entry's own file: its title plus the stored file's extension. */
+const entryFileName = (entry: LibraryEntry): string =>
+  withExt(entry.title || entry.id, extOfName(entry.audioFilename || '') || EXT_BY_MIME[entry.mimeType] || '');
+
+const entryKind = (entry: LibraryEntry): string =>
+  entry.kind === 'video' || entry.kind === 'image' ? entry.kind : 'audio';
+
+const saveEntryFile = (entry: LibraryEntry, url: string) =>
+  saveFile({ url, suggestedName: entryFileName(entry), kind: entryKind(entry) });
+
+/** An entry bundle's name, as GET /api/library/{id}/bundle names it. */
+const bundleFileName = (id: string, title: string): string =>
+  `${Array.from(title || 'entry', (c) => (/[\p{L}\p{N}._-]/u.test(c) ? c : '_')).slice(0, 60).join('')}_${id.slice(0, 8)}.zip`;
 
 export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpand?: () => void }> = ({ onSwitchTab, onExpand }) => {
   const [viewMode, setViewMode] = useState<'list' | 'grid'>('list');
@@ -768,6 +802,11 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
     }
   };
 
+  // Fed by the file input and the Recent list alike; each file loads in turn.
+  const onLoadMidiFiles = (files: File[]) => {
+    for (const file of files) void onLoadMidiFile(file);
+  };
+
   const handlePlay = async (entry: LibraryEntry) => {
     // If this entry is already loaded in the global engine, just toggle play/pause.
     if (engineEntryId === entry.id) {
@@ -806,10 +845,9 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
         `Added ${res.entries.length} track${res.entries.length === 1 ? '' : 's'} from ${res.folder}`,
       );
     } catch (e) {
-      logError(
-        'library',
-        `Folder import failed: ${e instanceof Error ? e.message : String(e)}`,
-      );
+      const msg = e instanceof Error ? e.message : String(e);
+      logError('library', `Folder import failed: ${msg}`);
+      useStatusBarStore.getState().setText(`FOLDER IMPORT FAILED: ${msg}`);
     }
   };
 
@@ -865,6 +903,7 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
             )}
           </div>
           <button
+            type="button"
             onClick={() => void abortStems()}
             className="shrink-0 text-[8px] font-mono uppercase tracking-widest px-1.5 py-0.5 rounded border border-red-500/40 text-red-300 hover:bg-red-500/15"
             title="Abort the running stem separation"
@@ -888,18 +927,20 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
           disk straight into the piano roll without running basic-pitch.
           `multiple` lets the user batch-import several .mid files in
           one go; each is loaded sequentially. */}
+      <label htmlFor="library-import-midi" className="sr-only">MIDI files to load into the piano roll</label>
       <input
         ref={midiFileInputRef}
         type="file"
+        id="library-import-midi"
         name="library-import-midi"
         accept=".mid,.midi,audio/midi"
         multiple
         className="hidden"
         onChange={(e) => {
           const files = Array.from(e.target.files ?? []);
-          for (const file of files) void onLoadMidiFile(file);
           // Reset so picking the same file(s) twice re-fires onChange.
           e.target.value = '';
+          onLoadMidiFiles(files);
         }}
       />
 
@@ -909,13 +950,17 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
           {/* Mic-in toggle removed per spec — the MicRecorder lives
               on EDIT + VJ now, not Library. */}
           <button
+            type="button"
             onClick={() => midiFileInputRef.current?.click()}
             className="p-1 rounded text-zinc-500 hover:text-purple-300"
             title="Import a .mid file → piano roll"
+            aria-label="Import a .mid file into the piano roll"
           >
             <FileMusic className="w-3 h-3" />
           </button>
+          <KnownFilesMenu id="library-import-midi-recent" exts={['.mid', '.midi']} label="Recent MIDI" onFiles={onLoadMidiFiles} />
           <button
+            type="button"
             onClick={() => void handleImportFolder()}
             className="p-1 rounded text-zinc-500 hover:text-purple-300"
             title="Add a folder of audio to the library (files stay where they are)"
@@ -924,6 +969,8 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
             <FolderPlus className="w-3 h-3" />
           </button>
           <button
+            type="button"
+            aria-label="Import from a link"
             onClick={() => setLinkOpen((v) => !v)}
             className={`p-1 rounded ${linkOpen ? 'bg-white/10 text-purple-200' : 'text-zinc-500 hover:text-purple-300'}`}
             title="Import from link: YouTube, SoundCloud, Bandcamp or a direct audio URL"
@@ -932,14 +979,14 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
           >
             <Link2 className="w-3 h-3" />
           </button>
-          <button onClick={() => setViewMode('list')} className={`p-1 rounded ${viewMode === 'list' ? 'bg-white/10 text-white' : 'text-zinc-600'}`} title="List view">
+          <button type="button" aria-label="List view" aria-pressed={viewMode === 'list'} onClick={() => setViewMode('list')} className={`p-1 rounded ${viewMode === 'list' ? 'bg-white/10 text-white' : 'text-zinc-600'}`} title="List view">
             <ListIcon className="w-3 h-3" />
           </button>
-          <button onClick={() => setViewMode('grid')} className={`p-1 rounded ${viewMode === 'grid' ? 'bg-white/10 text-white' : 'text-zinc-600'}`} title="Grid view">
+          <button type="button" aria-label="Grid view" aria-pressed={viewMode === 'grid'} onClick={() => setViewMode('grid')} className={`p-1 rounded ${viewMode === 'grid' ? 'bg-white/10 text-white' : 'text-zinc-600'}`} title="Grid view">
             <LayoutGrid className="w-3 h-3" />
           </button>
           {onExpand && (
-            <button onClick={onExpand} className="p-1 rounded text-zinc-500 hover:text-teal-300" title="Expand to full library">
+            <button type="button" onClick={onExpand} className="p-1 rounded text-zinc-500 hover:text-teal-300" title="Expand to full library" aria-label="Expand to full library">
               <Maximize2 className="w-3 h-3" />
             </button>
           )}
@@ -962,6 +1009,7 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
                 className="flex-1 min-w-0 bg-transparent text-[9px] font-mono text-zinc-200 py-1 focus:outline-none placeholder:text-zinc-600 disabled:opacity-50"
               />
               <button
+                type="button"
                 onClick={() => void runLinkImport()}
                 disabled={linkBusy || !linkUrl.trim()}
                 className="shrink-0 text-purple-300 hover:text-purple-100 disabled:opacity-30"
@@ -1004,24 +1052,26 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
 
           <div className="flex items-center gap-2 overflow-x-auto no-scrollbar pb-1">
             <button
-              className={`mono-tag flex items-center gap-1 whitespace-nowrap ${onlyFavorites ? 'bg-purple-600/20! text-purple-300! border-purple-500/40!' : 'bg-white/5! text-zinc-400!'}`}
+              type="button"
+              aria-pressed={onlyFavorites}
+              className={`mono-tag flex items-center gap-1 whitespace-nowrap ${onlyFavorites ?'bg-purple-600/20! text-purple-300! border-purple-500/40!' : 'bg-white/5! text-zinc-400!'}`}
               onClick={() => setOnlyFavorites(!onlyFavorites)}
             >
               <Star className="w-2 h-2 fill-current" /> FAVS
             </button>
-            <button className={`mono-tag flex items-center gap-1 whitespace-nowrap ${sortBy === 'newest' ? 'bg-purple-600/20! text-purple-300!' : 'bg-white/5! text-zinc-400!'}`} onClick={() => setSortBy('newest')}>
+            <button type="button" aria-pressed={sortBy === 'newest'} className={`mono-tag flex items-center gap-1 whitespace-nowrap ${sortBy === 'newest' ? 'bg-purple-600/20! text-purple-300!' : 'bg-white/5! text-zinc-400!'}`} onClick={() => setSortBy('newest')}>
               <Clock className="w-2 h-2" /> NEWEST
             </button>
-            <button className={`mono-tag flex items-center gap-1 whitespace-nowrap ${sortBy === 'duration' ? 'bg-purple-600/20! text-purple-300!' : 'bg-white/5! text-zinc-400!'}`} onClick={() => setSortBy('duration')}>
+            <button type="button" aria-pressed={sortBy === 'duration'} className={`mono-tag flex items-center gap-1 whitespace-nowrap ${sortBy === 'duration' ? 'bg-purple-600/20! text-purple-300!' : 'bg-white/5! text-zinc-400!'}`} onClick={() => setSortBy('duration')}>
               <Tag className="w-2 h-2" /> LENGTH
             </button>
-            <button className={`mono-tag flex items-center gap-1 whitespace-nowrap ${sortBy === 'title' ? 'bg-purple-600/20! text-purple-300!' : 'bg-white/5! text-zinc-400!'}`} onClick={() => setSortBy('title')}>
+            <button type="button" aria-pressed={sortBy === 'title'} className={`mono-tag flex items-center gap-1 whitespace-nowrap ${sortBy === 'title' ? 'bg-purple-600/20! text-purple-300!' : 'bg-white/5! text-zinc-400!'}`} onClick={() => setSortBy('title')}>
               <Filter className="w-2 h-2" /> TITLE
             </button>
-            <button className={`mono-tag flex items-center gap-1 whitespace-nowrap ${sortBy === 'plays' ? 'bg-purple-600/20! text-purple-300!' : 'bg-white/5! text-zinc-400!'}`} onClick={() => setSortBy('plays')}>
+            <button type="button" aria-pressed={sortBy === 'plays'} className={`mono-tag flex items-center gap-1 whitespace-nowrap ${sortBy === 'plays' ? 'bg-purple-600/20! text-purple-300!' : 'bg-white/5! text-zinc-400!'}`} onClick={() => setSortBy('plays')}>
               <Play className="w-2 h-2" /> PLAYS
             </button>
-            <button className="mono-tag flex items-center gap-1 whitespace-nowrap bg-purple-600/30! text-purple-200! border border-purple-500/40" onClick={() => setSuggestOpen(true)} title="Suggest a playlist from your library">
+            <button type="button" className="mono-tag flex items-center gap-1 whitespace-nowrap bg-purple-600/30! text-purple-200! border border-purple-500/40" onClick={() => setSuggestOpen(true)} title="Suggest a playlist from your library">
               <Sparkles className="w-2 h-2" /> SUGGEST
             </button>
           </div>
@@ -1113,7 +1163,7 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
           }}
         />
         <div className="flex items-center justify-between px-1 mb-1 text-[8px] font-mono text-zinc-600 uppercase border-b border-white/5 pb-1">
-          <button className="flex items-center gap-1 hover:text-zinc-300" onClick={() => setSortBy('title')}>
+          <button type="button" className="flex items-center gap-1 hover:text-zinc-300" onClick={() => setSortBy('title')}>
             <ArrowUpDown className="w-2 h-2" /> NAME
           </button>
           <div className="flex gap-4">
@@ -1159,7 +1209,9 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
                     className="absolute inset-0 w-full h-full"
                   />
                   <button
-                    className="absolute top-1 right-1 p-1 bg-black/80 rounded opacity-0 group-hover:opacity-100 transition-opacity"
+                    type="button"
+                    className="absolute top-1 right-1 p-1 bg-black/80 rounded opacity-0 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity"
+                    aria-label={engineEntryId === entry.id && engineIsPlaying ? `Pause ${entry.title}` : `Play ${entry.title}`}
                     onClick={() => handlePlay(entry)}
                   >
                     {engineEntryId === entry.id && engineIsPlaying ? <Pause className="w-3 h-3 text-purple-300" /> : <Play className="w-3 h-3 text-zinc-300" />}
@@ -1182,9 +1234,11 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
                     {entry.title}
                   </span>
                   <button
+                    type="button"
                     onClick={(e) => { e.stopPropagation(); void toggleFavorite(entry.id); }}
                     className="shrink-0"
                     title={entry.favorite ? 'Unfavorite' : 'Favorite'}
+                    aria-label={entry.favorite ? `Unfavorite ${entry.title}` : `Favorite ${entry.title}`}
                   >
                     <Star className={`w-2.5 h-2.5 ${entry.favorite ? 'text-yellow-500 fill-current' : 'text-zinc-700'}`} />
                   </button>
@@ -1208,54 +1262,68 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
                     {viewMode === 'list' && (
                       <div className="flex gap-1">
                         <button
+                          type="button"
                           className="p-1 hover:bg-white/10 rounded"
                           onClick={(e) => { e.stopPropagation(); handlePlay(entry); }}
                           title={engineEntryId === entry.id && engineIsPlaying ? 'Pause' : 'Play'}
+                          aria-label={engineEntryId === entry.id && engineIsPlaying ? `Pause ${entry.title}` : `Play ${entry.title}`}
                         >
                           {engineEntryId === entry.id && engineIsPlaying ? <Pause className="w-2.5 h-2.5 text-purple-400" /> : <Play className="w-2.5 h-2.5 text-zinc-400 group-hover:text-purple-400" />}
                         </button>
                         <button
+                          type="button"
                           className="p-1 hover:bg-white/10 rounded"
                           onClick={(e) => { e.stopPropagation(); openDetailsForEntry(entry.id); }}
                           title="Open details (metadata, prompt, analysis)"
+                          aria-label={`Open details for ${entry.title}`}
                         >
                           <Info className="w-2.5 h-2.5 text-zinc-500 hover:text-emerald-300" />
                         </button>
                         <button
+                          type="button"
                           className="p-1 hover:bg-white/10 rounded"
                           onClick={(e) => { e.stopPropagation(); handleSendToNewTrack(entry); }}
                           title="Send to editor as a new track"
+                          aria-label={`Send ${entry.title} to the editor as a new track`}
                         >
                           <Layers className="w-2.5 h-2.5 text-zinc-500 hover:text-purple-300" />
                         </button>
                         <button
+                          type="button"
                           className="p-1 hover:bg-white/10 rounded"
                           onClick={(e) => { e.stopPropagation(); handleSendToInit(entry); }}
                           title="Send to Init audio"
+                          aria-label={`Send ${entry.title} to Init audio`}
                         >
                           <Wand2 className="w-2.5 h-2.5 text-zinc-500 hover:text-purple-300" />
                         </button>
                         <button
+                          type="button"
                           className="p-1 hover:bg-white/10 rounded"
                           onClick={(e) => { e.stopPropagation(); handleSendToInpaint(entry); }}
                           title="Send to Inpaint"
+                          aria-label={`Send ${entry.title} to Inpaint`}
                         >
                           <PenLine className="w-2.5 h-2.5 text-zinc-500 hover:text-purple-300" />
                         </button>
                         <button
+                          type="button"
                           className="p-1 hover:bg-white/10 rounded"
-                          onClick={(e) => { e.stopPropagation(); downloadEntry(entry, getAudioUrl(entry)); }}
-                          title="Download"
+                          onClick={(e) => { e.stopPropagation(); void saveEntryFile(entry, getAudioUrl(entry)); }}
+                          title="Save this file to a folder you choose."
+                          aria-label={`Save ${entry.title}`}
                         >
                           <Download className="w-2.5 h-2.5 text-zinc-600 hover:text-white" />
                         </button>
                         <button
+                          type="button"
                           className="p-1 hover:bg-white/10 rounded"
                           onClick={(e) => {
                             e.stopPropagation();
                             if (confirm(`Delete "${entry.title}"?`)) void removeEntry(entry.id);
                           }}
                           title="Delete"
+                          aria-label={`Delete ${entry.title}`}
                         >
                           <Trash2 className="w-2.5 h-2.5 text-zinc-600 hover:text-red-400" />
                         </button>
@@ -1275,6 +1343,7 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
               <>
                 <p>Library is empty.</p>
                 <button
+                  type="button"
                   className="mono-tag bg-purple-600/20! text-purple-300! border-purple-500/40! cursor-pointer"
                   onClick={() => onSwitchTab?.('create')}
                 >
@@ -1405,13 +1474,12 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
             icon: <Download className="w-3 h-3" />,
             hint: 'file',
             onSelect: () => {
-              const title = entries.find((e) => e.id === ctxEntryId)?.title ?? ctxEntryId;
-              const a = document.createElement('a');
-              a.href = `/api/library/audio/${ctxEntryId}`;
-              a.download = title;
-              document.body.appendChild(a);
-              a.click();
-              document.body.removeChild(a);
+              const entry = entries.find((e) => e.id === ctxEntryId);
+              void saveFile({
+                url: `/api/library/audio/${ctxEntryId}`,
+                suggestedName: entry ? entryFileName(entry) : fileSafe(ctxEntryId),
+                kind: entry ? entryKind(entry) : 'audio',
+              });
             },
           },
           {
@@ -1430,12 +1498,12 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
             icon: <Package className="w-3 h-3" />,
             hint: '.zip+scores',
             onSelect: () => {
-              const a = document.createElement('a');
-              a.href = `/api/library/${ctxEntryId}/bundle`;
-              a.download = '';
-              document.body.appendChild(a);
-              a.click();
-              document.body.removeChild(a);
+              const title = entries.find((e) => e.id === ctxEntryId)?.title ?? '';
+              void saveFile({
+                url: `/api/library/${ctxEntryId}/bundle`,
+                suggestedName: bundleFileName(ctxEntryId, title),
+                kind: 'zip',
+              });
             },
           },
           {
@@ -1522,39 +1590,47 @@ const LibraryActionsToolbar: React.FC<LibraryActionsToolbarProps> = ({
   // to default-target the visible set.
   const downloadTargets = hasSelection ? selectedEntries : visibleEntries;
 
-  const downloadAll = (kind: 'song' | 'midi' | 'json' | 'bundle' | 'lineage') => {
-    for (const entry of downloadTargets) {
-      const a = document.createElement('a');
+  // One Save As per file, in order; cancelling one stops the rest. A browser on
+  // another machine gets an ordinary download of each file.
+  const downloadAll = async (kind: 'song' | 'midi' | 'json' | 'bundle' | 'lineage') => {
+    for (const entry of [...downloadTargets]) {
+      let result: { cancelled: boolean };
       if (kind === 'song') {
         // The entry's audio blob lives at this server-relative URL.
-        a.href = `/api/library/audio/${entry.id}`;
-        a.download = entry.title;
+        result = await saveEntryFile(entry, `/api/library/audio/${entry.id}`);
       } else if (kind === 'midi') {
-        a.href = `/api/midi/file/${entry.id}`;
-        a.download = `${entry.title}.mid`;
+        // The whole-mix conversion is the MIDI row `<entry id>__full`
+        // (backend/modules/midi/runner.py). Its bytes are fetched first so an
+        // entry with no conversion is skipped before any dialog opens.
+        const res = await fetch(`/api/midi/file/${encodeURIComponent(`${entry.id}__full`)}`).catch(() => null);
+        const blob = res?.ok ? await res.blob().catch(() => null) : null;
+        if (!blob) {
+          logWarn('library', `"${entry.title}" has no MIDI conversion yet, so it was skipped.`);
+          continue;
+        }
+        result = await saveFile({ blob, suggestedName: withExt(entry.title, '.mid'), kind: 'midi' });
       } else if (kind === 'bundle') {
-        a.href = `/api/library/${entry.id}/bundle`;
-        a.download = `${entry.title}.zip`;
+        result = await saveFile({
+          url: `/api/library/${entry.id}/bundle`,
+          suggestedName: withExt(entry.title, '.zip'),
+          kind: 'zip',
+        });
       } else if (kind === 'lineage') {
-        a.href = `/api/library/${entry.id}/lineage?depth=8`;
-        a.download = `${entry.title}-lineage.json`;
-      } else if (kind === 'json') {
+        result = await saveFile({
+          url: `/api/library/${entry.id}/lineage?depth=8`,
+          suggestedName: `${fileSafe(entry.title)}-lineage.json`,
+          kind: 'lineage-json',
+        });
+      } else {
         // Build a metadata JSON client-side from what the store already
         // has cached — no backend round-trip. If the user needs the
         // server's canonical view they can use Bundle.
         const blob = new Blob([JSON.stringify(entry, null, 2)], {
           type: 'application/json',
         });
-        a.href = URL.createObjectURL(blob);
-        a.download = `${entry.title}.json`;
+        result = await saveFile({ blob, suggestedName: withExt(entry.title, '.json'), kind: 'library-metadata' });
       }
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      if (kind === 'json') {
-        // Revoke after a beat so the browser actually triggers the save.
-        setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-      }
+      if (result.cancelled) break;
     }
   };
 
@@ -1566,21 +1642,21 @@ const LibraryActionsToolbar: React.FC<LibraryActionsToolbarProps> = ({
       icon: <Music className="w-3 h-3" />,
       hint: downloadTargets.length > 0 ? `${downloadTargets.length} files` : undefined,
       disabled: downloadTargets.length === 0,
-      onSelect: () => downloadAll('song'),
+      onSelect: () => void downloadAll('song'),
     },
     {
       type: 'item',
       label: 'MIDI (.mid)',
       icon: <FileMusic className="w-3 h-3" />,
       disabled: downloadTargets.length === 0,
-      onSelect: () => downloadAll('midi'),
+      onSelect: () => void downloadAll('midi'),
     },
     {
       type: 'item',
       label: 'Metadata JSON',
       icon: <FileText className="w-3 h-3" />,
       disabled: downloadTargets.length === 0,
-      onSelect: () => downloadAll('json'),
+      onSelect: () => void downloadAll('json'),
     },
     {
       type: 'item',
@@ -1588,7 +1664,7 @@ const LibraryActionsToolbar: React.FC<LibraryActionsToolbarProps> = ({
       icon: <Package className="w-3 h-3" />,
       hint: 'audio+meta+midi',
       disabled: downloadTargets.length === 0,
-      onSelect: () => downloadAll('bundle'),
+      onSelect: () => void downloadAll('bundle'),
     },
     {
       type: 'item',
@@ -1596,7 +1672,7 @@ const LibraryActionsToolbar: React.FC<LibraryActionsToolbarProps> = ({
       icon: <Network className="w-3 h-3" />,
       hint: 'JSON graph',
       disabled: downloadTargets.length === 0,
-      onSelect: () => downloadAll('lineage'),
+      onSelect: () => void downloadAll('lineage'),
     },
   ];
 
@@ -1745,6 +1821,8 @@ interface SubTabButtonProps {
 
 const SubTabButton: React.FC<SubTabButtonProps> = ({ active, onClick, icon, children }) => (
   <button
+    type="button"
+    aria-pressed={active}
     onClick={onClick}
     className={`flex items-center gap-1.5 px-2 py-1 rounded text-[9px] font-black uppercase tracking-widest border transition-colors ${
       active
@@ -1776,12 +1854,13 @@ const MediaGrid: React.FC<{
     onError: (m) => logError('library', m),
   });
 
-  const onPick = async (files: FileList | null) => {
-    if (!files || files.length === 0) return;
+  // Fed by the file input and the Recent list alike.
+  const onPick = async (files: File[]) => {
+    if (files.length === 0) return;
     setUploading(true);
     let ok = 0;
     let failed = 0;
-    for (const file of Array.from(files)) {
+    for (const file of files) {
       try {
         await importMedia(file);
         ok += 1;
@@ -1831,14 +1910,7 @@ const MediaGrid: React.FC<{
           type: 'item',
           label: 'Download',
           icon: <Download className="w-3 h-3" />,
-          onSelect: () => {
-            const a = document.createElement('a');
-            a.href = ctxEntry.mediaUrl ?? ctxEntry.audioUrl;
-            a.download = ctxEntry.title;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-          },
+          onSelect: () => { void saveEntryFile(ctxEntry, ctxEntry.mediaUrl ?? ctxEntry.audioUrl); },
         },
         {
           type: 'item',
@@ -1885,15 +1957,23 @@ const MediaGrid: React.FC<{
         <span className="text-[9px] font-mono text-zinc-600">
           Videos and images for the VJ tab. Transparent media can act as overlays.
         </span>
-        <button
-          type="button"
-          onClick={() => fileInputRef.current?.click()}
-          disabled={uploading}
-          className="flex items-center gap-1.5 px-2.5 py-1 rounded text-[9px] font-black uppercase tracking-widest border border-purple-500/40 bg-purple-500/15 text-purple-200 hover:bg-purple-500/25 disabled:opacity-50 transition-colors"
-        >
-          {uploading ? <Loader2 size={11} className="animate-spin" /> : <Upload size={11} />}
-          {uploading ? 'Importing…' : 'Import media'}
-        </button>
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            disabled={uploading}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded text-[9px] font-black uppercase tracking-widest border border-purple-500/40 bg-purple-500/15 text-purple-200 hover:bg-purple-500/25 disabled:opacity-50 transition-colors"
+          >
+            {uploading ? <Loader2 size={11} className="animate-spin" /> : <Upload size={11} />}
+            {uploading ? 'Importing…' : 'Import media'}
+          </button>
+          <KnownFilesMenu
+            id="media-import-recent"
+            exts={MEDIA_ACCEPT.split(',')}
+            label="Recent media"
+            onFiles={(files) => void onPick(files)}
+          />
+        </div>
         <label htmlFor="media-import-input" className="sr-only">Import video or image files</label>
         <input
           ref={fileInputRef}
@@ -1903,7 +1983,11 @@ const MediaGrid: React.FC<{
           accept={MEDIA_ACCEPT}
           multiple
           hidden
-          onChange={(e) => { void onPick(e.target.files); e.target.value = ''; }}
+          onChange={(e) => {
+            const files = Array.from(e.target.files ?? []);
+            e.target.value = '';
+            void onPick(files);
+          }}
         />
       </div>
 
@@ -2015,16 +2099,15 @@ const MediaCard: React.FC<{
         >
           <Tv2 size={12} />
         </button>
-        <a
-          href={mediaUrl}
-          download={entry.title}
-          onClick={(e) => e.stopPropagation()}
-          aria-label={`Download ${entry.title}`}
-          title="Download"
+        <button
+          type="button"
+          onClick={(e) => { e.stopPropagation(); void saveEntryFile(entry, mediaUrl); }}
+          aria-label={`Save ${entry.title}`}
+          title="Save this file to a folder you choose."
           className="p-0.5 rounded text-zinc-300 hover:text-white hover:bg-white/10"
         >
           <Download size={12} />
-        </a>
+        </button>
         <button
           type="button"
           onClick={(e) => { e.stopPropagation(); onRemove(); }}
@@ -2278,12 +2361,14 @@ const SubTabList: React.FC<SubTabListProps> = ({ byParent, parentTitles, kind, p
         label: 'Download .mid',
         icon: <Download className="w-3 h-3" />,
         onSelect: () => {
-          const a = document.createElement('a');
-          a.href = `/api/midi/file/${payload.midiId}`;
-          a.download = '';
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
+          // The route serves the file under its stored name, so the dialog offers that name.
+          const row = Object.values(byParent).flat().find((r) => String(r.id ?? '') === payload.midiId);
+          const stored = basenameOf(String(row?.midi_path ?? ''));
+          void saveFile({
+            url: `/api/midi/file/${encodeURIComponent(payload.midiId)}`,
+            suggestedName: stored || withExt(payload.label, '.mid'),
+            kind: 'midi',
+          });
         },
       },
       {
@@ -2331,12 +2416,11 @@ const SubTabList: React.FC<SubTabListProps> = ({ byParent, parentTitles, kind, p
         label: 'Download .wav',
         icon: <Download className="w-3 h-3" />,
         onSelect: () => {
-          const a = document.createElement('a');
-          a.href = audioUrl;
-          a.download = `${stemName}.wav`;
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
+          void saveFile({
+            url: audioUrl,
+            suggestedName: withExt(stemName, extOfName(String(payload.row.audio_path ?? '')) || '.wav'),
+            kind: 'audio',
+          });
         },
       },
       {
@@ -2416,18 +2500,30 @@ const ScoreList: React.FC<{
   const parentIds = Object.keys(byParent);
 
   const downloadScore = (id: string, kind: string) => {
-    const a = document.createElement('a');
+    let row: Record<string, unknown> | undefined;
+    for (const pid of parentIds) {
+      row = byParent[pid].find((r) => String(r.id ?? '') === id);
+      if (row) break;
+    }
+    // The names backend/modules/notation/router.py serves: `<song>_score.zip`
+    // for a pack, and the stored file prefixed with `<song>__` for an artifact.
+    const slug = songSlug(String(row?.parent_title ?? ''), 'score');
+    const stored = basenameOf(String(row?.path ?? ''));
+    const artifactName = !stored
+      ? `${slug}.${kind}`
+      : stored.toLowerCase().startsWith(slug.toLowerCase()) ? stored : `${slug}__${stored}`;
     // Sheets come down as a MusicXML + PDF zip; tabs/others as the raw file.
-    a.href = kind === 'musicxml' ? notationPackUrl(id) : notationArtifactUrl(id);
-    a.download = '';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    void saveFile(
+      kind === 'musicxml'
+        ? { url: notationPackUrl(id), suggestedName: `${slug}_score.zip` }
+        : { url: notationArtifactUrl(id), suggestedName: artifactName },
+    );
   };
 
   const refreshBtn = (
     <div className="flex justify-end">
       <button
+        type="button"
         onClick={() => void onRefresh()}
         className="p-1 rounded text-zinc-500 hover:text-purple-300"
         title="Refresh scores"

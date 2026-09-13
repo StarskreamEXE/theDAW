@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Trash2, Download, Upload, Clock, Music, FolderOpen } from 'lucide-react';
 import type { RecordingEntry, NoteEvent, ScaleType, Genre } from './types';
 import { NOTE_NAMES } from './constants';
+import { KnownFilesMenu } from '../../ui/KnownFilesMenu';
 
 interface RecordingHistoryProps {
   recordings: RecordingEntry[];
@@ -11,6 +12,12 @@ interface RecordingHistoryProps {
   onExportAll: () => void;
   onImport: (recordings: RecordingEntry[]) => void;
 }
+
+const RECENT_ID = 'vocal2midi-history-recent';
+const RECENT_EXTS = ['.json'];
+// Vocal2MidiPanel saves its recordings export under this kind, so the list
+// offers those files and no other JSON the app saved.
+const RECENT_KINDS = ['v2m-recordings'];
 
 export const RecordingHistory: React.FC<RecordingHistoryProps> = ({
   recordings,
@@ -36,30 +43,36 @@ export const RecordingHistory: React.FC<RecordingHistoryProps> = ({
     return `${NOTE_NAMES[rootNote % 12]} ${scale}`;
   };
 
+  // Shared by the file dialog and the Recent menu, which hands over a file the
+  // app saved earlier.
+  const importFiles = async (files: File[]) => {
+    const file = files[0];
+    if (!file) return;
+
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+
+      // Validate it's an array of recordings
+      if (Array.isArray(data) && data.every(r => r.id && r.notes && r.timestamp)) {
+        onImport(data);
+      } else if (data.id && data.notes && data.timestamp) {
+        // Single recording
+        onImport([data]);
+      } else {
+        alert('Invalid recording file format');
+      }
+    } catch (err) {
+      alert('Failed to parse recording file');
+    }
+  };
+
   const handleImportClick = () => {
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = '.json';
-    input.onchange = async (e) => {
-      const file = (e.target as HTMLInputElement).files?.[0];
-      if (!file) return;
-
-      try {
-        const text = await file.text();
-        const data = JSON.parse(text);
-
-        // Validate it's an array of recordings
-        if (Array.isArray(data) && data.every(r => r.id && r.notes && r.timestamp)) {
-          onImport(data);
-        } else if (data.id && data.notes && data.timestamp) {
-          // Single recording
-          onImport([data]);
-        } else {
-          alert('Invalid recording file format');
-        }
-      } catch (err) {
-        alert('Failed to parse recording file');
-      }
+    input.onchange = (e) => {
+      void importFiles(Array.from((e.target as HTMLInputElement).files ?? []));
     };
     input.click();
   };
@@ -72,12 +85,16 @@ export const RecordingHistory: React.FC<RecordingHistoryProps> = ({
             <Clock size={14} className="text-gray-500" />
             <span className="text-xs text-gray-400">Recording History</span>
           </div>
-          <button
-            onClick={handleImportClick}
-            className="text-[10px] text-gray-500 hover:text-cyan-400 transition-colors flex items-center gap-1"
-          >
-            <Upload size={10} /> Import
-          </button>
+          <div className="flex items-center gap-2">
+            <KnownFilesMenu id={RECENT_ID} exts={RECENT_EXTS} kinds={RECENT_KINDS} onFiles={(files) => void importFiles(files)} />
+            <button
+              type="button"
+              onClick={handleImportClick}
+              className="text-[10px] text-gray-500 hover:text-cyan-400 transition-colors flex items-center gap-1"
+            >
+              <Upload size={10} /> Import
+            </button>
+          </div>
         </div>
         <p className="text-[10px] text-gray-600 mt-2">No recordings saved yet</p>
       </div>
@@ -89,7 +106,9 @@ export const RecordingHistory: React.FC<RecordingHistoryProps> = ({
       {/* Header */}
       <div className="flex items-center justify-between mb-3">
         <button
+          type="button"
           onClick={() => setIsExpanded(!isExpanded)}
+          aria-expanded={isExpanded}
           className="flex items-center gap-2 text-gray-400 hover:text-white transition-colors"
         >
           <Clock size={14} />
@@ -100,26 +119,33 @@ export const RecordingHistory: React.FC<RecordingHistoryProps> = ({
         </button>
 
         <div className="flex items-center gap-2">
+          <KnownFilesMenu id={RECENT_ID} exts={RECENT_EXTS} kinds={RECENT_KINDS} onFiles={(files) => void importFiles(files)} />
           <button
+            type="button"
             onClick={handleImportClick}
             className="text-[10px] text-gray-500 hover:text-cyan-400 transition-colors"
             title="Import recordings"
+            aria-label="Import recordings"
           >
             <Upload size={12} />
           </button>
           {recordings.length > 0 && (
             <>
               <button
+                type="button"
                 onClick={onExportAll}
                 className="text-[10px] text-gray-500 hover:text-emerald-400 transition-colors"
                 title="Export all recordings"
+                aria-label="Export all recordings"
               >
                 <Download size={12} />
               </button>
               <button
+                type="button"
                 onClick={onClearAll}
                 className="text-[10px] text-gray-500 hover:text-red-400 transition-colors"
                 title="Clear all recordings"
+                aria-label="Clear all recordings"
               >
                 <Trash2 size={12} />
               </button>
@@ -153,18 +179,22 @@ export const RecordingHistory: React.FC<RecordingHistoryProps> = ({
                   </div>
                 </div>
 
-                <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
                   <button
+                    type="button"
                     onClick={() => onLoad(recording)}
                     className="p-1.5 text-gray-400 hover:text-cyan-400 hover:bg-cyan-500/10 rounded transition-colors"
                     title="Load recording"
+                    aria-label={`Load ${recording.name}`}
                   >
                     <FolderOpen size={12} />
                   </button>
                   <button
+                    type="button"
                     onClick={() => onDelete(recording.id)}
                     className="p-1.5 text-gray-400 hover:text-red-400 hover:bg-red-500/10 rounded transition-colors"
                     title="Delete recording"
+                    aria-label={`Delete ${recording.name}`}
                   >
                     <Trash2 size={12} />
                   </button>
@@ -177,6 +207,7 @@ export const RecordingHistory: React.FC<RecordingHistoryProps> = ({
 
       {!isExpanded && recordings.length > 0 && (
         <button
+          type="button"
           onClick={() => setIsExpanded(true)}
           className="text-[10px] text-gray-500 hover:text-white transition-colors"
         >

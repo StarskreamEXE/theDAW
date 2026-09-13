@@ -25,6 +25,7 @@ import httpx
 
 from backend.lib.atomic import atomic_replace
 from backend.lib import paths
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -165,6 +166,7 @@ def _run(adb: str, args: list[str], timeout: float) -> subprocess.CompletedProce
         text=True,
         timeout=timeout,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        env=child_env(),
     )
 
 

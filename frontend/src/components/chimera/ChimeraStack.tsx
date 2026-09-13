@@ -11,11 +11,15 @@ import { SlideTrack } from '../audio/SlideTrack';
 import { hasAudioDragData, readAudioDragData } from '../../lib/audioDnD';
 import { useExternalDragStore } from '../../state/externalDragStore';
 import { logError } from '../../state/logStore';
+import { KnownFilesMenu } from '../ui/KnownFilesMenu';
 import { ChimeraControls } from './ChimeraControls';
 import { laneColor, rgbCss } from './dna/dnaPalette';
 
 const isAudio = (mime: string, name: string): boolean =>
   mime.startsWith('audio/') || /\.(wav|mp3|flac|ogg|aac|m4a|opus)$/i.test(name);
+
+// The extensions isAudio accepts by name, for the Recent menu.
+const RECENT_AUDIO_EXTS = ['.wav', '.mp3', '.flac', '.ogg', '.aac', '.m4a', '.opus'];
 
 const fmtBpm = (bpm: number | null | undefined): string => {
   if (bpm == null) return '—';
@@ -246,6 +250,10 @@ export const ChimeraStack: React.FC = () => {
             ? 'Drop or click to start a Chimera (stack 2+ tracks)'
             : 'Drop more tracks here for a Chimera'}
         </span>
+      </div>
+      {/* Outside the drop zone, whose click opens the file dialog. */}
+      <div className="flex justify-end">
+        <KnownFilesMenu id="chimera-recent-audio" exts={RECENT_AUDIO_EXTS} onFiles={ingestFiles} className="mt-1" />
       </div>
 
       {lastMeta && (

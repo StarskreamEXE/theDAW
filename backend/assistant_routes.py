@@ -54,6 +54,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from backend.lib.launch_token import child_env
 
 try:
     from backend.key_pool import _key_id, key_pool
@@ -922,6 +923,7 @@ async def _stream_claude_spawn(req: ChatRequest, request: Request):
             * 1024
             * 1024,  # 10 MB — avoids ValueError on long Claude JSON lines
             cwd=PROJECT_CWD,
+            env=child_env(),
         )
 
         if process.stdout is None:
@@ -1171,6 +1173,7 @@ async def _stream_claude_persistent(req: ChatRequest, request: Request):
             * 1024
             * 1024,  # 10 MB — avoids ValueError on long Claude JSON lines
             cwd=PROJECT_CWD,
+            env=child_env(),
         )
         _claude_processes[session_id] = process
         _claude_process_configs[session_id] = desired_config

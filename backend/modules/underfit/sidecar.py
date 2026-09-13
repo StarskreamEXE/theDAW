@@ -40,6 +40,7 @@ from pathlib import Path
 from threading import Lock, Thread
 from typing import Optional
 from backend.lib import paths
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -198,7 +199,7 @@ def ensure_running(*, wait_for_ready: bool = True) -> str:
                 raise RuntimeError(
                     "Underfit sidecar cannot start: " + "; ".join(info["issues"])
                 )
-            env = dict(os.environ)
+            env = child_env()
             env["UNDERFIT_DASHBOARD_PORT"] = str(cfg.port)
             LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
             log_handle = open(LOG_PATH, "ab")  # noqa: SIM115 — child owns it
@@ -262,7 +263,7 @@ def setup_status() -> dict:
 
 
 def _setup_worker(cfg: UnderfitConfig, uv: str) -> None:
-    env = dict(os.environ)
+    env = child_env()
     # Keep uv's cache on the checkout's drive so wheels hardlink into .venv
     # rather than falling back to a cross-volume copy, matching install/setup.ps1.
     env.setdefault("UV_CACHE_DIR", str(_REPO_ROOT / ".uv-cache"))

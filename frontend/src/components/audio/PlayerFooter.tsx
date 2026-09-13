@@ -30,6 +30,8 @@ import {
 import { useEditThemeStore } from '../../state/editThemeStore';
 import { resolveEditThemeVars } from '../../lib/editThemes';
 import { LogActionButton } from '../layout/ProcessingLog';
+import { entryAudioFileName } from '../../convert/convertClient';
+import { saveFile } from '../../lib/saveFile';
 
 /** What each repeat state is called, in the tooltip and for a screen reader. */
 const REPEAT_LABEL: Record<'off' | 'all' | 'one', string> = {
@@ -659,12 +661,7 @@ export const PlayerFooter: React.FC = () => {
     const target = entries.find((e) => e.id === currentEntryId) ?? entries[0];
     if (!target) return;
     const url = useLibraryStore.getState().getAudioUrl(target);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = target.title;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    void saveFile({ url, suggestedName: entryAudioFileName(target), kind: 'audio' });
   };
 
   // "Up next" — no formal play queue yet, so derive the next track from the
@@ -921,8 +918,8 @@ export const PlayerFooter: React.FC = () => {
                 type="button"
                 onClick={handleDownload}
                 disabled={!hasTrack}
-                aria-label="Download current track"
-                title="Download current track"
+                aria-label="Save a copy of the current track"
+                title="Save a copy of the current track"
                 className={iconButton}
               >
                 <Download className="w-4 h-4" />

@@ -31,6 +31,8 @@ import {
   type NotationArtifact,
   type NotationCapabilities,
 } from '../../../lib/notationClient';
+import { basenameOf } from '../../../lib/placesClient';
+import { saveFile } from '../../../lib/saveFile';
 import type { PartDescriptor } from '../../../state/playAlongStore';
 import {
   ALL_PARTS,
@@ -376,10 +378,15 @@ export const ExportMenu: React.FC<ExportMenuProps> = ({
                 }
                 // The pack of one part carries ?parts=; the file download is
                 // always the whole artifact.
-                const href =
-                  entry.id === 'pack'
-                    ? notationPackUrl(artifact.id, highlighted.index === null ? undefined : [highlighted.index])
-                    : notationArtifactUrl(artifact.id);
+                const isPack = entry.id === 'pack';
+                const href = isPack
+                  ? notationPackUrl(artifact.id, highlighted.index === null ? undefined : [highlighted.index])
+                  : notationArtifactUrl(artifact.id);
+                const fileName = basenameOf(artifact.path) || `${artifact.kind}-${artifact.id}`;
+                const partTag = highlighted.index === null ? '' : `__part${highlighted.index + 1}`;
+                const suggestedName = isPack
+                  ? `${fileName.replace(/\.[^.]+$/, '')}${partTag}_score.zip`
+                  : fileName;
                 return (
                   <a
                     key={entry.id}
@@ -390,7 +397,13 @@ export const ExportMenu: React.FC<ExportMenuProps> = ({
                     download
                     className={ITEM_CLS}
                     title={entry.title}
-                    onClick={closeAndFocusTrigger}
+                    onClick={(e) => {
+                      // saveFile opens Save As on this machine and remembers
+                      // the path; a remote browser gets the download.
+                      e.preventDefault();
+                      closeAndFocusTrigger();
+                      void saveFile({ url: href, suggestedName, kind: isPack ? 'zip' : undefined });
+                    }}
                     onKeyDown={spaceActivates}
                   >
                     <Download className="w-3 h-3 shrink-0" aria-hidden="true" />

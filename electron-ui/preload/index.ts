@@ -1,10 +1,26 @@
 import { contextBridge, ipcRenderer } from 'electron'
 
+// Where an open dialog starts, what it lists and its title. All optional.
+interface OpenDialogOptions {
+  defaultPath?: string
+  filters?: Electron.FileFilter[]
+  title?: string
+}
+
+// A finished, cancelled or interrupted download. path is where the file was
+// written, and null for any state but 'completed'.
+interface DownloadDone {
+  path: string | null
+  filename: string
+  state: 'completed' | 'cancelled' | 'interrupted'
+}
+
 contextBridge.exposeInMainWorld('electronAPI', {
   isElectron: true,
   platform: process.platform,
-  selectFile: () => ipcRenderer.invoke('dialog:selectFile'),
-  selectDirectory: () => ipcRenderer.invoke('dialog:selectDirectory'),
+  selectFile: (options?: OpenDialogOptions) => ipcRenderer.invoke('dialog:selectFile', options),
+  selectDirectory: (options?: OpenDialogOptions) =>
+    ipcRenderer.invoke('dialog:selectDirectory', options),
   showSaveDialog: (options: object) => ipcRenderer.invoke('dialog:showSave', options),
   getApiBase: () => 'http://127.0.0.1:8600',
   // Quit the whole app: closes the window AND (via before-quit) kills the
@@ -26,6 +42,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
     const handler = (_e: unknown, filePath: string) => cb(filePath)
     ipcRenderer.on('open-file', handler)
     return () => ipcRenderer.removeListener('open-file', handler)
+  },
+  // Subscribe to finished downloads (a save the renderer started). Returns a
+  // disposer, same as onOpenFile.
+  onDownloadDone: (cb: (info: DownloadDone) => void) => {
+    const handler = (_e: unknown, info: DownloadDone) => cb(info)
+    ipcRenderer.on('download-done', handler)
+    return () => ipcRenderer.removeListener('download-done', handler)
   },
   // In-place update of the packaged app (electron-updater, GitHub releases).
   // check() resolves {supported, version?, available?, reason?}; download()

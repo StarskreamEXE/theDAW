@@ -29,6 +29,7 @@ import {
   type SheetRow,
 } from '../../../state/lyricAnalysisStore';
 import type { Device, DeviceFamily } from '../../../lib/lyricAnalysisClient';
+import { saveFile } from '../../../lib/saveFile';
 
 export type WebLayout = 'arc' | 'ring';
 
@@ -282,18 +283,10 @@ const edgePath = (
 const fileStem = (title: string): string =>
   (title || 'lyric').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'lyric';
 
-/** Hand the browser a file. Same shape as the SING tab's LRC export: a real
- *  anchor with a real object URL, revoked once the click has been taken. */
+/** Save a picture of the web through saveFile, which remembers where it went.
+ *  The SVG is recorded as an image, the kind the PNG gets from its name. */
 const saveBlob = (blob: Blob, name: string): void => {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = name;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  // Chrome needs the URL to outlive the click by a tick.
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  void saveFile({ blob, suggestedName: name, kind: 'image' });
 };
 
 export interface RhymeWebProps {
@@ -523,7 +516,7 @@ export const RhymeWeb: React.FC<RhymeWebProps> = ({
             type="button"
             className="btn-ghost flex items-center gap-1 px-1.5 py-0.5 text-zinc-200"
             onClick={exportSvg}
-            title="Download the chart as SVG — the same picture as on screen, at any size"
+            title="Save the chart as SVG. It is the picture on screen and scales to any size."
           >
             <Download className="h-3 w-3" /> SVG
           </button>
@@ -531,7 +524,7 @@ export const RhymeWeb: React.FC<RhymeWebProps> = ({
             type="button"
             className="btn-ghost flex items-center gap-1 px-1.5 py-0.5 text-zinc-200"
             onClick={exportPng}
-            title="Download the chart as a 2x PNG"
+            title="Save the chart as a 2x PNG"
           >
             <Download className="h-3 w-3" /> PNG
           </button>

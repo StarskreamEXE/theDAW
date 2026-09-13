@@ -57,6 +57,7 @@ from pathlib import Path
 from threading import Lock
 from typing import IO, Iterator, Optional
 from backend.lib import paths
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -293,6 +294,7 @@ def _ensure_build(cfg: VJConfig) -> None:
             capture_output=True,
             timeout=BUILD_TIMEOUT_SEC,
             shell=False,
+            env=child_env(),
         )
     except FileNotFoundError as e:
         raise RuntimeError(f"VJ sidecar: npm not found ({e}). Install Node.js.") from e
@@ -459,6 +461,7 @@ def ensure_running(*, wait_for_ready: bool = True) -> str:
                             stderr=subprocess.STDOUT,
                             shell=False,
                             timeout=NPM_INSTALL_TIMEOUT_SEC,
+                            env=child_env(),
                         )
                 except FileNotFoundError as e:
                     raise RuntimeError(
@@ -518,6 +521,7 @@ def ensure_running(*, wait_for_ready: bool = True) -> str:
                         stderr=subprocess.STDOUT,
                         creationflags=creationflags,
                         shell=False,
+                        env=child_env(),
                     )
             except FileNotFoundError as e:
                 raise RuntimeError(
@@ -567,6 +571,7 @@ def stop() -> bool:
                     ["taskkill", "/PID", str(_proc.pid), "/T", "/F"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    env=child_env(),
                 )
                 _proc.wait(timeout=5.0)
             else:

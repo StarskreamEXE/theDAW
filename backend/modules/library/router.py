@@ -32,14 +32,15 @@ from pathlib import Path
 from typing import Any, Optional
 
 import httpx
-from fastapi import APIRouter, Body, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 from .bundle import build_bundle_bytes
 from .store import AUDIO_EXTS, LibraryStore, _read_metadata, default_library_root
 from .tags import MAX_EMBEDDED_COVER_BYTES
-from backend.lib import paths
+from backend.lib import known_paths, paths
+from backend.lib.cross_site import refuse_cross_site
 
 log = logging.getLogger(__name__)
 
@@ -481,24 +482,33 @@ class ImportFolderRequest(BaseModel):
     recursive: bool = True
 
 
-@router.post("/import-folder")
+@router.post("/import-folder", dependencies=[Depends(refuse_cross_site)])
 def import_folder(
     req: ImportFolderRequest = Body(default=ImportFolderRequest()),
 ) -> dict[str, Any]:
     """Add a local folder of audio as a playlist, REFERENCE-IN-PLACE: each file
     becomes a library entry that points at the on-disk file (no copy), so it
     plays / analyses like any track. With no ``path``, opens a native folder
-    picker. Returns the created entries; the caller builds the setlist."""
+    picker in the last music folder added. Returns the created entries; the
+    caller builds the setlist."""
     folder = req.path
     if not folder:
-        from backend.core.folder_dialog import pick_folder
+        from backend.core import folder_dialog
 
-        folder = pick_folder(title="Choose a music folder to add as a playlist")
+        try:
+            folder = folder_dialog.pick_folder(
+                title="Choose a music folder to add as a playlist",
+                initial=known_paths.last_folder("library-folder"),
+            )
+        except folder_dialog.PickerError as e:
+            raise HTTPException(e.status_code, str(e)) from e
     if not folder:
         return {"cancelled": True, "folder": None, "entries": []}
     root = Path(folder)
     if not root.is_dir():
         raise HTTPException(400, f"not a folder: {folder!r}")
+    # Picked or typed, the folder is where the next picker opens.
+    known_paths.record(root, "library-folder", source="library-folder")
     paths = root.rglob("*") if req.recursive else root.iterdir()
     files = sorted(
         (p for p in paths if p.is_file() and p.suffix.lower() in AUDIO_EXTS),

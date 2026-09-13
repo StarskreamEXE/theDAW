@@ -332,7 +332,7 @@ export const MidiPanel: React.FC = () => {
     }
   }, [assetId, loadArtifact]);
 
-  const exportMidi = useCallback(() => {
+  const exportMidi = useCallback(async () => {
     const { notes, bpm } = usePianoRollStore.getState();
     if (!notes.length) {
       setStatus('no notes to export');
@@ -340,8 +340,11 @@ export const MidiPanel: React.FC = () => {
     }
     // downloadVocalMidi wraps the canonical RenderNote->SMF writer. Export exactly
     // what is in the roll (post-edit), not the stale artifact.
-    downloadVocalMidi(pianoToArtifact(notes, bpm), 'midi');
-    setStatus(`exported ${notes.length} notes to .mid`);
+    const result = await downloadVocalMidi(pianoToArtifact(notes, bpm), 'midi');
+    if (result.path) setStatus(`exported ${notes.length} notes to ${result.path}`);
+    else if (result.downloaded) setStatus(`exported ${notes.length} notes to .mid`);
+    else if (result.cancelled) setStatus('export cancelled');
+    else setStatus('export failed');
   }, []);
 
   const validate = useCallback(async () => {

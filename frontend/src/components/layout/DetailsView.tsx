@@ -9,6 +9,8 @@ import { useGenerateParamsStore } from '../../state/generateParamsStore';
 import { logError, logInfo } from '../../state/logStore';
 import { useBottomPanelStore } from '../../state/bottomPanelStore';
 import { deriveLyrics } from '../../catalog/catalogSearch';
+import { entryAudioFileName } from '../../convert/convertClient';
+import { saveFile } from '../../lib/saveFile';
 
 interface AnalysisRow {
   bpm: number | null;
@@ -235,13 +237,7 @@ export const DetailsView: React.FC = () => {
 
   const handleDownload = () => {
     if (!entry) return;
-    const url = getAudioUrl(entry);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = entry.title;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    void saveFile({ url: getAudioUrl(entry), suggestedName: entryAudioFileName(entry), kind: 'audio' });
   };
 
   const inferPrompt = async () => {
@@ -301,7 +297,7 @@ export const DetailsView: React.FC = () => {
           <button onClick={handleSendToNewEditorTrack} className="btn-ghost text-[9px] py-1 flex items-center gap-1" title="Create a new editor track for this clip">
             <Scissors className="w-3 h-3 text-purple-300" /> TO EDITOR
           </button>
-          <button onClick={handleDownload} className="btn-ghost text-[9px] py-1 flex items-center gap-1" title="Download the audio file">
+          <button onClick={handleDownload} className="btn-ghost text-[9px] py-1 flex items-center gap-1" title="Save a copy of the audio file">
             <Download className="w-3 h-3 text-purple-300" /> DOWNLOAD
           </button>
         </div>

@@ -517,7 +517,9 @@ export const ScoreView: React.FC = () => {
   const onExportAction = async (id: string) => {
     if (id !== 'locate-musescore') return;
     const selectFile = (window as unknown as {
-      electronAPI?: { selectFile?: () => Promise<{ canceled: boolean; filePaths: string[] }> };
+      electronAPI?: {
+        selectFile?: (options?: { defaultPath?: string; title?: string }) => Promise<{ canceled: boolean; filePaths: string[] }>;
+      };
     }).electronAPI?.selectFile;
     if (!selectFile) {
       window.dispatchEvent(new Event('thedaw:open-settings'));
@@ -525,7 +527,9 @@ export const ScoreView: React.FC = () => {
       return;
     }
     try {
-      const r = await selectFile();
+      // The dialog opens at the MuseScore path already saved, if there is one.
+      const currentPath = useFeatureToggleStore.getState().settings.notation?.musescore_path;
+      const r = await selectFile({ defaultPath: currentPath || undefined, title: 'Locate MuseScore' });
       if (r.canceled || !r.filePaths[0]) return;
       const chosen = r.filePaths[0];
       const saved = await useFeatureToggleStore.getState().patch({ notation: { musescore_path: chosen } });
@@ -1331,8 +1335,8 @@ const MusicXmlPreview: React.FC<{ artifact: NotationArtifact; entry: LibraryEntr
         if (xml.length > HEAVY_SCORE_CHARS && !confirmedHeavy.has(artifact.id)) {
           setHeavy({
             chars: xml.length,
-            parts: (xml.match(/<score-part/g) ?? []).length,
-            measures: (xml.match(/<measure/g) ?? []).length,
+            parts: (xml.match(/<score-part\b/g) ?? []).length,
+            measures: (xml.match(/<measure\b/g) ?? []).length,
           });
         } else {
           setHeavy(null);

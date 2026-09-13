@@ -11,11 +11,22 @@
     POST   /open                 open a known location in the OS file explorer
     POST   /pick-folder          open a native folder picker on the local machine
     POST   /pick-file            open a native file picker on the local machine
+    POST   /pick-save            open a native Save As dialog on the local machine
 
 Sizes come from a recursive walk cached for 60 seconds per path (pass
 ``refresh=1`` to force). The WSL-side Magenta locations are probed through
 ``wsl.exe`` with a short timeout and the same cache, so a missing distro
 degrades to ``exists: false`` instead of an error.
+
+The pickers take an optional ``kind`` (see backend/lib/known_paths.py). A
+dialog opens in ``initial_dir`` when that folder exists, else in the folder last
+used for ``kind``, and the path the user chooses is remembered for that kind. A
+checkpoint dialog with neither opens in the first local model folder, else
+beside the newest registered checkpoint.
+
+A dialog that failed answers 500 with its reason, and one that got no answer
+before folder_dialog's timeout answers 504. Only the user's cancel answers
+``cancelled: true``.
 """
 
 from __future__ import annotations
@@ -29,9 +40,10 @@ import threading
 import time
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from backend.core import folder_dialog
 from backend.core.probe_cache import CachedProbe
 from stable_audio_3.model_configs import (
     _is_model_config_json,
@@ -43,7 +55,9 @@ from stable_audio_3.model_configs import (
 )
 
 from .store import get_registry
-from backend.lib import paths
+from backend.lib import known_paths, paths
+from backend.lib.cross_site import refuse_cross_site
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -55,7 +69,6 @@ _size_lock = threading.Lock()
 
 _WSL_TIMEOUT = 10
 _wsl_cache: dict[str, tuple[float, dict]] = {}
-_PICKER_TIMEOUT_SECONDS = 300
 
 
 def _dir_stats(path: Path) -> dict:
@@ -148,6 +161,7 @@ def _wsl_location(label: str, key: str, wsl_path: str, refresh: bool) -> dict:
                 capture_output=True,
                 timeout=_WSL_TIMEOUT,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                env=child_env(),
             )
             stdout = result.stdout.decode("utf-8", errors="replace")
             lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
@@ -1031,25 +1045,26 @@ class OpenBody(BaseModel):
     path: str
 
 
-class PickerResult(BaseModel):
-    path: str | None = None
-    cancelled: bool = False
-
-
 def _allowed_open_roots() -> list[str]:
     roots = [str(p) for _, _, p in _windows_locations()]
     roots += [e["path"] for e in get_registry().list_checkpoints()]
     distro = _wsl_distro()
     if distro:
         roots.append(f"\\\\wsl.localhost\\{distro}")
-    return [r.lower().rstrip("\\/") for r in roots]
+    return [os.path.normpath(r).lower().rstrip("\\/") for r in roots]
 
 
-@router.post("/open")
+@router.post("/open", dependencies=[Depends(refuse_cross_site)])
 def storage_open(body: OpenBody) -> dict:
-    """Open a location in Explorer. Only paths under a known location are allowed."""
+    """Open a location in Explorer. Only paths under a known location are allowed.
+
+    The check runs on the normalized path, so a ``..`` segment cannot step out
+    of a known location. Explorer is started with ``child_env``: it launches
+    whatever handles the path, and that program must not inherit the launch
+    token."""
     target = body.path.strip()
-    normalized = target.lower().rstrip("\\/")
+    location = os.path.normpath(target) if target else target
+    normalized = location.lower().rstrip("\\/")
     if not any(
         normalized == root
         or normalized.startswith(root + "\\")
@@ -1059,73 +1074,150 @@ def storage_open(body: OpenBody) -> dict:
         raise HTTPException(403, "That path is not one of theDAW's model locations.")
     if sys.platform != "win32":
         raise HTTPException(501, "Open-in-explorer is implemented for Windows only.")
+    # Explorer handed a missing path opens its default folder and reports
+    # nothing, so a missing location is answered here.
+    if not os.path.exists(location):
+        raise HTTPException(404, f"Could not open {target!r}: nothing is there.")
     try:
-        os.startfile(target)  # noqa: S606 — deliberate, validated against known roots
+        subprocess.Popen(["explorer", location], env=child_env())
     except OSError as e:
         raise HTTPException(404, f"Could not open {target!r}: {e}") from e
     return {"opened": target}
 
 
-def _run_windows_picker(script: str) -> PickerResult:
-    """Run a small STA PowerShell picker and return the selected local path.
+# The native dialogs come from backend.core.folder_dialog: PowerShell WinForms
+# on Windows, owned by a TopMost form so they never open behind theDAW, and
+# tkinter elsewhere. The frontend cannot read absolute paths from a browser file
+# input, so theDAW, running as a trusted local app, asks the backend to show them.
+# ``refuse_cross_site`` keeps a page on another site from opening a dialog on
+# this machine, since CORS on this server is open. A machine with no dialog to
+# show (a headless Linux host) answers 501, so the frontend can fall back to a
+# browser download.
 
-    The frontend cannot read absolute folder paths from a normal browser file
-    input. Because theDAW runs as a trusted local app, Settings asks the backend
-    to show the native Windows dialog. Scripts are static constants so no user
-    text is interpolated into PowerShell.
-    """
-    if sys.platform != "win32":
-        raise HTTPException(501, "Native path picker is implemented for Windows only.")
+
+def _require_picker() -> None:
+    if not folder_dialog.picker_available():
+        raise HTTPException(501, "This machine has no native file dialog.")
+
+
+def _picker_failed(error: folder_dialog.PickerError) -> HTTPException:
+    """The answer for a dialog that failed: ``error.status_code`` (504 for a
+    timeout, else 500) with folder_dialog's message."""
+    return HTTPException(error.status_code, str(error))
+
+
+def _checkpoint_start_dir() -> str | None:
+    """Where a checkpoint dialog opens when no folder was sent or remembered:
+    the first local model folder that exists, else the folder holding the
+    newest registered checkpoint whose folder still exists."""
     try:
-        result = subprocess.run(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-STA",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                script,
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=_PICKER_TIMEOUT_SECONDS,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            check=False,
+        for folder in _local_search_dirs():
+            if os.path.isdir(folder):
+                return str(folder)
+        registered = get_registry().list_checkpoints()
+    except (OSError, ValueError) as e:
+        log.debug("storage: no checkpoint start folder: %s", e)
+        return None
+
+    def newest(item: tuple[int, dict]) -> tuple[float, int]:
+        at = item[1].get("added_at")
+        number = at if isinstance(at, (int, float)) and not isinstance(at, bool) else 0
+        return (float(number), item[0])
+
+    for _, entry in sorted(enumerate(registered), key=newest, reverse=True):
+        path = entry.get("path")
+        if not isinstance(path, str) or not path.strip():
+            continue
+        parent = os.path.dirname(os.path.abspath(path))
+        if os.path.isdir(parent):
+            return parent
+    return None
+
+
+# Kinds whose dialog, with no folder of their own yet, opens where the model
+# files are.
+_MODEL_FILE_KINDS = ("checkpoint", "lora")
+
+
+def _start_dir(initial_dir: str | None, kind: str | None) -> str | None:
+    """The folder a dialog opens in: ``initial_dir`` when it exists, else the
+    folder last used for ``kind`` (or that kind's default), else for a
+    checkpoint or LoRA the folder ``_checkpoint_start_dir`` finds, else
+    ``initial_dir`` as given.
+
+    An ``initial_dir`` on a share or device path is dropped before anything
+    checks it, because the request body names it, and Windows authenticates to
+    a share's host as soon as a path on it is checked."""
+    wanted = (initial_dir or "").strip()
+    if known_paths.is_remote_or_device_path(wanted):
+        wanted = ""
+    if wanted and os.path.isdir(wanted):
+        return wanted
+    if kind:
+        folder = known_paths.last_folder(kind)
+        if folder:
+            return folder
+        if kind in _MODEL_FILE_KINDS:
+            folder = _checkpoint_start_dir()
+            if folder:
+                return folder
+    return wanted or None
+
+
+def _remember_pick(path: str, kind: str | None) -> None:
+    """Record a picked path with source 'pick'.
+
+    A file whose extension names a different extension kind is listed under
+    its own kind, so a .als picked from the .tasmo field shows in DAW project
+    menus. The picker's kind still remembers the folder, so that field's next
+    dialog opens there. A kind no extension produces (``backup-zip``) is kept.
+
+    A checkpoint pick is listed without moving the last folder of the kind it
+    is listed under. The folder that holds the picked checkpoint becomes where
+    the next checkpoint dialog opens, among its sibling checkpoints."""
+    by_ext = known_paths.kind_for_path(path)
+    listed_as = kind or None
+    if (
+        kind
+        and kind != by_ext
+        and kind in known_paths.EXTENSION_KINDS
+        and by_ext in known_paths.EXTENSION_KINDS
+    ):
+        listed_as = by_ext
+    parent = os.path.dirname(os.path.abspath(path))
+    if kind == "checkpoint":
+        known_paths.record(path, listed_as, source="pick", update_folder=False)
+        known_paths.record_folder("checkpoint", parent)
+        return
+    # Without a kind the path is remembered under its extension kind, or as a
+    # 'folder'.
+    known_paths.record(path, listed_as, source="pick")
+    if kind and listed_as != kind:
+        known_paths.record_folder(kind, parent)
+
+
+class PickFolderRequest(BaseModel):
+    title: str | None = None
+    initial_dir: str | None = None
+    # known_paths kind: where the dialog opens, and what the choice is remembered as.
+    kind: str | None = None
+
+
+@router.post("/pick-folder", dependencies=[Depends(refuse_cross_site)])
+def storage_pick_folder(req: PickFolderRequest | None = None) -> dict:
+    _require_picker()
+    r = req or PickFolderRequest()
+    try:
+        path = folder_dialog.pick_folder(
+            title=r.title or "Select a folder for theDAW",
+            initial=_start_dir(r.initial_dir, r.kind),
         )
-    except subprocess.TimeoutExpired as e:
-        raise HTTPException(408, "Path picker timed out.") from e
-    except OSError as e:
-        raise HTTPException(500, f"Could not open path picker: {e}") from e
-
-    if result.returncode == 3:
-        return PickerResult(cancelled=True)
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "path picker failed").strip()
-        raise HTTPException(500, detail[:500])
-    picked = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
-    if not picked:
-        return PickerResult(cancelled=True)
-    return PickerResult(path=picked, cancelled=False)
-
-
-@router.post("/pick-folder")
-def storage_pick_folder() -> dict:
-    script = r"""
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-Add-Type -AssemblyName System.Windows.Forms
-$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-$dialog.Description = 'Select a folder for theDAW'
-$dialog.ShowNewFolderButton = $true
-if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-  Write-Output $dialog.SelectedPath
-} else {
-  exit 3
-}
-"""
-    return _run_windows_picker(script).model_dump()
+    except folder_dialog.PickerError as e:
+        raise _picker_failed(e) from e
+    if not path:
+        return {"path": None, "cancelled": True}
+    _remember_pick(path, r.kind)
+    return {"path": path, "cancelled": False}
 
 
 class PickFileRequest(BaseModel):
@@ -1134,38 +1226,26 @@ class PickFileRequest(BaseModel):
     # files so the dialog never hides project/audio files behind a model filter.
     filter: str | None = None
     title: str | None = None
+    initial_dir: str | None = None
+    kind: str | None = None
 
 
-def _ps_single_quote(value: str) -> str:
-    """Escape a string for embedding inside a single-quoted PowerShell literal.
-
-    Single-quoted PS strings treat ``$`` and backticks literally, so doubling
-    the single quote is enough to prevent breakout; newlines are flattened.
-    """
-    return value.replace("\r", " ").replace("\n", " ").replace("'", "''")
-
-
-@router.post("/pick-file")
+@router.post("/pick-file", dependencies=[Depends(refuse_cross_site)])
 def storage_pick_file(req: PickFileRequest | None = None) -> dict:
-    flt = (req.filter if req and req.filter else None) or "All files (*.*)|*.*"
-    title = (req.title if req and req.title else None) or "Select a file for theDAW"
-    script = r"""
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-Add-Type -AssemblyName System.Windows.Forms
-$dialog = New-Object System.Windows.Forms.OpenFileDialog
-$dialog.Title = '__TITLE__'
-$dialog.Filter = '__FILTER__'
-$dialog.Multiselect = $false
-if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-  Write-Output $dialog.FileName
-} else {
-  exit 3
-}
-"""
-    script = script.replace("__TITLE__", _ps_single_quote(title)).replace(
-        "__FILTER__", _ps_single_quote(flt)
-    )
-    return _run_windows_picker(script).model_dump()
+    _require_picker()
+    r = req or PickFileRequest()
+    try:
+        path = folder_dialog.pick_open_file(
+            title=r.title or "Select a file for theDAW",
+            initial_dir=_start_dir(r.initial_dir, r.kind),
+            filter_spec=r.filter or "All files (*.*)|*.*",
+        )
+    except folder_dialog.PickerError as e:
+        raise _picker_failed(e) from e
+    if not path:
+        return {"path": None, "cancelled": True}
+    _remember_pick(path, r.kind)
+    return {"path": path, "cancelled": False}
 
 
 class PickSaveRequest(BaseModel):
@@ -1174,20 +1254,42 @@ class PickSaveRequest(BaseModel):
     initial_dir: str | None = None
     initial_name: str | None = None
     default_ext: str | None = None
+    kind: str | None = None
 
 
-@router.post("/pick-save")
+@router.post("/pick-save", dependencies=[Depends(refuse_cross_site)])
 def storage_pick_save(req: PickSaveRequest | None = None) -> dict:
     """Open a native Save As dialog (for .tasmo project saves etc.). Returns
-    ``{cancelled, path}`` like the other pickers."""
-    from backend.core.folder_dialog import pick_save_file
+    ``{cancelled, path, grant}``.
 
+    The chosen path gets a one-time grant for POST /api/places/save, and
+    ``grant`` is the nonce that write has to carry. A network share or device
+    path, and a file type theDAW never writes
+    (``known_paths.BLOCKED_SAVE_EXTS``), answer 400 and grant nothing. For a
+    refused file type the chosen folder still becomes where the next Save
+    dialog of this kind opens. The file does not exist yet, so only the folder
+    is remembered here; the save records the file once it is written."""
+    _require_picker()
     r = req or PickSaveRequest()
-    path = pick_save_file(
-        title=r.title or "Save as",
-        initial_dir=r.initial_dir,
-        initial_name=r.initial_name,
-        default_ext=r.default_ext,
-        filter_spec=r.filter,
+    try:
+        path = folder_dialog.pick_save_file(
+            title=r.title or "Save as",
+            initial_dir=_start_dir(r.initial_dir, r.kind),
+            initial_name=r.initial_name,
+            default_ext=r.default_ext,
+            filter_spec=r.filter,
+        )
+    except folder_dialog.PickerError as e:
+        raise _picker_failed(e) from e
+    if not path:
+        return {"cancelled": True, "path": None}
+    if known_paths.is_remote_or_device_path(path):
+        raise HTTPException(400, "theDAW saves only to folders on this computer.")
+    known_paths.record_folder(
+        r.kind or known_paths.kind_for_path(path),
+        os.path.dirname(os.path.abspath(path)),
     )
-    return {"cancelled": path is None, "path": path}
+    grant = known_paths.grant_save(path)
+    if grant is None:
+        raise HTTPException(400, "That file type cannot be saved from theDAW.")
+    return {"cancelled": False, "path": path, "grant": grant}
