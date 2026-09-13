@@ -231,6 +231,139 @@ driven in the live app yet; items stay here until that happens.
 
 ---
 
+## P1 — from the user, 2026-09-13 (marked done only when the user says so)
+
+- [ ] **METER MAP in DETAILS: draw the map.** The block shows the engine's
+  summary sentence as a text box. The user wants the visual map from the UNCANNY
+  maps page, everything it shows and more, fed by the current engine. That page
+  draws, per track: a facts column; a time ruler with tempo-change flags; one
+  lane of meter blocks sized by time, coloured by bar-length family (fours,
+  threes and compound, fives, sevens, twos, the long and odd), hatched when
+  confidence is under 0.10, labelled with signature and grouping, badged 8TH or
+  16TH when read at the tatum, with hover and focus tooltips carrying the
+  numbers; a syncopation-per-bar lane (LHL); chips for polymeter, cross-rhythms
+  and swing; a legend. The family colours encode data and stay inside the map;
+  everything around it follows the one-accent item below. REPORT carries the
+  same drawing. Reference: artifact
+  `claude.ai/code/artifact/8e0033a4-d9d0-4a62-a599-c9ecd4022fb0`, saved with its
+  render script at
+  `C:\Users\dtruj\.claude\projects\g--Users-dtruj-Dev-theDAW\4df20534-aae7-4dce-952f-b7c88f167f76\tool-results\artifact-8e0033a4-1789170827-a5ab.html`.
+  Data: `meter_map`, `tempo.segments`, `bar_starts`, `lhl`, `offbeat`,
+  `syncopation`, `polymeter`, `cross_rhythms` from
+  `backend/modules/rhythm/engine.py`. — M —
+  `frontend/src/components/layout/RhythmBlock.tsx:190-300`
+- [ ] **One accent colour, taken from the theme.** Buttons, knobs and sliders
+  use many neon colours. They take the theme's accent and contrast with the
+  theme. A glow marks state: the selected control, an armed or recording
+  control, and other states where a glow carries meaning. DETAILS tints each
+  section its own colour: NOTATION IDENTITY amber (`DetailsView.tsx:339`),
+  ANALYSIS emerald (`:395`), sky (`:456`), purple (`:505`), METER MAP fuchsia
+  (`RhythmBlock.tsx:190`). The 2026-09-13 screenshot also marks the header icon
+  buttons (phone, help, IMPORT, menu), the DETAILS / BOTH / MEDIA switch with its
+  expand button, and the LIBRARY / MEDIA tabs. App-wide; DETAILS, the header and
+  MIDI first. — L — `frontend/src/lib/editThemes.ts`, `frontend/src/index.css`,
+  `frontend/src/components/layout/DetailsView.tsx`,
+  `frontend/src/components/layout/Shell.tsx:292`
+- [ ] **Footer buttons in the transport style.** CREATE and every other footer
+  button take the style of the LOOP / START / PLAY / END / RAND plate. — S —
+  `frontend/src/components/audio/PlayerFooter.tsx:776` (transport plate), `:934`
+  (CREATE and the other workspace actions)
+- [ ] **The footer speech bubble.** Shaped as a speech bubble, in theme colours
+  (not purple), placed further left. It takes the place of the "Drag to move"
+  label under the assistant orb. — S —
+  `frontend/src/components/audio/OrbTipBubble.tsx`,
+  `frontend/src/components/audio/PlayerFooter.tsx:724-728`,
+  `frontend/src/orb-kit/styles/gantasmo-orb.css:442`
+- [ ] **MIDI tab layout.** Four or more stacked rows sit above the piano roll:
+  the sub-tab bar; input, song search, ANALYZE, LOAD, .MID, BEAT, VALIDATE, ARP;
+  the VIRTUOSO sliders with key, style and groove; CAPTURE, RESET, STRUCTURE,
+  BUILD SONG; the piano roll toolbar. They take most of the vertical space, use
+  mixed neon colours, and share no grouping or alignment. One compact, uniform
+  arrangement on theme accents. — M —
+  `frontend/src/components/layout/MidiPanel.tsx:480,585,593,596,655`,
+  `frontend/src/components/audio/VirtuosoControls.tsx`,
+  `frontend/src/components/audio/PianoRoll.tsx:582`,
+  `frontend/src/components/audio/ArpeggiatorPanel.tsx:178`,
+  `frontend/src/components/audio/AiComposePopover.tsx:107`
+- [ ] **F1 vocal suite, piece 2: tuning and pitch correction.** Next in the
+  plan's order, confirmed by the user 2026-09-10. Plan:
+  `docs/guides/vocal-suite-plan.md` (`ac18a52`). Piece 1, a CUDA torch in the
+  stems sidecar, is done: torch 2.7.1+cu128, CUDA available, separation routed
+  to the GPU. Brief:
+  - New `backend/modules/vocal/render/` consuming `VocalArtifact` (`schema.py`,
+    the f0 curve and voiced mask from `preprocess/f0_curve.py`).
+  - Pure functions: `retune_targets(f0, target)` with target = scale/key, the
+    chord track, or the SCORE melody; `retune_ratio` with retune speed, strength
+    and a transition time; formant preservation on by default; a PSOLA or
+    phase-vocoder render that passes unvoiced frames through.
+  - Tests first, on synthetic vowels: a sung sine with vibrato snapped to a
+    scale, measured as cents error per frame; formant preservation measured as
+    spectral envelope distance before and after.
+  - UI later, in SING. It corrects the isolated vocal stem, never the mix, and
+    the UI says so.
+  — L — `backend/modules/vocal/`
+- [ ] **LOOM tendrils: part of the cell or colony.** The user: "They should look
+  like they are a part of the cell or colony, not like a South Park Studios paper
+  cutout." Tendrils here are the Verlet strands (`components/loom/tendril.ts`,
+  drawn in `ColonyCanvas.tsx:472-578`), not NodeF.I.'s tendril control. Measured
+  2026-09-10, headless at 1920x1080; screenshots and the probe are in
+  `C:\Users\dtruj\.claude\projects\g--Users-dtruj-Dev-theDAW\plans\loom-tendrils\`.
+  - Fix 1, prerequisite: the orb sprite draws the membrane near 0.5 r while the
+    selection halo, meter ticks and label sit at r (`ColonyCanvas.tsx:447-467`),
+    and tendrils anchor at `rimRadius(...) * 0.90` (`:496-499`), so a strand into
+    a colony ends outside the bubble. The sprite is `r * ORB_REGION` (4.3) px and
+    the shader raymarches a sphere of `u_radius` 0.42 (colony) or 0.33 (loop) in
+    region space (`orbParamsFor`, `:1096,1121`; `gooeyOrb.ts:97`); the camera
+    (`ro` at z 3, focal 1.8) projects those to about 0.5 r and 0.4 r. Measure the
+    sprite's alpha along a ray for a loop and a colony at known r, then set
+    `u_radius` or the camera so the projected sphere fills r. Acceptance: visible
+    rim, halo and anchor agree within 3 px for both kinds.
+  - Fix 2: re-parenting regrows strands. Ropes are keyed `parent|from|to`
+    (`ColonyCanvas.tsx:491`) and deleted when the key vanishes (`:578`); growth
+    that envelops a loop (`colonyGrow.ts:179-196`) re-points the wires, so each
+    strand is deleted and regrows over 6.5 s. Carry grow, pts and rest across a
+    key change that keeps the wire's identity; `stepRope` already re-seeds on a
+    large anchor jump (`tendril.ts:253-263`).
+  - Fix 3: under `prefers-reduced-motion` `stepRope` never runs
+    (`ColonyCanvas.tsx:514`), leaving two-segment stubs. Create ropes fused
+    (grow = 1) and skip only the physics.
+  - Fix 4: `flareA: rimA * 0.42 * k2` (`ColonyCanvas.tsx:534-535`) is a 120 px
+    half-width blob on a 300 px colony. Cap it at a few times the strand's mid
+    width.
+  - The look: strands are flat gradient ribbons with hard edges (`drawRibbon`,
+    `tendril.ts:362-418`) painted after the bodies (`ColonyCanvas.tsx:429-470`).
+    Draw strands before the orbs. Add up to a few root capsules per orb to
+    `mapBlob` (`gooeyOrb.ts:93-98`) joined by a smooth minimum, so the membrane
+    bulges into the strand; on colonies the roots take the glass material
+    (`u_body` 0.06). Paint the strand as a lit tube: the orb's two colours along
+    its length, a highlight toward the shader's light, a darker edge, the
+    `u_glowStrength` falloff and the body's alpha, composited with the orbs'
+    blend. The orb shader is the user's port of Tamino Martinius; if the user has
+    a reference for the strand material it goes first, so ask before starting
+    the material.
+  - Also seen: the colonies template places three colonies of radius 280 to
+    340 px on a ring of 120 + 6n px (`ColonyCanvas.tsx:199`), so the bubbles
+    overlap by most of their area; whether the physics spreads them needs a live
+    look. No console errors; strands grow, bow and fuse as `tendril.test.ts`
+    describes.
+  - Acceptance: at a loop and at a colony, a still frame at 1920x1080 shows no
+    seam at either end and the strand shares the body's colours and highlight;
+    `tendril.test.ts` passes unchanged and the Node rate tests hold. Order: fix
+    1, draw order, shader roots, tube paint; fixes 2 to 4 alongside. Measure with
+    `probe_loom_tendrils.mjs` at 1920x1080 (the shell's zoom is 1.0 at 1600x900,
+    which hides pointer bugs); judge seams on stills, since headless runs at
+    2.7 fps. `npm run clean` after any build. The user looks before it is
+    committed.
+  — M — `frontend/src/components/loom/ColonyCanvas.tsx`,
+  `frontend/src/components/loom/tendril.ts`,
+  `frontend/src/components/loom/gooeyOrb.ts`, tests via `npm run test:loom`
+- [ ] **Copilot on the `fix-learn-graph-fills-panel` PR: the wrapper guard reads
+  a fixed window.** It pairs a counter-zoom with a width or height only within
+  four lines either side, so moving the size above the zoom or adding
+  properties between them hides the regression while the test passes. Inspect
+  the whole style object, or parse the TSX. — XS —
+  `frontend/src/components/library/lineageWrapperGuards.test.ts:37-40`
+
 ## P1 — from the user, 2026-09-12 (marked done only when the user says so)
 
 - [ ] **Meter maps have no UI at all.** The whole rhythm engine ships and is
