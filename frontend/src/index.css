@@ -3,6 +3,8 @@
 @theme {
   --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
+  /* Orbitron, the @font-face below, for wordmarks and group headings. */
+  --font-display: "Orbitron", "Segoe UI", ui-sans-serif, sans-serif;
 
   /* The colour names orb-kit was written against.
    *

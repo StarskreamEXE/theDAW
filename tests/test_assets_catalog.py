@@ -20,6 +20,7 @@ from backend.modules.assets import catalog
 from backend.modules.plugin import router as plugin_router
 from backend.modules.plugin.gan_file import GanFile
 from backend.modules.plugin.owl_import import import_vst_foundry
+from backend.modules.sway import router as sway_router
 from backend.server import app
 
 
@@ -386,6 +387,70 @@ def test_a_scene_install_leaves_the_sway_picker_in_the_users_folder(
         body["path"],
         str(mine),
     ]
+
+
+@pytest.fixture
+def scene_catalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A catalog holding one .sway, with the home folders and the data tree in
+    tmp_path. Returns data/sway-projects."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("theDAW_DATA_DIR", str(tmp_path / "data"))
+    scenes = tmp_path / "data" / "sway-projects"
+    monkeypatch.setattr(sway_router, "_PROJECTS_DIR", scenes)
+    root = tmp_path / "examples"
+    (root / "scenes").mkdir(parents=True)
+    (root / "scenes" / "show.sway").write_text(
+        '{"version": 1, "scene": "show"}', encoding="utf-8"
+    )
+    (root / "catalog.json").write_text(
+        json.dumps(
+            {"assets": [{"id": "show", "name": "Show", "file": "scenes/show.sway"}]}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(catalog, "EXAMPLES_DIR", root)
+    monkeypatch.setattr(catalog, "BUNDLED_CATALOG", root / "catalog.json")
+    monkeypatch.setattr(catalog, "user_catalog_dir", lambda: tmp_path / "userdata")
+    return scenes
+
+
+def _listed_scenes(client: TestClient) -> dict[str, bool]:
+    rows = client.get("/api/sway/projects").json()["projects"]
+    return {r["name"]: r["builtin"] for r in rows}
+
+
+def test_the_scene_list_flags_catalog_installs_as_builtin(
+    client: TestClient, scene_catalog: Path
+) -> None:
+    """A cockpit save is the user's own; a catalog install is built in."""
+    saved = client.post(
+        "/api/sway/project-save", json={"name": "My Set", "doc": {"version": 1}}
+    )
+    assert saved.status_code == 200
+    installed = client.post("/api/assets/show/install").json()
+    assert Path(installed["path"]) == scene_catalog / "show.sway"
+
+    assert _listed_scenes(client) == {"My Set": False, "show": True}
+
+
+def test_a_copy_of_a_catalog_scene_is_builtin_until_a_save_rewrites_it(
+    client: TestClient, scene_catalog: Path
+) -> None:
+    """The flag follows the bytes: an unrecorded copy under another name still
+    counts, and a cockpit save over the installed scene makes it custom."""
+    client.post("/api/assets/show/install")
+    shipped = (catalog.EXAMPLES_DIR / "scenes" / "show.sway").read_bytes()
+    (scene_catalog / "show (2).sway").write_bytes(shipped)
+    assert _listed_scenes(client) == {"show": True, "show (2)": True}
+
+    client.post(
+        "/api/sway/project-save",
+        json={"name": "show", "doc": {"version": 1, "scene": "edited"}},
+    )
+    assert _listed_scenes(client) == {"show": False, "show (2)": True}
 
 
 def test_a_plugin_on_the_shelf_is_found_by_its_manifest_id(

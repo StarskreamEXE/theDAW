@@ -179,10 +179,10 @@ export const FEATURES: FeatureEntry[] = [
   {
     id: 'sway',
     name: 'SWAY',
-    what: 'SwayCommand: gesture VJ cockpit for the Audima Sway, plus theDAW’s Sway routing',
+    what: 'SwayCommand: gesture VJ cockpit for Audima Labs Sway, plus theDAW’s Sway routing',
     how: [
       'Open the SWAY tab.',
-      'Connect the Sway, or use the camera as the pose source.',
+      'Connect Audima Labs Sway, or use the camera as the pose source.',
       'Map a gesture to the parameter it should drive.',
     ],
     where: 'SWAY tab',
@@ -427,7 +427,7 @@ export const FEATURES: FeatureEntry[] = [
   {
     id: 'panel-sway',
     name: 'SWAY link',
-    what: 'Wire the Sway — or any MIDI controller — into theDAW: learn its six motion dimensions, route them and the camera pose to parameters, or mirror the whole surface onto the EDIT mixer',
+    what: 'Wire Audima Labs Sway — or any MIDI controller — into theDAW: learn its six motion dimensions, route them and the camera pose to parameters, or mirror the whole surface onto the EDIT mixer',
     how: [
       'Open the SWAY tab and turn MIDI input on in the link panel beside the cockpit.',
       'Press LEARN on a dimension, then move the control it should follow.',

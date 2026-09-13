@@ -565,7 +565,7 @@ export const TOUR_STEPS: ChapteredStep[] = [
       <>
         The <Em>SWAY</Em> tab's link panel is theDAW's own half of that integration: arm <Em>LEARN</Em> on
         one of the six expressive dimensions, move any control on any MIDI device, and it is bound. The
-        VJ's camera-pose channels and the Sway's Ableton pad map route from the same strip.
+        VJ's camera-pose channels and the Audima Labs Sway's Ableton pad map route from the same strip.
       </>
     ),
     tip: <>PERFORM reads whatever you bind here, and a .tasmo carries it with the project.</>,

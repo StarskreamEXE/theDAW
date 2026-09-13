@@ -26,14 +26,17 @@ This module also owns two glue duties the embedded cockpit needs:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import re
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
+from backend.modules.assets import catalog
 from backend.modules.project import media_access
 
 from . import sidecar
@@ -261,16 +264,64 @@ def sway_project(
     return {"name": target.stem, "path": str(target), "doc": doc}
 
 
+_DIGESTS: dict[tuple[str, int, int], str] = {}
+_DIGESTS_MAX = 256
+
+
+def _digest(path: Path, st: os.stat_result) -> str:
+    """sha256 of ``path``, cached by path, mtime and size."""
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    cached = _DIGESTS.get(key)
+    if cached is not None:
+        return cached
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+    if len(_DIGESTS) >= _DIGESTS_MAX:
+        _DIGESTS.clear()
+    _DIGESTS[key] = h.hexdigest()
+    return _DIGESTS[key]
+
+
+def _catalog_scene_digests() -> dict[int, set[str]]:
+    """Size -> digests of every .sway file the asset catalog installs."""
+    out: dict[int, set[str]] = {}
+    for entry in catalog.load_entries():
+        if entry.format != ".sway":
+            continue
+        try:
+            st = entry.file.stat()
+            out.setdefault(st.st_size, set()).add(_digest(entry.file, st))
+        except OSError:
+            continue
+    return out
+
+
 @router.get("/projects")
 async def sway_projects() -> dict:
-    """List the .sway projects persisted by /project-save, newest first."""
+    """List the .sway projects in data/sway-projects, newest first.
+
+    ``builtin`` is true for a file whose bytes match a .sway the asset catalog
+    installs, so a numbered second install counts too. A cockpit save over an
+    installed scene rewrites the file, and from then on it is the user's own."""
     if not _PROJECTS_DIR.is_dir():
         return {"projects": []}
+    shipped = _catalog_scene_digests()
     rows: list[dict] = []
     for p in _PROJECTS_DIR.glob("*.sway"):
         try:
-            rows.append({"name": p.stem, "path": str(p), "mtime": p.stat().st_mtime})
+            st = p.stat()
         except OSError:
             continue
+        builtin = False
+        if st.st_size in shipped:
+            try:
+                builtin = _digest(p, st) in shipped[st.st_size]
+            except OSError:
+                builtin = False
+        rows.append(
+            {"name": p.stem, "path": str(p), "mtime": st.st_mtime, "builtin": builtin}
+        )
     rows.sort(key=lambda r: r["mtime"], reverse=True)
     return {"projects": rows}
