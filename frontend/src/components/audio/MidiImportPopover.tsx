@@ -168,11 +168,11 @@ export const MidiImportPopover: React.FC<{
         className={`w-72 p-2 flex flex-col gap-2 ${FLYOUT_CARD}`}
       >
         <div className="flex items-stretch gap-1">
-          <button type="button" onClick={() => fileRef.current?.click()} className={sourceBtn}>
+          <button type="button" onClick={() => fileRef.current?.click()} className={sourceBtn} title="Import a MIDI file from disk" aria-label="Import a MIDI file from disk">
             <FolderOpen aria-hidden="true" className="w-3.5 h-3.5 shrink-0" />
-            MIDI file on disk…
+            <span>File</span>
           </button>
-          <KnownFilesMenu id={MIDI_RECENT_ID} exts={MIDI_RECENT_EXTS} label="Recent MIDI" onFiles={importMidiFiles} />
+          <KnownFilesMenu id={MIDI_RECENT_ID} exts={MIDI_RECENT_EXTS} label="Recent" name="Recent MIDI files" onFiles={importMidiFiles} />
         </div>
 
         {onImportSheetFile && (
@@ -181,12 +181,13 @@ export const MidiImportPopover: React.FC<{
               type="button"
               onClick={() => sheetRef.current?.click()}
               className={sourceBtn}
-              title="Import a notation file: MusicXML, ABC, or Humdrum kern"
+              title="Import sheet music: MusicXML, ABC or Humdrum kern"
+              aria-label="Import sheet music: MusicXML, ABC or Humdrum kern"
             >
               <FileMusic aria-hidden="true" className="w-3.5 h-3.5 shrink-0" />
-              Sheet music (MusicXML / ABC)…
+              <span>Sheet</span>
             </button>
-            <KnownFilesMenu id={SHEET_RECENT_ID} exts={SHEET_RECENT_EXTS} label="Recent sheets" onFiles={importSheetFiles} />
+            <KnownFilesMenu id={SHEET_RECENT_ID} exts={SHEET_RECENT_EXTS} label="Recent" name="Recent sheet music files" onFiles={importSheetFiles} />
           </div>
         )}
 
