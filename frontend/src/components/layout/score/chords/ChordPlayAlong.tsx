@@ -471,14 +471,8 @@ export const ChordPlayAlong: React.FC<ChordPlayAlongProps> = ({ entry, artifacts
         </div>
       )}
 
-      {/* Footer: shared transport. */}
-      <PlayAlongTransport
-        entry={entry}
-        isSameTrack={handle.isSameTrack}
-        isPlaying={handle.isPlaying}
-        otherTrackLoaded={handle.otherTrackLoaded}
-        onTransport={handle.onTransport}
-      >
+      {/* Footer: the shared play-along controls. Play sits in the Score header. */}
+      <PlayAlongTransport>
         {track && (
           <span className="text-zinc-500 truncate" title="Key, tempo and chord count of this chord track">
             {keyText ? `${keyText} · ` : ''}

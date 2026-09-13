@@ -1,9 +1,10 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  Play, Square, Target,
+  Target,
   Trash2, Sparkles, Plus, Activity,
   Download, Send, Music, Palette,
 } from 'lucide-react';
+import { SurfacePlayKey } from '../ui/SurfacePlayKey';
 import { SlideTrack } from './SlideTrack';
 import { getEngineCtx, getMasterGain } from '../../state/playerStore';
 import { useEditorStore, computePeaks } from '../../state/editorStore';
@@ -571,27 +572,23 @@ export const StepSequencer: React.FC = () => {
       {/* Extra right padding reserves space for the MIDI mapper pill (absolute
           top-right) so it never covers the + / CLEAR controls. */}
       <div className="flex items-center justify-between py-2 pl-2 pr-20 border-b border-white/5 bg-black/20">
-        <div className="flex items-center gap-4">
-          <div className="flex items-center gap-4">
-            <div className="flex flex-col">
-              <span className="text-[7px] font-mono text-zinc-600 uppercase leading-none">Tempo (BPM)</span>
-              <input
-                type="number"
-                name="step-seq-bpm"
-                value={bpm}
-                min={40}
-                max={240}
-                onChange={(e) => setBpm(parseInt(e.target.value) || 120)}
-                className="bg-transparent border-none outline-none text-[12px] font-mono text-cyan-500 w-14 font-black"
-              />
-            </div>
-            <button
-              onClick={handlePlayToggle}
-              className={`p-1.5 rounded transition-all ${isPlaying ? 'bg-red-500/20 text-red-400 border border-red-500/40' : 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/40 hover:bg-cyan-500/30'}`}
-              title={isPlaying ? 'Stop' : 'Play'}
-            >
-              {isPlaying ? <Square className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current" />}
-            </button>
+        {/* The play key leads the row, the spot every surface that plays music
+            puts it. min-h-7.5 keeps the row the height the old 30px button gave
+            it, so the grid below does not move. */}
+        <div className="flex items-center gap-4 min-h-7.5">
+          <SurfacePlayKey size="bar" playing={isPlaying} onToggle={handlePlayToggle} what="the pattern" />
+          <div className="flex flex-col">
+            <label htmlFor="step-seq-bpm" className="text-[7px] font-mono text-zinc-600 uppercase leading-none">Tempo (BPM)</label>
+            <input
+              id="step-seq-bpm"
+              type="number"
+              name="step-seq-bpm"
+              value={bpm}
+              min={40}
+              max={240}
+              onChange={(e) => setBpm(parseInt(e.target.value) || 120)}
+              className="bg-transparent border-none outline-none text-[12px] font-mono text-cyan-500 w-14 font-black"
+            />
           </div>
         </div>
 
@@ -599,14 +596,18 @@ export const StepSequencer: React.FC = () => {
           {/* Single / Multitrack toggle — controls both MIDI export and editor bounce. */}
           <div className="flex items-center bg-black/40 rounded border border-white/5 overflow-hidden">
             <button
+              type="button"
               onClick={() => setExportMode('single')}
+              aria-pressed={exportMode === 'single'}
               className={`px-1.5 py-0.5 text-[8px] uppercase font-bold tracking-widest transition-colors ${exportMode === 'single' ? 'bg-purple-600/30 text-purple-200' : 'text-zinc-500 hover:text-white'}`}
               title="Export as a single mixed track / single-track MIDI"
             >
               Single
             </button>
             <button
+              type="button"
               onClick={() => setExportMode('multi')}
+              aria-pressed={exportMode === 'multi'}
               className={`px-1.5 py-0.5 text-[8px] uppercase font-bold tracking-widest transition-colors ${exportMode === 'multi' ? 'bg-purple-600/30 text-purple-200' : 'text-zinc-500 hover:text-white'}`}
               title="Export as one track per voice / multi-track MIDI"
             >
@@ -616,8 +617,9 @@ export const StepSequencer: React.FC = () => {
 
           {/* Bars selector for editor bounce */}
           <div className="flex items-center gap-1 px-1.5 py-0.5 bg-black/40 border border-white/5 rounded">
-            <Music className="w-2.5 h-2.5 text-zinc-500" />
+            <Music className="w-2.5 h-2.5 text-zinc-500" aria-hidden="true" />
             <input
+              id="step-seq-export-bars"
               type="number"
               name="step-seq-export-bars"
               min={1}
@@ -627,7 +629,7 @@ export const StepSequencer: React.FC = () => {
               className="bg-transparent border-none outline-none text-[10px] font-mono text-zinc-300 w-6"
               title="Number of bars to render when sending to the editor"
             />
-            <span className="text-[7px] font-mono text-zinc-600 uppercase">bar{exportBars === 1 ? '' : 's'}</span>
+            <label htmlFor="step-seq-export-bars" className="text-[7px] font-mono text-zinc-600 uppercase">bar{exportBars === 1 ? '' : 's'}</label>
           </div>
 
           <button

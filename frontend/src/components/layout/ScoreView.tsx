@@ -1,5 +1,5 @@
 import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronLeft, ChevronRight, Download, FileMusic, Guitar, LayoutGrid, Loader2, Minus, Music2, Music4, Pause, Play, Plus, RefreshCw } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Download, FileMusic, Guitar, LayoutGrid, Loader2, Minus, Music2, Music4, Plus, RefreshCw } from 'lucide-react';
 import { useLibraryStore, type LibraryEntry } from '../../state/libraryStore';
 import { usePlayerStore } from '../../state/playerStore';
 import { logError, logInfo } from '../../state/logStore';
@@ -114,6 +114,8 @@ import {
 import { ModeSwitch } from './score/playAlong/ModeSwitch';
 import { ExportMenu } from './score/ExportMenu';
 import { PlayAlongTransportCompact } from './score/playAlong/PlayAlongTransport';
+import { usePlayAlong } from './score/playAlong/usePlayAlongClock';
+import { SurfacePlayKey } from '../ui/SurfacePlayKey';
 import { applyInstrumentPreset, discoverParts, knownParts, useKnownParts } from './score/playAlong/partRegistry';
 
 // The play-along views load on demand: OSMD and alphaTab are already dynamic
@@ -139,6 +141,9 @@ const INSTRUMENT_LABELS: Record<PlayAlongInstrument, string> = {
 /** Artifact kinds whose views work without a library track (a strip or a
  *  page can be read unplayed); everything else needs audio to derive chords. */
 const KINDS_WITHOUT_ENTRY = ['musicxml', 'alphatex', 'notechart', 'chordtrack'];
+
+/** The header's play key needs only the play-along transport, not its frames. */
+const NO_FRAME = (): void => {};
 
 const LazyFallback: React.FC = () => (
   <div className="h-full grid place-items-center text-[10px] font-mono text-zinc-500">Loading…</div>
@@ -193,6 +198,14 @@ export const ScoreView: React.FC = () => {
   const setSkin = usePlayAlongStore((s) => s.setSkin);
   const instrument = usePlayAlongStore((s) => s.instrument);
   const setInstrument = usePlayAlongStore((s) => s.setInstrument);
+  // One play key in the header serves every mode below it: PAGE, STRIP,
+  // CHORDS, HIGHWAY and the tab's PAGE all follow this same entry on the same
+  // player. Inside the SING split, SING's own key already plays this entry, so
+  // the header drops it (PlayAlongTransportCompact).
+  const playAlong = usePlayAlong(entry, NO_FRAME, { enabled: false });
+  const compact = useContext(PlayAlongTransportCompact);
+  const playingHere = playAlong.isSameTrack && playAlong.isPlaying;
+  const transportLabel = entry ? `${playingHere ? 'Pause' : 'Play'} ${entry.title}` : 'No track selected';
   // The global artist/composer name now lives in Settings (notation.artist); the
   // sheet preview reads it directly when rendering.
 
@@ -796,6 +809,33 @@ export const ScoreView: React.FC = () => {
 
       <div className="flex-1 min-w-0 min-h-0 flex flex-col">
         <div className="h-8 shrink-0 border-b border-white/5 bg-black/30 flex items-center gap-2 px-2">
+          {/* The play key leads the header, the spot every surface that plays
+              music puts it. The OTHER TRACK badge keeps its slot whether or not
+              it is showing, so nothing beside it shifts when the engine changes
+              track; `invisible` is visibility:hidden, out of the accessibility
+              tree, and aria-hidden says so too. */}
+          {!compact && (
+            <>
+              <SurfacePlayKey
+                size="bar"
+                playing={playingHere}
+                onToggle={() => void playAlong.onTransport()}
+                disabled={!entry}
+                what={entry?.title ?? 'the selected track'}
+                aria-label={transportLabel}
+                title={transportLabel}
+              />
+              <span
+                className={`shrink-0 whitespace-nowrap text-[9px] font-mono text-amber-300/90 ${playAlong.otherTrackLoaded ? '' : 'invisible'}`}
+                aria-hidden={playAlong.otherTrackLoaded ? undefined : true}
+                title={playAlong.otherTrackLoaded
+                  ? 'The player is holding a different track, so the score is parked. Press play here to load this track.'
+                  : undefined}
+              >
+                OTHER TRACK
+              </span>
+            </>
+          )}
           <span className="text-[9px] font-mono text-zinc-500 truncate flex-1">
             {selectedArtifact
               ? `${describeArtifact(selectedArtifact)} · ${selectedArtifact.kind} · ${selectedArtifact.id}`
@@ -1217,24 +1257,6 @@ const MusicXmlPreview: React.FC<{ artifact: NotationArtifact; entry: LibraryEntr
   const syncNowRef = useRef(syncNow);
   syncNowRef.current = syncNow;
 
-  // Play/pause the score's own track. When the engine holds something else the
-  // same button loads this entry first, through the established library path,
-  // so the footer and the cursor are never following different audio.
-  const onTransport = useCallback(async () => {
-    if (!entry) return;
-    if (usePlayerStore.getState().currentEntryId === entry.id) {
-      usePlayerStore.getState().toggle();
-      return;
-    }
-    try {
-      const blob = await useLibraryStore.getState().fetchAudioBlob(entry);
-      await usePlayerStore.getState().load(blob, { label: entry.title, entryId: entry.id });
-      usePlayerStore.getState().play();
-    } catch (e) {
-      logError('score', `Could not load "${entry.title}" for follow-along: ${e instanceof Error ? e.message : String(e)}`);
-    }
-  }, [entry]);
-
   useWheelZoom(scrollRef, (factor) => applyZoom(zoomRef.current * factor));
 
   useEffect(() => {
@@ -1510,16 +1532,6 @@ const MusicXmlPreview: React.FC<{ artifact: NotationArtifact; entry: LibraryEntr
       `${Math.round(fitInfo.report.tallestBottom)} of ${Math.round(fitInfo.report.usable)} units). ` +
       'Click to reset zoom.'
     : 'Reset zoom';
-  const otherTrackLoaded = !!entryId && !!engineEntryId && !isSameTrack;
-  // PAGE rolls its own footer rather than using PlayAlongTransport, so it has
-  // to honour the same context: inside the SING split, SING's footer already
-  // carries play/pause and the OTHER TRACK badge for this very entry.
-  const compact = useContext(PlayAlongTransportCompact);
-  const transportLabel = !entry
-    ? 'No track selected'
-    : isSameTrack
-      ? (isPlaying ? 'Pause' : 'Play')
-      : `Play ${entry.title} and follow the score`;
 
   return (
     <div className="relative h-full flex flex-col bg-[#23222a]">
@@ -1570,29 +1582,16 @@ const MusicXmlPreview: React.FC<{ artifact: NotationArtifact; entry: LibraryEntr
           className="gap-6 items-start [&>div]:shrink-0 [&>div]:bg-white [&>div]:shadow-2xl [&>div]:rounded-sm [&>svg]:shrink-0 [&>svg]:bg-white [&>svg]:shadow-2xl [&>svg]:rounded-sm"
         />
       </div>
-      {/* Footer: follow-along transport + page navigation + zoom.
+      {/* Footer: follow toggle + page navigation + zoom. Play is the Score
+          header's first control, where every surface keeps it.
           `justify-center-safe` (justify-content: safe center), not plain
-          `justify-center`: this row's content is ~790px wide and the score
-          pane is narrower than that whenever the panel is split — plain
-          centring then overflows BOTH edges and pushes play and FOLLOW off
-          the left, out of reach. Safe centring falls back to flex-start the
-          moment the content stops fitting, so the row only ever overflows to
-          the right. Identical to justify-center while it fits. */}
+          `justify-center`: this row's content is wider than the score pane
+          whenever the panel is split — plain centring then overflows BOTH
+          edges and pushes FOLLOW off the left, out of reach. Safe centring
+          falls back to flex-start the moment the content stops fitting, so
+          the row only ever overflows to the right. Identical to
+          justify-center while it fits. */}
       <div className="shrink-0 h-8 border-t border-white/10 bg-[#0a080f] flex items-center justify-center-safe gap-1.5 px-2 text-[10px] font-mono text-zinc-300">
-        {!compact && (
-          <button
-            type="button"
-            onClick={() => void onTransport()}
-            disabled={!entry}
-            className="p-1 rounded hover:bg-white/10 disabled:opacity-30"
-            title={transportLabel}
-            aria-label={transportLabel}
-          >
-            {isSameTrack && isPlaying
-              ? <Pause className="w-3.5 h-3.5" />
-              : <Play className="w-3.5 h-3.5 text-emerald-300" />}
-          </button>
-        )}
         <input
           id="score-follow"
           name="score-follow"
@@ -1603,24 +1602,6 @@ const MusicXmlPreview: React.FC<{ artifact: NotationArtifact; entry: LibraryEntr
         />
         <label htmlFor="score-follow" className="cursor-pointer select-none">FOLLOW</label>
         <LookControls />
-        {/* This row is justify-center, so ANY child that comes and goes
-            re-centres the whole footer: the badge flips exactly when the
-            engine picks up a different entry, which used to slide play,
-            FOLLOW, the look selects, the pager and the zoom sideways on every
-            track change. It keeps its slot instead. `invisible` is
-            visibility:hidden — out of the accessibility tree and untabbable
-            (a span is not focusable anyway); aria-hidden states it. */}
-        {!compact && (
-          <span
-            className={`text-amber-300/90 whitespace-nowrap ${otherTrackLoaded ? '' : 'invisible'}`}
-            aria-hidden={otherTrackLoaded ? undefined : true}
-            title={otherTrackLoaded
-              ? "The player is holding a different track, so the cursor is parked. Press play here to load this score's track."
-              : undefined}
-          >
-            OTHER TRACK
-          </span>
-        )}
         <span className="mx-1 w-px h-4 bg-white/10" />
         <button
           onClick={() => goToPage(page - 1)}

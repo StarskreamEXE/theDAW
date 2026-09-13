@@ -62,18 +62,18 @@ export const SingScoreView: React.FC = () => {
       <SingView />
     </Suspense>
   );
-  // SingView early-returns a bare placeholder — no footer at all — when nothing
-  // is selected or the selection is not audio (SingView.tsx: `!entry` and
-  // `!isAudio`). The score's transport may only be compacted while that footer
-  // is really on screen, or the split would have no play button anywhere.
-  const singFooterShown = !!entry && (!entry.kind || entry.kind === 'audio');
-  // `compact` on the score side only in the split: SING's own footer already
-  // carries play/pause and the OTHER TRACK badge for the same entry, so the
-  // score's transports drop theirs (they keep OFFSET/CALIBRATE — a different
-  // quantity from SING's per-song lyric offset, and with no other home).
-  // Alone, SCORE is exactly the standalone tab.
+  // SingView early-returns a bare placeholder — no header, so no play key — when
+  // nothing is selected or the selection is not audio (SingView.tsx: `!entry`
+  // and `!isAudio`). The score's play key may only be dropped while SING's is
+  // really on screen, or the split would have no play key anywhere.
+  const singPlayShown = !!entry && (!entry.kind || entry.kind === 'audio');
+  // `compact` on the score side only in the split: SING's play key, at the left
+  // end of the lyrics header, already plays the same entry and shows its OTHER
+  // TRACK badge, so the Score header drops both (the score's footers keep
+  // OFFSET/CALIBRATE — a different quantity from SING's per-song lyric offset,
+  // and with no other home). Alone, SCORE is exactly the standalone tab.
   const score = (
-    <PlayAlongTransportCompact.Provider value={pane === 'split' && singFooterShown}>
+    <PlayAlongTransportCompact.Provider value={pane === 'split' && singPlayShown}>
       <Suspense fallback={null}>
         <ScoreView />
       </Suspense>

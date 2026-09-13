@@ -3,10 +3,7 @@ import {
   AlignLeft,
   Download,
   Loader2,
-  MicVocal,
-  Pause,
   Pencil,
-  Play,
   Trash2,
   Undo2,
   Upload,
@@ -17,6 +14,7 @@ import { useLyricAnalysisStore } from '../../../state/lyricAnalysisStore';
 import { SING_LANGUAGES, useLyricsStore } from '../../../state/lyricsStore';
 import { lyricsExportUrl } from '../../../lib/lyricsClient';
 import { usePlayAlong } from '../score/playAlong/usePlayAlongClock';
+import { SurfacePlayKey } from '../../ui/SurfacePlayKey';
 import { LyricsScroller, type LyricsScrollerHandle } from './LyricsScroller';
 import { LyricsEditor } from './LyricsEditor';
 
@@ -194,6 +192,8 @@ export const SingView: React.FC = () => {
   const busy = !!job;
   const transcribeLabel = transcription === 'missing' ? 'INSTALL TRANSCRIPTION' : 'TRANSCRIBE';
   const store = useLyricsStore.getState;
+  const playingHere = handle.isSameTrack && handle.isPlaying;
+  const transportLabel = `${playingHere ? 'Pause' : 'Play'} ${entry.title}`;
   const runOrInstall = (which: 'transcribe' | 'align') => {
     if (transcription === 'missing') return void store().installTranscription();
     return which === 'transcribe' ? void store().runTranscribe() : void store().runAlign();
@@ -201,9 +201,24 @@ export const SingView: React.FC = () => {
 
   return (
     <div className="h-full min-h-0 flex flex-col bg-[#07050a] text-zinc-200">
-      {/* Header */}
+      {/* Header. The play key leads it: the first control of the first row,
+          the spot every surface that plays music puts it. It takes the place
+          of the old mic glyph, and EDIT's ml-auto replaces a spacer span (one
+          gap fewer), so the row still fits the SING split at 1366px. */}
       <div className="h-8 shrink-0 border-b border-white/5 bg-black/30 flex items-center gap-1.5 px-2 text-[9px] font-mono">
-        <MicVocal className="w-3.5 h-3.5 text-rose-300 shrink-0" />
+        <SurfacePlayKey
+          size="bar"
+          playing={playingHere}
+          onToggle={() => void handle.onTransport()}
+          what={entry.title}
+          aria-label={transportLabel}
+          title={transportLabel}
+        />
+        {handle.otherTrackLoaded && (
+          <span className="shrink-0 whitespace-nowrap text-amber-300/90" title="The player is holding a different track. Press play here to load this song.">
+            OTHER TRACK
+          </span>
+        )}
         <span className="truncate text-zinc-300" title={entry.title}>{entry.title}</span>
         {doc && (
           <span className="shrink-0 rounded border border-rose-500/30 bg-rose-500/10 px-1 text-rose-200" title="Where these lyrics came from">
@@ -226,8 +241,7 @@ export const SingView: React.FC = () => {
             {mismatched} {mismatched === 1 ? 'word differs' : 'words differ'}
           </span>
         )}
-        <span className="flex-1" />
-        <button type="button" className="btn-ghost text-[8px] py-1 px-1.5 flex items-center gap-1" onClick={() => setEditing((v) => !v)} disabled={!doc} title="Edit the lyrics text (unchanged lines keep their timings)">
+        <button type="button" className="ml-auto btn-ghost text-[8px] py-1 px-1.5 flex items-center gap-1" onClick={() => setEditing((v) => !v)} disabled={!doc} title="Edit the lyrics text (unchanged lines keep their timings)">
           <Pencil className="w-3 h-3" /> EDIT
         </button>
         <button type="button" className="btn-ghost text-[8px] py-1 px-1.5 flex items-center gap-1 disabled:opacity-40" onClick={() => runOrInstall('transcribe')} disabled={busy || !doc} title="Let whisper write the lyrics from the vocal (the first run installs the sidecar)">
@@ -421,9 +435,6 @@ export const SingView: React.FC = () => {
 
       {/* Footer */}
       <div className="shrink-0 h-8 border-t border-white/10 bg-[#0a080f] flex items-center gap-2 px-2 text-[10px] font-mono text-zinc-300">
-        <button type="button" onClick={() => void handle.onTransport()} className="p-1 rounded hover:bg-white/10" title={handle.isSameTrack && handle.isPlaying ? `Pause ${entry.title}` : `Play ${entry.title}`} aria-label={handle.isSameTrack && handle.isPlaying ? `Pause ${entry.title}` : `Play ${entry.title}`}>
-          {handle.isSameTrack && handle.isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5 text-rose-300" />}
-        </button>
         <input id="sing-follow" name="sing-follow" type="checkbox" className="accent-rose-400" checked={follow} onChange={(e) => store().setFollow(e.target.checked)} />
         <label htmlFor="sing-follow" className="cursor-pointer select-none" title="Highlight and scroll the lyrics with the track">FOLLOW</label>
         <input id="sing-auto-align" name="sing-auto-align" type="checkbox" className="accent-rose-400" checked={autoAlign} onChange={(e) => store().setAutoAlign(e.target.checked)} />
@@ -436,11 +447,6 @@ export const SingView: React.FC = () => {
         <button type="button" className="btn-ghost text-[8px] py-0.5 px-1.5 flex items-center gap-1 disabled:opacity-40" onClick={() => store().undoTap()} disabled={!tapMode} aria-label="Undo the last tap" title="Undo the last tap (Backspace)">
           <Undo2 className="w-3 h-3" /> UNDO
         </button>
-        {handle.otherTrackLoaded && (
-          <span className="text-amber-300/90" title="The player is holding a different track. Press play here to load this song.">
-            OTHER TRACK
-          </span>
-        )}
         <span className="ml-auto flex items-center gap-1">
           <label htmlFor="sing-offset" className="text-zinc-500 select-none" title="Shift every lyric: positive shows the words later">OFFSET ms</label>
           <input id="sing-offset" name="sing-offset" type="number" step={10} value={doc?.offset_ms ?? 0} onChange={(e) => store().setOffset(Number(e.target.value) || 0)} disabled={!doc} className="w-16 form-select text-[10px] px-1 py-0.5 tabular-nums" />
