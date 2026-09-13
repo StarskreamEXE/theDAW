@@ -76,6 +76,21 @@ const st = () => usePianoRollStore.getState();
   assert.equal(st().totalSteps, 266);
 }
 
+// Meter writes and length edits end the roll on a bar line; a merge-free write keeps a repeated meter.
+{
+  st().applyMeter({ meterMap: [{ bar: 0, meter: M44 }], pickupSteps: 0 });
+  st().setTotalSteps(256);
+  assert.equal(st().totalSteps, 256);
+  st().setMeterMap([{ bar: 0, meter: M54 }]);
+  assert.equal(st().totalSteps, 260);
+  st().setPickupSteps(2);
+  assert.equal(st().totalSteps, 262);
+  st().applyMeter({ meterMap: [{ bar: 0, meter: M44 }, { bar: 2, meter: M44 }] }, false);
+  assert.deepEqual(st().meterMap.map((s) => s.bar), [0, 2]);
+  st().setTotalSteps(20);
+  assert.equal(st().totalSteps, 34);
+}
+
 // Lane names and sanitizing.
 {
   assert.deepEqual([laneName(0), laneName(1), laneName(25), laneName(26), laneName(27)], ['A', 'B', 'Z', 'AA', 'AB']);

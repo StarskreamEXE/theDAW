@@ -76,6 +76,10 @@ interface PianoRollState {
   setLaneCycle: (id: number, cycleSteps: number | null) => void;
   /** Remove a lane; its notes move to lane 0. Lane 0 cannot be removed. */
   removeLane: (id: number) => void;
+  /** Write any of the meter map, pickup and lanes, then round the roll's length
+   *  up to a bar line. `merge` false keeps a change that repeats the meter before
+   *  it (the METER face's ADD). setMeterMap and setPickupSteps go through here. */
+  applyMeter: (meter: Partial<RollMeter>, merge?: boolean) => void;
 }
 
 const DEFAULT_STEPS = 256;
@@ -175,7 +179,8 @@ export const usePianoRollStore = create<PianoRollState>()((set, get) => ({
   activeLane: 0,
 
   setBpm: (bpm) => set({ bpm: Math.max(40, Math.min(240, bpm)) }),
-  setTotalSteps: (totalSteps) => set({ totalSteps: Math.max(MIN_STEPS, Math.min(MAX_STEPS, totalSteps)) }),
+  setTotalSteps: (totalSteps) =>
+    set((s) => ({ totalSteps: Math.min(MAX_STEPS, roundUpToBar(s.meterMap, Math.max(MIN_STEPS, totalSteps), s.pickupSteps)) })),
   setRange: (lo, hi) => set({ lowestNote: Math.max(0, lo), highestNote: Math.min(127, hi) }),
 
   addNote: (note) => {
@@ -272,8 +277,18 @@ export const usePianoRollStore = create<PianoRollState>()((set, get) => ({
       };
     }),
 
-  setMeterMap: (map) => set({ meterMap: normalizeMeterMap(map) }),
-  setPickupSteps: (steps) => set((s) => ({ pickupSteps: clampPickup(steps, s.pickupSteps) })),
+  setMeterMap: (map) => get().applyMeter({ meterMap: map }),
+  setPickupSteps: (steps) => get().applyMeter({ pickupSteps: steps }),
+  applyMeter: (meter, merge = true) =>
+    set((s) => {
+      const m = mergeMeter(s, meter);
+      const meterMap = meter.meterMap ? normalizeMeterMap(meter.meterMap, merge) : m.meterMap;
+      return {
+        ...m,
+        meterMap,
+        totalSteps: Math.min(MAX_STEPS, roundUpToBar(meterMap, Math.max(MIN_STEPS, s.totalSteps), m.pickupSteps)),
+      };
+    }),
   setLanes: (lanes) =>
     set((s) => {
       const next = sanitizeLanes(lanes);
