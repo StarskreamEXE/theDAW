@@ -235,10 +235,11 @@ const buildClip = async (
     }
   }
   const meter = sourcePianoRoll ? tasmoMeterToClip(c) : {};
-  // Files written before total_steps existed: the notes' end, up to a bar line.
+  // Files written before total_steps existed: the notes' end, up to a bar line
+  // of the clip's meter map (4/4 when it has none).
   const sourceTotalSteps = sourcePianoRoll
     ? meter.sourceTotalSteps ??
-      Math.max(16, roundUpToBar(meter.sourceMeterMap ?? [], Math.max(0, ...sourcePianoRoll.map((n) => n.step + n.length)), meter.sourcePickupSteps ?? 0))
+      roundUpToBar(meter.sourceMeterMap ?? [], Math.max(1, ...sourcePianoRoll.map((n) => n.step + n.length)), meter.sourcePickupSteps ?? 0)
     : undefined;
 
   const { peaks, duration } = await computePeaks(blob, 240);
@@ -269,6 +270,7 @@ const buildClip = async (
     sourcePianoRoll,
     sourceBpm: sourceKind ? bpm : undefined,
     sourceTotalSteps,
+    sourceRollNotes: meter.sourceRollNotes,
     sourceMeterMap: meter.sourceMeterMap,
     sourcePickupSteps: meter.sourcePickupSteps,
     sourceLanes: meter.sourceLanes,
@@ -451,9 +453,11 @@ export function captureEditorSession(): CapturedSession {
           start_time: c.startSec,
           end_time: c.startSec + c.durationSec,
           audio_file: `audio/${fname}`,
+          // The notes as they sound, lane repeats written out, for playback.
           midi_notes: isMidi && c.sourcePianoRoll ? c.sourcePianoRoll.map(pianoNoteToTasmo) : null,
-          // The roll's grid length, meter map, pickup and lanes, so "Edit in
-          // Piano Roll" after a reload opens the same bars.
+          // The roll's own notes with their lanes (roll_notes), its grid length,
+          // meter map, pickup and lanes, so "Edit in Piano Roll" after a reload
+          // opens the same bars.
           ...(isMidi ? clipMeterToTasmo(c) : {}),
           // Per-clip mute, gain, fades and the trim point all survive the .tasmo
           // round-trip. offset_into_source is the load-bearing one: the embedded

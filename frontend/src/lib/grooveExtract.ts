@@ -10,18 +10,24 @@
  * it preserves each onset's deviation from the quantized grid.
  */
 import { parseMidi } from './midi';
+import { midiEventsToMeterMap, stepsPerBar } from './meterMap';
 import type { GrooveTemplate } from './virtuosoTransform';
 
 const SLOTS = 16;
 const clampDev = (v: number): number => Math.max(-0.5, Math.min(0.5, v));
 
 /**
- * Build a 16-slot groove from MIDI bytes. Returns null if the file has no notes
- * (nothing to learn a pocket from).
+ * Build a 16-slot groove from MIDI bytes. An onset's slot is its 16th inside its
+ * bar, counted from the bar start. The bar is the file's first bar: its time
+ * signature (4/4 when the file has none), after any pickup, which counts back
+ * from the bar's end. A position past 16 wraps, the same way humanize reads the
+ * template. Returns null if the file has no notes (nothing to learn a pocket from).
  */
 export function buildGrooveFromMidiBytes(buf: ArrayBuffer | Uint8Array, name: string): GrooveTemplate | null {
   const data = parseMidi(buf);
   const stepTicks = Math.max(1, data.ppq / 4); // ticks per 16th note
+  const { map, pickupSteps } = midiEventsToMeterMap(data.timeSignatures ?? [], data.ppq);
+  const barLen = stepsPerBar(map[0].meter);
   const devSum = new Array<number>(SLOTS).fill(0);
   const devCount = new Array<number>(SLOTS).fill(0);
   const hits = new Array<number>(SLOTS).fill(0);
@@ -30,8 +36,10 @@ export function buildGrooveFromMidiBytes(buf: ArrayBuffer | Uint8Array, name: st
   for (const track of data.tracks) {
     for (const n of track.notes) {
       const stepF = n.tick / stepTicks;
-      const slot = ((Math.round(stepF) % SLOTS) + SLOTS) % SLOTS;
-      const dev = clampDev(stepF - Math.round(stepF));
+      const onStep = Math.round(stepF);
+      const inBar = (((onStep - pickupSteps) % barLen) + barLen) % barLen;
+      const slot = ((Math.round(inBar) % SLOTS) + SLOTS) % SLOTS;
+      const dev = clampDev(stepF - onStep);
       devSum[slot] += dev;
       devCount[slot] += 1;
       hits[slot] += 1;

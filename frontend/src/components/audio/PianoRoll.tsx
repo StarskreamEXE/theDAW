@@ -12,11 +12,15 @@ import {
   bars as meterBars,
   gridLines,
   meterEquals,
+  meterMapToMidiEvents,
+  midiEventsToMeterMap,
+  normalizeMeterMap,
   roundUpToBar,
   unrollLanes,
   type BarSpan,
   type PolyLane,
 } from '../../lib/meterMap';
+import { playedRollNotes, rollClipFields } from '../../lib/rollClip';
 import { syncopationByBar } from '../../lib/syncopation';
 import { MidiMapper } from './MidiMapper';
 import { ContextMenu, useContextMenu, type ContextMenuItem } from '../ui/ContextMenu';
@@ -63,14 +67,8 @@ const linesPath = (steps: readonly number[], stepPx: number, y0: number, y1: num
   return d;
 };
 
-/**
- * The notes as they sound: each looping lane's repeats written out across the
- * roll. The editor and a MIDI file play a note list once, so every hand-off
- * takes this list. Lane ids are dropped, so a clip loaded back into the roll
- * does not loop its repeats a second time.
- */
-export const playedRollNotes = (notes: readonly PianoNote[], lanes: readonly PolyLane[], totalSteps: number): PianoNote[] =>
-  unrollLanes(notes, lanes, totalSteps).map(({ lane: _lane, ...n }) => n);
+/** The notes as they sound, lane repeats written out and lane ids dropped (lib/rollClip); every hand-off that plays a note list once takes it. */
+export { playedRollNotes };
 
 /**
  * A lane note's look, all in the one accent. The active lane draws solid; each
@@ -431,21 +429,23 @@ export const PianoRollEditKey: React.FC = () => {
   const keyRef = useRef<HTMLButtonElement>(null);
 
   const handleSendToEditor = async () => {
-    const { notes: stored, bpm, totalSteps, lanes } = usePianoRollStore.getState();
-    if (stored.length === 0) {
+    const roll = usePianoRollStore.getState();
+    const { bpm, totalSteps } = roll;
+    if (roll.notes.length === 0) {
       logError('piano-roll', 'No notes to bounce');
       return;
     }
-    // The editor plays a clip's notes once, so it gets the lane repeats written out.
-    const notes = playedRollNotes(stored, lanes, totalSteps);
+    // The editor plays a clip's notes once, so it gets the lane repeats written
+    // out (sourcePianoRoll). The roll's own notes, meter map, pickup and lanes are
+    // copied beside them, so re-editing later sees the exact same state.
+    const fields = rollClipFields(roll);
+    const notes = fields.sourcePianoRoll;
     setIsBouncing(true);
     const start = performance.now();
     try {
       const { blob, duration } = await renderPianoRollToBlob(notes, bpm, totalSteps);
       const { peaks } = await computePeaks(blob, 240);
       const editor = useEditorStore.getState();
-      // Snapshot the notes so re-editing later sees the exact same state.
-      const noteSnapshot: PianoNote[] = notes.map((n) => ({ ...n }));
 
       if (editingClipId) {
         const existing = editor.clips.find((c) => c.id === editingClipId);
@@ -457,9 +457,7 @@ export const PianoRollEditKey: React.FC = () => {
             durationSec: duration,
             offsetIntoSource: 0,
             peaks,
-            sourcePianoRoll: noteSnapshot,
-            sourceBpm: bpm,
-            sourceTotalSteps: totalSteps,
+            ...fields,
             sourceKind: 'piano-roll',
             label: existing.label.startsWith('roll_')
               ? `roll_${bpm}bpm_${notes.length}n`
@@ -487,9 +485,7 @@ export const PianoRollEditKey: React.FC = () => {
         startSec: 0,
         color: trackColor,
         sourceKind: 'piano-roll',
-        sourcePianoRoll: noteSnapshot,
-        sourceBpm: bpm,
-        sourceTotalSteps: totalSteps,
+        ...fields,
       });
       editor.cachePeaks(newClipId, peaks);
       // Bind the roll to the new clip so subsequent Send-to-Editor edits in place.
@@ -596,9 +592,9 @@ export const PianoRollClearKey: React.FC = () => (
   />
 );
 
-/** Download the roll as a Standard MIDI File at its own BPM, lane repeats written out. */
+/** Download the roll as a Standard MIDI File at its own BPM and time signatures, lane repeats written out. */
 export const exportRollMidi = (): void => {
-  const { notes: stored, bpm, totalSteps, lanes } = usePianoRollStore.getState();
+  const { notes: stored, bpm, totalSteps, lanes, meterMap, pickupSteps } = usePianoRollStore.getState();
   if (stored.length === 0) {
     logError('piano-roll', 'No notes to export');
     return;
@@ -610,6 +606,9 @@ export const exportRollMidi = (): void => {
     {
       ppq,
       bpm,
+      tempos: [{ tick: 0, bpm }],
+      // One FF 58 per meter change, a partial bar at tick 0 for a pickup.
+      timeSignatures: meterMapToMidiEvents(meterMap, ppq, pickupSteps),
       tracks: [
         { name: 'Piano Roll', notes: midiNotes },
       ],
@@ -642,9 +641,11 @@ export const importMidiFileToRoll = (file: File): void => {
         return;
       }
       flat.sort((a, b) => a.step - b.step);
-      // importNotes auto-fits the grid length AND pitch range to the import.
-      usePianoRollStore.getState().importNotes(flat, data.bpm);
-      logInfo('piano-roll', `Imported ${flat.length} notes from "${file.name}" at ${Math.round(data.bpm)} BPM`);
+      // The file's time signatures and pickup; a file with none is 4/4.
+      const { map, pickupSteps } = midiEventsToMeterMap(data.timeSignatures ?? [], data.ppq);
+      // importNotes auto-fits the grid length (to a bar line of that map) AND pitch range to the import.
+      usePianoRollStore.getState().importNotes(flat, data.bpm, { meterMap: map, pickupSteps });
+      logInfo('piano-roll', `Imported ${flat.length} notes from "${file.name}" at ${Math.round(data.bpm)} BPM in ${meterLabel(map[0].meter)}`);
     } catch (e) {
       logError('piano-roll', `MIDI import failed: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -674,10 +675,14 @@ export const importSheetFileToRoll = (file: File): void => {
         return;
       }
       flat.sort((a, b) => a.step - b.step);
-      usePianoRollStore.getState().importNotes(flat, score.bpm);
+      // The score's first time signature holds for the whole roll; a score with
+      // none, or one the roll cannot draw, is 4/4. Its notes start at step 0.
+      const [num, den] = score.time_signature ?? [];
+      const meterMap = normalizeMeterMap([{ bar: 0, meter: { num: Number(num), den: Number(den), groups: [] } }]);
+      usePianoRollStore.getState().importNotes(flat, score.bpm, { meterMap, pickupSteps: 0 });
       logInfo(
         'piano-roll',
-        `Imported ${flat.length} notes from score "${file.name}" (${score.format}) at ${Math.round(score.bpm)} BPM`,
+        `Imported ${flat.length} notes from score "${file.name}" (${score.format}) at ${Math.round(score.bpm)} BPM in ${meterLabel(meterMap[0].meter)}`,
       );
     } catch (e) {
       logError('piano-roll', `Sheet import failed: ${e instanceof Error ? e.message : String(e)}`);

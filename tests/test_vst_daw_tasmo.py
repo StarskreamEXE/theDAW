@@ -121,7 +121,7 @@ def test_tasmo_embed_roundtrip(tmp_path=None):
     print("  TasmoFile embed round-trip OK")
 
 
-_METER_KEYS = ("total_steps", "meter_map", "pickup_steps", "lanes")
+_ROLL_KEYS = ("roll_notes", "total_steps", "meter_map", "pickup_steps", "lanes")
 
 
 def test_tasmo_clip_meter_roundtrip(tmp_path):
@@ -137,9 +137,18 @@ def test_tasmo_clip_meter_roundtrip(tmp_path):
         {"id": 0, "name": "A", "cycle_steps": None},
         {"id": 1, "name": "B", "cycle_steps": 12},
     ]
-    notes = [
+    # The roll's own notes; the second sits in lane B, which loops every 12 steps.
+    roll_notes = [
         {"note": 60, "step": 0, "length": 2, "velocity": 90},
         {"note": 64, "step": 3, "length": 1, "velocity": 80, "lane": 1},
+    ]
+    # The notes as they sound across 46 steps: lane B's note at every cycle.
+    notes = [
+        {"note": 60, "step": 0, "length": 2, "velocity": 90},
+        {"note": 64, "step": 3, "length": 1, "velocity": 80},
+        {"note": 64, "step": 15, "length": 1, "velocity": 80},
+        {"note": 64, "step": 27, "length": 1, "velocity": 80},
+        {"note": 64, "step": 39, "length": 1, "velocity": 80},
     ]
     # The frontend posts this JSON; the router validates it into the model.
     payload = {
@@ -157,6 +166,7 @@ def test_tasmo_clip_meter_roundtrip(tmp_path):
                         "clip_type": "midi",
                         "track_id": "t1",
                         "midi_notes": notes,
+                        "roll_notes": roll_notes,
                         "total_steps": 46,
                         "meter_map": meter_map,
                         "pickup_steps": 4,
@@ -176,18 +186,21 @@ def test_tasmo_clip_meter_roundtrip(tmp_path):
     assert clip.pickup_steps == 4
     assert clip.lanes == lanes
     assert clip.midi_notes == notes
-    assert clip.midi_notes[1]["lane"] == 1
+    assert not any("lane" in n for n in clip.midi_notes)
+    assert clip.roll_notes == roll_notes
+    assert clip.roll_notes[1]["lane"] == 1
     # And back out to the frontend as JSON.
     dumped = json.loads(json.dumps(loaded.model_dump()))["tracks"][0]["clips"][0]
-    assert {k: dumped[k] for k in _METER_KEYS} == {
+    assert {k: dumped[k] for k in _ROLL_KEYS} == {
+        "roll_notes": roll_notes,
         "total_steps": 46,
         "meter_map": meter_map,
         "pickup_steps": 4,
         "lanes": lanes,
     }
-    assert (
-        Clip(id="c2", name="audio", clip_type="audio", track_id="t1").meter_map is None
-    )
+    audio = Clip(id="c2", name="audio", clip_type="audio", track_id="t1")
+    assert audio.meter_map is None
+    assert audio.roll_notes is None
 
 
 def test_tasmo_file_without_meter_fields_loads_unchanged(tmp_path):
@@ -218,17 +231,17 @@ def test_tasmo_file_without_meter_fields_loads_unchanged(tmp_path):
             data = src.read(info.filename)
             if info.filename == "project.msgpack":
                 raw = msgpack.unpackb(data, raw=False)
-                for key in _METER_KEYS:
+                for key in _ROLL_KEYS:
                     del raw["tracks"][0]["clips"][0][key]
                 old_clip = raw["tracks"][0]["clips"][0]
                 data = msgpack.packb(raw, use_bin_type=True)
             dst.writestr(info, data)
-    assert not any(k in old_clip for k in _METER_KEYS)
+    assert not any(k in old_clip for k in _ROLL_KEYS)
 
     loaded, _ = TasmoFile.load(str(old_path))
     dumped = loaded.tracks[0].clips[0].model_dump()
-    assert all(dumped[k] is None for k in _METER_KEYS)
-    assert {k: v for k, v in dumped.items() if k not in _METER_KEYS} == old_clip
+    assert all(dumped[k] is None for k in _ROLL_KEYS)
+    assert {k: v for k, v in dumped.items() if k not in _ROLL_KEYS} == old_clip
     assert loaded.tempo == 100.0
 
 

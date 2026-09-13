@@ -82,8 +82,12 @@ export interface AudioClip {
   libraryEntryId?: string;
   /** How this clip was produced — informs "Edit in Piano Roll" availability. */
   sourceKind?: ClipSourceKind;
-  /** When sourceKind === 'piano-roll', the editable note list that produced the audio. */
+  /** When sourceKind === 'piano-roll', the note list that produced the audio, as it
+   *  sounds: looping lanes written out, no lane ids. Playback and drawing read it. */
   sourcePianoRoll?: PianoNote[];
+  /** When sourceKind === 'piano-roll', the roll's own notes with their lanes, which
+   *  "Edit in Piano Roll" loads. Absent on clips bounced before lanes existed. */
+  sourceRollNotes?: PianoNote[];
   /** When sourceKind === 'piano-roll', the BPM at render time. */
   sourceBpm?: number;
   /** When sourceKind === 'piano-roll', the grid length at render time. */
