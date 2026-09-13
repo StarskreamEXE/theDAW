@@ -363,6 +363,17 @@ driven in the live app yet; items stay here until that happens.
   properties between them hides the regression while the test passes. Inspect
   the whole style object, or parse the TSX. — XS —
   `frontend/src/components/library/lineageWrapperGuards.test.ts:37-40`
+- [ ] **Example projects are one audio track each.** Each of the five `.tasmo`
+  files in `examples/projects/` holds one track with one embedded clip, the
+  mastered song, plus 4 to 13 locators at meter changes. Gravy adds a
+  three-effect chain on that track and Miracle Mile six scene names. None
+  carries stems, MIDI, lyrics, a score, a PERFORM grid or controller mappings. A
+  sample project opens as a working session: the song split into stem tracks,
+  MIDI converted from each stem, aligned lyrics, the score, a PERFORM grid with
+  clips and scenes, FX chains on the stems, and the meter-map locators, built by
+  `scripts/build_examples.py` from each UNCANNY entry's own stems, MIDI, lyrics
+  and notation in the library. — L — `scripts/build_examples.py`,
+  `examples/catalog.json`, `backend/modules/project/tasmo_project.py`
 
 ## P1 — security, from the 2026-09-13 review of the known-paths work (not from the user)
 
@@ -377,7 +388,11 @@ driven in the live app yet; items stay here until that happens.
   the Vite proxy send it as a header (the Pinokio launcher starts both
   processes, so it can hand the secret to each); write, pick, reveal, backup and
   places routes require it; the Host header is checked against loopback, the
-  machine's names and its LAN addresses. — M — `backend/lib/cross_site.py`,
+  machine's names and its LAN addresses. The known-paths work adds two reads
+  the gate covers: `GET /api/places/recent` lists remembered absolute paths to a
+  caller that sends no browser headers, and `GET /api/places/file` serves such a
+  caller any file the desktop app downloaded (source `download`). — M —
+  `backend/lib/cross_site.py`, `backend/modules/places/router.py`,
   `backend/modules/project/router.py`, `backend/modules/plugin/router.py`,
   `backend/server.py`, `electron-ui/main/index.ts`, `frontend/vite.config.ts`
 
