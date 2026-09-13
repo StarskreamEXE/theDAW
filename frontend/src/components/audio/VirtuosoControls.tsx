@@ -6,13 +6,19 @@
  * captured source. Key, scale, style and the groove reference sit beside them.
  * CAPTURE snapshots the current roll as the morph base; SONG assembles a full
  * multi-section arrangement; FORM opens the song-structure editor above the row,
- * which lays out the sections (role + bar count) the build uses.
+ * which lays out the sections (role, bar count, meter) the build uses.
+ *
+ * A SHAPE | METER switch at the row's left end flips it to the METER face
+ * (MeterFace.tsx), remembered across sessions; the row keeps its height, its
+ * orb clearance and its single line on both faces.
  */
 import React from 'react';
 import { Camera, ChevronLeft, ChevronRight, Columns3, ListMusic, Plus, RotateCcw, X } from 'lucide-react';
 import { useVirtuosoStore } from '../../state/virtuosoStore';
 import { LibraryPicker, MIDI_ONLY_TABS } from './LibraryPicker';
+import { MeterFace } from './MeterFace';
 import { logError } from '../../state/logStore';
+import { meterLabel, parseMeterLabel, sectionMeterChoices } from '../../lib/meterFace';
 import {
   STYLES,
   STYLE_NAMES,
@@ -34,10 +40,16 @@ import {
   MINI_ICON_KEY,
   MINI_KEY,
   RANGE,
+  STRIP_KEY,
   Sep,
   StripKey,
+  keyTone,
   useOrbClearance,
+  useStoredToggle,
 } from './midiDockKit';
+
+/** The row's face: SHAPE (off) or METER (on). */
+const SHAPE_FACE_KEY = 'thedaw-midi-shape-face-v1';
 
 const KEYS = 'C C# D D# E F F# G G# A A# B'.split(' ');
 const MODES = [
@@ -66,6 +78,7 @@ const SongStructure: React.FC = () => {
   const style = useVirtuosoStore((s) => s.style);
   const setSectionRole = useVirtuosoStore((s) => s.setSectionRole);
   const setSectionBars = useVirtuosoStore((s) => s.setSectionBars);
+  const setSectionMeter = useVirtuosoStore((s) => s.setSectionMeter);
   const addSection = useVirtuosoStore((s) => s.addSection);
   const removeSection = useVirtuosoStore((s) => s.removeSection);
   const moveSection = useVirtuosoStore((s) => s.moveSection);
@@ -140,6 +153,20 @@ const SongStructure: React.FC = () => {
               onChange={(e) => setSectionBars(i, parseInt(e.target.value, 10) || 1)}
               className={`${sectionField} w-9`}
             />
+            <label htmlFor={`vt-sec-meter-${i}`} className="sr-only">{`Section ${i + 1} meter`}</label>
+            <select
+              id={`vt-sec-meter-${i}`}
+              name={`vt-sec-meter-${i}`}
+              value={sec.meter ? meterLabel(sec.meter) : ''}
+              onChange={(e) => setSectionMeter(i, parseMeterLabel(e.target.value))}
+              title="The section's time signature; Roll follows the piano roll's meter map"
+              className={sectionField}
+            >
+              <option value="">Roll</option>
+              {sectionMeterChoices(sec.meter).map((c) => (
+                <option key={c.value} value={c.value}>{c.label}</option>
+              ))}
+            </select>
             <button
               type="button"
               className={`${MINI_ICON_KEY} ${KEY_REST}`}
@@ -167,7 +194,8 @@ const SongStructure: React.FC = () => {
 
 /** `songEntryId`: the library entry chosen in the strip's song field, whose
  *  rhythm analysis MATCH reads the meter map from. */
-export const VirtuosoControls: React.FC<{ songEntryId?: string }> = () => {
+export const VirtuosoControls: React.FC<{ songEntryId?: string }> = ({ songEntryId }) => {
+  const [meterFace, setMeterFace] = useStoredToggle(SHAPE_FACE_KEY, false);
   const amounts = useVirtuosoStore((s) => s.amounts);
   const setAmount = useVirtuosoStore((s) => s.setAmount);
   const keyV = useVirtuosoStore((s) => s.key);
@@ -198,9 +226,38 @@ export const VirtuosoControls: React.FC<{ songEntryId?: string }> = () => {
         style={orb.left || orb.right ? { paddingLeft: orb.left || undefined, paddingRight: orb.right || undefined } : undefined}
         className="shrink-0 h-7.5 flex flex-nowrap items-center gap-1 px-1.5 border-t border-white/8 bg-black/40"
         role="group"
-        aria-label="Shape: virtuoso transforms"
-        title="Morph the piano roll into virtuoso lines. Dial each amount; the roll re-renders live from the captured source."
+        aria-label={meterFace ? 'Meter: time signatures, lanes and generators' : 'Shape: virtuoso transforms'}
       >
+        <div role="group" aria-label="Row" className="shrink-0 inline-flex gap-px">
+          <button
+            type="button"
+            aria-pressed={!meterFace}
+            title="Shape: the virtuoso transforms"
+            className={`${STRIP_KEY} ${keyTone({ on: !meterFace })}`}
+            onClick={() => setMeterFace(false)}
+          >
+            <span>Shape</span>
+          </button>
+          <button
+            type="button"
+            aria-pressed={meterFace}
+            title="Meter: time signatures, groups, lanes, syncopation and generators"
+            className={`${STRIP_KEY} ${keyTone({ on: meterFace })}`}
+            onClick={() => setMeterFace(true)}
+          >
+            <span>Meter</span>
+          </button>
+        </div>
+
+        <Sep />
+
+        {meterFace ? (
+          <MeterFace songEntryId={songEntryId} />
+        ) : (
+        <div
+          className="contents"
+          title="Morph the piano roll into virtuoso lines. Dial each amount; the roll re-renders live from the captured source."
+        >
         {SLIDERS.map(({ k, legend, label }) => (
           <div key={k} className={FIELD} title={`${label} amount`}>
             <label htmlFor={`vt-${k}`} className={FIELD_LEGEND}>{legend}</label>
@@ -312,10 +369,12 @@ export const VirtuosoControls: React.FC<{ songEntryId?: string }> = () => {
           icon={<ListMusic className="w-3 h-3" />}
           legend="Song"
         />
+        </div>
+        )}
       </div>
 
       <DockFlyout
-        open={showStructure}
+        open={showStructure && !meterFace}
         anchorRef={formKeyRef}
         onClose={() => setShowStructure(false)}
         placement="above"

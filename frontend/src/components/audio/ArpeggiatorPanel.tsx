@@ -67,6 +67,14 @@ export const ArpeggiatorPanel: React.FC = () => {
 
   const [cfg, setCfg] = useState<ArpConfig>({ ...DEFAULT_ARP_CONFIG });
   const [playing, setPlaying] = useState(false);
+
+  // The rag counts its odd 16ths from the roll's bar lines, so the engine
+  // follows the roll's meter map and pickup as they change.
+  const meterMap = usePianoRollStore((s) => s.meterMap);
+  const pickupSteps = usePianoRollStore((s) => s.pickupSteps);
+  useEffect(() => {
+    engine.setMeter({ meterMap, pickupSteps });
+  }, [engine, meterMap, pickupSteps]);
   const [activeChord, setActiveChord] = useState<number>(-1);
   const [activeMidi, setActiveMidi] = useState<Set<number>>(new Set());
   const timeoutsRef = useRef<number[]>([]);
