@@ -9,15 +9,18 @@
  * standardized CSS zoom and under its legacy zoom. At zoom 0.85 the LEARN
  * graph canvas measured 1136x476 inside a 1337x560 panel.
  *
- * This reads every .tsx under src and fails on any element that counter-zooms
- * and also multiplies its width or height by --layout-zoom.
+ * Every .tsx under src is parsed with the TypeScript compiler. Each object
+ * literal that counter-zooms is inspected whole, so a multiplied size is found
+ * wherever it sits in that object and however many properties lie between.
  */
 import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import ts from 'typescript';
 
 const srcRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+const lineageFile = join(srcRoot, 'components', 'library', 'LineageModal.tsx');
 
 const tsxFiles = (dir: string): string[] =>
   readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
@@ -26,20 +29,57 @@ const tsxFiles = (dir: string): string[] =>
     return entry.name.endsWith('.tsx') ? [full] : [];
   });
 
-const COUNTER_ZOOM = /zoom:\s*['"`]calc\(1\s*\/\s*var\(--layout-zoom/;
-const SCALED_SIZE = /(width|height):\s*['"`]calc\(100%\s*\*\s*var\(--layout-zoom/;
+const COUNTER_ZOOM = /^calc\(\s*1\s*\/\s*var\(--layout-zoom/;
+const SCALED_BY_ZOOM = /\*\s*var\(--layout-zoom/;
+const SIZE_KEYS = new Set(['width', 'height', 'minWidth', 'minHeight', 'maxWidth', 'maxHeight', 'inlineSize', 'blockSize']);
 
-const offenders: string[] = [];
-for (const file of tsxFiles(srcRoot)) {
-  const lines = readFileSync(file, 'utf8').split('\n');
-  lines.forEach((line, i) => {
-    if (!COUNTER_ZOOM.test(line)) return;
-    // A style object spans a few lines; check the counter-zoom line and the
-    // lines around it, which is where its width and height are written.
-    const window = lines.slice(Math.max(0, i - 4), i + 5).join('\n');
-    if (SCALED_SIZE.test(window)) offenders.push(`${relative(srcRoot, file)}:${i + 1}`);
-  });
+const keyName = (name: ts.PropertyName): string | null =>
+  ts.isIdentifier(name) || ts.isStringLiteral(name) ? name.text : null;
+
+/** The text of a string or template initializer; null for anything computed. */
+const literalText = (node: ts.Expression): string | null => {
+  if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
+  if (ts.isTemplateExpression(node)) return node.getText().slice(1, -1);
+  return null;
+};
+
+interface CounterZoomObject {
+  file: string;
+  line: number;
+  sizes: Map<string, string>;
 }
+
+const counterZoomObjects = (file: string): CounterZoomObject[] => {
+  const source = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const found: CounterZoomObject[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isObjectLiteralExpression(node)) {
+      let counterZooms = false;
+      const sizes = new Map<string, string>();
+      for (const prop of node.properties) {
+        if (!ts.isPropertyAssignment(prop)) continue;
+        const key = keyName(prop.name);
+        const text = literalText(prop.initializer);
+        if (key === null || text === null) continue;
+        if (key === 'zoom' && COUNTER_ZOOM.test(text.trim())) counterZooms = true;
+        if (SIZE_KEYS.has(key)) sizes.set(key, text);
+      }
+      if (counterZooms) {
+        const { line } = source.getLineAndCharacterOfPosition(node.getStart(source));
+        found.push({ file, line: line + 1, sizes });
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return found;
+};
+
+const counterZoomed = tsxFiles(srcRoot).flatMap(counterZoomObjects);
+
+const offenders = counterZoomed
+  .filter((o) => [...o.sizes.values()].some((value) => SCALED_BY_ZOOM.test(value)))
+  .map((o) => `${relative(srcRoot, o.file)}:${o.line}`);
 
 assert.deepEqual(
   offenders,
@@ -49,11 +89,14 @@ assert.deepEqual(
     offenders.join(', '),
 );
 
-const lineage = readFileSync(join(srcRoot, 'components', 'library', 'LineageModal.tsx'), 'utf8');
-assert.match(
-  lineage,
-  /zoom:\s*'calc\(1 \/ var\(--layout-zoom, 1\)\)',\s*width:\s*'100%',\s*height:\s*'100%'/,
-  'the LEARN graph wrapper must counter-zoom and stay 100% of its panel',
+const lineage = counterZoomed.filter((o) => o.file === lineageFile);
+assert.ok(
+  lineage.length > 0,
+  'the LEARN graph wrapper no longer counter-zooms; the graph libraries need an effective scale of 1',
 );
+for (const o of lineage) {
+  assert.equal(o.sizes.get('width'), '100%', `LineageModal.tsx:${o.line}: the wrapper must stay 100% wide`);
+  assert.equal(o.sizes.get('height'), '100%', `LineageModal.tsx:${o.line}: the wrapper must stay 100% high`);
+}
 
 console.log('lineage wrapper guards: ok');
