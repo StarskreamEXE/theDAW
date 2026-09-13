@@ -960,7 +960,7 @@ export const MidiPanel: React.FC = () => {
       </div>
 
       {/* ── SHAPE row ────────────────────────────────────────────────────── */}
-      <VirtuosoControls />
+      <VirtuosoControls songEntryId={assetId || undefined} />
     </div>
   );
 };

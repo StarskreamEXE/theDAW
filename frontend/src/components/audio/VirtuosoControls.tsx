@@ -165,7 +165,9 @@ const SongStructure: React.FC = () => {
   );
 };
 
-export const VirtuosoControls: React.FC = () => {
+/** `songEntryId`: the library entry chosen in the strip's song field, whose
+ *  rhythm analysis MATCH reads the meter map from. */
+export const VirtuosoControls: React.FC<{ songEntryId?: string }> = () => {
   const amounts = useVirtuosoStore((s) => s.amounts);
   const setAmount = useVirtuosoStore((s) => s.setAmount);
   const keyV = useVirtuosoStore((s) => s.key);
