@@ -6,6 +6,8 @@
  * both need.
  */
 
+import { saveFile, type SaveFileResult } from './saveFile';
+
 export interface MidiNote {
   /** Tick offset from the start of the track. */
   tick: number;
@@ -110,18 +112,13 @@ export const encodeMidi = (file: MidiFileData): Uint8Array => {
   return new Uint8Array(out);
 };
 
-export const downloadMidi = (file: MidiFileData, baseName = 'pattern'): void => {
+/** Save the file as `<baseName>-<timestamp>.mid` through saveFile, which
+ *  remembers the chosen path. Resolves with the save's outcome. */
+export const downloadMidi = (file: MidiFileData, baseName = 'pattern'): Promise<SaveFileResult> => {
   const bytes = encodeMidi(file);
   const blob = new Blob([bytes], { type: 'audio/midi' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  a.href = url;
-  a.download = `${baseName}-${stamp}.mid`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  return saveFile({ blob, suggestedName: `${baseName}-${stamp}.mid`, kind: 'midi' });
 };
 
 // =============================================================================

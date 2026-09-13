@@ -55,6 +55,8 @@ import { classifyModelGate } from '../../lib/modelDownloadClient';
 import { setLocalOnly } from '../../lib/storageClient';
 import { requireFeature } from '../../notices/featureGateStore';
 import { logError, logInfo } from '../../state/logStore';
+import { saveFile } from '../../lib/saveFile';
+import { KnownFilesMenu } from '../ui/KnownFilesMenu';
 import { registerEditorPlayback, unregisterEditorPlayback } from '../../state/editorPlaybackBridge';
 import { publishSelectedTracks } from '../../state/editorSelectionBridge';
 import * as liveMixer from '../../state/liveMixer';
@@ -2582,18 +2584,12 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
           tags: ['mixdown'],
         },
       });
-      // Also trigger an immediate browser download so the file lands on disk.
-      const dlUrl = URL.createObjectURL(wavBlob);
-      const a = document.createElement('a');
-      a.href = dlUrl;
-      a.download = title;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(dlUrl), 10000);
+      // Also put the file on disk. Save As opens in the folder last used for
+      // audio; not awaited, so COMMIT EDIT is free again while the dialog is up.
+      void saveFile({ blob: wavBlob, suggestedName: title.replace(/[<>:"/\\|?*]/g, '_'), kind: 'audio' });
 
       const ms = (performance.now() - start).toFixed(0);
-      logInfo('editor', `Mixdown complete: ${rendered.duration.toFixed(2)}s rendered in ${ms}ms → library + download`);
+      logInfo('editor', `Mixdown complete: ${rendered.duration.toFixed(2)}s rendered in ${ms}ms → library + save`);
       return wavBlob;
     } catch (e) {
       logError('editor', `Mixdown failed: ${e instanceof Error ? e.message : e}`);
@@ -3494,27 +3490,39 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     }
   };
 
-  /** Audio chosen from the OS dialog: imported to the library first (what a
-   *  desktop drop does), then placed. */
-  const onAddAudioFiles = async (files: File[]) => {
-    const target = pendingSystemAdd.current;
-    pendingSystemAdd.current = null;
+  /** Audio chosen from the OS dialog or a Recent list: imported to the library
+   *  first (what a desktop drop does), then placed. */
+  const onAddAudioFiles = async (files: File[], target: AddToTrackTarget | null) => {
     if (!target || files.length === 0) return;
     // importAudioFiles logs its own failures and its own multi-file summary.
     const { imported } = await importAudioFiles(files, ADD_TO_TRACK_ORIGIN);
     await placeEntriesOnTarget(imported, target);
   };
 
-  const onAddMidiFile = async (file: File) => {
-    const target = pendingSystemAdd.current;
-    pendingSystemAdd.current = null;
-    if (!target) return;
+  const onAddMidiFiles = async (files: File[], target: AddToTrackTarget | null) => {
+    const file = files[0];
+    if (!target || !file) return;
     try {
       const bytes = await file.arrayBuffer();
       await addMidiClipFromBytes(bytes, midiFileLabel(file.name), target.atSec, target.trackId);
     } catch (err) {
       logError('editor', `Could not read ${file.name}: ${err instanceof Error ? err.message : String(err)}`);
     }
+  };
+
+  /** The target the open OS dialog was opened for, handed over once. */
+  const takePendingAdd = (): AddToTrackTarget | null => {
+    const target = pendingSystemAdd.current;
+    pendingSystemAdd.current = null;
+    return target;
+  };
+
+  /** Where a file chosen from a Recent list lands: the one selected track, or
+   *  a new track when none or several are selected, at the playhead. */
+  const recentAddTarget = (): AddToTrackTarget => {
+    const st = useEditorStore.getState();
+    const track = selectedTrackIds.length === 1 ? st.tracks.find((t) => t.id === selectedTrackIds[0]) : undefined;
+    return { trackId: track?.id ?? null, trackName: track?.name ?? null, atSec: st.playheadSec };
   };
 
   /** Run one entry of the add-to-track menu.
@@ -4472,6 +4480,25 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             >
               <Plus className="w-3.5 h-3.5" />
             </button>
+            {/* Files the app saved or downloaded. A chosen one lands at the
+                playhead, on the selected track or a new one. Each list renders
+                nothing until it has a file. */}
+            <div className="flex flex-col gap-1 p-1">
+              <KnownFilesMenu
+                id={`editor-recent-audio-${addInputUid}`}
+                exts={AUDIO_ACCEPT.split(',')}
+                label="Recent audio"
+                onFiles={(files) => void onAddAudioFiles(files, recentAddTarget())}
+                className="w-full"
+              />
+              <KnownFilesMenu
+                id={`editor-recent-midi-${addInputUid}`}
+                exts={MIDI_ACCEPT.split(',')}
+                label="Recent MIDI"
+                onFiles={(files) => void onAddMidiFiles(files, recentAddTarget())}
+                className="w-full"
+              />
+            </div>
           </div>
         </div>
 
@@ -5186,7 +5213,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         onChange={(e) => {
           const files = Array.from(e.target.files ?? []);
           e.target.value = ''; // so picking the same file again still fires
-          void onAddAudioFiles(files);
+          void onAddAudioFiles(files, takePendingAdd());
         }}
       />
       <label htmlFor={addMidiInputId} className="sr-only">
@@ -5201,9 +5228,9 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         tabIndex={-1}
         className="sr-only"
         onChange={(e) => {
-          const file = e.target.files?.[0];
+          const files = Array.from(e.target.files ?? []);
           e.target.value = '';
-          if (file) void onAddMidiFile(file);
+          void onAddMidiFiles(files, takePendingAdd());
         }}
       />
 

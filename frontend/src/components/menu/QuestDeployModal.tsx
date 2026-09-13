@@ -120,6 +120,7 @@ export const QuestDeployModal: React.FC<{ open: boolean; onClose: () => void }> 
 
   const [fetchingApk, setFetchingApk] = useState(false);
   const [fetchApkError, setFetchApkError] = useState<string | null>(null);
+  const [apkPickError, setApkPickError] = useState<string | null>(null);
   const [fetchedTag, setFetchedTag] = useState<string | null>(null);
 
   const [deploying, setDeploying] = useState(false);
@@ -167,14 +168,17 @@ export const QuestDeployModal: React.FC<{ open: boolean; onClose: () => void }> 
     return () => window.removeEventListener('keydown', onKey);
   }, [open, onClose]);
 
+  // A dialog that failed or timed out says why under the field; the user can
+  // still paste a path.
   const chooseApk = async () => {
+    setApkPickError(null);
     try {
       const res = await fetch('/api/quest/pick-apk');
-      if (!res.ok) return;
+      if (!res.ok) throw new Error(await errText(res));
       const path = asStr(asRecord(await res.json()).path);
       if (path) setApkPath(path);
-    } catch {
-      /* picker unavailable — the user can paste a path */
+    } catch (e) {
+      setApkPickError(e instanceof Error ? e.message : 'The APK file dialog did not open.');
     }
   };
 
@@ -415,6 +419,7 @@ export const QuestDeployModal: React.FC<{ open: boolean; onClose: () => void }> 
               </span>
             )}
             {fetchApkError && <span className={ERR_CLS}>{fetchApkError}</span>}
+            {apkPickError && <span className={ERR_CLS}>{apkPickError}</span>}
           </div>
 
           <div className="flex flex-col gap-1">

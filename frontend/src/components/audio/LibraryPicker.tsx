@@ -36,7 +36,8 @@ import React, {
 import { createPortal } from 'react-dom';
 import { AudioLines, FolderOpen, Music, RefreshCw, Scissors, Search, Star, X } from 'lucide-react';
 import { InstrumentPicker } from './InstrumentPicker';
-import { MIDI_ACCEPT, midiFileLabel } from '../../lib/fileFilters';
+import { MIDI_ACCEPT, MIDI_EXTS, midiFileLabel } from '../../lib/fileFilters';
+import { KnownFilesMenu } from '../ui/KnownFilesMenu';
 import { fetchMidiBytesWithRetry } from '../../lib/fetchRetry';
 import {
   cachedLibraryMidi,
@@ -113,6 +114,9 @@ const TAB_LABEL: Record<LibraryPickerTab, string> = {
  *  thousands of DOM rows on every keystroke; the footer says what is hidden and
  *  search narrows to it. */
 const MAX_ROWS = 300;
+
+/** Extensions the MIDI tab's Recent menu offers. */
+const RECENT_MIDI_EXTS = MIDI_EXTS.map((e) => `.${e}`);
 
 const fmtDuration = (sec?: number | null): string | null => {
   if (typeof sec !== 'number' || !Number.isFinite(sec) || sec <= 0) return null;
@@ -228,6 +232,7 @@ export const LibraryPicker: React.FC<LibraryPickerProps> = ({
   const listId = `libpick-${uid}-list`;
   const panelId = `libpick-${uid}-panel`;
   const fileId = `libpick-${uid}-file`;
+  const recentId = `libpick-${uid}-recent`;
   const titleId = `libpick-${uid}-title`;
   const optionId = (i: number) => `libpick-${uid}-opt-${i}`;
 
@@ -438,6 +443,9 @@ export const LibraryPicker: React.FC<LibraryPickerProps> = ({
 
     const onDown = (e: MouseEvent) => {
       if (cardRef.current?.contains(e.target as Node)) return;
+      // The Recent MIDI list portals outside the card. While it is open, a
+      // click belongs to it, and it closes itself on an outside click.
+      if (document.getElementById(recentId)?.getAttribute('aria-expanded') === 'true') return;
       onCloseRef.current();
     };
     let attached = false;
@@ -685,16 +693,25 @@ export const LibraryPicker: React.FC<LibraryPickerProps> = ({
         </div>
         {allowFiles && tabList.includes('midi') && tab === 'midi' && (
           <>
-            <button
-              type="button"
-              // Synchronous inside the click: any await here loses the user
-              // activation and the browser silently refuses to open the dialog.
-              onClick={() => fileRef.current?.click()}
-              className="w-full flex items-center gap-2 px-2 py-1.5 rounded bg-white/3 hover:bg-white/8 border border-white/10 text-[10px] text-zinc-200 transition-colors"
-            >
-              <FolderOpen className="w-3.5 h-3.5 text-purple-300 shrink-0" />
-              From a file on disk…
-            </button>
+            <div className="flex items-stretch gap-1.5">
+              <button
+                type="button"
+                // Synchronous inside the click: any await here loses the user
+                // activation and the browser silently refuses to open the dialog.
+                onClick={() => fileRef.current?.click()}
+                className="flex-1 min-w-0 flex items-center gap-2 px-2 py-1.5 rounded bg-white/3 hover:bg-white/8 border border-white/10 text-[10px] text-zinc-200 transition-colors"
+              >
+                <FolderOpen className="w-3.5 h-3.5 text-purple-300 shrink-0" />
+                From a file on disk…
+              </button>
+              <KnownFilesMenu
+                id={recentId}
+                exts={RECENT_MIDI_EXTS}
+                onFiles={(files) => {
+                  if (files[0]) void pickMidiFile(files[0]);
+                }}
+              />
+            </div>
             {/* sr-only, not display:none — hiding it with `hidden` drops it from
                 the accessibility tree and leaves the label naming nothing. */}
             <label htmlFor={fileId} className="sr-only">

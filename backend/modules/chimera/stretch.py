@@ -23,6 +23,7 @@ from typing import Optional, TypedDict
 import numpy as np
 
 from .config import probe
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -148,6 +149,7 @@ def normalize_to_target(
             text=True,
             timeout=timeout_sec,
             stdin=subprocess.DEVNULL,
+            env=child_env(),
         )
     except subprocess.TimeoutExpired as e:
         raise RuntimeError(f"ffmpeg normalize timed out after {timeout_sec}s") from e
@@ -284,6 +286,7 @@ def stretch_audio(
                 text=True,
                 timeout=timeout_sec,
                 stdin=subprocess.DEVNULL,
+                env=child_env(),
             )
         except subprocess.TimeoutExpired as e:
             raise RuntimeError(
@@ -320,6 +323,7 @@ def stretch_audio(
             text=True,
             timeout=timeout_sec,
             stdin=subprocess.DEVNULL,
+            env=child_env(),
         )
     except subprocess.TimeoutExpired as e:
         raise RuntimeError(f"ffmpeg atempo timed out after {timeout_sec}s") from e

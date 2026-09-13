@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from backend.core.adb import resolve_adb_path
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -108,7 +109,9 @@ class QuestCastSidecar:
         if not adb:
             return "adb not found. Install Android platform-tools or set theDAW_ADB / theDAW_QUESTCAST_ADB"
         try:
-            subprocess.run([adb, "start-server"], capture_output=True, timeout=20)
+            subprocess.run(
+                [adb, "start-server"], capture_output=True, timeout=20, env=child_env()
+            )
         except (subprocess.TimeoutExpired, OSError) as e:
             return f"could not start adb server: {e}"
         return None
@@ -133,6 +136,7 @@ class QuestCastSidecar:
                 capture_output=True,
                 text=True,
                 timeout=BOOTSTRAP_TIMEOUT_SEC,
+                env=child_env(),
             )
         except (subprocess.TimeoutExpired, OSError) as e:
             return f"npm install failed: {e}"
@@ -152,7 +156,11 @@ class QuestCastSidecar:
             return {"ok": False, "error": err, "devices": []}
         try:
             out = subprocess.run(
-                [adb, "devices"], capture_output=True, text=True, timeout=15
+                [adb, "devices"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env=child_env(),
             )
         except (subprocess.TimeoutExpired, OSError) as e:
             return {"ok": False, "error": str(e), "devices": []}
@@ -255,7 +263,7 @@ class QuestCastSidecar:
                 return {"ok": False, "error": err}
             self._record("bootstrap ok")
 
-            env = dict(os.environ)
+            env = child_env()
             env["QUESTCAST_WS_PORT"] = str(self._port)
             if device_serial:
                 env["QUESTCAST_DEVICE_SERIAL"] = device_serial

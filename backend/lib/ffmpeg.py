@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 from pathlib import Path
+from backend.lib.launch_token import child_env
 
 
 class FFmpegError(RuntimeError):
@@ -32,6 +33,7 @@ async def run(cmd: list[str], timeout: float = 600.0) -> str:
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
+        env=child_env(),
     )
     try:
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)

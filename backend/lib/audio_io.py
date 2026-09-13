@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import soundfile as sf
+from backend.lib.launch_token import child_env
 
 if TYPE_CHECKING:
     import torch
@@ -198,6 +199,7 @@ def _read_via_ffmpeg(src: Any, cause: Exception) -> tuple[np.ndarray, int]:
             stderr=subprocess.PIPE,
             timeout=600,
             check=False,
+            env=child_env(),
         )
         if proc.returncode != 0:
             tail = proc.stderr.decode("utf-8", errors="replace")[-500:]

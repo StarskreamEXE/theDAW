@@ -1857,6 +1857,7 @@ const SelectRow: React.FC<{ label: string; value: string; options: Array<{ value
   <label className="flex flex-col gap-0.5">
     <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-400">{label}</span>
     <select
+      id={`lineage-select-${label.toLowerCase().replace(/\s+/g, '-')}`}
       name={`lineage-select-${label.toLowerCase().replace(/\s+/g, '-')}`}
       value={value}
       onChange={(e) => onChange(e.target.value)}
@@ -3348,12 +3349,18 @@ const Graph3DView = React.memo(function Graph3DViewBase({ payload, highlight, ap
             icon: <Package className="w-3 h-3" />,
             hint: '.zip',
             onSelect: () => {
-              const a = document.createElement('a');
-              a.href = `/api/library/${payload.nodeId}/bundle`;
-              a.download = '';
-              document.body.appendChild(a);
-              a.click();
-              document.body.removeChild(a);
+              // Named like the bundle route's Content-Disposition.
+              const safe = Array.from(payload.nodeName || 'entry', (c) =>
+                /[A-Za-z0-9._-]/.test(c) ? c : '_',
+              ).join('').slice(0, 60);
+              // Imported on demand: this item is the modal's only save.
+              void import('../../lib/saveFile').then(({ saveFile }) =>
+                saveFile({
+                  url: `/api/library/${encodeURIComponent(payload.nodeId)}/bundle`,
+                  suggestedName: `${safe}_${payload.nodeId.slice(0, 8)}.zip`,
+                  kind: 'zip',
+                }),
+              );
             },
           },
           {

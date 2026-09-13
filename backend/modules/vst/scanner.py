@@ -17,6 +17,7 @@ import threading
 import time
 from pathlib import Path
 from dataclasses import dataclass, asdict, fields
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -282,6 +283,7 @@ def _probe_subprocess(path: str, timeout_s: float) -> tuple[str, dict | None]:
             timeout=timeout_s,
             text=True,
             creationflags=flags,
+            env=child_env(),
         )
     except subprocess.TimeoutExpired:
         log.info("VST3 metadata probe timed out after %.0fs: %s", timeout_s, path)

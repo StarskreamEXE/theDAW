@@ -66,6 +66,7 @@ import { useFeatureToggleStore } from './state/featureToggleStore';
 import { useGanStore } from './state/ganStore';
 import { useProjectStore } from './state/projectStore';
 import { useAppUiStore } from './state/appUiStore';
+import { notifyPlacesChanged } from './lib/placesClient';
 
 import './orb-kit/styles/gantasmo-orb.css';
 import './orb-kit/chat/orb-chat.css';
@@ -193,6 +194,16 @@ export default function App() {
   useEffect(() => {
     if (!isBackendReady) return;
     void useModuleStore.getState().load();
+  }, [isBackendReady]);
+
+  // Settle the projects folder once the backend first answers: a folder this
+  // browser chose reaches the backend, or the backend's folder replaces it, so
+  // asset installs and backups use the same folder from the start.
+  const projectsDirSettled = useRef(false);
+  useEffect(() => {
+    if (!isBackendReady || projectsDirSettled.current) return;
+    projectsDirSettled.current = true;
+    void useProjectStore.getState().ensureDefaultDir();
   }, [isBackendReady]);
 
   // ONE device-change subscription for the whole app, plus the boot read of the
@@ -448,6 +459,31 @@ export default function App() {
       } else if (lower.endsWith('.tasmo')) {
         void useProjectStore.getState().loadPath(filePath);
         useAppUiStore.getState().setCenterTab('mix');
+      }
+    });
+  }, []);
+
+  // Desktop downloads: the Electron main process reports each finished download
+  // with the path it was saved to. The path goes to the status bar and into
+  // known places, so the next import control offers the file.
+  useEffect(() => {
+    const api = (window as unknown as {
+      electronAPI?: {
+        onDownloadDone?: (
+          cb: (info: { path: string | null; filename: string; state: string }) => void,
+        ) => () => void;
+      };
+    }).electronAPI;
+    if (!api?.onDownloadDone) return;
+    return api.onDownloadDone(({ path, filename, state }) => {
+      if (state === 'completed' && path) {
+        useStatusBarStore.getState().setText(`DOWNLOADED: ${path}`);
+        logInfo('files', `Downloaded ${filename} to ${path}`);
+        // The main process recorded the path before sending this event, so the
+        // Recent menus that refetch now already see it.
+        notifyPlacesChanged();
+      } else {
+        logWarn('files', `Download ${state}: ${filename}`);
       }
     });
   }, []);

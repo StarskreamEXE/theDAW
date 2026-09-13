@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { marked } from 'marked';
 import { X, Download, BookOpen, Printer, ExternalLink, Search } from 'lucide-react';
+import { saveFile } from '../../lib/saveFile';
 
 interface DocsModalProps {
   open: boolean;
@@ -312,14 +313,7 @@ export const DocsModal: React.FC<DocsModalProps> = ({ open, onClose }) => {
   const handleDownloadMd = () => {
     if (!markdown) return;
     const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'theDAW-user-guide.md';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    void saveFile({ blob, suggestedName: 'theDAW-user-guide.md' });
   };
 
   const filteredHeadings = search.trim()
@@ -353,7 +347,7 @@ export const DocsModal: React.FC<DocsModalProps> = ({ open, onClose }) => {
               type="button"
               onClick={handleDownloadMd}
               className="docs-btn flex items-center gap-1.5 px-2 py-1 rounded border border-white/10 hover:bg-white/10 text-zinc-300 text-[10px] font-bold uppercase tracking-widest transition-colors"
-              title="Download raw Markdown"
+              title="Save the guide as a Markdown file"
             >
               <Download className="w-3 h-3" /> MD
             </button>

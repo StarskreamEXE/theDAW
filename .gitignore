@@ -22,6 +22,8 @@ data/performance-sets/
 data/lyric-documents/
 data/settings.json
 data/recent_projects.json
+# Paths theDAW saved, installed, picked or downloaded (absolute, per machine)
+data/known_paths.json
 # Per-machine media roots (absolute paths to the user's audio folders)
 data/media_roots.json
 # Cockpit-saved Sway projects (contain absolute paths to the user's media)
@@ -393,6 +395,9 @@ logs/magenta-download-*.log
 
 # Chimera v2 per-clip analysis cache (sha256-keyed JSON)
 data/cache/
+
+# Rhythm analysis cache the app writes (meter maps per analysed file)
+data/rhythm/
 
 # UNCANNY demo album staging (converted audio + stems; distributed separately)
 data/uncanny/

@@ -27,6 +27,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Optional
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -215,6 +216,7 @@ def _spawn_renderer(
             stdin=subprocess.DEVNULL,
             creationflags=creationflags,
             shell=False,
+            env=child_env(),
         )
     except FileNotFoundError:
         return failure(_NODE_HINT)

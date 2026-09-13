@@ -15,6 +15,7 @@ from backend.lib.audio_depth import (
     probe_depth,
     widest,
 )
+from backend.lib.launch_token import child_env
 
 router = APIRouter()
 
@@ -139,6 +140,7 @@ def _has_librubberband() -> bool:
                 text=True,
                 timeout=10,
                 stdin=subprocess.DEVNULL,
+                env=child_env(),
             )
             _librubberband = out.returncode == 0 and "rubberband" in out.stdout.lower()
         except Exception:
@@ -450,6 +452,7 @@ async def studio_process(
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
+            env=child_env(),
         )
         try:
             _, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)

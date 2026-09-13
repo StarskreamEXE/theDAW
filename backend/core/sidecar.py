@@ -22,6 +22,7 @@ import asyncio
 import sys
 from pathlib import Path
 from typing import Optional
+from backend.lib.launch_token import child_env
 
 
 class SidecarUnavailable(RuntimeError):
@@ -73,6 +74,7 @@ class GPUSidecar:
                 *self.server_cmd,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
+                env=child_env(),
             )
             deadline = asyncio.get_running_loop().time() + self.boot_timeout
             while asyncio.get_running_loop().time() < deadline:
