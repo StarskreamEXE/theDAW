@@ -300,14 +300,14 @@ export const PianoRoll: React.FC = () => {
     }
   };
 
-  const handleExportMidi = () => {
+  const handleExportMidi = async () => {
     if (notes.length === 0) {
       logError('piano-roll', 'No notes to export');
       return;
     }
     const ppq = 480;
     const midiNotes = pianoNotesToMidiNotes(notes, ppq);
-    downloadMidi(
+    const result = await downloadMidi(
       {
         ppq,
         bpm,
@@ -317,7 +317,9 @@ export const PianoRoll: React.FC = () => {
       },
       'piano-roll',
     );
-    logInfo('piano-roll', `Exported ${notes.length} notes as MIDI`);
+    // A cancelled or failed save exported nothing; saveFile already logged a failure.
+    if (result.path) logInfo('piano-roll', `Exported ${notes.length} notes as MIDI to ${result.path}`);
+    else if (result.downloaded) logInfo('piano-roll', `Exported ${notes.length} notes as MIDI`);
   };
 
   const handleImportMidi = (file: File) => {
@@ -482,9 +484,10 @@ export const PianoRoll: React.FC = () => {
             {isPlaying ? <Square className="w-3.5 h-3.5 fill-current" /> : <Play className="w-3.5 h-3.5 fill-current" />}
           </button>
           <div className="flex items-center gap-1 px-1.5 py-0.5 bg-black/40 border border-white/5 rounded">
-            <span className="text-[7px] font-mono text-zinc-600 uppercase">BPM</span>
+            <label htmlFor="piano-roll-bpm" className="text-[7px] font-mono text-zinc-600 uppercase">BPM</label>
             <input
               type="number"
+              id="piano-roll-bpm"
               name="piano-roll-bpm"
               min={40}
               max={240}
@@ -494,9 +497,10 @@ export const PianoRoll: React.FC = () => {
             />
           </div>
           <div className="flex items-center gap-1 px-1.5 py-0.5 bg-black/40 border border-white/5 rounded">
-            <span className="text-[7px] font-mono text-zinc-600 uppercase">Steps</span>
+            <label htmlFor="piano-roll-total-steps" className="text-[7px] font-mono text-zinc-600 uppercase">Steps</label>
             <input
               type="number"
+              id="piano-roll-total-steps"
               name="piano-roll-total-steps"
               min={16}
               max={4096}
@@ -516,10 +520,12 @@ export const PianoRoll: React.FC = () => {
             </button>
           </div>
           <div className="flex items-center gap-1 px-1.5 py-0.5 bg-black/40 border border-white/5 rounded" title="Timing feel: quantize pulls notes to the grid; swing/rag delays or pushes off-16ths.">
-            <span className="text-[7px] font-mono text-zinc-600 uppercase">Q</span>
+            <label htmlFor="piano-roll-quantize" className="text-[7px] font-mono text-zinc-600 uppercase">Q</label>
             <input
               type="range"
+              id="piano-roll-quantize"
               name="piano-roll-quantize"
+              aria-label="Quantize"
               min={0}
               max={100}
               value={quantizePct}
@@ -527,9 +533,10 @@ export const PianoRoll: React.FC = () => {
               className="w-14 accent-cyan-400"
             />
             <span className="text-[8px] font-mono text-cyan-300 w-7 text-right">{quantizePct}%</span>
-            <span className="text-[7px] font-mono text-zinc-600 uppercase ml-1">Rag</span>
+            <label htmlFor="piano-roll-swing-rag" className="text-[7px] font-mono text-zinc-600 uppercase ml-1">Rag</label>
             <input
               type="range"
+              id="piano-roll-swing-rag"
               name="piano-roll-swing-rag"
               min={-50}
               max={50}

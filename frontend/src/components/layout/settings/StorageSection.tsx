@@ -2,12 +2,15 @@
  * Storage: every model/data location on one line each (label · path · size ·
  * Open), the Hugging Face cache as an expandable row, and the VJ export folder.
  */
-import React, { useEffect, useState } from 'react';
-import { ChevronRight, HardDrive, RefreshCw } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { ChevronRight, FolderOpen, HardDrive, Loader2, RefreshCw } from 'lucide-react';
+import { postJson } from '../../../lib/apiJson';
 import { fetchHfCache, fetchLocations, formatBytes, openLocation, type HfRepo, type StorageLocation } from '../../../lib/storageClient';
 import { useFeatureToggleStore } from '../../../state/featureToggleStore';
-import { PathInput } from '../../ui/PathInput';
 import { BTN_GHOST, CARD, SectionHeader } from './shared';
+
+const VJ_FOLDER_TIP =
+  'Where VJ recordings are saved. A relative path sits inside the project; Browse fills an absolute folder such as D:\\Renders. Each take adds its record-bar subfolder, then ffmpeg transcodes to the chosen codec.';
 
 /** Hover detail for a location's size: every model in the directory. */
 const locationInventoryTitle = (loc: StorageLocation): string | undefined => {
@@ -37,11 +40,37 @@ export const StorageSection: React.FC = () => {
   // committed on blur / Enter.
   const exportRoot = useFeatureToggleStore((s) => s.settings.vj?.export_root ?? 'exports/vj');
   const patchFeatures = useFeatureToggleStore((s) => s.patch);
+  const refreshFeatures = useFeatureToggleStore((s) => s.refresh);
   const [vjExportRoot, setVjExportRoot] = useState(exportRoot);
   useEffect(() => { setVjExportRoot(exportRoot); }, [exportRoot]);
+  const pendingCommit = useRef<Promise<boolean> | null>(null);
   const commitVjExportRoot = () => {
     const v = vjExportRoot.trim() || 'exports/vj';
-    if (v !== exportRoot) void patchFeatures({ vj: { export_root: v } });
+    if (v !== exportRoot) pendingCommit.current = patchFeatures({ vj: { export_root: v } });
+  };
+
+  // Browse asks the VJ module for the folder: its picker opens at the current
+  // export folder and stores the folder the user chooses as the setting.
+  const [vjPicking, setVjPicking] = useState(false);
+  const [vjPickError, setVjPickError] = useState<string | null>(null);
+  const browseVjExportRoot = async () => {
+    if (vjPicking) return;
+    setVjPicking(true);
+    setVjPickError(null);
+    try {
+      // Clicking Browse blurs the field first; let that commit land so the
+      // picker opens at the folder that was just typed.
+      await pendingCommit.current;
+      const res = await postJson<{ cancelled?: boolean; path?: string }>('/api/vj/export-folder/pick');
+      if (!res.cancelled && res.path) {
+        setVjExportRoot(res.path);
+        await refreshFeatures();
+      }
+    } catch (e) {
+      setVjPickError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setVjPicking(false);
+    }
   };
 
   const row = `${CARD} flex items-center gap-2 px-2 py-0.5 min-w-0`;
@@ -113,19 +142,42 @@ export const StorageSection: React.FC = () => {
 
         {/* VJ recordings folder */}
         <div className={`${CARD} px-2 py-1`}>
-          <PathInput
-            inline
-            id="settings-vj-export-root"
-            name="settings-vj-export-root"
-            label="VJ folder"
-            value={vjExportRoot}
-            onChange={setVjExportRoot}
-            kind="folder"
-            onBlur={commitVjExportRoot}
-            onEnter={commitVjExportRoot}
-            placeholder="exports/vj"
-            description="Where VJ recordings are saved. A relative path sits inside the project; Browse fills an absolute folder such as D:\Renders. Each take adds its record-bar subfolder, then ffmpeg transcodes to the chosen codec."
-          />
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <label
+              htmlFor="settings-vj-export-root"
+              title={VJ_FOLDER_TIP}
+              className="text-[9px] font-mono uppercase tracking-wider text-zinc-400 shrink-0 cursor-help"
+            >
+              VJ folder
+            </label>
+            <div className="flex gap-1.5 flex-1 min-w-0">
+              <input
+                id="settings-vj-export-root"
+                name="settings-vj-export-root"
+                type="text"
+                value={vjExportRoot}
+                title={VJ_FOLDER_TIP}
+                onChange={(e) => setVjExportRoot(e.target.value)}
+                onBlur={commitVjExportRoot}
+                onKeyDown={(e) => { if (e.key === 'Enter') commitVjExportRoot(); }}
+                spellCheck={false}
+                placeholder="exports/vj"
+                className="min-w-0 flex-1 bg-black/40 border border-white/10 rounded px-2 py-1.5 text-[10px] font-mono text-zinc-200 focus:border-purple-500/50 focus:outline-none"
+              />
+              <button
+                type="button"
+                onClick={() => void browseVjExportRoot()}
+                disabled={vjPicking}
+                aria-label="Choose the VJ recordings folder"
+                title="Choose the VJ recordings folder"
+                className="shrink-0 inline-flex items-center justify-center gap-1.5 rounded border border-white/10 bg-white/5 px-2.5 py-1.5 text-[9px] font-black uppercase tracking-widest text-zinc-300 hover:border-purple-400/40 hover:bg-purple-500/15 hover:text-purple-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              >
+                {vjPicking ? <Loader2 className="w-3 h-3 animate-spin" /> : <FolderOpen className="w-3 h-3" />}
+                Browse
+              </button>
+            </div>
+            {vjPickError && <p className="w-full text-[8px] text-red-300 leading-relaxed">{vjPickError}</p>}
+          </div>
         </div>
       </div>
     </section>

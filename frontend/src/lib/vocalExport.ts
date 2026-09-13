@@ -1,8 +1,8 @@
 /**
- * vocalExport.ts - turn a VocalArtifact into a .mid download or an inpaint guide.
+ * vocalExport.ts - turn a VocalArtifact into a saved .mid or an inpaint guide.
  *
  * Reuses the existing note/render surface end to end: artifact notes (ms) map to
- * RenderNote (seconds), notesToSmf writes the SMF for a .mid download, and
+ * RenderNote (seconds), notesToSmf writes the SMF for a saved .mid, and
  * renderNotesToBlob renders a guide WAV. Arming an inpaint guide just patches
  * generateParamsStore's existing inpaint fields, so the normal Generate flow
  * regenerates the masked window (no new generate path).
@@ -12,6 +12,7 @@ import { useGenerateParamsStore } from '../state/generateParamsStore';
 import { notesToSmf } from './midiWrite';
 import type { RenderNote } from './midiSynth';
 import { renderNotesToBlob } from './midiSynth';
+import { saveFile, type SaveFileResult } from './saveFile';
 
 export interface ArtifactNote {
   start_ms: number;
@@ -59,21 +60,11 @@ export const artifactNotesToRenderNotes = (notes: ArtifactNote[]): RenderNote[] 
     velocity: n.velocity,
   }));
 
-const anchorDownload = (blob: Blob, filename: string): void => {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-};
-
-/** Export the artifact notes as a .mid (type-0 SMF) and trigger a download. */
-export const downloadVocalMidi = (notes: ArtifactNote[], baseName = 'vocal'): void => {
+/** Export the artifact notes as a .mid (type-0 SMF) through saveFile, which
+ *  remembers the chosen path. Resolves with the save's outcome. */
+export const downloadVocalMidi = (notes: ArtifactNote[], baseName = 'vocal'): Promise<SaveFileResult> => {
   const bytes = notesToSmf(artifactNotesToRenderNotes(notes));
-  anchorDownload(new Blob([bytes], { type: 'audio/midi' }), `${baseName}.mid`);
+  return saveFile({ blob: new Blob([bytes], { type: 'audio/midi' }), suggestedName: `${baseName}.mid`, kind: 'midi' });
 };
 
 /** Render the artifact notes to a guide WAV (soundfont when active, else the

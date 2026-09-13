@@ -17,6 +17,11 @@ export const SESSION_IMPORT_FILTER =
 
 export const GAN_FILTER = 'GAN plugin (*.gan)|*.gan|All files (*.*)|*.*';
 
+/** A VST Foundry export is its project.json. */
+export const FOUNDRY_EXPORT_FILTER = 'VST Foundry export (*.json)|*.json|All files (*.*)|*.*';
+
+export const BACKUP_ZIP_FILTER = 'theDAW backup (*.zip)|*.zip|All files (*.*)|*.*';
+
 /**
  * Every audio extension the library backend will take on import — the same set
  * `_resolve_audio_file` resolves in backend/modules/library/store.py, including

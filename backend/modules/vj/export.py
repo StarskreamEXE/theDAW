@@ -29,6 +29,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from backend.lib import paths
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -252,6 +253,7 @@ def _run_ffmpeg(cmd: list[str]) -> None:
             text=True,
             stdin=subprocess.DEVNULL,
             timeout=600.0,
+            env=child_env(),
         )
     except subprocess.TimeoutExpired as e:
         log.error("vj.export: ffmpeg timed out: %s", " ".join(cmd))

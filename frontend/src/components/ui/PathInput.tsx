@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { FolderOpen, FileSearch, Save, Loader2 } from 'lucide-react';
 import { pickFile, pickFolder, pickSave } from '../../lib/storageClient';
+import { dirnameOf } from '../../lib/placesClient';
 
 interface PathInputProps {
   id: string;
@@ -44,6 +45,10 @@ interface PathInputProps {
   saveName?: string;
   saveExt?: string;
   saveDir?: string;
+  /** known_paths kind (e.g. 'tasmo', 'daw-project') sent to the native picker.
+   *  The picker opens in the folder last used for that kind when the field
+   *  names none, and remembers what the user picks. */
+  pickKind?: string;
 }
 
 export const PathInput: React.FC<PathInputProps> = ({
@@ -74,6 +79,7 @@ export const PathInput: React.FC<PathInputProps> = ({
   saveName,
   saveExt,
   saveDir,
+  pickKind,
 }) => {
   const [picking, setPicking] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -82,18 +88,26 @@ export const PathInput: React.FC<PathInputProps> = ({
     if (disabled || picking) return;
     setPicking(true);
     setError(null);
+    // The field's own value is the best start folder: the picker opens where
+    // the current path already points.
+    const current = value.trim();
     try {
       const result =
         kind === 'folder'
-          ? await pickFolder()
+          ? await pickFolder({ initialDir: current || undefined, kind: pickKind })
           : kind === 'save'
             ? await pickSave({
                 filter: fileFilter,
                 initialName: saveName,
                 defaultExt: saveExt,
                 initialDir: saveDir,
+                kind: pickKind,
               })
-            : await pickFile(fileFilter ? { filter: fileFilter } : undefined);
+            : await pickFile({
+                filter: fileFilter,
+                initialDir: dirnameOf(current) || undefined,
+                kind: pickKind,
+              });
       if (!result.cancelled && result.path) {
         onChange(result.path);
         onPicked?.(result.path);

@@ -29,13 +29,19 @@
  * opening its own MIDI access.
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertTriangle, RefreshCw, Waves } from 'lucide-react';
+import { AlertTriangle, ChevronDown, FolderOpen, Loader2, RefreshCw, Waves } from 'lucide-react';
 import { subscribeToMidi } from '../state/midiBus';
 import { getAnalyser } from '../state/playerStore';
-import { logInfo, logWarn } from '../state/logStore';
+import { logError, logInfo, logWarn } from '../state/logStore';
 import { describeHttpError } from '../lib/httpError';
+import { getJson } from '../lib/apiJson';
+import { basenameOf, dirnameOf, isLocalClient, pathKey, placesApi, type PlaceItem } from '../lib/placesClient';
+import { pickFile } from '../lib/storageClient';
+import { openSwayScene, openSwaySceneFromPath } from '../lib/swayOpen';
 import { useMidiDevicesStore } from '../state/midiDevicesStore';
 import { useMidiTriggerStore } from '../state/midiTriggerStore';
+import { useStatusBarStore } from '../state/statusBarStore';
+import { useSwayOpenStore } from '../state/swayOpenStore';
 
 /** Where the cockpit is mounted. Must match backend/modules/sway/sidecar.py. */
 const SWAY_SRC = '/sway-app/';
@@ -53,20 +59,300 @@ const DEFAULT_TEMPLATE = 'will-i-dream';
  * cockpit-saved project (`swayproject:/` paths resolve from
  * localStorage['sway:projects']) wins over the default template; transient
  * `swaydrop:/` handles die on reload and are skipped.
+ *
+ * An explicit `requested` target (a scene opened through openSwayScene) boots
+ * the cockpit into that project.
  */
-function swayBootSrc(): string {
-  let target: string = DEFAULT_TEMPLATE;
-  try {
-    const recents = JSON.parse(window.localStorage.getItem('sway:recents') ?? '[]') as Array<{ path?: string }>;
-    const saved = Array.isArray(recents)
-      ? recents.find((r) => typeof r?.path === 'string' && r.path.startsWith('swayproject:/'))
-      : null;
-    if (saved?.path) target = saved.path;
-  } catch {
-    /* unreadable recents — boot the default template */
+function swayBootSrc(requested?: string | null): string {
+  let target: string = requested || DEFAULT_TEMPLATE;
+  if (!requested) {
+    try {
+      const recents = JSON.parse(window.localStorage.getItem('sway:recents') ?? '[]') as Array<{ path?: string }>;
+      const saved = Array.isArray(recents)
+        ? recents.find((r) => typeof r?.path === 'string' && r.path.startsWith('swayproject:/'))
+        : null;
+      if (saved?.path) target = saved.path;
+    } catch {
+      /* unreadable recents — boot the default template */
+    }
   }
   return `${SWAY_SRC}?autoplay=${encodeURIComponent(target)}`;
 }
+
+interface SwayProjectRow {
+  name: string;
+  path: string;
+  mtime: number;
+}
+
+const SCENE_MENU_ID = 'sway-open-scene';
+
+const SWAY_FILE_FILTER = 'SwayCommand scene (*.sway)|*.sway|All files (*.*)|*.*';
+
+interface SceneEntry {
+  key: string;
+  label: string;
+  detail: string | null;
+  title: string;
+  action: boolean;
+  choose: () => void;
+}
+
+/** Opens a .sway file picked in the native dialog. A failure is logged and
+ *  shown in the status bar; a cancel does nothing. */
+async function chooseSceneFile(): Promise<void> {
+  try {
+    const picked = await pickFile({ kind: 'sway', filter: SWAY_FILE_FILTER });
+    if (picked.cancelled || !picked.path) return;
+    if (!/\.sway$/i.test(picked.path)) {
+      useStatusBarStore.getState().setText('SCENE OPEN FAILED: Choose a file that ends in .sway.');
+      return;
+    }
+    await openSwaySceneFromPath(picked.path);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    logError('sway', `Could not choose a scene file: ${msg}`);
+    useStatusBarStore.getState().setText(`SCENE OPEN FAILED: ${msg}`);
+  }
+}
+
+/**
+ * "Open scene", in three parts:
+ *   - the .sway scenes saved under data/sway-projects, newest first, opened by
+ *     name through openSwayScene;
+ *   - .sway files elsewhere that known places can serve (a Save a copy, a
+ *     cockpit save that was downloaded), opened by path;
+ *   - on the machine the backend runs on, a row that picks a .sway file in the
+ *     native dialog.
+ * The lists are read each time the menu opens, so a scene saved, installed or
+ * downloaded a moment ago is already in it.
+ */
+const SceneMenu: React.FC = () => {
+  const [open, setOpen] = useState(false);
+  const [rows, setRows] = useState<SwayProjectRow[] | null>(null);
+  const [files, setFiles] = useState<PlaceItem[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [activeIdx, setActiveIdx] = useState(0);
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const focusPendingRef = useRef(false);
+  const seqRef = useRef(0);
+  const listId = `${SCENE_MENU_ID}-listbox`;
+
+  const close = useCallback((restoreFocus: boolean) => {
+    seqRef.current += 1;
+    setOpen(false);
+    if (restoreFocus) triggerRef.current?.focus();
+  }, []);
+
+  const toggle = () => {
+    if (open) {
+      close(false);
+      return;
+    }
+    const seq = ++seqRef.current;
+    setOpen(true);
+    setActiveIdx(0);
+    setRows(null);
+    setFiles([]);
+    setError(null);
+    focusPendingRef.current = true;
+    const saved = getJson<{ projects?: SwayProjectRow[] }>('/api/sway/projects').then(
+      (j) => ({ rows: Array.isArray(j.projects) ? j.projects : [], error: null as string | null }),
+      (e: unknown) => ({
+        rows: [] as SwayProjectRow[],
+        error: e instanceof Error ? e.message : String(e),
+      }),
+    );
+    void Promise.all([saved, placesApi.recent({ kind: 'sway', exts: ['.sway'] })]).then(
+      ([scenes, recent]) => {
+        if (seq !== seqRef.current) return;
+        // A scene in data/sway-projects is listed once, by name.
+        const inFolder = new Set(scenes.rows.map((r) => pathKey(r.path)));
+        setFiles(recent.filter((it) => it.servable && !inFolder.has(pathKey(it.path))));
+        setError(scenes.error);
+        setRows(scenes.rows);
+      },
+    );
+  };
+
+  // Move focus into the list once it is read, so arrow keys work at once.
+  useEffect(() => {
+    if (!open || !rows || !focusPendingRef.current) return;
+    focusPendingRef.current = false;
+    optionRefs.current[0]?.focus({ preventScroll: true });
+  }, [open, rows]);
+
+  // Escape, a click outside, or a click into the cockpit closes it. A click in
+  // the iframe never reaches this window as a mousedown; the window blurs.
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (!(e.target instanceof Node && wrapRef.current?.contains(e.target))) close(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      e.stopPropagation();
+      close(true);
+    };
+    const onBlur = () => close(false);
+    window.addEventListener('mousedown', onDown);
+    window.addEventListener('keydown', onKey, true);
+    window.addEventListener('blur', onBlur);
+    return () => {
+      window.removeEventListener('mousedown', onDown);
+      window.removeEventListener('keydown', onKey, true);
+      window.removeEventListener('blur', onBlur);
+    };
+  }, [open, close]);
+
+  const entries: SceneEntry[] = rows
+    ? [
+        ...rows.map((row) => ({
+          key: `scene:${row.path}`,
+          label: row.name,
+          detail: new Date(row.mtime * 1000).toLocaleString(),
+          title: row.path,
+          action: false,
+          choose: () => void openSwayScene(row.name),
+        })),
+        ...files.map((it) => ({
+          key: `file:${it.path}`,
+          label: it.name || basenameOf(it.path),
+          detail: dirnameOf(it.path),
+          title: it.path,
+          action: false,
+          choose: () => void openSwaySceneFromPath(it.path),
+        })),
+        // The native dialog opens on the backend's machine, so a browser on
+        // another device gets no row for it.
+        ...(isLocalClient()
+          ? [
+              {
+                key: 'choose-file',
+                label: 'Choose a .sway file',
+                detail: null,
+                title: 'Opens a .sway file you choose and loads it.',
+                action: true,
+                choose: () => void chooseSceneFile(),
+              },
+            ]
+          : []),
+      ]
+    : [];
+
+  const choose = (entry: SceneEntry) => {
+    close(false);
+    entry.choose();
+  };
+
+  const onListKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const n = entries.length;
+    if (!n) return;
+    const current = Math.min(activeIdx, n - 1);
+    let next = -1;
+    if (e.key === 'ArrowDown') next = (current + 1) % n;
+    else if (e.key === 'ArrowUp') next = (current - 1 + n) % n;
+    else if (e.key === 'Home') next = 0;
+    else if (e.key === 'End') next = n - 1;
+    if (next < 0) return;
+    e.preventDefault();
+    setActiveIdx(next);
+    optionRefs.current[next]?.focus();
+  };
+
+  const loaded = rows !== null;
+  const active = Math.min(activeIdx, Math.max(0, entries.length - 1));
+  optionRefs.current.length = entries.length;
+  const emptyNote = !loaded
+    ? null
+    : error
+      ? `Could not read the saved scenes: ${error}`
+      : rows.length === 0 && files.length === 0
+        ? 'No scenes are saved yet.'
+        : null;
+
+  return (
+    <div ref={wrapRef} className="relative">
+      <button
+        ref={triggerRef}
+        id={SCENE_MENU_ID}
+        type="button"
+        onClick={toggle}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-controls={open && entries.length > 0 ? listId : undefined}
+        title="Lists saved and recent scenes and loads the one you choose."
+        className="inline-flex items-center gap-1 rounded border border-zinc-800 bg-black/40 px-1.5 py-0.5 text-[9px] font-mono text-zinc-200 outline-none hover:border-fuchsia-500/50 focus-visible:border-fuchsia-500/50"
+      >
+        <FolderOpen className="h-3 w-3 text-fuchsia-300" />
+        Open scene
+        <ChevronDown className="h-3 w-3 text-zinc-500" />
+      </button>
+      {open && (
+        <div className="absolute left-0 top-full z-20 mt-1 min-w-56 max-w-sm rounded border border-fuchsia-500/30 bg-[#0a080f] shadow-2xl">
+          {!loaded ? (
+            <p role="status" className="flex items-center gap-1 px-2 py-1.5 text-[9px] font-mono text-zinc-500">
+              <Loader2 className="h-3 w-3 animate-spin" /> Reading the saved scenes…
+            </p>
+          ) : (
+            <>
+              {emptyNote && (
+                <p
+                  role="status"
+                  className="border-b border-white/5 px-2 py-1.5 text-[9px] font-mono leading-relaxed text-zinc-500"
+                >
+                  {emptyNote}
+                </p>
+              )}
+              {entries.length > 0 && (
+                <div
+                  id={listId}
+                  role="listbox"
+                  aria-label="Scenes"
+                  onKeyDown={onListKeyDown}
+                  className="flex max-h-72 flex-col overflow-y-auto"
+                >
+                  {entries.map((entry, i) => (
+                    <button
+                      key={entry.key}
+                      ref={(el) => {
+                        optionRefs.current[i] = el;
+                      }}
+                      id={`${SCENE_MENU_ID}-opt-${i}`}
+                      type="button"
+                      role="option"
+                      aria-selected={i === active}
+                      tabIndex={i === active ? 0 : -1}
+                      onFocus={() => setActiveIdx(i)}
+                      onClick={() => choose(entry)}
+                      title={entry.title}
+                      className="flex w-full flex-col items-start border-b border-white/5 px-2 py-1 text-left last:border-b-0 hover:bg-fuchsia-500/15 focus:outline-none focus-visible:bg-fuchsia-500/15"
+                    >
+                      {entry.action ? (
+                        <span className="flex max-w-full items-center gap-1 text-[10px] font-mono text-fuchsia-200">
+                          <FolderOpen className="h-3 w-3 shrink-0" aria-hidden="true" />
+                          {entry.label}
+                        </span>
+                      ) : (
+                        <span className="max-w-full truncate text-[10px] font-mono text-zinc-100">{entry.label}</span>
+                      )}
+                      {entry.detail && (
+                        <span className="max-w-full truncate text-[8px] font-mono text-zinc-500">{entry.detail}</span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
 
 /** Wire-protocol version for every frame exchanged with the cockpit. */
 const PROTOCOL = 1;
@@ -120,8 +406,49 @@ export const SwayView: React.FC = () => {
     }
   }, []);
 
+  // --- which project the cockpit boots into ---------------------------------
+  // The cockpit reads its boot project only from its URL, so the src is fixed
+  // per open request and per probe. Reading recents on every render would
+  // change the src, and reload the cockpit, each time the cockpit saved a
+  // project.
+  //
+  // Every probe (the first one and each Retry) bumps `rev`, so an iframe
+  // mounted after it reads recents again. An open request boots its scene
+  // until a probe runs after it; openSwayScene also put that scene at the top
+  // of recents, so the read after a Retry still finds it unless the cockpit
+  // has since loaded or saved another project.
+  const openRequest = useSwayOpenStore((s) => s.request);
+  const [probeMark, setProbeMark] = useState<{ rev: number; nonce: number | null }>({
+    rev: 0,
+    nonce: null,
+  });
+  const requestedTarget =
+    openRequest && openRequest.nonce !== probeMark.nonce ? openRequest.target : null;
+  const bootSrc = useMemo(
+    () => swayBootSrc(requestedTarget),
+    // probeMark.rev is read by swayBootSrc through localStorage, not as a value.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [requestedTarget, probeMark.rev],
+  );
+  // Keyed on the nonce, so a second request for the same scene reloads too.
+  const frameKey = openRequest?.nonce ?? 0;
+
+  // A new request mounts a new iframe. Its document has not said hello, and
+  // frames queued for the old one do not apply to it.
+  useEffect(() => {
+    if (!openRequest) return;
+    readyRef.current = false;
+    pendingRef.current = [];
+    setChildReady(false);
+  }, [openRequest]);
+
   // --- is there a build to show? -------------------------------------------
   const probe = useCallback(async () => {
+    // The next iframe reads recents again; a request already booted gives way.
+    setProbeMark((p) => ({
+      rev: p.rev + 1,
+      nonce: useSwayOpenStore.getState().request?.nonce ?? null,
+    }));
     setEmbedState('checking');
     try {
       const res = await fetch('/api/sway/url');
@@ -231,6 +558,8 @@ export const SwayView: React.FC = () => {
   }, [embedState, active, post]);
 
   // --- audio analysis -------------------------------------------------------
+  // childReady is a dependency so a cockpit reloaded into another scene is told
+  // its audio source again once it says hello.
   useEffect(() => {
     if (embedState !== 'ready') return;
     if (audioSource !== 'thedaw') {
@@ -290,7 +619,7 @@ export const SwayView: React.FC = () => {
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [embedState, audioSource, active, post]);
+  }, [embedState, audioSource, active, childReady, post]);
 
   const buildLabel = useMemo(() => {
     if (!build) return null;
@@ -345,6 +674,8 @@ export const SwayView: React.FC = () => {
             <option value="input">Input device</option>
           </select>
 
+          <SceneMenu />
+
           <span className={`ml-auto text-[8px] font-mono ${hardwareTone}`}>{hardwareLabel}</span>
           <span className="text-[8px] font-mono text-zinc-600">
             · {embedState === 'ready' ? (childReady ? 'linked' : 'loading…') : embedState}
@@ -354,8 +685,9 @@ export const SwayView: React.FC = () => {
 
         {embedState === 'ready' ? (
           <iframe
+            key={frameKey}
             ref={iframeRef}
-            src={swayBootSrc()}
+            src={bootSrc}
             title="SwayCommand"
             onLoad={handleIframeLoad}
             // midi: the cockpit's own learn UI reads relayed frames, but the

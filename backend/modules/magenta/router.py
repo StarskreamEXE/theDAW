@@ -40,6 +40,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from . import sidecar
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -137,6 +138,7 @@ def _normalize_style_audio(audio_bytes: bytes) -> bytes:
             ],
             input=audio_bytes,
             capture_output=True,
+            env=child_env(),
         )
         if proc.returncode != 0:
             err = proc.stderr.decode("utf-8", "replace")[:200] if proc.stderr else "?"

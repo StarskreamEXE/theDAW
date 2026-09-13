@@ -1,6 +1,8 @@
 import React, { useMemo } from 'react';
 import { Download, Gamepad2 } from 'lucide-react';
 import { notationArtifactUrl, type NotationArtifact } from '../../../../lib/notationClient';
+import { basenameOf } from '../../../../lib/placesClient';
+import { saveFile } from '../../../../lib/saveFile';
 import { allowedModes, usePlayAlongStore } from '../../../../state/playAlongStore';
 import { describeArtifact } from '../scoreShared';
 import { DIFFICULTY_LABELS, levelFolderName, parseBeatSaberMeta, totalNotes } from './beatsaberMeta';
@@ -30,6 +32,8 @@ export const BeatSaberPackView: React.FC<BeatSaberPackViewProps> = ({ artifact, 
   );
   const sourceCanHighway = !!source && allowedModes(source.kind).includes('highway');
   const folder = levelFolderName(artifact.path, meta.folder);
+  const baseName = basenameOf(artifact.path) || 'beatsaber-level';
+  const zipName = /\.zip$/i.test(baseName) ? baseName : `${baseName}.zip`;
   const total = totalNotes(meta);
 
   const openHighway = () => {
@@ -122,7 +126,11 @@ export const BeatSaberPackView: React.FC<BeatSaberPackViewProps> = ({ artifact, 
             className="btn-ghost text-[9px] py-1 px-2 flex items-center gap-1"
             href={notationArtifactUrl(artifact.id)}
             download
-            title="Download the zipped level"
+            onClick={(e) => {
+              e.preventDefault();
+              void saveFile({ url: notationArtifactUrl(artifact.id), suggestedName: zipName, kind: 'zip' });
+            }}
+            title="Save the zipped level"
           >
             <Download className="w-3 h-3" aria-hidden="true" /> DOWNLOAD ZIP
           </a>

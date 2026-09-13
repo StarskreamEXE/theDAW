@@ -188,6 +188,7 @@ export const ProjectModal: React.FC = () => {
                 name="project_default_dir"
                 label="Default folder"
                 kind="folder"
+                pickKind="tasmo"
                 value={defaultDir}
                 onChange={setDefaultDir}
                 placeholder="Default .tasmo folder"
@@ -199,6 +200,7 @@ export const ProjectModal: React.FC = () => {
                 name="project_save_path"
                 label="Save to"
                 kind="save"
+                pickKind="tasmo"
                 fileFilter={TASMO_FILTER}
                 saveName={saveName}
                 saveExt="tasmo"
@@ -241,6 +243,7 @@ export const ProjectModal: React.FC = () => {
                 name="project_open_path"
                 label="Open .tasmo"
                 kind="file"
+                pickKind="tasmo"
                 fileFilter={TASMO_FILTER}
                 value={openPath}
                 onChange={setOpenPath}
