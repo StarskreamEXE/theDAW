@@ -1,6 +1,6 @@
 import React, { useRef, useMemo, useEffect, useState, useCallback } from 'react';
 import {
-  Play, Pause, Square, X, Plus,
+  Play, Square, X, Plus,
   Scissors, Mic2, Search, ChevronDown,
   LayoutList, AudioWaveform, Volume2, Sliders,
   Wand2, Loader2, BookOpen, Layers, Sparkles, Download,
@@ -16,6 +16,7 @@ import { LibraryPicker, MIDI_ONLY_TABS, type PickerAnchor } from '../components/
 import { renderMidiBufferToBlob } from '../lib/midiSynth';
 import { uuid } from '../orb-kit/utils';
 import { InfoTip } from '../components/ui/Tooltip';
+import { SurfacePlayKey } from '../components/ui/SurfacePlayKey';
 import { RICH_TOOLTIPS } from '../components/ui/tooltips';
 import { GENERATION_PRESETS, type GenerationPreset } from '../data/generationPresets';
 import { enhanceStableAudioPrompt } from '../orb-kit/promptEnhancer';
@@ -56,12 +57,9 @@ function FullAudioPlayer() {
   const [vol, setVol] = useState(1);
   const fmt = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
   return (
-    <div className="flex items-center gap-2 px-1">
-      <button onClick={toggle} title={isPlaying ? 'Pause (footer)' : 'Play (footer)'}
-        className="text-purple-400 hover:text-purple-300 cursor-pointer w-6 h-6 rounded-full bg-purple-500/10 flex items-center justify-center shrink-0">
-        {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5 ml-0.5" />}
-      </button>
-      <button onClick={stop} title="Stop" className="text-zinc-400 hover:text-zinc-200 cursor-pointer shrink-0">
+    <div className="flex items-center gap-2 px-1 min-h-6">
+      <SurfacePlayKey pauses playing={isPlaying} onToggle={toggle} what="the output" title={isPlaying ? 'Pause (footer)' : 'Play (footer)'} />
+      <button type="button" onClick={stop} title="Stop" aria-label="Stop the output" className="h-5.5 w-5.5 grid place-items-center rounded text-zinc-400 hover:text-zinc-200 cursor-pointer shrink-0">
         <Square className="w-3.5 h-3.5" />
       </button>
       <span className="text-[10px] font-mono text-zinc-400 tabular-nums shrink-0">{fmt(time)} / {fmt(dur)}</span>

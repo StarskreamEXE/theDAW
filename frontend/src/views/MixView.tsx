@@ -4,7 +4,7 @@ import { persist } from 'zustand/middleware';
 import {
   Upload, X, Eye, EyeOff, ChevronLeft, ChevronRight, ChevronUp, ChevronDown, Trash2,
   Download, Send, Sparkles, Plus, Gauge, History, Library, LayoutList, Grid3x3,
-  Plug, RefreshCw, Loader2, Play, Pause, Square, Blocks, FolderOpen, SlidersHorizontal,
+  Plug, RefreshCw, Loader2, Square, Blocks, FolderOpen, SlidersHorizontal,
   AudioWaveform, Activity, Layers,
 } from 'lucide-react';
 import { effectiveZoom } from '../lib/canvasScale';
@@ -25,6 +25,7 @@ import { EffectsVizPanel } from './EffectsVizPanel';
 import { EffectControls } from '../components/audio/effects/EffectControls';
 import { schemaForEffectId } from '../components/audio/effects/effectSchema';
 import { EffectGuiStage } from '../components/audio/EffectGuiStage';
+import { SurfacePlayKey } from '../components/ui/SurfacePlayKey';
 import { VstEmbedHost } from '../components/audio/VstEmbedHost';
 import { TheOwl } from '../components/audio/TheOwl';
 import { ModuleThumb } from '../components/audio/ModuleThumb';
@@ -155,7 +156,7 @@ const sectionTitle = 'text-[10px] font-black uppercase tracking-widest text-purp
    processed output). Drives the global player engine; the row whose label is
    currently loaded shows the live play/pause state so either can be auditioned
    at any time. ── */
-const MixTransport: React.FC<{ url: string | null; label: string }> = ({ url, label }) => {
+const MixTransport: React.FC<{ url: string | null; label: string; what: string }> = ({ url, label, what }) => {
   const isPlaying = usePlayerStore((s) => s.isPlaying);
   const currentLabel = usePlayerStore((s) => s.currentLabel);
   const isActive = currentLabel === label;
@@ -173,26 +174,19 @@ const MixTransport: React.FC<{ url: string | null; label: string }> = ({ url, la
   const stop = () => { if (isActive) usePlayerStore.getState().stop(); };
 
   return (
-    <>
+    <div className="flex items-center gap-1 shrink-0">
+      <SurfacePlayKey pauses playing={playing} onToggle={() => void toggle()} what={what} disabled={!url} />
       <button
-        onClick={() => void toggle()}
-        disabled={!url}
-        title={playing ? 'Pause' : 'Play'}
-        aria-label={playing ? 'Pause' : 'Play'}
-        className="p-1 rounded text-zinc-400 hover:text-purple-200 hover:bg-white/5 disabled:opacity-30 disabled:cursor-not-allowed"
-      >
-        {playing ? <Pause className="w-3 h-3" /> : <Play className="w-3 h-3" />}
-      </button>
-      <button
+        type="button"
         onClick={stop}
         disabled={!url || !isActive}
         title="Stop"
-        aria-label="Stop"
-        className="p-1 rounded text-zinc-400 hover:text-red-200 hover:bg-white/5 disabled:opacity-30 disabled:cursor-not-allowed"
+        aria-label={`Stop ${what}`}
+        className="h-5.5 w-5.5 grid place-items-center rounded text-zinc-400 hover:text-red-200 hover:bg-white/5 disabled:opacity-30 disabled:cursor-not-allowed"
       >
         <Square className="w-3 h-3" />
       </button>
-    </>
+    </div>
   );
 };
 
@@ -323,7 +317,9 @@ interface VizRackRowProps {
   open: boolean;
   onToggleOpen: () => void;
   bodyPx: number;
-  /** Header items (stats · transport · actions), shown in both states. */
+  /** The row's play key and stop, leading the header in both states. */
+  transport: React.ReactNode;
+  /** Header items (stats · actions), shown in both states. */
   extra: React.ReactNode;
   /** Show the "processing chain…" scrim (output row while the chain runs). */
   busy?: boolean;
@@ -335,7 +331,8 @@ interface VizRackRowProps {
 
 /** One rack row: the full MixVizRow card when open, a single-line strip that
  *  keeps every control (view toggle, overlay, stats, transport, actions) when
- *  collapsed. The chevron is the last header item in both states. */
+ *  collapsed. The transport is the first header item and the chevron the last,
+ *  in both states. */
 const VizRackRow: React.FC<VizRackRowProps> = (p) => {
   const chevron = (
     <button
@@ -366,6 +363,7 @@ const VizRackRow: React.FC<VizRackRowProps> = (p) => {
             playLabel={p.playLabel}
             mode={p.mode} onMode={p.onMode} overlay={p.overlay} onToggleOverlay={p.onToggleOverlay}
             placeholder={p.placeholder}
+            headerLead={p.transport}
             headerExtra={extra}
           />
           {p.busy && (
@@ -376,6 +374,7 @@ const VizRackRow: React.FC<VizRackRowProps> = (p) => {
         </div>
       ) : (
         <div className="h-6 flex items-center gap-2 px-2 rounded-lg border bg-black/40" style={{ borderColor: `${p.accent}55` }}>
+          {p.transport}
           <span className="text-[10px] font-black uppercase tracking-[0.18em] shrink-0" style={{ color: `var(--mix-label, ${p.accent})`, textShadow: `0 0 8px ${p.accent}` }}>{p.label}</span>
           <div className="flex items-center gap-0.5 bg-black/40 rounded p-0.5 shrink-0">
             <button type="button" onClick={() => p.onMode('wave')} aria-pressed={p.mode === 'wave'} aria-label={`${p.label}: waveform view`} title="Waveform" className={vizTabBtn(p.mode === 'wave')}>
@@ -460,12 +459,12 @@ const MixVizRack: React.FC<MixVizRackProps> = (p) => {
         mode={p.inputMode} onMode={p.setInputMode} overlay={p.inputOverlay} onToggleOverlay={p.toggleInputOverlay}
         open={inputOpen} onToggleOpen={() => prefs.setRow('input', inputOpen ? 'closed' : 'open')}
         bodyPx={prefs.bodyPx}
+        transport={<MixTransport url={p.sourceUrl} label="MIX Input" what="the input" />}
         wrapperClassName={p.dragOverSource ? 'rounded-lg ring-1 ring-purple-500/60 bg-purple-500/5' : ''}
         onDrop={p.onDrop} onDragOver={p.onDragOver} onDragLeave={p.onDragLeave}
         extra={
           <>
             {p.srcStats && <StatRow stats={p.srcStats} />}
-            <MixTransport url={p.sourceUrl} label="MIX Input" />
             <button
               type="button"
               onClick={p.onClickUpload}
@@ -490,11 +489,11 @@ const MixVizRack: React.FC<MixVizRackProps> = (p) => {
         mode={p.outputMode} onMode={p.setOutputMode} overlay={p.outputOverlay} onToggleOverlay={p.toggleOutputOverlay}
         open={outputOpen} onToggleOpen={() => prefs.setRow('output', outputOpen ? 'closed' : 'open')}
         bodyPx={prefs.bodyPx}
+        transport={<MixTransport url={p.outputUrl} label="MIX Output" what="the output" />}
         busy={p.isChainProcessing}
         extra={
           <>
             {p.outStats && <StatRow stats={p.outStats} />}
-            <MixTransport url={p.outputUrl} label="MIX Output" />
             <button type="button" onClick={p.onDownload} disabled={!p.outputUrl} title="Save" aria-label="Save the processed output" className="p-1 rounded text-zinc-400 hover:text-green-200 hover:bg-white/5 disabled:opacity-30 disabled:cursor-not-allowed"><Download className="w-3 h-3" /></button>
             <button type="button" onClick={p.onSendToDAW} disabled={!p.outputUrl} title="Send to Edit" aria-label="Send the output to the Edit tab" className="p-1 rounded text-zinc-400 hover:text-emerald-200 hover:bg-white/5 disabled:opacity-30 disabled:cursor-not-allowed"><Send className="w-3 h-3" /></button>
             <button type="button" onClick={p.onSendToInpaint} disabled={!p.outputUrl} title="Send to Inpaint" aria-label="Send the output to Inpaint" className="p-1 rounded text-zinc-400 hover:text-purple-200 hover:bg-white/5 disabled:opacity-30 disabled:cursor-not-allowed"><Sparkles className="w-3 h-3" /></button>

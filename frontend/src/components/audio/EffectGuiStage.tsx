@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { LayoutGrid, Pause, Play } from 'lucide-react';
+import { LayoutGrid } from 'lucide-react';
+import { SurfacePlayKey } from '../ui/SurfacePlayKey';
 import type { StudioModule } from '../../lib/moduleCatalog';
 
 /* ── EffectGuiStage ──────────────────────────────────────────────────────────
@@ -108,15 +109,7 @@ export const EffectGuiStage: React.FC<{
   return (
     <div className={`h-full w-full min-h-0 overflow-hidden bg-[#07080c] flex flex-col ${className ?? ''}`}>
       <div className="h-6 shrink-0 flex items-center px-1.5 bg-[#0a0c14] border-b border-[#1a1d28]">
-        <button
-          type="button"
-          onClick={togglePlay}
-          aria-label={playing ? 'Pause preview' : 'Play preview'}
-          aria-pressed={playing}
-          className="w-5 h-5 flex items-center justify-center rounded text-zinc-400 hover:text-zinc-100 hover:bg-white/5"
-        >
-          {playing ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
-        </button>
+        <SurfacePlayKey pauses playing={playing} onToggle={togglePlay} what="the preview" />
       </div>
       <iframe
         ref={iframeRef}

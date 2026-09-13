@@ -15,7 +15,7 @@
  * and primary ink so it reads on every theme.
  */
 import React, { useEffect, useMemo, useState } from 'react';
-import { Play, Square } from 'lucide-react';
+import { Play } from 'lucide-react';
 import { useLoomStore, type EdgeSel } from '../state/loomStore';
 import { useShardIndexStore, type ShardRow } from '../state/shardIndexStore';
 import { useLibraryStore } from '../state/libraryStore';
@@ -26,6 +26,7 @@ import * as shards from '../lib/shardEngine';
 import { GEN_BLURB, GEN_GLYPH, GEN_KINDS, type GenKind } from '../lib/loomGen';
 import { DEFAULT_SEED } from '../lib/loomEngine';
 import { ColonyCanvas } from '../components/loom/ColonyCanvas';
+import { SurfacePlayKey } from '../components/ui/SurfacePlayKey';
 import { findNode, GRAINS, graphAt, meterText, parseColony, serializeColony, SPACE_MODES, walkNodes, type ColonyNode, type GateNode, type LoopNode, type Meter, type ModNode, type RuleNode } from '../lib/colony';
 import { cellColor, KIND_COLOR, ROLE_COLOR, rgba } from '../lib/loomPalette';
 
@@ -73,18 +74,7 @@ export function LoomView(): React.ReactElement {
   return (
     <div className="absolute inset-0 flex flex-col bg-[#07050a] et-ink loom-surface">
       <header data-tour="loom-clock" className="flex flex-wrap items-center gap-x-4 gap-y-1.5 px-3 py-1.5 border-b border-white/15 bg-black/30 shrink-0">
-        <button
-          type="button"
-          onClick={toggle}
-          aria-label={running ? 'Stop the colony' : 'Play the colony'}
-          aria-pressed={running}
-          className={`flex items-center gap-1.5 rounded-md border px-3 py-1 text-xs font-mono font-semibold uppercase tracking-wider transition-colors ${
-            running ? 'border-amber-300 bg-amber-400/25 et-ink' : 'border-white/30 et-ink hover:bg-white/10'
-          }`}
-        >
-          {running ? <Square className="w-3 h-3 fill-current" /> : <Play className="w-3 h-3 fill-current" />}
-          {running ? 'Stop' : 'Play'}
-        </button>
+        <SurfacePlayKey size="bar" playing={running} onToggle={toggle} what="the colony" />
 
         <div className="flex items-center gap-1.5">
           <label htmlFor="loom-bpm" className={label}>BPM</label>
