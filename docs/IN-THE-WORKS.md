@@ -357,12 +357,29 @@ driven in the live app yet; items stay here until that happens.
   — M — `frontend/src/components/loom/ColonyCanvas.tsx`,
   `frontend/src/components/loom/tendril.ts`,
   `frontend/src/components/loom/gooeyOrb.ts`, tests via `npm run test:loom`
-- [ ] **Copilot on the `fix-learn-graph-fills-panel` PR: the wrapper guard reads
-  a fixed window.** It pairs a counter-zoom with a width or height only within
+- [ ] **Copilot on PR #172 (merged as `3e97b0f`): the wrapper guard reads a fixed
+  window.** It pairs a counter-zoom with a width or height only within
   four lines either side, so moving the size above the zoom or adding
   properties between them hides the regression while the test passes. Inspect
   the whole style object, or parse the TSX. — XS —
   `frontend/src/components/library/lineageWrapperGuards.test.ts:37-40`
+
+## P1 — security, from the 2026-09-13 review of the known-paths work (not from the user)
+
+- [ ] **The backend answers any client on the LAN.** It binds 0.0.0.0 with CORS
+  `*`. `refuse_cross_site` refuses pages from other origins and lets every
+  request without browser headers through, so a script on another machine
+  reaches every route. Two routes predate the known-paths work and need the
+  gate most: `POST /api/project/save` with `embed_audio` reads any path named
+  in the body into a `.tasmo` written at any path (`_gather_embedded_audio`),
+  and `POST /api/plugin/reveal` starts Explorer on any existing path. Design
+  from the review: the backend generates a per-launch secret; Electron main and
+  the Vite proxy send it as a header (the Pinokio launcher starts both
+  processes, so it can hand the secret to each); write, pick, reveal, backup and
+  places routes require it; the Host header is checked against loopback, the
+  machine's names and its LAN addresses. — M — `backend/lib/cross_site.py`,
+  `backend/modules/project/router.py`, `backend/modules/plugin/router.py`,
+  `backend/server.py`, `electron-ui/main/index.ts`, `frontend/vite.config.ts`
 
 ## P1 — from the user, 2026-09-12 (marked done only when the user says so)
 
