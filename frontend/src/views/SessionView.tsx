@@ -170,6 +170,7 @@ export const SessionView: React.FC = () => {
             name="session_import_path"
             label="Open"
             kind="file"
+            pickKind="tasmo"
             inline
             fileFilter={SESSION_IMPORT_FILTER}
             value={sourcePath}

@@ -33,6 +33,7 @@ import time
 from collections import deque
 from pathlib import Path
 from typing import Any, Optional
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -122,6 +123,7 @@ class AkvjSidecar:
                 [sys.executable, "-c", IMPORT_PROBE],
                 capture_output=True,
                 timeout=30,
+                env=child_env(),
             )
             self._deps_ok = r.returncode == 0
             return self._deps_ok
@@ -142,6 +144,7 @@ class AkvjSidecar:
                 capture_output=True,
                 text=True,
                 timeout=30,
+                env=child_env(),
             )
         except (subprocess.TimeoutExpired, OSError) as e:
             return False, str(e)
@@ -166,6 +169,7 @@ class AkvjSidecar:
                     capture_output=True,
                     text=True,
                     timeout=BOOTSTRAP_TIMEOUT_SEC,
+                    env=child_env(),
                 )
             except (subprocess.TimeoutExpired, OSError) as e:
                 last_err = f"{cmd[0]}: {e}"
@@ -258,7 +262,7 @@ class AkvjSidecar:
                 self._record(f"ABORT: {msg}")
                 return {"ok": False, "error": msg}
 
-            env = dict(os.environ)
+            env = child_env()
             env["AKVJ_WS_URL"] = str(overrides.get("ws_url") or _default_ws_url())
             if overrides.get("fps"):
                 env["AKVJ_FPS"] = str(overrides["fps"])

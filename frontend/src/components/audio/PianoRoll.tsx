@@ -638,8 +638,8 @@ export const PianoRollClearKey: React.FC = () => (
   />
 );
 
-/** Download the roll as a Standard MIDI File at its own BPM and time signatures, lane repeats written out. */
-export const exportRollMidi = (): void => {
+/** Save the roll as a Standard MIDI File at its own BPM and time signatures, lane repeats written out. */
+export const exportRollMidi = async (): Promise<void> => {
   const { notes: stored, bpm, totalSteps, lanes, meterMap, pickupSteps } = usePianoRollStore.getState();
   if (stored.length === 0) {
     logError('piano-roll', 'No notes to export');
@@ -648,7 +648,7 @@ export const exportRollMidi = (): void => {
   const notes = playedRollNotes(stored, lanes, totalSteps);
   const ppq = 480;
   const midiNotes = pianoNotesToMidiNotes(notes, ppq);
-  downloadMidi(
+  const result = await downloadMidi(
     {
       ppq,
       bpm,
@@ -661,7 +661,9 @@ export const exportRollMidi = (): void => {
     },
     'piano-roll',
   );
-  logInfo('piano-roll', `Exported ${notes.length} notes as MIDI`);
+  // A cancelled or failed save exported nothing; saveFile already logged a failure.
+  if (result.path) logInfo('piano-roll', `Exported ${notes.length} notes as MIDI to ${result.path}`);
+  else if (result.downloaded) logInfo('piano-roll', `Exported ${notes.length} notes as MIDI`);
 };
 
 export const importMidiFileToRoll = (file: File): void => {

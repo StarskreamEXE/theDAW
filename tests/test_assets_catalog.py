@@ -2,8 +2,9 @@
 
 A catalog file is data written by hand, so the parser's job is to drop a bad
 entry and keep the rest. Install is the other half: each format has one place
-it belongs, and a second install of the same item must not overwrite the copy
-the user has since edited.
+it belongs, a second install of the same item must not overwrite the copy the
+user has since edited, and every install is remembered so the library can open
+what it installed after a reload.
 """
 
 from __future__ import annotations
@@ -14,13 +15,30 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from backend.lib import known_paths
 from backend.modules.assets import catalog
+from backend.modules.plugin import router as plugin_router
+from backend.modules.plugin.gan_file import GanFile
+from backend.modules.plugin.owl_import import import_vst_foundry
 from backend.server import app
 
 
 @pytest.fixture
 def client() -> TestClient:
     return TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def projects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """known_paths and the projects folder inside tmp_path, so no test reads
+    or writes the real store or the user's Documents folder."""
+    monkeypatch.setattr(
+        known_paths, "_STORE_PATH", tmp_path / "state" / "known_paths.json"
+    )
+    monkeypatch.setattr(known_paths, "_GRANTS", {})
+    folder = tmp_path / "Documents" / "theDAW Projects"
+    known_paths.set_projects_dir(folder)
+    return folder
 
 
 @pytest.fixture
@@ -71,6 +89,62 @@ def bundled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     return root
 
 
+@pytest.fixture
+def gan_catalog(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
+    """A catalog holding one real .gan, with the plugin shelf in tmp_path.
+    Returns the plugin id inside the package."""
+    root = tmp_path / "examples"
+    (root / "plugins").mkdir(parents=True)
+    foundry = tmp_path / "foundry.json"
+    foundry.write_text(
+        json.dumps(
+            {
+                "canvasWidth": 400,
+                "canvasHeight": 300,
+                "elements": [
+                    {
+                        "id": "k1",
+                        "name": "Cutoff",
+                        "type": "Knob",
+                        "x": 10,
+                        "y": 20,
+                        "width": 80,
+                        "height": 80,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest, assets = import_vst_foundry(str(foundry), name="Shelf Demo")
+    GanFile.save(manifest, assets, str(root / "plugins" / "shelf-demo.gan"))
+    (root / "catalog.json").write_text(
+        json.dumps(
+            {
+                "assets": [
+                    {
+                        "id": "plugin-shelf-demo",
+                        "name": "Shelf Demo",
+                        "file": "plugins/shelf-demo.gan",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(catalog, "EXAMPLES_DIR", root)
+    monkeypatch.setattr(catalog, "BUNDLED_CATALOG", root / "catalog.json")
+    monkeypatch.setattr(catalog, "user_catalog_dir", lambda: tmp_path / "userdata")
+    monkeypatch.setattr(plugin_router, "GAN_DIR", tmp_path / "plugins")
+    monkeypatch.setattr(plugin_router, "RUNTIME_DIR", tmp_path / "plugins" / "_runtime")
+    return manifest.id
+
+
+def _row(client: TestClient, asset_id: str) -> dict:
+    rows = client.get("/api/assets").json()["assets"]
+    return next(r for r in rows if r["id"] == asset_id)
+
+
 def test_bad_entries_are_dropped_and_the_rest_survive(bundled: Path) -> None:
     entries = {e.id: e for e in catalog.load_entries()}
     assert set(entries) == {"demo", "missing-file"}
@@ -110,14 +184,18 @@ def test_user_catalog_overrides_a_bundled_id(
     assert entries["demo"].name == "My Own Demo"
 
 
-def test_listing_and_detail_over_http(client: TestClient, bundled: Path) -> None:
+def test_listing_and_detail_over_http(
+    client: TestClient, bundled: Path, projects: Path
+) -> None:
     body = client.get("/api/assets").json()
     assert body["count"] == 2
     assert {a["id"] for a in body["assets"]} == {"demo", "missing-file"}
+    assert all(a["installed_path"] is None for a in body["assets"])
 
     one = client.get("/api/assets/demo").json()
     assert one["name"] == "Demo Project"
-    assert one["installs_to"].endswith("theDAW Projects")
+    assert one["installs_to"] == str(projects)
+    assert one["installed_path"] is None
 
     assert client.get("/api/assets/nope").status_code == 404
     assert client.get("/api/assets/demo/cover").status_code == 200
@@ -132,15 +210,10 @@ def test_facets_count_every_axis(client: TestClient, bundled: Path) -> None:
 
 
 def test_installing_twice_reuses_the_copy_on_disk(
-    client: TestClient, bundled: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    client: TestClient, bundled: Path, projects: Path
 ) -> None:
     """Pressing the button twice used to leave demo (2) and demo (3) behind. An
     untouched copy is the same file, so the second press has nothing to do."""
-    projects = tmp_path / "Documents" / "theDAW Projects"
-    monkeypatch.setattr(
-        "backend.modules.assets.router._install_path", lambda entry: projects
-    )
-
     first = client.post("/api/assets/demo/install").json()
     assert Path(first["path"]).name == "demo.tasmo"
     assert first["already"] is False
@@ -151,16 +224,9 @@ def test_installing_twice_reuses_the_copy_on_disk(
     assert [p.name for p in sorted(projects.iterdir())] == ["demo.tasmo"]
 
 
-def test_an_edited_copy_is_never_overwritten(
-    client: TestClient, bundled: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_an_edited_copy_is_never_overwritten(client: TestClient, bundled: Path) -> None:
     """The copy the user has worked on differs from the shipped file, so a fresh
     install lands beside it under a numbered name."""
-    projects = tmp_path / "Documents" / "theDAW Projects"
-    monkeypatch.setattr(
-        "backend.modules.assets.router._install_path", lambda entry: projects
-    )
-
     first = Path(client.post("/api/assets/demo/install").json()["path"])
     first.write_bytes(b"the user has been working on this")
 
@@ -168,6 +234,171 @@ def test_an_edited_copy_is_never_overwritten(
     assert Path(second["path"]).name == "demo (2).tasmo"
     assert second["already"] is False
     assert first.read_bytes() == b"the user has been working on this"
+
+
+def test_a_project_installs_into_the_projects_folder_the_user_chose(
+    client: TestClient, bundled: Path, tmp_path: Path
+) -> None:
+    chosen = tmp_path / "Elsewhere" / "Songs"
+    known_paths.set_projects_dir(chosen)
+
+    assert client.get("/api/assets/demo").json()["installs_to"] == str(chosen)
+    body = client.post("/api/assets/demo/install").json()
+    assert Path(body["path"]) == chosen / "demo.tasmo"
+    assert body["where"] == str(chosen)
+    assert body["kind"] == "project"
+    assert "plugin_id" not in body
+
+
+def test_an_install_is_remembered_and_listed_after_a_reload(
+    client: TestClient, bundled: Path
+) -> None:
+    """The library loses its in-memory state on reload; the rows it fetches
+    next must still say where the item went."""
+    path = client.post("/api/assets/demo/install").json()["path"]
+
+    assert known_paths.installed_asset_path("demo") == path
+    assert _row(client, "demo")["installed_path"] == path
+    assert client.get("/api/assets/demo").json()["installed_path"] == path
+
+    [recent] = known_paths.recent(kind="tasmo")
+    assert (recent["path"], recent["source"], recent["servable"]) == (
+        path,
+        "install",
+        True,
+    )
+    assert known_paths.last_folder("tasmo") == str(Path(path).parent)
+
+
+def test_a_second_press_is_remembered_too(
+    client: TestClient,
+    bundled: Path,
+    projects: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An install made before installs were recorded answers 'already' on the
+    next press, and that press is what records it."""
+    first = client.post("/api/assets/demo/install").json()["path"]
+    monkeypatch.setattr(
+        known_paths, "_STORE_PATH", tmp_path / "fresh" / "known_paths.json"
+    )
+    known_paths.set_projects_dir(projects)
+    assert known_paths.installed_asset_path("demo") is None
+
+    again = client.post("/api/assets/demo/install").json()
+    assert again["already"] is True
+    assert known_paths.installed_asset_path("demo") == first
+
+
+def test_an_unrecorded_copy_is_found_by_name_and_size(
+    client: TestClient, bundled: Path, projects: Path
+) -> None:
+    projects.mkdir(parents=True)
+    copy = projects / "demo.tasmo"
+    copy.write_bytes((bundled / "projects" / "demo.tasmo").read_bytes())
+    assert _row(client, "demo")["installed_path"] == str(copy)
+
+    copy.write_bytes(b"a different file that happens to share the name")
+    assert _row(client, "demo")["installed_path"] is None
+
+
+def test_a_deleted_install_is_no_longer_listed_as_installed(
+    client: TestClient, bundled: Path
+) -> None:
+    path = Path(client.post("/api/assets/demo/install").json()["path"])
+    path.unlink()
+    assert known_paths.installed_asset_path("demo") is None
+    assert _row(client, "demo")["installed_path"] is None
+
+
+def test_a_plugin_install_names_the_plugin_to_open(
+    client: TestClient, gan_catalog: str, tmp_path: Path
+) -> None:
+    shelf = tmp_path / "plugins" / f"{gan_catalog}.gan"
+    assert _row(client, "plugin-shelf-demo")["installed_path"] is None
+
+    first = client.post("/api/assets/plugin-shelf-demo/install").json()
+    assert first["plugin_id"] == gan_catalog
+    assert first["kind"] == "plugin"
+    assert first["path"] == str(shelf)
+    assert first["already"] is False
+    assert (plugin_router._runtime_dir(gan_catalog) / "index.html").is_file()
+
+    second = client.post("/api/assets/plugin-shelf-demo/install").json()
+    assert second["already"] is True
+    assert second["path"] == str(shelf)
+
+    [recent] = known_paths.recent(kind="gan")
+    assert (recent["path"], recent["source"]) == (str(shelf), "install")
+    assert _row(client, "plugin-shelf-demo")["installed_path"] == str(shelf)
+
+
+def test_a_plugin_install_leaves_the_gan_picker_in_the_users_folder(
+    client: TestClient, gan_catalog: str, tmp_path: Path
+) -> None:
+    """The user opened a .gan from their own folder, then installs a plugin
+    from the library. The install joins Recent, and the next .gan dialog still
+    opens where the user's file is."""
+    mine = tmp_path / "Mine" / "pad.gan"
+    mine.parent.mkdir()
+    mine.write_bytes(
+        (tmp_path / "examples" / "plugins" / "shelf-demo.gan").read_bytes()
+    )
+    known_paths.record(mine, source="pick")
+
+    body = client.post("/api/assets/plugin-shelf-demo/install").json()
+    assert body["installed"] is True
+    assert known_paths.last_folder("gan") == str(mine.parent)
+    assert [e["path"] for e in known_paths.recent(kind="gan")] == [
+        body["path"],
+        str(mine),
+    ]
+
+
+def test_a_scene_install_leaves_the_sway_picker_in_the_users_folder(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A .sway installs into data/sway-projects, theDAW's own folder, so the
+    .sway dialog keeps the folder the user last chose a scene from."""
+    monkeypatch.setenv("theDAW_DATA_DIR", str(tmp_path / "data"))
+    root = tmp_path / "examples"
+    (root / "scenes").mkdir(parents=True)
+    (root / "scenes" / "show.sway").write_text('{"version": 1}', encoding="utf-8")
+    (root / "catalog.json").write_text(
+        json.dumps(
+            {"assets": [{"id": "show", "name": "Show", "file": "scenes/show.sway"}]}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(catalog, "EXAMPLES_DIR", root)
+    monkeypatch.setattr(catalog, "BUNDLED_CATALOG", root / "catalog.json")
+    monkeypatch.setattr(catalog, "user_catalog_dir", lambda: tmp_path / "userdata")
+    mine = tmp_path / "Shows" / "opener.sway"
+    mine.parent.mkdir()
+    mine.write_text("{}", encoding="utf-8")
+    known_paths.record(mine, source="pick")
+
+    body = client.post("/api/assets/show/install").json()
+    assert Path(body["path"]) == tmp_path / "data" / "sway-projects" / "show.sway"
+    assert known_paths.last_folder("sway") == str(mine.parent)
+    assert [e["path"] for e in known_paths.recent(kind="sway")] == [
+        body["path"],
+        str(mine),
+    ]
+
+
+def test_a_plugin_on_the_shelf_is_found_by_its_manifest_id(
+    client: TestClient, gan_catalog: str, tmp_path: Path
+) -> None:
+    """The bundled plugins are built onto the shelf at startup, with no install
+    record. The shelf file is named by manifest id, not by catalog file name."""
+    shelf = tmp_path / "plugins" / f"{gan_catalog}.gan"
+    shelf.parent.mkdir(parents=True)
+    shelf.write_bytes(
+        (tmp_path / "examples" / "plugins" / "shelf-demo.gan").read_bytes()
+    )
+    assert _row(client, "plugin-shelf-demo")["installed_path"] == str(shelf)
 
 
 def test_installing_something_absent_is_a_404(

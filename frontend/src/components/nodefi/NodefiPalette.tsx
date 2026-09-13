@@ -19,6 +19,14 @@ import { useLibraryStore } from '../../state/libraryStore';
 import { useNodefiStore } from '../../state/nodefiStore';
 import { useNodefiSetsStore, setToFile, type SavedNodeSet } from '../../state/nodefiSetsStore';
 import { logError, logInfo } from '../../state/logStore';
+import { saveFile } from '../../lib/saveFile';
+import { KnownFilesMenu } from '../ui/KnownFilesMenu';
+
+// A set export is recorded under its own kind, so the Recent list beside
+// Import set offers set files and no other JSON the app saved.
+const NODEFI_SET_KIND = 'nodefi-set';
+const NODEFI_SET_KINDS = [NODEFI_SET_KIND];
+const NODEFI_SET_EXTS = ['.json'];
 
 interface NodefiPaletteProps {
   onAdd: (kind: NodeKind) => void;
@@ -126,19 +134,13 @@ export function NodefiPalette({ onAdd, onOrbDown, onLoadTemplate, onLoadSet }: N
 
   const exportSet = (s: SavedNodeSet) => {
     const blob = new Blob([JSON.stringify(setToFile(s), null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${(s.name || 'set').replace(/[^\w \-.]/g, '')}.nodefi.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    const stem = (s.name || 'set').replace(/[^\w \-.]/g, '').trim() || 'set';
+    void saveFile({ blob, suggestedName: `${stem}.nodefi.json`, kind: NODEFI_SET_KIND });
   };
 
-  const onImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    e.target.value = '';
+  // Fed by the file input and the Recent list alike.
+  const importSetFiles = async (files: File[]) => {
+    const file = files[0];
     if (!file) return;
     try {
       const entry = useNodefiSetsStore
@@ -308,14 +310,23 @@ export function NodefiPalette({ onAdd, onOrbDown, onLoadTemplate, onLoadSet }: N
           ) : (
             <div className="text-[10px] font-mono text-zinc-500 px-1">No saved sets yet.</div>
           )}
-          <button
-            type="button"
-            onClick={() => importRef.current?.click()}
-            title="Import a .nodefi.json set file"
-            className="btn-ghost w-full mt-1 text-[9px] uppercase tracking-wider"
-          >
-            Import set…
-          </button>
+          <div className="flex items-stretch gap-1 mt-1">
+            <button
+              type="button"
+              onClick={() => importRef.current?.click()}
+              title="Import a .nodefi.json set file"
+              className="btn-ghost flex-1 min-w-0 text-[9px] uppercase tracking-wider"
+            >
+              Import set…
+            </button>
+            <KnownFilesMenu
+              id="nodefi-set-import-recent"
+              exts={NODEFI_SET_EXTS}
+              kinds={NODEFI_SET_KINDS}
+              label="Recent"
+              onFiles={(files) => void importSetFiles(files)}
+            />
+          </div>
           <input
             ref={importRef}
             id="nodefi-set-import"
@@ -324,7 +335,11 @@ export function NodefiPalette({ onAdd, onOrbDown, onLoadTemplate, onLoadSet }: N
             accept="application/json,.json"
             className="hidden"
             aria-label="Import a saved set file"
-            onChange={(e) => void onImportFile(e)}
+            onChange={(e) => {
+              const files = Array.from(e.target.files ?? []);
+              e.target.value = '';
+              void importSetFiles(files);
+            }}
           />
         </div>
       </div>

@@ -37,6 +37,7 @@ import { Visualizer } from './Visualizer';
 import { BpmTapper } from './BpmTapper';
 import { RecordingHistory } from './RecordingHistory';
 import { AssistantOrb } from './AssistantOrb';
+import { saveFile, type SaveFileResult } from '../../../lib/saveFile';
 
 import { usePianoRollStore, type PianoNote } from '../../../state/pianoRollStore';
 import { encodeWav } from '../../../lib/wavEncode';
@@ -449,14 +450,19 @@ export const Vocal2MidiPanel: React.FC = () => {
     }
   }, [processedNotes, config.prompt, bpm, pushNotes]);
 
-  const handleExportMidi = () => {
+  // What a save did, for the status line: the path when it was written.
+  const savedStatus = (label: string, saved: SaveFileResult): string =>
+    saved.path ? `${label} saved: ${saved.path}`
+      : saved.downloaded ? `${label} exported`
+        : saved.cancelled ? `${label} export cancelled`
+          : `${label} export failed`;
+
+  const handleExportMidi = async () => {
     if (processedNotes.length === 0) return;
     const profile = SOUND_PROFILES[config.activeProfileId] || SOUND_PROFILES['DEFAULT'];
     const blob = generateMidiFile(processedNotes, bpm, profile, { experimentalPitchBend: config.experimentalPitchBend });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = `vocal2midi_${Date.now()}.mid`; a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    const saved = await saveFile({ blob, suggestedName: `vocal2midi_${Date.now()}.mid`, kind: 'midi' });
+    setStatus(savedStatus('MIDI', saved));
   };
 
   const handleExportWav = async () => {
@@ -464,11 +470,8 @@ export const Vocal2MidiPanel: React.FC = () => {
     setStatus('rendering WAV...');
     try {
       const blob = await getMidiSynth().renderToWav(processedNotes);
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url; a.download = `vocal2midi_${Date.now()}.wav`; a.click();
-      setTimeout(() => URL.revokeObjectURL(url), 8000);
-      setStatus('WAV exported');
+      const saved = await saveFile({ blob, suggestedName: `vocal2midi_${Date.now()}.wav`, kind: 'audio' });
+      setStatus(savedStatus('WAV', saved));
     } catch (e) {
       setStatus(`WAV export failed: ${String(e)}`);
     }
@@ -671,7 +674,7 @@ export const Vocal2MidiPanel: React.FC = () => {
             <BpmTapper currentBpm={bpm} onBpmSet={(b) => { setAudioAnalysis((prev) => prev ? { ...prev, detectedBpm: b } : { detectedBpm: b, timeSignature: '4/4', suggestedInstrument: '', description: 'tap tempo', detectedProfileId: config.activeProfileId }); patch({ manualBpm: b }); if (capturedNotes.length) applyToRoll(processedNotes, b); }} />
           </div>
           <div className="flex items-center gap-1">
-            <button type="button" onClick={handleExportMidi} disabled={processedNotes.length === 0} className={`${chip} ${chipOff} flex items-center gap-1`}><Download aria-hidden="true" className="w-3 h-3" /> <span>MIDI</span></button>
+            <button type="button" onClick={() => void handleExportMidi()} disabled={processedNotes.length === 0} className={`${chip} ${chipOff} flex items-center gap-1`}><Download aria-hidden="true" className="w-3 h-3" /> <span>MIDI</span></button>
             <button type="button" onClick={() => void handleExportWav()} disabled={processedNotes.length === 0} className={`${chip} ${chipOff} flex items-center gap-1`}><Music4 aria-hidden="true" className="w-3 h-3" /> <span>WAV</span></button>
             <button type="button" onClick={() => { setCapturedNotes([]); setProcessedNotes([]); usePianoRollStore.getState().clear(); setStatus('cleared'); }} className={`${chip} ${chipOff} flex items-center gap-1`}><Trash2 aria-hidden="true" className="w-3 h-3" /> <span>Clear</span></button>
           </div>
@@ -685,9 +688,7 @@ export const Vocal2MidiPanel: React.FC = () => {
             onClearAll={() => setRecordings([])}
             onExportAll={() => {
               const blob = new Blob([JSON.stringify(recordings, null, 2)], { type: 'application/json' });
-              const url = URL.createObjectURL(blob);
-              const a = document.createElement('a'); a.href = url; a.download = 'vocal2midi_recordings.json'; a.click();
-              setTimeout(() => URL.revokeObjectURL(url), 5000);
+              void saveFile({ blob, suggestedName: 'vocal2midi_recordings.json', kind: 'v2m-recordings' });
             }}
             onImport={(recs) => setRecordings((p) => [...recs, ...p])}
           />

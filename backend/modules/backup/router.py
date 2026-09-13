@@ -7,7 +7,12 @@ Endpoints (prefix from module.json -> ``/api/backup``):
 - ``GET  /export/status``  — poll an export job.
 - ``POST /import``         — start a background restore from a backup zip.
 - ``GET  /import/status``  — poll an import job.
-- ``GET  /pick-folder``    — native OS folder picker for the export target.
+- ``GET  /pick-folder``    — native OS folder picker for the export target. It
+  opens in the folder the last backup went to and remembers the choice.
+
+Every route refuses a call a page on another site started
+(``refuse_cross_site``): an export writes the user's keys into a zip, an import
+overwrites user data, and the manifest lists the user's folders.
 """
 
 from __future__ import annotations
@@ -16,14 +21,16 @@ import asyncio
 import logging
 from typing import Literal, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
-from backend.core.folder_dialog import pick_folder
+from backend.core import folder_dialog
+from backend.lib import known_paths
+from backend.lib.cross_site import refuse_cross_site
 from backend.modules.backup import service
 
 log = logging.getLogger(__name__)
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(refuse_cross_site)])
 
 
 @router.get("/manifest")
@@ -86,9 +93,23 @@ async def import_status(job: str = Query(...)) -> dict:
     return status
 
 
+def _pick_backup_dest() -> Optional[str]:
+    path = folder_dialog.pick_folder(
+        "Select backup folder", known_paths.last_folder("backup-dest")
+    )
+    if path:
+        known_paths.record(path, "backup-dest", source="pick")
+    return path
+
+
 @router.get("/pick-folder")
 async def pick_backup_folder() -> dict:
     """Open the native OS folder picker (blocking dialog runs out-of-process
-    with its own timeout) and return the chosen path, or null on cancel."""
-    path = await asyncio.to_thread(pick_folder, "Select backup folder")
+    with its own timeout) and return the chosen path, or null on cancel. The
+    dialog opens in the last backup folder, and a chosen folder becomes it. A
+    dialog that failed answers 500, and one that timed out answers 504."""
+    try:
+        path = await asyncio.to_thread(_pick_backup_dest)
+    except folder_dialog.PickerError as e:
+        raise HTTPException(e.status_code, str(e)) from e
     return {"path": path}

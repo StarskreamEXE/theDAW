@@ -1,6 +1,10 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Archive, FolderOpen, HardDriveDownload, HardDriveUpload, Loader2, X } from 'lucide-react';
+import { placesApi } from '../../lib/placesClient';
+import { BACKUP_ZIP_FILTER } from '../../lib/fileFilters';
+import { useProjectStore } from '../../state/projectStore';
+import { PathInput } from '../ui/PathInput';
 
 /* ------------------------------------------------------------------ */
 /* Types + defensive JSON helpers (backup backend responses)           */
@@ -165,6 +169,17 @@ export const BackupModal: React.FC<{ open: boolean; onClose: () => void }> = ({ 
   const [importMode, setImportMode] = useState<'merge' | 'replace'>('merge');
   const [importJob, setImportJob] = useState<JobView>(IDLE_JOB);
   const [importError, setImportError] = useState<string | null>(null);
+  // True while the import field holds a path the app filled in, which a newer
+  // backup may replace. Typing or picking a path clears it.
+  const importPrefilledRef = useRef(false);
+
+  const prefillImportPath = useCallback((path: string) => {
+    setImportPath((cur) => {
+      if (cur.trim() && !importPrefilledRef.current) return cur;
+      importPrefilledRef.current = true;
+      return path;
+    });
+  }, []);
 
   // Bumping the token cancels any in-flight poll loop (close/unmount).
   const tokenRef = useRef(0);
@@ -177,6 +192,9 @@ export const BackupModal: React.FC<{ open: boolean; onClose: () => void }> = ({ 
   const loadManifest = useCallback(async () => {
     setManifestError(null);
     setRoots(null);
+    // The projects root is the backend's projects folder, so this browser's
+    // folder is settled with the backend before the manifest lists it.
+    await useProjectStore.getState().ensureDefaultDir();
     try {
       const res = await fetch('/api/backup/manifest');
       if (!res.ok) throw new Error(await errText(res));
@@ -201,6 +219,22 @@ export const BackupModal: React.FC<{ open: boolean; onClose: () => void }> = ({ 
     setPickError(null);
     void loadManifest();
   }, [open, loadManifest]);
+
+  // The import field starts at the newest backup zip the app wrote or picked,
+  // and the destination at the folder the last backup went to.
+  useEffect(() => {
+    if (!open) return;
+    let live = true;
+    void placesApi.recent({ kind: 'backup-zip', limit: 1 }).then((items) => {
+      if (live && items[0]?.path) prefillImportPath(items[0].path);
+    });
+    void placesApi.folder('backup-dest').then((folder) => {
+      if (live && folder) setDestination((cur) => (cur.trim() ? cur : folder));
+    });
+    return () => {
+      live = false;
+    };
+  }, [open, prefillImportPath]);
 
   useEffect(() => {
     if (!open) return;
@@ -274,6 +308,8 @@ export const BackupModal: React.FC<{ open: boolean; onClose: () => void }> = ({ 
       if (final.state === 'error') {
         setExportError(final.error || 'Export failed.');
         setExportJob(IDLE_JOB);
+      } else if (final.zipPath) {
+        prefillImportPath(final.zipPath);
       }
     } catch (e) {
       setExportError(e instanceof Error ? e.message : 'Export failed.');
@@ -435,24 +471,21 @@ export const BackupModal: React.FC<{ open: boolean; onClose: () => void }> = ({ 
           {/* ---------------- Import ---------------- */}
           <SectionDivider label="Import" />
 
-          <div className="flex flex-col gap-1">
-            <label
-              htmlFor="backup-import-path"
-              className="text-[9px] font-mono uppercase tracking-wider text-zinc-300"
-            >
-              Backup zip
-            </label>
-            <input
-              type="text"
-              id="backup-import-path"
-              name="backup-import-path"
-              value={importPath}
-              onChange={(e) => setImportPath(e.target.value)}
-              placeholder="Path to a theDAW backup .zip"
-              disabled={busy}
-              className={INPUT_CLS}
-            />
-          </div>
+          <PathInput
+            id="backup-import-path"
+            name="backup-import-path"
+            label="Backup zip"
+            kind="file"
+            pickKind="backup-zip"
+            fileFilter={BACKUP_ZIP_FILTER}
+            value={importPath}
+            onChange={(path) => {
+              importPrefilledRef.current = false;
+              setImportPath(path);
+            }}
+            placeholder="Path to a theDAW backup .zip"
+            disabled={busy}
+          />
 
           <div className="flex items-center gap-4">
             <label

@@ -6,6 +6,7 @@ import json
 import logging
 import mimetypes
 import tempfile
+import threading
 from pathlib import Path
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -14,7 +15,8 @@ from pydantic import BaseModel
 from backend.modules.project import media_access
 from backend.modules.project.tasmo_project import TasmoProject
 from backend.modules.project.tasmo_file import TasmoFile
-from backend.lib import paths
+from backend.lib import known_paths, paths
+from backend.lib.atomic import atomic_write
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -82,12 +84,44 @@ def _load_recent() -> list[dict]:
     return entries[:MAX_RECENT]
 
 
+def _recent_stamp() -> tuple[int, int] | None:
+    """The recent file's mtime and size, or None when there is no file."""
+    try:
+        st = _RECENT_PATH.stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+# Guards _recent_files and _recent_seen: the save and load handlers run on the
+# threadpool and both rewrite the list.
+_RECENT_LOCK = threading.Lock()
+# Stamped before the read, so a write landing between the two reads again.
+_recent_seen: tuple[int, int] | None = _recent_stamp()
 _recent_files: list[dict] = _load_recent()
 
 # Projects opened before this process started still have their folders in the
 # recent list; seeding from it keeps their clips playable when the UI restores
 # a session from its own storage without re-issuing /load.
 media_access.register_paths(r["path"] for r in _recent_files)
+
+
+def _sync_recent_locked() -> None:
+    """Re-read recent_projects.json when something else has rewritten it.
+
+    A backup restore writes the file straight to disk while this process holds
+    its own copy, so without this the list served after a restore, and the one
+    the next save wrote back, was the list from before it. The restored
+    projects' folders are registered the way the startup seed registers them.
+    Call under _RECENT_LOCK.
+    """
+    global _recent_files, _recent_seen
+    stamp = _recent_stamp()
+    if stamp == _recent_seen:
+        return
+    _recent_seen = stamp
+    _recent_files = _load_recent()
+    media_access.register_paths(r["path"] for r in _recent_files)
 
 
 def _register_project_media(project: TasmoProject, *paths: str) -> None:
@@ -233,14 +267,16 @@ def project_info(path: str):
 @router.get("/recent")
 def recent_projects():
     """List recently opened/saved projects."""
-    return _recent_files
+    with _RECENT_LOCK:
+        _sync_recent_locked()
+        return list(_recent_files)
 
 
 @router.get("/default-dir")
 def default_projects_dir():
-    """Suggested default folder for .tasmo saves (created on first save). The
-    frontend persists the user's override; this is just the out-of-box default."""
-    return {"path": str(Path.home() / "Documents" / "theDAW Projects")}
+    """The folder .tasmo saves and catalog project installs go into (created on
+    first save): the one the user chose, else Documents/theDAW Projects."""
+    return {"path": str(known_paths.projects_dir())}
 
 
 def _transcode_cache_dir() -> Path:
@@ -351,17 +387,26 @@ def list_audio(path: str):
 
 
 def _add_recent(path: str, name: str) -> None:
-    """Add to recent files list (deduped, most recent first)."""
-    global _recent_files
-    entry = {"path": path, "name": name}
-    _recent_files = [r for r in _recent_files if r["path"] != path]
-    _recent_files.insert(0, entry)
-    _recent_files = _recent_files[:MAX_RECENT]
-    # Best-effort persistence: recent-list IO must never fail a save/load request.
-    try:
-        _RECENT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _RECENT_PATH.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(_recent_files, indent=2), encoding="utf-8")
-        tmp.replace(_RECENT_PATH)
-    except OSError as e:
-        log.warning("project.recent: failed to persist %s: %s", _RECENT_PATH, e)
+    """Add to recent files list (deduped, most recent first), and remember the
+    file in known_paths for the Recent menus.
+
+    The path comes from the request body, so known_paths stores it as 'client',
+    never serves it (a save can embed any file the body names) and leaves the
+    'tasmo' picker folder where it is. The Save and Open dialogs record that
+    folder through /api/storage. A Recent .tasmo reopens through
+    /api/project/load by path."""
+    global _recent_files, _recent_seen
+    with _RECENT_LOCK:
+        _sync_recent_locked()
+        entry = {"path": path, "name": name}
+        _recent_files = [r for r in _recent_files if r["path"] != path]
+        _recent_files.insert(0, entry)
+        _recent_files = _recent_files[:MAX_RECENT]
+        # Best-effort persistence: recent-list IO must never fail a save/load
+        # request.
+        try:
+            atomic_write(_RECENT_PATH, json.dumps(_recent_files, indent=2))
+            _recent_seen = _recent_stamp()
+        except OSError as e:
+            log.warning("project.recent: failed to persist %s: %s", _RECENT_PATH, e)
+    known_paths.record(path, kind="tasmo", source="client", update_folder=False)

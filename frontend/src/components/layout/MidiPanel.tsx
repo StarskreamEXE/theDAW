@@ -452,7 +452,7 @@ export const MidiPanel: React.FC = () => {
     }
   }, [assetId, loadArtifact]);
 
-  const exportMidi = useCallback(() => {
+  const exportMidi = useCallback(async () => {
     const { notes, bpm, lanes, totalSteps, meterMap, pickupSteps } = usePianoRollStore.getState();
     if (!notes.length) {
       setStatus('no notes to export');
@@ -462,8 +462,11 @@ export const MidiPanel: React.FC = () => {
     // what the roll plays (post-edit, lane repeats written out), not the stale
     // artifact, with the roll's meter at the ticks its bar starts land on.
     const played = playedRollNotes(notes, lanes, totalSteps);
-    downloadVocalMidi(pianoToArtifact(played, bpm), 'midi', { meterMap, pickupSteps, bpm });
-    setStatus(`exported ${played.length} notes to .mid`);
+    const result = await downloadVocalMidi(pianoToArtifact(played, bpm), 'midi', { meterMap, pickupSteps, bpm });
+    if (result.path) setStatus(`exported ${played.length} notes to ${result.path}`);
+    else if (result.downloaded) setStatus(`exported ${played.length} notes to .mid`);
+    else if (result.cancelled) setStatus('export cancelled');
+    else setStatus('export failed');
   }, []);
 
   const validate = useCallback(async () => {
@@ -806,7 +809,7 @@ export const MidiPanel: React.FC = () => {
                   role="menuitem"
                   onClick={() => {
                     setExportMenuOpen(false);
-                    exportRollMidi();
+                    void exportRollMidi();
                   }}
                   title="The roll at its own BPM, one track named Piano Roll (piano-roll.mid)"
                   icon={<Download className="w-3 h-3" />}
@@ -817,7 +820,7 @@ export const MidiPanel: React.FC = () => {
                   role="menuitem"
                   onClick={() => {
                     setExportMenuOpen(false);
-                    exportMidi();
+                    void exportMidi();
                   }}
                   title="Through the vocal export writer: the same notes, seconds-exact (midi.mid); the status line reports it"
                   icon={<Download className="w-3 h-3" />}

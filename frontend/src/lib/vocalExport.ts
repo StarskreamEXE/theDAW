@@ -1,8 +1,8 @@
 /**
- * vocalExport.ts - turn a VocalArtifact into a .mid download or an inpaint guide.
+ * vocalExport.ts - turn a VocalArtifact into a saved .mid or an inpaint guide.
  *
  * Reuses the existing note/render surface end to end: artifact notes (ms) map to
- * RenderNote (seconds), notesToSmf writes the SMF for a .mid download, and
+ * RenderNote (seconds), notesToSmf writes the SMF for a saved .mid, and
  * renderNotesToBlob renders a guide WAV. Arming an inpaint guide just patches
  * generateParamsStore's existing inpaint fields, so the normal Generate flow
  * regenerates the masked window (no new generate path).
@@ -13,6 +13,7 @@ import type { MeterSegment } from './meterMap';
 import { notesToSmf, rollMeterToSmfEvents } from './midiWrite';
 import type { RenderNote } from './midiSynth';
 import { renderNotesToBlob } from './midiSynth';
+import { saveFile, type SaveFileResult } from './saveFile';
 
 export interface ArtifactNote {
   start_ms: number;
@@ -60,29 +61,19 @@ export const artifactNotesToRenderNotes = (notes: ArtifactNote[]): RenderNote[] 
     velocity: n.velocity,
   }));
 
-const anchorDownload = (blob: Blob, filename: string): void => {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-};
-
 /**
- * Export the artifact notes as a .mid (type-0 SMF) and trigger a download. With
- * `meter` (the roll's map, pickup and bpm) the file carries its time signatures.
+ * Export the artifact notes as a .mid (type-0 SMF) through saveFile, which
+ * remembers the chosen path. With `meter` (the roll's map, pickup and bpm) the
+ * file carries its time signatures. Resolves with the save's outcome.
  */
 export const downloadVocalMidi = (
   notes: ArtifactNote[],
   baseName = 'vocal',
   meter?: { meterMap: MeterSegment[]; pickupSteps: number; bpm: number },
-): void => {
+): Promise<SaveFileResult> => {
   const signatures = meter ? rollMeterToSmfEvents(meter.meterMap, meter.pickupSteps, meter.bpm) : [];
   const bytes = notesToSmf(artifactNotesToRenderNotes(notes), 0, 0, signatures);
-  anchorDownload(new Blob([bytes], { type: 'audio/midi' }), `${baseName}.mid`);
+  return saveFile({ blob: new Blob([bytes], { type: 'audio/midi' }), suggestedName: `${baseName}.mid`, kind: 'midi' });
 };
 
 /** Render the artifact notes to a guide WAV (soundfont when active, else the

@@ -20,10 +20,12 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from backend.core.folder_dialog import pick_open_file
+from backend.core.folder_dialog import PickerError, pick_open_file
+from backend.lib import known_paths
+from backend.lib.cross_site import refuse_cross_site
 from backend.modules.quest import service
 
 log = logging.getLogger(__name__)
@@ -121,18 +123,33 @@ async def quest_fetch_apk() -> dict:
         log.warning("quest: APK download failed: %s", exc)
         raise HTTPException(status_code=502, detail=f"APK download failed: {exc}")
     await asyncio.to_thread(service.save_config, {"last_apk_path": result["path"]})
+    await asyncio.to_thread(known_paths.record, result["path"], "apk", "install")
     return {"ok": True, **result}
 
 
-@router.get("/pick-apk")
+@router.get("/pick-apk", dependencies=[Depends(refuse_cross_site)])
 async def quest_pick_apk() -> dict:
-    """Open the native file picker for an .apk and return the chosen path."""
+    """Open the native file picker for an .apk and return the chosen path.
+
+    The dialog opens beside the APK deployed last, else in the folder the last
+    APK the app saw landed in (a finished download counts), else Downloads. A
+    dialog that failed answers 500, and one that timed out answers 504. A page
+    on another site cannot open the dialog."""
     cfg = await asyncio.to_thread(service.load_config)
     last = cfg.get("last_apk_path")
-    initial = str(Path(last).parent) if isinstance(last, str) and last else None
-    path = await asyncio.to_thread(
-        pick_open_file, "Select the Quest APK", initial, _APK_FILTER
+    initial = (
+        str(Path(last).parent)
+        if isinstance(last, str) and last and Path(last).parent.is_dir()
+        else await asyncio.to_thread(known_paths.last_folder, "apk")
     )
+    try:
+        path = await asyncio.to_thread(
+            pick_open_file, "Select the Quest APK", initial, _APK_FILTER
+        )
+    except PickerError as e:
+        raise HTTPException(e.status_code, str(e)) from e
+    if path:
+        await asyncio.to_thread(known_paths.record, path, "apk", "pick")
     return {"path": path}
 
 

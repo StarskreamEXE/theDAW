@@ -13,8 +13,9 @@ import {
 import { sunoActions } from '../suno/sunoActions';
 import { HoverTip } from '../components/ui/Tooltip';
 import { playCatalogueEntry } from './CatalogueList';
-import { loadConvertFormats, formatsForKind, convertLibraryEntry } from '../convert/convertClient';
+import { loadConvertFormats, formatsForKind, convertLibraryEntry, entryAudioFileName } from '../convert/convertClient';
 import type { ConvertFormat } from '../convert/convertClient';
+import { saveFile } from '../lib/saveFile';
 
 export interface CatalogueContextMenuState {
   x: number;
@@ -81,7 +82,10 @@ export const CatalogueContextMenu: React.FC<Props> = ({ menu, onClose }) => {
   const doConvert = (f: ConvertFormat) => {
     setConvertMsg(`Converting to ${f.label}…`);
     convertLibraryEntry(entry.id, f, entry.title)
-      .then(() => onClose())
+      .then((saved) => {
+        if (saved.path || saved.downloaded || saved.cancelled) onClose();
+        else setConvertMsg('The converted file was not saved.');
+      })
       .catch((e) => setConvertMsg(`Convert failed: ${e instanceof Error ? e.message : String(e)}`));
   };
 
@@ -111,14 +115,8 @@ export const CatalogueContextMenu: React.FC<Props> = ({ menu, onClose }) => {
 
   const run = (fn: () => void | Promise<unknown>) => () => { void fn(); onClose(); };
 
-  const download = () => {
-    const a = document.createElement('a');
-    a.href = getAudioUrl(entry);
-    a.download = entry.audioFilename || entry.title;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-  };
+  const saveCopy = () =>
+    saveFile({ url: getAudioUrl(entry), suggestedName: entryAudioFileName(entry), kind: 'audio' });
 
   const del = () => {
     if (window.confirm(`Delete "${entry.title}"? This cannot be undone.`)) {
@@ -184,8 +182,8 @@ export const CatalogueContextMenu: React.FC<Props> = ({ menu, onClose }) => {
 
       <div className="border-t border-white/5 my-0.5" />
       <Item icon={Star} label={entry.favorite ? 'Unfavorite' : 'Favorite'} tip={entry.favorite ? 'Remove from favorites.' : 'Mark as a favorite (star).'} onClick={run(() => toggleFavorite(entry.id))} />
-      <Item icon={Download} label="Download" tip="Download the original audio file to your computer." onClick={run(download)} />
-      <Item icon={Repeat} label="Convert to…" tip="Convert this track to another format (WAV, MP3, FLAC, OGG…) via FFmpeg and download it." onClick={openConvert} />
+      <Item icon={Download} label="Download" tip="Save a copy of the original audio file." onClick={run(saveCopy)} />
+      <Item icon={Repeat} label="Convert to…" tip="Convert this track to another format (WAV, MP3, FLAC, OGG…) via FFmpeg and save it." onClick={openConvert} />
       <div className="border-t border-white/5 my-0.5" />
       <Item icon={Trash2} label="Delete" tip="Permanently delete this entry from the library. Cannot be undone." onClick={run(del)} danger />
       </>

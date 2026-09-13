@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Trash2, Download, Upload, Clock, Music, FolderOpen } from 'lucide-react';
 import type { RecordingEntry, ScaleType } from './types';
 import { NOTE_NAMES } from './constants';
+import { KnownFilesMenu } from '../../ui/KnownFilesMenu';
 
 interface RecordingHistoryProps {
   recordings: RecordingEntry[];
@@ -15,6 +16,12 @@ interface RecordingHistoryProps {
 /** Hover lift for the small icon actions (a fill, never `hover:bg-*`, which the
  *  theme scope's background remaps outrank). */
 const ICON_ACTION = 'p-1.5 rounded-xs et-ink-3 transition-[color,box-shadow] hover:shadow-[inset_0_0_0_100px_rgba(255,255,255,0.08)]';
+
+const RECENT_ID = 'vocal2midi-history-recent';
+const RECENT_EXTS = ['.json'];
+// Vocal2MidiPanel saves its recordings export under this kind, so the list
+// offers those files and no other JSON the app saved.
+const RECENT_KINDS = ['v2m-recordings'];
 
 /** Saved Vocal2MIDI takes. Ink is the theme's; the one accent marks the count
  *  and each take's glyph; destructive actions go red on hover. */
@@ -42,30 +49,36 @@ export const RecordingHistory: React.FC<RecordingHistoryProps> = ({
     return `${NOTE_NAMES[rootNote % 12]} ${scale}`;
   };
 
+  // Shared by the file dialog and the Recent menu, which hands over a file the
+  // app saved earlier.
+  const importFiles = async (files: File[]) => {
+    const file = files[0];
+    if (!file) return;
+
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+
+      // Validate it's an array of recordings
+      if (Array.isArray(data) && data.every(r => r.id && r.notes && r.timestamp)) {
+        onImport(data);
+      } else if (data.id && data.notes && data.timestamp) {
+        // Single recording
+        onImport([data]);
+      } else {
+        alert('Invalid recording file format');
+      }
+    } catch {
+      alert('Failed to parse recording file');
+    }
+  };
+
   const handleImportClick = () => {
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = '.json';
-    input.onchange = async (e) => {
-      const file = (e.target as HTMLInputElement).files?.[0];
-      if (!file) return;
-
-      try {
-        const text = await file.text();
-        const data = JSON.parse(text);
-
-        // Validate it's an array of recordings
-        if (Array.isArray(data) && data.every(r => r.id && r.notes && r.timestamp)) {
-          onImport(data);
-        } else if (data.id && data.notes && data.timestamp) {
-          // Single recording
-          onImport([data]);
-        } else {
-          alert('Invalid recording file format');
-        }
-      } catch {
-        alert('Failed to parse recording file');
-      }
+    input.onchange = (e) => {
+      void importFiles(Array.from((e.target as HTMLInputElement).files ?? []));
     };
     input.click();
   };
@@ -78,13 +91,16 @@ export const RecordingHistory: React.FC<RecordingHistoryProps> = ({
             <Clock aria-hidden="true" size={14} className="et-ink-3" />
             <span className="text-xs et-ink-2">Recording History</span>
           </div>
-          <button
-            type="button"
-            onClick={handleImportClick}
-            className="text-[10px] et-ink-3 hover:et-ink transition-colors flex items-center gap-1"
-          >
-            <Upload aria-hidden="true" size={10} /> Import
-          </button>
+          <div className="flex items-center gap-2">
+            <KnownFilesMenu id={RECENT_ID} exts={RECENT_EXTS} kinds={RECENT_KINDS} onFiles={(files) => void importFiles(files)} />
+            <button
+              type="button"
+              onClick={handleImportClick}
+              className="text-[10px] et-ink-3 hover:et-ink transition-colors flex items-center gap-1"
+            >
+              <Upload aria-hidden="true" size={10} /> Import
+            </button>
+          </div>
         </div>
         <p className="text-[10px] et-ink-3 mt-2">No recordings saved yet</p>
       </div>
@@ -109,6 +125,7 @@ export const RecordingHistory: React.FC<RecordingHistoryProps> = ({
         </button>
 
         <div className="flex items-center gap-2">
+          <KnownFilesMenu id={RECENT_ID} exts={RECENT_EXTS} kinds={RECENT_KINDS} onFiles={(files) => void importFiles(files)} />
           <button
             type="button"
             onClick={handleImportClick}

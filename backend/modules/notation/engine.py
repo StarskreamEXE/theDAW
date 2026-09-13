@@ -53,6 +53,7 @@ from typing import Any, NamedTuple, Optional, Sequence
 from backend.modules.library.db import LibraryDB
 
 from . import pdf_render
+from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
 
@@ -326,6 +327,7 @@ def _musescore_version(binary: str) -> str:
             text=True,
             timeout=20,
             stdin=subprocess.DEVNULL,
+            env=child_env(),
         )
         text = (proc.stdout or proc.stderr or "unknown").strip()
         return text.splitlines()[0][:80] if text else "unknown"
@@ -1526,6 +1528,7 @@ def _convert_with_musescore(
             timeout=180,
             stdin=subprocess.DEVNULL,
             creationflags=creationflags,
+            env=child_env(),
         )
     except (subprocess.TimeoutExpired, OSError) as exc:
         return {"ok": False, "engine": "musescore", "error": repr(exc)}

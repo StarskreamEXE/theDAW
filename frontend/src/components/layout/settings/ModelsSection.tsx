@@ -218,6 +218,7 @@ export const ModelsSection: React.FC = () => {
           value={addPath}
           onChange={setAddPath}
           kind="folder"
+          pickKind="checkpoint"
           onEnter={() => void onAdd()}
           placeholder="D:\models\my-finetune"
           description="Browse or paste a folder (or .safetensors) path. The folder needs a model config JSON next to one .safetensors file. Get the config JSON from the matching Hugging Face repo or the training/export artifact. The entry appears in the MAKE model picker."
