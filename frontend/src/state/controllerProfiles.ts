@@ -330,7 +330,7 @@ const ROWS: Row[] = [
   // "6 DIMENSIONS" placeholder before). theDAW's swayBus maps these into its six
   // named dims; exact CC per control is per-preset and bound by learn / .als
   // auto-attach (swayImportResolve). Then the 8 encoders and performance pads.
-  ['audima-sway', 'Audima Sway', 'Audima', 'generic', ['sway', 'audima'], [
+  ['audima-sway', 'Audima Labs Sway', 'Audima Labs', 'generic', ['sway', 'audima'], [
     M(['L Hand X', 'L Hand Y', 'R Hand X', 'R Hand Y', 'Strike']),
     K(1, 8, 'ENCODERS'),
     P(2, 8, 'PERF PADS'),

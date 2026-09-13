@@ -4,8 +4,8 @@
 // cockpit. A cockpit that shows theDAW's controls in its own header lists its
 // capabilities in `sway/ready` and then asks for scenes, opens them and sets the
 // audio source over the same channel. This module decides what an incoming
-// frame asks for, orders the scene rows (custom first, then built-in, each
-// newest first), reads the lists both "Open scene" and the cockpit show, and
+// frame asks for, orders the scene rows (the Gantasmo scenes theDAW ships
+// first, then the user's saves, each newest first), reads the lists both "Open scene" and the cockpit show, and
 // derives the hardware status the header shows.
 
 import { getJson } from './apiJson';
@@ -71,13 +71,13 @@ export function cockpitAction(data: unknown): CockpitAction | null {
   }
 }
 
-/** Custom scenes first, then built-in ones, each newest first. */
+/** The Gantasmo scenes theDAW ships first, then the user's saves, each newest first. */
 export function orderSceneRows(rows: SwaySceneRow[]): SwaySceneRow[] {
   const newest = (a: SwaySceneRow, b: SwaySceneRow) => b.mtime - a.mtime;
-  return [...rows.filter((r) => !r.builtin).sort(newest), ...rows.filter((r) => r.builtin).sort(newest)];
+  return [...rows.filter((r) => r.builtin).sort(newest), ...rows.filter((r) => !r.builtin).sort(newest)];
 }
 
-/** The rows of a /api/sway/projects body. A row without `builtin` is custom. */
+/** The rows of a /api/sway/projects body. A row without `builtin` is a save. */
 export function sceneRowsFrom(projects: unknown): SwaySceneRow[] {
   if (!Array.isArray(projects)) return [];
   const rows: SwaySceneRow[] = [];
@@ -145,10 +145,14 @@ export function hostScenesFrame(
 
 export type HardwareTone = 'off' | 'none' | 'ok';
 
+/** The name every label shows for the hardware. Its MIDI port is named
+ *  "Audima Labs The Sway", and ports are still matched by that name. */
+export const SWAY_HARDWARE_NAME = 'Audima Labs Sway';
+
 /** The MIDI hardware line: what theDAW's own MIDIAccess has hooked up. */
 export function hardwareStatus(midiEnabled: boolean, inputs: string[]): { hardware: string; tone: HardwareTone } {
   if (!midiEnabled) return { hardware: 'MIDI off', tone: 'off' };
   if (inputs.length === 0) return { hardware: 'no MIDI device', tone: 'none' };
-  const sway = inputs.find((n) => /sway|audima/i.test(n));
-  return { hardware: sway ? `Sway: ${sway}` : inputs.join(', '), tone: 'ok' };
+  const sway = inputs.some((n) => /sway|audima/i.test(n));
+  return { hardware: sway ? SWAY_HARDWARE_NAME : inputs.join(', '), tone: 'ok' };
 }

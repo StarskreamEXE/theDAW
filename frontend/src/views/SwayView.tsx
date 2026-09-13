@@ -141,9 +141,9 @@ async function chooseSceneFile(): Promise<string | null> {
 
 /**
  * "Open scene", in three parts:
- *   - the .sway scenes under data/sway-projects, custom ones first and then
- *     the ones the asset catalog installed, each newest first, opened by name
- *     through openSwayScene;
+ *   - the .sway scenes under data/sway-projects, the Gantasmo scenes the asset
+ *     catalog installed first and then the user's saves, each newest first,
+ *     opened by name through openSwayScene;
  *   - .sway files elsewhere that known places can serve (a Save a copy, a
  *     cockpit save that was downloaded), opened by path;
  *   - on the machine the backend runs on, a row that picks a .sway file in the
@@ -231,11 +231,11 @@ const SceneMenu: React.FC = () => {
     choose: () => void openSwayScene(row.name),
   });
 
-  // rows arrive custom first, so each group keeps their newest-first order.
+  // rows arrive already ordered, so each group keeps its newest-first order.
   const groups: SceneGroup[] = rows
     ? [
-        { key: 'custom', label: 'Custom', entries: rows.filter((r) => !r.builtin).map(sceneEntry) },
-        { key: 'builtin', label: 'Built-in', entries: rows.filter((r) => r.builtin).map(sceneEntry) },
+        { key: 'gantasmo', label: 'Gantasmo', entries: rows.filter((r) => r.builtin).map(sceneEntry) },
+        { key: 'saved', label: 'Saved', entries: rows.filter((r) => !r.builtin).map(sceneEntry) },
         {
           key: 'recent',
           label: 'Recent',
@@ -322,17 +322,17 @@ const SceneMenu: React.FC = () => {
       // No border of its own: index.css gives a bordered button the control
       // contrast floor, which would draw every row line brighter than the
       // group lines. The headings and group borders separate the list.
-      className="flex w-full flex-col items-start px-2 py-1 text-left hover:bg-fuchsia-500/15 focus:outline-none focus-visible:bg-fuchsia-500/15"
+      className="flex w-full flex-col items-start gap-0.5 px-2 py-1.5 text-left hover:bg-fuchsia-500/15 focus:outline-none focus-visible:bg-fuchsia-500/15"
     >
       {entry.action ? (
-        <span className="flex max-w-full items-center gap-1 text-[10px] font-mono text-fuchsia-200">
-          <FolderOpen className="h-3 w-3 shrink-0" aria-hidden="true" />
+        <span className="flex max-w-full items-center gap-1.5 text-sm font-semibold text-fuchsia-200">
+          <FolderOpen className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
           {entry.label}
         </span>
       ) : (
-        <span className="max-w-full truncate text-[10px] font-mono text-zinc-100">{entry.label}</span>
+        <span className="max-w-full truncate text-sm font-semibold text-zinc-100">{entry.label}</span>
       )}
-      {entry.detail && <span className="max-w-full truncate text-[8px] font-mono text-zinc-500">{entry.detail}</span>}
+      {entry.detail && <span className="max-w-full truncate text-xs font-semibold text-zinc-400">{entry.detail}</span>}
     </button>
   );
 
@@ -347,24 +347,25 @@ const SceneMenu: React.FC = () => {
         aria-expanded={open}
         aria-controls={open && entries.length > 0 ? listId : undefined}
         title="Lists saved and recent scenes and loads the one you choose."
-        className="inline-flex items-center gap-1 rounded border border-zinc-800 bg-black/40 px-1.5 py-0.5 text-[9px] font-mono text-zinc-200 outline-none hover:border-fuchsia-500/50 focus-visible:border-fuchsia-500/50"
+        className="inline-flex items-center gap-1 rounded border border-zinc-800 bg-black/40 px-1.5 py-0 text-xs font-semibold leading-4.5 text-zinc-200 outline-none hover:border-fuchsia-500/50 focus-visible:border-fuchsia-500/50"
       >
         <FolderOpen className="h-3 w-3 text-fuchsia-300" />
         Open scene
-        <ChevronDown className="h-3 w-3 text-zinc-500" />
+        <ChevronDown className="h-3 w-3 text-zinc-400" />
       </button>
       {open && (
-        <div className="absolute left-0 top-full z-20 mt-1 min-w-56 max-w-sm rounded border border-fuchsia-500/30 bg-[#0a080f] shadow-2xl">
+        // The bar keeps its readouts on one line; notes in the menu wrap.
+        <div className="absolute left-0 top-full z-20 mt-1 min-w-64 max-w-sm whitespace-normal rounded border border-fuchsia-500/30 bg-[#0a080f] shadow-2xl">
           {!loaded ? (
-            <p role="status" className="flex items-center gap-1 px-2 py-1.5 text-[9px] font-mono text-zinc-500">
-              <Loader2 className="h-3 w-3 animate-spin" /> Reading the saved scenes…
+            <p role="status" className="flex items-center gap-1.5 px-2 py-2 text-xs font-semibold text-zinc-400">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" /> Reading the saved scenes…
             </p>
           ) : (
             <>
               {emptyNote && (
                 <p
                   role="status"
-                  className="border-b border-white/5 px-2 py-1.5 text-[9px] font-mono leading-relaxed text-zinc-500"
+                  className="border-b border-white/5 px-2 py-2 text-xs font-semibold leading-relaxed text-zinc-400"
                 >
                   {emptyNote}
                 </p>
@@ -375,7 +376,7 @@ const SceneMenu: React.FC = () => {
                   role="listbox"
                   aria-label="Scenes"
                   onKeyDown={onListKeyDown}
-                  className="flex max-h-72 flex-col overflow-y-auto"
+                  className="flex max-h-120 flex-col overflow-y-auto"
                 >
                   {groups.map((group) => {
                     const start = entries.indexOf(group.entries[0]);
@@ -394,7 +395,7 @@ const SceneMenu: React.FC = () => {
                         <div
                           id={labelId}
                           role="presentation"
-                          className="px-2 pb-0.5 pt-1.5 text-[8px] font-bold uppercase tracking-wider text-zinc-500"
+                          className="px-2 pb-1 pt-2 font-display text-xs font-bold uppercase tracking-wider text-zinc-400"
                         >
                           {group.label}
                         </div>
@@ -429,7 +430,7 @@ type AudioSource = HostAudioSource;
 
 const HARDWARE_TONE_CLASS: Record<HardwareTone, string> = {
   off: 'text-amber-400',
-  none: 'text-zinc-500',
+  none: 'text-zinc-400',
   ok: 'text-emerald-400',
 };
 
@@ -777,7 +778,7 @@ export const SwayView: React.FC = () => {
   }, [hostHeader, buildLabel]);
 
   return (
-    <div ref={hostRef} className="absolute inset-0 flex bg-black">
+    <div ref={hostRef} className="absolute inset-0 flex bg-black font-sans">
       {/* The SWAY tab is the SwayCommand cockpit, nothing else. theDAW's own
           Sway rail (routing selects, per-dim learn rows, the MIDI enable
           button) used to sit alongside it and duplicated what the cockpit
@@ -785,10 +786,12 @@ export const SwayView: React.FC = () => {
           PERFORM — only the redundant UI is gone. */}
       <div className="relative min-w-0 grow">
         {!hostHeader && (
-          <div data-tour="sway-bar" className="absolute inset-x-0 top-0 z-10 flex items-center gap-2 border-b border-white/10 bg-black/70 px-2 py-1 backdrop-blur">
-            <span className="text-[9px] font-black uppercase tracking-[0.2em] text-fuchsia-200">SwayCommand</span>
+          <div data-tour="sway-bar" className="absolute inset-x-0 top-0 z-10 flex items-center gap-2 whitespace-nowrap border-b border-white/10 bg-black/70 px-2 py-1 backdrop-blur">
+            <span className="font-display text-sm font-extrabold uppercase leading-none tracking-wider text-fuchsia-200">
+              SwayCommand
+            </span>
 
-            <label htmlFor="sway-audio-source" className="ml-3 text-[8px] font-bold uppercase tracking-wider text-zinc-400">
+            <label htmlFor="sway-audio-source" className="ml-3 text-xs font-semibold uppercase leading-none tracking-wider text-zinc-400">
               Audio
             </label>
             <select
@@ -796,7 +799,7 @@ export const SwayView: React.FC = () => {
               name="sway-audio-source"
               value={audioSource}
               onChange={(e) => setAudioSource(e.target.value as AudioSource)}
-              className="rounded border border-zinc-800 bg-black/40 px-1.5 py-0.5 text-[9px] font-mono text-zinc-200 outline-none focus:border-fuchsia-500/50"
+              className="rounded border border-zinc-800 bg-black/40 px-1.5 py-0 text-xs font-semibold leading-4.5 text-zinc-200 outline-none focus:border-fuchsia-500/50"
             >
               <option value="thedaw">theDAW master</option>
               <option value="input">Input device</option>
@@ -804,8 +807,8 @@ export const SwayView: React.FC = () => {
 
             <SceneMenu />
 
-            <span className={`ml-auto text-[8px] font-mono ${HARDWARE_TONE_CLASS[hardwareTone]}`}>{hardwareLabel}</span>
-            <span className="text-[8px] font-mono text-zinc-600">
+            <span className={`ml-auto text-xs font-semibold leading-none ${HARDWARE_TONE_CLASS[hardwareTone]}`}>{hardwareLabel}</span>
+            <span className="text-xs font-semibold leading-none text-zinc-500">
               · {embedState === 'ready' ? (childReady ? 'linked' : 'loading…') : embedState}
               {buildLabel ? ` · ${buildLabel}` : ''}
             </span>
@@ -831,23 +834,23 @@ export const SwayView: React.FC = () => {
         ) : (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-8 pt-6 text-center">
             {embedState === 'checking' ? (
-              <span className="text-[10px] font-mono uppercase tracking-widest text-zinc-500">
+              <span className="font-display text-sm font-bold uppercase tracking-wider text-zinc-400">
                 Looking for a SwayCommand build…
               </span>
             ) : (
               <>
                 <AlertTriangle className="h-5 w-5 text-amber-400" />
-                <p className="max-w-lg text-[11px] font-mono leading-relaxed text-zinc-300">
+                <p className="max-w-lg text-sm font-semibold leading-relaxed text-zinc-200">
                   {detail ?? 'The SwayCommand cockpit is not available.'}
                 </p>
-                <p className="max-w-lg text-[10px] font-mono leading-relaxed text-zinc-500">
+                <p className="max-w-lg text-sm font-semibold leading-relaxed text-zinc-400">
                   SwayCommand also runs as its own desktop application; this tab embeds the same
                   cockpit inside theDAW.
                 </p>
                 <button
                   type="button"
                   onClick={() => void probe()}
-                  className="mt-1 inline-flex items-center gap-1 rounded border border-white/15 px-2 py-1 text-[9px] font-mono uppercase tracking-widest text-zinc-300 hover:border-fuchsia-400/50 hover:text-fuchsia-200"
+                  className="mt-1 inline-flex items-center gap-1.5 rounded border border-white/15 px-3 py-1.5 text-xs font-bold uppercase tracking-wider text-zinc-200 hover:border-fuchsia-400/50 hover:text-fuchsia-200"
                 >
                   <RefreshCw className="h-3 w-3" /> Retry
                 </button>

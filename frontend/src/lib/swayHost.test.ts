@@ -1,6 +1,6 @@
 /**
  * swayHost holds the data half of the SWAY tab's cockpit protocol: what a frame
- * from the cockpit asks for, the scene rows custom first and then built-in,
+ * from the cockpit asks for, the scene rows with the Gantasmo scenes first and then the saves,
  * the lists "Open scene" and the cockpit both read, the sway/host-scenes body
  * and the hardware line.
  *
@@ -69,7 +69,7 @@ for (const frame of [null, undefined, 'sway/ready', 42, {}, { type: 'sway/midi',
   assert.equal(cockpitAction(frame), null, JSON.stringify(frame));
 }
 
-// ── scene rows: custom first, then built-in, each newest first ───────────────
+// ── scene rows: the Gantasmo scenes first, then saves, each newest first ─────
 const row = (name: string, builtin: boolean, mtime: number): SwaySceneRow => ({
   name,
   path: `D:\\data\\sway-projects\\${name}.sway`,
@@ -85,11 +85,11 @@ const mixed = [
 ];
 assert.deepEqual(
   orderSceneRows(mixed).map((r) => r.name),
-  ['New Set', 'Old Set', 'miracle-mile', 'will-i-dream', 'natures-tomb'],
+  ['miracle-mile', 'will-i-dream', 'natures-tomb', 'New Set', 'Old Set'],
 );
 assert.equal(mixed[0].name, 'will-i-dream', 'the input is left as it was');
 
-// ── the listing body: a row without builtin is custom, bad rows are dropped ──
+// ── the listing body: a row without builtin is a save, bad rows are dropped ──
 assert.deepEqual(
   sceneRowsFrom([
     { name: 'Legacy', path: 'D:\\s\\Legacy.sway', mtime: 5 },
@@ -126,7 +126,7 @@ assert.deepEqual(
 // ── the sway/host-scenes body ────────────────────────────────────────────────
 const lists = { rows: orderSceneRows(mixed), recent: [place('C:\\Downloads\\Gift.sway')], error: null };
 const frame = hostScenesFrame(lists);
-assert.deepEqual(frame.rows[0], row('New Set', false, 70));
+assert.deepEqual(frame.rows[0], row('miracle-mile', true, 90));
 assert.deepEqual(frame.recent, [{ name: 'Gift.sway', path: 'C:\\Downloads\\Gift.sway' }]);
 assert.equal('error' in frame, false, 'no error key when nothing failed');
 assert.equal(
@@ -140,10 +140,11 @@ assert.equal(
 );
 
 // ── the hardware line and its tone ───────────────────────────────────────────
-assert.deepEqual(hardwareStatus(false, ['Sway Audima']), { hardware: 'MIDI off', tone: 'off' });
+assert.deepEqual(hardwareStatus(false, ['Audima Labs The Sway']), { hardware: 'MIDI off', tone: 'off' });
 assert.deepEqual(hardwareStatus(true, []), { hardware: 'no MIDI device', tone: 'none' });
-assert.deepEqual(hardwareStatus(true, ['nanoKONTROL2', 'Audima Sway MIDI']), {
-  hardware: 'Sway: Audima Sway MIDI',
+// The port is "Audima Labs The Sway"; the label names the hardware without "The".
+assert.deepEqual(hardwareStatus(true, ['nanoKONTROL2', 'Audima Labs The Sway']), {
+  hardware: 'Audima Labs Sway',
   tone: 'ok',
 });
 assert.deepEqual(hardwareStatus(true, ['nanoKONTROL2', 'LPD8']), { hardware: 'nanoKONTROL2, LPD8', tone: 'ok' });
@@ -163,7 +164,7 @@ globalThis.fetch = (async (input: RequestInfo | URL) => {
 const read = await loadSceneLists();
 assert.deepEqual(
   read.rows.map((r) => r.name),
-  ['New Set', 'Old Set', 'miracle-mile', 'will-i-dream', 'natures-tomb'],
+  ['miracle-mile', 'will-i-dream', 'natures-tomb', 'New Set', 'Old Set'],
 );
 assert.deepEqual(
   read.recent.map((p) => p.path),
