@@ -69,6 +69,39 @@ def _collect_media_paths(node: object, out: list[str]) -> None:
             _collect_media_paths(value, out)
 
 
+def _shipped_song(template: Path) -> Path | None:
+    """The copy of a template's song that theDAW ships, matched by name: the
+    template ``will-i-dream.sway`` pairs with ``examples/audio/will i dream.*``."""
+    want = template.stem.replace("-", " ").replace("_", " ").casefold()
+    try:
+        for f in sorted((catalog.EXAMPLES_DIR / "audio").iterdir()):
+            if f.is_file() and f.stem.casefold() == want:
+                return f
+    except OSError:
+        return None
+    return None
+
+
+def _stand_in_missing_song(template: Path, doc: object) -> None:
+    """Point a template's one song at theDAW's shipped copy when the path the
+    template names has no file on this machine. The templates are authored on
+    another computer, so without this the cockpit's audio lane stays silent."""
+    project = doc.get("project") if isinstance(doc, dict) else None
+    media = project.get("media") if isinstance(project, dict) else None
+    if not isinstance(media, list):
+        return
+    named = [
+        m["path"]
+        for m in media
+        if isinstance(m, dict) and isinstance(m.get("path"), str) and m["path"]
+    ]
+    if len(named) != 1 or Path(named[0]).is_file():
+        return
+    song = _shipped_song(template)
+    if song is not None:
+        media_access.register_stand_in(named[0], song)
+
+
 def _register_template_media() -> None:
     """Allowlist every staged template's media with media_access (once)."""
     global _template_media_registered
@@ -85,6 +118,7 @@ def _register_template_media() -> None:
             except (OSError, ValueError):
                 continue
             _collect_media_paths(doc, paths)
+            _stand_in_missing_song(f, doc)
     except OSError:
         return
     # Only the STAGED templates above are trusted here. Saved projects under
