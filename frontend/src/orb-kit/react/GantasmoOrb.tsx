@@ -1,5 +1,17 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { EYE_LEFT_D, EYE_RIGHT_D, MOUTH_D, ORB_FACE_VIEWBOX, PUPIL_LEFT_D, PUPIL_RIGHT_D } from './orbFaceShapes';
+import {
+    browserStorage,
+    orbCornerPosition,
+    orbPinKey,
+    orbPointerMove,
+    orbPressResult,
+    persistOrbUnpinned,
+    readOrbPinned,
+    readSavedOrbPosition,
+    type OrbCorner,
+    type OrbPoint,
+} from './orbPin';
 
 export interface GantasmoOrbProps {
     /**
@@ -68,17 +80,18 @@ export interface GantasmoOrbProps {
     bounds?: number;
 
     /**
-     * Pin the orb to a viewport corner until the user drags it away.
+     * Pin the orb to a viewport corner until the user clicks it for the first time.
      *
-     * While stuck the orb re-solves its corner on every resize, so it cannot be
-     * left stranded mid-screen by a window change — which a saved absolute
-     * position otherwise does. The first drag past the threshold releases it
-     * permanently (persisted alongside the position), after which the orb is
-     * free and resizes only clamp it back into view.
+     * While pinned the orb cannot be dragged, a saved position is ignored, and
+     * the corner is re-solved on every resize, so a window change cannot strand
+     * it mid-screen. It wears the `pinned` class, which moves its drag sign above
+     * it. The first click toggles as usual and unpins it permanently (remembered
+     * beside the position, see orbPin.ts); after that the orb drags freely and a
+     * resize only clamps it back into view.
      */
-    stickCorner?: 'bottom-right' | 'bottom-left' | 'top-right' | 'top-left' | false;
+    stickCorner?: OrbCorner | false;
 
-    /** Gap in px between the orb box and the viewport edges while stuck. */
+    /** Gap in px between the orb box and the viewport edges while pinned. */
     cornerMargin?: number;
 }
 
@@ -108,39 +121,42 @@ export const GantasmoOrb: React.FC<GantasmoOrbProps> = ({
     stickCorner = false,
     cornerMargin = 12,
 }) => {
-    // Where the orb sits while it is still stuck to its corner. Recomputed from
-    // the live viewport rather than stored, so a resize can never strand it.
+    // Where the orb sits while it is pinned to its corner. Recomputed from the
+    // live viewport rather than stored, so a resize can never strand it.
     const cornerPosition = useCallback(() => {
         if (typeof window === 'undefined' || !stickCorner) return null;
-        const right = window.innerWidth - bounds - cornerMargin;
-        const bottom = window.innerHeight - bounds - cornerMargin;
-        switch (stickCorner) {
-            case 'bottom-right': return { x: Math.max(0, right), y: Math.max(0, bottom) };
-            case 'bottom-left': return { x: cornerMargin, y: Math.max(0, bottom) };
-            case 'top-right': return { x: Math.max(0, right), y: cornerMargin };
-            case 'top-left': return { x: cornerMargin, y: cornerMargin };
-            default: return null;
-        }
+        return orbCornerPosition(stickCorner, { width: window.innerWidth, height: window.innerHeight }, bounds, cornerMargin);
     }, [bounds, cornerMargin, stickCorner]);
 
-    const unstuckKey = persistenceKey ? `${persistenceKey}-unstuck` : null;
-    // Read the release flag synchronously so the very first paint is already in
-    // the right place — deferring it to an effect makes the orb visibly jump.
-    const [unstuck, setUnstuck] = useState<boolean>(() => {
-        if (!stickCorner) return true;
-        if (!unstuckKey || typeof window === 'undefined') return false;
-        try { return window.localStorage.getItem(unstuckKey) === '1'; } catch { return false; }
-    });
-
-    // Default visual placement mirrors the original app: lower-left-ish.
-    const initialPosition = (!unstuck && cornerPosition()) || defaultPosition || {
-        x: 20,
-        y: typeof window !== 'undefined' ? window.innerHeight - 140 : 500,
-    };
+    const pinKey = orbPinKey(persistenceKey);
+    // Read the pin synchronously so the very first paint is already in the
+    // right place — deferring it to an effect makes the orb visibly jump.
+    const [pinned, setPinned] = useState<boolean>(() => Boolean(stickCorner) && readOrbPinned(browserStorage(), pinKey));
+    // The first click unpins for good. When the write fails the orb is still
+    // unpinned for the rest of this session.
+    const unpin = useCallback(() => {
+        setPinned(false);
+        persistOrbUnpinned(browserStorage(), pinKey);
+    }, [pinKey]);
 
     // The orb owns only its own placement state.
     // The host owns whatever UI appears when the orb is toggled.
-    const [position, setPosition] = useState(initialPosition);
+    // First placement, read synchronously so the first paint is already right:
+    // a pinned orb takes its corner and ignores any saved position; a free one
+    // takes its saved position (clamped into this viewport), else the default,
+    // which mirrors the original app: lower-left-ish. The first click leaves the
+    // orb where it is, so nothing reads the saved position again.
+    const [position, setPosition] = useState<OrbPoint>(() => {
+        const corner = pinned ? cornerPosition() : null;
+        if (corner) return corner;
+        const saved = typeof window === 'undefined'
+            ? null
+            : readSavedOrbPosition(browserStorage(), persistenceKey || null, { width: window.innerWidth, height: window.innerHeight }, bounds);
+        return saved ?? defaultPosition ?? {
+            x: 20,
+            y: typeof window !== 'undefined' ? window.innerHeight - 140 : 500,
+        };
+    });
     const [isDragging, setIsDragging] = useState(false);
     const [hasDragged, setHasDragged] = useState(false);
 
@@ -167,61 +183,37 @@ export const GantasmoOrb: React.FC<GantasmoOrbProps> = ({
         };
     }, [bounds]);
 
-    // Restore persisted position on mount when enabled.
-    // We still clamp after load in case the viewport changed since last session.
-    useEffect(() => {
-        if (!persistenceKey || typeof window === 'undefined') {
-            return;
-        }
-        // While the orb is still stuck to its corner the saved position is
-        // deliberately ignored — the corner is the source of truth until the
-        // user drags the orb out of it for the first time.
-        if (!unstuck) {
-            return;
-        }
-
-        const savedPosition = window.localStorage.getItem(persistenceKey);
-        if (!savedPosition) {
-            return;
-        }
-
-        try {
-            const parsed = JSON.parse(savedPosition);
-            if (typeof parsed.x === 'number' && typeof parsed.y === 'number') {
-                setPosition(clampToViewport(parsed));
-            }
-        } catch {
-            // Ignore invalid persisted state.
-        }
-    }, [clampToViewport, persistenceKey, unstuck]);
-
-    // Keep the orb visible after viewport resizes. A still-stuck orb re-solves
-    // its corner (so it stays welded to the edge no matter how the window is
-    // resized); a released orb is only clamped back into view.
+    // Keep the orb visible after viewport resizes. A pinned orb re-solves its
+    // corner (so it stays welded to the edge no matter how the window is
+    // resized); an unpinned orb is only clamped back into view.
     useEffect(() => {
         if (typeof window === 'undefined') {
             return;
         }
 
         const onResize = () => {
-            const corner = !unstuck && cornerPosition();
+            const corner = pinned && cornerPosition();
             setPosition((current) => (corner ? corner : clampToViewport(current)));
         };
 
         window.addEventListener('resize', onResize);
         return () => window.removeEventListener('resize', onResize);
-    }, [clampToViewport, cornerPosition, unstuck]);
+    }, [clampToViewport, cornerPosition, pinned]);
 
     // Persist the latest settled position after drag completes. Skipped while
-    // stuck: the corner is recomputed each load, so writing it back would only
+    // pinned: the corner is recomputed each load, so writing it back would only
     // bake in one viewport's coordinates.
     useEffect(() => {
-        if (!persistenceKey || isDragging || !unstuck || typeof window === 'undefined') {
+        if (!persistenceKey || isDragging || pinned || typeof window === 'undefined') {
             return;
         }
 
-        window.localStorage.setItem(persistenceKey, JSON.stringify(position));
-    }, [isDragging, persistenceKey, position, unstuck]);
+        try {
+            window.localStorage.setItem(persistenceKey, JSON.stringify(position));
+        } catch {
+            // Storage full or blocked: the orb keeps its place for this session.
+        }
+    }, [isDragging, persistenceKey, position, pinned]);
 
     // Emit position updates outward so the host can anchor a related surface.
     useEffect(() => {
@@ -245,6 +237,7 @@ export const GantasmoOrb: React.FC<GantasmoOrbProps> = ({
     // Drag logic is intentionally imperative and simple:
     // - compute mouse delta
     // - ignore tiny movements
+    // - a pinned orb stays put (the press only stops counting as a click)
     // - clamp to viewport
     // - update position
     const handleMouseMove = useCallback((event: MouseEvent) => {
@@ -252,38 +245,34 @@ export const GantasmoOrb: React.FC<GantasmoOrbProps> = ({
             return;
         }
 
-        const deltaX = event.clientX - dragRef.current.startX;
-        const deltaY = event.clientY - dragRef.current.startY;
-        const distance = Math.sqrt(deltaX * deltaX + deltaY * deltaY);
-
-        if (distance <= DRAG_THRESHOLD) {
+        const move = orbPointerMove(
+            pinned,
+            { x: dragRef.current.startPosX, y: dragRef.current.startPosY },
+            { x: event.clientX - dragRef.current.startX, y: event.clientY - dragRef.current.startY },
+            DRAG_THRESHOLD,
+        );
+        if (!move.dragged) {
             return;
         }
 
         setHasDragged(true);
-        // The first drag past the threshold releases the orb from its corner
-        // for good. Persisted, so it stays free across reloads.
-        if (!unstuck) {
-            setUnstuck(true);
-            if (unstuckKey && typeof window !== 'undefined') {
-                try { window.localStorage.setItem(unstuckKey, '1'); } catch { /* non-fatal */ }
-            }
+        if (move.position) {
+            setPosition(clampToViewport(move.position));
         }
-        setPosition(clampToViewport({
-            x: dragRef.current.startPosX + deltaX,
-            y: dragRef.current.startPosY + deltaY,
-        }));
-    }, [clampToViewport, isDragging, unstuck, unstuckKey]);
+    }, [clampToViewport, isDragging, pinned]);
 
-    // If the pointer never crossed the drag threshold, treat the interaction as a click.
+    // If the pointer never crossed the drag threshold, treat the interaction as
+    // a click. The first click on a pinned orb also unpins it.
     const handleMouseUp = useCallback(() => {
-        if (isDragging && !hasDragged) {
-            onToggle?.();
+        if (isDragging) {
+            const press = orbPressResult(pinned, hasDragged);
+            if (press.toggle) onToggle?.();
+            if (press.unpin) unpin();
         }
 
         setIsDragging(false);
         dragRef.current = null;
-    }, [hasDragged, isDragging, onToggle]);
+    }, [hasDragged, isDragging, onToggle, pinned, unpin]);
 
     // We attach global listeners only during an active drag so the drag remains
     // stable even if the pointer moves faster than the orb element itself.
@@ -321,6 +310,7 @@ export const GantasmoOrb: React.FC<GantasmoOrbProps> = ({
         isActive ? 'active' : '',
         isDragging ? 'dragging' : '',
         processing ? 'processing' : '',
+        pinned ? 'pinned' : '',
     ].filter(Boolean).join(' ');
 
     return (
@@ -338,11 +328,14 @@ export const GantasmoOrb: React.FC<GantasmoOrbProps> = ({
                 role="button"
                 aria-label={ariaLabel}
                 tabIndex={0}
-                // Keyboard activation mirrors the mouse click/toggle pathway.
+                // Keyboard activation mirrors the mouse click/toggle pathway,
+                // including the first click's unpin.
                 onKeyDown={(event) => {
                     if (event.key === 'Enter' || event.key === ' ') {
                         event.preventDefault();
-                        onToggle?.();
+                        const press = orbPressResult(pinned, false);
+                        if (press.toggle) onToggle?.();
+                        if (press.unpin) unpin();
                     }
                 }}
             >

@@ -41,7 +41,7 @@ const TIPS: string[] = [
   'open SCORE to read a track as sheet music or tab',
   'right-click a library row for stems, MIDI and export',
   'ctrl-k opens the library',
-  'drag me anywhere — i stay put after that',
+  'click me once, then drag me anywhere — i stay put',
 ];
 
 const ROTATE_MS = 9000;

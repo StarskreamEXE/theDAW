@@ -464,6 +464,22 @@
     opacity: 0;
 }
 
+/* Pinned (GantasmoOrb's stickCorner, before the first click): the orb cannot be
+   dragged, so it takes a button's cursor, and its sign sits ABOVE it, because a
+   box pinned flush to the bottom edge leaves the sign's usual place below it off
+   screen. The sign stays visible and asks for the click that frees the orb. The
+   first click unpins the orb and both go back to the rules above. */
+.gantasmo-orb-theme .aether-orb-toggle.pinned {
+    cursor: pointer;
+}
+
+.gantasmo-orb-theme .aether-orb-toggle.pinned::after {
+    content: 'Click me';
+    top: -30px;
+    bottom: auto;
+    opacity: 1;
+}
+
 @keyframes gantasmo-orb-particle-float {
     0%,
     100% {
