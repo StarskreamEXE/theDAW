@@ -1,0 +1,154 @@
+// theDAW's half of the SWAY tab's message protocol (v1), the parts that are data.
+//
+// SwayView relays MIDI, analysis and visibility to the embedded SwayCommand
+// cockpit. A cockpit that shows theDAW's controls in its own header lists its
+// capabilities in `sway/ready` and then asks for scenes, opens them and sets the
+// audio source over the same channel. This module decides what an incoming
+// frame asks for, orders the scene rows (custom first, then built-in, each
+// newest first), reads the lists both "Open scene" and the cockpit show, and
+// derives the hardware status the header shows.
+
+import { getJson } from './apiJson';
+import { basenameOf, pathKey, placesApi, type PlaceItem } from './placesClient';
+
+/** The cockpit shows theDAW's controls in its own header. */
+export const CAP_HOST_HEADER = 'host-header';
+/** The cockpit shows the scene list theDAW sends. */
+export const CAP_HOST_SCENES = 'host-scenes';
+
+/** A scene in data/sway-projects, as GET /api/sway/projects lists it. */
+export interface SwaySceneRow {
+  name: string;
+  path: string;
+  /** True when the file is a scene theDAW's asset catalog installs. */
+  builtin: boolean;
+  /** Unix seconds. */
+  mtime: number;
+}
+
+/** SwayView's audio source. The cockpit calls theDAW's master 'host'. */
+export type HostAudioSource = 'thedaw' | 'input';
+
+export type CockpitAction =
+  | { kind: 'ready'; caps: string[] }
+  | { kind: 'set-audio-source'; source: HostAudioSource }
+  | { kind: 'request-scenes' }
+  | { kind: 'open-scene'; name: string | null; path: string | null }
+  | { kind: 'choose-scene-file' };
+
+const nonEmpty = (v: unknown): string | null => (typeof v === 'string' && v.trim() ? v : null);
+
+/**
+ * What a frame from the cockpit asks for, or null when it is not a request this
+ * host answers. The caller has already checked the frame's window and origin.
+ * An open-scene frame with a name opens a row from `rows` by name, the way
+ * "Open scene" does; one with only a path opens a `recent` file.
+ */
+export function cockpitAction(data: unknown): CockpitAction | null {
+  if (!data || typeof data !== 'object') return null;
+  const d = data as Record<string, unknown>;
+  switch (d.type) {
+    case 'sway/ready':
+      return {
+        kind: 'ready',
+        caps: Array.isArray(d.caps) ? d.caps.filter((c): c is string => typeof c === 'string') : [],
+      };
+    case 'sway/set-audio-source':
+      if (d.source === 'host') return { kind: 'set-audio-source', source: 'thedaw' };
+      if (d.source === 'input') return { kind: 'set-audio-source', source: 'input' };
+      return null;
+    case 'sway/request-scenes':
+      return { kind: 'request-scenes' };
+    case 'sway/open-scene': {
+      const name = nonEmpty(d.name);
+      const path = nonEmpty(d.path);
+      return name || path ? { kind: 'open-scene', name, path } : null;
+    }
+    case 'sway/choose-scene-file':
+      return { kind: 'choose-scene-file' };
+    default:
+      return null;
+  }
+}
+
+/** Custom scenes first, then built-in ones, each newest first. */
+export function orderSceneRows(rows: SwaySceneRow[]): SwaySceneRow[] {
+  const newest = (a: SwaySceneRow, b: SwaySceneRow) => b.mtime - a.mtime;
+  return [...rows.filter((r) => !r.builtin).sort(newest), ...rows.filter((r) => r.builtin).sort(newest)];
+}
+
+/** The rows of a /api/sway/projects body. A row without `builtin` is custom. */
+export function sceneRowsFrom(projects: unknown): SwaySceneRow[] {
+  if (!Array.isArray(projects)) return [];
+  const rows: SwaySceneRow[] = [];
+  for (const raw of projects) {
+    const r = raw as Partial<SwaySceneRow> | null;
+    if (!r || typeof r.name !== 'string' || typeof r.path !== 'string') continue;
+    rows.push({
+      name: r.name,
+      path: r.path,
+      builtin: r.builtin === true,
+      mtime: typeof r.mtime === 'number' && Number.isFinite(r.mtime) ? r.mtime : 0,
+    });
+  }
+  return rows;
+}
+
+/** Recent .sway files the backend will serve, less those already listed by name. */
+export function recentOutsideSceneFolder(recent: PlaceItem[], rows: SwaySceneRow[]): PlaceItem[] {
+  const inFolder = new Set(rows.map((r) => pathKey(r.path)));
+  return recent.filter((it) => it.servable && !inFolder.has(pathKey(it.path)));
+}
+
+export interface SceneLists {
+  rows: SwaySceneRow[];
+  recent: PlaceItem[];
+  /** Why the saved scenes could not be read, or null. */
+  error: string | null;
+}
+
+/** The scene lists, read fresh: saved scenes in order, then recent files. */
+export async function loadSceneLists(): Promise<SceneLists> {
+  const saved = getJson<{ projects?: unknown }>('/api/sway/projects').then(
+    (j) => ({ rows: sceneRowsFrom(j.projects), error: null as string | null }),
+    (e: unknown) => ({ rows: [] as SwaySceneRow[], error: e instanceof Error ? e.message : String(e) }),
+  );
+  const [scenes, recent] = await Promise.all([saved, placesApi.recent({ kind: 'sway', exts: ['.sway'] })]);
+  return {
+    rows: orderSceneRows(scenes.rows),
+    recent: recentOutsideSceneFolder(recent, scenes.rows),
+    error: scenes.error,
+  };
+}
+
+/** The sentence shown when the saved scenes cannot be read. */
+export function scenesUnreadable(detail: string): string {
+  return `Could not read the saved scenes: ${detail}`;
+}
+
+/** The body of a `sway/host-scenes` frame. `failure` wins over a read error. */
+export function hostScenesFrame(
+  lists: SceneLists,
+  failure: string | null = null,
+): {
+  rows: SwaySceneRow[];
+  recent: { name: string; path: string }[];
+  error?: string;
+} {
+  const error = failure ?? (lists.error ? scenesUnreadable(lists.error) : null);
+  return {
+    rows: lists.rows.map(({ name, path, builtin, mtime }) => ({ name, path, builtin, mtime })),
+    recent: lists.recent.map((it) => ({ name: it.name || basenameOf(it.path), path: it.path })),
+    ...(error ? { error } : {}),
+  };
+}
+
+export type HardwareTone = 'off' | 'none' | 'ok';
+
+/** The MIDI hardware line: what theDAW's own MIDIAccess has hooked up. */
+export function hardwareStatus(midiEnabled: boolean, inputs: string[]): { hardware: string; tone: HardwareTone } {
+  if (!midiEnabled) return { hardware: 'MIDI off', tone: 'off' };
+  if (inputs.length === 0) return { hardware: 'no MIDI device', tone: 'none' };
+  const sway = inputs.find((n) => /sway|audima/i.test(n));
+  return { hardware: sway ? `Sway: ${sway}` : inputs.join(', '), tone: 'ok' };
+}

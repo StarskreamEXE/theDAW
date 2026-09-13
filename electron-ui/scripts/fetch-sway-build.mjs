@@ -77,18 +77,7 @@ function resolveCheckout() {
 // a fresh build cannot silently reintroduce them. Each entry must match EXACTLY
 // once; zero matches means upstream fixed it (log + skip), more than once means
 // the bundle changed shape (fail loudly rather than patch blind).
-//
-// available(): in embed mode the cockpit never requests its own MIDIAccess (the
-// host relays raw bytes over postMessage), so `n` stays null and the splash's
-// MIDI row reported "WebMIDI unavailable" forever — while relayed MIDI was
-// audibly playing. `l` is the in-iframe/embed flag in the same scope; embed IS
-// available by construction. Fixed upstream in SwayCommand this stays a no-op.
 const BUNDLE_PATCHES = [
-  {
-    reason: 'embed splash: MIDI row must reflect the host relay, not the absent local MIDIAccess',
-    find: 'supported:c,get available(){return!!n}',
-    replace: 'supported:c,get available(){return l||!!n}',
-  },
   // project.write persists to localStorage + a browser download only; mirror
   // every save to theDAW's backend so a real .sway lands in data/sway-projects
   // and survives cleared browser storage. Fire-and-forget: a failed mirror

@@ -29,15 +29,25 @@
  * opening its own MIDI access.
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertTriangle, ChevronDown, FolderOpen, Loader2, RefreshCw, Waves } from 'lucide-react';
+import { AlertTriangle, ChevronDown, FolderOpen, Loader2, RefreshCw } from 'lucide-react';
 import { subscribeToMidi } from '../state/midiBus';
 import { getAnalyser } from '../state/playerStore';
 import { logError, logInfo, logWarn } from '../state/logStore';
 import { describeHttpError } from '../lib/httpError';
-import { getJson } from '../lib/apiJson';
-import { basenameOf, dirnameOf, isLocalClient, pathKey, placesApi, type PlaceItem } from '../lib/placesClient';
+import { basenameOf, dirnameOf, isLocalClient, type PlaceItem } from '../lib/placesClient';
 import { pickFile } from '../lib/storageClient';
 import { openSwayScene, openSwaySceneFromPath } from '../lib/swayOpen';
+import {
+  CAP_HOST_HEADER,
+  cockpitAction,
+  hardwareStatus,
+  hostScenesFrame,
+  loadSceneLists,
+  scenesUnreadable,
+  type HardwareTone,
+  type HostAudioSource,
+  type SwaySceneRow,
+} from '../lib/swayHost';
 import { useMidiDevicesStore } from '../state/midiDevicesStore';
 import { useMidiTriggerStore } from '../state/midiTriggerStore';
 import { useStatusBarStore } from '../state/statusBarStore';
@@ -79,12 +89,6 @@ function swayBootSrc(requested?: string | null): string {
   return `${SWAY_SRC}?autoplay=${encodeURIComponent(target)}`;
 }
 
-interface SwayProjectRow {
-  name: string;
-  path: string;
-  mtime: number;
-}
-
 const SCENE_MENU_ID = 'sway-open-scene';
 
 const SWAY_FILE_FILTER = 'SwayCommand scene (*.sway)|*.sway|All files (*.*)|*.*';
@@ -98,28 +102,48 @@ interface SceneEntry {
   choose: () => void;
 }
 
-/** Opens a .sway file picked in the native dialog. A failure is logged and
- *  shown in the status bar; a cancel does nothing. */
-async function chooseSceneFile(): Promise<void> {
+interface SceneGroup {
+  key: string;
+  /** Null for the row that closes the list without a heading. */
+  label: string | null;
+  entries: SceneEntry[];
+}
+
+const OPEN_FAILED = 'SCENE OPEN FAILED: ';
+
+/** The reason a scene open just wrote to the status bar. openSwayScene and
+ *  openSwaySceneFromPath write it there before they resolve false. */
+function lastOpenFailure(): string {
+  const text = useStatusBarStore.getState().text;
+  return text.startsWith(OPEN_FAILED) ? text.slice(OPEN_FAILED.length) : 'The scene could not be opened.';
+}
+
+/** Opens a .sway file picked in the native dialog. A failure is logged, shown
+ *  in the status bar and returned; a cancel or an open returns null. */
+async function chooseSceneFile(): Promise<string | null> {
   try {
     const picked = await pickFile({ kind: 'sway', filter: SWAY_FILE_FILTER });
-    if (picked.cancelled || !picked.path) return;
+    if (picked.cancelled || !picked.path) return null;
     if (!/\.sway$/i.test(picked.path)) {
-      useStatusBarStore.getState().setText('SCENE OPEN FAILED: Choose a file that ends in .sway.');
-      return;
+      const msg = 'Choose a file that ends in .sway.';
+      logWarn('sway', msg);
+      useStatusBarStore.getState().setText(`${OPEN_FAILED}${msg}`);
+      return msg;
     }
-    await openSwaySceneFromPath(picked.path);
+    return (await openSwaySceneFromPath(picked.path)) ? null : lastOpenFailure();
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     logError('sway', `Could not choose a scene file: ${msg}`);
-    useStatusBarStore.getState().setText(`SCENE OPEN FAILED: ${msg}`);
+    useStatusBarStore.getState().setText(`${OPEN_FAILED}${msg}`);
+    return msg;
   }
 }
 
 /**
  * "Open scene", in three parts:
- *   - the .sway scenes saved under data/sway-projects, newest first, opened by
- *     name through openSwayScene;
+ *   - the .sway scenes under data/sway-projects, custom ones first and then
+ *     the ones the asset catalog installed, each newest first, opened by name
+ *     through openSwayScene;
  *   - .sway files elsewhere that known places can serve (a Save a copy, a
  *     cockpit save that was downloaded), opened by path;
  *   - on the machine the backend runs on, a row that picks a .sway file in the
@@ -129,7 +153,7 @@ async function chooseSceneFile(): Promise<void> {
  */
 const SceneMenu: React.FC = () => {
   const [open, setOpen] = useState(false);
-  const [rows, setRows] = useState<SwayProjectRow[] | null>(null);
+  const [rows, setRows] = useState<SwaySceneRow[] | null>(null);
   const [files, setFiles] = useState<PlaceItem[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [activeIdx, setActiveIdx] = useState(0);
@@ -158,23 +182,13 @@ const SceneMenu: React.FC = () => {
     setFiles([]);
     setError(null);
     focusPendingRef.current = true;
-    const saved = getJson<{ projects?: SwayProjectRow[] }>('/api/sway/projects').then(
-      (j) => ({ rows: Array.isArray(j.projects) ? j.projects : [], error: null as string | null }),
-      (e: unknown) => ({
-        rows: [] as SwayProjectRow[],
-        error: e instanceof Error ? e.message : String(e),
-      }),
-    );
-    void Promise.all([saved, placesApi.recent({ kind: 'sway', exts: ['.sway'] })]).then(
-      ([scenes, recent]) => {
-        if (seq !== seqRef.current) return;
-        // A scene in data/sway-projects is listed once, by name.
-        const inFolder = new Set(scenes.rows.map((r) => pathKey(r.path)));
-        setFiles(recent.filter((it) => it.servable && !inFolder.has(pathKey(it.path))));
-        setError(scenes.error);
-        setRows(scenes.rows);
-      },
-    );
+    // The cockpit's own scene list reads the same lists, in the same order.
+    void loadSceneLists().then((lists) => {
+      if (seq !== seqRef.current) return;
+      setFiles(lists.recent);
+      setError(lists.error);
+      setRows(lists.rows);
+    });
   };
 
   // Move focus into the list once it is read, so arrow keys work at once.
@@ -208,40 +222,53 @@ const SceneMenu: React.FC = () => {
     };
   }, [open, close]);
 
-  const entries: SceneEntry[] = rows
+  const sceneEntry = (row: SwaySceneRow): SceneEntry => ({
+    key: `scene:${row.path}`,
+    label: row.name,
+    detail: new Date(row.mtime * 1000).toLocaleString(),
+    title: row.path,
+    action: false,
+    choose: () => void openSwayScene(row.name),
+  });
+
+  // rows arrive custom first, so each group keeps their newest-first order.
+  const groups: SceneGroup[] = rows
     ? [
-        ...rows.map((row) => ({
-          key: `scene:${row.path}`,
-          label: row.name,
-          detail: new Date(row.mtime * 1000).toLocaleString(),
-          title: row.path,
-          action: false,
-          choose: () => void openSwayScene(row.name),
-        })),
-        ...files.map((it) => ({
-          key: `file:${it.path}`,
-          label: it.name || basenameOf(it.path),
-          detail: dirnameOf(it.path),
-          title: it.path,
-          action: false,
-          choose: () => void openSwaySceneFromPath(it.path),
-        })),
-        // The native dialog opens on the backend's machine, so a browser on
-        // another device gets no row for it.
-        ...(isLocalClient()
-          ? [
-              {
-                key: 'choose-file',
-                label: 'Choose a .sway file',
-                detail: null,
-                title: 'Opens a .sway file you choose and loads it.',
-                action: true,
-                choose: () => void chooseSceneFile(),
-              },
-            ]
-          : []),
-      ]
+        { key: 'custom', label: 'Custom', entries: rows.filter((r) => !r.builtin).map(sceneEntry) },
+        { key: 'builtin', label: 'Built-in', entries: rows.filter((r) => r.builtin).map(sceneEntry) },
+        {
+          key: 'recent',
+          label: 'Recent',
+          entries: files.map((it) => ({
+            key: `file:${it.path}`,
+            label: it.name || basenameOf(it.path),
+            detail: dirnameOf(it.path),
+            title: it.path,
+            action: false,
+            choose: () => void openSwaySceneFromPath(it.path),
+          })),
+        },
+        {
+          key: 'choose',
+          label: null,
+          // The native dialog opens on the backend's machine, so a browser on
+          // another device gets no row for it.
+          entries: isLocalClient()
+            ? [
+                {
+                  key: 'choose-file',
+                  label: 'Choose a .sway file',
+                  detail: null,
+                  title: 'Opens a .sway file you choose and loads it.',
+                  action: true,
+                  choose: () => void chooseSceneFile(),
+                },
+              ]
+            : [],
+        },
+      ].filter((g) => g.entries.length > 0)
     : [];
+  const entries = groups.flatMap((g) => g.entries);
 
   const choose = (entry: SceneEntry) => {
     close(false);
@@ -260,7 +287,11 @@ const SceneMenu: React.FC = () => {
     if (next < 0) return;
     e.preventDefault();
     setActiveIdx(next);
-    optionRefs.current[next]?.focus();
+    const el = optionRefs.current[next];
+    el?.focus();
+    // The first option of a group brings its heading into view with it.
+    const heading = el?.previousElementSibling;
+    if (heading?.getAttribute('role') === 'presentation') heading.scrollIntoView({ block: 'nearest' });
   };
 
   const loaded = rows !== null;
@@ -269,10 +300,41 @@ const SceneMenu: React.FC = () => {
   const emptyNote = !loaded
     ? null
     : error
-      ? `Could not read the saved scenes: ${error}`
+      ? scenesUnreadable(error)
       : rows.length === 0 && files.length === 0
         ? 'No scenes are saved yet.'
         : null;
+
+  const option = (entry: SceneEntry, i: number) => (
+    <button
+      key={entry.key}
+      ref={(el) => {
+        optionRefs.current[i] = el;
+      }}
+      id={`${SCENE_MENU_ID}-opt-${i}`}
+      type="button"
+      role="option"
+      aria-selected={i === active}
+      tabIndex={i === active ? 0 : -1}
+      onFocus={() => setActiveIdx(i)}
+      onClick={() => choose(entry)}
+      title={entry.title}
+      // No border of its own: index.css gives a bordered button the control
+      // contrast floor, which would draw every row line brighter than the
+      // group lines. The headings and group borders separate the list.
+      className="flex w-full flex-col items-start px-2 py-1 text-left hover:bg-fuchsia-500/15 focus:outline-none focus-visible:bg-fuchsia-500/15"
+    >
+      {entry.action ? (
+        <span className="flex max-w-full items-center gap-1 text-[10px] font-mono text-fuchsia-200">
+          <FolderOpen className="h-3 w-3 shrink-0" aria-hidden="true" />
+          {entry.label}
+        </span>
+      ) : (
+        <span className="max-w-full truncate text-[10px] font-mono text-zinc-100">{entry.label}</span>
+      )}
+      {entry.detail && <span className="max-w-full truncate text-[8px] font-mono text-zinc-500">{entry.detail}</span>}
+    </button>
+  );
 
   return (
     <div ref={wrapRef} className="relative">
@@ -315,35 +377,31 @@ const SceneMenu: React.FC = () => {
                   onKeyDown={onListKeyDown}
                   className="flex max-h-72 flex-col overflow-y-auto"
                 >
-                  {entries.map((entry, i) => (
-                    <button
-                      key={entry.key}
-                      ref={(el) => {
-                        optionRefs.current[i] = el;
-                      }}
-                      id={`${SCENE_MENU_ID}-opt-${i}`}
-                      type="button"
-                      role="option"
-                      aria-selected={i === active}
-                      tabIndex={i === active ? 0 : -1}
-                      onFocus={() => setActiveIdx(i)}
-                      onClick={() => choose(entry)}
-                      title={entry.title}
-                      className="flex w-full flex-col items-start border-b border-white/5 px-2 py-1 text-left last:border-b-0 hover:bg-fuchsia-500/15 focus:outline-none focus-visible:bg-fuchsia-500/15"
-                    >
-                      {entry.action ? (
-                        <span className="flex max-w-full items-center gap-1 text-[10px] font-mono text-fuchsia-200">
-                          <FolderOpen className="h-3 w-3 shrink-0" aria-hidden="true" />
-                          {entry.label}
-                        </span>
-                      ) : (
-                        <span className="max-w-full truncate text-[10px] font-mono text-zinc-100">{entry.label}</span>
-                      )}
-                      {entry.detail && (
-                        <span className="max-w-full truncate text-[8px] font-mono text-zinc-500">{entry.detail}</span>
-                      )}
-                    </button>
-                  ))}
+                  {groups.map((group) => {
+                    const start = entries.indexOf(group.entries[0]);
+                    const options = group.entries.map((entry, j) => option(entry, start + j));
+                    if (group.label === null) return <React.Fragment key={group.key}>{options}</React.Fragment>;
+                    // A listbox may own groups of options; each group is named
+                    // by its heading, which is not an option itself.
+                    const labelId = `${SCENE_MENU_ID}-group-${group.key}`;
+                    return (
+                      <div
+                        key={group.key}
+                        role="group"
+                        aria-labelledby={labelId}
+                        className="flex flex-col border-b border-white/10 last:border-b-0"
+                      >
+                        <div
+                          id={labelId}
+                          role="presentation"
+                          className="px-2 pb-0.5 pt-1.5 text-[8px] font-bold uppercase tracking-wider text-zinc-500"
+                        >
+                          {group.label}
+                        </div>
+                        {options}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </>
@@ -367,7 +425,13 @@ type EmbedState = 'checking' | 'ready' | 'unavailable' | 'error';
  * all -- the visuals react to what you are actually making. An input device is
  * what standalone does, kept here for performing to an external source.
  */
-type AudioSource = 'thedaw' | 'input';
+type AudioSource = HostAudioSource;
+
+const HARDWARE_TONE_CLASS: Record<HardwareTone, string> = {
+  off: 'text-amber-400',
+  none: 'text-zinc-500',
+  ok: 'text-emerald-400',
+};
 
 interface SwayUrlResponse {
   url: string | null;
@@ -383,6 +447,9 @@ export const SwayView: React.FC = () => {
   const [build, setBuild] = useState<SwayUrlResponse['build']>(null);
   const [audioSource, setAudioSource] = useState<AudioSource>('thedaw');
   const [childReady, setChildReady] = useState(false);
+  // What the cockpit said it can do in its last sway/ready. Cleared with
+  // childReady, so a reloading cockpit shows theDAW's bar until it says hello.
+  const [caps, setCaps] = useState<string[]>([]);
 
   // Readiness is a ref, not just state: the analysis and MIDI loops read it on
   // every frame and a state value captured in a closure would be stale.
@@ -390,6 +457,11 @@ export const SwayView: React.FC = () => {
   // Frames posted before the cockpit says hello are queued, not dropped -- the
   // handshake and the first MIDI event can race.
   const pendingRef = useRef<Record<string, unknown>[]>([]);
+  // Bumped for every open request, which mounts a new iframe, so an answer read
+  // for the old cockpit is never posted to the new one. The load event does not
+  // bump it: that fires after the cockpit's first hello, and a scene request
+  // sent at boot must still be answered.
+  const frameGenRef = useRef(0);
 
   const post = useCallback((payload: Record<string, unknown>) => {
     const w = iframeRef.current?.contentWindow;
@@ -439,7 +511,9 @@ export const SwayView: React.FC = () => {
     if (!openRequest) return;
     readyRef.current = false;
     pendingRef.current = [];
+    frameGenRef.current += 1;
     setChildReady(false);
+    setCaps([]);
   }, [openRequest]);
 
   // --- is there a build to show? -------------------------------------------
@@ -481,7 +555,22 @@ export const SwayView: React.FC = () => {
     void probe();
   }, [probe]);
 
-  // --- handshake ------------------------------------------------------------
+  // --- scene list for a cockpit that shows it ------------------------------
+  // The same lists "Open scene" reads. `failure` is a message the cockpit shows
+  // in place of theDAW's bar, which is hidden while it hosts the controls; the
+  // caller has logged it. A saved-scene read error is logged here.
+  const sendScenes = useCallback(
+    async (failure: string | null) => {
+      const gen = frameGenRef.current;
+      const lists = await loadSceneLists();
+      if (gen !== frameGenRef.current) return;
+      if (lists.error) logWarn('sway', scenesUnreadable(lists.error));
+      post({ type: 'sway/host-scenes', v: PROTOCOL, ...hostScenesFrame(lists, failure) });
+    },
+    [post],
+  );
+
+  // --- handshake and cockpit requests ---------------------------------------
   useEffect(() => {
     const onMessage = (e: MessageEvent) => {
       // Two guards, both required: the right window AND the right origin. The
@@ -489,32 +578,63 @@ export const SwayView: React.FC = () => {
       // other frame on the page.
       if (e.source !== iframeRef.current?.contentWindow) return;
       if (e.origin !== window.location.origin) return;
-      const d = e.data as { type?: string; v?: number } | null;
-      if (!d || typeof d.type !== 'string') return;
+      const action = cockpitAction(e.data);
+      if (!action) return;
 
-      switch (d.type) {
-        case 'sway/ready': {
+      switch (action.kind) {
+        case 'ready': {
           readyRef.current = true;
           setChildReady(true);
-          logInfo('sway', 'SwayCommand cockpit reported ready');
+          setCaps(action.caps);
+          logInfo(
+            'sway',
+            `SwayCommand cockpit reported ready${action.caps.length ? ` (${action.caps.join(', ')})` : ''}`,
+          );
           const queued = pendingRef.current;
           pendingRef.current = [];
           post({ type: 'sway/host-ready', v: PROTOCOL, host: 'theDAW' });
           for (const frame of queued) post(frame);
           break;
         }
-        default:
+        case 'set-audio-source':
+          // The audio effect below answers with sway/audio-source.
+          setAudioSource(action.source);
           break;
+        case 'request-scenes':
+          void sendScenes(null);
+          break;
+        case 'open-scene': {
+          // A scene that opens reloads the cockpit, so only a failure answers.
+          const opening =
+            action.name !== null ? openSwayScene(action.name) : openSwaySceneFromPath(action.path ?? '');
+          void opening.then((ok) => {
+            if (!ok) void sendScenes(lastOpenFailure());
+          });
+          break;
+        }
+        case 'choose-scene-file': {
+          if (!isLocalClient()) {
+            const msg = 'A .sway file can be chosen only on the computer theDAW runs on.';
+            logWarn('sway', msg);
+            void sendScenes(msg);
+            break;
+          }
+          void chooseSceneFile().then((failure) => {
+            if (failure) void sendScenes(failure);
+          });
+          break;
+        }
       }
     };
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
-  }, [post]);
+  }, [post, sendScenes]);
 
   // A reloaded iframe has not said hello yet; re-gate until it does.
   const handleIframeLoad = useCallback(() => {
     readyRef.current = false;
     setChildReady(false);
+    setCaps([]);
   }, []);
 
   // --- visibility: this tab is warmed and never unmounted -------------------
@@ -635,18 +755,26 @@ export const SwayView: React.FC = () => {
   // this header used to tell.
   const midiEnabled = useMidiTriggerStore((s) => s.enabled);
   const midiInputs = useMidiDevicesStore((s) => s.inputs);
-  const hardwareLabel = useMemo(() => {
-    if (!midiEnabled) return 'MIDI off';
-    if (midiInputs.length === 0) return 'no MIDI device';
-    const sway = midiInputs.find((n) => /sway|audima/i.test(n));
-    if (sway) return `Sway: ${sway}`;
-    return midiInputs.join(', ');
-  }, [midiEnabled, midiInputs]);
-  const hardwareTone = !midiEnabled
-    ? 'text-amber-400'
-    : midiInputs.length === 0
-      ? 'text-zinc-500'
-      : 'text-emerald-400';
+  const { hardware: hardwareLabel, tone: hardwareTone } = useMemo(
+    () => hardwareStatus(midiEnabled, midiInputs),
+    [midiEnabled, midiInputs],
+  );
+
+  // The cockpit's header shows the same line when it hosts theDAW's controls.
+  // childReady re-sends it to a cockpit that reloaded.
+  useEffect(() => {
+    post({ type: 'sway/host-status', v: PROTOCOL, hardware: hardwareLabel, tone: hardwareTone });
+  }, [hardwareLabel, hardwareTone, childReady, post]);
+
+  // A cockpit that reports 'host-header' shows these controls in its own
+  // header, so theDAW's bar steps aside. Every other state keeps the bar:
+  // checking, an error, a cockpit still loading, and a build without the cap.
+  const hostHeader = embedState === 'ready' && childReady && caps.includes(CAP_HOST_HEADER);
+
+  // The bar's build label has no place in the cockpit's header; the log keeps it.
+  useEffect(() => {
+    if (hostHeader && buildLabel) logInfo('sway', `SwayCommand build ${buildLabel} shows theDAW's controls in its header`);
+  }, [hostHeader, buildLabel]);
 
   return (
     <div ref={hostRef} className="absolute inset-0 flex bg-black">
@@ -656,32 +784,33 @@ export const SwayView: React.FC = () => {
           already does properly. Its plumbing is unchanged and still feeds
           PERFORM — only the redundant UI is gone. */}
       <div className="relative min-w-0 grow">
-        <div data-tour="sway-bar" className="absolute inset-x-0 top-0 z-10 flex items-center gap-2 border-b border-white/10 bg-black/70 px-2 py-1 backdrop-blur">
-          <Waves className="h-3 w-3 shrink-0 text-fuchsia-300" />
-          <span className="text-[9px] font-black uppercase tracking-[0.2em] text-fuchsia-200">SwayCommand</span>
+        {!hostHeader && (
+          <div data-tour="sway-bar" className="absolute inset-x-0 top-0 z-10 flex items-center gap-2 border-b border-white/10 bg-black/70 px-2 py-1 backdrop-blur">
+            <span className="text-[9px] font-black uppercase tracking-[0.2em] text-fuchsia-200">SwayCommand</span>
 
-          <label htmlFor="sway-audio-source" className="ml-3 text-[8px] font-bold uppercase tracking-wider text-zinc-400">
-            Audio
-          </label>
-          <select
-            id="sway-audio-source"
-            name="sway-audio-source"
-            value={audioSource}
-            onChange={(e) => setAudioSource(e.target.value as AudioSource)}
-            className="rounded border border-zinc-800 bg-black/40 px-1.5 py-0.5 text-[9px] font-mono text-zinc-200 outline-none focus:border-fuchsia-500/50"
-          >
-            <option value="thedaw">theDAW master</option>
-            <option value="input">Input device</option>
-          </select>
+            <label htmlFor="sway-audio-source" className="ml-3 text-[8px] font-bold uppercase tracking-wider text-zinc-400">
+              Audio
+            </label>
+            <select
+              id="sway-audio-source"
+              name="sway-audio-source"
+              value={audioSource}
+              onChange={(e) => setAudioSource(e.target.value as AudioSource)}
+              className="rounded border border-zinc-800 bg-black/40 px-1.5 py-0.5 text-[9px] font-mono text-zinc-200 outline-none focus:border-fuchsia-500/50"
+            >
+              <option value="thedaw">theDAW master</option>
+              <option value="input">Input device</option>
+            </select>
 
-          <SceneMenu />
+            <SceneMenu />
 
-          <span className={`ml-auto text-[8px] font-mono ${hardwareTone}`}>{hardwareLabel}</span>
-          <span className="text-[8px] font-mono text-zinc-600">
-            · {embedState === 'ready' ? (childReady ? 'linked' : 'loading…') : embedState}
-            {buildLabel ? ` · ${buildLabel}` : ''}
-          </span>
-        </div>
+            <span className={`ml-auto text-[8px] font-mono ${HARDWARE_TONE_CLASS[hardwareTone]}`}>{hardwareLabel}</span>
+            <span className="text-[8px] font-mono text-zinc-600">
+              · {embedState === 'ready' ? (childReady ? 'linked' : 'loading…') : embedState}
+              {buildLabel ? ` · ${buildLabel}` : ''}
+            </span>
+          </div>
+        )}
 
         {embedState === 'ready' ? (
           <iframe
@@ -694,7 +823,10 @@ export const SwayView: React.FC = () => {
             // permissions policy must still allow it for any direct use.
             // microphone: the 'Input device' audio source.
             allow="midi; microphone; autoplay; fullscreen"
-            className="absolute inset-0 h-full w-full border-0 bg-black pt-6"
+            // The tour's SWAY step points at the bar; with the bar hidden the
+            // cockpit's header holds those controls, so the step points here.
+            data-tour={hostHeader ? 'sway-bar' : undefined}
+            className={`absolute inset-0 h-full w-full border-0 bg-black ${hostHeader ? '' : 'pt-6'}`}
           />
         ) : (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-8 pt-6 text-center">
