@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { encodeMidi, parseMidi, type MidiFileData } from './midi.ts';
 import { meterMapToMidiEvents, midiEventsToMeterMap, normalizeMeterMap, type MeterSegment } from './meterMap.ts';
-import { notesToSmf, rollMeterToSmfEvents } from './midiWrite.ts';
+import { notesToRollSmf, notesToSmf } from './midiWrite.ts';
 
 const hex = (b: Uint8Array): string => Buffer.from(b).toString('hex');
 
@@ -153,23 +153,70 @@ const KIT = [
   assert.deepEqual(midiEventsToMeterMap(foreign.timeSignatures ?? [], foreign.ppq), { map: [{ bar: 0, meter: { num: 5, den: 4, groups: [] } }, { bar: 1, meter: M78 }], pickupSteps: 0 });
 }
 
-// The .mid export's writer: the roll's meter at the ticks its seconds land on, the notes unchanged, nothing added without a meter.
+// The writer without a tempo or signatures writes the bytes it wrote before it
+// took either (captured from the unmodified writer): the soundfont renderer's
+// notesToSmf(notes, program) and the drum beat's notesToSmf(notes, 0, 9).
 {
-  const render = [{ midi: 60, startSec: 0.4, durationSec: 0.2, velocity: 90 }];
-  const plain = notesToSmf(render);
-  assert.equal(hex(notesToSmf(render, 0, 0, [])), hex(plain));
-  // 7/8 3+2+2 after a 4-step pickup, then 5/4 from bar 2, at 90 BPM: a step is 1/6 s, which is 160 ticks at 120 BPM / 480 PPQ.
+  const render = [
+    { midi: 60, startSec: 0, durationSec: 0.25, velocity: 100 },
+    { midi: 64.4, startSec: 0.4, durationSec: 0.2, velocity: 90 },
+    { midi: 67, startSec: 1.2345, durationSec: 0.001, velocity: 200 },
+    { midi: 72, startSec: 3.7, durationSec: 1.5, velocity: 0 },
+  ];
+  const tail = '903c648170803c00811090405a8140804000846190437f01804300923e9048018b2080480000ff2f00';
+  const PLAIN = `4d546864000000060000000101e04d54726b0000003400ff510307a12000c00000${tail}`;
+  const PROGRAM_41 = `4d546864000000060000000101e04d54726b0000003400ff510307a12000c02900${tail}`;
+  const KIT_CHANNEL =
+    '4d546864000000060000000101e04d54726b0000003400ff510307a12000c90000' +
+    '993c648170893c00811099405a8140894000846199437f01894300923e9948018b2089480000ff2f00';
+  assert.equal(hex(notesToSmf(render)), PLAIN);
+  assert.equal(hex(notesToSmf(render, 41)), PROGRAM_41);
+  assert.equal(hex(notesToSmf(render, 0, 9)), KIT_CHANNEL);
+  assert.equal(hex(notesToSmf(render, 0, 0, [])), PLAIN);
+  assert.equal(hex(notesToSmf(render, 0, 0, [], 120)), PLAIN);
+}
+
+// The VOCAL export at the roll's tempo: 7/8 3+2+2 after a 4-step pickup, then
+// 5/4 from bar 2, at 90 BPM. A roll step is 120 ticks there, so the signatures
+// sit on the bar lines the notes are placed against, the file reads back with
+// the roll's tempo, map and pickup (the 5/4 on bar 2, not a bar late), and each
+// note keeps its time in seconds.
+{
+  const bpm = 90;
+  const stepSec = 60 / bpm / 4;
   const map: MeterSegment[] = [{ bar: 0, meter: { num: 7, den: 8, groups: [3, 2, 2] } }, { bar: 2, meter: { num: 5, den: 4, groups: [] } }];
-  const sigs = rollMeterToSmfEvents(map, 4, 90);
-  assert.deepEqual(sigs.map((e) => [e.tick, e.num, e.den]), [[0, 1, 4], [640, 7, 8], [5120, 5, 4]]);
-  const parsed = parseMidi(notesToSmf(render, 0, 0, sigs));
-  assert.deepEqual(parsed.tracks[0].notes, parseMidi(plain).tracks[0].notes);
+  const pickupSteps = 4;
+  // Downbeats of the pickup, bars 0 and 1 (14 steps of 7/8 each) and the 5/4 bar, then one note off the grid.
+  const downbeats = [0, 4, 18, 32];
+  const render = [
+    ...downbeats.map((s, i) => ({ midi: 60 + i, startSec: s * stepSec, durationSec: 2 * stepSec, velocity: 90 })),
+    { midi: 72, startSec: 0.4, durationSec: 0.2, velocity: 80 },
+  ];
+  const parsed = parseMidi(notesToRollSmf(render, { meterMap: map, pickupSteps, bpm }));
+
+  assert.equal(parsed.bpm, bpm);
+  assert.deepEqual(parsed.tempos, [{ tick: 0, bpm }]);
   assert.deepEqual(parsed.timeSignatures, [
-    { tick: 0, num: 1, den: 4, pickupSteps: 640 / 120 },
-    { tick: 640, num: 7, den: 8, groups: [3, 2, 2] },
-    { tick: 5120, num: 5, den: 4 },
+    { tick: 0, num: 1, den: 4, pickupSteps },
+    { tick: 4 * 120, num: 7, den: 8, groups: [3, 2, 2] },
+    { tick: 32 * 120, num: 5, den: 4 },
   ]);
-  assert.deepEqual(midiEventsToMeterMap(parsed.timeSignatures ?? [], parsed.ppq).pickupSteps, 640 / 120);
+  assert.deepEqual(midiEventsToMeterMap(parsed.timeSignatures ?? [], parsed.ppq), { map: normalizeMeterMap(map), pickupSteps });
+
+  const secPerTick = 60 / bpm / parsed.ppq;
+  const notes = parsed.tracks[0].notes;
+  // A note on a roll step lands on that step's tick, the one its bar line is written at.
+  downbeats.forEach((s, i) => {
+    const n = notes.find((m) => m.note === 60 + i);
+    assert.equal(n?.tick, s * (parsed.ppq / 4));
+    assert.equal(n?.durationTicks, 2 * (parsed.ppq / 4));
+  });
+  for (const r of render) {
+    const n = notes.find((m) => m.note === r.midi);
+    assert.ok(n);
+    assert.ok(Math.abs(n.tick * secPerTick - r.startSec) <= secPerTick / 2);
+    assert.ok(Math.abs((n.tick + n.durationTicks) * secPerTick - (r.startSec + r.durationSec)) <= secPerTick / 2);
+  }
 }
 
 console.log('midi tests passed');
