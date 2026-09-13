@@ -12,8 +12,8 @@
  */
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  Mic, Square, ChevronDown, ChevronRight, Download, Wand2, Loader2, Trash2,
-  Activity, Music4, Save,
+  Mic, Square, ChevronRight, Download, Wand2, Loader2, Trash2,
+  Activity, Music4,
 } from 'lucide-react';
 
 import {
@@ -46,6 +46,7 @@ import { describeMicFailure } from '../../../lib/micErrors';
 import { getEngineCtx } from '../../../state/playerStore';
 import { surfaceDeviceId, useIoDevicesStore } from '../../../state/ioDevicesStore';
 import { InstrumentPicker } from '../InstrumentPicker';
+import { KEY_ON, KEY_REST, MINI_ICON_KEY, STRIP_ICON_KEY, keyTone } from '../midiDockKit';
 
 const HISTORY_KEY = 'vocal2midi_recordings';
 
@@ -104,7 +105,7 @@ const Section: React.FC<{ title: string; defaultOpen?: boolean; children: React.
   title, defaultOpen = true, children,
 }) => (
   <details open={defaultOpen} className="rounded border border-white/10 bg-black/30">
-    <summary className="cursor-pointer select-none px-2 py-1 text-[9px] font-mono font-bold uppercase tracking-widest text-cyan-300/80 hover:text-cyan-200">
+    <summary className="cursor-pointer select-none px-2 py-1 text-[9px] font-mono font-bold uppercase tracking-widest et-ink-2 hover:et-ink">
       {title}
     </summary>
     <div className="px-2 pb-2 pt-1 space-y-1.5">{children}</div>
@@ -113,9 +114,11 @@ const Section: React.FC<{ title: string; defaultOpen?: boolean; children: React.
 
 const labelCls = 'text-[9px] font-mono uppercase tracking-wide text-zinc-400';
 const selectCls = 'w-full bg-zinc-800 border border-zinc-600 rounded text-[10px] font-mono text-zinc-100 px-1 py-0.5';
-const chip = 'px-1.5 py-0.5 text-[10px] font-mono rounded border transition-colors cursor-pointer';
-const chipOff = 'border-white/15 bg-white/5 text-zinc-200 hover:border-cyan-500/40';
-const chipOn = 'border-cyan-400 bg-cyan-500 text-black font-bold';
+// The MIDI dock's key grammar (midiDockKit): a chip's label is always an
+// element, so a disabled chip dims its label and keeps its cap.
+const chip = 'h-5 px-1.5 inline-flex items-center gap-1 rounded-xs border-b text-[10px] font-mono transition-[color,box-shadow,border-color] cursor-pointer disabled:cursor-default disabled:*:opacity-40';
+const chipOff = KEY_REST;
+const chipOn = KEY_ON;
 
 /* ── component ────────────────────────────────────────────────────────────── */
 
@@ -157,7 +160,40 @@ export const Vocal2MidiPanel: React.FC = () => {
   const lastBlobRef = useRef<Blob | null>(null);
 
   useEffect(() => { sensitivityRef.current = config.sensitivity; }, [config.sensitivity]);
-  useEffect(() => { localStorage.setItem(HISTORY_KEY, JSON.stringify(recordings)); }, [recordings]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(recordings));
+    } catch {
+      /* storage blocked or full: the history lasts for this session only */
+    }
+  }, [recordings]);
+
+  // The column unmounts when VOICE turns off or the tab closes, possibly
+  // mid-recording. stopRecording is the only other teardown, so release the
+  // recorder, the graph on the SHARED engine context and the mic here.
+  useEffect(() => () => {
+    isRecordingRef.current = false;
+    const rec = mediaRecorderRef.current;
+    mediaRecorderRef.current = null;
+    try {
+      if (rec && rec.state !== 'inactive') rec.stop();
+    } catch {
+      /* already stopped */
+    }
+    if (processorRef.current) processorRef.current.onaudioprocess = null;
+    for (const node of [sourceRef.current, processorRef.current, sinkRef.current]) {
+      try {
+        node?.disconnect();
+      } catch {
+        /* never connected */
+      }
+    }
+    sourceRef.current = null;
+    processorRef.current = null;
+    sinkRef.current = null;
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+  }, []);
 
   const bpm = audioAnalysis?.detectedBpm || config.manualBpm || 120;
 
@@ -460,33 +496,53 @@ export const Vocal2MidiPanel: React.FC = () => {
   /* ── render ────────────────────────────────────────────────────────────── */
   if (collapsed) {
     return (
-      <div className="h-full w-9 shrink-0 border-l border-white/8 bg-zinc-950 flex flex-col items-center gap-2 py-2">
-        <button type="button" onClick={() => setCollapsed(false)} title="Expand Vocal2MIDI" aria-label="Expand Vocal2MIDI"
-          className="text-cyan-300 hover:text-cyan-200"><ChevronRight className="w-4 h-4 rotate-180" /></button>
+      <div className="h-full w-9 shrink-0 border-l border-white/8 bg-zinc-950 flex flex-col items-center gap-1.5 py-1">
+        <button type="button" onClick={() => setCollapsed(false)} title="Expand Voice" aria-label="Expand Vocal2MIDI"
+          className={`${MINI_ICON_KEY} ${KEY_REST}`}><ChevronRight aria-hidden="true" className="w-3 h-3 rotate-180" /></button>
         <button type="button" onClick={() => (isRecording ? void stopRecording() : void startRecording())}
           title={isRecording ? 'Stop' : 'Record'} aria-label={isRecording ? 'Stop recording' : 'Record'}
-          className={`grid place-items-center w-6 h-6 rounded border ${isRecording ? 'border-red-500 text-red-300 bg-red-600/25' : 'border-cyan-600 text-cyan-300 hover:bg-cyan-600/15'}`}>
-          {isRecording ? <Square className="w-3 h-3" /> : <Mic className="w-3 h-3" />}
+          className={`${STRIP_ICON_KEY} ${keyTone({ rec: isRecording })}`}>
+          {isRecording ? <Square aria-hidden="true" className="w-3 h-3" /> : <Mic aria-hidden="true" className="w-3 h-3" />}
         </button>
-        <span className="text-[8px] font-mono text-zinc-600 [writing-mode:vertical-rl] rotate-180 tracking-widest">VOCAL2MIDI</span>
+        <span className="text-[8px] font-mono uppercase et-ink-3 [writing-mode:vertical-rl] rotate-180 tracking-widest">Voice</span>
       </div>
     );
   }
 
   return (
     <div className="h-full w-72 shrink-0 border-l border-white/8 bg-zinc-950 flex flex-col min-h-0">
-      {/* header */}
-      <div className="shrink-0 flex items-center gap-2 px-2 py-1.5 border-b border-white/10">
-        <button type="button" onClick={() => setCollapsed(true)} title="Collapse" aria-label="Collapse Vocal2MIDI"
-          className="text-zinc-500 hover:text-zinc-200"><ChevronDown className="w-3.5 h-3.5 -rotate-90" /></button>
-        <span className="text-[10px] font-mono font-bold uppercase tracking-widest text-cyan-300">Vocal2MIDI</span>
+      {/* header — 22px, level with the piano roll's ruler */}
+      <div className="shrink-0 h-5.5 flex items-center gap-1 pl-2 pr-0.5 border-b border-white/5 bg-black/60">
+        <span className="text-[8px] font-mono font-semibold uppercase tracking-widest et-ink-3" title="Vocal2MIDI">Voice</span>
         <div className="flex-1" />
+        {/* AI assistant: a key here, its chat opens over the page — drives
+            config + the piano-roll notes */}
+        <AssistantOrb
+          currentConfig={config}
+          onConfigUpdate={(updates) => patch(updates)}
+          pianoRollControls={{
+            notes: processedNotes,
+            bpm,
+            rootNote: config.rootNote,
+            scale: config.scale,
+            isPlaying: false,
+            onNotesChange: (notes) => pushNotes(notes),
+            onBpmChange: (b) => { setAudioAnalysis((prev) => prev ? { ...prev, detectedBpm: b } : { detectedBpm: b, timeSignature: '4/4', suggestedInstrument: '', description: '', detectedProfileId: config.activeProfileId }); patch({ manualBpm: b }); },
+            onKeyChange: (root, scale) => setConfig((p) => ({ ...p, rootNote: root, scale })),
+            onPlay: playPreview,
+            onStop: stopPreview,
+            onInstrumentChange: (inst) => { void getMidiSynth().setInstrument(inst as Parameters<ReturnType<typeof getMidiSynth>['setInstrument']>[0]); },
+          }}
+        />
         <button type="button" onClick={() => (isRecording ? void stopRecording() : void startRecording())}
           disabled={isProcessing}
           aria-label={isRecording ? 'Stop recording' : 'Record'}
-          className={`grid place-items-center w-7 h-7 rounded border transition-colors disabled:opacity-40 ${isRecording ? 'border-red-500 text-red-300 bg-red-600/25' : 'border-cyan-600 text-cyan-300 hover:bg-cyan-600/15'}`}>
-          {isProcessing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : isRecording ? <Square className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
+          title={isRecording ? 'Stop recording' : 'Record (live pitch detection to the piano roll)'}
+          className={`${MINI_ICON_KEY} ${keyTone({ rec: isRecording })}`}>
+          {isProcessing ? <Loader2 aria-hidden="true" className="w-3 h-3 animate-spin" /> : isRecording ? <Square aria-hidden="true" className="w-2.5 h-2.5" /> : <Mic aria-hidden="true" className="w-3 h-3" />}
         </button>
+        <button type="button" onClick={() => setCollapsed(true)} title="Collapse" aria-label="Collapse Vocal2MIDI"
+          className={`${MINI_ICON_KEY} ${KEY_REST}`}><ChevronRight aria-hidden="true" className="w-3 h-3" /></button>
       </div>
 
       <div className="flex-1 min-h-0 overflow-y-auto p-2 space-y-2">
@@ -495,15 +551,15 @@ export const Vocal2MidiPanel: React.FC = () => {
           <div className="flex items-center gap-2">
             <label htmlFor="v2m-sens" className={labelCls}>Sensitivity</label>
             <input id="v2m-sens" name="v2m-sens" type="range" min={0} max={100} value={config.sensitivity}
-              onChange={(e) => patch({ sensitivity: parseInt(e.target.value, 10) })} className="flex-1 accent-cyan-500" />
-            <span className="w-8 text-right text-[9px] font-mono text-cyan-300">{config.sensitivity}%</span>
+              onChange={(e) => patch({ sensitivity: parseInt(e.target.value, 10) })} className="flex-1 accent-[rgb(var(--et-accent))]" />
+            <span className="w-8 text-right text-[9px] font-mono et-ink">{config.sensitivity}%</span>
           </div>
-          <label className="flex items-center gap-1.5 text-[10px] text-zinc-300">
-            <input type="checkbox" id="v2m-cleanup" name="v2m-cleanup" checked={config.enableCleanup} onChange={(e) => patch({ enableCleanup: e.target.checked })} className="accent-cyan-500" />
+          <label htmlFor="v2m-cleanup" className="flex items-center gap-1.5 text-[10px] text-zinc-300">
+            <input type="checkbox" id="v2m-cleanup" name="v2m-cleanup" checked={config.enableCleanup} onChange={(e) => patch({ enableCleanup: e.target.checked })} className="accent-[rgb(var(--et-accent))]" />
             Note cleanup
           </label>
-          <label className="flex items-center gap-1.5 text-[10px] text-zinc-300">
-            <input type="checkbox" id="v2m-pitchbend" name="v2m-pitchbend" checked={config.experimentalPitchBend} onChange={(e) => patch({ experimentalPitchBend: e.target.checked })} className="accent-cyan-500" />
+          <label htmlFor="v2m-pitchbend" className="flex items-center gap-1.5 text-[10px] text-zinc-300">
+            <input type="checkbox" id="v2m-pitchbend" name="v2m-pitchbend" checked={config.experimentalPitchBend} onChange={(e) => patch({ experimentalPitchBend: e.target.checked })} className="accent-[rgb(var(--et-accent))]" />
             Pitch bend (experimental)
           </label>
           <span className="block text-[9px] font-mono text-zinc-500 truncate" title={status}>{status}</span>
@@ -511,16 +567,16 @@ export const Vocal2MidiPanel: React.FC = () => {
 
         <Section title="Musical">
           <div className="flex items-center gap-2">
-            <label className="flex items-center gap-1.5 text-[10px] text-zinc-300 flex-1">
-              <input type="checkbox" id="v2m-autokey" name="v2m-autokey" checked={config.autoKeyDetection} onChange={(e) => patch({ autoKeyDetection: e.target.checked })} className="accent-cyan-500" />
+            <label htmlFor="v2m-autokey" className="flex items-center gap-1.5 text-[10px] text-zinc-300 flex-1">
+              <input type="checkbox" id="v2m-autokey" name="v2m-autokey" checked={config.autoKeyDetection} onChange={(e) => patch({ autoKeyDetection: e.target.checked })} className="accent-[rgb(var(--et-accent))]" />
               Auto key
             </label>
-            <label className="flex items-center gap-1.5 text-[10px] text-zinc-300 flex-1">
-              <input type="checkbox" id="v2m-autobpm" name="v2m-autobpm" checked={config.useGeminiForBpm} onChange={(e) => patch({ useGeminiForBpm: e.target.checked })} className="accent-cyan-500" />
+            <label htmlFor="v2m-autobpm" className="flex items-center gap-1.5 text-[10px] text-zinc-300 flex-1">
+              <input type="checkbox" id="v2m-autobpm" name="v2m-autobpm" checked={config.useGeminiForBpm} onChange={(e) => patch({ useGeminiForBpm: e.target.checked })} className="accent-[rgb(var(--et-accent))]" />
               Auto BPM (AI)
             </label>
           </div>
-          {detectedKeyString && <span className="block text-[9px] font-mono text-emerald-400">key: {detectedKeyString}</span>}
+          {detectedKeyString && <span className="block text-[9px] font-mono text-[rgb(var(--et-accent))]">key: {detectedKeyString}</span>}
           <div className="grid grid-cols-2 gap-1.5">
             <div>
               <label htmlFor="v2m-root" className={labelCls}>Root</label>
@@ -551,13 +607,13 @@ export const Vocal2MidiPanel: React.FC = () => {
           <div>
             <span className={labelCls}>Quantize</span>
             <div className="flex gap-1 mt-0.5">
-              <button type="button" onClick={() => patch({ quantizeMode: 'AUTO' })} className={`${chip} ${config.quantizeMode === 'AUTO' ? chipOn : chipOff}`}>Auto</button>
-              <button type="button" onClick={() => patch({ quantizeMode: 'MANUAL' })} className={`${chip} ${config.quantizeMode === 'MANUAL' ? chipOn : chipOff}`}>Manual</button>
+              <button type="button" onClick={() => patch({ quantizeMode: 'AUTO' })} className={`${chip} ${config.quantizeMode === 'AUTO' ? chipOn : chipOff}`}><span>Auto</span></button>
+              <button type="button" onClick={() => patch({ quantizeMode: 'MANUAL' })} className={`${chip} ${config.quantizeMode === 'MANUAL' ? chipOn : chipOff}`}><span>Manual</span></button>
               {config.quantizeMode === 'MANUAL' && (
                 <>
-                  <button type="button" onClick={() => patch({ manualQuantizeValue: QuantizeValue.OFF })} className={`${chip} ${config.manualQuantizeValue === QuantizeValue.OFF ? chipOn : chipOff}`}>Off</button>
+                  <button type="button" onClick={() => patch({ manualQuantizeValue: QuantizeValue.OFF })} className={`${chip} ${config.manualQuantizeValue === QuantizeValue.OFF ? chipOn : chipOff}`}><span>Off</span></button>
                   {QUANT_BUTTONS.map((q) => (
-                    <button key={q.label} type="button" onClick={() => patch({ manualQuantizeValue: q.value })} className={`${chip} ${config.manualQuantizeValue === q.value ? chipOn : chipOff}`}>{q.label}</button>
+                    <button key={q.label} type="button" onClick={() => patch({ manualQuantizeValue: q.value })} className={`${chip} ${config.manualQuantizeValue === q.value ? chipOn : chipOff}`}><span>{q.label}</span></button>
                   ))}
                 </>
               )}
@@ -575,23 +631,23 @@ export const Vocal2MidiPanel: React.FC = () => {
           <div className="flex flex-wrap gap-1">
             <span className={`${labelCls} w-full`}>Re-quantize</span>
             {QUANT_BUTTONS.map((q) => (
-              <button key={q.label} type="button" onClick={() => doQuantize(q.value)} className={`${chip} ${chipOff}`} disabled={processedNotes.length === 0}>{q.label}</button>
+              <button key={q.label} type="button" onClick={() => doQuantize(q.value)} className={`${chip} ${chipOff}`} disabled={processedNotes.length === 0}><span>{q.label}</span></button>
             ))}
           </div>
           <div className="flex flex-wrap items-center gap-1">
             <span className={labelCls}>Transpose</span>
-            <button type="button" onClick={() => doTranspose(-12)} className={`${chip} ${chipOff}`}>-12</button>
-            <button type="button" onClick={() => doTranspose(-1)} className={`${chip} ${chipOff}`}>-1</button>
-            <button type="button" onClick={() => doTranspose(1)} className={`${chip} ${chipOff}`}>+1</button>
-            <button type="button" onClick={() => doTranspose(12)} className={`${chip} ${chipOff}`}>+12</button>
-            <button type="button" onClick={doSnap} className={`${chip} ${chipOff}`} disabled={processedNotes.length === 0}>Snap to scale</button>
+            <button type="button" onClick={() => doTranspose(-12)} className={`${chip} ${chipOff}`}><span>-12</span></button>
+            <button type="button" onClick={() => doTranspose(-1)} className={`${chip} ${chipOff}`}><span>-1</span></button>
+            <button type="button" onClick={() => doTranspose(1)} className={`${chip} ${chipOff}`}><span>+1</span></button>
+            <button type="button" onClick={() => doTranspose(12)} className={`${chip} ${chipOff}`}><span>+12</span></button>
+            <button type="button" onClick={doSnap} className={`${chip} ${chipOff}`} disabled={processedNotes.length === 0}><span>Snap to scale</span></button>
           </div>
           {relatedKeys.length > 0 && (
             <div className="flex flex-wrap items-center gap-1">
               <span className={labelCls}>Change key</span>
               {relatedKeys.map((rk) => (
                 <button key={rk.relationship} type="button" title={rk.relationship} onClick={() => doChangeKey(rk.midiNote, rk.scale)} className={`${chip} ${chipOff}`}>
-                  {NOTE_NAMES[rk.root]} {rk.scale}
+                  <span>{NOTE_NAMES[rk.root]} {rk.scale}</span>
                 </button>
               ))}
             </div>
@@ -604,8 +660,8 @@ export const Vocal2MidiPanel: React.FC = () => {
             placeholder="AI context / instruction (optional)" aria-label="AI prompt"
             className="w-full bg-zinc-800 border border-zinc-600 rounded text-[10px] text-zinc-100 px-1.5 py-1" />
           <button type="button" onClick={() => void handleSmartCleanup()} disabled={isSmartCleaning || !lastBlobRef.current || processedNotes.length === 0}
-            className="w-full flex items-center justify-center gap-1 px-2 py-1 text-[10px] font-mono uppercase tracking-wide rounded border border-violet-500/50 text-violet-200 hover:bg-violet-500/15 disabled:opacity-40">
-            {isSmartCleaning ? <Loader2 className="w-3 h-3 animate-spin" /> : <Wand2 className="w-3 h-3" />} Smart cleanup (AI)
+            className={`${chip} ${chipOff} w-full justify-center uppercase tracking-wide`}>
+            {isSmartCleaning ? <Loader2 aria-hidden="true" className="w-3 h-3 animate-spin" /> : <Wand2 aria-hidden="true" className="w-3 h-3" />} <span>Smart cleanup (AI)</span>
           </button>
           {lastCleanupSummary && <span className="block text-[9px] text-zinc-400 wrap-break-word">{lastCleanupSummary}</span>}
           <span className="block text-[8px] font-mono text-zinc-600">AI uses theDAW's Gemini (gemini-3.5-flash). Needs GEMINI_API_KEY set on the server.</span>
@@ -613,14 +669,14 @@ export const Vocal2MidiPanel: React.FC = () => {
 
         <Section title="Play & export" defaultOpen={false}>
           <div className="flex items-center gap-1">
-            <button type="button" onClick={playPreview} disabled={processedNotes.length === 0} className={`${chip} ${chipOff} flex items-center gap-1`}><Activity className="w-3 h-3" /> Play</button>
-            <button type="button" onClick={stopPreview} className={`${chip} ${chipOff} flex items-center gap-1`}><Square className="w-3 h-3" /> Stop</button>
+            <button type="button" onClick={playPreview} disabled={processedNotes.length === 0} className={`${chip} ${chipOff} flex items-center gap-1`}><Activity aria-hidden="true" className="w-3 h-3" /> <span>Play</span></button>
+            <button type="button" onClick={stopPreview} className={`${chip} ${chipOff} flex items-center gap-1`}><Square aria-hidden="true" className="w-3 h-3" /> <span>Stop</span></button>
             <BpmTapper currentBpm={bpm} onBpmSet={(b) => { setAudioAnalysis((prev) => prev ? { ...prev, detectedBpm: b } : { detectedBpm: b, timeSignature: '4/4', suggestedInstrument: '', description: 'tap tempo', detectedProfileId: config.activeProfileId }); patch({ manualBpm: b }); if (capturedNotes.length) applyToRoll(processedNotes, b); }} />
           </div>
           <div className="flex items-center gap-1">
-            <button type="button" onClick={() => void handleExportMidi()} disabled={processedNotes.length === 0} className={`${chip} ${chipOff} flex items-center gap-1`}><Download className="w-3 h-3" /> MIDI</button>
-            <button type="button" onClick={() => void handleExportWav()} disabled={processedNotes.length === 0} className={`${chip} ${chipOff} flex items-center gap-1`}><Music4 className="w-3 h-3" /> WAV</button>
-            <button type="button" onClick={() => { setCapturedNotes([]); setProcessedNotes([]); usePianoRollStore.getState().clear(); setStatus('cleared'); }} className={`${chip} ${chipOff} flex items-center gap-1`}><Trash2 className="w-3 h-3" /> Clear</button>
+            <button type="button" onClick={() => void handleExportMidi()} disabled={processedNotes.length === 0} className={`${chip} ${chipOff} flex items-center gap-1`}><Download aria-hidden="true" className="w-3 h-3" /> <span>MIDI</span></button>
+            <button type="button" onClick={() => void handleExportWav()} disabled={processedNotes.length === 0} className={`${chip} ${chipOff} flex items-center gap-1`}><Music4 aria-hidden="true" className="w-3 h-3" /> <span>WAV</span></button>
+            <button type="button" onClick={() => { setCapturedNotes([]); setProcessedNotes([]); usePianoRollStore.getState().clear(); setStatus('cleared'); }} className={`${chip} ${chipOff} flex items-center gap-1`}><Trash2 aria-hidden="true" className="w-3 h-3" /> <span>Clear</span></button>
           </div>
         </Section>
 
@@ -638,25 +694,6 @@ export const Vocal2MidiPanel: React.FC = () => {
           />
         </Section>
       </div>
-
-      {/* AI assistant orb — drives config + the piano-roll notes */}
-      <AssistantOrb
-        currentConfig={config}
-        onConfigUpdate={(updates) => patch(updates)}
-        pianoRollControls={{
-          notes: processedNotes,
-          bpm,
-          rootNote: config.rootNote,
-          scale: config.scale,
-          isPlaying: false,
-          onNotesChange: (notes) => pushNotes(notes),
-          onBpmChange: (b) => { setAudioAnalysis((prev) => prev ? { ...prev, detectedBpm: b } : { detectedBpm: b, timeSignature: '4/4', suggestedInstrument: '', description: '', detectedProfileId: config.activeProfileId }); patch({ manualBpm: b }); },
-          onKeyChange: (root, scale) => setConfig((p) => ({ ...p, rootNote: root, scale })),
-          onPlay: playPreview,
-          onStop: stopPreview,
-          onInstrumentChange: (inst) => { void getMidiSynth().setInstrument(inst as Parameters<ReturnType<typeof getMidiSynth>['setInstrument']>[0]); },
-        }}
-      />
     </div>
   );
 };

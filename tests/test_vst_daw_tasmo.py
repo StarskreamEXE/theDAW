@@ -121,6 +121,130 @@ def test_tasmo_embed_roundtrip(tmp_path=None):
     print("  TasmoFile embed round-trip OK")
 
 
+_ROLL_KEYS = ("roll_notes", "total_steps", "meter_map", "pickup_steps", "lanes")
+
+
+def test_tasmo_clip_meter_roundtrip(tmp_path):
+    import json
+    from backend.modules.project.tasmo_project import TasmoProject, Clip
+    from backend.modules.project.tasmo_file import TasmoFile
+
+    meter_map = [
+        {"bar": 0, "meter": {"num": 4, "den": 4, "groups": []}},
+        {"bar": 2, "meter": {"num": 7, "den": 8, "groups": [3, 2, 2]}},
+    ]
+    lanes = [
+        {"id": 0, "name": "A", "cycle_steps": None},
+        {"id": 1, "name": "B", "cycle_steps": 12},
+    ]
+    # The roll's own notes; the second sits in lane B, which loops every 12 steps.
+    roll_notes = [
+        {"note": 60, "step": 0, "length": 2, "velocity": 90},
+        {"note": 64, "step": 3, "length": 1, "velocity": 80, "lane": 1},
+    ]
+    # The notes as they sound across 46 steps: lane B's note at every cycle.
+    notes = [
+        {"note": 60, "step": 0, "length": 2, "velocity": 90},
+        {"note": 64, "step": 3, "length": 1, "velocity": 80},
+        {"note": 64, "step": 15, "length": 1, "velocity": 80},
+        {"note": 64, "step": 27, "length": 1, "velocity": 80},
+        {"note": 64, "step": 39, "length": 1, "velocity": 80},
+    ]
+    # The frontend posts this JSON; the router validates it into the model.
+    payload = {
+        "project_name": "Meter",
+        "tempo": 96.0,
+        "tracks": [
+            {
+                "id": "t1",
+                "name": "Roll",
+                "type": "audio",
+                "clips": [
+                    {
+                        "id": "c1",
+                        "name": "roll",
+                        "clip_type": "midi",
+                        "track_id": "t1",
+                        "midi_notes": notes,
+                        "roll_notes": roll_notes,
+                        "total_steps": 46,
+                        "meter_map": meter_map,
+                        "pickup_steps": 4,
+                        "lanes": lanes,
+                    }
+                ],
+            }
+        ],
+    }
+    project = TasmoProject.model_validate(json.loads(json.dumps(payload)))
+    path = tmp_path / "meter.tasmo"
+    TasmoFile.save(project, str(path))
+    loaded, _ = TasmoFile.load(str(path))
+    clip = loaded.tracks[0].clips[0]
+    assert clip.total_steps == 46
+    assert clip.meter_map == meter_map
+    assert clip.pickup_steps == 4
+    assert clip.lanes == lanes
+    assert clip.midi_notes == notes
+    assert not any("lane" in n for n in clip.midi_notes)
+    assert clip.roll_notes == roll_notes
+    assert clip.roll_notes[1]["lane"] == 1
+    # And back out to the frontend as JSON.
+    dumped = json.loads(json.dumps(loaded.model_dump()))["tracks"][0]["clips"][0]
+    assert {k: dumped[k] for k in _ROLL_KEYS} == {
+        "roll_notes": roll_notes,
+        "total_steps": 46,
+        "meter_map": meter_map,
+        "pickup_steps": 4,
+        "lanes": lanes,
+    }
+    audio = Clip(id="c2", name="audio", clip_type="audio", track_id="t1")
+    assert audio.meter_map is None
+    assert audio.roll_notes is None
+
+
+def test_tasmo_file_without_meter_fields_loads_unchanged(tmp_path):
+    import zipfile
+
+    import msgpack
+
+    from backend.modules.project.tasmo_project import TasmoProject, Track, Clip
+    from backend.modules.project.tasmo_file import TasmoFile
+
+    notes = [{"note": 60, "step": 0, "length": 4, "velocity": 100}]
+    project = TasmoProject(project_name="Old", tempo=100.0)
+    track = Track(id="t1", name="Roll", type="audio")
+    track.clips.append(
+        Clip(id="c1", name="roll", clip_type="midi", track_id="t1", midi_notes=notes)
+    )
+    project.tracks.append(track)
+    new_path = tmp_path / "new.tasmo"
+    TasmoFile.save(project, str(new_path))
+
+    # The same archive as a file written before the meter fields existed.
+    old_path = tmp_path / "old.tasmo"
+    with (
+        zipfile.ZipFile(new_path) as src,
+        zipfile.ZipFile(old_path, "w", zipfile.ZIP_DEFLATED) as dst,
+    ):
+        for info in src.infolist():
+            data = src.read(info.filename)
+            if info.filename == "project.msgpack":
+                raw = msgpack.unpackb(data, raw=False)
+                for key in _ROLL_KEYS:
+                    del raw["tracks"][0]["clips"][0][key]
+                old_clip = raw["tracks"][0]["clips"][0]
+                data = msgpack.packb(raw, use_bin_type=True)
+            dst.writestr(info, data)
+    assert not any(k in old_clip for k in _ROLL_KEYS)
+
+    loaded, _ = TasmoFile.load(str(old_path))
+    dumped = loaded.tracks[0].clips[0].model_dump()
+    assert all(dumped[k] is None for k in _ROLL_KEYS)
+    assert {k: v for k, v in dumped.items() if k not in _ROLL_KEYS} == old_clip
+    assert loaded.tempo == 100.0
+
+
 def test_vst_scanner():
     from backend.modules.vst.scanner import _default_vst3_dirs, Vst3PluginInfo
 
@@ -229,11 +353,16 @@ def test_detect_all_formats():
 
 
 if __name__ == "__main__":
+    import tempfile
+    from pathlib import Path
+
     print("Running VST / DAW import / .tasmo smoke tests...")
     test_daw_models()
     test_tasmo_project()
     test_tasmo_file_roundtrip()
     test_tasmo_embed_roundtrip()
+    test_tasmo_clip_meter_roundtrip(Path(tempfile.mkdtemp()))
+    test_tasmo_file_without_meter_fields_loads_unchanged(Path(tempfile.mkdtemp()))
     test_vst_scanner()
     test_vst_host()
     test_ableton_parser_structure()

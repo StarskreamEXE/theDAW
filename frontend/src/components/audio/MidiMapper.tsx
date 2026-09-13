@@ -6,11 +6,16 @@
  * mappable, plus an `onChange(key, value)` callback fired whenever
  * a mapped CC produces a fresh value. Mappings persist to
  * localStorage under `storageKey`.
+ *
+ * Two forms: the floating top-right `pill` (the SEQUENCE tab), and a `key`
+ * for a toolbar strip (the MIDI dock's MAP key), whose panel opens below it
+ * in a flyout the dock cannot clip.
  */
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Music2, Plug, X, RotateCcw, Crosshair, Zap } from 'lucide-react';
+import React, { useCallback, useEffect, useId, useRef, useState } from 'react';
+import { Cable, Music2, Plug, X, RotateCcw, Crosshair, Zap } from 'lucide-react';
 import { subscribeToMidi } from '../../state/midiBus';
 import { enableMidi } from '../../state/midiTriggerStore';
+import { DockFlyout, FLYOUT_CARD, StripKey } from './midiDockKit';
 
 export interface MidiParamDef<K extends string = string> {
   key: K;
@@ -43,8 +48,11 @@ interface MidiMapperProps<K extends string = string> {
   /** localStorage key for the mappings dictionary. Make this unique
    *  per surface so Piano and Sequence don't collide. */
   storageKey: string;
-  /** Color accent — affects the pill border and active LEARN highlight. */
-  accent?: 'purple' | 'cyan' | 'emerald';
+  /** Color accent — affects the pill border and active LEARN highlight.
+   *  `theme` draws everything in the theme's accent (`--et-accent`). */
+  accent?: 'purple' | 'cyan' | 'emerald' | 'theme';
+  /** `pill` floats top-right of its positioned parent; `key` is a MAP key. */
+  variant?: 'pill' | 'key';
 }
 
 function scaleCcValue(value: number, def: MidiParamDef): number {
@@ -103,6 +111,11 @@ const ACCENTS = {
     panelBorder: 'border-purple-500/40',
     learn: 'border-amber-400/60 bg-amber-500/15 text-amber-200',
     learnHover: 'hover:text-purple-200 hover:border-purple-500/40',
+    learningText: 'text-amber-300',
+    idleText: 'text-zinc-500',
+    inverted: 'border-purple-500/40 text-purple-200 bg-purple-500/15',
+    invertHover: 'hover:text-purple-200',
+    clearHover: 'hover:text-rose-300 hover:border-rose-500/40',
   },
   cyan: {
     pillBorder: 'border-cyan-500/40',
@@ -115,6 +128,11 @@ const ACCENTS = {
     panelBorder: 'border-cyan-500/40',
     learn: 'border-amber-400/60 bg-amber-500/15 text-amber-200',
     learnHover: 'hover:text-cyan-200 hover:border-cyan-500/40',
+    learningText: 'text-amber-300',
+    idleText: 'text-zinc-500',
+    inverted: 'border-purple-500/40 text-purple-200 bg-purple-500/15',
+    invertHover: 'hover:text-purple-200',
+    clearHover: 'hover:text-rose-300 hover:border-rose-500/40',
   },
   emerald: {
     pillBorder: 'border-emerald-500/40',
@@ -127,6 +145,30 @@ const ACCENTS = {
     panelBorder: 'border-emerald-500/40',
     learn: 'border-amber-400/60 bg-amber-500/15 text-amber-200',
     learnHover: 'hover:text-emerald-200 hover:border-emerald-500/40',
+    learningText: 'text-amber-300',
+    idleText: 'text-zinc-500',
+    inverted: 'border-purple-500/40 text-purple-200 bg-purple-500/15',
+    invertHover: 'hover:text-purple-200',
+    clearHover: 'hover:text-rose-300 hover:border-rose-500/40',
+  },
+  // The theme's one accent. Ink uses the et-ink utilities, which no theme
+  // remap overrides, so their hover variants actually paint.
+  theme: {
+    pillBorder: 'border-white/10',
+    pillBg: 'bg-white/10',
+    pillText: 'et-ink-2',
+    pillDot: 'bg-[rgb(var(--et-accent))]',
+    icon: 'text-[rgb(var(--et-accent))]',
+    headerText: 'et-ink',
+    headerBorder: 'border-white/10',
+    panelBorder: 'border-white/10',
+    learn: 'border-[rgb(var(--et-accent))] bg-white/10 text-[rgb(var(--et-accent))]',
+    learnHover: 'hover:et-ink hover:border-white/25',
+    learningText: 'text-[rgb(var(--et-accent))]',
+    idleText: 'et-ink-3',
+    inverted: 'border-[rgb(var(--et-accent))] text-[rgb(var(--et-accent))] bg-white/10',
+    invertHover: 'hover:et-ink',
+    clearHover: 'hover:et-ink hover:border-white/25',
   },
 } as const;
 
@@ -136,6 +178,7 @@ export function MidiMapper<K extends string = string>({
   onChange,
   storageKey,
   accent = 'purple',
+  variant = 'pill',
 }: MidiMapperProps<K>): React.ReactElement {
   const [open, setOpen] = useState(false);
   const [mappings, setMappings] = useState<Record<K, MidiMapping>>(
@@ -144,6 +187,8 @@ export function MidiMapper<K extends string = string>({
   const [learning, setLearning] = useState<K | null>(null);
   const [lastSeenCc, setLastSeenCc] = useState<{ cc: number; value: number; channel: number } | null>(null);
   const [connected, setConnected] = useState(false);
+  const keyRef = useRef<HTMLButtonElement>(null);
+  const panelId = `midi-mapper-${useId().replace(/:/g, '')}`;
 
   // Refs so the bus subscriber callback (set up once below) always
   // sees the freshest mapping table + learn target.
@@ -232,42 +277,38 @@ export function MidiMapper<K extends string = string>({
   }, []);
 
   const resetMappings = useCallback(() => {
-    if (typeof window !== 'undefined') window.localStorage.removeItem(storageKey);
+    try {
+      if (typeof window !== 'undefined') window.localStorage.removeItem(storageKey);
+    } catch {
+      /* storage blocked: the defaults below still apply for this session */
+    }
     setMappings(loadMappings(storageKey, paramsRef.current));
   }, [storageKey]);
 
   const cls = ACCENTS[accent];
+  const controllerTitle = `MIDI mapper for ${title} — ${connected ? 'controller seen' : 'waiting for controller'}`;
 
-  if (!open) {
-    return (
-      <button
-        type="button"
-        onClick={() => setOpen(true)}
-        className={`absolute top-1.5 right-1.5 z-30 flex items-center gap-1.5 px-2 py-0.5 rounded border text-[9px] font-mono uppercase tracking-widest ${cls.pillBorder} ${cls.pillBg} ${cls.pillText}`}
-        title={`MIDI mapper for ${title} — ${connected ? 'controller seen' : 'waiting for controller'}`}
-      >
-        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${connected ? `${cls.pillDot} animate-pulse` : 'bg-zinc-700'}`} />
-        <Music2 className="w-3 h-3" />
-        <span>MIDI</span>
-      </button>
-    );
-  }
-
-  return (
-    <div className={`absolute top-1.5 right-1.5 z-40 w-72 max-h-[70vh] flex flex-col bg-black/90 backdrop-blur-md border rounded text-[10px] font-mono text-zinc-200 shadow-[0_8px_24px_rgba(0,0,0,0.6)] ${cls.panelBorder}`}>
+  const panel = (
+    <>
       <div className={`flex items-center justify-between gap-2 px-3 py-2 border-b shrink-0 ${cls.headerBorder}`}>
         <div className="flex items-center gap-1.5">
-          <Music2 className={`w-3.5 h-3.5 ${cls.icon}`} />
+          <Music2 aria-hidden="true" className={`w-3.5 h-3.5 ${cls.icon}`} />
           <span className={`font-black uppercase tracking-widest ${cls.headerText}`}>{title} · MIDI</span>
         </div>
-        <button onClick={() => setOpen(false)} className="p-1 text-zinc-500 hover:text-white">
-          <X className="w-3 h-3" />
+        <button
+          type="button"
+          onClick={() => setOpen(false)}
+          aria-label="Close MIDI mapper"
+          title="Close"
+          className={`p-1 ${cls.idleText} hover:text-white`}
+        >
+          <X aria-hidden="true" className="w-3 h-3" />
         </button>
       </div>
 
       <div className="px-3 py-2 border-b border-white/5 shrink-0 flex flex-col gap-1">
         <div className="flex items-center gap-1.5">
-          <Plug className={`w-3 h-3 ${connected ? cls.icon : 'text-zinc-500'}`} />
+          <Plug aria-hidden="true" className={`w-3 h-3 ${connected ? cls.icon : cls.idleText}`} />
           <span className="text-zinc-400">{connected ? 'Receiving controller input' : 'Waiting for controller'}</span>
         </div>
         {lastSeenCc && (
@@ -276,8 +317,8 @@ export function MidiMapper<K extends string = string>({
           </div>
         )}
         {learning && (
-          <div className="text-[9px] text-amber-300 animate-pulse mt-0.5 flex items-center gap-1">
-            <Crosshair className="w-2.5 h-2.5" /> LEARN: move a knob to bind {String(learning)}
+          <div className={`text-[9px] animate-pulse mt-0.5 flex items-center gap-1 ${cls.learningText}`}>
+            <Crosshair aria-hidden="true" className="w-2.5 h-2.5" /> LEARN: move a knob to bind {String(learning)}
           </div>
         )}
       </div>
@@ -297,27 +338,35 @@ export function MidiMapper<K extends string = string>({
                 </span>
               </div>
               <button
+                type="button"
                 onClick={() => setLearning(isLearning ? null : param.key)}
-                className={`p-1 rounded border ${isLearning ? `${cls.learn} animate-pulse` : `border-white/10 text-zinc-500 ${cls.learnHover}`}`}
+                aria-label={isLearning ? `Cancel learn for ${param.label}` : `Learn a control for ${param.label}`}
+                aria-pressed={isLearning}
+                className={`p-1 rounded border ${isLearning ? `${cls.learn} animate-pulse` : `border-white/10 ${cls.idleText} ${cls.learnHover}`}`}
                 title={isLearning ? 'Cancel learn' : 'MIDI LEARN — move a knob to bind'}
               >
-                <Crosshair className="w-3 h-3" />
+                <Crosshair aria-hidden="true" className="w-3 h-3" />
               </button>
               {m && (
                 <>
                   <button
+                    type="button"
                     onClick={() => setMapping(param.key, { ...m, inverted: !m.inverted })}
-                    className={`p-1 rounded border ${m.inverted ? 'border-purple-500/40 text-purple-200 bg-purple-500/15' : 'border-white/10 text-zinc-500 hover:text-purple-200'}`}
+                    aria-label={`Invert range for ${param.label}`}
+                    aria-pressed={!!m.inverted}
+                    className={`p-1 rounded border ${m.inverted ? cls.inverted : `border-white/10 ${cls.idleText} ${cls.invertHover}`}`}
                     title="Invert range"
                   >
-                    <Zap className="w-3 h-3" />
+                    <Zap aria-hidden="true" className="w-3 h-3" />
                   </button>
                   <button
+                    type="button"
                     onClick={() => setMapping(param.key, null)}
-                    className="p-1 rounded border border-white/10 text-zinc-500 hover:text-rose-300 hover:border-rose-500/40"
+                    aria-label={`Clear mapping for ${param.label}`}
+                    className={`p-1 rounded border border-white/10 ${cls.idleText} ${cls.clearHover}`}
                     title="Clear mapping"
                   >
-                    <X className="w-3 h-3" />
+                    <X aria-hidden="true" className="w-3 h-3" />
                   </button>
                 </>
               )}
@@ -328,15 +377,76 @@ export function MidiMapper<K extends string = string>({
 
       <div className="flex items-center justify-between px-3 py-2 border-t border-white/5 shrink-0">
         <button
+          type="button"
           onClick={resetMappings}
           className="flex items-center gap-1.5 px-2 py-1 rounded border border-white/10 text-[9px] uppercase tracking-widest text-zinc-400 hover:text-zinc-100 hover:bg-white/5"
           title="Restore auto-map defaults"
         >
-          <RotateCcw className="w-3 h-3" /> Defaults
+          <RotateCcw aria-hidden="true" className="w-3 h-3" /> Defaults
         </button>
         <span className="text-[8px] text-zinc-700">global MIDI bus · audio runs in parallel</span>
       </div>
+    </>
+  );
+
+  if (variant === 'key') {
+    return (
+      <>
+        <StripKey
+          ref={keyRef}
+          onClick={() => setOpen((v) => !v)}
+          aria-haspopup="dialog"
+          aria-expanded={open}
+          aria-controls={panelId}
+          aria-label={`Map MIDI controls for ${title.toLowerCase()}`}
+          title={controllerTitle}
+          on={open}
+          icon={
+            <>
+              <span
+                className={`self-center w-1 h-1 mr-0.5 rounded-full ${connected ? 'bg-[rgb(var(--et-accent))] animate-pulse' : 'bg-white/20'}`}
+              />
+              <Cable className="w-3 h-3" />
+            </>
+          }
+          legend="Map"
+        />
+        <DockFlyout
+          open={open}
+          anchorRef={keyRef}
+          onClose={() => setOpen(false)}
+          placement="below"
+          align="end"
+          closeOnOutside={false}
+          id={panelId}
+          role="dialog"
+          aria-label={`${title} MIDI mapper`}
+          className={`w-72 max-h-[70vh] flex flex-col text-[10px] font-mono text-zinc-200 ${FLYOUT_CARD}`}
+        >
+          {panel}
+        </DockFlyout>
+      </>
+    );
+  }
+
+  if (!open) {
+    return (
+      <button
+        type="button"
+        onClick={() => setOpen(true)}
+        className={`absolute top-1.5 right-1.5 z-30 flex items-center gap-1.5 px-2 py-0.5 rounded border text-[9px] font-mono uppercase tracking-widest ${cls.pillBorder} ${cls.pillBg} ${cls.pillText}`}
+        title={controllerTitle}
+      >
+        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${connected ? `${cls.pillDot} animate-pulse` : 'bg-zinc-700'}`} />
+        <Music2 aria-hidden="true" className="w-3 h-3" />
+        <span>MIDI</span>
+      </button>
+    );
+  }
+
+  return (
+    <div className={`absolute top-1.5 right-1.5 z-40 w-72 max-h-[70vh] flex flex-col bg-black/90 backdrop-blur-md border rounded text-[10px] font-mono text-zinc-200 shadow-[0_8px_24px_rgba(0,0,0,0.6)] ${cls.panelBorder}`}>
+      {panel}
     </div>
   );
 }
-

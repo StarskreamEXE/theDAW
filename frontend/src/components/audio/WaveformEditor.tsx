@@ -32,6 +32,8 @@ import type { ChainEntry } from '../../state/effectChainStore';
 import type { Vst3PluginInfo } from '../../lib/vstClient';
 import { getEngineCtx, getMasterGain, usePlayerStore } from '../../state/playerStore';
 import { usePianoRollStore } from '../../state/pianoRollStore';
+import { clipRollLoad } from '../../lib/rollClip';
+import { midiEventsToMeterMap, roundUpToBar } from '../../lib/meterMap';
 import { GM_NAMES, gmShortName } from '../../lib/gmInstruments';
 import { useSoundfontStore, ensureSoundfontReady, isSoundfontActive, getActiveProgram } from '../../lib/soundfontEngine';
 import { renderStepNotesToBlob } from '../../lib/midiSynth';
@@ -1190,8 +1192,13 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     try {
       await ensureSoundfontReady();
       const bpm = clip.sourceBpm ?? useEditorStore.getState().bpm;
+      // A clip with no grid length renders to the bar line after its last note.
       const totalSteps = clip.sourceTotalSteps
-        ?? Math.max(16, ...clip.sourcePianoRoll.map((n) => n.step + n.length));
+        ?? roundUpToBar(
+          clip.sourceMeterMap ?? [],
+          Math.max(1, ...clip.sourcePianoRoll.map((n) => n.step + n.length)),
+          clip.sourcePickupSteps ?? 0,
+        );
       const rendered = await renderStepNotesToBlob(clip.sourcePianoRoll, bpm, totalSteps, { program });
       const { peaks } = await computePeaks(rendered.blob, 240);
       // Re-read: the user may have deleted or re-assigned the clip mid-render.
@@ -3280,14 +3287,12 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   /** Bind a MIDI clip to the Piano Roll and reveal it (FL: double-click a clip). */
   const editClipInPianoRoll = useCallback((clip: AudioClip) => {
     if (!clip.sourcePianoRoll) return;
-    usePianoRollStore.getState().loadFromClip(
-      clip.id,
-      clip.sourcePianoRoll,
-      clip.sourceBpm ?? 120,
-      clip.sourceTotalSteps ?? 32,
-    );
+    // The roll's own notes with their lanes, meter map and pickup; a clip bounced
+    // before the roll had a meter opens as 4/4 on a whole number of bars.
+    const args = clipRollLoad(clip);
+    usePianoRollStore.getState().loadFromClip(...args);
     useBottomPanelStore.getState().showTab('midi');
-    logInfo('editor', `Editing clip ${clip.id.slice(0, 8)} in MIDI (${clip.sourcePianoRoll.length} notes)`);
+    logInfo('editor', `Editing clip ${clip.id.slice(0, 8)} in MIDI (${args[1].length} notes)`);
   }, []);
 
   const onClipDoubleClick = (clip: AudioClip) => {
@@ -3363,8 +3368,11 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         return;
       }
       const bpm = Math.round(data.bpm) || 120;
+      // The file's time signatures and pickup (4/4 when it has none); the clip
+      // ends on the bar line after its last note.
+      const { map: meterMap, pickupSteps } = midiEventsToMeterMap(data.timeSignatures ?? [], data.ppq || 480);
       const lastStep = notes.reduce((m, n) => Math.max(m, n.step + n.length), 0);
-      const totalSteps = Math.max(16, Math.ceil(lastStep / 16) * 16);
+      const totalSteps = roundUpToBar(meterMap, Math.max(1, lastStep), pickupSteps);
       const globalProgram = isSoundfontActive() ? getActiveProgram() : undefined;
       const nominalDuration = totalSteps * (60 / Math.max(40, bpm) / 4);
       const blob = silentWavBlob();
@@ -3396,6 +3404,8 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         sourcePianoRoll: notes,
         sourceBpm: bpm,
         sourceTotalSteps: totalSteps,
+        sourceMeterMap: meterMap,
+        sourcePickupSteps: pickupSteps,
         instrumentProgram: program,
       });
       logInfo('editor', `Added MIDI "${label}" (${notes.length} notes) to ${track?.name ?? 'a new track'} at ${startSec.toFixed(2)}s; rendering audio in background…`);

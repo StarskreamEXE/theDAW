@@ -1,11 +1,13 @@
 /**
  * Tiny Standard MIDI File (SMF) encoder + parser.
  *
- * Just enough to round-trip note-on / note-off events with tempo, which is
- * what the sequencer's drum-pattern export and the piano roll's note grid
- * both need.
+ * Just enough to round-trip note-on / note-off events with tempo changes and
+ * time signatures, which is what the sequencer's drum-pattern export and the
+ * piano roll's note grid both need. A signature's additive grouping (3+2+2)
+ * has no field in FF 58, so it travels in a text event `theDAW:groups=3+2+2`
+ * at the signature's tick, which only this parser reads back.
  */
-
+import type { MeterEvent } from './meterMap';
 import { saveFile, type SaveFileResult } from './saveFile';
 
 export interface MidiNote {
@@ -26,12 +28,25 @@ export interface MidiTrack {
   notes: MidiNote[];
 }
 
+export interface MidiTempo {
+  tick: number;
+  bpm: number;
+}
+
 export interface MidiFileData {
   /** Ticks per quarter note. */
   ppq: number;
-  /** Beats per minute, derived from the first tempo meta event. Defaults to 120. */
+  /**
+   * Beats per minute. Parsed: the tempo at tick 0, or the first tempo when none
+   * sits at tick 0, rounded; 120 when the file has no tempo. Encoded: written
+   * at tick 0 unless `tempos` holds a tick-0 entry.
+   */
   bpm: number;
   tracks: MidiTrack[];
+  /** Every time signature (FF 58), sorted by tick, merged across tracks. Parsed: absent when the file has none. Encoded: absent or empty writes 4/4 at tick 0. */
+  timeSignatures?: MeterEvent[];
+  /** Every tempo (FF 51), sorted by tick, merged across tracks. Parsed: absent when the file has none. */
+  tempos?: MidiTempo[];
 }
 
 // =============================================================================
@@ -83,16 +98,59 @@ const serializeTrackChunk = (events: RawEvent[], name: string): number[] => {
   return [...ascii('MTrk'), ...u32be(body.length), ...body];
 };
 
-const buildConductor = (bpm: number): number[] => {
-  const microsPerQuarter = Math.round(60_000_000 / Math.max(20, bpm));
+const GROUPS_TEXT = 'theDAW:groups=';
+const PICKUP_TEXT = 'theDAW:pickup=';
+
+const tempoBytes = (bpm: number): number[] => {
+  const microsPerQuarter = Math.min(0xffffff, Math.round(60_000_000 / Math.max(20, bpm)));
+  return [0xff, 0x51, 0x03, (microsPerQuarter >>> 16) & 0xff, (microsPerQuarter >>> 8) & 0xff, microsPerQuarter & 0xff];
+};
+
+/** FF 58 04 nn dd cc bb: numerator, log2 of the denominator, 96/den MIDI clocks per click, eight 32nds per quarter. */
+const signatureBytes = (num: number, den: number): number[] => {
+  const dd = Math.max(0, Math.min(7, Math.round(Math.log2(Math.max(1, den)))));
+  const clocks = Math.max(1, Math.round(96 / 2 ** dd));
+  return [0xff, 0x58, 0x04, Math.max(1, Math.min(255, Math.round(num))), dd, clocks, 8];
+};
+
+const textBytes = (text: string): number[] => [0xff, 0x01, ...writeVLQ(text.length), ...ascii(text)];
+
+const tickOf = (tick: number): number => (Number.isFinite(tick) ? Math.max(0, Math.round(tick)) : 0);
+
+/**
+ * One signature's meta events, in the order they sit at its tick: the FF 58,
+ * its groups text, then its pickup text. midiWrite's writer uses the same bytes.
+ */
+export const meterEventMetas = (s: MeterEvent): number[][] => {
+  const out = [signatureBytes(s.num, s.den)];
+  if (s.groups?.length) out.push(textBytes(`${GROUPS_TEXT}${s.groups.join('+')}`));
+  if (typeof s.pickupSteps === 'number' && Number.isFinite(s.pickupSteps) && s.pickupSteps >= 0) out.push(textBytes(`${PICKUP_TEXT}${s.pickupSteps}`));
+  return out;
+};
+
+/**
+ * The conductor track: every tempo and time signature at its own tick. At one
+ * tick the tempo comes first, then the signature, its groups text and its
+ * pickup text. With no lists it holds one tempo and a 4/4 at tick 0.
+ */
+const buildConductor = (file: MidiFileData): number[] => {
+  const tempos = (file.tempos ?? []).map((t) => ({ tick: tickOf(t.tick), bpm: t.bpm }));
+  if (!tempos.some((t) => t.tick === 0)) tempos.unshift({ tick: 0, bpm: file.bpm });
+  const signatures = file.timeSignatures?.length ? file.timeSignatures : [{ tick: 0, num: 4, den: 4 }];
+  const events: Array<RawEvent & { rank: number }> = [];
+  for (const t of tempos) events.push({ tick: t.tick, rank: 0, bytes: tempoBytes(t.bpm) });
+  for (const s of signatures) {
+    const tick = tickOf(s.tick);
+    meterEventMetas(s).forEach((bytes, i) => events.push({ tick, rank: 1 + i, bytes }));
+  }
+  events.sort((a, b) => a.tick - b.tick || a.rank - b.rank);
   const body: number[] = [];
-  body.push(...writeVLQ(0), 0xff, 0x03, 5, ...ascii('Tempo'));
-  body.push(...writeVLQ(0), 0xff, 0x51, 0x03,
-    (microsPerQuarter >>> 16) & 0xff,
-    (microsPerQuarter >>> 8) & 0xff,
-    microsPerQuarter & 0xff,
-  );
-  body.push(...writeVLQ(0), 0xff, 0x58, 0x04, 4, 2, 24, 8);
+  body.push(...writeVLQ(0), 0xff, 0x03, ...writeVLQ(5), ...ascii('Tempo'));
+  let last = 0;
+  for (const ev of events) {
+    body.push(...writeVLQ(ev.tick - last), ...ev.bytes);
+    last = ev.tick;
+  }
   body.push(0, 0xff, 0x2f, 0x00);
   return [...ascii('MTrk'), ...u32be(body.length), ...body];
 };
@@ -107,7 +165,7 @@ export const encodeMidi = (file: MidiFileData): Uint8Array => {
     ...u16be(ntrks),
     ...u16be(file.ppq),
   ];
-  const out: number[] = [...header, ...buildConductor(file.bpm)];
+  const out: number[] = [...header, ...buildConductor(file)];
   for (const c of tracks) out.push(...c);
   return new Uint8Array(out);
 };
@@ -157,12 +215,26 @@ interface NotePartial {
   channel: number;
 }
 
-const decodeTrack = (chunk: Uint8Array, ppq: number): { name: string; notes: MidiNote[]; tempoBpm: number | null } => {
+interface DecodedTrack {
+  name: string;
+  notes: MidiNote[];
+  tempos: MidiTempo[];
+  signatures: MeterEvent[];
+  /** `theDAW:groups=` text events, attached to the signature at the same tick by parseMidi. */
+  groups: Array<{ tick: number; groups: number[] }>;
+  /** `theDAW:pickup=` text events, attached the same way. */
+  pickups: Array<{ tick: number; steps: number }>;
+}
+
+const decodeTrack = (chunk: Uint8Array, ppq: number): DecodedTrack => {
   const r = new Reader(chunk);
   let runningStatus = 0;
   let tick = 0;
   let name = '';
-  let tempoBpm: number | null = null;
+  const tempos: MidiTempo[] = [];
+  const signatures: MeterEvent[] = [];
+  const groups: DecodedTrack['groups'] = [];
+  const pickups: DecodedTrack['pickups'] = [];
   const open = new Map<string, NotePartial>(); // key = `${ch}:${note}`
   const finished: MidiNote[] = [];
 
@@ -184,9 +256,21 @@ const decodeTrack = (chunk: Uint8Array, ppq: number): { name: string; notes: Mid
       if (meta === 0x03) {
         // Track name
         name = Array.from(data, (b) => String.fromCharCode(b)).join('').trim();
+      } else if (meta === 0x01) {
+        const text = Array.from(data, (b) => String.fromCharCode(b)).join('');
+        if (text.startsWith(GROUPS_TEXT)) {
+          const g = text.slice(GROUPS_TEXT.length).split('+').map(Number);
+          if (g.length && g.every((x) => Number.isInteger(x) && x >= 1)) groups.push({ tick, groups: g });
+        } else if (text.startsWith(PICKUP_TEXT)) {
+          const steps = Number(text.slice(PICKUP_TEXT.length));
+          if (Number.isFinite(steps) && steps >= 0) pickups.push({ tick, steps });
+        }
       } else if (meta === 0x51 && data.length === 3) {
         const microsPerQuarter = (data[0] << 16) | (data[1] << 8) | data[2];
-        if (microsPerQuarter > 0) tempoBpm = 60_000_000 / microsPerQuarter;
+        // Three decimals: the microsecond rounding of FF 51 reads 97 back as 96.99995.
+        if (microsPerQuarter > 0) tempos.push({ tick, bpm: Math.round(60_000_000_000 / microsPerQuarter) / 1000 });
+      } else if (meta === 0x58 && data.length >= 2) {
+        if (data[0] > 0) signatures.push({ tick, num: data[0], den: 2 ** data[1] });
       } else if (meta === 0x2f) {
         break;
       }
@@ -238,7 +322,7 @@ const decodeTrack = (chunk: Uint8Array, ppq: number): { name: string; notes: Mid
   }
 
   finished.sort((a, b) => a.tick - b.tick);
-  return { name, notes: finished, tempoBpm };
+  return { name, notes: finished, tempos, signatures, groups, pickups };
 };
 
 export const parseMidi = (buf: ArrayBuffer | Uint8Array): MidiFileData => {
@@ -255,18 +339,41 @@ export const parseMidi = (buf: ArrayBuffer | Uint8Array): MidiFileData => {
   // Division: positive value = ticks per quarter; negative would be SMPTE (not supported).
   const ppq = (division & 0x8000) ? 480 : division;
 
-  let bpm = 120;
   const tracks: MidiTrack[] = [];
+  const tempos: MidiTempo[] = [];
+  const signatures: MeterEvent[] = [];
+  const groups: DecodedTrack['groups'] = [];
+  const pickups: DecodedTrack['pickups'] = [];
   for (let i = 0; i < ntrks; i += 1) {
     if (r.str(4) !== 'MTrk') throw new Error(`Track ${i} missing MTrk marker`);
     const len = r.u32();
     const chunk = r.bytes(len);
     const t = decodeTrack(chunk, ppq);
-    if (t.tempoBpm) bpm = t.tempoBpm;
+    tempos.push(...t.tempos);
+    signatures.push(...t.signatures);
+    groups.push(...t.groups);
+    pickups.push(...t.pickups);
     if (t.notes.length > 0) {
       tracks.push({ name: t.name || `Track ${i}`, notes: t.notes });
     }
   }
-  return { ppq, bpm: Math.round(bpm), tracks };
+  // Stable sorts: at one tick, events keep track order, so the last one written is the one in force.
+  tempos.sort((a, b) => a.tick - b.tick);
+  signatures.sort((a, b) => a.tick - b.tick);
+  for (const g of groups) {
+    for (const s of signatures) if (s.tick === g.tick) s.groups = [...g.groups];
+  }
+  for (const p of pickups) {
+    for (const s of signatures) if (s.tick === p.tick) s.pickupSteps = p.steps;
+  }
+  const atZero = tempos.filter((t) => t.tick === 0);
+  const bpm = atZero.length ? atZero[atZero.length - 1].bpm : tempos.length ? tempos[0].bpm : 120;
+  return {
+    ppq,
+    bpm: Math.round(bpm),
+    tracks,
+    ...(signatures.length ? { timeSignatures: signatures } : {}),
+    ...(tempos.length ? { tempos } : {}),
+  };
 };
 

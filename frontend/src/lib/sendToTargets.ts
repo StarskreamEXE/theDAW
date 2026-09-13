@@ -18,9 +18,10 @@
 import { useEditorStore, computePeaks } from '../state/editorStore';
 import { useGenerateParamsStore } from '../state/generateParamsStore';
 import { useBottomPanelStore } from '../state/bottomPanelStore';
-import { usePianoRollStore } from '../state/pianoRollStore';
+import { DEFAULT_LANES, usePianoRollStore } from '../state/pianoRollStore';
 import { addBlobsToChimera } from './chimeraClient';
 import { parseMidi } from './midi';
+import { midiEventsToMeterMap } from './meterMap';
 import { renderMidiBufferToBlob } from './midiSynth';
 import { fetchMidiBytesWithRetry, fetchBlobWithRetry } from './fetchRetry';
 import { logError, logInfo } from '../state/logStore';
@@ -178,8 +179,11 @@ export function loadMidiIntoPianoRoll(
       logError('send-to', `MIDI ${labelForLog} parsed empty — no note-on events`);
       return false;
     }
+    // The file's time signatures set the roll's meter; a file with no FF 58 is 4/4 by the MIDI spec.
+    // Its notes carry no lanes, so the roll's lanes reset to lane A alone.
+    const { map: meterMap, pickupSteps } = midiEventsToMeterMap(midi.timeSignatures ?? [], ppq);
     const piano = usePianoRollStore.getState();
-    piano.importNotes(notes, midi.bpm); // auto-fits length + pitch range to the import
+    piano.importNotes(notes, midi.bpm, { meterMap, pickupSteps, lanes: [...DEFAULT_LANES] }); // auto-fits length + pitch range to the import
     useBottomPanelStore.getState().showTab(target === 'piano-roll' ? 'midi' : 'step-seq');
     const totalSteps = usePianoRollStore.getState().totalSteps;
     logInfo(

@@ -9,6 +9,7 @@ import {
   midiRowLabel as rowLabel,
   type LibraryMidiRow as MidiRow,
 } from '../../lib/libraryIndex';
+import { DockFlyout, FLYOUT_CARD, RailKey } from './midiDockKit';
 
 const MIDI_ACCEPT_LIST = '.mid,.midi,audio/midi';
 const MIDI_RECENT_ID = 'piano-roll-import-midi-recent';
@@ -17,17 +18,19 @@ const SHEET_RECENT_ID = 'piano-roll-import-sheet-recent';
 const MIDI_RECENT_EXTS = MIDI_ACCEPT_LIST.split(',');
 const SHEET_RECENT_EXTS = SHEET_ACCEPT.split(',');
 
-/** True while one of the popover's Recent lists is open. Those lists portal to
- *  document.body, so a click on one of their rows lands outside the popover. */
+/** True while one of the flyout's Recent lists is open. Those lists portal to
+ *  document.body, so a click on one of their rows lands outside the flyout. */
 const recentListOpen = (): boolean =>
   [MIDI_RECENT_ID, SHEET_RECENT_ID].some(
     (id) => document.getElementById(id)?.getAttribute('aria-expanded') === 'true',
   );
 
 /**
- * IMPORT MIDI control for the Piano Roll. One popover, three sources:
- *   - "From file…" opens the OS file picker (hidden <input type=file>).
- *   - "Recent" lists MIDI and sheet files the app saved or downloaded.
+ * IMPORT control for the Piano Roll: the IMPORT key in the MIDI dock's action
+ * rail, with one flyout and these sources:
+ *   - "MIDI file on disk…" opens the OS file picker (hidden <input type=file>).
+ *   - "Sheet music…" imports MusicXML / ABC / kern through the backend.
+ *   - "Recent" beside each lists MIDI and sheet files the app saved or downloaded.
  *   - the library list loads any converted MIDI straight into the roll.
  */
 export const MidiImportPopover: React.FC<{
@@ -39,8 +42,7 @@ export const MidiImportPopover: React.FC<{
   const [midis, setMidis] = useState<MidiRow[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [query, setQuery] = useState('');
-  const rootRef = useRef<HTMLDivElement>(null);
-  const triggerRef = useRef<HTMLButtonElement>(null);
+  const keyRef = useRef<HTMLButtonElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const sheetRef = useRef<HTMLInputElement>(null);
 
@@ -64,25 +66,6 @@ export const MidiImportPopover: React.FC<{
     if (open && midis === null && !loading) void loadMidis();
   }, [open, midis, loading, loadMidis]);
 
-  // Close on outside click + Escape. An open Recent list closes first: it
-  // takes Escape in the capture phase, and its own outside click closes it.
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      if (recentListOpen()) return;
-      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setOpen(false);
-    };
-    window.addEventListener('mousedown', onDown);
-    window.addEventListener('keydown', onKey);
-    return () => {
-      window.removeEventListener('mousedown', onDown);
-      window.removeEventListener('keydown', onKey);
-    };
-  }, [open]);
-
   const filtered = useMemo(() => {
     const list = midis || [];
     const q = query.trim().toLowerCase();
@@ -104,19 +87,28 @@ export const MidiImportPopover: React.FC<{
     const f = files[0];
     if (f) onImportFile(f);
     setOpen(false);
-    triggerRef.current?.focus();
+    keyRef.current?.focus();
   };
 
   const importSheetFiles = (files: File[]) => {
     const f = files[0];
     if (f && onImportSheetFile) onImportSheetFile(f);
     setOpen(false);
-    triggerRef.current?.focus();
+    keyRef.current?.focus();
   };
 
+  // The flyout closes on an outside click, except one on an open Recent list's
+  // rows; that list closes itself first and takes its own Escape.
+  const closeFlyout = () => {
+    if (!recentListOpen()) setOpen(false);
+  };
+
+  const sourceBtn =
+    'flex-1 min-w-0 flex items-center gap-2 px-2 py-1.5 rounded-xs bg-white/5 border-b border-b-transparent text-left text-[10px] text-zinc-200 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.1),inset_0_0_0_100px_rgba(255,255,255,0.06)] transition-shadow';
+
   return (
-    <div className="relative" ref={rootRef}>
-      {/* Hidden OS file picker, triggered by "From file…". */}
+    <>
+      {/* Hidden OS file picker, triggered by "MIDI file on disk…". */}
       <label htmlFor="piano-roll-import-midi" className="sr-only">MIDI file to import</label>
       <input
         ref={fileRef}
@@ -152,106 +144,103 @@ export const MidiImportPopover: React.FC<{
         />
       )}
 
-      <button
-        ref={triggerRef}
-        type="button"
+      <RailKey
+        ref={keyRef}
         onClick={() => setOpen((v) => !v)}
         aria-haspopup="dialog"
         aria-expanded={open}
         aria-controls="piano-roll-import-popover"
-        className="btn-ghost text-[9px] py-1 flex items-center gap-1.5"
-        title="Import a MIDI file from disk or from the library"
-      >
-        <Upload className="w-3 h-3 text-purple-300" /> IMPORT MIDI
-      </button>
+        aria-label="Import MIDI"
+        title="Import a MIDI file from disk, from recent files or from the library"
+        on={open}
+        icon={<Upload className="w-3 h-3" />}
+        legend="Import"
+      />
 
-      {open && (
-        <div
-          id="piano-roll-import-popover"
-          role="dialog"
-          aria-label="Import MIDI"
-          className="absolute right-0 top-full mt-1 z-50 w-72 bg-[#0a080f] border border-white/10 rounded-lg shadow-[0_8px_32px_rgba(0,0,0,0.75)] p-2 flex flex-col gap-2"
-        >
+      <DockFlyout
+        open={open}
+        anchorRef={keyRef}
+        onClose={closeFlyout}
+        placement="right"
+        id="piano-roll-import-popover"
+        role="dialog"
+        aria-label="Import MIDI"
+        className={`w-72 p-2 flex flex-col gap-2 ${FLYOUT_CARD}`}
+      >
+        <div className="flex items-stretch gap-1">
+          <button type="button" onClick={() => fileRef.current?.click()} className={sourceBtn} title="Import a MIDI file from disk" aria-label="Import a MIDI file from disk">
+            <FolderOpen aria-hidden="true" className="w-3.5 h-3.5 shrink-0" />
+            <span>File</span>
+          </button>
+          <KnownFilesMenu id={MIDI_RECENT_ID} exts={MIDI_RECENT_EXTS} label="Recent" name="Recent MIDI files" onFiles={importMidiFiles} />
+        </div>
+
+        {onImportSheetFile && (
           <div className="flex items-stretch gap-1">
             <button
               type="button"
-              onClick={() => fileRef.current?.click()}
-              className="flex-1 min-w-0 flex items-center gap-2 px-2 py-1.5 rounded bg-white/3 hover:bg-white/8 border border-white/10 text-[10px] text-zinc-200 transition-colors"
+              onClick={() => sheetRef.current?.click()}
+              className={sourceBtn}
+              title="Import sheet music: MusicXML, ABC or Humdrum kern"
+              aria-label="Import sheet music: MusicXML, ABC or Humdrum kern"
             >
-              <FolderOpen className="w-3.5 h-3.5 text-purple-300 shrink-0" />
-              MIDI file on disk…
+              <FileMusic aria-hidden="true" className="w-3.5 h-3.5 shrink-0" />
+              <span>Sheet</span>
             </button>
-            <KnownFilesMenu id={MIDI_RECENT_ID} exts={MIDI_RECENT_EXTS} label="Recent MIDI" onFiles={importMidiFiles} />
+            <KnownFilesMenu id={SHEET_RECENT_ID} exts={SHEET_RECENT_EXTS} label="Recent" name="Recent sheet music files" onFiles={importSheetFiles} />
           </div>
+        )}
 
-          {onImportSheetFile && (
-            <div className="flex items-stretch gap-1">
-              <button
-                type="button"
-                onClick={() => sheetRef.current?.click()}
-                className="flex-1 min-w-0 flex items-center gap-2 px-2 py-1.5 rounded bg-white/3 hover:bg-white/8 border border-white/10 text-left text-[10px] text-zinc-200 transition-colors"
-                title="Import a notation file: MusicXML, ABC, or Humdrum kern"
-              >
-                <FileMusic className="w-3.5 h-3.5 text-emerald-300 shrink-0" />
-                Sheet music (MusicXML / ABC)…
-              </button>
-              <KnownFilesMenu id={SHEET_RECENT_ID} exts={SHEET_RECENT_EXTS} label="Recent sheets" onFiles={importSheetFiles} />
-            </div>
-          )}
-
-          <div className="flex items-center gap-1.5 px-1 pt-0.5">
-            <span className="text-[8px] font-mono uppercase tracking-widest text-zinc-600">
-              From library
-            </span>
-            <div className="flex-1 h-px bg-white/10" />
-          </div>
-
-          <div className="flex items-center gap-1.5 bg-black/40 border border-white/10 rounded px-2">
-            <Search className="w-3 h-3 text-zinc-500 shrink-0" />
-            <input
-              id="piano-roll-library-midi-search"
-              name="piano-roll-library-midi-search"
-              aria-label="Search library MIDI"
-              type="text"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search…"
-              className="flex-1 min-w-0 bg-transparent border-none outline-none py-1 text-[10px] text-zinc-200 placeholder:text-zinc-600"
-            />
-          </div>
-
-          <div className="max-h-64 overflow-y-auto flex flex-col gap-0.5 pr-0.5">
-            {loading && (
-              <span className="text-[9px] font-mono text-zinc-600 px-2 py-3 text-center">loading…</span>
-            )}
-            {!loading && filtered.length === 0 && (
-              <span className="text-[9px] font-mono text-zinc-600 px-2 py-3 text-center">
-                {midis && midis.length === 0 ? 'No library MIDI yet' : 'No matches'}
-              </span>
-            )}
-            {!loading &&
-              filtered.map((m) => (
-                <button
-                  key={m.id}
-                  type="button"
-                  onClick={() => pickLibraryMidi(m)}
-                  className="w-full flex items-center gap-2 px-2 py-1 rounded hover:bg-purple-500/15 text-left transition-colors group"
-                  title={`Load "${rowLabel(m)}" into the piano roll`}
-                >
-                  {m.favorite ? (
-                    <Star className="w-3 h-3 text-amber-400 fill-amber-400 shrink-0" />
-                  ) : (
-                    <Music className="w-3 h-3 text-zinc-600 group-hover:text-purple-300 shrink-0" />
-                  )}
-                  <span className="flex-1 min-w-0 truncate text-[10px] text-zinc-300">{rowLabel(m)}</span>
-                  {typeof m.notes_count === 'number' && (
-                    <span className="text-[8px] font-mono text-zinc-600 shrink-0">{m.notes_count}n</span>
-                  )}
-                </button>
-              ))}
-          </div>
+        <div className="flex items-center gap-1.5 px-1 pt-0.5">
+          <span className="text-[8px] font-mono uppercase tracking-widest et-ink-3">From library</span>
+          <div className="flex-1 h-px bg-white/10" />
         </div>
-      )}
-    </div>
+
+        <div className="flex items-center gap-1.5 bg-black/40 border border-white/10 rounded px-2">
+          <Search aria-hidden="true" className="w-3 h-3 et-ink-3 shrink-0" />
+          <input
+            id="piano-roll-library-midi-search"
+            name="piano-roll-library-midi-search"
+            aria-label="Search library MIDI"
+            type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search…"
+            className="flex-1 min-w-0 bg-transparent border-none outline-none py-1 text-[10px] text-zinc-200 placeholder:text-zinc-600"
+          />
+        </div>
+
+        <div className="max-h-64 overflow-y-auto flex flex-col gap-0.5 pr-0.5">
+          {loading && (
+            <span className="text-[9px] font-mono et-ink-3 px-2 py-3 text-center">loading…</span>
+          )}
+          {!loading && filtered.length === 0 && (
+            <span className="text-[9px] font-mono et-ink-3 px-2 py-3 text-center">
+              {midis && midis.length === 0 ? 'No library MIDI yet' : 'No matches'}
+            </span>
+          )}
+          {!loading &&
+            filtered.map((m) => (
+              <button
+                key={m.id}
+                type="button"
+                onClick={() => pickLibraryMidi(m)}
+                className="w-full flex items-center gap-2 px-2 py-1 rounded-xs text-left transition-shadow hover:shadow-[inset_0_0_0_100px_rgba(255,255,255,0.06)] group"
+                title={`Load "${rowLabel(m)}" into the piano roll`}
+              >
+                {m.favorite ? (
+                  <Star aria-label="Favorite" className="w-3 h-3 shrink-0 text-[rgb(var(--et-accent))] fill-current" />
+                ) : (
+                  <Music aria-hidden="true" className="w-3 h-3 shrink-0 et-ink-3 group-hover:et-ink" />
+                )}
+                <span className="flex-1 min-w-0 truncate text-[10px] text-zinc-300">{rowLabel(m)}</span>
+                {typeof m.notes_count === 'number' && (
+                  <span className="text-[8px] font-mono et-ink-3 shrink-0">{m.notes_count}n</span>
+                )}
+              </button>
+            ))}
+        </div>
+      </DockFlyout>
+    </>
   );
 };
