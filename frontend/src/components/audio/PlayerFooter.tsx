@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Volume2, Download, Share2, Heart, Repeat, Repeat1, Shuffle, VolumeX, Maximize2, MoreHorizontal, Cast, Check, Activity, ChevronUp, Headphones, Speaker } from 'lucide-react';
+import { Volume2, Download, Share2, Heart, Repeat, Repeat1, Shuffle, VolumeX, MoreHorizontal, Cast, Check, Activity, ChevronUp, Headphones, Speaker } from 'lucide-react';
 import { useGenerateStore } from '../../state/generateStore';
 import { usePlaybackStore } from '../../state/playbackStore';
 import { usePlayerStore } from '../../state/playerStore';
@@ -690,14 +690,6 @@ export const PlayerFooter: React.FC = () => {
     })();
   };
 
-  const toggleFullscreen = () => {
-    if (document.fullscreenElement) {
-      void document.exitFullscreen();
-    } else {
-      void document.documentElement.requestFullscreen();
-    }
-  };
-
   // The dead keys: START needs a track (or the editor's render path); PLAY also
   // counts the live tabs, where it is the master transport with no track loaded.
   const startDisabled = !inEditorMode && !hasTrack;
@@ -777,9 +769,8 @@ export const PlayerFooter: React.FC = () => {
             hairline grid (the plate's p-px/gap-px well IS the grid; keys carry
             no borders or the theme floors them to a 3:1 line). 2+2 about PLAY
             so the flex-1 side sections keep it on the viewport centre. The
-            playhead is in the strip above. Fullscreen lives with the window
-            utilities on the right (its handler, aria-label, title and icon are
-            unchanged) — an even key count is what keeps PLAY dead centre. The
+            playhead is in the strip above. Fullscreen lives in the top bar
+            beside Mobile — an even key count is what keeps PLAY dead centre. The
             wrapper is a div, so its border-white/8 stays a hairline (the scope's
             button border floor never touches it), and `bg-black/40` /
             `border-white/8` are both theme-remapped. Never give it
@@ -882,7 +873,30 @@ export const PlayerFooter: React.FC = () => {
               </span>
             </div>
           </button>
+          {/* Left to right: download and more options, then the output (the
+              master FX pill, the output device, mute + volume), then CREATE.
+              The two indicators stay beside the volume control because that is
+              where the symptom they account for shows. Fullscreen is in the top
+              bar, beside Mobile. */}
           <div className="flex items-center gap-4 shrink-0">
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={handleDownload}
+                disabled={!hasTrack}
+                aria-label="Save a copy of the current track"
+                title="Save a copy of the current track"
+                className={iconButton}
+              >
+                <Download className="w-4 h-4" />
+              </button>
+              <button type="button" aria-label="More options" title="More options" className={iconButton}>
+                <MoreHorizontal className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="h-6 w-px bg-white/5" />
+
             <MasterFxIndicator />
             <AudioOutIndicator />
             <div className="flex items-center gap-2.5">
@@ -898,35 +912,6 @@ export const PlayerFooter: React.FC = () => {
               </button>
               <SlideTrack min={0} max={100} step={1} value={volume}
                 onChange={(v) => setVolume(v)} className="w-24" ariaLabel="Volume" />
-            </div>
-
-            <div className="h-6 w-px bg-white/5" />
-
-            <div className="flex items-center gap-1">
-              {/* Fullscreen — a window utility, so it sits here rather than on the
-                  transport plate (handler, aria-label, title and icon unchanged). */}
-              <button
-                type="button"
-                onClick={toggleFullscreen}
-                aria-label="Toggle fullscreen"
-                title="Toggle fullscreen"
-                className={iconButton}
-              >
-                <Maximize2 className="w-3.5 h-3.5" />
-              </button>
-              <button
-                type="button"
-                onClick={handleDownload}
-                disabled={!hasTrack}
-                aria-label="Save a copy of the current track"
-                title="Save a copy of the current track"
-                className={iconButton}
-              >
-                <Download className="w-4 h-4" />
-              </button>
-              <button type="button" aria-label="More options" title="More options" className={iconButton}>
-                <MoreHorizontal className="w-4 h-4" />
-              </button>
             </div>
 
             <div className="h-6 w-px bg-white/5" />

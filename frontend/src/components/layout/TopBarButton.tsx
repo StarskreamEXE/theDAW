@@ -41,6 +41,8 @@ export interface TopBarButtonProps {
    * aria-controls at all.
    */
   ariaControls?: string;
+  /** On/off state, for a button that toggles something (fullscreen). */
+  ariaPressed?: boolean;
   /** So a popover can hand focus back to its trigger when it closes. */
   buttonRef?: React.Ref<HTMLButtonElement>;
 }
@@ -83,6 +85,7 @@ export const TopBarButton: React.FC<TopBarButtonProps> = ({
   ariaHasPopup,
   ariaExpanded,
   ariaControls,
+  ariaPressed,
   buttonRef,
 }) => {
   const cls = ACCENT_CLS[accent];
@@ -97,6 +100,7 @@ export const TopBarButton: React.FC<TopBarButtonProps> = ({
       aria-haspopup={ariaHasPopup}
       aria-expanded={ariaExpanded}
       aria-controls={ariaControls}
+      aria-pressed={ariaPressed}
       className={`p-1.5 rounded border transition-colors group flex items-center gap-1.5 outline-none focus-visible:ring-1 focus-visible:ring-purple-400/60 ${stateCls}`}
     >
       {icon}
