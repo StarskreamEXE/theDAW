@@ -50,7 +50,7 @@ env:
   # bump it deliberately, the same way VJ_COMMIT is pinned in
   # fetch-vj-build.mjs.
   SWAY_REPO: danieljtrujillo/SwayCommand
-  SWAY_REF: 5fb092d3641f2d279f5ca13b010e96a370d9d32c
+  SWAY_REF: ec1683f9e141ec1e929426be1e0e6b7104f1f33f
 
 jobs:
   # Resolves the release version and fails fast on any version drift
