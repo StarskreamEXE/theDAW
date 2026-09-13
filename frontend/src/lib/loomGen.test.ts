@@ -17,6 +17,8 @@ const gen = (g: GenTile['gen'], alphabet: GenTile['alphabet'], span: number, opt
   assert.equal(euclidPattern(3, 8).map((b) => (b ? 'x' : '.')).join(''), 'x..x..x.');
   assert.equal(euclidPattern(5, 16, 3).filter(Boolean).length, 5);
   assert.equal(euclidPattern(0, 8).some(Boolean), false);
+  // E(5,16) rotated by 10 is the tresillo stab the virtuoso ragtime plays (TRESILLO).
+  assert.deepEqual(euclidPattern(5, 16, 10).flatMap((b, i) => (b ? [i] : [])), [0, 3, 6, 10, 13]);
 }
 
 // Fibonacci word over two symbols is the golden sequence, and drifts by lap.

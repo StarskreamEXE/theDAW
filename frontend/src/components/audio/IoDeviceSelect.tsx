@@ -58,6 +58,9 @@ const DeviceSelect: React.FC<{
   labelsKnown: boolean;
   missing?: DeviceRef;
   showLabel?: boolean;
+  /** The visible label's text when it should be shorter than the accessible
+   *  name (which stays `label` and must contain this word). */
+  legend?: string;
   labelClassName?: string;
   className?: string;
 }> = ({
@@ -72,12 +75,13 @@ const DeviceSelect: React.FC<{
   labelsKnown,
   missing,
   showLabel,
+  legend,
   labelClassName = 'text-[11px] font-mono uppercase tracking-wider text-zinc-400 shrink-0',
   className = '',
 }) => (
   <>
     <label htmlFor={id} className={showLabel ? labelClassName : 'sr-only'}>
-      {label}
+      {showLabel && legend ? legend : label}
     </label>
     <select
       id={id}
@@ -142,9 +146,11 @@ export const IoSurfaceSelect: React.FC<{
   /** Accessible name; visible when `showLabel`. */
   label?: string;
   showLabel?: boolean;
+  /** Shorter visible label text; the accessible name stays `label`. */
+  legend?: string;
   labelClassName?: string;
   className?: string;
-}> = ({ surface, id, label, showLabel, labelClassName, className }) => {
+}> = ({ surface, id, label, showLabel, legend, labelClassName, className }) => {
   const def = surfaceById(surface);
   const kind = def?.kind ?? 'audioIn';
   const resolved: Resolved = useResolvedSurface(surface);
@@ -177,6 +183,7 @@ export const IoSurfaceSelect: React.FC<{
       labelsKnown={labelsKnown}
       missing={resolved.source === 'missing' ? resolved.missing : undefined}
       showLabel={showLabel}
+      legend={legend}
       labelClassName={labelClassName}
       className={className}
     />

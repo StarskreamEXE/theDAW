@@ -4,6 +4,32 @@ import type { DawProject } from './dawImportClient';
 import { dawDeviceToEffectNode } from './dawEffectMap';
 import type { SwayBinding, SwayUnattached } from './swayImportResolve';
 import type { PerformRoutingSnapshot } from '../state/performRouting';
+import type { AudioClip } from '../state/editorStore';
+import type { PianoNote } from '../state/pianoRollStore';
+import { normalizeMeterMap } from './meterMap';
+
+// --- Piano-roll meter (mirrors lib/meterMap in the .tasmo JSON shape) ---
+/** A time-signature change: the meter from `bar` until the next change. */
+export interface TasmoMeterSegment {
+  bar: number;
+  meter: { num: number; den: number; groups: number[] };
+}
+
+/** A polymeter lane; `cycle_steps` null means the lane spans the whole clip. */
+export interface TasmoPolyLane {
+  id: number;
+  name: string;
+  cycle_steps: number | null;
+}
+
+/** A piano-roll note as a MIDI clip stores it; `lane` only when the note sits in one. */
+export interface TasmoStepNote {
+  note: number;
+  step: number;
+  length: number;
+  velocity: number;
+  lane?: number;
+}
 
 // --- Effect chain (mirrors backend tasmo_project.py EffectChainNode/VstPluginState) ---
 export interface VstPluginState {
@@ -44,8 +70,11 @@ export interface TasmoClipInput {
   end_time?: number;
   audio_file?: string | null;
   /** Carried so MIDI clips survive the round-trip (the backend Clip model keeps
-   *  these). The shape is whatever the importer produced; the loader is tolerant. */
+   *  these). The shape is whatever the importer produced; the loader is tolerant.
+   *  A piano-roll clip writes the notes as they sound, lane repeats written out. */
   midi_notes?: unknown[] | null;
+  /** A piano-roll clip's own notes with their lanes, which the roll loads. */
+  roll_notes?: TasmoStepNote[] | null;
   loop_start?: number | null;
   loop_end?: number | null;
   /** Per-clip mute; optional so pre-mute payloads stay valid. */
@@ -63,6 +92,12 @@ export interface TasmoClipInput {
   track_index?: number | null;
   scene_index?: number | null;
   slot_index?: number | null;
+  /** Piano-roll clips: the grid length in steps, the time signatures by bar, the
+   *  steps before bar 0 and the polymeter lanes the clip was bounced with. */
+  total_steps?: number | null;
+  meter_map?: TasmoMeterSegment[] | null;
+  pickup_steps?: number | null;
+  lanes?: TasmoPolyLane[] | null;
 }
 
 export interface TasmoTrackInput {
@@ -107,6 +142,9 @@ export interface TasmoLoadedClip {
   end_time?: number;
   audio_file: string | null;
   midi_notes?: Array<Record<string, number>> | null;
+  /** A piano-roll clip's own notes with their lanes; absent in .tasmo files
+   *  written before the roll had lanes. */
+  roll_notes?: TasmoStepNote[] | null;
   instrument_program?: number;
   /** Per-clip mute; absent in .tasmo files written before the field existed. */
   muted?: boolean;
@@ -127,6 +165,12 @@ export interface TasmoLoadedClip {
   track_index?: number | null;
   scene_index?: number | null;
   slot_index?: number | null;
+  /** Piano-roll grid length and meter; absent in .tasmo files written before
+   *  the roll had a meter. */
+  total_steps?: number | null;
+  meter_map?: TasmoMeterSegment[] | null;
+  pickup_steps?: number | null;
+  lanes?: TasmoPolyLane[] | null;
 }
 
 export interface TasmoLoadedTrack {
@@ -175,6 +219,81 @@ export interface RecentItem {
   path: string;
   name: string;
 }
+
+// --- Piano-roll clip fields <-> .tasmo JSON (pure; tested in projectImport.test.ts) ---
+type ClipMeterFields = Pick<AudioClip, 'sourceRollNotes' | 'sourceTotalSteps' | 'sourceMeterMap' | 'sourcePickupSteps' | 'sourceLanes'>;
+type TasmoMeterFields = Pick<TasmoClipInput, 'roll_notes' | 'total_steps' | 'meter_map' | 'pickup_steps' | 'lanes'>;
+
+/** A piano-roll note in the .tasmo shape, carrying `lane` when the note has one. */
+export const pianoNoteToTasmo = (n: PianoNote): TasmoStepNote => ({
+  note: n.note,
+  step: n.step,
+  length: n.length,
+  velocity: n.velocity,
+  ...(n.lane !== undefined ? { lane: n.lane } : {}),
+});
+
+/** A piano-roll clip's own notes, grid length and meter in the .tasmo shape. Fields the clip lacks are left out. */
+export const clipMeterToTasmo = (c: ClipMeterFields): TasmoMeterFields => ({
+  ...(c.sourceRollNotes ? { roll_notes: c.sourceRollNotes.map(pianoNoteToTasmo) } : {}),
+  ...(c.sourceTotalSteps !== undefined ? { total_steps: c.sourceTotalSteps } : {}),
+  ...(c.sourceMeterMap
+    ? { meter_map: c.sourceMeterMap.map((s) => ({ bar: s.bar, meter: { num: s.meter.num, den: s.meter.den, groups: [...s.meter.groups] } })) }
+    : {}),
+  ...(c.sourcePickupSteps !== undefined ? { pickup_steps: c.sourcePickupSteps } : {}),
+  ...(c.sourceLanes ? { lanes: c.sourceLanes.map((l) => ({ id: l.id, name: l.name, cycle_steps: l.cycleSteps })) } : {}),
+});
+
+const numberAtLeast = (v: unknown, min: number): number | undefined =>
+  typeof v === 'number' && Number.isFinite(v) && v >= min ? v : undefined;
+
+/**
+ * The inverse of pianoNoteToTasmo for a list. A note needs a pitch 0-127, a step
+ * of 0 or more and a length above 0, or it is left out; velocity clamps to
+ * 1-127 (100 when missing) and a lane that is not a whole number 0 or more is
+ * dropped. The file stores no ids, so each note gets `<idPrefix>-<index>`.
+ */
+export const tasmoNotesToPiano = (raw: readonly unknown[] | null | undefined, idPrefix = 'rn'): PianoNote[] => {
+  const out: PianoNote[] = [];
+  for (const item of raw ?? []) {
+    if (!item || typeof item !== 'object') continue;
+    const n = item as Record<string, unknown>;
+    const note = numberAtLeast(n.note, 0);
+    const step = numberAtLeast(n.step, 0);
+    const length = numberAtLeast(n.length, Number.MIN_VALUE);
+    if (note === undefined || note > 127 || step === undefined || length === undefined) continue;
+    const velocity = typeof n.velocity === 'number' && Number.isFinite(n.velocity) ? Math.max(1, Math.min(127, n.velocity)) : 100;
+    const lane = n.lane;
+    out.push({
+      id: `${idPrefix}-${out.length}`,
+      note: Math.round(note),
+      step,
+      length,
+      velocity,
+      ...(typeof lane === 'number' && Number.isInteger(lane) && lane >= 0 ? { lane } : {}),
+    });
+  }
+  return out;
+};
+
+/** The inverse of clipMeterToTasmo. A field that is absent, null or malformed stays
+ *  undefined, so files written before these fields load as they did. */
+export const tasmoMeterToClip = (c: TasmoMeterFields): ClipMeterFields => {
+  const out: ClipMeterFields = {};
+  const rollNotes = Array.isArray(c.roll_notes) ? tasmoNotesToPiano(c.roll_notes) : [];
+  if (rollNotes.length) out.sourceRollNotes = rollNotes;
+  const total = numberAtLeast(c.total_steps, 1);
+  if (total !== undefined) out.sourceTotalSteps = total;
+  if (Array.isArray(c.meter_map) && c.meter_map.length) out.sourceMeterMap = normalizeMeterMap(c.meter_map);
+  const pickup = numberAtLeast(c.pickup_steps, 0);
+  if (pickup !== undefined) out.sourcePickupSteps = pickup;
+  if (Array.isArray(c.lanes) && c.lanes.length) {
+    out.sourceLanes = c.lanes
+      .filter((l) => l && Number.isInteger(l.id) && l.id >= 0)
+      .map((l) => ({ id: l.id, name: String(l.name ?? ''), cycleSteps: numberAtLeast(l.cycle_steps, 1) ?? null }));
+  }
+  return out;
+};
 
 export const projectApi = {
   save: (project: TasmoProjectInput, path: string, embed_audio: boolean) =>

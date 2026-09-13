@@ -287,6 +287,37 @@ def test_seven_eight_against_five_four_is_a_polymeter():
     assert "7/8" in seven[0]["label"], seven[0]
 
 
+def test_polymeter_entries_carry_the_denominator_their_bar_is_counted_in():
+    # "level" names the grid (x2 is den 8 over the quarter, or ratio 2 over the
+    # segment's den), so the lane length needs the denominator itself:
+    # beats_per_bar * 16 / denominator sixteenths.
+    three_four, _ = _analyze(
+        MeterSegment(bpm=120.0, beats_per_bar=4, bars=24, poly_cycle=3)
+    )
+    seven_five, _ = _analyze(
+        MeterSegment(
+            bpm=240.0,
+            beats_per_bar=10,
+            bars=24,
+            grouping=(2, 2, 2, 2, 2),
+            pulse="groups",
+            poly_cycle=7,
+        )
+    )
+    entries = three_four["polymeter"] + seven_five["polymeter"]
+    assert entries
+    for p in entries:
+        assert p["denominator"] in (1, 2, 4, 8, 16, 32, 64), p
+        if not p["relation"].startswith("displaced"):
+            assert p["label"].startswith(f"{p['beats_per_bar']}/{p['denominator']} "), p
+    three = [p for p in three_four["polymeter"] if p["beats_per_bar"] == 3]
+    assert three[0]["denominator"] == 4, three[0]
+    assert three[0]["beats_per_bar"] * 16 / three[0]["denominator"] == 12
+    seven = [p for p in seven_five["polymeter"] if p["beats_per_bar"] == 7]
+    assert seven[0]["denominator"] == 8, seven[0]
+    assert seven[0]["beats_per_bar"] * 16 / seven[0]["denominator"] == 14
+
+
 # --------------------------------------------------------------------------
 # the report
 # --------------------------------------------------------------------------

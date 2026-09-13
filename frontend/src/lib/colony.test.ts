@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { barSeconds, canWire, findNode, graphAt, groupStarts, nodeKey, parseColony, serializeColony, STARTER_COLONY, uniqueId, walkNodes } from './colony.ts';
+import { barSeconds, canWire, findNode, graphAt, groupStarts, nodeKey, parseColony, partitions, serializeColony, STARTER_COLONY, uniqueId, walkNodes } from './colony.ts';
 
 // The starter is a SPORE — one loop that repeats itself, and it grows.
 {
@@ -112,6 +112,16 @@ pulse -> seven on=0
   assert.deepEqual(groupStarts({ num: 7, den: 8, groups: [3, 2, 2] }, 7), [0, 3, 5]);
   assert.deepEqual(groupStarts({ num: 11, den: 8, groups: [3, 3, 3, 2] }, 22), [0, 6, 12, 18]);
   assert.deepEqual(groupStarts({ num: 4, den: 4, groups: [] }, 16), [0]);
+  // On the roll's sixteenth grid: 5/16 3+2 holds 5 steps, 7/8 3+2+2 holds 14.
+  assert.deepEqual(groupStarts({ num: 5, den: 16, groups: [3, 2] }, 5), [0, 3]);
+  assert.deepEqual(groupStarts({ num: 7, den: 8, groups: [3, 2, 2] }, 14), [0, 6, 10]);
+}
+
+// Groupings a meter control offers: 2s, 3s and 4s, even first.
+{
+  assert.deepEqual(partitions(7), [[], [3, 2, 2], [3, 4], [2, 3, 2], [2, 2, 3], [4, 3]]);
+  assert.deepEqual(partitions(3), [[]]);
+  assert.ok(partitions(16).length <= 9);
 }
 
 // Fractal nesting: a colony in a colony in a colony, each with its own meter and tempo.

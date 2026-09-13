@@ -5,6 +5,8 @@ interface BpmTapperProps {
   currentBpm: number;
 }
 
+/** Tap tempo, drawn in the MIDI dock's key grammar: the theme accent while
+ *  taps are landing, no glow. */
 export const BpmTapper: React.FC<BpmTapperProps> = ({ onBpmSet, currentBpm }) => {
   const [taps, setTaps] = useState<number[]>([]);
   const [calculatedBpm, setCalculatedBpm] = useState<number | null>(null);
@@ -81,14 +83,17 @@ export const BpmTapper: React.FC<BpmTapperProps> = ({ onBpmSet, currentBpm }) =>
     }
   }, [calculatedBpm, onBpmSet]);
 
+  const lift = 'shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.1),inset_0_0_0_100px_rgba(255,255,255,0.06)]';
+
   return (
-    <div className="bg-zinc-900 border border-white/10 rounded-xl p-4">
+    <div className="bg-zinc-900 border border-white/10 rounded-xs p-4">
       <div className="flex items-center justify-between mb-3">
-        <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider">Tap Tempo</h3>
+        <h3 className="text-xs font-bold et-ink-3 uppercase tracking-wider">Tap Tempo</h3>
         {calculatedBpm && (
           <button
+            type="button"
             onClick={handleReset}
-            className="text-[10px] text-gray-500 hover:text-white transition-colors"
+            className="text-[10px] et-ink-3 hover:et-ink transition-colors"
           >
             Reset
           </button>
@@ -97,11 +102,13 @@ export const BpmTapper: React.FC<BpmTapperProps> = ({ onBpmSet, currentBpm }) =>
 
       {/* Tap Button */}
       <button
+        type="button"
         onClick={handleTap}
-        className={`w-full h-20 rounded-lg font-bold text-lg transition-all ${
+        aria-label={calculatedBpm ? `Tap tempo, ${calculatedBpm} BPM` : 'Tap tempo'}
+        className={`w-full h-20 rounded-xs bg-white/10 border-b-2 font-bold text-lg transition-[color,box-shadow,border-color] ${lift} ${
           isActive
-            ? 'bg-cyan-500/20 border-2 border-cyan-400 text-cyan-400 shadow-[0_0_20px_rgba(6,182,212,0.3)]'
-            : 'bg-black/50 border-2 border-white/10 text-gray-400 hover:border-gray-600'
+            ? 'text-[rgb(var(--et-accent))] border-b-[rgb(var(--et-accent))]'
+            : 'et-ink-2 border-b-transparent hover:et-ink'
         }`}
       >
         {calculatedBpm ? (
@@ -113,16 +120,16 @@ export const BpmTapper: React.FC<BpmTapperProps> = ({ onBpmSet, currentBpm }) =>
 
       {/* Tap count indicator */}
       <div className="flex justify-between items-center mt-2">
-        <span className="text-[10px] text-gray-500">
+        <span className="text-[10px] et-ink-3">
           {taps.length > 0 ? `${taps.length} taps` : 'Tap to start'}
         </span>
         {taps.length >= 2 && (
-          <div className="flex gap-1">
+          <div className="flex gap-1" aria-hidden="true">
             {Array.from({ length: Math.min(taps.length, 8) }).map((_, i) => (
               <div
                 key={i}
                 className={`w-1.5 h-1.5 rounded-full ${
-                  i < taps.length ? 'bg-cyan-400' : 'bg-gray-700'
+                  i < taps.length ? 'bg-[rgb(var(--et-accent))]' : 'bg-white/10'
                 }`}
               />
             ))}
@@ -133,14 +140,15 @@ export const BpmTapper: React.FC<BpmTapperProps> = ({ onBpmSet, currentBpm }) =>
       {/* Apply button */}
       {calculatedBpm && (
         <button
+          type="button"
           onClick={handleApply}
-          className="w-full mt-3 py-2 rounded-lg bg-cyan-500/20 border border-cyan-400 text-cyan-400 text-xs font-medium hover:bg-cyan-500 hover:text-black transition-all"
+          className={`w-full mt-3 py-2 rounded-xs bg-white/10 border-b border-b-[rgb(var(--et-accent))] text-[rgb(var(--et-accent))] text-xs font-medium transition-shadow ${lift}`}
         >
           Set BPM to {calculatedBpm} (current: {currentBpm})
         </button>
       )}
 
-      <p className="text-[9px] text-gray-600 mt-2 text-center">
+      <p className="text-[9px] et-ink-3 mt-2 text-center">
         Tap along with your beat. Best accuracy with 4-8 taps.
       </p>
     </div>

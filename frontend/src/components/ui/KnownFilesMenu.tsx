@@ -39,6 +39,8 @@ interface KnownFilesMenuProps {
   /** known_paths kinds to include; every kind when omitted. */
   kinds?: string[];
   label?: string;
+  /** The trigger's and the list's accessible name; defaults to "<label> files". */
+  name?: string;
   onFiles: (files: File[]) => void;
   className?: string;
 }
@@ -59,6 +61,7 @@ export const KnownFilesMenu: React.FC<KnownFilesMenuProps> = ({
   exts,
   kinds,
   label = 'Recent',
+  name,
   onFiles,
   className = '',
 }) => {
@@ -75,7 +78,7 @@ export const KnownFilesMenu: React.FC<KnownFilesMenuProps> = ({
   const seqRef = useRef(0);
 
   const listId = `${id}-listbox`;
-  const menuName = `${label} files`;
+  const menuName = name ?? `${label} files`;
   const local = isLocalClient();
 
   // String keys, so a caller passing an inline array does not refetch on
@@ -256,7 +259,7 @@ export const KnownFilesMenu: React.FC<KnownFilesMenuProps> = ({
         aria-controls={open ? listId : undefined}
         aria-label={menuName}
         title="Lists recent files this app saved, installed, opened or downloaded."
-        className={`shrink-0 inline-flex items-center justify-center gap-1.5 rounded border border-white/10 bg-white/5 px-2 py-1 text-[9px] font-black uppercase tracking-widest text-zinc-300 hover:border-purple-400/40 hover:bg-purple-500/15 hover:text-purple-100 transition-colors ${className}`}
+        className={`shrink-0 inline-flex items-center justify-center gap-1.5 rounded border border-white/10 bg-white/5 px-2 py-1 text-[9px] font-black uppercase tracking-widest text-zinc-300 hover:text-[rgb(var(--et-accent))] hover:shadow-[inset_0_0_0_100px_rgba(255,255,255,0.06)] transition-colors ${className}`}
       >
         <History className="w-3 h-3" />
         {label}
@@ -265,7 +268,7 @@ export const KnownFilesMenu: React.FC<KnownFilesMenuProps> = ({
         createPortal(
           <div
             ref={popupRef}
-            className="fixed z-400 rounded border border-purple-500/40 bg-[#0a080f] shadow-[0_8px_24px_rgba(0,0,0,0.6)]"
+            className="fixed z-400 rounded border border-white/10 bg-[#0a080f] shadow-[0_8px_24px_rgba(0,0,0,0.6)]"
             style={{
               left: pos?.left ?? -9999,
               top: pos?.top ?? -9999,
@@ -296,8 +299,8 @@ export const KnownFilesMenu: React.FC<KnownFilesMenuProps> = ({
                     onFocus={() => setActiveIdx(i)}
                     onClick={() => void choose(item)}
                     title={item.path}
-                    className={`flex h-9 w-full flex-col justify-center border-b border-white/5 px-2 text-left last:border-b-0 hover:bg-purple-500/15 focus:outline-none focus-visible:bg-purple-500/15 ${
-                      i === active ? 'text-purple-100' : 'text-zinc-200'
+                    className={`flex h-9 w-full flex-col justify-center border-b border-white/5 px-2 text-left last:border-b-0 hover:shadow-[inset_0_0_0_100px_rgba(255,255,255,0.06)] focus:outline-none focus-visible:shadow-[inset_0_0_0_100px_rgba(255,255,255,0.08)] ${
+                      i === active ? 'text-[rgb(var(--et-accent))]' : 'text-zinc-200'
                     }`}
                   >
                     <span className="flex min-w-0 items-center gap-1.5">
@@ -319,7 +322,7 @@ export const KnownFilesMenu: React.FC<KnownFilesMenuProps> = ({
                       onClick={() => void reveal(item)}
                       aria-label={`Show ${item.name} in folder`}
                       title="Shows this file in its folder."
-                      className="inline-flex h-9 w-8 items-center justify-center border-b border-white/5 text-zinc-400 last:border-b-0 hover:bg-purple-500/15 hover:text-purple-100"
+                      className="inline-flex h-9 w-8 items-center justify-center border-b border-white/5 text-zinc-400 last:border-b-0 hover:shadow-[inset_0_0_0_100px_rgba(255,255,255,0.06)] hover:text-[rgb(var(--et-accent))]"
                     >
                       <FolderOpen className="w-3 h-3" />
                     </button>

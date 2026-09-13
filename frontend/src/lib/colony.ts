@@ -134,6 +134,19 @@ export function parseGroups(s: string, num: number): number[] | null {
   return parts;
 }
 
+/** Sensible groupings of n beats into 2s and 3s (plus even). */
+export function partitions(n: number): number[][] {
+  const out: number[][] = [[]];
+  if (n < 4) return out;
+  const seen = new Set<string>();
+  const rec = (rest: number, acc: number[]) => {
+    if (rest === 0) { const k = acc.join('+'); if (!seen.has(k) && acc.length > 1) { seen.add(k); out.push([...acc]); } return; }
+    for (const p of [3, 2, 4]) if (p <= rest && acc.length < 5) rec(rest - p, [...acc, p]);
+  };
+  rec(n, []);
+  return out.slice(0, 9);
+}
+
 /** Placeholder alphabet so lib/loomGen's rules yield a symbol INDEX. */
 export function ruleTile(node: RuleNode): GenTile {
   const alphabet: (LoomQuery | null)[] = Array.from({ length: Math.max(1, node.symbols) }, (_, i) => ({ shardId: `sym:${i}` }));

@@ -9,7 +9,8 @@
  */
 
 import { useGenerateParamsStore } from '../state/generateParamsStore';
-import { notesToSmf } from './midiWrite';
+import type { MeterSegment } from './meterMap';
+import { notesToRollSmf, notesToSmf } from './midiWrite';
 import type { RenderNote } from './midiSynth';
 import { renderNotesToBlob } from './midiSynth';
 import { saveFile, type SaveFileResult } from './saveFile';
@@ -60,10 +61,19 @@ export const artifactNotesToRenderNotes = (notes: ArtifactNote[]): RenderNote[] 
     velocity: n.velocity,
   }));
 
-/** Export the artifact notes as a .mid (type-0 SMF) through saveFile, which
- *  remembers the chosen path. Resolves with the save's outcome. */
-export const downloadVocalMidi = (notes: ArtifactNote[], baseName = 'vocal'): Promise<SaveFileResult> => {
-  const bytes = notesToSmf(artifactNotesToRenderNotes(notes));
+/**
+ * Export the artifact notes as a .mid (type-0 SMF) through saveFile, which
+ * remembers the chosen path. With `meter` (the roll's map, pickup and bpm) the
+ * file is written at the roll's tempo and carries its time signatures on that
+ * grid. Resolves with the save's outcome.
+ */
+export const downloadVocalMidi = (
+  notes: ArtifactNote[],
+  baseName = 'vocal',
+  meter?: { meterMap: MeterSegment[]; pickupSteps: number; bpm: number },
+): Promise<SaveFileResult> => {
+  const render = artifactNotesToRenderNotes(notes);
+  const bytes = meter ? notesToRollSmf(render, meter) : notesToSmf(render);
   return saveFile({ blob: new Blob([bytes], { type: 'audio/midi' }), suggestedName: `${baseName}.mid`, kind: 'midi' });
 };
 

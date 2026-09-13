@@ -26,7 +26,7 @@ import * as shards from '../lib/shardEngine';
 import { GEN_BLURB, GEN_GLYPH, GEN_KINDS, type GenKind } from '../lib/loomGen';
 import { DEFAULT_SEED } from '../lib/loomEngine';
 import { ColonyCanvas } from '../components/loom/ColonyCanvas';
-import { findNode, GRAINS, graphAt, meterText, parseColony, serializeColony, SPACE_MODES, walkNodes, type ColonyNode, type GateNode, type LoopNode, type Meter, type ModNode, type RuleNode } from '../lib/colony';
+import { findNode, GRAINS, graphAt, meterText, parseColony, partitions, serializeColony, SPACE_MODES, walkNodes, type ColonyNode, type GateNode, type LoopNode, type Meter, type ModNode, type RuleNode } from '../lib/colony';
 import { cellColor, KIND_COLOR, ROLE_COLOR, rgba } from '../lib/loomPalette';
 import { SurfacePlayKey } from '../components/ui/SurfacePlayKey';
 
@@ -291,19 +291,6 @@ const MeterEditor: React.FC<{ id: string; meter: Meter; tempo: number; onChange:
     </div>
   );
 };
-
-/** Sensible groupings of n beats into 2s and 3s (plus even). */
-function partitions(n: number): number[][] {
-  const out: number[][] = [[]];
-  if (n < 4) return out;
-  const seen = new Set<string>();
-  const rec = (rest: number, acc: number[]) => {
-    if (rest === 0) { const k = acc.join('+'); if (!seen.has(k) && acc.length > 1) { seen.add(k); out.push([...acc]); } return; }
-    for (const p of [3, 2, 4]) if (p <= rest && acc.length < 5) rec(rest - p, [...acc, p]);
-  };
-  rec(n, []);
-  return out.slice(0, 9);
-}
 
 const NodeInspector: React.FC<{ nodeKey: string; node: ColonyNode; path: string[]; graph: ReturnType<typeof graphAt> }> = ({ nodeKey, node, path, graph }) => {
   const update = useLoomStore((s) => s.updateColonyNode);
