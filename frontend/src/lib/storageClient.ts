@@ -107,9 +107,21 @@ export interface ModelStatusResponse {
 // This wrapper's message is what Settings → Models prints after "Model status
 // failed: ", so "HTTP 502" was the whole of what a user got when the app could
 // not reach its own backend — see frontend/src/lib/httpError.ts.
+// The thrown Error also carries the HTTP `status`, so a caller can tell "no
+// native picker on this platform" (501) from a picker that failed.
 async function json<T>(r: Response): Promise<T> {
-  if (!r.ok) throw new Error(await describeHttpError(r));
+  if (!r.ok) {
+    const err = new Error(await describeHttpError(r)) as Error & { status?: number };
+    err.status = r.status;
+    throw err;
+  }
   return r.json() as Promise<T>;
+}
+
+/** The HTTP status carried by an error this client threw, or null. */
+export function storageErrorStatus(e: unknown): number | null {
+  const status = (e as { status?: unknown } | null)?.status;
+  return typeof status === 'number' ? status : null;
 }
 
 export async function fetchCheckpoints(): Promise<{
@@ -164,18 +176,46 @@ export async function openLocation(path: string): Promise<void> {
   }));
 }
 
-export async function pickFolder(): Promise<PathPickerResult> {
-  return json(await fetch('/api/storage/pick-folder', { method: 'POST' }));
+// Every picker takes an optional `kind` (see backend/lib/known_paths.py). With
+// no `initialDir`, the backend opens the dialog in the folder last used for that
+// kind, and it records what the user picked so the next picker starts there.
+
+export async function pickFolder(opts?: {
+  title?: string;
+  initialDir?: string;
+  kind?: string;
+}): Promise<PathPickerResult> {
+  return json(
+    await fetch('/api/storage/pick-folder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: opts?.title,
+        initial_dir: opts?.initialDir,
+        kind: opts?.kind,
+      }),
+    }),
+  );
 }
 
-export async function pickFile(opts?: { filter?: string; title?: string }): Promise<PathPickerResult> {
+export async function pickFile(opts?: {
+  filter?: string;
+  title?: string;
+  initialDir?: string;
+  kind?: string;
+}): Promise<PathPickerResult> {
   // Always send a (possibly empty) JSON body; the backend defaults to an
   // "All files" filter so project/audio files are never hidden.
   return json(
     await fetch('/api/storage/pick-file', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(opts ?? {}),
+      body: JSON.stringify({
+        filter: opts?.filter,
+        title: opts?.title,
+        initial_dir: opts?.initialDir,
+        kind: opts?.kind,
+      }),
     }),
   );
 }
@@ -186,8 +226,10 @@ export async function pickSave(opts?: {
   initialDir?: string;
   initialName?: string;
   defaultExt?: string;
+  kind?: string;
 }): Promise<PathPickerResult> {
-  // Native Save As dialog (for .tasmo saves). The backend snake_cases the keys.
+  // Native Save As dialog. The chosen path is granted one write through
+  // POST /api/places/save, so a save can land where the user pointed it.
   return json(
     await fetch('/api/storage/pick-save', {
       method: 'POST',
@@ -198,6 +240,7 @@ export async function pickSave(opts?: {
         initial_dir: opts?.initialDir,
         initial_name: opts?.initialName,
         default_ext: opts?.defaultExt,
+        kind: opts?.kind,
       }),
     }),
   );

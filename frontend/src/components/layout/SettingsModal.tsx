@@ -56,11 +56,15 @@ export const SettingsModal: React.FC<{ open: boolean; onClose: () => void }> = (
     if (v !== musescorePath) void patchFeatures({ notation: { musescore_path: v } });
   };
   const electronSelectFile = (window as unknown as {
-    electronAPI?: { selectFile?: () => Promise<{ canceled: boolean; filePaths: string[] }> };
+    electronAPI?: {
+      selectFile?: (options?: { defaultPath?: string; title?: string }) => Promise<{ canceled: boolean; filePaths: string[] }>;
+    };
   }).electronAPI?.selectFile;
   const browseMusescore = async () => {
     if (!electronSelectFile) return;
-    const r = await electronSelectFile();
+    // The dialog opens at the path already in the field.
+    const current = musescoreDraft.trim() || musescorePath;
+    const r = await electronSelectFile({ defaultPath: current || undefined, title: 'Locate MuseScore' });
     if (r.canceled || !r.filePaths[0]) return;
     setMusescoreDraft(r.filePaths[0]);
     commitMusescore(r.filePaths[0]);

@@ -7,13 +7,15 @@
  * it: a labelled button beside the app menu that opens a small menu with the
  * three things "import" can mean — audio files into the library, a .tasmo
  * project, or a DAW project — and that also takes audio files dropped
- * straight onto it.
+ * straight onto it. A Recent button beside it lists the audio files the app
+ * saved or downloaded, and choosing one imports it through the same handler.
  *
  * Wiring notes:
  * - The `data-tour` hook and the drop target both sit on the wrapper, not the
  *   button: TopBarButton takes no data attributes, and the menu is absolutely
  *   positioned, so the wrapper's box is exactly the trigger's — a spotlight
- *   rings the button and a drop anywhere on it lands.
+ *   rings the button and a drop anywhere on it lands. The Recent button is a
+ *   sibling of that wrapper so the box stays the trigger's.
  * - HOME's "Import Audio" reaches the same picker through the
  *   `IMPORT_AUDIO_EVENT` window event. That dispatch, and the listener's
  *   `input.click()`, run synchronously inside HOME's click handler: any await
@@ -26,7 +28,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { FileAudio, FolderInput, FolderOpen } from 'lucide-react';
 import { TopBarButton } from './TopBarButton';
-import { AUDIO_ACCEPT } from '../../lib/fileFilters';
+import { KnownFilesMenu } from '../ui/KnownFilesMenu';
+import { AUDIO_ACCEPT, AUDIO_EXTS } from '../../lib/fileFilters';
 import { importAudioFiles, isAudioFile, type AudioImportOrigin } from '../../lib/importAudioFiles';
 import type { LibraryEntry } from '../../state/libraryEntry';
 import { useLibraryStore } from '../../state/libraryStore';
@@ -38,6 +41,8 @@ export const IMPORT_AUDIO_EVENT = 'thedaw:import-audio';
 
 const MENU_ID = 'header-import-menu';
 const INPUT_ID = 'header-import-audio-files';
+const RECENT_ID = 'header-import-recent-audio';
+const RECENT_EXTS = AUDIO_EXTS.map((e) => `.${e}`);
 
 const PICKER_ORIGIN: AudioImportOrigin = { prompt: 'Imported from file picker', tags: ['imported'] };
 const DROP_ORIGIN: AudioImportOrigin = { prompt: 'Imported from header drop', tags: ['imported', 'drop'] };
@@ -189,78 +194,86 @@ export const ImportMenu: React.FC<ImportMenuProps> = ({ onOpenProject, onImportD
   };
 
   return (
-    <div
-      data-tour="import"
-      ref={rootRef}
-      className="relative"
-      onDragOver={onDragOver}
-      onDragLeave={onDragLeave}
-      onDrop={onDrop}
-    >
-      <TopBarButton
-        buttonRef={triggerRef}
-        onClick={() => setOpen((v) => !v)}
-        icon={<FolderInput className="w-3.5 h-3.5" aria-hidden="true" />}
-        label="Import"
-        title="Import audio files, a .tasmo project or a DAW project — or drop audio files here"
-        accent="sky"
-        active={open || dragOver}
-        ariaHasPopup="menu"
-        ariaExpanded={open}
-        ariaControls={open ? MENU_ID : undefined}
-      />
-      {/* The native picker: a real labelled field, visually hidden with
-          sr-only (a 1px clip) rather than display:none, which would drop it
-          from the accessibility tree and leave the label naming nothing. It
-          is kept out of the Tab order because the menu's "Audio files…" item
-          is the keyboard route — Tab from IMPORT must not land on a field
-          nobody can see — while a screen reader's browse mode still finds it
-          under its label. AUDIO_ACCEPT rather than a bare audio/* so an
-          empty-mime .wav is not greyed out on Windows. */}
-      <label htmlFor={INPUT_ID} className="sr-only">
-        Audio files to import
-      </label>
-      <input
-        ref={fileInputRef}
-        id={INPUT_ID}
-        name={INPUT_ID}
-        type="file"
-        accept={AUDIO_ACCEPT}
-        multiple
-        tabIndex={-1}
-        className="sr-only"
-        onChange={onFileChange}
-      />
+    <>
+      <div
+        data-tour="import"
+        ref={rootRef}
+        className="relative"
+        onDragOver={onDragOver}
+        onDragLeave={onDragLeave}
+        onDrop={onDrop}
+      >
+        <TopBarButton
+          buttonRef={triggerRef}
+          onClick={() => setOpen((v) => !v)}
+          icon={<FolderInput className="w-3.5 h-3.5" aria-hidden="true" />}
+          label="Import"
+          title="Import audio files, a .tasmo project or a DAW project — or drop audio files here"
+          accent="sky"
+          active={open || dragOver}
+          ariaHasPopup="menu"
+          ariaExpanded={open}
+          ariaControls={open ? MENU_ID : undefined}
+        />
+        {/* The native picker: a real labelled field, visually hidden with
+            sr-only (a 1px clip) rather than display:none, which would drop it
+            from the accessibility tree and leave the label naming nothing. It
+            is kept out of the Tab order because the menu's "Audio files…" item
+            is the keyboard route — Tab from IMPORT must not land on a field
+            nobody can see — while a screen reader's browse mode still finds it
+            under its label. AUDIO_ACCEPT rather than a bare audio/* so an
+            empty-mime .wav is not greyed out on Windows. */}
+        <label htmlFor={INPUT_ID} className="sr-only">
+          Audio files to import
+        </label>
+        <input
+          ref={fileInputRef}
+          id={INPUT_ID}
+          name={INPUT_ID}
+          type="file"
+          accept={AUDIO_ACCEPT}
+          multiple
+          tabIndex={-1}
+          className="sr-only"
+          onChange={onFileChange}
+        />
 
-      {open && (
-        <div
-          id={MENU_ID}
-          role="menu"
-          aria-label="Import"
-          onKeyDown={onMenuKeyDown}
-          className="absolute right-0 top-full mt-1 z-50 w-56 bg-[#0a080f] border border-white/10 rounded-lg shadow-[0_8px_32px_rgba(0,0,0,0.75)] p-1.5 flex flex-col gap-0.5"
-        >
-          {items.map((item, i) => {
-            const Icon = item.icon;
-            return (
-              <button
-                key={item.id}
-                type="button"
-                role="menuitem"
-                tabIndex={-1}
-                ref={(el) => {
-                  itemRefs.current[i] = el;
-                }}
-                onClick={() => selectItem(item)}
-                className={ITEM_CLS}
-              >
-                <Icon className={`w-3.5 h-3.5 shrink-0 ${item.iconCls}`} />
-                <span className="flex-1 min-w-0 truncate">{item.label}</span>
-              </button>
-            );
-          })}
-        </div>
-      )}
-    </div>
+        {open && (
+          <div
+            id={MENU_ID}
+            role="menu"
+            aria-label="Import"
+            onKeyDown={onMenuKeyDown}
+            className="absolute right-0 top-full mt-1 z-50 w-56 bg-[#0a080f] border border-white/10 rounded-lg shadow-[0_8px_32px_rgba(0,0,0,0.75)] p-1.5 flex flex-col gap-0.5"
+          >
+            {items.map((item, i) => {
+              const Icon = item.icon;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  role="menuitem"
+                  tabIndex={-1}
+                  ref={(el) => {
+                    itemRefs.current[i] = el;
+                  }}
+                  onClick={() => selectItem(item)}
+                  className={ITEM_CLS}
+                >
+                  <Icon className={`w-3.5 h-3.5 shrink-0 ${item.iconCls}`} />
+                  <span className="flex-1 min-w-0 truncate">{item.label}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+      <KnownFilesMenu
+        id={RECENT_ID}
+        exts={RECENT_EXTS}
+        label="Recent audio"
+        onFiles={(files) => void runImport(files, PICKER_ORIGIN)}
+      />
+    </>
   );
 };

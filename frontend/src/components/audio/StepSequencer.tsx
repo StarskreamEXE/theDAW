@@ -11,6 +11,7 @@ import { logError, logInfo } from '../../state/logStore';
 import { MidiMapper } from './MidiMapper';
 import { ContextMenu, useContextMenu, type ContextMenuItem } from '../ui/ContextMenu';
 import { encodeWav } from '../../lib/wavEncode';
+import { saveFile, type SaveFileResult } from '../../lib/saveFile';
 import {
   STYLE_NAMES,
   combineStylesForRole,
@@ -286,18 +287,11 @@ const buildMidiFile = (
   return new Uint8Array(out);
 };
 
-const downloadMidi = (tracks: Track[], bpm: number, mode: 'single' | 'multi'): void => {
+const saveMidi = (tracks: Track[], bpm: number, mode: 'single' | 'multi'): Promise<SaveFileResult> => {
   const bytes = buildMidiFile(tracks, bpm, mode);
   const blob = new Blob([bytes], { type: 'audio/midi' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  a.href = url;
-  a.download = `thedaw-pattern-${stamp}-${mode}.mid`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  return saveFile({ blob, suggestedName: `thedaw-pattern-${stamp}-${mode}.mid`, kind: 'midi' });
 };
 
 // =============================================================================
@@ -490,14 +484,16 @@ export const StepSequencer: React.FC = () => {
     );
   };
 
-  const handleExportMidi = () => {
+  const handleExportMidi = async () => {
     const active = tracks.filter((t) => t.steps.some(Boolean));
     if (active.length === 0) {
       logError('sequencer', 'No active steps to export');
       return;
     }
-    downloadMidi(active, bpm, exportMode);
-    logInfo('sequencer', `MIDI exported: ${active.length} voice(s), ${exportMode} mode, ${bpm} BPM`);
+    const saved = await saveMidi(active, bpm, exportMode);
+    if (saved.path || saved.downloaded) {
+      logInfo('sequencer', `MIDI exported: ${active.length} voice(s), ${exportMode} mode, ${bpm} BPM`);
+    }
   };
 
   const handleSendToEditor = async () => {
@@ -574,9 +570,10 @@ export const StepSequencer: React.FC = () => {
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-4">
             <div className="flex flex-col">
-              <span className="text-[7px] font-mono text-zinc-600 uppercase leading-none">Tempo (BPM)</span>
+              <label htmlFor="step-seq-bpm" className="text-[7px] font-mono text-zinc-600 uppercase leading-none">Tempo (BPM)</label>
               <input
                 type="number"
+                id="step-seq-bpm"
                 name="step-seq-bpm"
                 value={bpm}
                 min={40}
@@ -619,7 +616,9 @@ export const StepSequencer: React.FC = () => {
             <Music className="w-2.5 h-2.5 text-zinc-500" />
             <input
               type="number"
+              id="step-seq-export-bars"
               name="step-seq-export-bars"
+              aria-label="Bars to render when sending to the editor"
               min={1}
               max={16}
               value={exportBars}
@@ -631,9 +630,9 @@ export const StepSequencer: React.FC = () => {
           </div>
 
           <button
-            onClick={handleExportMidi}
+            onClick={() => void handleExportMidi()}
             className="btn-ghost flex items-center gap-1.5 py-1 text-[9px]"
-            title="Download this pattern as a Standard MIDI File (.mid)"
+            title="Save this pattern as a Standard MIDI File (.mid)"
           >
             <Download className="w-3 h-3 text-purple-300" /> EXPORT MIDI
           </button>
@@ -750,7 +749,9 @@ export const StepSequencer: React.FC = () => {
               <div className="flex justify-between items-center mb-1 gap-1">
                 <input
                   type="text"
+                  id={`step-seq-track-name-${track.id}`}
                   name={`step-seq-track-name-${track.id}`}
+                  aria-label="Track name"
                   value={track.name}
                   onChange={(e) => setTrackName(track.id, e.target.value)}
                   className="bg-transparent border-none outline-none text-[9px] font-black uppercase truncate hover:bg-white/5 px-1 -mx-1 rounded transition-colors flex-1 min-w-0"

@@ -24,6 +24,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from backend.core.folder_dialog import pick_open_file
+from backend.lib import known_paths
 from backend.modules.quest import service
 
 log = logging.getLogger(__name__)
@@ -121,18 +122,28 @@ async def quest_fetch_apk() -> dict:
         log.warning("quest: APK download failed: %s", exc)
         raise HTTPException(status_code=502, detail=f"APK download failed: {exc}")
     await asyncio.to_thread(service.save_config, {"last_apk_path": result["path"]})
+    await asyncio.to_thread(known_paths.record, result["path"], "apk", "install")
     return {"ok": True, **result}
 
 
 @router.get("/pick-apk")
 async def quest_pick_apk() -> dict:
-    """Open the native file picker for an .apk and return the chosen path."""
+    """Open the native file picker for an .apk and return the chosen path.
+
+    The dialog opens beside the APK deployed last, else in the folder the last
+    APK the app saw landed in (a finished download counts), else Downloads."""
     cfg = await asyncio.to_thread(service.load_config)
     last = cfg.get("last_apk_path")
-    initial = str(Path(last).parent) if isinstance(last, str) and last else None
+    initial = (
+        str(Path(last).parent)
+        if isinstance(last, str) and last and Path(last).parent.is_dir()
+        else await asyncio.to_thread(known_paths.last_folder, "apk")
+    )
     path = await asyncio.to_thread(
         pick_open_file, "Select the Quest APK", initial, _APK_FILTER
     )
+    if path:
+        await asyncio.to_thread(known_paths.record, path, "apk", "pick")
     return {"path": path}
 
 

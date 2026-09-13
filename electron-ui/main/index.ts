@@ -711,6 +711,44 @@ function sendLoadingStatus(msg: string): void {
 }
 
 // ---------------------------------------------------------------------------
+// Downloads the renderer starts (an <a download>, a blob save)
+//
+// Chromium writes these straight to disk, so the backend never sees where they
+// went. When one finishes, the path goes to /api/places/record so the app's
+// pickers and "Recent" menus can offer that file back, and the renderer hears
+// about it on 'download-done' so it can say where the file landed.
+// ---------------------------------------------------------------------------
+
+const PLACES_RECORD_URL = `${BACKEND_BASE}/api/places/record`
+
+function watchDownloads(ses: Electron.Session): void {
+  ses.on('will-download', (_event, item) => {
+    item.once('done', (_doneEvent, state) => {
+      const filename = item.getFilename()
+      const savePath = state === 'completed' ? item.getSavePath() || null : null
+      if (savePath) {
+        log(`Download completed: ${savePath}`)
+        // Fire and forget: a backend that is down or restarting must not
+        // surface as an error for a download that already succeeded.
+        globalThis
+          .fetch(PLACES_RECORD_URL, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ path: savePath }),
+            signal: AbortSignal.timeout(5000),
+          })
+          .catch(() => {})
+      } else {
+        log(`Download ${state}: ${filename}`)
+      }
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('download-done', { path: savePath, filename, state })
+      }
+    })
+  })
+}
+
+// ---------------------------------------------------------------------------
 // Production: custom protocol for renderer files
 // ---------------------------------------------------------------------------
 
@@ -791,18 +829,43 @@ function registerAppProtocol(): void {
 // IPC handlers for native dialogs
 // ---------------------------------------------------------------------------
 
+/** What the renderer may set on an open dialog: where it starts, what it lists
+ *  and its title. Anything else in the payload is dropped, so the renderer can
+ *  never turn a file picker into a multi-select or a directory picker. */
+function openDialogOptions(raw: unknown): Pick<Electron.OpenDialogOptions, 'defaultPath' | 'filters' | 'title'> {
+  const out: Pick<Electron.OpenDialogOptions, 'defaultPath' | 'filters' | 'title'> = {}
+  if (!raw || typeof raw !== 'object') return out
+  const o = raw as { defaultPath?: unknown; filters?: unknown; title?: unknown }
+  if (typeof o.defaultPath === 'string' && o.defaultPath) out.defaultPath = o.defaultPath
+  if (typeof o.title === 'string' && o.title) out.title = o.title
+  if (Array.isArray(o.filters)) {
+    const filters = o.filters.filter(
+      (f): f is Electron.FileFilter =>
+        !!f &&
+        typeof f === 'object' &&
+        typeof (f as Electron.FileFilter).name === 'string' &&
+        Array.isArray((f as Electron.FileFilter).extensions) &&
+        (f as Electron.FileFilter).extensions.every((e) => typeof e === 'string'),
+    )
+    if (filters.length) out.filters = filters
+  }
+  return out
+}
+
 function registerIpcHandlers(): void {
-  ipcMain.handle('dialog:selectFile', async () => {
+  ipcMain.handle('dialog:selectFile', async (_event, options?: unknown) => {
     if (!mainWindow) return { canceled: true, filePaths: [] }
     const result = await dialog.showOpenDialog(mainWindow, {
+      ...openDialogOptions(options),
       properties: ['openFile'],
     })
     return result
   })
 
-  ipcMain.handle('dialog:selectDirectory', async () => {
+  ipcMain.handle('dialog:selectDirectory', async (_event, options?: unknown) => {
     if (!mainWindow) return { canceled: true, filePaths: [] }
     const result = await dialog.showOpenDialog(mainWindow, {
+      ...openDialogOptions(options),
       properties: ['openDirectory'],
     })
     return result
@@ -1026,6 +1089,7 @@ if (gotSingleInstanceLock) app.whenReady().then(async () => {
   const ses = session.defaultSession
   ses.setPermissionRequestHandler((_wc, _permission, callback) => callback(true))
   ses.setPermissionCheckHandler(() => true)
+  watchDownloads(ses)
 
   registerIpcHandlers()
 

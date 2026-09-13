@@ -3,8 +3,11 @@
  *
  * The catalog is served by backend/modules/assets. Items are projects
  * (.tasmo), plugins (.gan), volumetric captures (.ares) and cockpit scenes
- * (.sway). Install puts the file where its format belongs and reports the
- * path; download hands the raw file over for use elsewhere.
+ * (.sway). The primary button installs the file where its format belongs and
+ * then opens it where it is used. The backend reports each item's installed
+ * path in the list, so an install made in an earlier session still shows as
+ * installed and can be shown in its folder. Save a copy writes the raw file to
+ * a folder the user picks.
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
@@ -13,6 +16,7 @@ import {
   Check,
   Download,
   FileMusic,
+  FolderOpen,
   Layers,
   Loader2,
   GripVertical,
@@ -23,6 +27,14 @@ import {
 } from 'lucide-react';
 import { logError, logInfo } from '../../state/logStore';
 import { useProjectStore } from '../../state/projectStore';
+import { useAppUiStore } from '../../state/appUiStore';
+import { useGanStore } from '../../state/ganStore';
+import { useMixStageStore } from '../../state/mixStageStore';
+import { useStatusBarStore } from '../../state/statusBarStore';
+import { describeHttpError } from '../../lib/httpError';
+import { basenameOf, isLocalClient, placesApi } from '../../lib/placesClient';
+import { kindForName, saveFile } from '../../lib/saveFile';
+import { openSwayScene } from '../../lib/swayOpen';
 
 interface Asset {
   id: string;
@@ -43,6 +55,20 @@ interface Asset {
   download_url: string;
   cover_url: string;
   installs_to?: string;
+  /** Where the installed copy is on disk; null when none is. Absent from a
+   *  backend that predates the field. */
+  installed_path?: string | null;
+}
+
+interface InstallResult {
+  id: string;
+  installed: boolean;
+  already?: boolean;
+  path: string;
+  where: string;
+  kind?: string;
+  /** The plugin's manifest id, for a .gan. */
+  plugin_id?: string | null;
 }
 
 interface Facet {
@@ -56,6 +82,58 @@ const KIND_ICON: Record<string, React.ComponentType<{ className?: string }>> = {
   volumetric: Box,
   scene: Waves,
 };
+
+interface PrimaryAction {
+  label: string;
+  title: string;
+  /** Where an install lands when the detail call has not said yet. */
+  fallbackWhere: string;
+  hint: (where: string) => string;
+}
+
+/** The primary button for each kind: install, then open it where it is used. */
+const PRIMARY: Record<string, PrimaryAction> = {
+  project: {
+    label: 'OPEN',
+    title: 'Installs the project and opens it on the EDIT timeline.',
+    fallbackWhere: 'your projects folder',
+    hint: (where) => `OPEN puts it in ${where} and opens it on the timeline.`,
+  },
+  plugin: {
+    label: 'OPEN IN MIX',
+    title: 'Installs the plugin and opens it in the MIX effect stage.',
+    fallbackWhere: 'the plugin shelf',
+    hint: (where) => `OPEN IN MIX puts it on ${where} and opens it in the MIX effect stage.`,
+  },
+  scene: {
+    label: 'OPEN IN SWAY',
+    title: 'Installs the scene and loads it in the SWAY cockpit.',
+    fallbackWhere: 'the SWAY scenes folder',
+    hint: (where) => `OPEN IN SWAY puts it in ${where} and loads it in the SWAY cockpit.`,
+  },
+  volumetric: {
+    label: 'INSTALL',
+    title: 'Installs the capture and shows it in its folder.',
+    fallbackWhere: 'the captures folder',
+    hint: (where) => `INSTALL puts it in ${where} and shows it in its folder.`,
+  },
+};
+
+const DEFAULT_PRIMARY: PrimaryAction = {
+  label: 'INSTALL',
+  title: 'Installs the file and shows it in its folder.',
+  fallbackWhere: 'the place it belongs',
+  hint: (where) => `INSTALL puts it in ${where} and shows it in its folder.`,
+};
+
+/** The file name Save a copy offers: the installed copy's, else name + format. */
+const copyName = (asset: Asset, installedPath: string | null): string => {
+  if (installedPath) return basenameOf(installedPath);
+  const base = asset.name.replace(/[\\/:*?"<>|]+/g, '').trim() || asset.id;
+  return `${base}${asset.format}`;
+};
+
+const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 interface Rect {
   x: number;
@@ -116,7 +194,12 @@ export const AssetLibraryModal: React.FC<{ open: boolean; onClose: () => void }>
   const [detail, setDetail] = useState<Asset | null>(null);
   const [loading, setLoading] = useState(false);
   const [installing, setInstalling] = useState(false);
+  const [saving, setSaving] = useState(false);
+  // asset id -> installed path. Seeded from the backend's installed_path, so it
+  // holds installs from earlier sessions too.
   const [installed, setInstalled] = useState<Record<string, string>>({});
+  // Bumped after an install so the open detail is read again.
+  const [detailRev, setDetailRev] = useState(0);
   const [rect, setRect] = useState<Rect>(initialRect);
   // The gesture in flight. A ref, not state: it changes on every pointermove
   // and nothing renders from it.
@@ -165,6 +248,26 @@ export const AssetLibraryModal: React.FC<{ open: boolean; onClose: () => void }>
     if (el.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
   }, []);
 
+  /** Take the backend's word on what is installed. A row without the field
+   *  leaves the map alone; a null path means the copy is gone. */
+  const mergeInstalled = useCallback((rows: Asset[]) => {
+    setInstalled((prev) => {
+      let next = prev;
+      for (const a of rows) {
+        if (a.installed_path === undefined) continue;
+        if (a.installed_path) {
+          if (next[a.id] === a.installed_path) continue;
+          if (next === prev) next = { ...prev };
+          next[a.id] = a.installed_path;
+        } else if (a.id in next) {
+          if (next === prev) next = { ...prev };
+          delete next[a.id];
+        }
+      }
+      return next;
+    });
+  }, []);
+
   const load = useCallback(async () => {
     setLoading(true);
     try {
@@ -173,16 +276,17 @@ export const AssetLibraryModal: React.FC<{ open: boolean; onClose: () => void }>
       if (kind) params.set('kind', kind);
       if (tab) params.set('tab', tab);
       const r = await fetch(`/api/assets?${params.toString()}`);
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw new Error(await describeHttpError(r));
       const j = (await r.json()) as { assets: Asset[] };
       setAssets(j.assets);
+      mergeInstalled(j.assets);
     } catch (e) {
-      logError('assets', `Could not read the asset catalog: ${e instanceof Error ? e.message : String(e)}`);
+      logError('assets', `Could not read the asset catalog: ${errText(e)}`);
       setAssets([]);
     } finally {
       setLoading(false);
     }
-  }, [query, kind, tab]);
+  }, [query, kind, tab, mergeInstalled]);
 
   useEffect(() => {
     if (!open) return;
@@ -212,13 +316,15 @@ export const AssetLibraryModal: React.FC<{ open: boolean; onClose: () => void }>
     void fetch(`/api/assets/${encodeURIComponent(selectedId)}`)
       .then((r) => (r.ok ? r.json() : null))
       .then((j) => {
-        if (!cancelled && j) setDetail(j as Asset);
+        if (cancelled || !j) return;
+        setDetail(j as Asset);
+        mergeInstalled([j as Asset]);
       })
       .catch(() => undefined);
     return () => {
       cancelled = true;
     };
-  }, [selectedId]);
+  }, [selectedId, detailRev, mergeInstalled]);
 
   useEffect(() => {
     if (!open) return;
@@ -229,14 +335,24 @@ export const AssetLibraryModal: React.FC<{ open: boolean; onClose: () => void }>
     return () => window.removeEventListener('keydown', onKey);
   }, [open, onClose]);
 
+  const reveal = useCallback(async (path: string) => {
+    try {
+      await placesApi.reveal(path);
+    } catch (e) {
+      const msg = errText(e);
+      logError('assets', `Could not show ${path} in its folder: ${msg}`);
+      useStatusBarStore.getState().setText(`SHOW IN FOLDER FAILED: ${msg}`);
+    }
+  }, []);
+
   /**
    * One button, one outcome: the item ends up usable.
    *
-   * A project is installed and then opened on the EDIT timeline, because
-   * installing a project and leaving the user to find the file is not getting
-   * the project. Installing the same item twice returns the copy already on
-   * disk rather than writing a second one. Plugins and scenes land where their
-   * format belongs and the panel says where.
+   * The install puts the file where its format belongs and answers with the
+   * path it wrote. That path is then opened where the item is used: a project on
+   * the EDIT timeline, a plugin in the MIX effect stage, a scene in the SWAY
+   * cockpit. A volumetric capture has no viewer here, so its folder is shown.
+   * Installing the same item twice returns the copy already on disk.
    */
   const get = useCallback(
     async (asset: Asset) => {
@@ -245,8 +361,8 @@ export const AssetLibraryModal: React.FC<{ open: boolean; onClose: () => void }>
         const r = await fetch(`/api/assets/${encodeURIComponent(asset.id)}/install`, {
           method: 'POST',
         });
-        if (!r.ok) throw new Error(await r.text());
-        const j = (await r.json()) as { path: string; where: string; already?: boolean };
+        if (!r.ok) throw new Error(await describeHttpError(r));
+        const j = (await r.json()) as InstallResult;
         setInstalled((prev) => ({ ...prev, [asset.id]: j.path }));
         logInfo(
           'assets',
@@ -254,23 +370,67 @@ export const AssetLibraryModal: React.FC<{ open: boolean; onClose: () => void }>
             ? `${asset.name} was already installed at ${j.path}`
             : `Installed ${asset.name} to ${j.path}`,
         );
-        if (asset.kind === 'project') {
+        // Read the list and the detail again, so the installed path shown is the
+        // backend's and is still there after a reload.
+        void load();
+        setDetailRev((n) => n + 1);
+
+        const assetKind = j.kind || asset.kind;
+        if (assetKind === 'project') {
           onClose();
           await useProjectStore.getState().loadPath(j.path);
+        } else if (assetKind === 'plugin') {
+          // An installed .gan is stored as <manifest id>.gan.
+          const pluginId = j.plugin_id || basenameOf(j.path).replace(/\.gan$/i, '');
+          const gan = useGanStore.getState();
+          await gan.refresh();
+          // A focused module or Magenta tool outranks a plugin on the stage.
+          const stage = useMixStageStore.getState();
+          stage.setActiveModuleId(null);
+          stage.setActiveMagentaId(null);
+          // openById marks the plugin active before its first await, so MIX
+          // mounts with it already open.
+          const opening = useGanStore.getState().openById(pluginId);
+          useAppUiStore.getState().setCenterTab('mix');
+          onClose();
+          await opening;
+        } else if (assetKind === 'scene') {
+          const stem = basenameOf(j.path).replace(/\.sway$/i, '');
+          if (await openSwayScene(stem)) onClose();
+        } else {
+          await reveal(j.path);
         }
       } catch (e) {
-        logError('assets', `Could not get ${asset.name}: ${e instanceof Error ? e.message : String(e)}`);
+        logError('assets', `Could not get ${asset.name}: ${errText(e)}`);
+        useStatusBarStore.getState().setText(`INSTALL FAILED: ${errText(e)}`);
       } finally {
         setInstalling(false);
       }
     },
-    [onClose],
+    [onClose, load, reveal],
   );
+
+  const saveCopy = useCallback(async (asset: Asset, installedPath: string | null) => {
+    const suggestedName = copyName(asset, installedPath);
+    setSaving(true);
+    try {
+      await saveFile({
+        url: asset.download_url,
+        suggestedName,
+        kind: kindForName(suggestedName),
+        title: `Save a copy of ${asset.name}`,
+      });
+    } finally {
+      setSaving(false);
+    }
+  }, []);
 
   const selected = useMemo(
     () => detail ?? assets.find((a) => a.id === selectedId) ?? null,
     [detail, assets, selectedId],
   );
+  const selectedPath = selected ? (installed[selected.id] ?? null) : null;
+  const action = selected ? (PRIMARY[selected.kind] ?? DEFAULT_PRIMARY) : DEFAULT_PRIMARY;
 
   if (!open) return null;
 
@@ -442,40 +602,50 @@ export const AssetLibraryModal: React.FC<{ open: boolean; onClose: () => void }>
                 </div>
               )}
 
-              <div className="mt-3 flex items-center gap-1.5">
+              <div className="mt-3 flex flex-wrap items-center gap-1.5">
                 <button
                   type="button"
                   onClick={() => void get(selected)}
                   disabled={installing || !selected.available}
-                  title={
-                    selected.kind === 'project'
-                      ? 'Install it and open it on the EDIT timeline'
-                      : `Install it into ${selected.installs_to ?? 'the place it belongs'}`
-                  }
+                  title={action.title}
                   className="btn-primary flex items-center gap-1 text-[9px] disabled:opacity-40"
                 >
                   {installing ? <Loader2 className="h-3 w-3 animate-spin" /> : <Check className="h-3 w-3" />}
-                  {selected.kind === 'project' ? 'OPEN' : 'INSTALL'}
+                  {action.label}
                 </button>
-                <a
-                  href={selected.download_url}
-                  download
-                  title="Save the file somewhere else"
-                  aria-label={`Save ${selected.name} as a file`}
-                  className="btn-ghost flex items-center gap-1 text-[9px]"
+                {selectedPath && isLocalClient() && (
+                  <button
+                    type="button"
+                    onClick={() => void reveal(selectedPath)}
+                    title="Shows the installed file in its folder."
+                    className="btn-ghost flex items-center gap-1 text-[9px]"
+                  >
+                    <FolderOpen className="h-3 w-3 text-purple-300" />
+                    Show in folder
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => void saveCopy(selected, selectedPath)}
+                  disabled={saving || !selected.available}
+                  title="Saves a copy of the file to a folder you choose."
+                  className="btn-ghost flex items-center gap-1 text-[9px] disabled:opacity-40"
                 >
-                  <Download className="h-3 w-3 text-purple-300" />
-                </a>
+                  {saving ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    <Download className="h-3 w-3 text-purple-300" />
+                  )}
+                  Save a copy
+                </button>
               </div>
 
               <p className="mt-2 text-[9px] font-mono leading-relaxed text-zinc-500">
-                {selected.kind === 'project'
-                  ? `OPEN puts it in ${selected.installs_to ?? 'your projects folder'} and opens it on the timeline.`
-                  : `INSTALL puts it in ${selected.installs_to ?? 'the place it belongs'}.`}
+                {action.hint(selected.installs_to ?? action.fallbackWhere)}
               </p>
-              {installed[selected.id] && (
-                <p className="mt-1 text-[9px] font-mono text-emerald-300">
-                  On disk at {installed[selected.id]}
+              {selectedPath && (
+                <p className="mt-1 break-all text-[9px] font-mono text-emerald-300">
+                  On disk at {selectedPath}
                 </p>
               )}
             </aside>

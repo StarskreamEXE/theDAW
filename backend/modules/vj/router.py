@@ -26,6 +26,8 @@ from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
+from backend.lib import known_paths
+
 from . import export, sidecar
 
 log = logging.getLogger(__name__)
@@ -272,6 +274,9 @@ def post_export(
             pass
 
     log.info("vj.export: wrote %s (%s)", out_path, codec_key)
+    # The take is a file the app wrote, so a picker for videos (or zips, for a
+    # PNG sequence) opens beside it and a Recent menu can hand it back.
+    known_paths.record(out_path, source="save")
     return {
         "ok": True,
         "path": str(out_path),

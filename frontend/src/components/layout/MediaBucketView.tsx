@@ -6,9 +6,10 @@ import { useLibraryStore } from '../../state/libraryStore';
 import { logError, logInfo } from '../../state/logStore';
 import { addBlobsToChimera } from '../../lib/chimeraClient';
 import { setAudioDragData } from '../../lib/audioDnD';
-import { AUDIO_ACCEPT, hasAudioExt } from '../../lib/fileFilters';
+import { AUDIO_ACCEPT, AUDIO_EXTS, hasAudioExt } from '../../lib/fileFilters';
 import { useAppUiStore } from '../../state/appUiStore';
 import { ContextMenu, useContextMenu, type ContextMenuItem } from '../ui/ContextMenu';
+import { KnownFilesMenu } from '../ui/KnownFilesMenu';
 
 const fmtSize = (b: number): string => {
   if (b >= 1024 * 1024) return `${(b / 1024 / 1024).toFixed(1)} MB`;
@@ -24,6 +25,14 @@ const isAudio = (mime: string, name: string): boolean =>
 // listed one by one because `audio/*` alone loses the files the OS hands over
 // with an empty mime type — a float .wav from another DAW, a .caf, a .w64.
 const BUCKET_ACCEPT = `${AUDIO_ACCEPT},.mid,.midi,image/*,video/*`;
+
+// The same set as extensions, for the Recent menu (it matches by extension).
+const BUCKET_EXTS = [
+  ...AUDIO_EXTS.map((e) => `.${e}`),
+  '.mid', '.midi',
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.avif',
+  '.mp4', '.mov', '.mkv', '.m4v', '.avi', '.ogv', '.webm',
+];
 
 export const MediaBucketView: React.FC = () => {
   const items = useMediaBucketStore((s) => s.items);
@@ -236,6 +245,7 @@ export const MediaBucketView: React.FC = () => {
               <FolderPlus className="w-3 h-3 text-purple-300" /> ADD FILES
             </span>
           </label>
+          <KnownFilesMenu id="media-bucket-recent-files" exts={BUCKET_EXTS} onFiles={addMany} />
           {items.length > 0 && (
             <button onClick={clear} className="btn-ghost text-[9px] py-1 flex items-center gap-1.5" title="Empty the bucket">
               <Trash2 className="w-3 h-3" /> CLEAR

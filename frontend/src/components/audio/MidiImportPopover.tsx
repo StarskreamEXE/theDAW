@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Upload, FolderOpen, Search, Star, Music, FileMusic } from 'lucide-react';
 import { sendMidiIdToTarget } from '../../lib/sendToTargets';
 import { SHEET_ACCEPT } from '../../lib/sheetImportClient';
+import { KnownFilesMenu } from '../ui/KnownFilesMenu';
 import {
   cachedLibraryMidi,
   loadLibraryMidi,
@@ -9,9 +10,24 @@ import {
   type LibraryMidiRow as MidiRow,
 } from '../../lib/libraryIndex';
 
+const MIDI_ACCEPT_LIST = '.mid,.midi,audio/midi';
+const MIDI_RECENT_ID = 'piano-roll-import-midi-recent';
+const SHEET_RECENT_ID = 'piano-roll-import-sheet-recent';
+// KnownFilesMenu drops the mime entries, so the accept lists pass as they are.
+const MIDI_RECENT_EXTS = MIDI_ACCEPT_LIST.split(',');
+const SHEET_RECENT_EXTS = SHEET_ACCEPT.split(',');
+
+/** True while one of the popover's Recent lists is open. Those lists portal to
+ *  document.body, so a click on one of their rows lands outside the popover. */
+const recentListOpen = (): boolean =>
+  [MIDI_RECENT_ID, SHEET_RECENT_ID].some(
+    (id) => document.getElementById(id)?.getAttribute('aria-expanded') === 'true',
+  );
+
 /**
- * IMPORT MIDI control for the Piano Roll. One popover, two sources:
+ * IMPORT MIDI control for the Piano Roll. One popover, three sources:
  *   - "From file…" opens the OS file picker (hidden <input type=file>).
+ *   - "Recent" lists MIDI and sheet files the app saved or downloaded.
  *   - the library list loads any converted MIDI straight into the roll.
  */
 export const MidiImportPopover: React.FC<{
@@ -24,6 +40,7 @@ export const MidiImportPopover: React.FC<{
   const [loading, setLoading] = useState(false);
   const [query, setQuery] = useState('');
   const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const sheetRef = useRef<HTMLInputElement>(null);
 
@@ -47,10 +64,12 @@ export const MidiImportPopover: React.FC<{
     if (open && midis === null && !loading) void loadMidis();
   }, [open, midis, loading, loadMidis]);
 
-  // Close on outside click + Escape.
+  // Close on outside click + Escape. An open Recent list closes first: it
+  // takes Escape in the capture phase, and its own outside click closes it.
   useEffect(() => {
     if (!open) return;
     const onDown = (e: MouseEvent) => {
+      if (recentListOpen()) return;
       if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
     };
     const onKey = (e: KeyboardEvent) => {
@@ -80,25 +99,43 @@ export const MidiImportPopover: React.FC<{
     setOpen(false);
   };
 
+  // One handler per source kind, fed by the file input and the Recent list alike.
+  const importMidiFiles = (files: File[]) => {
+    const f = files[0];
+    if (f) onImportFile(f);
+    setOpen(false);
+    triggerRef.current?.focus();
+  };
+
+  const importSheetFiles = (files: File[]) => {
+    const f = files[0];
+    if (f && onImportSheetFile) onImportSheetFile(f);
+    setOpen(false);
+    triggerRef.current?.focus();
+  };
+
   return (
     <div className="relative" ref={rootRef}>
       {/* Hidden OS file picker, triggered by "From file…". */}
+      <label htmlFor="piano-roll-import-midi" className="sr-only">MIDI file to import</label>
       <input
         ref={fileRef}
         type="file"
         id="piano-roll-import-midi"
         name="piano-roll-import-midi"
-        accept=".mid,.midi,audio/midi"
+        accept={MIDI_ACCEPT_LIST}
         className="hidden"
         onChange={(e) => {
-          const f = e.target.files?.[0];
-          if (f) onImportFile(f);
+          const files = Array.from(e.target.files ?? []);
           e.target.value = '';
-          setOpen(false);
+          importMidiFiles(files);
         }}
       />
 
       {/* Hidden picker for notation files (parsed on the backend via music21). */}
+      {onImportSheetFile && (
+        <label htmlFor="piano-roll-import-sheet" className="sr-only">Sheet music file to import</label>
+      )}
       {onImportSheetFile && (
         <input
           ref={sheetRef}
@@ -108,18 +145,18 @@ export const MidiImportPopover: React.FC<{
           accept={SHEET_ACCEPT}
           className="hidden"
           onChange={(e) => {
-            const f = e.target.files?.[0];
-            if (f) onImportSheetFile(f);
+            const files = Array.from(e.target.files ?? []);
             e.target.value = '';
-            setOpen(false);
+            importSheetFiles(files);
           }}
         />
       )}
 
       <button
+        ref={triggerRef}
         type="button"
         onClick={() => setOpen((v) => !v)}
-        aria-haspopup="menu"
+        aria-haspopup="dialog"
         aria-expanded={open}
         aria-controls="piano-roll-import-popover"
         className="btn-ghost text-[9px] py-1 flex items-center gap-1.5"
@@ -131,29 +168,35 @@ export const MidiImportPopover: React.FC<{
       {open && (
         <div
           id="piano-roll-import-popover"
-          role="menu"
+          role="dialog"
           aria-label="Import MIDI"
           className="absolute right-0 top-full mt-1 z-50 w-72 bg-[#0a080f] border border-white/10 rounded-lg shadow-[0_8px_32px_rgba(0,0,0,0.75)] p-2 flex flex-col gap-2"
         >
-          <button
-            type="button"
-            onClick={() => fileRef.current?.click()}
-            className="w-full flex items-center gap-2 px-2 py-1.5 rounded bg-white/3 hover:bg-white/8 border border-white/10 text-[10px] text-zinc-200 transition-colors"
-          >
-            <FolderOpen className="w-3.5 h-3.5 text-purple-300 shrink-0" />
-            MIDI file on disk…
-          </button>
-
-          {onImportSheetFile && (
+          <div className="flex items-stretch gap-1">
             <button
               type="button"
-              onClick={() => sheetRef.current?.click()}
-              className="w-full flex items-center gap-2 px-2 py-1.5 rounded bg-white/3 hover:bg-white/8 border border-white/10 text-[10px] text-zinc-200 transition-colors"
-              title="Import a notation file: MusicXML, ABC, or Humdrum kern"
+              onClick={() => fileRef.current?.click()}
+              className="flex-1 min-w-0 flex items-center gap-2 px-2 py-1.5 rounded bg-white/3 hover:bg-white/8 border border-white/10 text-[10px] text-zinc-200 transition-colors"
             >
-              <FileMusic className="w-3.5 h-3.5 text-emerald-300 shrink-0" />
-              Sheet music (MusicXML / ABC)…
+              <FolderOpen className="w-3.5 h-3.5 text-purple-300 shrink-0" />
+              MIDI file on disk…
             </button>
+            <KnownFilesMenu id={MIDI_RECENT_ID} exts={MIDI_RECENT_EXTS} label="Recent MIDI" onFiles={importMidiFiles} />
+          </div>
+
+          {onImportSheetFile && (
+            <div className="flex items-stretch gap-1">
+              <button
+                type="button"
+                onClick={() => sheetRef.current?.click()}
+                className="flex-1 min-w-0 flex items-center gap-2 px-2 py-1.5 rounded bg-white/3 hover:bg-white/8 border border-white/10 text-left text-[10px] text-zinc-200 transition-colors"
+                title="Import a notation file: MusicXML, ABC, or Humdrum kern"
+              >
+                <FileMusic className="w-3.5 h-3.5 text-emerald-300 shrink-0" />
+                Sheet music (MusicXML / ABC)…
+              </button>
+              <KnownFilesMenu id={SHEET_RECENT_ID} exts={SHEET_RECENT_EXTS} label="Recent sheets" onFiles={importSheetFiles} />
+            </div>
           )}
 
           <div className="flex items-center gap-1.5 px-1 pt-0.5">
@@ -191,7 +234,6 @@ export const MidiImportPopover: React.FC<{
                 <button
                   key={m.id}
                   type="button"
-                  role="menuitem"
                   onClick={() => pickLibraryMidi(m)}
                   className="w-full flex items-center gap-2 px-2 py-1 rounded hover:bg-purple-500/15 text-left transition-colors group"
                   title={`Load "${rowLabel(m)}" into the piano roll`}

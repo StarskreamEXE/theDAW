@@ -26,7 +26,8 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { FolderPlus, Library, Loader2, Pause, Play, Search, Send, Star, Volume2, Wand2 } from 'lucide-react';
 import { CoverArt } from '../../catalog/CoverArt';
 import { ContextMenu, useContextMenu, type ContextMenuItem } from '../ui/ContextMenu';
-import { AUDIO_ACCEPT } from '../../lib/fileFilters';
+import { AUDIO_ACCEPT, AUDIO_EXTS } from '../../lib/fileFilters';
+import { KnownFilesMenu } from '../ui/KnownFilesMenu';
 import { importAudioFiles, isAudioFile, type AudioImportOrigin } from '../../lib/importAudioFiles';
 import {
   DESKTOP_DROP_ORIGIN,
@@ -50,6 +51,7 @@ import { logError, logInfo, logWarn } from '../../state/logStore';
 const FILTER_ID = 'details-library-filter';
 const SORT_ID = 'details-library-sort';
 const IMPORT_ID = 'details-library-import-files';
+const RECENT_AUDIO_EXTS = [...AUDIO_EXTS];
 
 const PICKER_ORIGIN: AudioImportOrigin = {
   prompt: 'Imported from the details library',
@@ -262,14 +264,22 @@ export const DetailsLibraryPane: React.FC = () => {
             if (files.length > 0) void importFiles(files, PICKER_ORIGIN);
           }}
         />
-        <button
-          type="button"
-          onClick={() => fileInputRef.current?.click()}
-          className="btn-ghost text-[9px] py-1 flex items-center gap-1.5 shrink-0"
-          title="Import audio files into the library — or drop them anywhere in this list"
-        >
-          <FolderPlus className="w-3 h-3 text-purple-300" aria-hidden="true" /> IMPORT
-        </button>
+        <div className="flex items-center gap-1.5 shrink-0">
+          <KnownFilesMenu
+            id="details-library-recent-audio"
+            exts={RECENT_AUDIO_EXTS}
+            label="Recent"
+            onFiles={(files) => void importFiles(files, PICKER_ORIGIN)}
+          />
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            className="btn-ghost text-[9px] py-1 flex items-center gap-1.5 shrink-0"
+            title="Import audio files into the library — or drop them anywhere in this list"
+          >
+            <FolderPlus className="w-3 h-3 text-purple-300" aria-hidden="true" /> IMPORT
+          </button>
+        </div>
       </div>
 
       {/* Filter + sort. The filter is local to this pane, so the column always

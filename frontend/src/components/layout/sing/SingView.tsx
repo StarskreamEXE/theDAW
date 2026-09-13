@@ -16,11 +16,24 @@ import { useLibraryStore } from '../../../state/libraryStore';
 import { useLyricAnalysisStore } from '../../../state/lyricAnalysisStore';
 import { SING_LANGUAGES, useLyricsStore } from '../../../state/lyricsStore';
 import { lyricsExportUrl } from '../../../lib/lyricsClient';
+import { saveFile } from '../../../lib/saveFile';
+import { KnownFilesMenu } from '../../ui/KnownFilesMenu';
 import { usePlayAlong } from '../score/playAlong/usePlayAlongClock';
 import { LyricsScroller, type LyricsScrollerHandle } from './LyricsScroller';
 import { LyricsEditor } from './LyricsEditor';
 
 const PitchLane = React.lazy(() => import('./PitchLane'));
+
+const LYRICS_RECENT_EXTS = ['.lrc', '.txt'];
+
+/** The export's file name, slugged the way backend/modules/lyrics/service.py
+ *  names the download. */
+const lyricsFileName = (title: string, ext: 'lrc' | 'txt'): string => {
+  const cleaned = Array.from(title || '', (c) => (/[\p{L}\p{N} _-]/u.test(c) ? c : '_')).join('');
+  const slug = cleaned.split(/\s+/).filter(Boolean).join('_').replace(/^[_-]+|[_-]+$/g, '');
+  // 60 code points, the way Python slices the string.
+  return `${Array.from(slug).slice(0, 60).join('') || 'lyrics'}.${ext}`;
+};
 
 const SOURCE_LABELS: Record<string, string> = {
   '': 'untimed',
@@ -163,7 +176,9 @@ export const SingView: React.FC = () => {
     setImportOpen(false);
   };
 
-  const onImportFile = async (file: File | undefined) => {
+  // Fed by the file input and the Recent list alike.
+  const onImportFiles = async (files: File[]) => {
+    const file = files[0];
     if (!file) return;
     const text = await file.text();
     const fmt: 'lrc' | 'txt' = /\.lrc$/i.test(file.name) || /^\s*\[\d{1,2}:\d{2}/m.test(text) ? 'lrc' : 'txt';
@@ -254,19 +269,28 @@ export const SingView: React.FC = () => {
           <Upload className="w-3 h-3" /> IMPORT
         </button>
         <span className="relative">
-          <button type="button" className="btn-ghost text-[8px] py-1 px-1.5 flex items-center gap-1 disabled:opacity-40" onClick={() => setExportOpen((v) => !v)} disabled={!hasText} aria-haspopup="menu" aria-expanded={exportOpen} aria-controls="sing-export-menu" title="Download the lyrics as LRC or TXT">
+          <button type="button" className="btn-ghost text-[8px] py-1 px-1.5 flex items-center gap-1 disabled:opacity-40" onClick={() => setExportOpen((v) => !v)} disabled={!hasText} aria-haspopup="menu" aria-expanded={exportOpen} aria-controls="sing-export-menu" title="Save the lyrics as an LRC or TXT file.">
             <Download className="w-3 h-3" /> EXPORT
           </button>
           {exportOpen && (
             <div id="sing-export-menu" role="menu" className="absolute right-0 top-full mt-1 z-20 min-w-36 rounded border border-white/10 bg-[#0a080f] p-1 shadow-xl">
               {([
-                ['LRC', lyricsExportUrl(entry.id, 'lrc', false)],
-                ['LRC + word tags', lyricsExportUrl(entry.id, 'lrc', true)],
-                ['TXT', lyricsExportUrl(entry.id, 'txt', false)],
-              ] as Array<[string, string]>).map(([label, href]) => (
-                <a key={label} role="menuitem" href={href} download className="block rounded px-2 py-1 text-[9px] hover:bg-white/10" onClick={() => setExportOpen(false)}>
+                ['LRC', lyricsExportUrl(entry.id, 'lrc', false), 'lrc'],
+                ['LRC + word tags', lyricsExportUrl(entry.id, 'lrc', true), 'lrc'],
+                ['TXT', lyricsExportUrl(entry.id, 'txt', false), 'txt'],
+              ] as Array<[string, string, 'lrc' | 'txt']>).map(([label, url, ext]) => (
+                <button
+                  key={label}
+                  type="button"
+                  role="menuitem"
+                  className="block w-full text-left rounded px-2 py-1 text-[9px] hover:bg-white/10"
+                  onClick={() => {
+                    setExportOpen(false);
+                    void saveFile({ url, suggestedName: lyricsFileName(entry.title, ext), kind: 'lyrics' });
+                  }}
+                >
                   {label}
-                </a>
+                </button>
               ))}
             </div>
           )}
@@ -349,7 +373,8 @@ export const SingView: React.FC = () => {
             <label htmlFor="sing-import-fmt-txt">TXT</label>
             <button type="button" className="btn-ghost text-[8px] py-1 px-2 border border-rose-500/40 text-rose-200" onClick={() => void applyImport()} disabled={!importDraft.trim()}>IMPORT PASTED</button>
             <label htmlFor="sing-import-file" className="text-zinc-500">or a file</label>
-            <input id="sing-import-file" name="sing-import-file" type="file" accept=".lrc,.txt" className="text-[9px]" onChange={(e) => void onImportFile(e.target.files?.[0])} />
+            <input id="sing-import-file" name="sing-import-file" type="file" accept=".lrc,.txt" className="text-[9px]" onChange={(e) => void onImportFiles(Array.from(e.target.files ?? []))} />
+            <KnownFilesMenu id="sing-import-recent" exts={LYRICS_RECENT_EXTS} label="Recent lyrics" onFiles={(files) => void onImportFiles(files)} />
             <button type="button" className="btn-ghost text-[8px] py-1 px-2 ml-auto" onClick={() => setImportOpen(false)}>CLOSE</button>
           </div>
         </div>

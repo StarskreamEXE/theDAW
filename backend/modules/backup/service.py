@@ -5,8 +5,8 @@ All user-data roots worth backing up are enumerated by :func:`user_data_roots`:
 - ``library``  — ``data/generations`` (or ``theDAW_GENERATIONS_DIR``): audio,
   ``library.db`` (entries + genealogy/lineage relations), spectrograms, and the
   per-entry ``stems/``, ``midi/`` and ``notation/`` subfolders.
-- ``projects`` — the default ``~/Documents/theDAW Projects`` folder where
-  ``.tasmo`` files are saved out of the box.
+- ``projects`` — the projects folder ``.tasmo`` files are saved into
+  (``known_paths.projects_dir()``, ``~/Documents/theDAW Projects`` by default).
 - ``settings`` — the top-level ``data/*.json`` registries (``settings.json``,
   ``local_checkpoints.json``, ``recent_projects.json``).
 
@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Optional
-from backend.lib import paths
+from backend.lib import known_paths, paths
 
 log = logging.getLogger(__name__)
 
@@ -95,7 +95,9 @@ def user_data_roots() -> list[RootSpec]:
         RootSpec(
             id="projects",
             label="Projects (.tasmo)",
-            path=Path.home() / "Documents" / "theDAW Projects",
+            # The folder projects are saved and installed into, wherever the
+            # user has moved it.
+            path=known_paths.projects_dir(),
             kind="dir",
         ),
         RootSpec(
@@ -245,7 +247,12 @@ def start_export(dest_dir: Optional[str], include: Optional[list[str]]) -> str:
             raise ValueError(f"unknown root ids: {', '.join(unknown)}")
         if not include:
             raise ValueError("include list is empty — nothing to export")
-    dest = Path(dest_dir).expanduser() if dest_dir else Path.home() / "Documents"
+    if dest_dir:
+        dest = Path(dest_dir).expanduser()
+    else:
+        # The folder the last backup went to, else Documents.
+        last = known_paths.last_folder("backup-dest")
+        dest = Path(last) if last else Path.home() / "Documents"
     try:
         dest.mkdir(parents=True, exist_ok=True)
     except OSError as e:
@@ -313,6 +320,11 @@ def _run_export(job: _Job, dest: Path, include: Optional[list[str]]) -> None:
                 with _jobs_lock:
                     job.bytes_written = written
                     job.progress = written / total if total else 1.0
+        # Remembered before the job reports done, so a client that reads the
+        # recent backups as soon as it sees 'done' finds this zip. Both calls
+        # swallow their own IO errors.
+        known_paths.record(zip_path, "backup-zip", source="backup")
+        known_paths.record_folder("backup-dest", dest)
         with _jobs_lock:
             job.zip_path = str(zip_path)
             job.bytes_written = written
@@ -361,6 +373,9 @@ def validate_backup_zip(zip_path: str) -> Path:
 def start_import(zip_path: str, mode: str) -> str:
     """Validate the archive, spawn the restore worker, return the job id."""
     p = validate_backup_zip(zip_path)
+    # The path came from the request body, so it is remembered as 'client': the
+    # next restore can offer it, and it never becomes servable by this route.
+    known_paths.record(p, "backup-zip", source="client")
     job = _register_job("import")
     with _jobs_lock:
         job.zip_path = str(p)
@@ -377,6 +392,10 @@ def start_import(zip_path: str, mode: str) -> str:
 def _run_import(job: _Job, zip_path: Path, mode: str) -> None:
     try:
         roots_by_id = {s.id: s for s in user_data_roots()}
+        # The archive's projects land in the folder in use now. The settings
+        # root can restore a known_paths.json whose projects folder is on
+        # another machine; that setting is put back to this folder below.
+        projects_before = roots_by_id["projects"].path
         written = 0
         processed = 0
         with zipfile.ZipFile(zip_path) as zf:
@@ -427,6 +446,15 @@ def _run_import(job: _Job, zip_path: Path, mode: str) -> None:
                 with _jobs_lock:
                     job.bytes_written = written
                     job.progress = processed / total
+        restored_projects = known_paths.projects_dir()
+        if restored_projects != projects_before and not restored_projects.is_dir():
+            log.info(
+                "backup: restored projects folder %s is not on this machine; "
+                "keeping %s",
+                restored_projects,
+                projects_before,
+            )
+            known_paths.set_projects_dir(projects_before)
         with _jobs_lock:
             job.bytes_written = written
             job.progress = 1.0

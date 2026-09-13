@@ -7,8 +7,9 @@ import {
   type TasmoProjectLoaded,
   type TasmoTrackInput,
 } from '../lib/projectClient';
+import { placesApi } from '../lib/placesClient';
 import type { PerformRoutingSnapshot } from './performRouting';
-import { logError, logInfo } from './logStore';
+import { logError, logInfo, logWarn } from './logStore';
 import { useStatusBarStore } from './statusBarStore';
 import { useEditorStore } from './editorStore';
 import {
@@ -64,12 +65,53 @@ interface ProjectState {
 }
 
 const PROJECTS_DIR_KEY = 'thedaw-projects-dir';
-const readDefaultDir = (): string => {
+// Set once this browser's folder has reached the backend. From then on the
+// backend's projects folder is the one every client and asset install uses.
+const PROJECTS_DIR_SYNCED_KEY = 'thedaw-projects-dir-synced';
+
+const readLocal = (key: string): string => {
   try {
-    return localStorage.getItem(PROJECTS_DIR_KEY) || '';
+    return localStorage.getItem(key) || '';
   } catch {
     return '';
   }
+};
+
+const writeLocal = (key: string, value: string) => {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    /* ignore — non-persistent fallback */
+  }
+};
+
+const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+// A drive or UNC path, or a POSIX root. The backend refuses a relative folder.
+const looksAbsolute = (p: string) => /^(?:[a-zA-Z]:[\\/]|[\\/])/.test(p);
+
+const applyDefaultDir = (dir: string) => {
+  writeLocal(PROJECTS_DIR_KEY, dir);
+  useProjectStore.setState({ defaultDir: dir });
+};
+
+// The folder field calls setDefaultDir on every keystroke; only the value the
+// user stops on is sent to the backend.
+const PUSH_DELAY_MS = 600;
+let pushTimer: ReturnType<typeof setTimeout> | null = null;
+
+const pushProjectsDir = (dir: string) => {
+  if (pushTimer) clearTimeout(pushTimer);
+  pushTimer = null;
+  const target = dir.trim();
+  if (!target || !looksAbsolute(target)) return;
+  pushTimer = setTimeout(() => {
+    pushTimer = null;
+    placesApi.setProjectsDir(target).then(
+      () => writeLocal(PROJECTS_DIR_SYNCED_KEY, '1'),
+      (e: unknown) => logWarn('project', `Projects folder ${target} was not stored: ${errMsg(e)}`),
+    );
+  }, PUSH_DELAY_MS);
 };
 
 const status = (text: string) => useStatusBarStore.getState().setText(text);
@@ -94,7 +136,7 @@ export const useProjectStore = create<ProjectState>()((set, get) => ({
   openPath: '',
   loaded: null,
 
-  defaultDir: readDefaultDir(),
+  defaultDir: readLocal(PROJECTS_DIR_KEY),
 
   open: (tab = 'save', seed) => {
     if (seed) {
@@ -125,22 +167,52 @@ export const useProjectStore = create<ProjectState>()((set, get) => ({
   setOpenPath: (openPath) => set({ openPath, error: null }),
 
   setDefaultDir: (defaultDir) => {
-    try {
-      localStorage.setItem(PROJECTS_DIR_KEY, defaultDir);
-    } catch {
-      /* ignore — non-persistent fallback */
-    }
-    set({ defaultDir });
+    applyDefaultDir(defaultDir);
+    pushProjectsDir(defaultDir);
   },
 
+  // The backend holds the projects folder, so asset installs and every client
+  // use the same one. A folder this browser chose before the backend kept one
+  // is handed over once; after that the backend's folder is shown here.
   ensureDefaultDir: async () => {
-    if (get().defaultDir.trim()) return;
+    const before = get().defaultDir;
+    let backendDir: string;
     try {
-      const res = await projectApi.defaultDir();
-      if (res?.path && !get().defaultDir.trim()) get().setDefaultDir(res.path);
+      backendDir = (await placesApi.projectsDir()).trim();
     } catch {
-      /* no backend default available */
+      // A backend without /api/places: keep this browser's folder, or take the
+      // project module's default.
+      if (get().defaultDir.trim()) return;
+      try {
+        const res = await projectApi.defaultDir();
+        if (res?.path && !get().defaultDir.trim()) applyDefaultDir(res.path);
+      } catch {
+        /* no backend default available */
+      }
+      return;
     }
+    // The user changed the folder while the request ran; that edit is the one
+    // on its way to the backend.
+    if (get().defaultDir !== before || pushTimer) return;
+    const localDir = before.trim();
+    if (
+      localDir &&
+      localDir !== backendDir &&
+      looksAbsolute(localDir) &&
+      !readLocal(PROJECTS_DIR_SYNCED_KEY)
+    ) {
+      try {
+        const stored = await placesApi.setProjectsDir(localDir);
+        writeLocal(PROJECTS_DIR_SYNCED_KEY, '1');
+        if (get().defaultDir === before) applyDefaultDir(stored);
+      } catch (e) {
+        // Keep this browser's folder and try again the next time it is needed.
+        logWarn('project', `Projects folder ${localDir} was not stored: ${errMsg(e)}`);
+      }
+      return;
+    }
+    writeLocal(PROJECTS_DIR_SYNCED_KEY, '1');
+    if (backendDir && backendDir !== before) applyDefaultDir(backendDir);
   },
 
   // Prefill the save path from the default folder + project name, so the user can

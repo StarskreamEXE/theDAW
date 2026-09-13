@@ -19,6 +19,8 @@ This module also owns two glue duties the embedded cockpit needs:
   localStorage plus a browser download; the staged bundle additionally mirrors
   each save to ``POST /api/sway/project-save`` so a real ``.sway`` file lands
   in ``data/sway-projects`` and survives cleared browser storage.
+  ``GET /api/sway/project`` reads one back by name, which is how theDAW opens
+  a scene it installed.
 """
 
 from __future__ import annotations
@@ -26,14 +28,16 @@ from __future__ import annotations
 import json
 import logging
 import re
+from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from backend.modules.project import media_access
 
 from . import sidecar
-from backend.lib import paths
+from backend.lib import known_paths, paths
+from backend.lib.atomic import atomic_write
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -141,20 +145,53 @@ class SwayProjectSave(BaseModel):
     doc: dict
 
 
+def _project_file(name: str, fallback: str | None) -> Path:
+    """The .sway file ``name`` names inside data/sway-projects.
+
+    Everything but word characters, spaces, hyphens and dots is dropped, so a
+    name carries no separator. A name that sanitizes to nothing becomes
+    ``fallback``, or is refused when there is none. The resolved file must sit
+    directly in the projects folder, which also refuses a Windows device name.
+    """
+    safe = re.sub(r"[^\w \-.]+", "", name).strip().strip(".")
+    if not safe:
+        if fallback is None:
+            raise HTTPException(400, f"Invalid project name: {name}")
+        safe = fallback
+    if not safe.lower().endswith(".sway"):
+        safe += ".sway"
+    root = _PROJECTS_DIR.resolve()
+    target = (root / safe).resolve()
+    if target.parent != root:
+        raise HTTPException(400, f"Invalid project name: {name}")
+    return target
+
+
+def _listed_scene(name: str) -> Path | None:
+    """The .sway file in data/sway-projects whose stem is exactly ``name``.
+
+    Only names of files already in the folder can match, so nothing in
+    ``name`` can point outside it."""
+    stem = name[: -len(".sway")] if name.lower().endswith(".sway") else name
+    if not stem or not _PROJECTS_DIR.is_dir():
+        return None
+    for p in _PROJECTS_DIR.glob("*.sway"):
+        if p.stem == stem and p.is_file():
+            return p.resolve()
+    return None
+
+
 @router.post("/project-save")
 async def sway_project_save(req: SwayProjectSave) -> dict:
     """Persist a cockpit save as a real .sway file under data/sway-projects."""
-    safe = re.sub(r"[^\w \-.]+", "", req.name).strip().strip(".") or "untitled"
-    if not safe.lower().endswith(".sway"):
-        safe += ".sway"
     _PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
-    target = (_PROJECTS_DIR / safe).resolve()
-    if not str(target).startswith(str(_PROJECTS_DIR.resolve())):
-        raise HTTPException(400, f"Invalid project name: {req.name}")
+    target = _project_file(req.name, fallback="untitled")
     try:
-        target.write_text(json.dumps(req.doc, indent=2), encoding="utf-8")
+        # Atomic, because GET /project may read this file while a save lands.
+        atomic_write(target, json.dumps(req.doc, indent=2))
     except OSError as e:
         raise HTTPException(500, f"Save failed: {e}")
+    known_paths.record(target, kind="sway", source="sway-save")
     # Deliberately does NOT call media_access.register_paths(req.doc's media).
     # The server binds 0.0.0.0 with permissive CORS, so this body is
     # attacker-reachable; registering paths from it would turn a save into
@@ -163,6 +200,25 @@ async def sway_project_save(req: SwayProjectSave) -> dict:
     # allowlisted when the user opened the project, so playback is unaffected.
     # If a path genuinely is not reachable, add it as a media root instead.
     return {"status": "ok", "path": str(target)}
+
+
+@router.get("/project")
+def sway_project(
+    name: str = Query(..., description="the scene's file stem, as /projects lists"),
+) -> dict:
+    """One saved .sway scene, read back by name so theDAW can hand it to the
+    cockpit. 404 when no scene has that name, 400 when the name is not one.
+
+    A name /projects lists is matched exactly first, so a file whose name holds
+    characters a save would drop (an install's "Scene (2).sway") still opens."""
+    target = _listed_scene(name) or _project_file(name, fallback=None)
+    if not target.is_file():
+        raise HTTPException(404, f"No saved scene named {name}")
+    try:
+        doc = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise HTTPException(500, f"Could not read {target.name}: {e}")
+    return {"name": target.stem, "path": str(target), "doc": doc}
 
 
 @router.get("/projects")

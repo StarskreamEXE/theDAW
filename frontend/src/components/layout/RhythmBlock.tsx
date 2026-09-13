@@ -14,6 +14,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Activity, Download, Loader2, Waves } from 'lucide-react';
 import { logError, logInfo } from '../../state/logStore';
+import { saveFile } from '../../lib/saveFile';
 
 interface MeterSegment {
   start_sec: number;
@@ -75,15 +76,8 @@ const fmtTime = (sec: number): string => {
   return `${m}:${String(s).padStart(2, '0')}`;
 };
 
-const download = (name: string, text: string, mime: string): void => {
-  const url = URL.createObjectURL(new Blob([text], { type: mime }));
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = name;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+const saveText = (name: string, text: string, mime: string): void => {
+  void saveFile({ blob: new Blob([text], { type: mime }), suggestedName: name });
 };
 
 const safeName = (s: string): string =>
@@ -206,16 +200,16 @@ export const RhythmBlock: React.FC<{
           {result && (
             <>
               <button
-                onClick={() => download(`${safeName(title)} - meter map.json`, JSON.stringify(result, null, 2), 'application/json')}
+                onClick={() => saveText(`${safeName(title)} - meter map.json`, JSON.stringify(result, null, 2), 'application/json')}
                 className="btn-ghost text-[8px] py-0.5 flex items-center gap-1"
-                title="Download the full map, tempo curve, beats and downbeats as JSON"
+                title="Save the full map, tempo curve, beats and downbeats as JSON"
               >
                 <Download className="w-3 h-3 text-fuchsia-300" /> JSON
               </button>
               <button
-                onClick={() => download(`${safeName(title)} - meter map.md`, rhythmMarkdown(title, result, analysis), 'text/markdown')}
+                onClick={() => saveText(`${safeName(title)} - meter map.md`, rhythmMarkdown(title, result, analysis), 'text/markdown')}
                 className="btn-ghost text-[8px] py-0.5 flex items-center gap-1"
-                title="Download the map, key and tempo as a readable report"
+                title="Save the map, key and tempo as a readable report"
               >
                 <Download className="w-3 h-3 text-fuchsia-300" /> REPORT
               </button>

@@ -12,8 +12,6 @@ import hashlib
 import logging
 import os
 import shutil
-import subprocess
-import sys
 import threading
 from uuid import uuid4
 from email.utils import formatdate, parsedate_to_datetime
@@ -26,7 +24,8 @@ from pydantic import BaseModel
 from backend.core.startup import register_startup_hook
 from backend.modules.plugin.gan_file import GanFile
 from backend.modules.plugin.owl_import import import_vst_foundry, source_fingerprint
-from backend.lib import paths
+from backend.lib import known_paths, paths
+from backend.lib import reveal as reveal_lib
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +57,28 @@ _ARES_PROJECT = (
 
 def _gan_path(plugin_id: str) -> Path:
     return GAN_DIR / f"{plugin_id}.gan"
+
+
+def _plugin_id_ok(plugin_id: object) -> bool:
+    """True for an id that names one file in GAN_DIR and one runtime folder.
+
+    Ids arrive in request bodies, URL segments and the manifests inside .gan
+    files, and each is joined onto GAN_DIR and RUNTIME_DIR. ``..``, ``.``, a
+    separator or a drive colon would point those joins at another folder, and
+    delete_plugin removes the runtime folder it is given.
+    """
+    return (
+        isinstance(plugin_id, str)
+        and bool(plugin_id.strip())
+        and plugin_id not in {".", ".."}
+        and not any(ch in plugin_id for ch in "/\\:\x00")
+    )
+
+
+def _require_plugin_id(plugin_id: object) -> str:
+    if not _plugin_id_ok(plugin_id):
+        raise HTTPException(400, f"Invalid plugin id: {plugin_id!r}")
+    return str(plugin_id)
 
 
 # Every write to an extracted runtime goes through this. Three endpoints and
@@ -191,10 +212,12 @@ def import_owl(req: ImportOwlRequest) -> dict:
     except (ValueError, KeyError) as e:
         raise HTTPException(400, f"Import failed: {e}")
 
+    _require_plugin_id(manifest.id)
     GAN_DIR.mkdir(parents=True, exist_ok=True)
     gan_path = _gan_path(manifest.id)
     manifest_dict = GanFile.save(manifest, assets, str(gan_path))
     _publish_runtime(gan_path, manifest.id)
+    known_paths.record(gan_path, kind="gan", source="gan")
 
     return {
         "manifest": manifest_dict,
@@ -248,10 +271,16 @@ def plugin_info(path: str) -> dict:
 @router.post("/open")
 def open_plugin(req: OpenRequest) -> dict:
     """Open an installed plugin by id, or install+open a .gan at a path.
-    Returns the manifest + entry URL ready to iframe."""
+    Returns the manifest, the entry URL ready to iframe, and the installed
+    .gan's path."""
     if req.id:
-        manifest = _ensure_runtime(req.id)
-        return {"manifest": manifest, "entry_url": _entry_url(req.id, manifest)}
+        pid = _require_plugin_id(req.id)
+        manifest = _ensure_runtime(pid)
+        return {
+            "manifest": manifest,
+            "entry_url": _entry_url(pid, manifest),
+            "gan_path": str(_gan_path(pid)),
+        }
 
     if req.path:
         src = Path(req.path)
@@ -261,14 +290,19 @@ def open_plugin(req: OpenRequest) -> dict:
             manifest = GanFile.info(req.path)
         except ValueError as e:
             raise HTTPException(400, str(e))
-        pid = manifest.get("id") or src.stem
+        pid = _require_plugin_id(manifest.get("id") or src.stem)
         # Install a copy into the library if it is not already there.
         GAN_DIR.mkdir(parents=True, exist_ok=True)
         dest = _gan_path(pid)
         if src.resolve() != dest.resolve():
             GanFile.install(str(src), str(dest))
         _publish_runtime(dest, pid)
-        return {"manifest": manifest, "entry_url": _entry_url(pid, manifest)}
+        known_paths.record(dest, kind="gan", source="gan")
+        return {
+            "manifest": manifest,
+            "entry_url": _entry_url(pid, manifest),
+            "gan_path": str(dest),
+        }
 
     raise HTTPException(400, "Provide an id or a path.")
 
@@ -349,25 +383,19 @@ class RevealRequest(BaseModel):
 @router.post("/reveal")
 def reveal_path(req: RevealRequest) -> dict:
     """Reveal a file in the OS file manager (Explorer/Finder), selecting it."""
-    p = Path(req.path)
-    if not p.exists():
-        raise HTTPException(404, f"Not found: {req.path}")
-    plat: str = sys.platform
     try:
-        if plat == "win32":
-            subprocess.Popen(["explorer", f"/select,{p}"])
-        elif plat == "darwin":
-            subprocess.Popen(["open", "-R", str(p)])
-        else:
-            subprocess.Popen(["xdg-open", str(p.parent)])
+        shown = reveal_lib.reveal(req.path)
+    except FileNotFoundError:
+        raise HTTPException(404, f"Not found: {req.path}")
     except OSError as e:
         raise HTTPException(500, f"Reveal failed: {e}")
-    return {"status": "ok", "path": str(p)}
+    return {"status": "ok", "path": shown}
 
 
 @router.delete("/{plugin_id}")
 def delete_plugin(plugin_id: str) -> dict:
     """Remove an installed plugin and its extracted runtime."""
+    _require_plugin_id(plugin_id)
     gan = _gan_path(plugin_id)
     removed = False
     if gan.is_file():
@@ -407,6 +435,8 @@ def serve_runtime(plugin_id: str, asset_path: str, request: Request) -> Response
     a surface is near-instant while a repackaged runtime still shows up at once
     (its mtime/etag change, so the revalidation returns the new body).
     """
+    if not _plugin_id_ok(plugin_id):
+        raise HTTPException(404, "Asset not found")
     # Only extract when the runtime dir is missing: reading the .gan's manifest
     # for every one of a surface's ~25 asset requests bought nothing.
     if not (_runtime_dir(plugin_id) / "index.html").is_file():

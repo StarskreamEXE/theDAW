@@ -66,6 +66,7 @@ import { useFeatureToggleStore } from './state/featureToggleStore';
 import { useGanStore } from './state/ganStore';
 import { useProjectStore } from './state/projectStore';
 import { useAppUiStore } from './state/appUiStore';
+import { placesApi } from './lib/placesClient';
 
 import './orb-kit/styles/gantasmo-orb.css';
 import './orb-kit/chat/orb-chat.css';
@@ -448,6 +449,32 @@ export default function App() {
       } else if (lower.endsWith('.tasmo')) {
         void useProjectStore.getState().loadPath(filePath);
         useAppUiStore.getState().setCenterTab('mix');
+      }
+    });
+  }, []);
+
+  // Desktop downloads: the Electron main process reports each finished download
+  // with the path it was saved to. The path goes to the status bar and into
+  // known places, so the next import control offers the file.
+  useEffect(() => {
+    const api = (window as unknown as {
+      electronAPI?: {
+        onDownloadDone?: (
+          cb: (info: { path: string | null; filename: string; state: string }) => void,
+        ) => () => void;
+      };
+    }).electronAPI;
+    if (!api?.onDownloadDone) return;
+    return api.onDownloadDone(({ path, filename, state }) => {
+      if (state === 'completed' && path) {
+        useStatusBarStore.getState().setText(`DOWNLOADED: ${path}`);
+        logInfo('files', `Downloaded ${filename} to ${path}`);
+        // The main process records the path as well. Recording it from here
+        // too means the refetch this triggers already sees it, whichever of the
+        // two requests lands first.
+        void placesApi.record(path);
+      } else {
+        logWarn('files', `Download ${state}: ${filename}`);
       }
     });
   }, []);

@@ -6,12 +6,18 @@ run in an STA, out-of-process so it can never block or corrupt the FastAPI
 server's threads. Falls back to tkinter elsewhere (best effort).
 
 Returns the chosen absolute path, or ``None`` when the user cancels / no GUI
-is available.
+is available. ``picker_available`` tells a caller beforehand whether a dialog
+can open at all, so it can answer "no picker here" apart from a cancel.
+
+PowerShell writes the chosen path as UTF-8 and it is decoded as UTF-8, so a
+folder with accented or non-Latin characters comes back intact.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 import subprocess
 import sys
 from typing import Optional
@@ -21,6 +27,52 @@ log = logging.getLogger(__name__)
 # A blocking native dialog can sit open for a long time while the user
 # navigates; give them a generous window before we give up on it.
 _DIALOG_TIMEOUT_SEC = 600.0
+
+# First statement of every PowerShell dialog script. Without it the path is
+# written in the console code page and a non-ASCII name arrives garbled.
+_PS_UTF8 = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8;"
+
+
+def picker_available() -> bool:
+    """Whether this machine can show a native dialog: PowerShell on Windows,
+    tkinter elsewhere, and on Linux a display for it to open on."""
+    if sys.platform == "win32":
+        return shutil.which("powershell.exe") is not None
+    if sys.platform != "darwin" and not (
+        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    ):
+        return False
+    try:
+        import tkinter  # noqa: F401
+    except Exception:  # noqa: BLE001 — headless / no Tk available
+        return False
+    return True
+
+
+def _run_powershell(script: list[str], what: str) -> Optional[str]:
+    """Run a dialog script in an STA PowerShell and return what it printed."""
+    cmd = [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-STA",
+        "-Command",
+        " ".join([_PS_UTF8, *script]),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_DIALOG_TIMEOUT_SEC,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning("folder_dialog: PowerShell %s failed: %s", what, e)
+        return None
+    path = (proc.stdout or "").strip().lstrip("\ufeff")
+    return path or None
 
 
 def pick_folder(
@@ -107,23 +159,7 @@ def _pick_save_windows(
         "if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($f.FileName) }"
         "$owner.Dispose();"
     )
-    cmd = [
-        "powershell.exe",
-        "-NoProfile",
-        "-NonInteractive",
-        "-STA",
-        "-Command",
-        " ".join(script),
-    ]
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=_DIALOG_TIMEOUT_SEC
-        )
-    except (OSError, subprocess.TimeoutExpired) as e:
-        log.warning("folder_dialog: PowerShell save picker failed: %s", e)
-        return None
-    path = (proc.stdout or "").strip()
-    return path or None
+    return _run_powershell(script, "save picker")
 
 
 def _parse_filetypes(filter_spec: Optional[str]) -> list[tuple[str, str]]:
@@ -188,23 +224,7 @@ def _pick_folder_windows(title: str, initial: Optional[str]) -> Optional[str]:
         "if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($f.SelectedPath) }"
         "$owner.Dispose();"
     )
-    cmd = [
-        "powershell.exe",
-        "-NoProfile",
-        "-NonInteractive",
-        "-STA",
-        "-Command",
-        " ".join(script),
-    ]
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=_DIALOG_TIMEOUT_SEC
-        )
-    except (OSError, subprocess.TimeoutExpired) as e:
-        log.warning("folder_dialog: PowerShell picker failed: %s", e)
-        return None
-    path = (proc.stdout or "").strip()
-    return path or None
+    return _run_powershell(script, "folder picker")
 
 
 def _pick_folder_tk(title: str, initial: Optional[str]) -> Optional[str]:
@@ -249,23 +269,7 @@ def _pick_open_windows(
         "if ($r -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($f.FileName) }"
         "$owner.Dispose();"
     )
-    cmd = [
-        "powershell.exe",
-        "-NoProfile",
-        "-NonInteractive",
-        "-STA",
-        "-Command",
-        " ".join(script),
-    ]
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=_DIALOG_TIMEOUT_SEC
-        )
-    except (OSError, subprocess.TimeoutExpired) as e:
-        log.warning("folder_dialog: PowerShell open picker failed: %s", e)
-        return None
-    path = (proc.stdout or "").strip()
-    return path or None
+    return _run_powershell(script, "open picker")
 
 
 def _pick_open_tk(

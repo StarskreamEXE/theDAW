@@ -13,6 +13,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from backend.lib import known_paths
 from backend.modules.project import media_access
 
 log = logging.getLogger(__name__)
@@ -60,7 +61,22 @@ def _finish_import(project, source_path: str) -> dict:
             ),
         ]
     )
-    return project.to_dict()
+    result = project.to_dict()
+    _remember_source(source_path)
+    return result
+
+
+def _remember_source(source_path: str) -> None:
+    """Remember the project file an import read, so the next import picker
+    opens in its folder and a Recent menu can offer it again.
+
+    Only a path with a DAW project extension is remembered. The path comes from
+    the request body and a remembered project is servable from
+    /api/places/file, so a lenient parser (an XML format, say) accepting some
+    other file must not make that file downloadable.
+    """
+    if known_paths.kind_for_path(source_path) == "daw-project":
+        known_paths.record(source_path, kind="daw-project", source="project")
 
 
 @router.post("/detect", response_model=DetectResponse)

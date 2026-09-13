@@ -34,7 +34,11 @@ import { fetchCheckpoints, setLocalOnly, type RegisteredCheckpoint } from '../li
 import { classifyModelGate } from '../lib/modelDownloadClient';
 import { requireFeature } from '../notices/featureGateStore';
 import { logError, logInfo, logWarn } from '../state/logStore';
+import { KnownFilesMenu } from '../components/ui/KnownFilesMenu';
+import { AUDIO_EXTS } from '../lib/fileFilters';
 import '../components/layout/track-controls.css';
+
+const RECENT_AUDIO_EXTS = [...AUDIO_EXTS];
 
 /* Local rather than in RICH_TOOLTIPS because the depth choice only makes sense
    next to the format one — the two rules it has to state (FLAC stops at 24,
@@ -170,7 +174,7 @@ function TemplatesPanel() {
       </div>
       <div className="flex items-center gap-1 mb-1.5">
         <Search className="w-3 h-3 text-zinc-600 shrink-0" />
-        <input name="gen-template-search" className="compact-input flex-1 text-[9px]" placeholder="Search templates..." value={searchQuery}
+        <input id="gen-template-search" name="gen-template-search" aria-label="Search templates" className="compact-input flex-1 text-[9px]" placeholder="Search templates..." value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)} />
       </div>
       <div className="overflow-y-auto min-h-0 flex-1">
@@ -714,8 +718,8 @@ export const AdvancedGenPanel: React.FC<{
             {!isMagenta && (
               <>
                 <div className="flex items-center gap-1 shrink-0">
-                  <span className="text-[9px] text-zinc-400">Type</span>
-                  <select name="gen-init-type" className="compact-input h-5 py-0 text-[9px] w-20" value={p.initType} onChange={(e) => sf('initType', e.target.value)} style={{ colorScheme: 'dark' }}>
+                  <label htmlFor="gen-init-type" className="text-[9px] text-zinc-400">Type</label>
+                  <select id="gen-init-type" name="gen-init-type" className="compact-input h-5 py-0 text-[9px] w-20" value={p.initType} onChange={(e) => sf('initType', e.target.value)} style={{ colorScheme: 'dark' }}>
                     <option value="Audio">Audio</option><option value="RF-Inversion">RF-Inv</option>
                   </select>
                 </div>
@@ -727,16 +731,22 @@ export const AdvancedGenPanel: React.FC<{
                 </div>
               </>
             )}
-            <button onClick={() => sf('initAudioEnabled', !p.initAudioEnabled)}
+            <button type="button" onClick={() => sf('initAudioEnabled', !p.initAudioEnabled)}
+              aria-pressed={p.initAudioEnabled} aria-label="Use init audio"
               className={`mono-tag cursor-pointer shrink-0 ${p.initAudioEnabled ? 'bg-purple-600/30 text-purple-200 border-purple-500/50' : ''}`}>
               {p.initAudioEnabled ? 'ON' : 'OFF'}
             </button>
             {p.initAudioFile ? (
-              <button className="btn-ghost cursor-pointer shrink-0" onClick={() => patch({ initAudioFile: null, initAudioEnabled: false })}><X className="w-3 h-3" /></button>
+              <button type="button" aria-label="Remove the init audio" className="btn-ghost cursor-pointer shrink-0" onClick={() => patch({ initAudioFile: null, initAudioEnabled: false })}><X className="w-3 h-3" /></button>
             ) : (
-              <button className="btn-ghost cursor-pointer text-[9px] shrink-0" onClick={() => initRef.current?.click()}>LOAD</button>
+              <>
+                <KnownFilesMenu id="gen-init-audio-recent" exts={RECENT_AUDIO_EXTS}
+                  onFiles={(files) => { if (files[0]) patch({ initAudioFile: files[0], initAudioEnabled: true }); }} />
+                <button type="button" className="btn-ghost cursor-pointer text-[9px] shrink-0" onClick={() => initRef.current?.click()}>LOAD</button>
+              </>
             )}
-            <input ref={initRef} name="gen-init-audio-file" type="file" accept="audio/*" multiple className="hidden"
+            <label htmlFor="gen-init-audio-file" className="sr-only">Init audio file</label>
+            <input ref={initRef} id="gen-init-audio-file" name="gen-init-audio-file" type="file" accept="audio/*" multiple className="hidden"
               onChange={async (e) => {
                 const files = Array.from(e.target.files ?? []);
                 e.target.value = '';
@@ -762,16 +772,22 @@ export const AdvancedGenPanel: React.FC<{
             <span className={`${subTitle} flex items-center gap-1`}>INPAINT <InfoTip {...RICH_TOOLTIPS.inpainting} /></span>
             <span className="text-[9px] text-purple-200 truncate flex-1 min-w-0">{p.inpaintAudioFile ? p.inpaintAudioFile.name : 'drop audio / load'}</span>
             {p.inpaintAudioFile && <span className="text-[9px] font-mono text-purple-300/80 shrink-0">{p.maskStart.toFixed(1)}–{p.maskEnd.toFixed(1)}s</span>}
-            <button onClick={() => sf('inpaintEnabled', !p.inpaintEnabled)}
+            <button type="button" onClick={() => sf('inpaintEnabled', !p.inpaintEnabled)}
+              aria-pressed={p.inpaintEnabled} aria-label="Use inpaint audio"
               className={`mono-tag cursor-pointer shrink-0 ${p.inpaintEnabled ? 'bg-purple-600/30 text-purple-200 border-purple-500/50' : ''}`}>
               {p.inpaintEnabled ? 'ON' : 'OFF'}
             </button>
             {p.inpaintAudioFile ? (
-              <button className="btn-ghost cursor-pointer shrink-0" onClick={() => patch({ inpaintAudioFile: null, inpaintEnabled: false, maskStart: 0, maskEnd: 0 })}><X className="w-3 h-3" /></button>
+              <button type="button" aria-label="Remove the inpaint audio" className="btn-ghost cursor-pointer shrink-0" onClick={() => patch({ inpaintAudioFile: null, inpaintEnabled: false, maskStart: 0, maskEnd: 0 })}><X className="w-3 h-3" /></button>
             ) : (
-              <button className="btn-ghost cursor-pointer text-[9px] shrink-0" onClick={() => inpaintRef.current?.click()}>LOAD</button>
+              <>
+                <KnownFilesMenu id="gen-inpaint-audio-recent" exts={RECENT_AUDIO_EXTS}
+                  onFiles={(files) => { if (files[0]) patch({ inpaintAudioFile: files[0], inpaintEnabled: true, maskStart: 0, maskEnd: 0 }); }} />
+                <button type="button" className="btn-ghost cursor-pointer text-[9px] shrink-0" onClick={() => inpaintRef.current?.click()}>LOAD</button>
+              </>
             )}
-            <input ref={inpaintRef} name="gen-inpaint-audio-file" type="file" accept="audio/*" className="hidden"
+            <label htmlFor="gen-inpaint-audio-file" className="sr-only">Inpaint audio file</label>
+            <input ref={inpaintRef} id="gen-inpaint-audio-file" name="gen-inpaint-audio-file" type="file" accept="audio/*" className="hidden"
               onChange={(e) => { if (e.target.files?.[0]) patch({ inpaintAudioFile: e.target.files[0], inpaintEnabled: true, maskStart: 0, maskEnd: 0 }); e.target.value = ''; }} />
           </div>
           <div className="flex-1 min-h-0 rounded overflow-hidden border border-white/5 bg-black/40">
@@ -922,8 +938,8 @@ export const AdvancedGenPanel: React.FC<{
               <SlideRow label="Length (s)" value={p.duration} onChange={(v) => sf('duration', v)} min={0.5} max={512} step={0.5} tipKey="duration" />
               {isMagenta ? (
                 <div className="flex items-center gap-2">
-                  <span className="text-[11px] text-zinc-300 w-16 shrink-0 whitespace-nowrap">Drums</span>
-                  <select name="gen-mag-drums" className="compact-input flex-1" value={p.magDrums} onChange={(e) => sf('magDrums', +e.target.value)} style={{ colorScheme: 'dark' }}>
+                  <label htmlFor="gen-mag-drums" className="text-[11px] text-zinc-300 w-16 shrink-0 whitespace-nowrap">Drums</label>
+                  <select id="gen-mag-drums" name="gen-mag-drums" className="compact-input flex-1" value={p.magDrums} onChange={(e) => sf('magDrums', +e.target.value)} style={{ colorScheme: 'dark' }}>
                     <option value={-1}>Auto</option>
                     <option value={0}>Off</option>
                     <option value={1}>On</option>
@@ -937,9 +953,9 @@ export const AdvancedGenPanel: React.FC<{
                     onRandomize={() => sf('seed', Math.floor(Math.random() * 2147483647))} />
                   {/* Batch — value field aligned (flush right) with the SlideRows above */}
                   <div className="flex items-center gap-2">
-                    <span className="text-[11px] text-zinc-300 w-16 shrink-0 whitespace-nowrap">Batch</span>
+                    <label htmlFor="gen-batch" className="text-[11px] text-zinc-300 w-16 shrink-0 whitespace-nowrap">Batch</label>
                     <div className="flex-1 min-w-0" />
-                    <input name="gen-batch" type="number" className="compact-input w-11 text-center tabular-nums shrink-0" min={1} max={16} step={1} value={p.batch} onChange={(e) => sf('batch', +e.target.value || 1)} />
+                    <input id="gen-batch" name="gen-batch" type="number" className="compact-input w-11 text-center tabular-nums shrink-0" min={1} max={16} step={1} value={p.batch} onChange={(e) => sf('batch', +e.target.value || 1)} />
                   </div>
                 </>
               )}
@@ -977,7 +993,7 @@ export const AdvancedGenPanel: React.FC<{
               </div>
               <div className="border-t border-white/8 mt-0.5 pt-1 flex items-center gap-1.5 shrink-0">
                 <span className={`${subTitle} shrink-0`}>SAMPLER</span>
-                <select name="gen-sampler" className="compact-input flex-1 h-6 py-0 text-[9px]" value={p.samplerType} onChange={(e) => sf('samplerType', e.target.value)} style={{ colorScheme: 'dark' }}>
+                <select id="gen-sampler" name="gen-sampler" aria-label="Sampler" className="compact-input flex-1 h-6 py-0 text-[9px]" value={p.samplerType} onChange={(e) => sf('samplerType', e.target.value)} style={{ colorScheme: 'dark' }}>
                   <option value="pingpong">pingpong</option><option value="euler">euler</option>
                   <option value="rk4">rk4</option><option value="dpmpp">dpmpp</option>
                 </select>
@@ -1129,7 +1145,7 @@ export const AdvancedGenPanel: React.FC<{
                           inp.click();
                         }}>Choose file…</button>
                       )}
-                      <input name={`gen-lora-weight-${i}`} type="number" className="compact-input w-10 text-center text-[9px]" value={lora.weight} step={0.05} min={0} max={2}
+                      <input id={`gen-lora-weight-${i}`} name={`gen-lora-weight-${i}`} aria-label={`LoRA ${i + 1} weight`} type="number" className="compact-input w-10 text-center text-[9px]" value={lora.weight} step={0.05} min={0} max={2}
                         onChange={(e) => { const u = p.loras.map((l, idx) => idx === i ? { ...l, weight: +e.target.value } : l); sf('loras', u); }} />
                       <button className="text-zinc-500 hover:text-red-400 cursor-pointer" onClick={() => sf('loras', p.loras.filter((_, idx) => idx !== i))}><X className="w-3 h-3" /></button>
                     </div>
@@ -1141,7 +1157,7 @@ export const AdvancedGenPanel: React.FC<{
             {/* NAME — name your outputs (below LoRA) */}
             <div className="hardware-card flex flex-col shrink-0 gap-1">
               <span className={`${sectionTitle} flex items-center gap-1`}>NAME</span>
-              <input name="gen-output-name" className="compact-input w-full" placeholder="name your output…" maxLength={80}
+              <input id="gen-output-name" name="gen-output-name" aria-label="Output name" className="compact-input w-full" placeholder="name your output…" maxLength={80}
                 value={p.outputName} onChange={(e) => sf('outputName', e.target.value)} />
             </div>
 
@@ -1289,8 +1305,8 @@ export const AdvancedGenPanel: React.FC<{
           </div>
           {isMagenta ? (
             <div className="shrink-0 flex items-center gap-2">
-              <span className="text-[10px] text-zinc-400 shrink-0">Seed</span>
-              <input name="gen-mag-seed" type="number" className="compact-input w-24 text-center tabular-nums" min={-1} max={2147483647} step={1}
+              <label htmlFor="gen-mag-seed" className="text-[10px] text-zinc-400 shrink-0">Seed</label>
+              <input id="gen-mag-seed" name="gen-mag-seed" type="number" className="compact-input w-24 text-center tabular-nums" min={-1} max={2147483647} step={1}
                 value={p.magSeed} onChange={(e) => sf('magSeed', Math.floor(+e.target.value))}
                 title="Seed — same seed + same prompt reads the style identically. -1 = fresh each run." />
               <button className="btn-ghost cursor-pointer p-1 text-zinc-500 hover:text-purple-300" title="Lock a random seed"
@@ -1305,7 +1321,7 @@ export const AdvancedGenPanel: React.FC<{
             </div>
           ) : (
           <div className="shrink-0 flex items-start gap-1">
-            <textarea name="gen-negative-prompt" className="compact-input flex-1 min-w-0 resize-none h-9"
+            <textarea id="gen-negative-prompt" name="gen-negative-prompt" aria-label="Negative prompt" className="compact-input flex-1 min-w-0 resize-none h-9"
               placeholder="negative: vocals, distortion, harshness…"
               value={p.negativePrompt} onChange={(e) => sf('negativePrompt', e.target.value)} maxLength={500} />
             <div className="shrink-0 flex items-center gap-1 pt-1">
