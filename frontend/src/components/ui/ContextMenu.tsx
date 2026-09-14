@@ -22,8 +22,10 @@
  * anywhere else all close the menu. Items run `onSelect` then the menu
  * auto-closes — callers don't need to remember to call `onClose`.
  */
-import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { resolveEditThemeVars } from '../../lib/editThemes';
+import { useEditThemeStore } from '../../state/editThemeStore';
 
 /**
  * Anchor coords for a right-click menu. The Shell scales the DAW with CSS
@@ -80,6 +82,18 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({
   minWidth = '12rem',
 }) => {
   const menuRef = useRef<HTMLDivElement | null>(null);
+  // The menu portals to <body>, outside the Shell's `.edit-theme-scope`, so it
+  // carries its own scope: the theme's popup surface, lines and ink tiers reach
+  // it the same way they reach the rest of the app. `--et-root-bg` is left off
+  // because the scope wrapper paints no box, and on the custom-image theme that
+  // value is the whole image as a data URL.
+  const editThemeId = useEditThemeStore((s) => s.themeId);
+  const editThemeImage = useEditThemeStore((s) => s.customImage);
+  const editTheme = useMemo(() => {
+    const { vars, light } = resolveEditThemeVars(editThemeId, editThemeImage);
+    const scopeVars = Object.fromEntries(Object.entries(vars).filter(([name]) => name !== '--et-root-bg'));
+    return { vars: scopeVars, light };
+  }, [editThemeId, editThemeImage]);
   // After mount we measure the menu and nudge its position so it stays
   // inside the viewport — anchoring to (clientX, clientY) without this
   // would overflow on right-edge / bottom-edge clicks.
@@ -158,6 +172,13 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({
   const pos = adjusted ?? { x: -9999, y: -9999 };
 
   return createPortal(
+    // `contents`: the scope wrapper lays out and paints nothing; it only hands
+    // the theme's variables and remaps down to the menu.
+    <div
+      className="edit-theme-scope contents"
+      data-et-light={editTheme.light ? '1' : undefined}
+      style={editTheme.vars as React.CSSProperties}
+    >
     <div
       ref={menuRef}
       role="menu"
@@ -175,8 +196,11 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({
         e.stopPropagation();
       }}
     >
+      {/* Title, headers and hints are 8px, so they take the theme's secondary
+          ink (--et-ink-2), which each theme holds at 4.5:1 or better on its
+          popup surface. */}
       {title && (
-        <div className="px-3 py-1.5 text-[8px] uppercase tracking-widest text-zinc-600 border-b border-white/5 mb-0.5 truncate">
+        <div className="px-3 py-1.5 text-[8px] uppercase tracking-widest et-ink-2 border-b border-white/5 mb-0.5 truncate">
           {title}
         </div>
       )}
@@ -188,7 +212,7 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({
           return (
             <div
               key={idx}
-              className="px-3 py-1 text-[8px] uppercase tracking-widest text-zinc-600"
+              className="px-3 py-1 text-[8px] uppercase tracking-widest et-ink-2"
             >
               {item.label}
             </div>
@@ -197,6 +221,8 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({
         const itemColor = item.danger
           ? 'text-red-300 hover:bg-red-500/20'
           : 'text-purple-200 hover:bg-purple-500/15';
+        // A disabled row dims its icon and label only. The hint is the row's
+        // stated reason ("nothing copied"), so it stays at full ink.
         return (
           <button
             key={idx}
@@ -205,20 +231,21 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({
             disabled={item.disabled}
             title={item.title}
             onClick={() => handleItemClick(item)}
-            className={`w-full text-left px-3 py-1.5 flex items-center justify-between gap-3 disabled:opacity-40 disabled:pointer-events-none ${itemColor}`}
+            className={`w-full text-left px-3 py-1.5 flex items-center justify-between gap-3 disabled:pointer-events-none ${itemColor}`}
           >
-            <span className="flex items-center gap-1.5 min-w-0">
+            <span className={`flex items-center gap-1.5 min-w-0${item.disabled ? ' opacity-40' : ''}`}>
               {item.icon ? <span className="shrink-0">{item.icon}</span> : null}
               <span className="truncate">{item.label}</span>
             </span>
             {item.hint != null && (
-              <span className="shrink-0 text-zinc-600 text-[8px] normal-case">
+              <span className="shrink-0 et-ink-2 text-[8px] normal-case">
                 {item.hint}
               </span>
             )}
           </button>
         );
       })}
+    </div>
     </div>,
     document.body,
   );
