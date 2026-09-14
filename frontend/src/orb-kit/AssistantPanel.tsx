@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
-import { X, Send, Sparkles, Bot, User, Loader2, Command, Play, Zap, KeyRound, RefreshCw, Trash2, Minimize2, Maximize2, Copy, Square, Paperclip, Mic, MicOff, FileText, Image as ImageIcon, Music, Film } from 'lucide-react';
+import { X, Send, Sparkles, Bot, User, Loader2, Command, Play, Zap, KeyRound, RefreshCw, Trash2, Minimize2, Maximize2, Copy, Square, Paperclip, Mic, MicOff, FileText, Image as ImageIcon, Music, Film, History, Plus } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { ProviderModelSelector, type ModelInfo } from './ProviderModelSelector';
@@ -8,6 +8,16 @@ import { actionFromAssistantEvent, sanitizeAssistantAction, statusFromAssistantE
 import { getToolTier, describeToolCall } from './tool-tiers';
 import { buildtheDAWAppContext } from './appContext';
 import { uuid } from './utils';
+import {
+    loadConversations,
+    upsertConversation,
+    deleteConversation,
+    getConversation,
+    getActiveId,
+    setActiveId,
+    deriveTitle,
+    type StoredConversation,
+} from './chatHistory';
 import { useStatusBarStore } from '../state/statusBarStore';
 import { useAssistantActivityStore } from '../state/assistantActivityStore';
 
@@ -38,7 +48,7 @@ interface AssistantPanelProps {
     orbPosition?: { x: number; y: number };
 }
 
-interface Message {
+export interface Message {
     id: string;
     role: 'user' | 'assistant';
     content: string;
@@ -128,6 +138,17 @@ function readInitialAssistantSelection() {
     }
 }
 
+function timeAgo(ts: number): string {
+    const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+    if (s < 60) return 'just now';
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ago`;
+    const d = Math.floor(h / 24);
+    return `${d}d ago`;
+}
+
 export const AssistantPanel: React.FC<AssistantPanelProps> = ({
     isOpen,
     onClose,
@@ -136,7 +157,15 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
 }) => {
     const isBackendReady = useStatusBarStore((s) => s.isBackendReady);
     const initialAssistantSelection = useMemo(readInitialAssistantSelection, []);
-    const [messages, setMessages] = useState<Message[]>([]);
+    // Chat history: restore the last-active conversation on mount so a reload
+    // or app restart keeps the transcript (persisted to localStorage below).
+    const activeConvIdRef = useRef<string>(getActiveId() || uuid());
+    const [messages, setMessages] = useState<Message[]>(
+        () => getConversation(activeConvIdRef.current)?.messages ?? [],
+    );
+    const [conversations, setConversations] = useState<StoredConversation[]>(() => loadConversations());
+    const [showHistory, setShowHistory] = useState(false);
+    const persistTimerRef = useRef<number | null>(null);
     const [input, setInput] = useState('');
     const [isProcessing, setIsProcessing] = useState(false);
     const [statusText, setStatusText] = useState<string>('');
@@ -156,7 +185,10 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
     const [selectedModel, setSelectedModel] = useState<string>(initialAssistantSelection.model);
     const [claudeMode, setClaudeMode] = useState<string>(initialAssistantSelection.claudeMode);
     const conversationIdRef = useRef<string | null>(
-        (() => { try { return sessionStorage.getItem('thedaw:conversationId'); } catch { return null; } })()
+        (() => {
+            try { const s = sessionStorage.getItem('thedaw:conversationId'); if (s) return s; } catch { /* ignore */ }
+            return getConversation(activeConvIdRef.current)?.sessionId ?? null;
+        })()
     );
     const abortRef = useRef<AbortController | null>(null);
     const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -476,7 +508,28 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
 
     useEffect(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }, [messages]);
+        // Debounced persist of the active conversation. Streaming mutates
+        // `messages` per token, so writes are coalesced to ~half a second.
+        if (messages.length === 0) return;
+        if (persistTimerRef.current) window.clearTimeout(persistTimerRef.current);
+        persistTimerRef.current = window.setTimeout(() => {
+            const existing = getConversation(activeConvIdRef.current);
+            const now = Date.now();
+            const record: StoredConversation = {
+                id: activeConvIdRef.current,
+                title: existing?.title || deriveTitle(messages),
+                messages,
+                provider: selectedProvider,
+                model: selectedModel,
+                claudeMode,
+                sessionId: conversationIdRef.current,
+                createdAt: existing?.createdAt ?? now,
+                updatedAt: now,
+            };
+            setActiveId(activeConvIdRef.current);
+            setConversations(upsertConversation(record));
+        }, 500);
+    }, [messages, selectedProvider, selectedModel, claudeMode]);
 
     const sendMessage = async (text: string) => {
         const pendingAttachments = attachments;
@@ -718,8 +771,35 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
         handleQuickCommand(suggestion);
     };
 
+    // "New chat": the current transcript is already saved by the persist
+    // effect, so this just starts a fresh conversation id with an empty view.
     const handleClearHistory = () => {
         setMessages([]);
+        activeConvIdRef.current = uuid();
+        setActiveId(activeConvIdRef.current);
+        conversationIdRef.current = null;
+        try { sessionStorage.removeItem('thedaw:conversationId'); } catch { /* ignore */ }
+        setShowHistory(false);
+    };
+
+    const resumeConversation = (conv: StoredConversation) => {
+        activeConvIdRef.current = conv.id;
+        setActiveId(conv.id);
+        setMessages(conv.messages);
+        conversationIdRef.current = conv.sessionId;
+        try {
+            if (conv.sessionId) sessionStorage.setItem('thedaw:conversationId', conv.sessionId);
+            else sessionStorage.removeItem('thedaw:conversationId');
+        } catch { /* ignore */ }
+        if (conv.provider) setSelectedProvider(conv.provider);
+        if (conv.model) setSelectedModel(conv.model);
+        if (conv.claudeMode) setClaudeMode(conv.claudeMode);
+        setShowHistory(false);
+    };
+
+    const removeConversation = (id: string) => {
+        setConversations(deleteConversation(id));
+        if (id === activeConvIdRef.current) handleClearHistory();
     };
 
     if (!isOpen) return null;
@@ -803,11 +883,22 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                         <Zap size={14} />
                     </button>
                     <button
+                        onClick={() => setShowHistory((v) => !v)}
+                        className="p-1.5 hover:bg-white/10 rounded-lg transition-colors text-muted hover:text-white"
+                        title="Chat history"
+                        aria-label="Chat history"
+                        aria-expanded={showHistory}
+                        aria-haspopup="true"
+                    >
+                        <History size={14} />
+                    </button>
+                    <button
                         onClick={handleClearHistory}
                         className="p-1.5 hover:bg-white/10 rounded-lg transition-colors text-muted hover:text-white"
-                        title="Clear History"
+                        title="New chat"
+                        aria-label="New chat"
                     >
-                        <Trash2 size={14} />
+                        <Plus size={14} />
                     </button>
                     <button
                         onClick={() => setIsMinimized(true)}
@@ -826,6 +917,50 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                     </button>
                 </div>
             </div>
+
+            {showHistory && (
+                <div className="border-b border-border bg-surface/95 max-h-72 overflow-y-auto custom-scrollbar">
+                    <div className="flex items-center justify-between px-3 py-2 border-b border-white/5">
+                        <span className="text-[10px] font-semibold text-muted uppercase tracking-wide">History</span>
+                        <button
+                            onClick={handleClearHistory}
+                            className="inline-flex items-center gap-1 text-[10px] text-primary hover:text-white transition-colors"
+                            title="Start a new chat"
+                        >
+                            <Plus size={12} /> New chat
+                        </button>
+                    </div>
+                    {conversations.length === 0 ? (
+                        <div className="px-3 py-3 text-[10px] text-muted italic">No saved conversations yet.</div>
+                    ) : (
+                        conversations.map((c) => (
+                            <div
+                                key={c.id}
+                                role="button"
+                                tabIndex={0}
+                                onClick={() => resumeConversation(c)}
+                                onKeyDown={(e) => {
+                                    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); resumeConversation(c); }
+                                }}
+                                className={`group flex items-center gap-2 px-3 py-2 border-b border-white/5 last:border-0 cursor-pointer hover:bg-white/5 ${c.id === activeConvIdRef.current ? 'bg-primary/10' : ''}`}
+                            >
+                                <div className="flex-1 min-w-0">
+                                    <div className="text-[11px] text-white truncate">{c.title}</div>
+                                    <div className="text-[9px] text-muted">{timeAgo(c.updatedAt)} · {c.messages.length} msgs</div>
+                                </div>
+                                <button
+                                    onClick={(e) => { e.stopPropagation(); removeConversation(c.id); }}
+                                    className="p-1 text-muted hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity shrink-0"
+                                    title="Delete conversation"
+                                    aria-label={`Delete conversation: ${c.title}`}
+                                >
+                                    <Trash2 size={12} />
+                                </button>
+                            </div>
+                        ))
+                    )}
+                </div>
+            )}
 
             {showModelInfo && (
                 <div className="border-b border-border">
