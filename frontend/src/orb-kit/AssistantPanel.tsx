@@ -1047,10 +1047,14 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                                                             />
                                                         );
                                                     },
-                                                    code({ inline, className, children, ...props }: any) {
+                                                    code({ className, children, ...props }: any) {
                                                         const match = /language-(\w+)/.exec(className || '')
                                                         const text = String(children).replace(/\n$/, '')
-                                                        return !inline ? (
+                                                        // react-markdown v10 removed the `inline` prop, so infer block
+                                                        // vs inline: a fenced block has a language class or a newline.
+                                                        // Inline code stays a <code> so it never nests a <div> in a <p>.
+                                                        const isBlock = Boolean(match) || text.includes('\n')
+                                                        return isBlock ? (
                                                             <div className="relative group">
                                                                 <button
                                                                     onClick={() => copyToClipboard(text)}

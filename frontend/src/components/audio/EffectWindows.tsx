@@ -482,6 +482,12 @@ export interface FxChainListProps {
   emptyHint?: string;
 }
 
+// Stable reference for the "no chain yet" case. Returning a fresh `[]` from the
+// zustand selector below makes useSyncExternalStore see a new snapshot every
+// render (reference equality) → "getSnapshot should be cached" → infinite
+// re-render loop. One shared empty array keeps the snapshot stable.
+const EMPTY_CHAIN: ChainEntry[] = [];
+
 export const FxChainList: React.FC<FxChainListProps> = ({
   scope,
   onOpenEntry,
@@ -496,7 +502,7 @@ export const FxChainList: React.FC<FxChainListProps> = ({
   const chain = useEditorStore((s) => {
     if (scope.kind === 'master') return s.masterFxChain;
     if (scope.kind === 'masterVst') return s.masterVstChain;
-    return s.tracks.find((t) => t.id === scope.trackId)?.fxChain ?? [];
+    return s.tracks.find((t) => t.id === scope.trackId)?.fxChain ?? EMPTY_CHAIN;
   });
   const openWindows = useEffectWindowStore((s) => s.windows);
   const [showVstBrowser, setShowVstBrowser] = useState(false);
