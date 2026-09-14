@@ -275,6 +275,7 @@ export const ExportMenu: React.FC<ExportMenuProps> = ({
       <button
         type="button"
         id={EXPORT_TRIGGER_ID}
+        data-tour="score-export"
         ref={triggerRef}
         className="btn-ghost text-[8px] py-1 px-1.5 flex items-center gap-1 disabled:opacity-40"
         aria-label="Export"
