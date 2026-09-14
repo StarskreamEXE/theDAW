@@ -30,6 +30,8 @@ const AssistantPanel = lazy(() => import('./orb-kit/AssistantPanel'));
 // splash own the GPU until then). The CSS gradient core renders meanwhile.
 const FerroOrbCore = lazy(() => import('./components/audio/FerroOrbCore'));
 import OrbDripTrail from './components/audio/OrbDripTrail';
+import { OrbStatusFloat } from './components/audio/OrbStatusFloat';
+import { useBottomPanelStore } from './state/bottomPanelStore';
 import { useAssistantActivityStore } from './state/assistantActivityStore';
 import { logInfo, logWarn, useLogStore, type LogLevel } from './state/logStore';
 import { handletheDAWAction } from './orb-kit/actionHandlers';
@@ -587,6 +589,12 @@ export default function App() {
             persistenceKey="thedaw-orb-pos-v4"
           />
           <OrbDripTrail position={orbPosition} orbBox={112} />
+          {/* Status notices by the orb below xl, where the footer bubble is hidden. */}
+          <OrbStatusFloat
+            position={orbPosition}
+            orbBox={112}
+            onOpenLog={() => useBottomPanelStore.getState().setLogOpen(true)}
+          />
         </>
       )}
       {assistantMounted && (

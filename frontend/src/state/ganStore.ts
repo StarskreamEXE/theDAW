@@ -131,7 +131,7 @@ export const useGanStore = create<GanState>()((set, get) => ({
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'import failed';
       set({ busy: false, error: msg });
-      useStatusBarStore.getState().setText(`IMPORT FAILED: ${msg}`);
+      useStatusBarStore.getState().setText(`IMPORT FAILED: ${msg}`, { source: 'plugin' });
       logError('plugin', msg);
     }
   },

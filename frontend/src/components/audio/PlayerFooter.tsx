@@ -30,6 +30,7 @@ import {
 import { useEditThemeStore } from '../../state/editThemeStore';
 import { resolveEditThemeVars } from '../../lib/editThemes';
 import { LogActionButton } from '../layout/ProcessingLog';
+import { useBottomPanelStore } from '../../state/bottomPanelStore';
 import { entryAudioFileName } from '../../convert/convertClient';
 import { saveFile } from '../../lib/saveFile';
 
@@ -717,8 +718,13 @@ export const PlayerFooter: React.FC = () => {
             sticks to the bottom-left corner and overlaps the footer, so pad left
             past it: 16px margin + the 112px orb = 128, plus clearance. */}
         <div className="flex items-center gap-3 min-w-0 pl-36">
-          {/* The orb's speech bubble, in the slot G-Search used to hold. */}
-          <OrbTipBubble className="hidden xl:block" />
+          {/* The orb's speech bubble, in the slot G-Search held. Status notices
+              show in it, and a click on one opens the LOG. Below xl it is
+              hidden and OrbStatusFloat (App.tsx) shows notices by the orb. */}
+          <OrbTipBubble
+            className="hidden xl:block"
+            onOpenLog={() => useBottomPanelStore.getState().setLogOpen(true)}
+          />
           <div className="flex flex-col min-w-0 flex-1 gap-0.5">
             <h4 className="text-[13px] font-bold text-zinc-100 truncate tracking-tight leading-tight">
               {displayLabel ?? 'No output loaded'}
