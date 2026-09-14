@@ -226,7 +226,9 @@ def build_percussion_part(midi_path: Path, *, title: str = "Drums") -> Any:
     ``percussion.PercussionChord``. The part is barred (``makeMeasures``).
     """
     import pretty_midi  # type: ignore[import]
-    from music21 import clef, instrument, meter, percussion, stream, tempo  # type: ignore[import]
+    from music21 import clef, instrument, meter, percussion, stream  # type: ignore[import]
+
+    from ..tempo_marks import metronome_mark
 
     pm = pretty_midi.PrettyMIDI(str(midi_path))
 
@@ -236,7 +238,9 @@ def build_percussion_part(midi_path: Path, *, title: str = "Drums") -> Any:
     part.insert(0, clef.PercussionClef())
     part.insert(0, instrument.UnpitchedPercussion())
     part.insert(0, meter.TimeSignature(_time_signature(pm)))
-    part.insert(0, tempo.MetronomeMark(number=_initial_tempo(pm)))
+    # The sheet prints the tempo as a whole number. The file's exact tempo is
+    # the sounding tempo, because every hit's offset below is worked out at it.
+    part.insert(0, metronome_mark(_initial_tempo(pm)))
 
     events = _hit_events(pm)
     # Group simultaneous hits; dedupe identical staff positions in a group.

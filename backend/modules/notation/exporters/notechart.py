@@ -65,6 +65,7 @@ from ..arrangers.percussion import (
     gm_pitch_for_display,
     is_drum_midi,
 )
+from ..tempo_marks import restore_sounding_tempi
 from . import beatsaber_map
 
 log = logging.getLogger(__name__)
@@ -1384,6 +1385,9 @@ def build_notechart(
         score = converter.parse(str(source_path))
     if score is None:
         raise ValueError(f"music21 could not parse {source_path}")
+    # An engraved sheet prints a whole-number tempo; the tempo map needs the
+    # <sound tempo> its notes were placed at, which music21 does not read back.
+    restore_sounding_tempi(score, source_path)
 
     if source_format == "midi" and not drum_source:
         # Match what MAKE SHEET engraves, so the chart and the sheet agree.

@@ -46,6 +46,7 @@ from .notechart import (
     _seconds_from_beats,
     _tempo_map,
 )
+from ..tempo_marks import restore_sounding_tempi
 
 log = logging.getLogger(__name__)
 
@@ -452,6 +453,7 @@ def _from_harmony(
     from music21 import converter, harmony  # type: ignore[import]
 
     score = converter.parse(str(lead_sheet_path))
+    restore_sounding_tempi(score, lead_sheet_path)
     score = _expand_repeats(score)
     tempo_entries = _tempo_map(score, 480)
     to_sec = _seconds_from_beats(tempo_entries)
