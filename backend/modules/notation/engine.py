@@ -1721,12 +1721,16 @@ def midi_to_arrangement(
     source_ref: Optional[str] = None,
     artifact_id: Optional[str] = None,
     title: str = "",
+    reference_bpm: Optional[float] = None,
 ) -> dict[str, Any]:
     """Arrange one or more source MIDIs into a MusicXML score of ``style`` and
-    register it as a ``musicxml`` notation artifact."""
+    register it as a ``musicxml`` notation artifact.
+
+    ``reference_bpm`` is the song's analysed tempo; a band score lays every
+    staff out at it (see :func:`.arrangers.score_arrange.arrange`)."""
     from .arrangers.score_arrange import arrange
 
-    result = arrange(sources, style=style, title=title)
+    result = arrange(sources, style=style, title=title, reference_bpm=reference_bpm)
     if not result.get("ok"):
         return result
 
