@@ -96,6 +96,11 @@ interface GenerateStoreState {
   statusLabel: string;
   progressPct: number;
   currentJobId: string | null;
+  /**
+   * The job routes of the live run, set when it starts: `/api/jobs` for Stable
+   * Audio, `/api/magenta/jobs` for Magenta. STOP posts `{base}/{id}/cancel`.
+   */
+  runJobsBase: JobsBase;
   lastAudioUrl: string | null;
   lastAudioBlob: Blob | null;
   lastFilename: string | null;
@@ -104,11 +109,22 @@ interface GenerateStoreState {
   error: string | null;
   pollRunId: number;
   submitGeneration: (params: GenerateParams) => Promise<void>;
-  cancelPolling: () => void;
+  /**
+   * STOP. Ends the live run in the app at once (the key returns to CREATE) and
+   * cancels its backend job, Stable Audio or Magenta: the caption reads
+   * CANCELLING... until the job reports cancelled, then CANCELLED. A job whose
+   * id has not come back yet is cancelled the moment it does. Does nothing
+   * when no run is live.
+   */
+  cancelGeneration: () => void;
   clearResult: () => void;
 }
 
+type JobsBase = '/api/jobs' | '/api/magenta/jobs';
+
 const POLL_INTERVAL_MS = 1000;
+/** How long STOP waits for a cancelled job to report it, before it gives up watching. */
+const CANCEL_CONFIRM_MS = 120_000;
 
 // ── Whole-run progress pacer ────────────────────────────────────────────────
 // progressPct spans the ENTIRE run — weave render + submit + model load +
@@ -141,6 +157,11 @@ function _stopPacer(): void {
     clearInterval(_paceTimer);
     _paceTimer = null;
   }
+}
+
+/** Stops the pacer only while it still paces run `runId`: a stale run never stops a newer run's count. */
+function _stopPacerFor(runId: number): void {
+  if (_paceRunId === runId) _stopPacer();
 }
 
 // continuous whole-run fraction (float, computed at call time): pre-sampling
@@ -678,8 +699,14 @@ const runHealPass = async (
     const response = await fetch('/api/generate-jobs', { method: 'POST', body: buildGenerateJobFormData(healParams, prompt) });
     let payload: unknown = null;
     try { payload = await response.json(); } catch { payload = null; }
+    const jobId = response.ok ? (payload as { job?: { id?: string } })?.job?.id : undefined;
+    // STOP landed while the POST was in flight: cancel the heal job if one was
+    // made, and leave the stopped run's state alone.
+    if (!alive()) {
+      if (jobId) void confirmCancel(jobId, store.getState().isGenerating ? -1 : store.getState().pollRunId, '/api/jobs');
+      return null;
+    }
     if (!response.ok) throw new Error(getErrorMessage(payload, `HTTP ${response.status} ${response.statusText}`));
-    const jobId = (payload as { job?: { id?: string } })?.job?.id;
     if (!jobId) throw new Error('Backend did not return a job id for the heal pass.');
     store.setState({ currentJobId: jobId, jobStatus: 'queued', statusLabel: 'HEALING SEAMS...' });
     logInfo('generate', `[${elapsed()}] Heal pass queued: ${jobId.slice(0, 8)}`);
@@ -688,6 +715,9 @@ const runHealPass = async (
       const jobResponse = await fetch(`/api/jobs/${jobId}`);
       let jobPayload: unknown = null;
       try { jobPayload = await jobResponse.json(); } catch { jobPayload = null; }
+      // STOP landed while this poll was out; cancelGeneration already sent the
+      // heal job's cancel, so nothing here may touch the stopped run.
+      if (!alive()) return null;
       if (!jobResponse.ok) {
         throw new Error(getErrorMessage(jobPayload, `HTTP ${jobResponse.status} ${jobResponse.statusText}`));
       }
@@ -716,11 +746,81 @@ const runHealPass = async (
     return null;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    if (!alive()) {
+      logInfo('generate', `Heal pass request ended after STOP: ${msg}`);
+      return null;
+    }
     logError('generate', `Heal pass failed — keeping the first result: ${msg}`);
     useStatusBarStore.getState().setText('HEAL PASS FAILED — first result kept');
     return null;
   } finally {
-    _stopPacer();
+    _stopPacerFor(runId);
+  }
+};
+
+/**
+ * STOP's backend half: ask the job to cancel, then watch it until it settles.
+ * `jobsBase` is the run's job routes (Stable Audio or Magenta). `runId` is the
+ * pollRunId STOP left behind; the caption is written only while no newer run
+ * has started since (pass -1 when one already has). A Stable Audio job ends at
+ * its next sampler step and a Magenta take at its next rendered chunk, so
+ * CANCELLING... is on screen for about that long. Re-POSTing the cancel is how
+ * it watches: the route is idempotent and answers with the summary, never the
+ * audio payload.
+ */
+const confirmCancel = async (jobId: string, runId: number, jobsBase: JobsBase): Promise<void> => {
+  const store = useGenerateStore;
+  const short = jobId.slice(0, 8);
+  const still = () => store.getState().pollRunId === runId && !store.getState().isGenerating;
+  const settle = (statusLabel: string, bar: string) => {
+    if (!still()) return;
+    store.setState({ statusLabel });
+    useStatusBarStore.getState().setText(bar);
+  };
+  settle('CANCELLING...', `CANCELLING JOB ${short}`);
+  try {
+    const started = Date.now();
+    let job: { status?: string; saved_takes?: number } = {};
+    for (;;) {
+      const r = await fetch(`${jobsBase}/${jobId}/cancel`, { method: 'POST' });
+      if (r.status === 404) {
+        // The route's own 404 names the job; any other 404 is a backend that
+        // predates the route, whose job is still running.
+        const detail = ((await r.json().catch(() => null)) as { detail?: unknown } | null)?.detail;
+        if (detail === 'Job not found') {
+          logInfo('generate', `Job ${short} is no longer on the server (it restarted), so nothing is running.`);
+          settle('STOPPED', 'GENERATION STOPPED');
+          return;
+        }
+        throw new Error('the backend has no cancel route; restart the backend to get it');
+      }
+      if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText}`);
+      job = (await r.json()) as { status?: string; saved_takes?: number };
+      if (job.status !== 'queued' && job.status !== 'running') break;
+      if (Date.now() - started > CANCEL_CONFIRM_MS) {
+        logError('generate', `Job ${short} did not report cancelled within ${CANCEL_CONFIRM_MS / 1000}s and may still be running.`);
+        settle('STOPPED', 'GENERATION STOPPED');
+        return;
+      }
+      await wait(POLL_INTERVAL_MS);
+    }
+    if (job.status === 'cancelled') {
+      const saved = job.saved_takes ?? 0;
+      logInfo('generate', `Job ${short} cancelled on the server${saved > 0 ? `; ${saved} take(s) finished before the cancel and stay in the library` : ''}.`);
+      if (saved > 0) void useLibraryStore.getState().refresh();
+      settle('CANCELLED', 'GENERATION CANCELLED');
+    } else if (job.status === 'completed') {
+      logInfo('generate', `Job ${short} finished before the cancel reached it; its take is in the library.`);
+      void useLibraryStore.getState().refresh();
+      settle('STOPPED', 'GENERATION STOPPED: the take finished first and is in the library');
+    } else {
+      logInfo('generate', `Job ${short} ended as ${job.status ?? 'unknown'} before the cancel reached it.`);
+      settle('STOPPED', 'GENERATION STOPPED');
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    logError('generate', `Cancel request for job ${short} failed (${msg}); the job may still be running.`);
+    settle('STOPPED', 'GENERATION STOPPED: the cancel request failed');
   }
 };
 
@@ -730,6 +830,7 @@ export const useGenerateStore = create<GenerateStoreState>()((set, get) => ({
   statusLabel: 'READY',
   progressPct: 0,
   currentJobId: null,
+  runJobsBase: '/api/jobs',
   lastAudioUrl: null,
   lastAudioBlob: null,
   lastFilename: null,
@@ -762,7 +863,7 @@ export const useGenerateStore = create<GenerateStoreState>()((set, get) => ({
     // double-click, XR trigger bounce, assistant) saw isGenerating=false and
     // stacked a duplicate backend job; worse, a press MEANT as cancel during
     // the SUBMITTING window started a second run instead. Claiming the flag
-    // here makes a second press route to cancelPolling, and the pollRunId
+    // here makes a second press route to cancelGeneration, and the pollRunId
     // checks after each pre-flight await make that cancel actually abort the
     // submission before the job is POSTed.
     if (get().isGenerating) {
@@ -780,6 +881,7 @@ export const useGenerateStore = create<GenerateStoreState>()((set, get) => ({
       statusLabel: chimeraArmed ? 'RENDERING CHIMERA...' : 'SUBMITTING JOB...',
       progressPct: 0,
       currentJobId: null,
+      runJobsBase: params.model.startsWith('magenta-') ? '/api/magenta/jobs' : '/api/jobs',
       error: null,
       lastAudioUrl: null,
       lastAudioBlob: null,
@@ -887,12 +989,17 @@ export const useGenerateStore = create<GenerateStoreState>()((set, get) => ({
         useStatusBarStore.getState().setText('CHIMERA READY — submitting job');
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
+        // STOP (and maybe a new run) came first: this run owns nothing any more.
+        if (get().pollRunId !== nextRunId) {
+          logInfo('generate', `Chimera mashup ended after STOP: ${msg}`);
+          return;
+        }
         logError('generate', `Chimera mashup failed; aborting generation: ${msg}`);
         useStatusBarStore.getState().setText(`CHIMERA FAILED: ${msg}`);
         set({
           isGenerating: false,
           jobStatus: 'idle',
-          statusLabel: 'IDLE',
+          statusLabel: 'CHIMERA FAILED',
           error: `Chimera mashup failed: ${msg}`,
         });
         return;
@@ -945,16 +1052,28 @@ export const useGenerateStore = create<GenerateStoreState>()((set, get) => ({
         payload = null;
       }
 
+      const jobId = response.ok ? (payload as { job?: { id?: string } })?.job?.id : undefined;
+
+      // STOP landed while the POST was in flight: cancel the job if one was
+      // made, and leave the stopped run's state alone; a run started since
+      // then keeps its caption (-1).
+      if (get().pollRunId !== nextRunId) {
+        if (jobId) {
+          logInfo('generate', `Job ${jobId.slice(0, 8)} was submitted before STOP reached it; cancelling it now.`);
+          void confirmCancel(jobId, get().isGenerating ? -1 : get().pollRunId, jobsBase);
+        }
+        return;
+      }
+
       if (!response.ok) {
         const detail = getErrorMessage(payload, `HTTP ${response.status} ${response.statusText}`);
-        logError('generate', `POST /api/generate-jobs → ${response.status} ${response.statusText} — ${detail}`);
+        logError('generate', `POST ${genEndpoint} → ${response.status} ${response.statusText} — ${detail}`);
         throw new Error(detail);
       }
 
-      const jobId = (payload as { job?: { id?: string } })?.job?.id;
       if (!jobId) {
-        logError('generate', 'POST /api/generate-jobs → 200 OK but no job_id in response payload');
-        throw new Error('Backend did not return a job id for /api/generate-jobs.');
+        logError('generate', `POST ${genEndpoint} → 200 OK but no job_id in response payload`);
+        throw new Error(`Backend did not return a job id for ${genEndpoint}.`);
       }
 
       logInfo('generate', `[${elapsed()}] POST /api/generate-jobs → 200 OK — job_id=${jobId.slice(0, 8)} (server received the job)`);
@@ -979,6 +1098,10 @@ export const useGenerateStore = create<GenerateStoreState>()((set, get) => ({
         } catch {
           jobPayload = null;
         }
+        // STOP landed while this poll was out. cancelGeneration already sent
+        // the job's cancel and wrote the stopped run's caption; whatever the
+        // poll says (running, completed, an error), it must not revive the run.
+        if (get().pollRunId !== nextRunId) return;
 
         if (!jobResponse.ok) {
           if (jobResponse.status === 404) {
@@ -1051,6 +1174,9 @@ export const useGenerateStore = create<GenerateStoreState>()((set, get) => ({
           let healedJobId: string | null = null;
           if (polishRegions.length && !isMagenta) {
             logInfo('generate', `[${elapsed()}] First pass done (${resultItem.filename || 'output.wav'}); starting the seam heal pass`);
+            // The first job is finished, so a STOP from here on has nothing of
+            // it to cancel; the heal job becomes currentJobId once its id is back.
+            set({ currentJobId: null });
             const healed = await runHealPass(
               { blob: resultBlob, filename: resultItem.filename || 'chimera_pass1.wav' },
               { ...effectiveParams, inpaintRegions: polishRegions },
@@ -1168,6 +1294,17 @@ export const useGenerateStore = create<GenerateStoreState>()((set, get) => ({
           return;
         }
 
+        // Cancelled on the server by another caller of POST /api/jobs/{id}/cancel
+        // (this key's own STOP has already left this loop).
+        if (job.status === 'cancelled') {
+          _stopPacer();
+          clearHealParams();
+          set({ isGenerating: false, jobStatus: 'idle', statusLabel: 'CANCELLED', progressPct: 0, currentJobId: null });
+          useStatusBarStore.getState().setText('GENERATION CANCELLED');
+          logInfo('generate', `[${elapsed()}] Job ${jobId.slice(0, 8)} was cancelled on the server.`);
+          return;
+        }
+
         if (job.status === 'failed') {
           throw new Error(job.error || 'Generation job failed.');
         }
@@ -1176,6 +1313,12 @@ export const useGenerateStore = create<GenerateStoreState>()((set, get) => ({
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Generation failed unexpectedly.';
+      // A request that failed after STOP (and maybe after a new run started)
+      // belongs to no live run: log it and leave the store to whoever owns it.
+      if (get().pollRunId !== nextRunId) {
+        logInfo('generate', `A request of the stopped run ended with: ${message}`);
+        return;
+      }
       clearHealParams();
       set({
         isGenerating: false,
@@ -1242,7 +1385,9 @@ export const useGenerateStore = create<GenerateStoreState>()((set, get) => ({
     }
   },
 
-  cancelPolling: () => {
+  cancelGeneration: () => {
+    const { isGenerating, currentJobId, runJobsBase } = get();
+    if (!isGenerating) return;
     const nextRunId = get().pollRunId + 1;
     // every pollRunId-mismatch exit in submitGeneration/runHealPass routes
     // through here, so this is where an aborted heal run gives back the
@@ -1256,8 +1401,13 @@ export const useGenerateStore = create<GenerateStoreState>()((set, get) => ({
       progressPct: 0,
       currentJobId: null,
     });
+    if (currentJobId) {
+      logInfo('generate', `STOP pressed: cancelling job ${currentJobId.slice(0, 8)} on the server`);
+      void confirmCancel(currentJobId, nextRunId, runJobsBase);
+      return;
+    }
     useStatusBarStore.getState().setText('GENERATION STOPPED');
-    logInfo('generate', 'Job aborted by user');
+    logInfo('generate', 'STOP pressed before the backend returned a job id: a job already submitted is cancelled when its id comes back');
   },
 
   clearResult: () => {

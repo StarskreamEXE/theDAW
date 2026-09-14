@@ -51,9 +51,11 @@ interface OrbTipBubbleProps {
   /** Raise the assistant panel. Optional — without it the bubble is inert. */
   onOpen?: () => void;
   className?: string;
+  /** The bubble's width utilities (default `w-56`). A fixed width, so what sits beside it never shifts. */
+  widthClass?: string;
 }
 
-export const OrbTipBubble: React.FC<OrbTipBubbleProps> = ({ onOpen, className }) => {
+export const OrbTipBubble: React.FC<OrbTipBubbleProps> = ({ onOpen, className, widthClass = 'w-56' }) => {
   // -1 is the greeting; 0..n index into TIPS. Every launch opens on the
   // greeting, then enters the tip rotation at a random point so it is not the
   // same three lines each session.
@@ -96,16 +98,18 @@ export const OrbTipBubble: React.FC<OrbTipBubbleProps> = ({ onOpen, className })
       type="button"
       aria-live="polite"
       aria-label={`Assistant tip: ${text}. Activate for the next tip.`}
+      title={text}
       onMouseEnter={() => { paused.current = true; }}
       onMouseLeave={() => { paused.current = false; }}
       onClick={() => (onOpen ? onOpen() : advance())}
       className={[
-        // FIXED width, not max-width: the now-playing title, duration and
-        // sample rate sit immediately to the right, and a bubble that resized
-        // with its text dragged them back and forth on every rotation.
-        'group/tip relative shrink-0 w-56 text-left',
+        // FIXED width, not max-width: the now-playing title and chip row sit
+        // immediately to the right, and a bubble that resized with its text
+        // dragged them back and forth on every rotation.
+        'group/tip relative shrink-0 text-left',
+        widthClass,
         'rounded-2xl rounded-bl-sm border border-purple-500/25 bg-purple-500/8',
-        'px-3 py-1.5 hover:bg-purple-500/15 hover:border-purple-400/40',
+        'px-3 py-1 hover:bg-purple-500/15 hover:border-purple-400/40',
         'transition-colors cursor-pointer',
         className || '',
       ].join(' ')}
@@ -113,14 +117,14 @@ export const OrbTipBubble: React.FC<OrbTipBubbleProps> = ({ onOpen, className })
       {/* Bubble tail, bottom-left, so it reads as speech rather than a chip. */}
       <span
         aria-hidden="true"
-        className="absolute -bottom-1 left-2 h-2 w-2 rotate-45 border-b border-l border-purple-500/25 bg-purple-500/8 group-hover/tip:bg-purple-500/15"
+        className="absolute -bottom-0.5 left-2 h-2 w-2 rotate-45 border-b border-l border-purple-500/25 bg-purple-500/8 group-hover/tip:bg-purple-500/15"
       />
-      {/* Wraps and grows DOWNWARD; never truncates. The footer is 56px tall and
-          the bubble is vertically centred in it, so extra lines expand evenly
-          without pushing the transport off-centre. */}
+      {/* Bold sans at 12px on two 16px lines at most: with the 4px padding and
+          border the bubble is 42px, inside the footer's 48px row. A longer tip
+          ends in an ellipsis; the whole tip is the button's name and title. */}
       <span
         className={[
-          'block whitespace-normal wrap-break-word font-mono text-[9px] leading-relaxed tracking-wide text-purple-100/85',
+          'line-clamp-2 whitespace-normal wrap-break-word font-sans font-bold text-xs leading-4 text-purple-100/85',
           'transition-opacity duration-300',
           visible ? 'opacity-100' : 'opacity-0',
         ].join(' ')}

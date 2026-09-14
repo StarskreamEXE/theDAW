@@ -350,12 +350,13 @@ export const PitchLane: React.FC<PitchLaneProps> = ({ entryId, getPosMs, activeL
 
   return (
     <div className="shrink-0 border-b border-white/10 bg-[#0a080f]">
-      <div className="flex flex-wrap items-center gap-2 px-2 py-1 text-[9px] font-mono text-zinc-400">
-        <span className="font-black uppercase tracking-widest text-rose-200">Pitch</span>
+      {/* Orbitron bold for the legends and keys, the bold sans for values and notes, all 12px. */}
+      <div className="flex flex-wrap items-center gap-2 px-2 py-1 font-sans font-bold text-xs text-zinc-400">
+        <span className="font-display uppercase text-rose-200">Pitch</span>
         {artifact === null && (
           <button
             type="button"
-            className="btn-ghost text-[9px] py-0.5 px-1.5 border border-purple-500/40 text-purple-200 disabled:opacity-50"
+            className="btn-ghost font-display font-bold text-xs py-0.5 px-1.5 border border-purple-500/40 text-purple-200 disabled:opacity-50"
             onClick={() => void analyzeMelody()}
             disabled={!!analyzing}
             title="Analyze the vocal (isolate + pitch + notes) so the lane has a target melody"
@@ -366,7 +367,7 @@ export const PitchLane: React.FC<PitchLaneProps> = ({ entryId, getPosMs, activeL
         {analyzing && <span className="text-zinc-500">{analyzing}</span>}
         <button
           type="button"
-          className={`btn-ghost text-[9px] py-0.5 px-1.5 flex items-center gap-1 ${micOn ? 'border border-emerald-500/40 text-emerald-200' : ''}`}
+          className={`btn-ghost font-display font-bold text-xs py-0.5 px-1.5 flex items-center gap-1 ${micOn ? 'border border-emerald-500/40 text-emerald-200' : ''}`}
           onClick={() => setMicOn(!micOn)}
           aria-pressed={micOn}
           title="Listen to the microphone and score the sung pitch"
@@ -378,10 +379,11 @@ export const PitchLane: React.FC<PitchLaneProps> = ({ entryId, getPosMs, activeL
           id="sing-mic"
           label="MIC"
           showLabel
-          labelClassName="text-zinc-500 shrink-0"
-          className="text-[9px] px-1 py-0.5 max-w-40"
+          labelClassName="font-display font-bold text-xs leading-4 uppercase text-zinc-500 shrink-0"
+          className="max-w-48"
+          dense
         />
-        <label htmlFor="sing-mic-offset" className="text-zinc-500" title="Microphone latency compensation">MIC OFFSET ms</label>
+        <label htmlFor="sing-mic-offset" className="font-display uppercase text-zinc-500" title="Microphone latency compensation">MIC OFFSET ms</label>
         <input
           id="sing-mic-offset"
           name="sing-mic-offset"
@@ -391,7 +393,7 @@ export const PitchLane: React.FC<PitchLaneProps> = ({ entryId, getPosMs, activeL
           max={400}
           value={micOffsetMs}
           onChange={(e) => setMicOffsetMs(Number(e.target.value) || 0)}
-          className="w-14 form-select text-[9px] px-1 py-0.5 tabular-nums"
+          className="w-16 form-select font-sans font-bold text-xs px-1 py-0.5 tabular-nums"
         />
         <span className="ml-auto text-amber-300/80" title="Without headphones the microphone hears the track and scores the song, not you">
           Use headphones

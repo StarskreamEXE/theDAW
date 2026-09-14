@@ -1784,11 +1784,79 @@ _JOBS_MAX = 40
 def _prune_jobs() -> None:
     while len(JOBS) > _JOBS_MAX:
         for jid, j in list(JOBS.items()):
-            if j.get("status") in ("completed", "failed", "error"):
+            if j.get("status") in ("completed", "failed", "error", "cancelled"):
                 JOBS.pop(jid, None)
+                _JOB_CANCEL_EVENTS.pop(jid, None)
                 break
         else:
             break
+
+
+class _GenerationCancelled(Exception):
+    """A generate job whose cancel was requested (POST /api/jobs/{id}/cancel)."""
+
+
+# One event per generate job that has a cancel request, set by cancel_job so a
+# job still waiting for the generation lock leaves the queue at once. Kept out
+# of JOBS, whose entries are returned as JSON.
+_JOB_CANCEL_EVENTS: dict[str, asyncio.Event] = {}
+
+
+def _job_cancel_event(job_id: str) -> asyncio.Event:
+    event = _JOB_CANCEL_EVENTS.get(job_id)
+    if event is None:
+        event = _JOB_CANCEL_EVENTS[job_id] = asyncio.Event()
+    return event
+
+
+def _raise_if_cancelled(job_id: str) -> None:
+    """Checkpoint inside a generate job: raise once its cancel has been requested.
+
+    The job checks while it waits for the generation lock (_generation_lane),
+    after it gets it, at every sampler step (the step callback runs in the
+    executor thread, so the raise unwinds the sampler mid-run), and after each
+    take decodes, before anything is written. A take that finished decoding
+    before the cancel stays saved; nothing after the checkpoint that sees the
+    flag is.
+    """
+    job = JOBS.get(job_id)
+    if job is not None and job.get("cancel_requested"):
+        raise _GenerationCancelled(job_id)
+
+
+@asynccontextmanager
+async def _generation_lane(job_id: str):
+    """Hold the generation lock for one job.
+
+    A job whose cancel arrives while it still waits for the lock raises
+    _GenerationCancelled at once, so it reports "cancelled" without waiting for
+    the job ahead of it, and never takes the GPU.
+    """
+    _raise_if_cancelled(job_id)
+    acquire = asyncio.ensure_future(_generation_job_lock.acquire())
+    cancelled = asyncio.ensure_future(_job_cancel_event(job_id).wait())
+    try:
+        await asyncio.wait({acquire, cancelled}, return_when=asyncio.FIRST_COMPLETED)
+    except BaseException:
+        # The job itself was cancelled (shutdown): give back a lock it got.
+        cancelled.cancel()
+        acquire.cancel()
+        await asyncio.wait({acquire})
+        if not acquire.cancelled() and acquire.exception() is None:
+            _generation_job_lock.release()
+        raise
+    cancelled.cancel()
+    if not acquire.done():
+        # asyncio.Lock passes a grant a cancelled waiter can no longer use on
+        # to the next waiter, so the job ahead and the jobs behind are unaffected.
+        acquire.cancel()
+        await asyncio.wait({acquire})
+    if acquire.cancelled():
+        raise _GenerationCancelled(job_id)
+    try:
+        yield
+    finally:
+        _generation_job_lock.release()
 
 
 def _audio_save_subtype(fmt: str, wav_bit_depth: str) -> str | None:
@@ -1862,8 +1930,11 @@ async def _run_generate_job(
         # leaving the job "queued" and the background queue jammed forever.
 
         items = []
-        async with _generation_job_lock:
+        # The lane gives the job the generation lock, or ends it at once when
+        # its cancel arrives while it still waits its turn for the GPU.
+        async with _generation_lane(job_id):
             try:
+                _raise_if_cancelled(job_id)
                 if lora_paths:
                     _clear_generation_loras(generation_pipeline)
                     generation_pipeline.load_lora(lora_paths)
@@ -1872,6 +1943,7 @@ async def _run_generate_job(
 
                 seed_base = int(base_args.get("seed", -1))
                 for i in range(max(1, batch_size)):
+                    _raise_if_cancelled(job_id)
                     args = dict(base_args)
                     if batch_size > 1 and seed_base != -1:
                         args["seed"] = seed_base + i
@@ -1880,6 +1952,10 @@ async def _run_generate_job(
                         # Ensure we update the job progress safely
                         if job_id in JOBS:
                             JOBS[job_id]["progress"]["step"] = step_info.get("i", 0) + 1
+                        # Runs in the executor thread between sampler steps; the
+                        # raise unwinds the sampler and the executor re-raises it
+                        # here in the job.
+                        _raise_if_cancelled(job_id)
 
                     audio_bytes, fmt = await loop.run_in_executor(
                         None,
@@ -1890,6 +1966,8 @@ async def _run_generate_job(
                         _step_callback,
                         wav_bit_depth,
                     )
+                    # Cancelled while this take decoded: none of it is written.
+                    _raise_if_cancelled(job_id)
                     mime_type = mime_map.get(fmt, "audio/wav")
                     filename = _make_generation_filename(
                         job_id,
@@ -2009,6 +2087,14 @@ async def _run_generate_job(
             JOBS[job_id]["artifact_dir"],
         )
 
+    except _GenerationCancelled:
+        # Stopped by the user, not a failure. A take that finished before the
+        # cancel is already in the library; saved_takes says how many.
+        JOBS[job_id]["status"] = "cancelled"
+        JOBS[job_id]["saved_takes"] = len(items)
+        logger.info(
+            "generate job %s cancelled (%d take(s) already saved)", job_id, len(items)
+        )
     except Exception as e:
         JOBS[job_id]["status"] = "failed"
         JOBS[job_id]["error"] = str(e)
@@ -2016,6 +2102,7 @@ async def _run_generate_job(
         # carries the one-line message.
         logger.exception("generate job %s failed", job_id)
     finally:
+        _JOB_CANCEL_EVENTS.pop(job_id, None)
         if lora_temp_dir is not None:
             shutil.rmtree(lora_temp_dir, ignore_errors=True)
         # Release the idle gate so background workers can resume.
@@ -2281,6 +2368,26 @@ async def get_job(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    """Cancel a generate job.
+
+    A queued or running job is flagged and ends as "cancelled" at its next
+    checkpoint (_raise_if_cancelled): at once while it waits for the generation
+    lock, at the next sampler step, or once the take in hand has decoded. A
+    finished job comes back as it is. The reply is the job summary without its
+    result, so a client can poll this or GET /api/jobs/{id} until the status
+    settles.
+    """
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.get("status") in ("queued", "running"):
+        job["cancel_requested"] = True
+        _job_cancel_event(job_id).set()
+    return {k: v for k, v in job.items() if k != "result"}
 
 
 @app.get("/api/autoencoder/info")

@@ -42,6 +42,23 @@ interface Option {
   text: string;
 }
 
+/** The Settings dropdown style with the device name in the bold sans at 12px. */
+const DEVICE_SELECT = SELECT.replace('font-mono', 'font-sans font-bold');
+/** …with half the vertical padding, for a picker in a toolbar row or a small widget. */
+const DEVICE_SELECT_DENSE = DEVICE_SELECT.replace('py-1', 'py-0.5');
+
+/** Layout options every picker takes. */
+interface PickerLayout {
+  /** Half the vertical padding (a 22px dropdown), for a toolbar row or a small widget. */
+  dense?: boolean;
+  /**
+   * For a cell too small for a sentence: the status (not connected, cannot
+   * route, names unknown) is the dropdown's description and tooltip, and a
+   * device that is gone shows as an amber warning icon beside it.
+   */
+  quietStatus?: boolean;
+}
+
 
 /** The shared presentational half: label + select + the honest status chips. */
 const DeviceSelect: React.FC<{
@@ -63,7 +80,7 @@ const DeviceSelect: React.FC<{
   legend?: string;
   labelClassName?: string;
   className?: string;
-}> = ({
+} & PickerLayout> = ({
   id,
   label,
   title,
@@ -76,44 +93,66 @@ const DeviceSelect: React.FC<{
   missing,
   showLabel,
   legend,
-  labelClassName = 'text-[11px] font-mono uppercase tracking-wider text-zinc-400 shrink-0',
+  labelClassName = 'font-display font-bold text-xs leading-4 uppercase text-zinc-400 shrink-0',
   className = '',
-}) => (
-  <>
-    <label htmlFor={id} className={showLabel ? labelClassName : 'sr-only'}>
-      {showLabel && legend ? legend : label}
-    </label>
-    <select
-      id={id}
-      name={id}
-      value={value}
-      onChange={(e) => onPick(e.target.value)}
-      aria-label={label}
-      title={unsupported || title || label}
-      disabled={disabled || !!unsupported}
-      className={`${SELECT} ${className}`}
-      style={{ colorScheme: 'dark' }}
-    >
-      {options.map((o) => (
-        <option key={o.value} value={o.value}>
-          {o.text}
-        </option>
-      ))}
-    </select>
-    {unsupported && <span className="text-[11px] font-mono text-amber-300/80">{unsupported}</span>}
-    {!unsupported && missing && (
-      <span className="inline-flex items-center gap-1 text-[11px] font-mono text-amber-300">
-        <AlertTriangle className="w-3 h-3 shrink-0" />
-        not connected — using the system default
-      </span>
-    )}
-    {!unsupported && !labelsKnown && (
-      <span className="text-[11px] font-mono text-zinc-500">
-        device names appear once something opens the mic
-      </span>
-    )}
-  </>
-);
+  dense,
+  quietStatus,
+}) => {
+  // The status, in the words the chips print.
+  const status = unsupported
+    ? unsupported
+    : [missing ? 'not connected — using the system default' : '', !labelsKnown ? 'device names appear once something opens the mic' : '']
+        .filter(Boolean)
+        .join('; ');
+  const statusId = `${id}-status`;
+  return (
+    <>
+      <label htmlFor={id} className={showLabel ? labelClassName : 'sr-only'}>
+        {showLabel && legend ? legend : label}
+      </label>
+      <select
+        id={id}
+        name={id}
+        value={value}
+        onChange={(e) => onPick(e.target.value)}
+        aria-label={label}
+        aria-describedby={quietStatus && status ? statusId : undefined}
+        title={[unsupported || title || label, quietStatus && !unsupported ? status : ''].filter(Boolean).join(': ')}
+        disabled={disabled || !!unsupported}
+        className={`${dense ? DEVICE_SELECT_DENSE : DEVICE_SELECT} ${className}`}
+        style={{ colorScheme: 'dark' }}
+      >
+        {options.map((o) => (
+          <option key={o.value} value={o.value}>
+            {o.text}
+          </option>
+        ))}
+      </select>
+      {quietStatus ? (
+        <>
+          {!unsupported && missing && <AlertTriangle aria-hidden="true" className="w-3 h-3 shrink-0 text-amber-300" />}
+          {status && <span id={statusId} className="sr-only">{status}</span>}
+        </>
+      ) : (
+        <>
+          {/* The status chips: the bold sans at 12px, on every surface that shows a picker. */}
+          {unsupported && <span className="font-sans font-bold text-xs leading-4 text-amber-300/80">{unsupported}</span>}
+          {!unsupported && missing && (
+            <span className="inline-flex items-center gap-1 font-sans font-bold text-xs leading-4 text-amber-300">
+              <AlertTriangle className="w-3 h-3 shrink-0" />
+              not connected — using the system default
+            </span>
+          )}
+          {!unsupported && !labelsKnown && (
+            <span className="font-sans font-bold text-xs leading-4 text-zinc-500">
+              device names appear once something opens the mic
+            </span>
+          )}
+        </>
+      )}
+    </>
+  );
+};
 
 /** Live devices that are safe to name. A blank label is never invented into one. */
 const namedDevices = (live: LiveDevice[]): LiveDevice[] => live.filter((d) => d.label !== '');
@@ -150,7 +189,7 @@ export const IoSurfaceSelect: React.FC<{
   legend?: string;
   labelClassName?: string;
   className?: string;
-}> = ({ surface, id, label, showLabel, legend, labelClassName, className }) => {
+} & PickerLayout> = ({ surface, id, label, showLabel, legend, labelClassName, className, dense, quietStatus }) => {
   const def = surfaceById(surface);
   const kind = def?.kind ?? 'audioIn';
   const resolved: Resolved = useResolvedSurface(surface);
@@ -186,6 +225,8 @@ export const IoSurfaceSelect: React.FC<{
       legend={legend}
       labelClassName={labelClassName}
       className={className}
+      dense={dense}
+      quietStatus={quietStatus}
     />
   );
 };
@@ -201,7 +242,7 @@ export const IoGlobalSelect: React.FC<{
   className?: string;
   /** Set when the runtime cannot route this slot at all; disables the list. */
   unsupported?: string;
-}> = ({ slot, id, label, showLabel, labelClassName, className, unsupported }) => {
+} & PickerLayout> = ({ slot, id, label, showLabel, labelClassName, className, unsupported, dense, quietStatus }) => {
   const resolved = useResolvedGlobal(slot);
   const kind = slot === 'audio_input' ? 'audioIn' : slot === 'midi_output' ? 'midiOut' : slot === 'visual_display' ? 'display' : 'audioOut';
   const live = useIoDevicesStore((s) =>
@@ -242,6 +283,8 @@ export const IoGlobalSelect: React.FC<{
       showLabel={showLabel}
       labelClassName={labelClassName}
       className={className}
+      dense={dense}
+      quietStatus={quietStatus}
     />
   );
 };

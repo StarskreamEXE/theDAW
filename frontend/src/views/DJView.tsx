@@ -3130,15 +3130,17 @@ function buildDjRegistry(p: DjRegArgs): WidgetRegistry {
   ) };
 
   reg.cueDevice = { id: 'cueDevice', label: 'Cue Output', group: 'Mixer', kind: 'button', source: 'builtin', render: () => (
-    <div className="h-full w-full grid place-items-center px-1">
+    // grid-cols-1 is a minmax(0,1fr) track, so the picker narrows with a narrow cell.
+    <div className="h-full w-full grid grid-cols-1 place-items-center px-1">
       {p.cueSupported ? (
         <div className="flex items-center gap-1 w-full">
           <Headphones className="w-2.5 h-2.5 text-zinc-500 shrink-0" />
           {/* Was the app's oldest device picker and had only a `title` — no id,
               no name, no <label>, no aria-label. Now the shared control. */}
-          <IoGlobalSelect slot="cue_output" id="dj-cue-output" label="Headphone (cue) output" className="flex-1 text-[8px] px-1 py-0.5" />
+          {/* A widget cell has no room for a status sentence: the picker keeps it as its description and tooltip. */}
+          <IoGlobalSelect slot="cue_output" id="dj-cue-output" label="Headphone (cue) output" className="flex-1 max-w-none" dense quietStatus />
         </div>
-      ) : <span className="text-[7px] font-mono text-zinc-700">cue n/a</span>}
+      ) : <span className="font-sans font-bold text-xs text-zinc-500">cue n/a</span>}
     </div>
   ) };
 

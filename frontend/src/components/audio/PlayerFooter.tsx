@@ -30,14 +30,31 @@ import {
 import { useEditThemeStore } from '../../state/editThemeStore';
 import { resolveEditThemeVars } from '../../lib/editThemes';
 import { LogActionButton } from '../layout/ProcessingLog';
+import {
+  keyLabel,
+  transportKey,
+  transportKeyDead,
+  transportKeyOff,
+  transportKeyOn,
+  transportPlate,
+  transportPlayDead,
+  transportPlayKey,
+  transportPlayOn,
+  transportPlayRest,
+} from './transportKeys';
+import { Glyph, GLYPH_PAUSE, GLYPH_PLAY, GLYPH_TO_END, GLYPH_TO_START } from './transportGlyphs';
 import { entryAudioFileName } from '../../convert/convertClient';
 import { saveFile } from '../../lib/saveFile';
 
-/** What each repeat state is called, in the tooltip and for a screen reader. */
+/**
+ * What each repeat state is called, in the tooltip and for a screen reader.
+ * Each name starts with the words its key prints (LOOP, ALL, ONE), so a speech
+ * command that reads the key off the screen finds it (label-in-name).
+ */
 const REPEAT_LABEL: Record<'off' | 'all' | 'one', string> = {
-  off: 'Repeat off - play the list through and stop',
-  all: 'Repeat all - the list starts again at the end',
-  one: 'Repeat one - this track loops',
+  off: 'Loop off - play the list through and stop',
+  all: 'Loop all - the list starts again at the end',
+  one: 'Loop one - this track loops',
 };
 const REPEAT_KEY_LABEL: Record<'off' | 'all' | 'one', string> = {
   off: 'LOOP',
@@ -144,7 +161,9 @@ const ScrubStrip: React.FC = () => {
 
   return (
     <div className="flex items-center gap-2.5 w-3/5 mx-auto h-4 shrink-0">
-      <span className="w-9 shrink-0 text-right text-[10px] font-mono tabular-nums text-zinc-400">
+      {/* The times: the bold sans at 12px in tabular figures, so the digits
+          hold still as they tick. */}
+      <span className="w-10 shrink-0 text-right font-sans font-bold text-xs leading-4 tabular-nums text-zinc-400">
         {formatDuration(drag !== null ? drag * duration : currentTime)}
       </span>
       <div
@@ -186,14 +205,14 @@ const ScrubStrip: React.FC = () => {
         />
         {canSeek && shown !== null && (
           <span
-            className="absolute bottom-full mb-1.5 -translate-x-1/2 whitespace-nowrap rounded-xs border border-white/12 bg-[#0a080f] px-1.5 py-0.5 text-[10px] font-mono tabular-nums text-zinc-200 pointer-events-none"
+            className="absolute bottom-full mb-1.5 -translate-x-1/2 whitespace-nowrap rounded-xs border border-white/12 bg-[#0a080f] px-1.5 py-0.5 font-sans font-bold text-xs leading-4 tabular-nums text-zinc-200 pointer-events-none"
             style={{ left: `${shown * 100}%` }}
           >
             {formatDuration(shown * duration)}
           </span>
         )}
       </div>
-      <span className="w-9 shrink-0 text-[10px] font-mono tabular-nums text-zinc-400">
+      <span className="w-10 shrink-0 font-sans font-bold text-xs leading-4 tabular-nums text-zinc-400">
         {formatDuration(duration)}
       </span>
     </div>
@@ -268,24 +287,28 @@ const AudioOutIndicator: React.FC = () => {
         aria-label="Audio output devices"
         className="absolute bottom-full right-0 mb-2 z-50 w-80 rounded-md border border-purple-500/30 bg-[#0c0a14] p-2 shadow-xl flex flex-col gap-2"
       >
-        <div className="flex items-center gap-1.5">
-          <Speaker className="w-3 h-3 text-zinc-500 shrink-0" />
+        {/* Each row: icon, legend, select, and under them any status chip the
+            picker prints (flex-wrap; the chip takes the whole next line). */}
+        <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 [&>span]:basis-full">
+          <Speaker className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
           <IoGlobalSelect
             slot="audio_output"
             id="footer-main-out"
             label="Main output"
             showLabel
+            labelClassName={AUDIO_OUT_LEGEND}
             className="flex-1"
             unsupported={supports.ctxSink ? undefined : 'the desktop app can move this'}
           />
         </div>
-        <div className="flex items-center gap-1.5">
-          <Headphones className="w-3 h-3 text-zinc-500 shrink-0" />
+        <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 [&>span]:basis-full">
+          <Headphones className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
           <IoGlobalSelect
             slot="cue_output"
             id="footer-cue-out"
             label="Cue output"
             showLabel
+            labelClassName={AUDIO_OUT_LEGEND}
             className="flex-1"
             unsupported={supports.elementSink ? undefined : 'not routable here'}
           />
@@ -296,7 +319,7 @@ const AudioOutIndicator: React.FC = () => {
             setOpen(false);
             window.dispatchEvent(new CustomEvent('thedaw:open-settings'));
           }}
-          className="self-start text-[11px] font-mono uppercase tracking-widest text-purple-300 hover:text-purple-100"
+          className="self-start font-display font-bold text-xs leading-4 uppercase text-purple-300 hover:text-purple-100"
         >
           All inputs &amp; outputs…
         </button>
@@ -338,16 +361,17 @@ const MasterFxIndicator: React.FC = () => {
 
   return (
     <div ref={wrapRef} className="relative flex items-center shrink-0">
+      {/* The printed words lead the name (label-in-name): "Master FX", then the count. */}
       <button
         type="button"
         onClick={openMix}
-        aria-label={`${count} master effect${plural} live on the output — open MIX`}
+        aria-label={`Master FX: ${count} effect${plural} live on the output. Open MIX`}
         title={`${count} effect${plural} on the master insert${takers > 0 ? ', some of which take level' : ''}. Open MIX.`}
         className="flex items-center gap-1.5 pl-2 pr-1.5 py-1 rounded-l border border-r-0 border-[rgb(var(--et-accent)/0.4)] bg-[rgb(var(--et-accent)/0.1)] text-[rgb(var(--et-accent))] hover:bg-[rgb(var(--et-accent)/0.2)] hover:border-[rgb(var(--et-accent)/0.7)] transition-colors shadow-[0_0_12px_rgb(var(--et-accent)/0.18)]"
       >
-        <Activity className="w-3 h-3" />
-        <span className="text-[9px] font-black uppercase tracking-widest">Master FX</span>
-        <span className="text-[9px] font-mono text-[rgb(var(--et-accent))]">{count}</span>
+        <Activity className="w-3.5 h-3.5 shrink-0" />
+        <span className="font-display font-bold text-xs leading-4 uppercase whitespace-nowrap">Master FX</span>
+        <span className="font-sans font-bold text-xs leading-4 tabular-nums">{count}</span>
       </button>
       <button
         type="button"
@@ -362,19 +386,21 @@ const MasterFxIndicator: React.FC = () => {
       {open && (
         <div
           id="master-fx-detail"
-          className="absolute bottom-full right-0 mb-2 w-64 flex flex-col gap-2 p-2.5 rounded-lg border border-[rgb(var(--et-accent)/0.3)] bg-[#0a080f] shadow-[0_0_24px_rgb(var(--et-accent)/0.2)]"
+          className="absolute bottom-full right-0 mb-2 w-72 flex flex-col gap-2 p-2.5 rounded-lg border border-[rgb(var(--et-accent)/0.3)] bg-[#0a080f] shadow-[0_0_24px_rgb(var(--et-accent)/0.2)]"
         >
-          <span className="text-[9px] font-black uppercase tracking-widest text-[rgb(var(--et-accent))]">On the master insert</span>
-          <p className="text-[10px] leading-snug text-zinc-400">
+          {/* Orbitron bold for the heading, the tags and the buttons; the bold
+              sans for the copy and the rows; nothing under 12px. */}
+          <span className="font-display font-bold text-xs leading-4 uppercase text-[rgb(var(--et-accent))]">On the master insert</span>
+          <p className="font-sans font-bold text-xs leading-4 text-zinc-400">
             These sit between the mix bus and the meter, so they shape everything the
             transport plays — in every tab, until they are switched off.
           </p>
           <ul className="flex flex-col gap-1">
             {entries.map((e) => (
               <li key={e.id} className="flex items-center justify-between gap-2">
-                <span className="text-[10px] text-zinc-200 truncate">{rackEntryLabel(e)}</span>
+                <span className="min-w-0 font-sans font-bold text-xs leading-4 text-zinc-200 truncate" title={rackEntryLabel(e)}>{rackEntryLabel(e)}</span>
                 {LEVEL_TAKING_RACK_IDS.has(e.effect) && (
-                  <span className="shrink-0 text-[8px] font-mono uppercase tracking-widest text-amber-300">takes level</span>
+                  <span className="shrink-0 font-display font-bold text-xs leading-4 uppercase whitespace-nowrap text-amber-300">takes level</span>
                 )}
               </li>
             ))}
@@ -383,14 +409,14 @@ const MasterFxIndicator: React.FC = () => {
             <button
               type="button"
               onClick={openMix}
-              className="flex-1 px-2 py-1 rounded border border-white/10 text-[9px] font-black uppercase tracking-widest text-zinc-300 hover:border-[rgb(var(--et-accent)/0.6)] hover:text-[rgb(var(--et-accent))] transition-colors"
+              className="flex-1 px-2 py-1 rounded border border-white/10 font-display font-bold text-xs leading-4 uppercase whitespace-nowrap text-zinc-300 hover:border-[rgb(var(--et-accent)/0.6)] hover:text-[rgb(var(--et-accent))] transition-colors"
             >
               Show in MIX
             </button>
             <button
               type="button"
               onClick={bypassLiveRack}
-              className="flex-1 px-2 py-1 rounded border border-[rgb(var(--et-accent)/0.4)] bg-[rgb(var(--et-accent)/0.1)] text-[9px] font-black uppercase tracking-widest text-[rgb(var(--et-accent))] hover:bg-[rgb(var(--et-accent)/0.2)] hover:border-[rgb(var(--et-accent)/0.7)] transition-colors"
+              className="flex-1 px-2 py-1 rounded border border-[rgb(var(--et-accent)/0.4)] bg-[rgb(var(--et-accent)/0.1)] font-display font-bold text-xs leading-4 uppercase whitespace-nowrap text-[rgb(var(--et-accent))] hover:bg-[rgb(var(--et-accent)/0.2)] hover:border-[rgb(var(--et-accent)/0.7)] transition-colors"
             >
               Bypass all
             </button>
@@ -404,86 +430,8 @@ const MasterFxIndicator: React.FC = () => {
 /** A quiet icon button in the footer's secondary row. */
 const iconButton = 'p-1.5 rounded-md text-zinc-500 hover:text-white hover:bg-white/5 transition-colors disabled:opacity-30 disabled:pointer-events-none';
 
-/**
- * A transport key on the matte plate: squared, flat, borderless. The plate's
- * own p-px/gap-px well is the grid between keys, so a key must NEVER carry a
- * border-white/N class — index.css floors any bordered button to
- * rgb(var(--et-border)) (a >= 3:1 line) and the hairline grid turns hard. The
- * plate must likewise never gain overflow-hidden or a clip-path: keyboard focus
- * is the scope's 2px ink outline (index.css), drawn OUTSIDE the key, which is
- * why a focused key only lifts itself above its neighbours (relative + z-10)
- * and adds no ring of its own.
- *
- * The OFF / ON / DEAD strings below are exclusive — each owns the key's bg and
- * text — because the scope's ink remaps are unlayered: a `disabled:` or
- * `hover:` utility stacked on `text-zinc-400` would lose to the remapped base
- * class, so state switches the whole string, never layers on top of it.
- */
-const transportKey = 'h-full w-8 flex flex-col items-center justify-center gap-0.5 rounded-none first:rounded-l-xs last:rounded-r-xs select-none transition-[color,box-shadow] duration-100 active:shadow-[inset_0_1px_2px_rgba(0,0,0,0.7)] focus-visible:relative focus-visible:z-10 disabled:pointer-events-none';
-/**
- * …at rest / toggle OFF: a 5% tile with a 1px etched top highlight (a hairline,
- * not a glow). `bg-white/5`, `text-zinc-400` and `hover:text-zinc-100` are
- * theme-remapped by UNLAYERED rules, which is why hover and press never use a
- * `hover:bg-*` / `active:bg-*` utility: a layered variant loses to the remapped
- * base fill and paints nothing. The hover fill is an inset box-shadow with a
- * 100px spread (a translucent layer over the tile, under the glyph) and the
- * press is the inset shade on the key string; shadows are never remapped.
- * `bg-white/4|6|8` are not remapped at all: never "tune" the tile to those.
- */
-const transportKeyOff = 'bg-white/5 text-zinc-400 hover:text-zinc-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.08),inset_0_0_0_100px_rgba(255,255,255,0.06)]';
-/**
- * …toggle ON: latched IN (inset shade, one tint step up) in the theme's accent
- * ink (`--et-accent`, editThemes.ts: the theme's own hue, or purple on a
- * neutral theme) — the glyph and legend take currentColor, so nothing else is
- * needed and no light is added. Hover brightens the whole key a step.
- */
-const transportKeyOn = 'bg-white/10 text-[rgb(var(--et-accent))] hover:brightness-110 shadow-[inset_0_1px_2px_rgba(0,0,0,0.6)] hover:shadow-[inset_0_1px_2px_rgba(0,0,0,0.6),inset_0_0_0_100px_rgba(255,255,255,0.04)]';
-/**
- * …disabled: the key keeps its cap — a dead START/END stays a tile in the grid,
- * not a hole — and only its glyph and legend dim, to 40 % of the live ink, so
- * the cue survives every theme (a fixed dead-ink hex read as live on the light
- * themes, and any zinc step is floored up to a live tier by the remaps).
- */
-const transportKeyDead = 'bg-white/5 text-zinc-400 [&>*]:opacity-40 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]';
-/**
- * The PLAY key: the plate's double-width key, one tint step lighter, primary
- * ink. `border-b` is always present (transparent at rest) so the playing edge
- * never shifts layout; neither border-b colour is in the scope's border-floor
- * list, so nothing floors it.
- */
-const transportPlayKey = 'h-full w-11 flex flex-col items-center justify-center gap-0.5 rounded-none select-none border-b transition-[color,box-shadow,border-color] duration-100 active:shadow-[inset_0_1px_2px_rgba(0,0,0,0.7)] focus-visible:relative focus-visible:z-10 disabled:pointer-events-none';
-const transportPlayRest = 'bg-white/10 text-zinc-100 border-b-transparent shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.1),inset_0_0_0_100px_rgba(255,255,255,0.08)]';
-/**
- * …while playing: the same fill and shadow, accent ink and a 1px etched accent
- * bottom edge (sitting 1px above the plate's own hairline) — the grammar of a
- * latched LOOP/RAND, so it reads across the room on the DJ/VJ tabs where this
- * key is the master transport. No glow.
- */
-const transportPlayOn = 'bg-white/10 text-[rgb(var(--et-accent))] hover:brightness-110 border-b-[rgb(var(--et-accent))] shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.1),inset_0_0_0_100px_rgba(255,255,255,0.06)]';
-const transportPlayDead = 'bg-white/10 text-zinc-100 [&>*]:opacity-40 border-b-transparent shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]';
-/**
- * The etched legend under each glyph. Decorative (aria-hidden — the key's
- * aria-label is its name, and the legend always sits inside that name: LOOP
- * in "Looping on", RAND in "Random order on"),
- * it inherits the key's ink, so rest / hover / ON / dead all flow through the
- * button's class. 8px has no scale token (the file already uses 9px and 10px).
- */
-const keyLabel = 'text-[8px] font-mono uppercase tracking-widest leading-none';
-
-/**
- * The four motion glyphs, hard-cornered (no rounded joins) so they read as one
- * engraved set at 14px — lucide's round joins go soft that small. Fill-only in
- * currentColor, so the key's ink, hover ink and ON accent flow straight in.
- */
-const Glyph: React.FC<{ d: string; className?: string }> = ({ d, className }) => (
-  <svg viewBox="0 0 14 14" fill="currentColor" aria-hidden="true" focusable="false" className={className}>
-    <path d={d} />
-  </svg>
-);
-const GLYPH_PLAY = 'M3 1.5 12.5 7 3 12.5Z';
-const GLYPH_PAUSE = 'M3 2h3v10H3zM8 2h3v10H8z';
-const GLYPH_TO_START = 'M2 2h2v10H2zM12 2 5 7l7 5z';
-const GLYPH_TO_END = 'M2 2l7 5-7 5zM10 2h2v10h-2z';
+/** The visible legend beside each picker in the audio-output panel: Orbitron bold at 12px. */
+const AUDIO_OUT_LEGEND = 'font-display font-bold text-xs leading-4 uppercase text-zinc-400 shrink-0';
 
 export const PlayerFooter: React.FC = () => {
   const [isLiked, setIsLiked] = useState(false);
@@ -695,6 +643,10 @@ export const PlayerFooter: React.FC = () => {
   const startDisabled = !inEditorMode && !hasTrack;
   const playDisabled = !isVjMode && !inEditorMode && !hasTrack;
 
+  // The now-playing chip: the model that made the last output, LIBRARY for a
+  // loaded entry, IDLE for nothing.
+  const nowChip = lastModelName ? lastModelName.toUpperCase() : (displayLabel ? 'LIBRARY' : 'IDLE');
+
   return (
     <footer
       className="edit-theme-scope fixed bottom-0 left-0 right-0 h-16 bg-[#0a080f]/95 backdrop-blur-xl border-t border-white/5 z-50 flex flex-col group"
@@ -712,27 +664,37 @@ export const PlayerFooter: React.FC = () => {
           because only a grid keeps the two side tracks equal with padding
           inside them: as a flex-1 pair, section 1's 144px orb clearance made it
           144px wider and pushed PLAY 72px right of the window centre. */}
-      <div className="flex-1 min-h-0 grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-4 px-6 pb-0.5">
+      <div className="flex-1 min-h-0 grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 xl:gap-4 px-4 xl:px-6 pb-0.5">
         {/* 1. Orb speech bubble + Now Playing, in the left track. The orb
             sticks to the bottom-left corner and overlaps the footer, so pad left
             past it: 16px margin + the 112px orb = 128, plus clearance. */}
         <div className="flex items-center gap-3 min-w-0 pl-36">
-          {/* The orb's speech bubble, in the slot G-Search used to hold. */}
-          <OrbTipBubble className="hidden xl:block" />
+          {/* The orb's speech bubble, in the slot G-Search used to hold, from xl
+              up. 192px below 2xl and 224px from 2xl: beside the 276px transport
+              plate, 192px at 1280px still leaves the now-playing block room for
+              its title and a LIBRARY chip row. */}
+          <OrbTipBubble className="hidden xl:block" widthClass="w-48 2xl:w-56" />
           <div className="flex flex-col min-w-0 flex-1 gap-0.5">
             <h4 className="text-[13px] font-bold text-zinc-100 truncate tracking-tight leading-tight">
               {displayLabel ?? 'No output loaded'}
             </h4>
-            <div className="flex items-center gap-2">
-              <span className="text-[9px] text-[rgb(var(--et-accent))] font-mono uppercase tracking-widest border border-[rgb(var(--et-accent)/0.25)] px-1 rounded-xs bg-[rgb(var(--et-accent)/0.06)]">
-                {lastModelName ? lastModelName.toUpperCase() : (displayLabel ? 'LIBRARY' : 'IDLE')}
+            {/* One line at every width: the chip gives way first and ends in an
+                ellipsis (its whole name is its title); the duration and the VJ
+                chip keep their width. No sample rate: the engine plays whatever
+                rate the file carries. */}
+            <div className="flex items-center gap-2 min-w-0 whitespace-nowrap">
+              <span
+                title={nowChip}
+                className="min-w-0 truncate font-display font-bold text-xs leading-4 uppercase text-[rgb(var(--et-accent))] border border-[rgb(var(--et-accent)/0.25)] px-1 rounded-xs bg-[rgb(var(--et-accent)/0.06)]"
+              >
+                {nowChip}
               </span>
-              <span className="text-[10px] text-zinc-500 font-mono">
-                {displayDuration > 0 ? `${formatDuration(displayDuration)} // 48kHz` : '--:-- // 48kHz'}
+              <span className="shrink-0 font-sans font-bold text-xs leading-4 tabular-nums text-zinc-400">
+                {displayDuration > 0 ? formatDuration(displayDuration) : '--:--'}
               </span>
               {isVjMode && vjSetCount > 0 && (
                 <span
-                  className={`flex items-center gap-1 px-1.5 py-0.5 rounded border text-[9px] font-mono uppercase tracking-widest shrink-0 ${
+                  className={`flex items-center gap-1 px-1.5 rounded border font-display font-bold text-xs leading-4 uppercase shrink-0 ${
                     vjSetAcked
                       ? 'border-emerald-500/40 bg-emerald-500/5 text-emerald-300'
                       : 'border-amber-500/40 bg-amber-500/5 text-amber-300'
@@ -749,7 +711,12 @@ export const PlayerFooter: React.FC = () => {
               )}
             </div>
           </div>
-          <div className="flex items-center gap-0.5 ml-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+          {/* Like and Share, on footer hover or keyboard focus, at every width.
+              At rest the pair is 0px wide and its -ml-3 cancels the row gap, so
+              the now-playing block keeps that room; hover or focus opens it,
+              and its overflow turns visible with it so a focused key's outline
+              is never clipped. Both keys stay in the tab order throughout. */}
+          <div className="flex shrink-0 items-center gap-0.5 w-0 -ml-3 overflow-hidden opacity-0 transition-opacity group-hover:w-auto group-hover:ml-1 group-hover:overflow-visible group-hover:opacity-100 focus-within:w-auto focus-within:ml-1 focus-within:overflow-visible focus-within:opacity-100">
             <button
               type="button"
               onClick={() => setIsLiked(!isLiked)}
@@ -765,18 +732,17 @@ export const PlayerFooter: React.FC = () => {
           </div>
         </div>
 
-        {/* 2. Transport — one matte plate: LOOP · START · PLAY · END · RAND on a
-            hairline grid (the plate's p-px/gap-px well IS the grid; keys carry
-            no borders or the theme floors them to a 3:1 line). 2+2 about PLAY
-            so the flex-1 side sections keep it on the viewport centre. The
-            playhead is in the strip above. Fullscreen lives in the top bar
-            beside Mobile — an even key count is what keeps PLAY dead centre. The
-            wrapper is a div, so its border-white/8 stays a hairline (the scope's
-            button border floor never touches it), and `bg-black/40` /
-            `border-white/8` are both theme-remapped. Never give it
-            overflow-hidden or a clip-path: the keys' focus outline draws
-            outside them. */}
-        <div data-tour="transport" className="shrink-0 flex items-stretch h-9 p-px gap-px rounded-xs border border-white/8 bg-black/40 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
+        {/* 2. Transport — one matte plate (transportPlate): LOOP · START · PLAY ·
+            END · RAND on a hairline grid (the plate's p-px/gap-px well IS the
+            grid; keys carry no borders or the theme floors them to a 3:1 line).
+            2+2 about PLAY so the flex-1 side sections keep it on the viewport
+            centre, and the keys pair up in width about PLAY (w-12 · w-14 · w-15
+            · w-14 · w-12) so PLAY stays on the plate's centre too. Each width
+            is its widest legend at 12px Orbitron bold plus about 4px a side:
+            RAND 39.9px, START 48.1px, PAUSE 48.6px. The playhead is in the
+            strip above. Fullscreen lives in the top bar beside Mobile — an even
+            key count is what keeps PLAY dead centre. */}
+        <div data-tour="transport" className={`shrink-0 ${transportPlate}`}>
           {/* Three states, one key: off -> the list plays through and stops,
               all -> the list wraps, one -> this track repeats. aria-pressed is
               deliberately absent: a tri-state control is not a toggle, so the
@@ -786,7 +752,7 @@ export const PlayerFooter: React.FC = () => {
             onClick={cycleRepeat}
             aria-label={REPEAT_LABEL[repeatMode]}
             title={`${REPEAT_LABEL[repeatMode]} - click to change`}
-            className={`${transportKey} ${repeatMode === 'off' ? transportKeyOff : transportKeyOn}`}
+            className={`${transportKey} w-12 ${repeatMode === 'off' ? transportKeyOff : transportKeyOn}`}
           >
             {repeatMode === 'one' ? (
               <Repeat1 className="w-3.5 h-3.5" strokeWidth={1.5} absoluteStrokeWidth strokeLinecap="square" strokeLinejoin="miter" />
@@ -801,7 +767,7 @@ export const PlayerFooter: React.FC = () => {
             disabled={startDisabled}
             aria-label="Jump to start"
             title="Jump to start"
-            className={`${transportKey} ${startDisabled ? transportKeyDead : transportKeyOff}`}
+            className={`${transportKey} w-14 ${startDisabled ? transportKeyDead : transportKeyOff}`}
           >
             <Glyph d={GLYPH_TO_START} className="w-3.5 h-3.5" />
             <span aria-hidden="true" className={keyLabel}>START</span>
@@ -812,7 +778,7 @@ export const PlayerFooter: React.FC = () => {
             disabled={playDisabled}
             aria-label={displayIsPlaying ? 'Pause' : 'Play'}
             title={displayIsPlaying ? 'Pause' : 'Play'}
-            className={`${transportPlayKey} ${playDisabled ? transportPlayDead : displayIsPlaying ? transportPlayOn : transportPlayRest}`}
+            className={`${transportPlayKey} w-15 ${playDisabled ? transportPlayDead : displayIsPlaying ? transportPlayOn : transportPlayRest}`}
           >
             {displayIsPlaying
               ? <Glyph d={GLYPH_PAUSE} className="w-4 h-4" />
@@ -827,7 +793,7 @@ export const PlayerFooter: React.FC = () => {
             disabled={!hasTrack}
             aria-label="Jump to end"
             title="Jump to end"
-            className={`${transportKey} ${hasTrack ? transportKeyOff : transportKeyDead}`}
+            className={`${transportKey} w-14 ${hasTrack ? transportKeyOff : transportKeyDead}`}
           >
             <Glyph d={GLYPH_TO_END} className="w-3.5 h-3.5" />
             <span aria-hidden="true" className={keyLabel}>END</span>
@@ -835,10 +801,10 @@ export const PlayerFooter: React.FC = () => {
           <button
             type="button"
             onClick={() => setIsShuffle((v) => !v)}
-            aria-label={isShuffle ? 'Random order on' : 'Random order off'}
+            aria-label="Rand: random order"
             aria-pressed={isShuffle}
-            title="Random order: any other library track plays next"
-            className={`${transportKey} ${isShuffle ? transportKeyOn : transportKeyOff}`}
+            title={`Rand: random order ${isShuffle ? 'on' : 'off'} - any other library track plays next`}
+            className={`${transportKey} w-12 ${isShuffle ? transportKeyOn : transportKeyOff}`}
           >
             <Shuffle className="w-3.5 h-3.5" strokeWidth={1.5} absoluteStrokeWidth strokeLinecap="square" strokeLinejoin="miter" />
             <span aria-hidden="true" className={keyLabel}>RAND</span>
@@ -851,9 +817,10 @@ export const PlayerFooter: React.FC = () => {
           {/* Up Next — mirror of the Now Playing block, right-aligned. Click loads
               the next track (no formal queue yet, so it's the next library entry —
               or a random other one while RAND is on, which the title says).
-              Hidden below xl: at 1024px the right track is 382px and the
-              utilities alone take 340 of them, so at lg it collapsed to 0px and
-              its second row spilled over the plate. */}
+              Hidden below xl: there the right track is all the utilities' (at
+              the desktop app's 960px minimum it is 318px, the utilities 312px),
+              and at lg it once collapsed to 0px and its second row spilled over
+              the plate. */}
           <button
             type="button"
             onClick={loadNext}
@@ -864,21 +831,25 @@ export const PlayerFooter: React.FC = () => {
             <h4 className="text-[13px] font-bold text-zinc-300 group-hover/next:text-white transition-colors truncate tracking-tight leading-tight w-full">
               {nextEntry?.title ?? 'Nothing queued'}
             </h4>
-            <div className="flex items-center gap-2">
-              <span className="text-[10px] text-zinc-500 font-mono">
+            <div className="flex items-center gap-2 whitespace-nowrap">
+              <span className="shrink-0 font-sans font-bold text-xs leading-4 tabular-nums text-zinc-400">
                 {nextEntry ? formatDuration(nextEntry.duration) : '--:--'}
               </span>
-              <span className="text-[9px] text-emerald-400 font-mono uppercase tracking-widest border border-emerald-500/20 px-1 rounded-xs bg-emerald-500/5">
+              <span className="shrink-0 font-display font-bold text-xs leading-4 uppercase text-emerald-400 border border-emerald-500/20 px-1 rounded-xs bg-emerald-500/5">
                 Up Next
               </span>
             </div>
           </button>
           {/* Left to right: download and more options, then the output (the
-              master FX pill, the output device, mute + volume), then CREATE.
-              The two indicators stay beside the volume control because that is
-              where the symptom they account for shows. Fullscreen is in the top
-              bar, beside Mobile. */}
-          <div className="flex items-center gap-4 shrink-0">
+              master FX pill, the output device, mute + volume), then the action
+              key. The two indicators stay beside the volume control because
+              that is where the symptom they account for shows. Fullscreen is in
+              the top bar, beside Mobile. Below 2xl the gaps close to 8px and the
+              volume track to 64px (312px of utilities, 384px at 2xl): that keeps
+              them inside the right track beside the 276px transport plate from
+              the desktop app's 960px minimum, and leaves Up Next room for its
+              title and chip row from xl. */}
+          <div className="flex items-center gap-2 2xl:gap-4 shrink-0">
             <div className="flex items-center gap-1">
               <button
                 type="button"
@@ -911,15 +882,18 @@ export const PlayerFooter: React.FC = () => {
                 {isMuted || volume === 0 ? <VolumeX className="w-4 h-4 text-red-400" /> : <Volume2 className="w-4 h-4" />}
               </button>
               <SlideTrack min={0} max={100} step={1} value={volume}
-                onChange={(v) => setVolume(v)} className="w-24" ariaLabel="Volume" />
+                onChange={(v) => setVolume(v)} className="w-16 2xl:w-24" ariaLabel="Volume" />
             </div>
 
             <div className="h-6 w-px bg-white/5" />
 
-            {/* The workspace action button (CREATE / PROCESS / TRAIN / …) — lives
-                at the footer's bottom-right on EVERY tab. Rounded 2×1, sized to
-                sit inside the 48px row. */}
-            <div data-tour="action-button" className="shrink-0 w-20 h-10">
+            {/* The workspace action key (CREATE / PROCESS / TRAIN / STOP / CHAIN
+                / SEND) — at the footer's bottom-right on EVERY tab, alone on a
+                matte plate the transport's height (transportPlate). The plate
+                is 80px: its key is 76px inside, and PROCESS, the widest legend,
+                is 68.2px at 12px Orbitron bold. The plate is `relative` for
+                CREATE's stage caption, which hangs over its top edge. */}
+            <div data-tour="action-button" className={`relative shrink-0 w-20 ${transportPlate}`}>
               <LogActionButton />
             </div>
           </div>

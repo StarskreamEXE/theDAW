@@ -773,11 +773,11 @@ export const MidiPanel: React.FC = () => {
                   label="Microphone input"
                   legend="Input"
                   showLabel
-                  labelClassName="text-[8px] font-mono uppercase tracking-widest et-ink-3"
-                  className="w-full max-w-none text-[10px]"
+                  labelClassName="font-display font-bold text-xs leading-4 uppercase et-ink-3"
+                  className="w-full max-w-none"
                 />
                 {micPerm === 'denied' && (
-                  <span className="text-[9px] font-mono text-red-300">mic blocked</span>
+                  <span className="font-sans font-bold text-xs leading-4 text-red-300">mic blocked</span>
                 )}
               </DockFlyout>
 
