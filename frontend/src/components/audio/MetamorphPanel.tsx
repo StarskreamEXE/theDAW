@@ -132,26 +132,26 @@ export function MetamorphPanel() {
     <div className="flex flex-col gap-2.5">
       <div className="grid grid-cols-2 gap-2">
         <div className="flex flex-col gap-1">
-          <label htmlFor="morph-donor" className="text-[9px] font-mono text-zinc-500">Donor A (identity)</label>
+          <label htmlFor="morph-donor" className="font-sans text-xs font-bold text-zinc-400">Donor A (identity)</label>
           <select
             id="morph-donor"
             name="morph-donor"
             value={aId ?? ''}
             onChange={pick('a')}
-            className="form-select px-2 py-1 text-[11px] font-mono"
+            className="form-select px-2 py-1 font-sans text-xs font-bold"
             style={{ colorScheme: 'dark' }}
           >
             <SourceOptions />
           </select>
         </div>
         <div className="flex flex-col gap-1">
-          <label htmlFor="morph-host" className="text-[9px] font-mono text-zinc-500">Host B (structure)</label>
+          <label htmlFor="morph-host" className="font-sans text-xs font-bold text-zinc-400">Host B (structure)</label>
           <select
             id="morph-host"
             name="morph-host"
             value={bId ?? ''}
             onChange={pick('b')}
-            className="form-select px-2 py-1 text-[11px] font-mono"
+            className="form-select px-2 py-1 font-sans text-xs font-bold"
             style={{ colorScheme: 'dark' }}
           >
             <SourceOptions />
@@ -159,12 +159,12 @@ export function MetamorphPanel() {
         </div>
       </div>
 
-      <div className="flex items-center gap-3">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
         <button
           onClick={() => (playing ? stop() : void play())}
           disabled={!ready}
           aria-label={playing ? 'Stop the morph' : 'Play the morph'}
-          className={`flex items-center gap-1.5 px-2.5 py-1 rounded border text-[10px] font-mono uppercase tracking-wider transition-colors disabled:opacity-30 disabled:pointer-events-none
+          className={`flex items-center gap-1.5 px-2.5 py-1 rounded border font-display text-xs font-bold uppercase tracking-wider transition-colors disabled:opacity-30 disabled:pointer-events-none
             ${playing ? 'bg-purple-500/30 border-purple-500/50 text-purple-200' : 'border-purple-500/30 text-purple-300 hover:bg-purple-500/10'}`}
         >
           {playing ? <Square className="w-3 h-3 fill-current" /> : <Play className="w-3 h-3 fill-current" />}
@@ -175,13 +175,13 @@ export function MetamorphPanel() {
           disabled={!ready || sending}
           aria-label="Render the morph and add it to the timeline"
           title="Render one pass and drop it on a new track as an ordinary clip"
-          className="flex items-center gap-1.5 px-2.5 py-1 rounded border border-white/10 text-[10px] font-mono uppercase tracking-wider text-zinc-300 hover:bg-white/5 transition-colors disabled:opacity-30 disabled:pointer-events-none"
+          className="flex items-center gap-1.5 px-2.5 py-1 rounded border border-white/10 font-display text-xs font-bold uppercase tracking-wider text-zinc-300 hover:bg-white/5 transition-colors disabled:opacity-30 disabled:pointer-events-none"
         >
           <Download className={`w-3 h-3 ${sending ? 'animate-pulse' : ''}`} />
           {sending ? 'Rendering…' : 'Send to editor'}
         </button>
-        <span className="text-[9px] font-mono text-zinc-500 tabular-nums">{fmt(posSec)} / {fmt(durSec)}</span>
-        <span className="text-[9px] font-mono text-zinc-600">
+        <span className="font-sans text-xs font-bold text-zinc-400 tabular-nums">{fmt(posSec)} / {fmt(durSec)}</span>
+        <span className="font-sans text-xs font-bold text-zinc-500">
           {status === 'loading' ? 'loading…' : status === 'error' ? 'load failed' : ready ? '' : 'pick A + B'}
         </span>
       </div>
@@ -193,7 +193,7 @@ export function MetamorphPanel() {
           const decimals = p.step < 0.1 ? (p.step < 0.01 ? 3 : 2) : 0;
           return (
             <div key={p.key} className="flex items-center gap-2">
-              <span id={labelId} className="text-[9px] font-mono text-zinc-500 w-12 shrink-0">{p.label}</span>
+              <span id={labelId} className="font-sans text-xs font-bold text-zinc-400 w-12 shrink-0">{p.label}</span>
               <SlideTrack
                 value={v}
                 min={p.min}
@@ -203,7 +203,7 @@ export function MetamorphPanel() {
                 className="flex-1"
                 onChange={(nv) => setParam(p.key, nv)}
               />
-              <span className="text-[9px] font-mono text-zinc-400 w-14 shrink-0 text-right tabular-nums">
+              <span className="font-sans text-xs font-bold text-zinc-300 w-16 shrink-0 text-right tabular-nums">
                 {v.toFixed(decimals)}{p.unit ? ` ${p.unit}` : ''}
               </span>
             </div>

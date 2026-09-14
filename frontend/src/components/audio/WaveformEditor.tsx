@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
+import { createPortal, flushSync } from 'react-dom';
 import {
   Scissors, Play, Square, ZoomIn, ZoomOut,
   Magnet, Trash2, Move, Plus, Volume2, Upload, Save, Piano, Paintbrush, X, Wand2, Layers,
@@ -66,7 +66,9 @@ import { useDjAnalysisStore } from '../../state/djAnalysisStore';
 import { ContextMenu, useContextMenu, type ContextMenuItem, type ContextMenuPosition } from '../ui/ContextMenu';
 import { SurfacePlayKey } from '../ui/SurfacePlayKey';
 import { StemsRunModal, type StemsRunOptions } from '../library/StemsRunModal';
-import { EffectWindowsHost, FxChainList, openEffectWindow, type FxScope } from './EffectWindows';
+import { EffectWindowsHost, FxChainList, openEffectWindow, type EffectWindowOrigin, type FxScope } from './EffectWindows';
+import { browserPopoverEnv, popoverMaxHeight, sameLayout, watchPopover, type PopoverLayout } from '../../lib/popoverPlacement';
+import { useTrackFxRackStore, type TrackFxRackAnchor } from '../../state/trackFxRackStore';
 import { ensureStems } from '../../lib/djStems';
 import { useFeatureToggleStore } from '../../state/featureToggleStore';
 import { SurfaceAudio } from './IoDeviceSelect';
@@ -293,45 +295,56 @@ const MidiClipNotes: React.FC<{ clip: AudioClip; zoom: number; selected: boolean
  * Floating popover portaled to document.body, mirroring ContextMenu's pattern:
  * the Shell scales the DAW with CSS `zoom` (`.dense-layout`), so a fixed panel
  * rendered INSIDE the zoomed tree drifts away from raw clientX/Y anchors. The
- * body portal escapes the zoom, so the coords land at the click. After mount
- * we measure the panel and nudge it to stay inside the viewport (right/bottom
- * edge clicks would overflow otherwise). When no coords are given the panel
- * renders at `anchorClassName` (the legacy fixed position) instead.
+ * body portal escapes the zoom, so the coords land at the click. The panel is
+ * laid out inside the window and above the transport footer (watchPopover)
+ * when it opens, again whenever its own size changes (a rack gaining rows),
+ * and again when the window resizes, so no edge runs off screen or over the
+ * transport as the content grows. Its max-height is that room less the edge
+ * gaps, and it scrolls inside itself past that. When no coords are given the
+ * panel renders at `anchorClassName` (the legacy fixed position) instead.
  */
 const PopoverPortal: React.FC<{
   x?: number;
   y?: number;
   anchorClassName?: string;
   className: string;
+  /** The panel's design max-height as a CSS length (`70vh`). The window's
+   *  height less the edge gaps caps it either way. */
+  maxHeight?: string;
   /** Optional external ref (outside-click dismissal needs the panel node). */
   innerRef?: React.RefObject<HTMLDivElement | null>;
   children: React.ReactNode;
-}> = ({ x, y, anchorClassName = '', className, innerRef, children }) => {
+}> = ({ x, y, anchorClassName = '', className, maxHeight, innerRef, children }) => {
   const localRef = useRef<HTMLDivElement | null>(null);
   const ref = innerRef ?? localRef;
   const hasCoords = x != null && y != null;
-  const [adjusted, setAdjusted] = useState<{ x: number; y: number } | null>(null);
+  const [layout, setLayout] = useState<PopoverLayout | null>(null);
   useLayoutEffect(() => {
-    if (x == null || y == null || !ref.current) {
-      setAdjusted(null);
+    const el = ref.current;
+    if (x == null || y == null || !el) {
+      setLayout(null);
       return;
     }
-    const rect = ref.current.getBoundingClientRect();
-    const pad = 8;
-    let nx = x;
-    let ny = y;
-    if (nx + rect.width + pad > window.innerWidth) nx = Math.max(pad, window.innerWidth - rect.width - pad);
-    if (ny + rect.height + pad > window.innerHeight) ny = Math.max(pad, window.innerHeight - rect.height - pad);
-    setAdjusted((prev) => (prev && prev.x === nx && prev.y === ny ? prev : { x: nx, y: ny }));
+    const keep = (next: PopoverLayout) => setLayout((prev) => (prev && sameLayout(prev, next) ? prev : next));
+    // Size changes are reported after layout; flushSync renders the new spot
+    // before that frame paints, so a grown panel never shows past the edge.
+    return watchPopover({ x, y }, browserPopoverEnv(el), (next, initial) => {
+      if (initial) keep(next);
+      else flushSync(() => keep(next));
+    });
   }, [x, y, ref]);
   // While measuring (first paint) the panel renders off-screen, exactly like
   // ContextMenu, so the un-clamped position never flashes.
-  const shown = hasCoords ? adjusted ?? { x: -9999, y: -9999 } : null;
+  const shown = hasCoords ? layout ?? { x: -9999, y: -9999 } : null;
   return createPortal(
     <div
       ref={ref}
       className={`${className}${shown ? '' : ` ${anchorClassName}`}`}
-      style={shown ? { left: shown.x, top: shown.y } : undefined}
+      style={{
+        maxHeight: popoverMaxHeight(hasCoords ? layout?.maxHeight ?? null : null, maxHeight),
+        overflowY: 'auto',
+        ...(shown ? { left: shown.x, top: shown.y } : {}),
+      }}
     >
       {children}
     </div>,
@@ -731,6 +744,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const removeClip = useEditorStore((s) => s.removeClip);
   const splitClipAt = useEditorStore((s) => s.splitClipAt);
   const cachePeaks = useEditorStore((s) => s.cachePeaks);
+  const applyClipRender = useEditorStore((s) => s.applyClipRender);
   const addClipToTrack = useEditorStore((s) => s.addClipToTrack);
   const snapSec = useEditorStore((s) => s.snapSec);
   const getTotalDurationSec = useEditorStore((s) => s.getTotalDurationSec);
@@ -937,6 +951,8 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const containerRef = useRef<HTMLDivElement>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
   const trackHeaderScrollRef = useRef<HTMLDivElement>(null);
+  /** The track header column; the FX rack opens clear of it. */
+  const trackHeaderColRef = useRef<HTMLDivElement>(null);
   const opRef = useRef<PointerOp | null>(null);
   const inpaintDragRef = useRef<{ clipId: string; anchorSec: number } | null>(null);
   const previewSourceRef = useRef<AudioBufferSourceNode | null>(null);
@@ -962,7 +978,22 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   // Per-track FX rack popover. x/y anchor it at the opening click (clip FX
   // button, track-header F, context menu); both undefined falls back to the
   // legacy right-4 top-28 position.
-  const [fxPanel, setFxPanel] = useState<{ trackId: string; x?: number; y?: number } | null>(null);
+  // The rack lives in its own store, which closes it when its lane leaves the
+  // arrangement, so undoing a lane's removal never reopens the lane's rack.
+  const fxPanel = useTrackFxRackStore((s) => s.rack);
+  const openFxRack = useTrackFxRackStore((s) => s.open);
+  const toggleFxRack = useTrackFxRackStore((s) => s.toggle);
+  const closeFxRack = useTrackFxRackStore((s) => s.close);
+  // Leaving EDIT closes the rack.
+  useEffect(() => () => useTrackFxRackStore.getState().close(), []);
+  /** The rack's anchor for a click at (x, y): at the click, moved right of the
+   *  track header column so every lane's header controls, its F button among
+   *  them, stay clickable while the rack is open. */
+  const fxRackAnchor = (trackId: string, x?: number, y?: number): TrackFxRackAnchor => {
+    if (x == null || y == null) return { trackId };
+    const headerRight = trackHeaderColRef.current?.getBoundingClientRect().right ?? 0;
+    return { trackId, x: Math.max(x, Math.round(headerRight) + 8), y };
+  };
   // Open a VST entry's REAL native GUI; the sink stores the captured raw_state
   // on the right chain (a track's fxChain or the master VST chain).
   const openVstEditor = (entry: ChainEntry, sink: (entryId: string, rawState: string) => void) =>
@@ -982,7 +1013,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   // window; VST entries also (re)open their native GUI, 'ares' takes the
   // one app-wide surface. One window per effect — reopening focuses.
   const openEntryWindow = useCallback(
-    (scope: FxScope, entry: ChainEntry) => openEffectWindow(scope, entry, openVstFor),
+    (scope: FxScope, entry: ChainEntry, origin?: EffectWindowOrigin) => openEffectWindow(scope, entry, openVstFor, origin),
     [openVstFor],
   );
   // Clicking an available plugin adds it to the right chain (once) AND opens
@@ -1205,12 +1236,13 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       // Re-read: the user may have deleted or re-assigned the clip mid-render.
       const live = useEditorStore.getState().clips.find((c) => c.id === clipId);
       if (!live || effectiveProgramFor(live) !== program) return;
-      updateClip(clipId, { audioBlob: rendered.blob, mimeType: 'audio/wav', renderedProgram: program });
-      cachePeaks(clipId, peaks);
+      // Derived audio, so no undo step: undo restores clips whose bounce is
+      // stale, and this write then follows the undo with the redo stack intact.
+      applyClipRender(clipId, { audioBlob: rendered.blob, mimeType: 'audio/wav', renderedProgram: program }, peaks);
     } catch (e) {
       logError('editor', `Instrument re-render failed for "${clip.label}": ${e instanceof Error ? e.message : String(e)}`);
     }
-  }, [cachePeaks, effectiveProgramFor, updateClip]);
+  }, [applyClipRender, effectiveProgramFor]);
 
   // Keep every MIDI clip's bounced audio in step with its instrument. Covers clip
   // overrides, track defaults and the global picker in one place, so no individual
@@ -3415,7 +3447,9 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         try {
           const rendered = await renderStepNotesToBlob(notes, bpm, totalSteps, { program });
           const { peaks } = await computePeaks(rendered.blob, 240);
-          updateClip(clipId, {
+          // The bounce is derived from the clip's notes, so it adds no undo step
+          // of its own (see applyClipRender).
+          applyClipRender(clipId, {
             audioBlob: rendered.blob,
             mimeType: 'audio/wav',
             sourceDuration: rendered.duration,
@@ -3423,8 +3457,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             // Record what this bounce actually contains so the instrument-sync
             // effect doesn't immediately re-render a clip that is already correct.
             renderedProgram: program,
-          });
-          cachePeaks(clipId, peaks);
+          }, peaks);
           logInfo('editor', `MIDI audio ready for "${label}" in ${(performance.now() - started).toFixed(0)}ms`);
         } catch (renderErr) {
           logError('editor', `MIDI audio render failed for "${label}": ${renderErr instanceof Error ? renderErr.message : String(renderErr)}`);
@@ -3433,7 +3466,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     } catch (err) {
       logError('editor', `Add MIDI failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-  }, [addTrack, addClipToTrack, cachePeaks, updateClip]);
+  }, [addTrack, addClipToTrack, applyClipRender]);
 
   /* -- "Add to track" ------------------------------------------------------
      One dispatcher behind the timeline menu, the track-header menu and the two
@@ -3817,7 +3850,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             onClick={() => setShowMasterFx((v) => !v)}
             aria-pressed={showMasterFx}
             aria-label="Master FX"
-            className={`flex items-center gap-1.5 p-1 px-2 rounded border transition-colors text-[9px] font-mono uppercase tracking-wider
+            className={`flex items-center gap-1.5 p-1 px-2 rounded border transition-colors font-display text-xs font-bold uppercase tracking-wider
               ${showMasterFx || masterFxChain.length + masterVstChain.length > 0 ? 'bg-purple-600/20 border-purple-500/40 text-purple-300' : 'border-white/5 text-zinc-500 hover:text-white hover:bg-white/5'}`}
             title="Master FX — built-in effects, VST3s and control surfaces in one chain; click an entry to open its control window"
           >
@@ -3837,7 +3870,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             aria-expanded={!!toolsMenu}
             aria-label="Generative tools"
             title="Generative tools — Magenta RT2, Metamorph"
-            className={`flex items-center gap-1.5 p-1 px-2 rounded border transition-colors text-[9px] font-mono uppercase tracking-wider
+            className={`flex items-center gap-1.5 p-1 px-2 rounded border transition-colors font-display text-xs font-bold uppercase tracking-wider
               ${magentaTool || showMetamorph ? 'bg-cyan-600/20 border-cyan-500/40 text-cyan-300' : 'border-white/5 text-zinc-500 hover:text-white hover:bg-white/5'}`}
           >
             <Wand2 className="w-3 h-3" /> TOOLS <ChevronDown className="w-2.5 h-2.5" />
@@ -3927,7 +3960,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
           {showMasterFx && (
             <section aria-label="Master FX" className="w-90 max-h-[70vh] overflow-y-auto hardware-card bg-black/90 border border-purple-500/30 rounded-lg shadow-2xl shadow-purple-900/40 p-3 flex flex-col gap-2">
               <div className="flex items-center justify-between gap-2 border-b border-white/10 pb-2">
-                <span className="text-[10px] font-mono uppercase tracking-wider text-purple-300">Master FX</span>
+                <span className="font-display text-xs font-bold uppercase tracking-wider text-purple-300">Master FX</span>
                 <button
                   onClick={() => setShowMasterFx(false)}
                   aria-label="Close master FX"
@@ -3961,14 +3994,14 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
               <div className="flex items-center gap-1.5 border-t border-white/10 pt-2">
                 <button
                   onClick={enterLiveMode}
-                  className={`flex-1 inline-flex items-center justify-center gap-1 px-2 py-1 rounded border text-[9px] font-black uppercase tracking-widest transition-colors ${previewMode === 'live' ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-100' : 'border-white/10 text-zinc-400 hover:bg-white/5'}`}
+                  className={`flex-1 inline-flex items-center justify-center gap-1 px-2 py-1 rounded border font-display text-xs font-bold uppercase tracking-wider transition-colors ${previewMode === 'live' ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-100' : 'border-white/10 text-zinc-400 hover:bg-white/5'}`}
                 >
                   <Play className="w-3 h-3" /> Live
                 </button>
                 <button
                   onClick={() => void enterFrozenMode()}
                   disabled={masterVstChain.length === 0 || clips.length === 0 || isFreezing}
-                  className={`flex-1 inline-flex items-center justify-center gap-1 px-2 py-1 rounded border text-[9px] font-black uppercase tracking-widest transition-colors disabled:opacity-40 ${previewMode === 'frozen' ? 'border-cyan-500/50 bg-cyan-500/15 text-cyan-100' : 'border-white/10 text-zinc-400 hover:bg-white/5'}`}
+                  className={`flex-1 inline-flex items-center justify-center gap-1 px-2 py-1 rounded border font-display text-xs font-bold uppercase tracking-wider transition-colors disabled:opacity-40 ${previewMode === 'frozen' ? 'border-cyan-500/50 bg-cyan-500/15 text-cyan-100' : 'border-white/10 text-zinc-400 hover:bg-white/5'}`}
                 >
                   {isFreezing ? <Loader2 className="w-3 h-3 animate-spin" /> : <Snowflake className="w-3 h-3" />} Frozen
                 </button>
@@ -3977,14 +4010,14 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                 <button
                   onClick={() => void reRenderFrozen()}
                   disabled={isFreezing || !frozenStale}
-                  className="btn-ghost inline-flex items-center justify-center gap-1.5 disabled:opacity-40"
+                  className="btn-ghost inline-flex items-center justify-center gap-1.5 font-sans text-xs font-bold disabled:opacity-40"
                   title={frozenStale ? 'Re-render the master through the VST chain' : 'Frozen render is up to date'}
                 >
                   {isFreezing ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
                   {frozenStale ? 'Re-render (stale)' : 'Up to date'}
                 </button>
               )}
-              <p className="text-[8px] text-zinc-600 leading-relaxed">
+              <p className="font-sans text-xs font-bold text-zinc-500 leading-relaxed">
                 VST3 entries apply to the rendered master: Live plays the realtime mix (built-in rack only); Frozen plays the VST-processed render and re-renders after edits.
               </p>
             </section>
@@ -3992,8 +4025,8 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
           {showMetamorph && (
             <section aria-label="Metamorph" className="w-90 max-h-[70vh] overflow-y-auto hardware-card bg-black/90 border border-purple-500/30 rounded-lg shadow-2xl shadow-purple-900/40 p-3 flex flex-col gap-2">
               <div className="flex items-center justify-between gap-2 border-b border-white/10 pb-2">
-                <span className="text-[10px] font-mono uppercase tracking-wider text-purple-300">
-                  Metamorph <span className="text-zinc-600 normal-case tracking-normal">granular identity bleed</span>
+                <span className="font-display text-xs font-bold uppercase tracking-wider text-purple-300">
+                  Metamorph <span className="font-sans text-zinc-500 normal-case tracking-normal">granular identity bleed</span>
                 </span>
                 <button
                   onClick={() => setShowMetamorph(false)}
@@ -4060,14 +4093,16 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             x={fxPanel.x}
             y={fxPanel.y}
             anchorClassName="right-4 top-28"
-            className="fixed z-50 w-90 max-h-[70vh] overflow-y-auto hardware-card bg-black/90 border border-purple-500/30 rounded-lg shadow-2xl shadow-purple-900/40 p-3 flex flex-col gap-2"
+            maxHeight="70vh"
+            className="fixed z-50 w-90 overflow-y-auto hardware-card bg-black/90 border border-purple-500/30 rounded-lg shadow-2xl shadow-purple-900/40 p-3 flex flex-col gap-2"
           >
-            <div className="flex items-center justify-between gap-2 border-b border-white/10 pb-2">
-              <span className="text-[10px] font-mono uppercase tracking-wider text-zinc-400 truncate">
+            {/* Title and add controls stay put; the rows between them scroll. */}
+            <div className="shrink-0 flex items-center justify-between gap-2 border-b border-white/10 pb-2">
+              <span className="font-display text-xs font-bold uppercase tracking-wider text-zinc-400 truncate">
                 Track FX — <span style={{ color: t.color }}>{t.name}</span>
               </span>
               <button
-                onClick={() => setFxPanel(null)}
+                onClick={closeFxRack}
                 aria-label="Close track FX rack"
                 title="Close"
                 className="p-0.5 rounded text-zinc-500 hover:text-white hover:bg-white/10 shrink-0"
@@ -4086,6 +4121,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
               vstScanning={vstScanning}
               onRescanVst={() => void scanVst(true)}
               emptyHint="No inserts on this track yet — add one below."
+              scrollRows
             />
           </PopoverPortal>
         );
@@ -4369,7 +4405,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       {/* Body: track headers + scrollable timeline */}
       <div className="flex-1 min-h-0 flex overflow-hidden">
         {/* Track headers (sticky, not scrolled) */}
-        <div className="shrink-0 bg-[#0c0a12] border-r border-[#1a1528] overflow-hidden flex flex-col" style={{ width: TRACK_HEADER_PX }}>
+        <div ref={trackHeaderColRef} className="shrink-0 bg-[#0c0a12] border-r border-[#1a1528] overflow-hidden flex flex-col" style={{ width: TRACK_HEADER_PX }}>
           {/* Ruler row spacer */}
           <div className="h-6 border-b border-white/5 bg-black/30 flex items-center justify-center text-[8px] font-mono text-zinc-700 uppercase">tracks</div>
           <div ref={trackHeaderScrollRef} className="flex-1 overflow-hidden">
@@ -4392,7 +4428,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                     type="text"
                     value={t.name}
                     onChange={(e) => updateTrack(t.id, { name: e.target.value, nameAutoGenerated: false })}
-                    className="bg-transparent border-none outline-none text-[10px] font-bold w-full hover:bg-white/5 px-1 -mx-1 rounded transition-colors min-w-0"
+                    className="bg-transparent border-none outline-none font-sans text-xs font-bold w-full hover:bg-white/5 px-1 -mx-1 rounded transition-colors min-w-0"
                     style={{ color: t.color }}
                   />
                   <div className="flex gap-1 shrink-0">
@@ -4409,24 +4445,29 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                       onClick={() => updateTrack(t.id, { mute: !t.mute })}
                       aria-label={`Mute track ${t.name}`}
                       aria-pressed={t.mute}
-                      className={`w-4 h-4 rounded text-[8px] font-bold flex items-center justify-center ${t.mute ? 'bg-red-500/20 text-red-400 border border-red-500/50' : 'bg-black/40 text-zinc-500 border border-white/5 hover:text-white'}`}
+                      className={`w-4 h-4 rounded font-display text-xs font-bold leading-none flex items-center justify-center ${t.mute ? 'bg-red-500/20 text-red-400 border border-red-500/50' : 'bg-black/40 text-zinc-500 border border-white/5 hover:text-white'}`}
                     >M</button>
                     <button
                       onClick={() => toggleSolo(t.id)}
                       aria-label={`Solo track ${t.name}`}
                       aria-pressed={t.solo}
-                      className={`w-4 h-4 rounded text-[8px] font-bold flex items-center justify-center ${t.solo ? 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/50' : 'bg-black/40 text-zinc-500 border border-white/5 hover:text-white'}`}
+                      className={`w-4 h-4 rounded font-display text-xs font-bold leading-none flex items-center justify-center ${t.solo ? 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/50' : 'bg-black/40 text-zinc-500 border border-white/5 hover:text-white'}`}
                     >S</button>
                     <button
-                      onClick={(e) =>
-                        setFxPanel((cur) =>
-                          cur?.trackId === t.id ? null : { trackId: t.id, x: e.clientX, y: e.clientY },
-                        )
-                      }
+                      onClick={(e) => toggleFxRack(fxRackAnchor(t.id, e.clientX, e.clientY))}
                       aria-label={`Track ${t.name} insert FX`}
                       aria-pressed={fxPanel?.trackId === t.id}
                       title="Track insert FX rack"
-                      className={`w-4 h-4 rounded text-[8px] font-bold flex items-center justify-center ${(t.fxChain?.length ?? 0) > 0 || fxPanel?.trackId === t.id ? 'bg-purple-500/20 text-purple-300 border border-purple-500/50' : 'bg-black/40 text-zinc-500 border border-white/5 hover:text-white'}`}
+                      // Rack open: a solid fill. Inserts on the lane with the rack
+                      // closed: a light tint, so a lane restored with its effects by
+                      // undo never looks like its rack is open.
+                      className={`w-4 h-4 rounded font-display text-xs font-bold leading-none flex items-center justify-center border ${
+                        fxPanel?.trackId === t.id
+                          ? 'bg-purple-500 text-white border-purple-200 shadow-[0_0_6px_rgba(168,85,247,0.7)]'
+                          : (t.fxChain?.length ?? 0) > 0
+                            ? 'bg-purple-500/15 text-purple-300 border-purple-500/40 hover:text-white'
+                            : 'bg-black/40 text-zinc-500 border-white/5 hover:text-white'
+                      }`}
                     >F</button>
                     {(t.frozenOriginal || (t.fxChain ?? []).some((e) => e.effect === 'vst3' && e.vst)) && (
                       <button
@@ -4456,7 +4497,8 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                     )}
                     <button
                       onClick={() => removeTrack(t.id)}
-                      className="w-4 h-4 rounded text-[8px] flex items-center justify-center bg-black/40 text-zinc-600 border border-white/5 hover:text-red-400"
+                      aria-label={`Remove track ${t.name}`}
+                      className="w-4 h-4 rounded font-sans text-xs font-bold leading-none flex items-center justify-center bg-black/40 text-zinc-500 border border-white/5 hover:text-red-400"
                       title="Remove track"
                     >×</button>
                   </div>
@@ -4473,11 +4515,11 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                     onChange={(v) => writeFader('trackVolume', t.id, v)} />
                 </div>
                 <div className="flex items-center gap-1.5">
-                  <span className="text-[7px] font-mono text-zinc-600 uppercase w-3">P</span>
+                  <span className="font-sans text-xs font-bold text-zinc-500 uppercase w-3">P</span>
                   <NativeFader label={`${t.name} pan`} min={-1} max={1} step={0.01} defaultValue={0}
                     {...faderDisplay('trackPan', t.id, t.pan)}
                     onChange={(v) => writeFader('trackPan', t.id, v)} />
-                  <span className="text-[7px] font-mono text-zinc-600 text-right w-5">
+                  <span className="font-sans text-xs font-bold text-zinc-500 text-right w-8 shrink-0 tabular-nums">
                     {t.pan > 0 ? `R${Math.round(t.pan * 100)}` : t.pan < 0 ? `L${Math.round(-t.pan * 100)}` : 'C'}
                   </span>
                 </div>
@@ -4650,7 +4692,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                   }}
                 >
                   {/* Header bar */}
-                  <div className="absolute top-0 left-0 right-0 px-1 h-3.5 bg-black/50 backdrop-blur-sm border-b border-white/10 flex justify-between items-center text-[8px] font-mono uppercase tracking-tighter">
+                  <div className="absolute top-0 left-0 right-0 px-1 h-3.5 bg-black/50 backdrop-blur-sm border-b border-white/10 flex justify-between items-center font-sans text-xs font-bold leading-none">
                     <span className="flex items-center gap-1 min-w-0 max-w-3/5">
                       {clip.sourceKind === 'piano-roll' && (
                         <Piano className="w-2.5 h-2.5 text-emerald-300 shrink-0" />
@@ -4669,10 +4711,10 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                         onDoubleClick={(e) => e.stopPropagation()}
                         onClick={(e) => {
                           e.stopPropagation();
-                          setFxPanel({ trackId: clip.trackId, x: e.clientX, y: e.clientY });
+                          openFxRack(fxRackAnchor(clip.trackId, e.clientX, e.clientY));
                         }}
                         aria-label={`Open track FX for clip ${clip.label}`}
-                        className="px-0.5 h-3 rounded-sm text-[7px] font-bold leading-none flex items-center bg-black/40 text-zinc-400 border border-white/10 hover:text-purple-300 hover:border-purple-500/50"
+                        className="px-1 h-3.5 rounded-sm font-display text-xs font-bold leading-none flex items-center bg-black/40 text-zinc-300 border border-white/10 hover:text-purple-300 hover:border-purple-500/50"
                       >FX</button>
                       <button
                         type="button"
@@ -4684,9 +4726,9 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                         }}
                         aria-label={`Mute clip ${clip.label}`}
                         aria-pressed={!!clip.muted}
-                        className={`px-0.5 h-3 rounded-sm text-[7px] font-bold leading-none flex items-center ${clip.muted ? 'bg-red-500/20 text-red-400 border border-red-500/50' : 'bg-black/40 text-zinc-400 border border-white/10 hover:text-white'}`}
+                        className={`px-1 h-3.5 rounded-sm font-display text-xs font-bold leading-none flex items-center ${clip.muted ? 'bg-red-500/20 text-red-400 border border-red-500/50' : 'bg-black/40 text-zinc-300 border border-white/10 hover:text-white'}`}
                       >M</button>
-                      <span className="text-zinc-300">{clip.durationSec.toFixed(2)}s</span>
+                      <span className="text-zinc-300 tabular-nums">{clip.durationSec.toFixed(2)}s</span>
                     </span>
                   </div>
                   {/* Body: MIDI clips show their notes (FL-style); audio clips show
@@ -5124,7 +5166,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             label: 'Open FX rack',
             // Anchor the rack at the right-click that opened this menu; the
             // legacy right-4 top-28 spot is the no-coords fallback.
-            onSelect: () => setFxPanel({ trackId: t.id, x: trackMenu.position?.x, y: trackMenu.position?.y }),
+            onSelect: () => openFxRack(fxRackAnchor(t.id, trackMenu.position?.x, trackMenu.position?.y)),
           },
           { type: 'separator' },
           { type: 'header', label: 'Add insert' },

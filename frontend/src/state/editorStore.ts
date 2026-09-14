@@ -299,7 +299,15 @@ interface EditorStoreState {
   updateClip: (id: string, updates: Partial<AudioClip>) => void;
   removeClip: (id: string) => void;
   splitClipAt: (id: string, atSec: number) => string | null;
+  /** Store peaks decoded from a clip's audio. Peaks are derived data, so the
+   *  write goes through applyClipRender and stays out of undo history. */
   cachePeaks: (id: string, peaks: Float32Array) => void;
+  /** Store audio derived from a clip's own document data, such as a MIDI clip's
+   *  bounce through its instrument, together with its peaks. The write adds no
+   *  undo step and keeps the redo stack: undo can restore a clip from before its
+   *  bounce or peaks landed, and the write that replaces them must leave redo
+   *  intact. */
+  applyClipRender: (id: string, updates: Partial<AudioClip>, peaks?: Float32Array) => void;
 
   setSelected: (id: string | null) => void;
   setTool: (t: ToolMode) => void;
@@ -684,10 +692,19 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     return newId;
   },
 
-  cachePeaks: (id, peaks) =>
+  cachePeaks: (id, peaks) => get().applyClipRender(id, {}, peaks),
+
+  applyClipRender: (id, updates, peaks) => {
+    if (!get().clips.some((c) => c.id === id)) return;
+    historyApplying = true;
     set((s) => ({
-      clips: s.clips.map((c) => (c.id === id ? { ...c, peaks } : c)),
-    })),
+      clips: s.clips.map((c) => (c.id === id ? { ...c, ...updates, ...(peaks ? { peaks } : {}) } : c)),
+      // The saved project carries the clip's audio, so new audio still makes the
+      // document dirty, as it did when this went through updateClip.
+      dirty: true,
+    }));
+    historyApplying = false;
+  },
 
   setSelected: (id) => set({ selectedClipId: id }),
   setTool: (t) => set({ tool: t }),

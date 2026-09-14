@@ -79,7 +79,7 @@ export function FxRack({
             onChange={(e) => {
               if (e.target.value) onAdd(e.target.value);
             }}
-            className="form-select px-2 py-1 text-[11px] font-mono"
+            className="form-select px-2 py-1 font-sans text-xs font-bold"
             style={{ colorScheme: 'dark' }}
             title="Add a psychoacoustic insert effect to this chain"
           >
@@ -89,7 +89,7 @@ export function FxRack({
             ))}
           </select>
           {chain.length === 0 && (
-            <span className="text-[9px] font-mono text-zinc-600 uppercase tracking-wider">no inserts</span>
+            <span className="font-display text-xs font-bold text-zinc-500 uppercase tracking-wider">no inserts</span>
           )}
         </div>
       )}
@@ -118,8 +118,8 @@ export function FxRack({
                 className={`${expanded ? 'grow basis-full' : 'grow basis-60 max-w-xs'} rounded border border-white/5 bg-black/30 p-2 flex flex-col gap-1.5`}
               >
                 <div className="flex items-center gap-1.5">
-                  <span className="text-[8px] font-black uppercase tracking-wider text-amber-300/80 shrink-0">IMP</span>
-                  <span className="text-[10px] font-mono text-zinc-300 flex-1 truncate" title={`${label} — preserved from import (not rendered live on this track yet)`}>
+                  <span className="font-display text-xs font-bold uppercase tracking-wider text-amber-300/80 shrink-0">IMP</span>
+                  <span className="font-sans text-xs font-bold text-zinc-300 flex-1 truncate" title={`${label} — preserved from import (not rendered live on this track yet)`}>
                     {label}
                   </span>
                   <button
@@ -149,11 +149,11 @@ export function FxRack({
               key={entry.id}
               className="grow basis-60 max-w-xs rounded border border-white/5 bg-black/30 p-2 flex items-center gap-1.5 opacity-60"
             >
-              <span className="text-[8px] font-black uppercase tracking-wider text-amber-300/80 shrink-0">
+              <span className="font-display text-xs font-bold uppercase tracking-wider text-amber-300/80 shrink-0">
                 {entry.effect === 'vst3' ? 'VST' : 'IMP'}
               </span>
               <span
-                className="text-[10px] font-mono text-zinc-300 flex-1 truncate"
+                className="font-sans text-xs font-bold text-zinc-300 flex-1 truncate"
                 title={`${label} — preserved from import (not rendered live on this track yet)`}
               >
                 {label}
@@ -200,7 +200,7 @@ export function FxRack({
                 title={entry.enabled ? 'Bypass this effect' : 'Enable this effect'}
                 className={`w-2.5 h-2.5 rounded-full shrink-0 transition-colors ${entry.enabled ? 'bg-purple-400' : 'bg-zinc-700'}`}
               />
-              <span className="text-[10px] font-mono text-zinc-200 flex-1 truncate" title={def.description}>
+              <span className="font-sans text-xs font-bold text-zinc-200 flex-1 truncate" title={def.description}>
                 {def.label}
               </span>
               {entry.effect === 'ares' && onOpenSurface && (

@@ -22,7 +22,7 @@ import { effectiveZoom } from '../../lib/canvasScale';
 
 // The header label reuses MIX's section-title styling so the host reads the
 // same in every view that mounts it.
-const sectionTitle = 'text-[10px] font-black uppercase tracking-widest text-purple-300';
+const sectionTitle = 'font-display text-xs font-bold uppercase tracking-wider text-purple-300';
 
 export const VstEmbedHost: React.FC<{
   pluginPath: string;
@@ -135,7 +135,7 @@ export const VstEmbedHost: React.FC<{
     >
       <div className="flex items-center gap-2 shrink-0">
         <span className={sectionTitle}>{pluginName}</span>
-        <span className="text-[8px] font-mono text-zinc-600">{error ? 'plugin error' : 'native VST GUI'}</span>
+        <span className="font-sans text-xs font-bold text-zinc-500">{error ? 'plugin error' : 'native VST GUI'}</span>
         {!error && (
           <button
             type="button"
@@ -143,20 +143,20 @@ export const VstEmbedHost: React.FC<{
             title={expanded ? 'Collapse' : 'Expand'}
             aria-label={expanded ? 'Collapse plugin editor' : 'Expand plugin editor'}
             aria-pressed={expanded}
-            className="ml-auto inline-flex items-center gap-1 text-[10px] text-zinc-500 hover:text-teal-300 transition-colors shrink-0"
+            className="ml-auto inline-flex items-center gap-1 font-sans text-xs font-bold text-zinc-500 hover:text-teal-300 transition-colors shrink-0"
           >
             {expanded ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />} {expanded ? 'Collapse' : 'Expand'}
           </button>
         )}
-        <button onClick={onClose} title="Close the plugin editor" className={`inline-flex items-center gap-1 text-[10px] text-zinc-500 hover:text-red-400 transition-colors shrink-0 ${error ? 'ml-auto' : ''}`}>
+        <button onClick={onClose} title="Close the plugin editor" className={`inline-flex items-center gap-1 font-sans text-xs font-bold text-zinc-500 hover:text-red-400 transition-colors shrink-0 ${error ? 'ml-auto' : ''}`}>
           <X className="w-3.5 h-3.5" /> Close
         </button>
       </div>
       {error ? (
         <div className="flex-1 min-h-0 rounded border border-red-500/30 bg-red-950/20 grid place-items-center p-3">
           <div className="text-center max-w-md">
-            <span className="text-[11px] font-semibold text-red-300 block mb-1">This plugin could not be loaded</span>
-            <span className="text-[9px] font-mono text-red-200/70 wrap-break-word">{error}</span>
+            <span className="font-sans text-xs font-bold text-red-300 block mb-1">This plugin could not be loaded</span>
+            <span className="font-sans text-xs font-bold text-red-200/70 wrap-break-word">{error}</span>
           </div>
         </div>
       ) : (
@@ -165,7 +165,7 @@ export const VstEmbedHost: React.FC<{
               positioned over the visible viewport by the backend watcher. */}
           <div style={natural ? { width: natural.w, height: natural.h } : { width: '100%', height: '100%' }} />
           {!natural && (
-            <span className="absolute inset-0 grid place-items-center text-[10px] font-mono text-zinc-600 pointer-events-none">loading plugin editor...</span>
+            <span className="absolute inset-0 grid place-items-center font-sans text-xs font-bold text-zinc-500 pointer-events-none">loading plugin editor...</span>
           )}
         </div>
       )}
