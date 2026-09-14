@@ -121,7 +121,14 @@ def test_tasmo_embed_roundtrip(tmp_path=None):
     print("  TasmoFile embed round-trip OK")
 
 
-_ROLL_KEYS = ("roll_notes", "total_steps", "meter_map", "pickup_steps", "lanes")
+_ROLL_KEYS = (
+    "roll_notes",
+    "total_steps",
+    "meter_map",
+    "pickup_steps",
+    "lanes",
+    "roll_bends",
+)
 
 
 def test_tasmo_clip_meter_roundtrip(tmp_path):
@@ -150,6 +157,19 @@ def test_tasmo_clip_meter_roundtrip(tmp_path):
         {"note": 64, "step": 27, "length": 1, "velocity": 80},
         {"note": 64, "step": 39, "length": 1, "velocity": 80},
     ]
+    # Lane B's pitch bend at a range of 12: a ramp, a hold, then an ease.
+    roll_bends = [
+        {
+            "lane": 1,
+            "range": 12,
+            "points": [
+                {"step": 0, "value": 0},
+                {"step": 2.5, "value": 0.5, "shape": "hold"},
+                {"step": 6, "value": -1, "shape": "smooth"},
+                {"step": 9, "value": 0},
+            ],
+        }
+    ]
     # The frontend posts this JSON; the router validates it into the model.
     payload = {
         "project_name": "Meter",
@@ -171,6 +191,7 @@ def test_tasmo_clip_meter_roundtrip(tmp_path):
                         "meter_map": meter_map,
                         "pickup_steps": 4,
                         "lanes": lanes,
+                        "roll_bends": roll_bends,
                     }
                 ],
             }
@@ -189,6 +210,7 @@ def test_tasmo_clip_meter_roundtrip(tmp_path):
     assert not any("lane" in n for n in clip.midi_notes)
     assert clip.roll_notes == roll_notes
     assert clip.roll_notes[1]["lane"] == 1
+    assert clip.roll_bends == roll_bends
     # And back out to the frontend as JSON.
     dumped = json.loads(json.dumps(loaded.model_dump()))["tracks"][0]["clips"][0]
     assert {k: dumped[k] for k in _ROLL_KEYS} == {
@@ -197,10 +219,12 @@ def test_tasmo_clip_meter_roundtrip(tmp_path):
         "meter_map": meter_map,
         "pickup_steps": 4,
         "lanes": lanes,
+        "roll_bends": roll_bends,
     }
     audio = Clip(id="c2", name="audio", clip_type="audio", track_id="t1")
     assert audio.meter_map is None
     assert audio.roll_notes is None
+    assert audio.roll_bends is None
 
 
 def test_tasmo_file_without_meter_fields_loads_unchanged(tmp_path):

@@ -274,6 +274,7 @@ const buildClip = async (
     sourceMeterMap: meter.sourceMeterMap,
     sourcePickupSteps: meter.sourcePickupSteps,
     sourceLanes: meter.sourceLanes,
+    sourceBends: meter.sourceBends,
     // Restore the per-clip mute; omit the field entirely for unmuted clips so
     // pre-mute projects hydrate exactly as before. Gain and fades follow the same
     // rule: a unity/zero value stays `undefined` rather than being written back.

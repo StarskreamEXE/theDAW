@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { logError, logInfo } from './logStore';
 import type { PianoNote } from './pianoRollStore';
 import type { MeterSegment, PolyLane } from '../lib/meterMap';
+import type { LaneBend } from '../lib/pitchBend';
 import type { ChainEntry, VstNode } from './effectChainStore';
 import { rackEffectDefaults } from '../lib/rackEffects';
 
@@ -99,6 +100,9 @@ export interface AudioClip {
   /** When sourceKind === 'piano-roll', the roll's polymeter lanes at render time.
    *  `sourcePianoRoll` holds the notes already unrolled across those lanes. */
   sourceLanes?: PolyLane[];
+  /** When sourceKind === 'piano-roll', each lane's pitch bend at render time (lib/pitchBend).
+   *  Absent on clips bounced before the roll had pitch bend, or with none. */
+  sourceBends?: LaneBend[];
   /** GM program (0-127) this MIDI clip plays through live on the timeline; falls
    *  back to the track default, then the global active instrument. Audio clips: undefined. */
   instrumentProgram?: number;
