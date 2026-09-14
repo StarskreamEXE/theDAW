@@ -290,7 +290,7 @@ export const SingView: React.FC = () => {
             <Download className="w-3 h-3" /> EXPORT
           </button>
           {exportOpen && (
-            <div id="sing-export-menu" role="menu" className="absolute right-0 top-full mt-1 z-20 min-w-36 rounded border border-white/10 bg-[#0a080f] p-1 shadow-xl">
+            <div id="sing-export-menu" role="menu" className="et-opaque absolute right-0 top-full mt-1 z-20 min-w-36 rounded border border-white/10 bg-[#0a080f] p-1 shadow-xl">
               {([
                 ['LRC', lyricsExportUrl(entry.id, 'lrc', false), 'lrc'],
                 ['LRC + word tags', lyricsExportUrl(entry.id, 'lrc', true), 'lrc'],
