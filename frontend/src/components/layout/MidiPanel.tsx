@@ -32,9 +32,9 @@ import {
   Loader2,
   Mic,
   MicVocal,
-  Music4,
   Search,
   Square,
+  TrendingUp,
 } from 'lucide-react';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 
@@ -81,15 +81,24 @@ import { AiComposePopover } from '../audio/AiComposePopover';
 import { MidiImportPopover } from '../audio/MidiImportPopover';
 import { InstrumentPicker } from '../audio/InstrumentPicker';
 import {
+  CORNER_CHEVRON_VIEWBOX,
+  CORNER_GLYPH,
   CORNER_KEY,
   DockFlyout,
   FIELD,
   FLYOUT_CARD,
+  CORNER_CLEAR_GLYPH,
+  FLYOUT_SELECT,
+  MenuKey,
+  RAIL_GLYPH,
+  RAIL_KEY_COMPACT_PX,
+  RAIL_KEY_PX,
   RailKey,
-  STRIP_ICON_KEY,
+  STRIP_GLYPH,
   Sep,
   StripKey,
-  keyTone,
+  useDockTip,
+  useEdgeTabClearance,
   useOrbClearance,
   useStoredToggle,
 } from '../audio/midiDockKit';
@@ -97,6 +106,36 @@ import {
 /** The rail's "more keys this way" cue: a thin band over the rail's end. */
 const RAIL_CUE =
   'absolute inset-x-0 z-20 h-3.5 flex items-center justify-center et-ink-2 hover:et-ink';
+
+/**
+ * One end's rail cue for a rail taller than the dock. Pointer only: keyboard
+ * focus scrolls a key into view on its own, so the cue stays out of Tab. Its
+ * word opens in a DockTip to its right, as the rail keys' do.
+ */
+const RailCue: React.FC<{ dir: 1 | -1; onGo: () => void; bottom?: number }> = ({ dir, onGo, bottom }) => {
+  const name = dir === 1 ? 'Scroll down to more actions' : 'Scroll up to more actions';
+  const { anchorRef, describedBy, tip } = useDockTip({ word: 'More actions', label: name, placement: 'right' });
+  return (
+    <>
+      <button
+        ref={anchorRef}
+        type="button"
+        tabIndex={-1}
+        onClick={onGo}
+        aria-label={name}
+        aria-describedby={describedBy}
+        className={`${RAIL_CUE} ${dir === 1 ? '' : 'top-0'}`}
+        style={{
+          ...(dir === 1 ? { bottom } : {}),
+          background: `linear-gradient(to ${dir === 1 ? 'top' : 'bottom'}, var(--et-panel, #0c0a12) 45%, transparent)`,
+        }}
+      >
+        {dir === 1 ? <ChevronDown aria-hidden="true" className="w-3 h-3" /> : <ChevronUp aria-hidden="true" className="w-3 h-3" />}
+      </button>
+      {tip}
+    </>
+  );
+};
 
 const stepSec = (bpm: number): number => 60 / bpm / 4;
 
@@ -208,7 +247,14 @@ export const MidiPanel: React.FC = () => {
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recordStartRef = useRef(0);
   const recWrapRef = useRef<HTMLDivElement>(null);
-  const recInputKeyRef = useRef<HTMLButtonElement>(null);
+  // The REC key's corner: its DockTip's anchor is also where the input card hands focus back.
+  const recInputTip = useDockTip({
+    word: 'Input',
+    description: 'The microphone REC records from. Right-click REC opens it too.',
+    label: 'Recording input device',
+    expanded: inputMenuOpen,
+    placement: 'right',
+  });
   const songMenuKeyRef = useRef<HTMLButtonElement>(null);
   const exportKeyRef = useRef<HTMLButtonElement>(null);
   // The rail scrolls when the dock is short; the cues say which way more keys
@@ -218,10 +264,17 @@ export const MidiPanel: React.FC = () => {
   const railScrollRef = useRef<HTMLDivElement>(null);
   const railContentRef = useRef<HTMLDivElement>(null);
   const [railMore, setRailMore] = useState({ up: false, down: false });
-  // Keys drop from 24px to 22px (and the gaps to 1px) only when that is what
-  // keeps the whole rail in view without scrolling.
+  // Keys drop from RAIL_KEY_PX to RAIL_KEY_COMPACT_PX (28px to 21px; the gaps
+  // to 1px, the end padding to none) only when that is what keeps the whole
+  // rail in view without scrolling.
   const [railCompact, setRailCompact] = useState(false);
   const railOrb = useOrbClearance(railRef);
+  // A dock taller than its default reaches up under the Shell's Library edge
+  // tab; the strip and the body pad their right side clear of it.
+  const stripRef = useRef<HTMLDivElement>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const stripEdge = useEdgeTabClearance(stripRef);
+  const bodyEdge = useEdgeTabClearance(bodyRef);
 
   useEffect(() => {
     const el = railScrollRef.current;
@@ -231,8 +284,15 @@ export const MidiPanel: React.FC = () => {
       if (content) {
         // Compact iff the full-height rail would not fit. The full height is
         // derived the same way in both states, so the switch cannot flap.
-        const keys = Array.from(content.children).filter((c) => (c as HTMLElement).offsetHeight > 0).length;
-        const saving = keys * 2 + Math.max(0, keys - 1);
+        // Keys in the flow only: the import key's screen-reader labels are
+        // absolutely placed and take no height or gap.
+        const keys = Array.from(content.children).filter((c) => {
+          const el = c as HTMLElement;
+          return el.offsetHeight > 0 && getComputedStyle(el).position !== 'absolute';
+        }).length;
+        // Per key the height difference, per gap 1px (2px to 1px), and the
+        // content's 2px top and bottom padding, which compact drops.
+        const saving = keys * (RAIL_KEY_PX - RAIL_KEY_COMPACT_PX) + Math.max(0, keys - 1) + 4;
         setRailCompact((wasCompact) => {
           const fullHeight = content.offsetHeight + (wasCompact ? saving : 0);
           return fullHeight > el.clientHeight + 1;
@@ -541,7 +601,11 @@ export const MidiPanel: React.FC = () => {
     // rail or the SHAPE row still hands Delete to the roll, as its old toolbar did.
     <div data-keyscope="piano-roll" className="h-full w-full flex flex-col bg-zinc-950 text-zinc-200">
       {/* ── SETTINGS strip ───────────────────────────────────────────────── */}
-      <div className="shrink-0 h-7 flex flex-nowrap items-center gap-1 px-1.5 border-b border-white/8 bg-black/40">
+      <div
+        ref={stripRef}
+        className="shrink-0 h-8.5 flex flex-nowrap items-center gap-1 px-1.5 border-b border-white/8 bg-black/40"
+        style={stripEdge ? { paddingRight: stripEdge } : undefined}
+      >
         {/* The tab's one PLAY key: the roll, or the arpeggiator while its face is up. */}
         <PianoRollTransport arpShowing={arpOn} arpPlaying={arpPlaying} onArpPlayingChange={setArpPlaying} />
         <Sep />
@@ -580,7 +644,7 @@ export const MidiPanel: React.FC = () => {
             });
           }}
         >
-          <Search aria-hidden="true" className="w-3 h-3 shrink-0 et-ink-3" />
+          <Search aria-hidden="true" className={`${STRIP_GLYPH} shrink-0 et-ink-3`} />
           <label htmlFor="midi-asset-id" className="sr-only">
             Search library song
           </label>
@@ -602,7 +666,7 @@ export const MidiPanel: React.FC = () => {
             onBlur={() => window.setTimeout(() => setAssetOpen(false), 150)}
             placeholder="Song"
             title="Type a song name (or drop a library item or an audio file here). Pick a result to use it — no need to paste a raw id."
-            className="flex-1 min-w-0 h-full bg-transparent border-none outline-none text-[10px] font-mono et-ink"
+            className="flex-1 min-w-0 h-full bg-transparent border-none outline-none text-[12px] font-semibold et-ink"
           />
           {listOpen && (
             <div
@@ -619,12 +683,12 @@ export const MidiPanel: React.FC = () => {
                   aria-selected={e.id === assetId}
                   onMouseDown={(ev) => ev.preventDefault()}
                   onClick={() => pickAsset(e.id, e.title)}
-                  className={`w-full text-left px-2 py-1.5 text-[10px] border-b border-white/5 last:border-0 transition-shadow hover:shadow-[inset_0_0_0_100px_rgba(255,255,255,0.06)] ${
+                  className={`w-full text-left px-2 py-1.5 text-[12px] font-semibold border-b border-white/5 last:border-0 transition-shadow hover:shadow-[inset_0_0_0_100px_rgba(255,255,255,0.06)] ${
                     e.id === assetId ? 'text-[rgb(var(--et-accent))]' : 'text-zinc-200'
                   }`}
                 >
                   <span className="block truncate">{e.title}</span>
-                  <span className="block truncate text-[8px] font-mono et-ink-3">{e.id}</span>
+                  <span className="block truncate text-[12px] font-semibold et-ink-3">{e.id}</span>
                 </button>
               ))}
             </div>
@@ -632,37 +696,37 @@ export const MidiPanel: React.FC = () => {
         </div>
         <StripKey
           onClick={() => void analyze()}
-          disabled={busy}
-          title="Detect notes, pitch and lyrics from the library vocal (basic-pitch) and load them into the roll"
-          icon={busy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Activity className="w-3 h-3" />}
+          unavailable={busy}
+          description="Detect notes, pitch and lyrics from the library vocal (basic-pitch) and load them into the roll"
+          icon={busy ? <Loader2 className={`${STRIP_GLYPH} animate-spin`} /> : <Activity className={STRIP_GLYPH} />}
           legend="Analyze"
         />
-        <button
+        <StripKey
           ref={songMenuKeyRef}
-          type="button"
+          iconOnly
           onClick={() => setSongMenuOpen((v) => !v)}
           aria-haspopup="menu"
           aria-expanded={songMenuOpen}
           aria-controls="midi-song-menu"
           aria-label="More song actions"
-          title="Load or validate the song's artifact"
-          className={`${STRIP_ICON_KEY} ${keyTone({ on: songMenuOpen })}`}
-        >
-          <ChevronDown aria-hidden="true" className="w-3 h-3" />
-        </button>
+          description="Load or validate the song's artifact"
+          on={songMenuOpen}
+          icon={<ChevronDown className={STRIP_GLYPH} />}
+          legend="More"
+        />
         <DockFlyout
           open={songMenuOpen}
           anchorRef={songMenuKeyRef}
           onClose={() => setSongMenuOpen(false)}
           placement="below"
           align="end"
+          floorSelector="[data-dock-floor]"
           id="midi-song-menu"
           role="menu"
           aria-label="Song actions"
           className={`w-32 p-1 flex flex-col gap-0.5 ${FLYOUT_CARD}`}
         >
-          <StripKey
-            role="menuitem"
+          <MenuKey
             onClick={() => {
               setSongMenuOpen(false);
               if (assetId) void loadArtifact(assetId);
@@ -671,10 +735,8 @@ export const MidiPanel: React.FC = () => {
             title="Load an already-analyzed artifact's notes + lyrics into the roll without re-detecting"
             icon={<FolderOpen className="w-3 h-3" />}
             legend="Load"
-            className="w-full justify-start"
           />
-          <StripKey
-            role="menuitem"
+          <MenuKey
             onClick={() => {
               setSongMenuOpen(false);
               void validate();
@@ -683,12 +745,11 @@ export const MidiPanel: React.FC = () => {
             title="Check the notes survive a notes -> MIDI -> notes round-trip and report any timing drift"
             icon={<FileCheck2 className="w-3 h-3" />}
             legend="Validate"
-            className="w-full justify-start"
           />
         </DockFlyout>
 
         <div
-          className="flex-1 min-w-0 px-1 text-right truncate text-[9px] font-mono et-ink-3"
+          className="flex-1 min-w-0 px-1 text-right truncate text-[12px] font-semibold et-ink-3"
           title={progress || (status === 'idle' ? undefined : status)}
         >
           {progress && <span>{progress}</span>}
@@ -701,19 +762,19 @@ export const MidiPanel: React.FC = () => {
       </div>
 
       {/* ── body: ACTION rail · roll (or arpeggiator) · artifact rail · Voice ─ */}
-      <div className="flex-1 min-h-0 flex">
+      <div ref={bodyRef} className="flex-1 min-h-0 flex" style={bodyEdge ? { paddingRight: bodyEdge } : undefined}>
         <div
           ref={railRef}
           role="group"
           aria-label="MIDI actions"
-          className="relative w-10 shrink-0 flex flex-col border-r border-white/8 bg-black/40"
+          className="relative w-9 shrink-0 flex flex-col border-r border-white/8 bg-black/40"
           style={railOrb.bottom ? { paddingBottom: railOrb.bottom } : undefined}
         >
-          <div ref={railScrollRef} className="flex-1 min-h-0 overflow-y-auto no-scrollbar scroll-py-4">
+          <div ref={railScrollRef} className="flex-1 min-h-0 overflow-x-hidden overflow-y-auto no-scrollbar scroll-py-4">
             <div
               ref={railContentRef}
               data-compact={railCompact || undefined}
-              className="group/rail flex flex-col gap-0.5 data-compact:gap-px p-0.5"
+              className="group/rail flex flex-col gap-0.5 data-compact:gap-px p-0.5 data-compact:py-0"
             >
               {/* REC: the always-on monitor records; the corner opens the input. */}
               <div
@@ -726,40 +787,44 @@ export const MidiPanel: React.FC = () => {
               >
                 <RailKey
                   onClick={toggleRecord}
-                  disabled={busy || micPerm === 'denied'}
+                  disabled={micPerm === 'denied'}
+                  unavailable={busy}
                   rec={recording}
-                  aria-label={recording ? 'Stop recording' : 'Record vocal to notes'}
-                  title={
+                  tipSuppressed={inputMenuOpen}
+                  aria-label={recording ? 'Rec: stop recording' : 'Rec: record vocal to notes'}
+                  description={
                     recording
-                      ? 'Stop recording'
+                      ? 'Stop recording and convert the take to notes'
                       : micPerm === 'denied'
                         ? 'Microphone blocked: allow it for this app, then choose the input from the corner menu'
-                        : 'Record (mic -> notes via basic-pitch). Right-click or the corner for the input device.'
+                        : 'Record the mic and convert it to notes with basic-pitch. Right-click or the corner for the input device.'
                   }
-                  icon={recording ? <Square className="w-3 h-3" /> : <Mic className="w-3 h-3" />}
+                  icon={recording ? <Square className={`${RAIL_GLYPH} ${CORNER_CLEAR_GLYPH}`} /> : <Mic className={`${RAIL_GLYPH} ${CORNER_CLEAR_GLYPH}`} />}
                   legend="Rec"
                 />
                 {monitorOpen && <RecLevel monitorRef={monitorRef} recording={recording} />}
                 <button
-                  ref={recInputKeyRef}
+                  ref={recInputTip.anchorRef}
                   type="button"
                   onClick={() => setInputMenuOpen((v) => !v)}
                   aria-haspopup="dialog"
                   aria-expanded={inputMenuOpen}
                   aria-controls="midi-rec-input"
                   aria-label="Recording input device"
-                  title="Microphone input"
+                  aria-describedby={recInputTip.describedBy}
                   className={CORNER_KEY}
                 >
-                  <ChevronRight aria-hidden="true" className="w-2.5 h-2.5" />
+                  <ChevronRight aria-hidden="true" className={CORNER_GLYPH} viewBox={CORNER_CHEVRON_VIEWBOX} strokeWidth={3} />
                 </button>
+                {recInputTip.tip}
               </div>
               <DockFlyout
                 open={inputMenuOpen}
                 anchorRef={recWrapRef}
-                returnFocusRef={recInputKeyRef}
+                returnFocusRef={recInputTip.anchorRef}
                 onClose={() => setInputMenuOpen(false)}
                 placement="right"
+                floorSelector="[data-dock-floor]"
                 id="midi-rec-input"
                 role="dialog"
                 aria-label="Microphone input"
@@ -773,11 +838,12 @@ export const MidiPanel: React.FC = () => {
                   label="Microphone input"
                   legend="Input"
                   showLabel
-                  labelClassName="text-[8px] font-mono uppercase tracking-widest et-ink-3"
-                  className="w-full max-w-none text-[10px]"
+                  labelClassName="text-[12px] font-display font-bold uppercase et-ink-3"
+                  selectClassName={FLYOUT_SELECT}
+                  hintClassName="text-[12px] font-semibold"
                 />
                 {micPerm === 'denied' && (
-                  <span className="text-[9px] font-mono text-red-300">mic blocked</span>
+                  <span className="text-[12px] font-semibold text-red-300">mic blocked</span>
                 )}
               </DockFlyout>
 
@@ -790,9 +856,9 @@ export const MidiPanel: React.FC = () => {
                 aria-expanded={exportMenuOpen}
                 aria-controls="midi-export-menu"
                 aria-label="Export MIDI"
-                title="Download the roll as a Standard MIDI (.mid) file"
+                description="Save the roll as a Standard MIDI (.mid) file"
                 on={exportMenuOpen}
-                icon={<Download className="w-3 h-3" />}
+                icon={<Download className={RAIL_GLYPH} />}
                 legend="Export"
               />
               <DockFlyout
@@ -800,13 +866,13 @@ export const MidiPanel: React.FC = () => {
                 anchorRef={exportKeyRef}
                 onClose={() => setExportMenuOpen(false)}
                 placement="right"
+                floorSelector="[data-dock-floor]"
                 id="midi-export-menu"
                 role="menu"
                 aria-label="Export MIDI"
                 className={`w-28 p-1 flex flex-col gap-0.5 ${FLYOUT_CARD}`}
               >
-                <StripKey
-                  role="menuitem"
+                <MenuKey
                   onClick={() => {
                     setExportMenuOpen(false);
                     void exportRollMidi();
@@ -814,10 +880,8 @@ export const MidiPanel: React.FC = () => {
                   title="The roll at its own BPM, one track named Piano Roll (piano-roll.mid)"
                   icon={<Download className="w-3 h-3" />}
                   legend="Roll"
-                  className="w-full justify-start"
                 />
-                <StripKey
-                  role="menuitem"
+                <MenuKey
                   onClick={() => {
                     setExportMenuOpen(false);
                     void exportMidi();
@@ -825,7 +889,6 @@ export const MidiPanel: React.FC = () => {
                   title="Through the vocal export writer: the same notes, seconds-exact (midi.mid); the status line reports it"
                   icon={<Download className="w-3 h-3" />}
                   legend="Vocal"
-                  className="w-full justify-start"
                 />
               </DockFlyout>
 
@@ -839,62 +902,34 @@ export const MidiPanel: React.FC = () => {
               <RailKey
                 onClick={() => void makeBeat()}
                 aria-label="Beat from the notes"
-                title="Render a General MIDI drum beat from the notes (low/mid/high -> kick/snare/hat) and play it"
-                icon={<Drum className="w-3 h-3" />}
+                description="Render a General MIDI drum beat from the notes (low, mid and high to kick, snare and hat) and play it"
+                icon={<Drum className={RAIL_GLYPH} />}
                 legend="Beat"
               />
               <RailKey
                 onClick={() => setArpOn((v) => !v)}
                 aria-pressed={arpOn}
                 aria-label="Arp: chord-progression arpeggiator"
-                title={arpOn ? 'Back to the piano roll' : 'Chord-progression arpeggiator'}
+                description={arpOn ? 'Back to the piano roll' : 'Show the chord-progression arpeggiator'}
                 on={arpOn}
-                icon={<Music4 className="w-3 h-3" />}
+                icon={<TrendingUp className={RAIL_GLYPH} />}
                 legend="Arp"
               />
               <RailKey
                 onClick={() => setVoiceOn(!voiceOn)}
                 aria-pressed={voiceOn}
                 aria-label="Voice: the Vocal2MIDI column"
-                title={voiceOn ? 'Hide the Vocal2MIDI column' : 'Show the Vocal2MIDI column'}
+                description={voiceOn ? 'Hide the Vocal2MIDI column' : 'Show the Vocal2MIDI column'}
                 on={voiceOn}
-                icon={<AudioLines className="w-3 h-3" />}
+                icon={<AudioLines className={RAIL_GLYPH} />}
                 legend="Voice"
               />
               <PianoRollClearKey />
             </div>
           </div>
-          {/* Pointer cues for a rail taller than the dock; keyboard focus
-              scrolls a key into view on its own, so they stay out of Tab. */}
-          {railMore.up && (
-            <button
-              type="button"
-              tabIndex={-1}
-              onClick={() => scrollRail(-1)}
-              aria-label="Scroll the actions up"
-              title="More actions above"
-              className={`${RAIL_CUE} top-0`}
-              style={{ background: 'linear-gradient(to bottom, var(--et-panel, #0c0a12) 45%, transparent)' }}
-            >
-              <ChevronUp aria-hidden="true" className="w-3 h-3" />
-            </button>
-          )}
-          {railMore.down && (
-            <button
-              type="button"
-              tabIndex={-1}
-              onClick={() => scrollRail(1)}
-              aria-label="Scroll the actions down"
-              title="More actions below"
-              className={RAIL_CUE}
-              style={{
-                bottom: railOrb.bottom,
-                background: 'linear-gradient(to top, var(--et-panel, #0c0a12) 45%, transparent)',
-              }}
-            >
-              <ChevronDown aria-hidden="true" className="w-3 h-3" />
-            </button>
-          )}
+          {/* Pointer cues for a rail taller than the dock (RailCue). */}
+          {railMore.up && <RailCue dir={-1} onGo={() => scrollRail(-1)} />}
+          {railMore.down && <RailCue dir={1} onGo={() => scrollRail(1)} bottom={railOrb.bottom} />}
         </div>
 
         {/* The arpeggiator stays mounted but hidden so its transport keeps
@@ -909,12 +944,13 @@ export const MidiPanel: React.FC = () => {
         </div>
 
         {!arpOn && artifact && (
-          <div className="w-64 shrink-0 border-l border-white/8 overflow-y-auto p-2 space-y-3">
+          // data-dock-aside: a dock card opened from the strip (MAP) keeps off this rail.
+          <div data-dock-aside="" className="w-64 shrink-0 border-l border-white/8 overflow-y-auto p-2 space-y-3">
             <section>
-              <h3 className="text-[8px] font-mono uppercase tracking-widest et-ink-3 mb-1">
+              <h3 className="text-[12px] font-display font-bold uppercase et-ink-3 mb-1">
                 Lyrics
               </h3>
-              <p className="text-[10px] text-zinc-300 whitespace-pre-wrap wrap-break-word">
+              <p className="text-[12px] font-semibold text-zinc-300 whitespace-pre-wrap wrap-break-word">
                 {artifact.lyrics?.text || (
                   <span className="et-ink-3">none (analyze with transcription)</span>
                 )}
@@ -922,41 +958,41 @@ export const MidiPanel: React.FC = () => {
               <StripKey
                 onClick={() => useBottomPanelStore.getState().showTab('sing')}
                 aria-label="Sing: open the lyrics in the SING tab"
-                title="Sing along, edit or time the lyrics in the SING tab"
-                icon={<MicVocal className="w-3 h-3" />}
+                description="Sing along, edit or time the lyrics in the SING tab"
+                icon={<MicVocal className={STRIP_GLYPH} />}
                 legend="Sing"
                 className="mt-1"
               />
             </section>
 
             <section>
-              <h3 className="text-[8px] font-mono uppercase tracking-widest et-ink-3 mb-1">
+              <h3 className="text-[12px] font-display font-bold uppercase et-ink-3 mb-1">
                 Segments
               </h3>
               {artifact.segments?.length ? (
                 <ul className="space-y-1">
                   {artifact.segments.map((s, i) => (
                     <li key={s.id} className="flex items-center gap-1.5">
-                      <span className="flex-1 min-w-0 truncate text-[10px] font-mono text-zinc-400">
+                      <span className="flex-1 min-w-0 truncate text-[12px] font-semibold text-zinc-400 tabular-nums">
                         {(s.start_ms / 1000).toFixed(2)}-{(s.end_ms / 1000).toFixed(2)}s {s.kind}
                       </span>
                       <StripKey
                         onClick={() => void inpaintSegment(i)}
                         aria-label={`Inpaint segment ${i + 1}`}
-                        title="Arm an inpaint guide for this segment"
-                        icon={<Brush className="w-3 h-3" />}
+                        description="Arm an inpaint guide for this segment"
+                        icon={<Brush className={STRIP_GLYPH} />}
                         legend="Inpaint"
                       />
                     </li>
                   ))}
                 </ul>
               ) : (
-                <p className="text-[10px] et-ink-3">none</p>
+                <p className="text-[12px] font-semibold et-ink-3">none</p>
               )}
             </section>
 
             {validateMsg && (
-              <p className="text-[9px] font-mono text-zinc-400 wrap-break-word">{validateMsg}</p>
+              <p className="text-[12px] font-semibold text-zinc-400 wrap-break-word">{validateMsg}</p>
             )}
           </div>
         )}

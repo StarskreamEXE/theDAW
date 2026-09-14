@@ -9,7 +9,7 @@ import {
   midiRowLabel as rowLabel,
   type LibraryMidiRow as MidiRow,
 } from '../../lib/libraryIndex';
-import { DockFlyout, FLYOUT_CARD, RailKey } from './midiDockKit';
+import { DockFlyout, FLYOUT_CARD, RAIL_GLYPH, RailKey } from './midiDockKit';
 
 const MIDI_ACCEPT_LIST = '.mid,.midi,audio/midi';
 const MIDI_RECENT_ID = 'piano-roll-import-midi-recent';
@@ -104,7 +104,7 @@ export const MidiImportPopover: React.FC<{
   };
 
   const sourceBtn =
-    'flex-1 min-w-0 flex items-center gap-2 px-2 py-1.5 rounded-xs bg-white/5 border-b border-b-transparent text-left text-[10px] text-zinc-200 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.1),inset_0_0_0_100px_rgba(255,255,255,0.06)] transition-shadow';
+    'flex-1 min-w-0 flex items-center gap-2 px-2 py-1.5 rounded-xs bg-white/5 border-b border-b-transparent text-left text-[12px] font-semibold text-zinc-200 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] hover:shadow-[inset_0_1px_0_rgba(255,255,255,0.1),inset_0_0_0_100px_rgba(255,255,255,0.06)] transition-shadow';
 
   return (
     <>
@@ -151,9 +151,9 @@ export const MidiImportPopover: React.FC<{
         aria-expanded={open}
         aria-controls="piano-roll-import-popover"
         aria-label="Import MIDI"
-        title="Import a MIDI file from disk, from recent files or from the library"
+        description="Import a MIDI file from disk, from recent files or from the library"
         on={open}
-        icon={<Upload className="w-3 h-3" />}
+        icon={<Upload className={RAIL_GLYPH} />}
         legend="Import"
       />
 
@@ -162,6 +162,7 @@ export const MidiImportPopover: React.FC<{
         anchorRef={keyRef}
         onClose={closeFlyout}
         placement="right"
+        floorSelector="[data-dock-floor]"
         id="piano-roll-import-popover"
         role="dialog"
         aria-label="Import MIDI"
@@ -172,7 +173,7 @@ export const MidiImportPopover: React.FC<{
             <FolderOpen aria-hidden="true" className="w-3.5 h-3.5 shrink-0" />
             <span>File</span>
           </button>
-          <KnownFilesMenu id={MIDI_RECENT_ID} exts={MIDI_RECENT_EXTS} label="Recent" name="Recent MIDI files" onFiles={importMidiFiles} />
+          <KnownFilesMenu id={MIDI_RECENT_ID} exts={MIDI_RECENT_EXTS} label="Recent" name="Recent MIDI files" size="flyout" onFiles={importMidiFiles} />
         </div>
 
         {onImportSheetFile && (
@@ -187,35 +188,37 @@ export const MidiImportPopover: React.FC<{
               <FileMusic aria-hidden="true" className="w-3.5 h-3.5 shrink-0" />
               <span>Sheet</span>
             </button>
-            <KnownFilesMenu id={SHEET_RECENT_ID} exts={SHEET_RECENT_EXTS} label="Recent" name="Recent sheet music files" onFiles={importSheetFiles} />
+            <KnownFilesMenu id={SHEET_RECENT_ID} exts={SHEET_RECENT_EXTS} label="Recent" name="Recent sheet music files" size="flyout" onFiles={importSheetFiles} />
           </div>
         )}
 
         <div className="flex items-center gap-1.5 px-1 pt-0.5">
-          <span className="text-[8px] font-mono uppercase tracking-widest et-ink-3">From library</span>
+          <span className="text-[12px] font-display font-bold uppercase et-ink-3">From library</span>
           <div className="flex-1 h-px bg-white/10" />
         </div>
 
         <div className="flex items-center gap-1.5 bg-black/40 border border-white/10 rounded px-2">
           <Search aria-hidden="true" className="w-3 h-3 et-ink-3 shrink-0" />
+          <label htmlFor="piano-roll-library-midi-search" className="sr-only">
+            Search library MIDI
+          </label>
           <input
             id="piano-roll-library-midi-search"
             name="piano-roll-library-midi-search"
-            aria-label="Search library MIDI"
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search…"
-            className="flex-1 min-w-0 bg-transparent border-none outline-none py-1 text-[10px] text-zinc-200 placeholder:text-zinc-600"
+            className="flex-1 min-w-0 bg-transparent border-none outline-none py-1 text-[12px] font-semibold text-zinc-200 placeholder:text-zinc-600"
           />
         </div>
 
         <div className="max-h-64 overflow-y-auto flex flex-col gap-0.5 pr-0.5">
           {loading && (
-            <span className="text-[9px] font-mono et-ink-3 px-2 py-3 text-center">loading…</span>
+            <span className="text-[12px] font-semibold et-ink-3 px-2 py-3 text-center">loading…</span>
           )}
           {!loading && filtered.length === 0 && (
-            <span className="text-[9px] font-mono et-ink-3 px-2 py-3 text-center">
+            <span className="text-[12px] font-semibold et-ink-3 px-2 py-3 text-center">
               {midis && midis.length === 0 ? 'No library MIDI yet' : 'No matches'}
             </span>
           )}
@@ -233,9 +236,9 @@ export const MidiImportPopover: React.FC<{
                 ) : (
                   <Music aria-hidden="true" className="w-3 h-3 shrink-0 et-ink-3 group-hover:et-ink" />
                 )}
-                <span className="flex-1 min-w-0 truncate text-[10px] text-zinc-300">{rowLabel(m)}</span>
+                <span className="flex-1 min-w-0 truncate text-[12px] font-semibold text-zinc-300">{rowLabel(m)}</span>
                 {typeof m.notes_count === 'number' && (
-                  <span className="text-[8px] font-mono et-ink-3 shrink-0">{m.notes_count}n</span>
+                  <span className="text-[12px] font-bold et-ink-3 shrink-0 tabular-nums">{m.notes_count}n</span>
                 )}
               </button>
             ))}

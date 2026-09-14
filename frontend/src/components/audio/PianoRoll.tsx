@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Check, Info, Minus, Plus, Save, Send, Trash2, Unlink } from 'lucide-react';
+import { Check, Info, Minus, Plus, Save, Scissors, Trash2, Unlink } from 'lucide-react';
 import { DEFAULT_LANES, usePianoRollStore, pianoNotesToMidiNotes, type PianoNote } from '../../state/pianoRollStore';
 import { usePlaybackStore } from '../../state/playbackStore';
 import { getEngineCtx } from '../../state/playerStore';
@@ -29,6 +29,7 @@ import { triggerPianoNote } from '../../lib/pianoTrigger';
 import { parseSheetFile } from '../../lib/sheetImportClient';
 import { ownsKey } from '../../lib/keyScope';
 import {
+  CORNER_CLEAR_GLYPH,
   CORNER_KEY,
   DockFlyout,
   FIELD,
@@ -37,11 +38,14 @@ import {
   FLYOUT_CARD,
   KEY_ON,
   KEY_PLAY_REST,
+  RAIL_GLYPH,
   RANGE,
   RailKey,
+  STRIP_GLYPH,
   STRIP_ICON_KEY,
   StripKey,
-  KEY_REST,
+  MenuKey,
+  useDockTip,
 } from './midiDockKit';
 
 const NOTE_HEIGHT = 12;
@@ -53,7 +57,7 @@ const STEP_PX_MAX_WHEEL = 64;
 /** Step lines draw only from this step width up; below it the bar, group and beat tiers carry the grid. */
 const STEP_LINES_MIN_PX = 10;
 /** The pickup cell prints its legend from this width (px) up; a narrower one keeps it in its title. */
-const PICKUP_LEGEND_MIN_PX = 36;
+const PICKUP_LEGEND_MIN_PX = 38;
 /** Notes and lane repeats draw this far (px) past each side of the view, so a scroll redraws them only after crossing it. */
 const WINDOW_OVERSCAN_PX = 960;
 
@@ -133,7 +137,7 @@ const useMasterGainRef = () => {
 
 /** The footer's hard-cornered transport glyphs, fill-only in currentColor. */
 const Glyph: React.FC<{ d: string }> = ({ d }) => (
-  <svg viewBox="0 0 14 14" fill="currentColor" aria-hidden="true" focusable="false" className="w-3 h-3">
+  <svg viewBox="0 0 14 14" fill="currentColor" aria-hidden="true" focusable="false" className={STRIP_GLYPH}>
     <path d={d} />
   </svg>
 );
@@ -262,6 +266,7 @@ export const PianoRollTransport: React.FC<{
     logInfo('piano-roll', `Playing ${usePianoRollStore.getState().notes.length} notes at ${bpm} BPM`);
   };
   const playName = sounding ? 'Stop' : arpShowing ? 'Play the arpeggiator' : 'Play';
+  const playTip = useDockTip({ word: sounding ? 'Stop' : 'Play', description: arpShowing && !sounding ? 'Play the arpeggiator' : undefined, label: playName });
 
   // STEPS moves by one bar of the meter the roll ends in, and a new length
   // lands on the next bar line in the direction of the change, whatever the meter.
@@ -283,14 +288,16 @@ export const PianoRollTransport: React.FC<{
   return (
     <>
       <button
+        ref={playTip.anchorRef}
         type="button"
         onClick={handlePlayToggle}
         aria-label={playName}
-        title={playName}
-        className={`${STRIP_ICON_KEY} w-7 ${sounding ? KEY_ON : KEY_PLAY_REST}`}
+        aria-describedby={playTip.describedBy}
+        className={`${STRIP_ICON_KEY} w-7.5 ${sounding ? KEY_ON : KEY_PLAY_REST}`}
       >
         <Glyph d={sounding ? GLYPH_STOP : GLYPH_PLAY} />
       </button>
+      {playTip.tip}
       <div className={FIELD}>
         <label htmlFor="piano-roll-bpm" className={FIELD_LEGEND}>BPM</label>
         <input
@@ -341,27 +348,25 @@ export const PianoRollZoom: React.FC<{ stepPx: number; onStepPxChange: (px: numb
   onStepPxChange,
 }) => (
   <>
-    <button
-      type="button"
+    <StripKey
+      iconOnly
       onClick={() => onStepPxChange(Math.max(STEP_PX_MIN, stepPx - 2))}
       aria-label="Zoom out"
-      title="Zoom out"
-      className={`${STRIP_ICON_KEY} ${KEY_REST}`}
-    >
-      <Minus aria-hidden="true" className="w-3 h-3" />
-    </button>
-    <span className="w-5 text-center text-[9px] font-mono et-ink-2 tabular-nums" title="Step width (px)">
+      description="Narrower steps"
+      icon={<Minus className={STRIP_GLYPH} />}
+      legend="Zoom out"
+    />
+    <span className="w-5 text-center text-[12px] font-bold et-ink-2 tabular-nums" title="Step width (px)">
       {Math.round(stepPx)}
     </span>
-    <button
-      type="button"
+    <StripKey
+      iconOnly
       onClick={() => onStepPxChange(Math.min(STEP_PX_MAX_BUTTON, stepPx + 2))}
       aria-label="Zoom in"
-      title="Zoom in"
-      className={`${STRIP_ICON_KEY} ${KEY_REST}`}
-    >
-      <Plus aria-hidden="true" className="w-3 h-3" />
-    </button>
+      description="Wider steps"
+      icon={<Plus className={STRIP_GLYPH} />}
+      legend="Zoom in"
+    />
   </>
 );
 
@@ -397,7 +402,7 @@ export const PianoRollFeel: React.FC = () => {
   return (
     <>
       <div className={FIELD} title="Quantize: pulls notes toward the grid (100 = dead on)">
-        <label htmlFor="piano-roll-quantize" className={FIELD_LEGEND}>Q</label>
+        <label htmlFor="piano-roll-quantize" className={FIELD_LEGEND}>Quant</label>
         <input
           id="piano-roll-quantize"
           type="range"
@@ -408,7 +413,7 @@ export const PianoRollFeel: React.FC = () => {
           onChange={(e) => setQuantizePct(parseInt(e.target.value) || 0)}
           className={RANGE}
         />
-        <span className={`${FIELD_VALUE} w-5`}>{quantizePct}</span>
+        <span className={`${FIELD_VALUE} w-5.5`}>{quantizePct}</span>
       </div>
       <div className={FIELD} title="Swing (rag): delays (+) or pushes (−) the off-16ths, in percent of a step">
         <label htmlFor="piano-roll-swing-rag" className={FIELD_LEGEND}>Swing</label>
@@ -422,14 +427,14 @@ export const PianoRollFeel: React.FC = () => {
           onChange={(e) => setSwingPct(parseInt(e.target.value) || 0)}
           className={RANGE}
         />
-        <span className={`${FIELD_VALUE} w-6`}>{swingPct > 0 ? '+' : ''}{swingPct}</span>
+        <span className={`${FIELD_VALUE} w-5.5`}>{swingPct > 0 ? '+' : ''}{swingPct}</span>
       </div>
       <StripKey
         onClick={applyTimingFeel}
         disabled={noteCount === 0}
         aria-label="Apply timing feel"
-        title="Apply the quantize and swing amounts to every note"
-        icon={<Check className="w-3 h-3" />}
+        description="Apply the quantize and swing amounts to every note"
+        icon={<Check className={STRIP_GLYPH} />}
         legend="Apply"
       />
     </>
@@ -443,7 +448,7 @@ export const PianoRollNoteCount: React.FC = () => {
   const currentStep = usePianoRollStore((s) => (s.isPlaying ? Math.floor(s.currentStep) : 0));
   const totalSteps = usePianoRollStore((s) => s.totalSteps);
   return (
-    <span className="shrink-0 text-[9px] font-mono et-ink-2 whitespace-nowrap tabular-nums">
+    <span className="shrink-0 text-[12px] font-semibold et-ink-2 whitespace-nowrap tabular-nums">
       {isPlaying && (
         <span className="et-ink-3 mr-1.5" title="Playhead step">
           {currentStep + 1}/{totalSteps}
@@ -559,8 +564,18 @@ export const PianoRollEditKey: React.FC = () => {
   };
 
   const linked = !!editingClipId;
+  const unlinkTip = useDockTip({
+    word: 'Unlink',
+    description: 'Detach: future renders create a new editor clip instead of updating the linked one',
+    label: 'Unlink from the editor clip',
+    expanded: clipMenuOpen,
+    placement: 'right',
+  });
+  // The name always carries the key's word (the DockTip's EDIT or SAVE).
   const name = isBouncing
-    ? 'Edit: bouncing to the editor'
+    ? linked
+      ? 'Save: bouncing to the linked editor clip'
+      : 'Edit: bouncing to the editor'
     : linked
       ? `Save to the linked editor clip ${editingClipId.slice(0, 8)}`
       : 'Edit: send to the editor';
@@ -577,28 +592,32 @@ export const PianoRollEditKey: React.FC = () => {
       <RailKey
         ref={keyRef}
         onClick={() => void handleSendToEditor()}
-        disabled={isBouncing || noteCount === 0}
+        disabled={noteCount === 0}
+        unavailable={isBouncing}
+        tipSuppressed={clipMenuOpen && linked}
         aria-label={name}
-        title={linked
+        description={linked
           ? `Linked to clip ${editingClipId.slice(0, 8)}: re-render and update it in place. Right-click or the corner to unlink.`
-          : 'Render these notes to audio and add to the waveform editor as a new track'}
+          : 'Render these notes to audio and add them to the waveform editor as a new track'}
         on={linked}
         icon={linked
-          ? <Save className={`w-3 h-3 ${isBouncing ? 'animate-pulse' : ''}`} />
-          : <Send className={`w-3 h-3 ${isBouncing ? 'animate-pulse' : ''}`} />}
+          ? <Save className={`${RAIL_GLYPH} ${CORNER_CLEAR_GLYPH} ${isBouncing ? 'animate-pulse' : ''}`} />
+          : <Scissors className={`${RAIL_GLYPH} ${isBouncing ? 'animate-pulse' : ''}`} />}
         legend={linked ? 'Save' : 'Edit'}
       />
       {linked && (
         <button
+          ref={unlinkTip.anchorRef}
           type="button"
           onClick={() => setEditingClip(null)}
           aria-label="Unlink from the editor clip"
-          title="Detach: future renders will create a new editor clip instead of updating the linked one"
+          aria-describedby={unlinkTip.describedBy}
           className={CORNER_KEY}
         >
-          <Unlink aria-hidden="true" className="w-2.5 h-2.5" />
+          <Unlink aria-hidden="true" className="w-3 h-3" strokeWidth={2.5} />
         </button>
       )}
+      {linked && unlinkTip.tip}
       {/* Right-click on SAVE: the same two actions as full-size menu items, so
           UNLINK does not depend on the 12px corner target. */}
       <DockFlyout
@@ -607,13 +626,13 @@ export const PianoRollEditKey: React.FC = () => {
         returnFocusRef={keyRef}
         onClose={() => setClipMenuOpen(false)}
         placement="right"
+        floorSelector="[data-dock-floor]"
         id="piano-roll-clip-menu"
         role="menu"
         aria-label="Linked editor clip"
         className={`w-28 p-1 flex flex-col gap-0.5 ${FLYOUT_CARD}`}
       >
-        <StripKey
-          role="menuitem"
+        <MenuKey
           onClick={() => {
             setClipMenuOpen(false);
             void handleSendToEditor();
@@ -622,10 +641,8 @@ export const PianoRollEditKey: React.FC = () => {
           title="Re-render the notes and update the linked editor clip in place"
           icon={<Save className="w-3 h-3" />}
           legend="Save"
-          className="w-full justify-start"
         />
-        <StripKey
-          role="menuitem"
+        <MenuKey
           onClick={() => {
             setClipMenuOpen(false);
             setEditingClip(null);
@@ -633,7 +650,6 @@ export const PianoRollEditKey: React.FC = () => {
           title="Detach: future renders will create a new editor clip instead of updating the linked one"
           icon={<Unlink className="w-3 h-3" />}
           legend="Unlink"
-          className="w-full justify-start"
         />
       </DockFlyout>
     </div>
@@ -645,8 +661,8 @@ export const PianoRollClearKey: React.FC = () => (
   <RailKey
     onClick={() => usePianoRollStore.getState().clear()}
     aria-label="Clear every note"
-    title="Remove every note"
-    icon={<Trash2 className="w-3 h-3" />}
+    description="Remove every note from the roll"
+    icon={<Trash2 className={RAIL_GLYPH} />}
     legend="Clear"
   />
 );
@@ -780,8 +796,9 @@ const RollRuler = React.memo(function RollRuler({
   const ticks = useMemo(
     () => ({
       bar: linesPath(tiers.bar, stepPx, 0, HEADER_HEIGHT),
-      group: linesPath(tiers.group, stepPx, 14, 21),
-      beat: linesPath(tiers.beat, stepPx, 18, 21),
+      // Below the 12px labels, which sit 5px from the top.
+      group: linesPath(tiers.group, stepPx, 17, 21),
+      beat: linesPath(tiers.beat, stepPx, 19, 21),
     }),
     [tiers, stepPx],
   );
@@ -789,7 +806,8 @@ const RollRuler = React.memo(function RollRuler({
 
   return (
     // An opaque ground in the theme's canvas: notes and loop lines scrolled under the ruler stay off its ticks and text.
-    <div className="sticky top-0 z-20 bg-[#07050a] border-b border-white/5" style={{ height: HEADER_HEIGHT, width, minWidth: '100%' }}>
+    // data-dock-ceiling: the SHAPE row's above cards (GEN, FORM) keep their tops below this line.
+    <div data-dock-ceiling="" className="sticky top-0 z-20 bg-[#07050a] border-b border-white/5" style={{ height: HEADER_HEIGHT, width, minWidth: '100%' }}>
       {spans.map((b, i) => {
         const prev = i > 0 ? spans[i - 1] : null;
         const change = b.bar >= 0 && (!prev || prev.bar < 0 || !meterEquals(prev.meter, b.meter));
@@ -800,7 +818,7 @@ const RollRuler = React.memo(function RollRuler({
           <div
             key={b.start}
             data-ruler-bar="1"
-            className="absolute top-0 bottom-0 overflow-hidden flex items-center gap-1 pl-1 text-[8px] leading-none font-mono text-zinc-500 tabular-nums whitespace-nowrap"
+            className="absolute top-0 bottom-0 overflow-hidden flex items-start gap-2.5 pl-1 pt-1.25 text-[12px] leading-none font-display font-bold text-zinc-500 whitespace-nowrap"
             style={{ left: b.start * stepPx, width: cellPx }}
             title={`${b.bar < 0 ? 'Pickup' : `Bar ${b.bar + 1}`} syncopation ${score.toFixed(2)}`}
           >
@@ -810,8 +828,10 @@ const RollRuler = React.memo(function RollRuler({
               className="absolute inset-x-0 top-0 h-0.75"
               style={{ backgroundColor: `rgb(var(--et-accent) / ${alpha.toFixed(3)})` }}
             />
-            {b.bar >= 0 ? b.bar + 1 : cellPx >= PICKUP_LEGEND_MIN_PX ? 'Pickup' : null}
-            {change && <span className="font-semibold et-ink">{meterLabel(b.meter)}</span>}
+            {/* Orbitron's "1" carries its space on the left, so 10px keeps the bar number
+                visibly apart from the meter beside it ("1  7/8 3+2+2"). */}
+            {(b.bar >= 0 || cellPx >= PICKUP_LEGEND_MIN_PX) && <span>{b.bar >= 0 ? b.bar + 1 : 'Pickup'}</span>}
+            {change && <span className="font-extrabold et-ink">{meterLabel(b.meter)}</span>}
           </div>
         );
       })}
@@ -939,7 +959,11 @@ const KeyboardKeys = React.memo(function KeyboardKeys({
           <div
             key={midi}
             onClick={() => triggerPianoNote(midi, 100, getEngineCtx().currentTime + 0.02, 0.25, masterRef.current)}
-            className={`flex items-center justify-end pr-1 text-[8px] font-mono cursor-pointer transition-shadow border-b border-black/40 hover:shadow-[inset_0_0_0_100px_rgb(var(--et-accent)/0.3)] ${black ? 'bg-zinc-900 text-zinc-600' : isC ? 'bg-zinc-200 text-zinc-700' : 'bg-zinc-300 text-zinc-700'}`}
+            // Fixed key colours: the theme remaps bg-zinc-900 and text-zinc-700 (light
+            // black keys on paper, pale C labels on dark), while a keyboard needs
+            // dark black keys and dark ink on the white ones in every theme.
+            // text-zinc-800 is left unmapped for exactly this.
+            className={`flex items-center justify-end pr-1 text-[12px] leading-none font-bold cursor-pointer transition-shadow border-b border-black/40 hover:shadow-[inset_0_0_0_100px_rgb(var(--et-accent)/0.3)] ${black ? 'bg-[#18181b]' : isC ? 'bg-zinc-200 text-zinc-800' : 'bg-zinc-300 text-zinc-800'}`}
             style={{ height: NOTE_HEIGHT }}
             title={`Preview ${noteLabel(midi)}`}
           >
@@ -1304,7 +1328,7 @@ export const PianoRoll: React.FC<{ stepPx: number; onStepPxChange: (px: number) 
             {loopEnds.map((l, i) => {
               const { form } = laneOf(l.id);
               const name = `Lane ${l.name} loops every ${l.cycleSteps} steps`;
-              const tagPx = 16 + 5 * String(l.cycleSteps).length;
+              const tagPx = 18 + 7.5 * String(l.cycleSteps).length;
               const others = loopEnds.map((o) => o.cycleSteps);
               const roomRight = (Math.min(totalSteps, ...others.filter((c) => c > l.cycleSteps)) - l.cycleSteps) * stepPx;
               const roomLeft = (l.cycleSteps - Math.max(0, ...others.filter((c) => c < l.cycleSteps))) * stepPx;
@@ -1320,8 +1344,8 @@ export const PianoRoll: React.FC<{ stepPx: number; onStepPxChange: (px: number) 
                     aria-label={name}
                     title={name}
                     data-loop-tag="1"
-                    className={`sticky flex w-max items-center gap-0.5 ${onLeft ? '-ml-0.5 -translate-x-full' : 'ml-0.5'} px-0.5 py-0.5 rounded-xs bg-[#0a080f] text-[8px] leading-none font-mono font-semibold et-ink tabular-nums whitespace-nowrap pointer-events-auto`}
-                    style={{ top: HEADER_HEIGHT + 4 + i * 16, marginTop: 4 + i * 16 }}
+                    className={`sticky flex w-max items-center gap-0.5 ${onLeft ? '-ml-0.5 -translate-x-full' : 'ml-0.5'} px-0.5 py-0.5 rounded-xs bg-[#0a080f] text-[12px] leading-none font-bold et-ink tabular-nums whitespace-nowrap pointer-events-auto`}
+                    style={{ top: HEADER_HEIGHT + 4 + i * 18, marginTop: 4 + i * 18 }}
                   >
                     <span className={`w-2 h-2 rounded-xs border ${form.fill} ${form.edge}`} style={form.style} />
                     {l.cycleSteps}

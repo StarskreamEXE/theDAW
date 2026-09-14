@@ -89,20 +89,20 @@ export const RecordingHistory: React.FC<RecordingHistoryProps> = ({
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Clock aria-hidden="true" size={14} className="et-ink-3" />
-            <span className="text-xs et-ink-2">Recording History</span>
+            <span className="text-xs font-semibold et-ink-2">Recording History</span>
           </div>
           <div className="flex items-center gap-2">
-            <KnownFilesMenu id={RECENT_ID} exts={RECENT_EXTS} kinds={RECENT_KINDS} onFiles={(files) => void importFiles(files)} />
+            <KnownFilesMenu id={RECENT_ID} exts={RECENT_EXTS} kinds={RECENT_KINDS} size="flyout" onFiles={(files) => void importFiles(files)} />
             <button
               type="button"
               onClick={handleImportClick}
-              className="text-[10px] et-ink-3 hover:et-ink transition-colors flex items-center gap-1"
+              className="text-[12px] font-semibold et-ink-3 hover:et-ink transition-colors flex items-center gap-1"
             >
               <Upload aria-hidden="true" size={10} /> Import
             </button>
           </div>
         </div>
-        <p className="text-[10px] et-ink-3 mt-2">No recordings saved yet</p>
+        <p className="text-[12px] font-semibold et-ink-3 mt-2">No recordings saved yet</p>
       </div>
     );
   }
@@ -118,14 +118,14 @@ export const RecordingHistory: React.FC<RecordingHistoryProps> = ({
           className="flex items-center gap-2 et-ink-2 hover:et-ink transition-colors"
         >
           <Clock aria-hidden="true" size={14} />
-          <span className="text-xs font-medium">Recording History</span>
-          <span className="text-[10px] text-[rgb(var(--et-accent))] bg-white/10 px-1.5 py-0.5 rounded-xs">
+          <span className="text-xs font-semibold">Recording History</span>
+          <span className="text-[12px] font-bold tabular-nums text-[rgb(var(--et-accent))] bg-white/10 px-1.5 py-0.5 rounded-xs">
             {recordings.length}
           </span>
         </button>
 
         <div className="flex items-center gap-2">
-          <KnownFilesMenu id={RECENT_ID} exts={RECENT_EXTS} kinds={RECENT_KINDS} onFiles={(files) => void importFiles(files)} />
+          <KnownFilesMenu id={RECENT_ID} exts={RECENT_EXTS} kinds={RECENT_KINDS} size="flyout" onFiles={(files) => void importFiles(files)} />
           <button
             type="button"
             onClick={handleImportClick}
@@ -172,9 +172,9 @@ export const RecordingHistory: React.FC<RecordingHistoryProps> = ({
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2">
                     <Music aria-hidden="true" size={10} className="text-[rgb(var(--et-accent))] shrink-0" />
-                    <span className="text-xs et-ink truncate">{recording.name}</span>
+                    <span className="text-xs font-semibold et-ink truncate">{recording.name}</span>
                   </div>
-                  <div className="flex items-center gap-2 mt-1 text-[9px] et-ink-3">
+                  <div className="flex flex-wrap items-center gap-x-2 mt-1 text-[12px] font-semibold et-ink-3">
                     <span>{formatDate(recording.timestamp)}</span>
                     <span>|</span>
                     <span>{recording.notes.length} notes</span>
@@ -216,7 +216,7 @@ export const RecordingHistory: React.FC<RecordingHistoryProps> = ({
         <button
           type="button"
           onClick={() => setIsExpanded(true)}
-          className="text-[10px] et-ink-3 hover:et-ink transition-colors"
+          className="text-[12px] font-semibold et-ink-3 hover:et-ink transition-colors"
         >
           Click to expand ({recordings.length} recordings)
         </button>

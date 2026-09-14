@@ -88,12 +88,12 @@ export const BpmTapper: React.FC<BpmTapperProps> = ({ onBpmSet, currentBpm }) =>
   return (
     <div className="bg-zinc-900 border border-white/10 rounded-xs p-4">
       <div className="flex items-center justify-between mb-3">
-        <h3 className="text-xs font-bold et-ink-3 uppercase tracking-wider">Tap Tempo</h3>
+        <h3 className="text-[12px] font-display font-bold et-ink-3 uppercase">Tap Tempo</h3>
         {calculatedBpm && (
           <button
             type="button"
             onClick={handleReset}
-            className="text-[10px] et-ink-3 hover:et-ink transition-colors"
+            className="text-[12px] font-semibold et-ink-3 hover:et-ink transition-colors"
           >
             Reset
           </button>
@@ -120,7 +120,7 @@ export const BpmTapper: React.FC<BpmTapperProps> = ({ onBpmSet, currentBpm }) =>
 
       {/* Tap count indicator */}
       <div className="flex justify-between items-center mt-2">
-        <span className="text-[10px] et-ink-3">
+        <span className="text-[12px] font-semibold et-ink-3">
           {taps.length > 0 ? `${taps.length} taps` : 'Tap to start'}
         </span>
         {taps.length >= 2 && (
@@ -142,13 +142,13 @@ export const BpmTapper: React.FC<BpmTapperProps> = ({ onBpmSet, currentBpm }) =>
         <button
           type="button"
           onClick={handleApply}
-          className={`w-full mt-3 py-2 rounded-xs bg-white/10 border-b border-b-[rgb(var(--et-accent))] text-[rgb(var(--et-accent))] text-xs font-medium transition-shadow ${lift}`}
+          className={`w-full mt-3 py-2 rounded-xs bg-white/10 border-b border-b-[rgb(var(--et-accent))] text-[rgb(var(--et-accent))] text-xs font-semibold transition-shadow ${lift}`}
         >
           Set BPM to {calculatedBpm} (current: {currentBpm})
         </button>
       )}
 
-      <p className="text-[9px] et-ink-3 mt-2 text-center">
+      <p className="text-[12px] font-semibold et-ink-3 mt-2 text-center">
         Tap along with your beat. Best accuracy with 4-8 taps.
       </p>
     </div>
