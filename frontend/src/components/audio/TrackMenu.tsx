@@ -44,6 +44,15 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { DockFlyout, FLYOUT_CARD } from './midiDockKit';
+import {
+  lastMenuItem,
+  markOf,
+  menuItems,
+  restoreTarget,
+  rovingIndex,
+  type FocusMark,
+  type MenuKey,
+} from './trackMenuFocus';
 import { TrackMetaDialog } from './TrackMetaDialog';
 import { StemsRunModal, type StemsRunOptions } from '../library/StemsRunModal';
 import { usePlayerStore, getLoadedAudioUrl } from '../../state/playerStore';
@@ -194,8 +203,7 @@ const extOf = (path: unknown): string => /\.([a-z0-9]{1,5})$/i.exec(String(path 
 
 /* ── keyboard helpers ─────────────────────────────────────────────────── */
 
-const itemsIn = (root: HTMLElement): HTMLElement[] =>
-  Array.from(root.querySelectorAll<HTMLElement>('[role="menuitem"]'));
+const itemsIn = menuItems;
 
 /** The row of the next column (dir 1) or the previous one (dir -1) nearest in height. */
 function acrossColumns(from: HTMLElement, dir: 1 | -1, root: HTMLElement): HTMLElement | null {
@@ -271,12 +279,19 @@ interface TrackMenuProps {
 export const TrackMenu: React.FC<TrackMenuProps> = ({ buttonClassName }) => {
   const keyRef = useRef<HTMLButtonElement | null>(null);
   const lyricsInputRef = useRef<HTMLInputElement | null>(null);
-  /** Opened with ArrowUp on the key: focus the last row, not the first. */
+  /**
+   * Opened with ArrowUp on the key: focus the last row, not the first.
+   *
+   * It stays set until the user moves focus themselves, because the menu's last
+   * row is not the last row for long. The Stems group is built last and starts
+   * as one "Checking" placeholder; when the probe lands it becomes a line per
+   * stem, so the row that was last is gone and many rows now sit below it. Held,
+   * the intent re-lands on whatever the last row has become.
+   */
   const focusLastRef = useRef(false);
-  /** The row that last had focus and its group, to give focus back when a
-   *  resize remounts the columns or a probe replaces the row. */
-  const lastFocusedIdRef = useRef<string | null>(null);
-  const lastFocusedGroupRef = useRef<string | null>(null);
+  /** Where focus was, to give it back when a resize remounts the columns or a
+   *  probe replaces the row (trackMenuFocus). */
+  const markRef = useRef<FocusMark | null>(null);
   /** Load lyrics waits here for the file picker's answer. */
   const pendingLyricsRef = useRef<PendingRow | null>(null);
   const [open, setOpen] = useState(false);
@@ -327,30 +342,14 @@ export const TrackMenu: React.FC<TrackMenuProps> = ({ buttonClassName }) => {
   const close = useCallback(() => {
     setOpen(false);
     setPointedId(null);
-    lastFocusedIdRef.current = null;
-    lastFocusedGroupRef.current = null;
+    markRef.current = null;
+    focusLastRef.current = false;
   }, []);
 
-  // DockFlyout puts focus on the first row once the card is placed; a menu
-  // opened with ArrowUp moves it on to the last row after that.
-  useEffect(() => {
-    if (!open || !focusLastRef.current) return;
+  /** The user moved focus themselves, so the menu stops steering it. */
+  const takeFocus = useCallback(() => {
     focusLastRef.current = false;
-    let raf = 0;
-    let frames = 0;
-    const tick = () => {
-      const menu = document.getElementById(MENU_ID);
-      const items = menu ? itemsIn(menu) : [];
-      if (menu && items.length > 0 && menu.contains(document.activeElement)) {
-        items[items.length - 1].focus();
-        return;
-      }
-      frames += 1;
-      if (frames < 30) raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [open]);
+  }, []);
 
   const toggle = () => {
     if (open) {
@@ -512,20 +511,42 @@ export const TrackMenu: React.FC<TrackMenuProps> = ({ buttonClassName }) => {
   // A resize that packs the groups into other columns remounts the column
   // boxes, and the focused row with them, which drops focus to <body>. The
   // same row takes focus back. A row a probe replaced (the Stems placeholder
-  // becoming one line per stem) hands focus to the first row of its group.
+  // becoming one line per stem) hands focus back to the end of its group the
+  // user was at, so the row after the placeholder is not the group's first when
+  // the user had arrowed to its last.
   useLayoutEffect(() => {
     if (!open) return;
-    const id = lastFocusedIdRef.current;
+    const mark = markRef.current;
     const active = document.activeElement;
-    if (!id || (active && active !== document.body)) return;
+    if (!mark || (active && active !== document.body)) return;
     const menu = document.getElementById(MENU_ID);
     if (!menu) return;
-    const items = itemsIn(menu);
-    const group = [...menu.querySelectorAll<HTMLElement>('[role="group"]')].find(
-      (g) => g.dataset.groupId === lastFocusedGroupRef.current,
-    );
-    const target = items.find((el) => el.dataset.rowId === id) ?? (group ? itemsIn(group)[0] : undefined) ?? items[0];
-    target?.focus({ preventScroll: true });
+    restoreTarget(menu, mark)?.focus({ preventScroll: true });
+  }, [open, layout]);
+
+  // DockFlyout puts focus on the first row once the card is placed; a menu
+  // opened with ArrowUp moves it on to the last row after that. This runs again
+  // on every layout, so the probe that turns the Stems placeholder into a line
+  // per stem — every one of them below the row that was last — moves the intent
+  // on to the row that is last now. It holds until the user moves focus (any
+  // key, or the pointer over a row), which is what clears focusLastRef.
+  useEffect(() => {
+    if (!open || !focusLastRef.current) return;
+    let raf = 0;
+    let frames = 0;
+    const tick = () => {
+      if (!focusLastRef.current) return;
+      const menu = document.getElementById(MENU_ID);
+      const last = menu ? lastMenuItem(menu) : null;
+      if (menu && last && menu.contains(document.activeElement)) {
+        if (document.activeElement !== last) last.focus();
+        return;
+      }
+      frames += 1;
+      if (frames < 30) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
   }, [open, layout]);
 
   const choose = (row: TrackMenuRow) => {
@@ -577,6 +598,9 @@ export const TrackMenu: React.FC<TrackMenuProps> = ({ buttonClassName }) => {
     // (EDIT's Delete, Backspace, Ctrl+Z, Ctrl+A) would act behind the menu.
     e.stopPropagation();
     if (e.ctrlKey || e.metaKey || e.altKey) return;
+    // From here the user is steering, so the open-at-the-last-row intent ends
+    // and a later probe no longer moves focus out from under them.
+    takeFocus();
     const root = e.currentTarget;
     const items = itemsIn(root);
     if (items.length === 0) return;
@@ -585,16 +609,10 @@ export const TrackMenu: React.FC<TrackMenuProps> = ({ buttonClassName }) => {
     let next: HTMLElement | null = null;
     switch (e.key) {
       case 'ArrowDown':
-        next = items[at < 0 || at >= items.length - 1 ? 0 : at + 1];
-        break;
       case 'ArrowUp':
-        next = items[at <= 0 ? items.length - 1 : at - 1];
-        break;
       case 'Home':
-        next = items[0];
-        break;
       case 'End':
-        next = items[items.length - 1];
+        next = items[rovingIndex(at, items.length, e.key as MenuKey)] ?? null;
         break;
       case 'ArrowRight':
       case 'ArrowLeft':
@@ -638,10 +656,12 @@ export const TrackMenu: React.FC<TrackMenuProps> = ({ buttonClassName }) => {
       onClick: () => choose(row),
       onFocus: (e: React.FocusEvent<HTMLButtonElement>) => {
         setPointedId(row.id);
-        lastFocusedIdRef.current = row.id;
-        lastFocusedGroupRef.current = e.currentTarget.closest<HTMLElement>('[role="group"]')?.dataset.groupId ?? null;
+        markRef.current = markOf(e.currentTarget);
       },
-      onMouseEnter: () => setPointedId(row.id),
+      onMouseEnter: () => {
+        takeFocus();
+        setPointedId(row.id);
+      },
     };
     const iconTone = row.enabled
       ? 'et-ink-2 group-hover/row:text-[rgb(var(--et-accent))] group-focus/row:text-[rgb(var(--et-accent))]'
