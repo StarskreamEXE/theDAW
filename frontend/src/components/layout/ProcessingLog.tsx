@@ -217,7 +217,7 @@ export const LogBody: React.FC = () => {
           onClick={() => setLogVerbose(!verbose)}
           aria-pressed={verbose}
           aria-label="Toggle verbose log"
-          className={`uppercase text-[8px] font-mono font-black tracking-widest transition-colors ${
+          className={`uppercase text-xs font-display font-bold tracking-widest transition-colors ${
             verbose ? 'text-purple-300' : 'text-zinc-600 hover:text-purple-300'
           }`}
           title={verbose
@@ -232,7 +232,7 @@ export const LogBody: React.FC = () => {
             onClick={() => setErrorsOnly((v) => !v)}
             aria-pressed={errorsOnly}
             aria-label={errorsOnly ? 'Show all log entries' : 'Show only errors'}
-            className={`flex items-center gap-1 px-1.5 py-0.5 rounded uppercase text-[8px] font-mono font-black tracking-widest transition-colors ${
+            className={`flex items-center gap-1 px-1.5 py-0.5 rounded uppercase text-xs font-display font-bold tabular-nums tracking-widest transition-colors ${
               errorsOnly
                 ? 'bg-red-500/20 text-red-300 border border-red-500/40'
                 : errorCount > 0
@@ -269,14 +269,14 @@ export const LogBody: React.FC = () => {
         <div
           ref={bodyRef}
           onScroll={onBodyScroll}
-          className="log-scroll h-full overflow-y-auto px-2 py-1 font-mono text-[9px] space-y-0.5 pr-22"
+          className="log-scroll h-full overflow-y-auto px-2 py-1 text-xs font-semibold leading-4 space-y-0.5 pr-26"
         >
           {displayRows.length === 0
             ? <p className="text-zinc-700 italic">{errorsOnly ? 'No errors.' : 'Waiting for signal...'}</p>
             : displayRows.map(({ entry: e, count }) => verbose
                 ? (
                   <p key={e.id} className={`pl-2 ${levelStyles[e.level]}`}>
-                    <span className="text-zinc-600">{fmtTime(e.ts)}</span>{' '}
+                    <span className="text-zinc-600 tabular-nums">{fmtTime(e.ts)}</span>{' '}
                     <span className="text-zinc-500 uppercase">[{e.source}]</span>{' '}
                     <span>{e.msg}</span>
                   </p>
@@ -284,46 +284,47 @@ export const LogBody: React.FC = () => {
                 : (
                   <p key={e.id} className={`pl-2 ${levelStyles[e.level]}`}>
                     <span>{e.msg}</span>
-                    {count > 1 && <span className="text-zinc-600"> x{count}</span>}
+                    {count > 1 && <span className="text-zinc-600 tabular-nums"> x{count}</span>}
                   </p>
                 ))
           }
         </div>
 
-        {/* Telemetry overlay — right side, like spectral Hz/RMS/peak */}
-        <div className="absolute right-0 top-0 bottom-0 w-20 pointer-events-none flex flex-col justify-end pb-2"
-             style={{ background: 'linear-gradient(to left, rgba(0,0,0,0.85) 60%, transparent)' }}>
+        {/* Telemetry overlay — right side, like spectral Hz/RMS/peak. Its fade is
+            the theme's popup colour, so a light theme gets a light ground. */}
+        <div className="absolute right-0 top-0 bottom-0 w-24 pointer-events-none flex flex-col justify-end pb-2"
+             style={{ background: 'linear-gradient(to left, color-mix(in srgb, var(--et-popup, #0a080f) 88%, transparent) 60%, transparent)' }}>
           <div className="flex flex-col gap-1 pr-2 items-end">
             {stats && gpuUtil(stats) != null && (
-              <div className="flex flex-col items-end leading-none" title={gpuTitle(stats)}>
-                <span className="text-[7px] font-mono text-zinc-600 uppercase">{gpuLabel(stats, 'GPU')}</span>
-                <span className="text-[10px] font-mono text-purple-300">{gpuUtil(stats)}%</span>
+              <div className="flex flex-col items-end gap-0.5 leading-none" title={gpuTitle(stats)}>
+                <span className="text-xs font-display font-bold text-zinc-500 uppercase">{gpuLabel(stats, 'GPU')}</span>
+                <span className="text-xs font-semibold tabular-nums text-purple-300">{gpuUtil(stats)}%</span>
               </div>
             )}
             {stats?.cpu_pct != null && (
-              <div className="flex flex-col items-end leading-none">
-                <span className="text-[7px] font-mono text-zinc-600 uppercase">CPU</span>
-                <span className="text-[10px] font-mono text-emerald-400">{stats.cpu_pct}%</span>
+              <div className="flex flex-col items-end gap-0.5 leading-none">
+                <span className="text-xs font-display font-bold text-zinc-500 uppercase">CPU</span>
+                <span className="text-xs font-semibold tabular-nums text-emerald-400">{stats.cpu_pct}%</span>
               </div>
             )}
             {stats && gpuTemp(stats) != null && (() => { const t = gpuTemp(stats) as number; return (
-              <div className="flex flex-col items-end leading-none" title={gpuTitle(stats)}>
-                <span className="text-[7px] font-mono text-zinc-600 uppercase">HEAT</span>
-                <span className={`text-[10px] font-mono ${t > 80 ? 'text-red-400' : t > 65 ? 'text-amber-400' : 'text-zinc-300'}`}>
+              <div className="flex flex-col items-end gap-0.5 leading-none" title={gpuTitle(stats)}>
+                <span className="text-xs font-display font-bold text-zinc-500 uppercase">HEAT</span>
+                <span className={`text-xs font-semibold tabular-nums ${t > 80 ? 'text-red-400' : t > 65 ? 'text-amber-400' : 'text-zinc-300'}`}>
                   {t}°C
                 </span>
               </div>
             ); })()}
             {stats && gpuVram(stats).total > 0 && (() => { const v = gpuVram(stats); return (
-              <div className="flex flex-col items-end leading-none" title={gpuTitle(stats)}>
-                <span className="text-[7px] font-mono text-zinc-600 uppercase">{gpuLabel(stats, 'VRAM')}</span>
-                <span className="text-[10px] font-mono text-zinc-300">{v.used}/{v.total}G</span>
+              <div className="flex flex-col items-end gap-0.5 leading-none" title={gpuTitle(stats)}>
+                <span className="text-xs font-display font-bold text-zinc-500 uppercase">{gpuLabel(stats, 'VRAM')}</span>
+                <span className="text-xs font-semibold tabular-nums text-zinc-300">{v.used}/{v.total}G</span>
               </div>
             ); })()}
             {isGenerating && estMs > 0 && (
-              <div className="flex flex-col items-end leading-none">
-                <span className="text-[7px] font-mono text-zinc-600 uppercase">EST</span>
-                <span className="text-[10px] font-mono text-cyan-400">{fmtEst(estMs)}</span>
+              <div className="flex flex-col items-end gap-0.5 leading-none">
+                <span className="text-xs font-display font-bold text-zinc-500 uppercase">EST</span>
+                <span className="text-xs font-semibold tabular-nums text-cyan-400">{fmtEst(estMs)}</span>
               </div>
             )}
           </div>
@@ -475,9 +476,9 @@ const TEMP_CLASS = (c: number) =>
   c > 80 ? 'text-red-400' : c > 65 ? 'text-amber-400' : 'text-zinc-300';
 
 const Stat: React.FC<{ label: string; value: string; valueClass?: string; title?: string }> = ({ label, value, valueClass, title }) => (
-  <span className="flex items-baseline gap-0.5 shrink-0" title={title}>
-    <span className="text-[7px] font-mono text-zinc-600 uppercase">{label}</span>
-    <span className={`text-[9px] font-mono tabular-nums ${valueClass ?? 'text-zinc-300'}`}>{value}</span>
+  <span className="flex items-baseline gap-1 shrink-0" title={title}>
+    <span className="text-xs font-display font-bold text-zinc-500 uppercase">{label}</span>
+    <span className={`text-xs font-semibold tabular-nums ${valueClass ?? 'text-zinc-300'}`}>{value}</span>
   </span>
 );
 
