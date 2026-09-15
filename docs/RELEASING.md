@@ -18,11 +18,19 @@ in both files.
 
 1. Bump `version` in `electron-ui/package.json` to the new `X.Y.Z`.
 2. Bump `version` in `pyproject.toml` to the identical `X.Y.Z`.
-3. Commit both files together on `main`.
-4. Create the tag: `git tag vX.Y.Z`.
-5. Push the tag: `git push origin vX.Y.Z`.
+3. Bump both root `version` lines in `electron-ui/package-lock.json` to match.
+   `npm ci` refuses to run when the lock disagrees with its `package.json`.
+4. Run `uv lock` to carry the version into `uv.lock`, then
+   `python scripts/check_lock.py`.
+5. Commit all four files together on `main`.
+6. Create the tag: `git tag vX.Y.Z`.
+7. Push the tag: `git push origin vX.Y.Z`.
 
 The tag push triggers the Release workflow.
+
+Only `version-check` reads `electron-ui/package.json` and `pyproject.toml`, so
+a bump that skips the two lockfiles passes the version gate and fails later in
+the installer jobs.
 
 ## What CI produces on a tag push
 
