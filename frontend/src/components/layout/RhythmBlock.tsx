@@ -187,7 +187,7 @@ export const RhythmBlock: React.FC<{
   const tempo = result?.tempo;
 
   return (
-    <div className="mt-3 p-2 rounded border border-fuchsia-500/25 bg-fuchsia-500/4">
+    <div data-tour="meter-map" className="mt-3 p-2 rounded border border-fuchsia-500/25 bg-fuchsia-500/4">
       <div className="flex items-center justify-between mb-1 gap-2">
         <p className="text-[8px] font-mono text-fuchsia-300/80 uppercase tracking-widest flex items-center gap-1.5">
           <Waves className="w-3 h-3" /> METER MAP

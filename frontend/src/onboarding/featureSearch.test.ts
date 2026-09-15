@@ -51,6 +51,26 @@ const lyricHits = ids('lyrics');
 assert.ok(lyricHits.includes('panel-lyric'), 'lyrics reaches the LYRIC notepad');
 assert.ok(lyricHits.includes('panel-sing'), 'lyrics reaches SING');
 
+// Features shipped from 2026-09-09 to 2026-09-13, each asked for the way a user
+// names it. "meter map" returned SLIDE and SWAY: the METER MAP block and the
+// piano roll's METER face had no entries, so the only hits were the words
+// "meter" and "map" inside the prose of unrelated panels.
+const FIRST_HITS: Array<[query: string, id: string]> = [
+  ['meter map', 'details-meter-map'],
+  ['match', 'midi-meter'],
+  ['meter', 'midi-meter'],
+  ['rhyme', 'sing-study'],
+  ['rhyme web', 'rhyme-web'],
+  ['lyric notebook', 'panel-lyric'],
+  ['asset library', 'asset-library'],
+  ['import', 'import'],
+  ['inputs', 'settings-io'],
+  ['export', 'score-export'],
+];
+for (const [query, id] of FIRST_HITS) {
+  assert.equal(ids(query)[0], id, `"${query}" finds ${id} first (got ${ids(query).join(', ') || 'nothing'})`);
+}
+
 // A query made entirely of question words still tries, rather than going blank.
 assert.deepEqual(tokenize('how do I'), ['how do i'], 'an all-noise query falls back to itself');
 

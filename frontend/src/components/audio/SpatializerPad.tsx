@@ -217,7 +217,7 @@ export function SpatializerPad({ params, onChange, idPrefix }: SpatializerPadPro
           <line x1={C} y1={C - R} x2={C} y2={C + R} stroke="#ffffff" strokeOpacity={0.06} />
           <line x1={C - R} y1={C} x2={C + R} y2={C} stroke="#ffffff" strokeOpacity={0.06} />
           {/* front marker */}
-          <text x={C} y={12} textAnchor="middle" fontSize={7} fill="#71717a" fontFamily="monospace">FRONT</text>
+          <text x={C} y={15} textAnchor="middle" fontSize={12} fill="#a1a1aa" className="font-display font-bold">FRONT</text>
           {renderMotionPath()}
           {/* listener */}
           <circle cx={C} cy={C} r={3} fill="#52525b" />
@@ -233,7 +233,7 @@ export function SpatializerPad({ params, onChange, idPrefix }: SpatializerPadPro
             name={motionId}
             value={motion}
             onChange={(e) => set('motion', Number(e.target.value))}
-            className="form-select px-2 py-1 text-[11px] font-mono"
+            className="form-select px-2 py-1 font-sans text-xs font-bold"
             style={{ colorScheme: 'dark' }}
           >
             {SPATIAL_MOTIONS.map((label, i) => (
@@ -245,7 +245,7 @@ export function SpatializerPad({ params, onChange, idPrefix }: SpatializerPadPro
               <button
                 key={preset.label}
                 onClick={() => merge(preset.values)}
-                className="text-[9px] font-mono px-1.5 py-1 rounded border border-white/5 bg-black/30 text-zinc-400 hover:text-purple-200 hover:border-purple-500/40 hover:bg-purple-500/10 transition-colors truncate"
+                className="font-sans text-xs font-bold px-1.5 py-1 rounded border border-white/5 bg-black/30 text-zinc-400 hover:text-purple-200 hover:border-purple-500/40 hover:bg-purple-500/10 transition-colors truncate"
                 title={`Apply the ${preset.label} motion preset`}
               >
                 {preset.label}
@@ -268,7 +268,7 @@ export function SpatializerPad({ params, onChange, idPrefix }: SpatializerPadPro
           const decimals = p.step < 1 ? (p.step < 0.1 ? 2 : 1) : 0;
           return (
             <div key={p.key} className="flex items-center gap-2">
-              <span id={labelId} className="text-[9px] font-mono text-zinc-500 w-16 shrink-0">{p.label}</span>
+              <span id={labelId} className="font-sans text-xs font-bold text-zinc-400 w-16 shrink-0">{p.label}</span>
               <SlideTrack
                 value={p.value}
                 min={p.min}
@@ -278,7 +278,7 @@ export function SpatializerPad({ params, onChange, idPrefix }: SpatializerPadPro
                 className="flex-1"
                 onChange={(v) => set(p.key, v)}
               />
-              <span className="text-[9px] font-mono text-zinc-400 w-16 shrink-0 text-right tabular-nums">
+              <span className="font-sans text-xs font-bold text-zinc-300 w-16 shrink-0 text-right tabular-nums">
                 {p.value.toFixed(decimals)}{p.unit ? ` ${p.unit}` : ''}
               </span>
             </div>

@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Check, Info, Minus, Plus, Save, Send, Trash2, Unlink } from 'lucide-react';
-import { DEFAULT_LANES, usePianoRollStore, pianoNotesToMidiNotes, type PianoNote } from '../../state/pianoRollStore';
+import { DEFAULT_LANES, usePianoRollStore, type PianoNote } from '../../state/pianoRollStore';
 import { usePlaybackStore } from '../../state/playbackStore';
 import { getEngineCtx } from '../../state/playerStore';
 import { useEditorStore, computePeaks } from '../../state/editorStore';
@@ -12,20 +12,33 @@ import {
   bars as meterBars,
   gridLines,
   meterEquals,
-  meterMapToMidiEvents,
-  midiEventsToMeterMap,
   normalizeMeterMap,
   roundUpToBar,
   unrollLanes,
   type BarSpan,
   type PolyLane,
 } from '../../lib/meterMap';
+import {
+  BEND_CENTER,
+  DEFAULT_BEND_RANGE,
+  liveLaneChannels,
+  loopedBendAutomation,
+  loopedWheelEvents,
+  playedRollBends,
+  playingLane,
+  rollRenderBends,
+  type LaneBend,
+  type PlayedBend,
+} from '../../lib/pitchBend';
+import { BEND_TAIL_SEC, type VoiceBend } from '../../lib/pitchBendVoice';
+import { midiFileToRoll, rollToMidiFile } from '../../lib/rollMidi';
 import { playedRollNotes, rollClipFields } from '../../lib/rollClip';
 import { syncopationByBar } from '../../lib/syncopation';
 import { MidiMapper } from './MidiMapper';
 import { ContextMenu, useContextMenu, type ContextMenuItem } from '../ui/ContextMenu';
 import { renderStepNotesToBlob } from '../../lib/midiSynth';
 import { triggerPianoNote } from '../../lib/pianoTrigger';
+import { isSoundfontActive, sfPitchWheel, sfPitchWheelRange } from '../../lib/soundfontEngine';
 import { parseSheetFile } from '../../lib/sheetImportClient';
 import { ownsKey } from '../../lib/keyScope';
 import {
@@ -111,15 +124,6 @@ const PIANO_MIDI_PARAMS = [
   { key: 'totalSteps' as const, label: 'Total Steps', min: 16,  max: 256, autoCc: 15, integer: true },
 ];
 
-/** Render the current pattern offline to a WAV Blob. Used by SEND TO EDITOR.
- *  Delegates to the shared step renderer in `lib/midiSynth`. */
-const renderPianoRollToBlob = (
-  notes: PianoNote[],
-  bpm: number,
-  totalSteps: number,
-): Promise<{ blob: Blob; duration: number }> =>
-  renderStepNotesToBlob(notes, bpm, totalSteps);
-
 const useMasterGainRef = () => {
   const masterGain = usePlaybackStore((s) => (s.muted ? 0 : s.volume / 100));
   const masterRef = useRef(masterGain);
@@ -176,9 +180,17 @@ export const PianoRollTransport: React.FC<{
   // micro-timing offsets) play — not just integer 16ths. Loops seamlessly by
   // scheduling each note's next occurrence every `total` steps. It resumes from
   // the store's current step, which every tick writes. It plays the lanes
-  // unrolled. Each tick reads the notes, lanes, length and BPM from the store,
-  // so an edit while playing (a note, a meter, a lane's loop) changes what plays
-  // next without a restart, and a step already scheduled is never scheduled again.
+  // unrolled. Each tick reads the notes, lanes, length, BPM and bends from the
+  // store, so an edit while playing (a note, a meter, a lane's loop, a bend)
+  // changes what plays next without a restart, and a step already scheduled is
+  // never scheduled again.
+  //
+  // Pitch bend: a built-in voice follows its lane's curve through automation
+  // scheduled with the note (lib/pitchBendVoice). A soundfont wheel bends a
+  // whole channel, so each bent lane plays on its own channel and each tick
+  // sends that channel's wheel messages for the window it schedules notes in.
+  // The roll's soundfont channels count down from 14 (lib/pitchBend
+  // liveLaneChannels), clear of EDIT's live MIDI and the arpeggiator.
   useEffect(() => {
     if (!isPlaying) return;
     const ctx = getEngineCtx();
@@ -190,13 +202,28 @@ export const PianoRollTransport: React.FC<{
     // Absolute step s is roll step (s - lap.base) mod lap.total; a length change re-anchors the lap at the cursor.
     const lap = { base: 0, total: 0 };
     let cursor = startStep - 1e-4; // absolute step scheduled up to (inclusive)
-    // Unroll once per note, lane or length edit, not once per tick.
-    let source: { notes: PianoNote[]; lanes: PolyLane[]; total: number } | null = null;
+    // Unroll once per note, lane, length or bend edit, not once per tick.
+    let source: { notes: PianoNote[]; lanes: PolyLane[]; total: number; bends: LaneBend[] } | null = null;
     let played: PianoNote[] = [];
+    let bent = new Map<number, PlayedBend>();
+    let channels = new Map<number, number>();
+    // Soundfont channels this playback has bent, with the range last sent, and the latest wheel message time.
+    const wheelRanges = new Map<number, number>();
+    let lastWheelTime = 0;
+    // The next tick first sends each bent channel where its curve is: at the start, and after a bend, lane or length edit.
+    let wheelFresh = true;
+
+    /** A channel's wheel back at the centre and the default range, after every message already sent to it. */
+    const releaseWheel = (ch: number) => {
+      const at = Math.max(ctx.currentTime, lastWheelTime) + 0.001;
+      sfPitchWheel(ch, BEND_CENTER, at);
+      sfPitchWheelRange(ch, DEFAULT_BEND_RANGE, at);
+      wheelRanges.delete(ch);
+    };
 
     const tick = () => {
       const now = ctx.currentTime;
-      const { notes, lanes, totalSteps: steps, bpm: tempo } = usePianoRollStore.getState();
+      const { notes, lanes, totalSteps: steps, bpm: tempo, bends } = usePianoRollStore.getState();
       const total = Math.max(1, steps);
       const stepSec = 60 / Math.max(40, tempo) / 4;
       if (clock.stepSec === 0) clock.stepSec = stepSec;
@@ -212,18 +239,51 @@ export const PianoRollTransport: React.FC<{
         lap.base = pos < total ? cursor - pos : cursor + 1e-4;
         lap.total = total;
       }
-      if (!source || source.notes !== notes || source.lanes !== lanes || source.total !== total) {
-        source = { notes, lanes, total };
+      if (!source || source.notes !== notes || source.lanes !== lanes || source.total !== total || source.bends !== bends) {
+        if (source && (source.lanes !== lanes || source.total !== total || source.bends !== bends)) wheelFresh = true;
+        source = { notes, lanes, total, bends };
         played = unrollLanes(notes, lanes, total);
+        bent = playedRollBends(bends, lanes, total);
+        channels = liveLaneChannels(lanes, bends);
       }
       const targetAbs = clock.step + (now + lookahead - clock.time) / stepSec;
+      const soundfont = isSoundfontActive();
+      if (soundfont) {
+        // A channel whose lane stopped bending goes back to the centre.
+        const bentChannels = new Set([...bent.keys()].map((lane) => channels.get(lane) ?? 0));
+        for (const ch of [...wheelRanges.keys()]) if (!bentChannels.has(ch)) releaseWheel(ch);
+        for (const [lane, curve] of bent) {
+          const ch = channels.get(lane) ?? 0;
+          if (wheelRanges.get(ch) !== curve.range) {
+            sfPitchWheelRange(ch, curve.range);
+            wheelRanges.set(ch, curve.range);
+          }
+          for (const e of loopedWheelEvents(curve.points, total, cursor - lap.base, targetAbs - lap.base, wheelFresh, curve.range)) {
+            const at = Math.max(now, clock.time + (e.abs + lap.base - clock.step) * stepSec);
+            sfPitchWheel(ch, e.raw, at);
+            lastWheelTime = Math.max(lastWheelTime, at);
+          }
+        }
+        wheelFresh = false;
+      }
       for (const n of played) {
         const first = lap.base + n.step;
         let occ = first + Math.ceil((cursor - first) / total) * total;
         if (occ <= cursor) occ += total;
+        if (occ > targetAbs) continue;
+        const lane = playingLane(n.lane, lanes);
+        const channel = channels.get(lane) ?? 0;
+        const curve = soundfont ? undefined : bent.get(lane);
         while (occ <= targetAbs) {
           const when = clock.time + (occ - clock.step) * stepSec;
-          triggerPianoNote(n.note, n.velocity, Math.max(now, when), n.length * stepSec, masterRef.current);
+          const at = Math.max(now, when);
+          let bend: VoiceBend | undefined;
+          if (curve) {
+            // A note that starts late picks its curve up where the curve is by then.
+            const { events, originStep } = loopedBendAutomation(curve, total, n.step + (at - when) / stepSec, n.length + BEND_TAIL_SEC / stepSec);
+            bend = { events, originStep, stepSec };
+          }
+          triggerPianoNote(n.note, n.velocity, at, n.length * stepSec, masterRef.current, { channel, bend });
           occ += total;
         }
       }
@@ -237,6 +297,7 @@ export const PianoRollTransport: React.FC<{
         window.clearInterval(playTimerRef.current);
         playTimerRef.current = null;
       }
+      for (const ch of [...wheelRanges.keys()]) releaseWheel(ch);
     };
   }, [isPlaying, setCurrentStep, masterRef]);
 
@@ -495,14 +556,17 @@ export const PianoRollEditKey: React.FC = () => {
       return;
     }
     // The editor plays a clip's notes once, so it gets the lane repeats written
-    // out (sourcePianoRoll). The roll's own notes, meter map, pickup and lanes are
-    // copied beside them, so re-editing later sees the exact same state.
+    // out (sourcePianoRoll). The roll's own notes, meter map, pickup, lanes and
+    // bends are copied beside them, so re-editing later sees the exact same state.
     const fields = rollClipFields(roll);
     const notes = fields.sourcePianoRoll;
     setIsBouncing(true);
     const start = performance.now();
     try {
-      const { blob, duration } = await renderPianoRollToBlob(notes, bpm, totalSteps);
+      // Each note renders in its own lane, so a lane's pitch bend bends its notes in the audio too.
+      const { blob, duration } = await renderStepNotesToBlob(unrollLanes(roll.notes, roll.lanes, totalSteps), bpm, totalSteps, {
+        bends: rollRenderBends(roll.bends, roll.lanes, totalSteps),
+      });
       const { peaks } = await computePeaks(blob, 240);
       const editor = useEditorStore.getState();
 
@@ -651,63 +715,41 @@ export const PianoRollClearKey: React.FC = () => (
   />
 );
 
-/** Save the roll as a Standard MIDI File at its own BPM and time signatures, lane repeats written out. */
+/** Save the roll as a Standard MIDI File at its own BPM and time signatures, lane
+ *  repeats written out, each bent lane on its own channel with its pitch wheel and range (lib/rollMidi). */
 export const exportRollMidi = async (): Promise<void> => {
-  const { notes: stored, bpm, totalSteps, lanes, meterMap, pickupSteps } = usePianoRollStore.getState();
-  if (stored.length === 0) {
+  const roll = usePianoRollStore.getState();
+  if (roll.notes.length === 0) {
     logError('piano-roll', 'No notes to export');
     return;
   }
-  const notes = playedRollNotes(stored, lanes, totalSteps);
-  const ppq = 480;
-  const midiNotes = pianoNotesToMidiNotes(notes, ppq);
-  const result = await downloadMidi(
-    {
-      ppq,
-      bpm,
-      tempos: [{ tick: 0, bpm }],
-      // One FF 58 per meter change, a partial bar at tick 0 for a pickup.
-      timeSignatures: meterMapToMidiEvents(meterMap, ppq, pickupSteps),
-      tracks: [
-        { name: 'Piano Roll', notes: midiNotes },
-      ],
-    },
-    'piano-roll',
-  );
+  const file = rollToMidiFile(roll);
+  const count = file.tracks[0]?.notes.length ?? 0;
+  const result = await downloadMidi(file, 'piano-roll');
   // A cancelled or failed save exported nothing; saveFile already logged a failure.
-  if (result.path) logInfo('piano-roll', `Exported ${notes.length} notes as MIDI to ${result.path}`);
-  else if (result.downloaded) logInfo('piano-roll', `Exported ${notes.length} notes as MIDI`);
+  if (result.path) logInfo('piano-roll', `Exported ${count} notes as MIDI to ${result.path}`);
+  else if (result.downloaded) logInfo('piano-roll', `Exported ${count} notes as MIDI`);
 };
 
 export const importMidiFileToRoll = (file: File): void => {
   file.arrayBuffer().then((buf) => {
     try {
       const data = parseMidi(new Uint8Array(buf));
-      // Flatten all tracks' notes into a single piano-roll layer.
-      const stepTicks = data.ppq / 4;
-      const flat: PianoNote[] = [];
-      for (const track of data.tracks) {
-        for (const n of track.notes) {
-          flat.push({
-            id: `imp-${Math.random().toString(36).slice(2)}-${flat.length}`,
-            note: n.note,
-            step: Math.round(n.tick / stepTicks),
-            length: Math.max(1, Math.round(n.durationTicks / stepTicks)),
-            velocity: n.velocity,
-          });
-        }
-      }
+      // Every track's notes, the file's time signatures and pickup (4/4 when it
+      // has none). A channel whose pitch wheel moves gets its own lane and curve;
+      // every other note is in lane A (lib/rollMidi).
+      const { notes: flat, bpm, meter, bends } = midiFileToRoll(data, 'imp');
       if (flat.length === 0) {
         logError('piano-roll', `No notes found in "${file.name}"`);
         return;
       }
-      flat.sort((a, b) => a.step - b.step);
-      // The file's time signatures and pickup; a file with none is 4/4. Its notes
-      // carry no lanes, so the roll's lanes reset to lane A alone.
-      const { map, pickupSteps } = midiEventsToMeterMap(data.timeSignatures ?? [], data.ppq);
       // importNotes auto-fits the grid length (to a bar line of that map) AND pitch range to the import.
-      usePianoRollStore.getState().importNotes(flat, data.bpm, { meterMap: map, pickupSteps, lanes: [...DEFAULT_LANES] });
-      logInfo('piano-roll', `Imported ${flat.length} notes from "${file.name}" at ${Math.round(data.bpm)} BPM in ${meterLabel(map[0].meter)}`);
+      usePianoRollStore.getState().importNotes(flat, bpm, meter, bends);
+      const bent = bends.filter((b) => b.points.length).length;
+      logInfo(
+        'piano-roll',
+        `Imported ${flat.length} notes from "${file.name}" at ${Math.round(bpm)} BPM in ${meterLabel(meter.meterMap[0].meter)}${bent ? `, pitch bend in ${bent} lane${bent === 1 ? '' : 's'}` : ''}`,
+      );
     } catch (e) {
       logError('piano-roll', `MIDI import failed: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -739,10 +781,10 @@ export const importSheetFileToRoll = (file: File): void => {
       flat.sort((a, b) => a.step - b.step);
       // The score's first time signature holds for the whole roll; a score with
       // none, or one the roll cannot draw, is 4/4. Its notes start at step 0 and
-      // carry no lanes, so the roll's lanes reset to lane A alone.
+      // carry no lanes or bends, so the roll's lanes reset to lane A alone, unbent.
       const [num, den] = score.time_signature ?? [];
       const meterMap = normalizeMeterMap([{ bar: 0, meter: { num: Number(num), den: Number(den), groups: [] } }]);
-      usePianoRollStore.getState().importNotes(flat, score.bpm, { meterMap, pickupSteps: 0, lanes: [...DEFAULT_LANES] });
+      usePianoRollStore.getState().importNotes(flat, score.bpm, { meterMap, pickupSteps: 0, lanes: [...DEFAULT_LANES] }, []);
       logInfo(
         'piano-roll',
         `Imported ${flat.length} notes from score "${file.name}" (${score.format}) at ${Math.round(score.bpm)} BPM in ${meterLabel(meterMap[0].meter)}`,

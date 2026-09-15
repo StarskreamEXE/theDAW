@@ -247,6 +247,19 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
       }, 1500);
     }
 
+    // MIDI conversion and analysis report nothing until they return, and the
+    // first MIDI run of a session spends a minute loading basic-pitch. A
+    // 30-second heartbeat keeps the LOG showing the run is alive.
+    let heartbeat: ReturnType<typeof setInterval> | null = null;
+    if (kind !== 'stems') {
+      const startedAt = Date.now();
+      heartbeat = setInterval(() => {
+        const s = Math.round((Date.now() - startedAt) / 1000);
+        const elapsed = `${Math.floor(s / 60)}m${(s % 60).toString().padStart(2, '0')}s`;
+        logInfo('library', `${labels[kind]} still running on ${entryId.slice(0, 8)} (${elapsed})`);
+      }, 30_000);
+    }
+
     // Build the run URL — stems honours the user's device + count
     // preferences from Settings → Background features.
     let runUrl = `/api/${kind}/${entryId}/run`;
@@ -327,6 +340,7 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
       }
     } finally {
       if (stemsPoller) clearInterval(stemsPoller);
+      if (heartbeat) clearInterval(heartbeat);
       if (kind === 'stems') {
         stemsAbortControllerRef.current = null;
         setStemsBanner(null);

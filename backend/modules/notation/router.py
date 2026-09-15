@@ -342,13 +342,7 @@ def export_artifact(entry_id: str, body: ExportRequest) -> dict[str, Any]:
     audio_path = store.get_audio_path(entry_id)
     duration = getattr(entry, "duration", None) if entry is not None else None
     audio_duration_sec = float(duration) if duration else None
-    analysis = store.db.get_analysis(entry_id)
-    analysis_bpm: Optional[float] = None
-    if analysis and analysis.get("bpm"):
-        try:
-            analysis_bpm = float(analysis["bpm"])
-        except (TypeError, ValueError):
-            analysis_bpm = None
+    analysis_bpm = _analysis_bpm(store, entry_id)
 
     result = convert_score(
         store.db,
@@ -379,6 +373,19 @@ def _artifact_metadata(artifact: dict[str, Any]) -> dict[str, Any]:
         except ValueError:
             return {}
     return raw if isinstance(raw, dict) else {}
+
+
+def _analysis_bpm(store: Any, entry_id: str) -> Optional[float]:
+    """The entry's analysed tempo, or None when its analysis row has no
+    positive BPM."""
+    analysis = store.db.get_analysis(entry_id)
+    if not analysis or not analysis.get("bpm"):
+        return None
+    try:
+        bpm = float(analysis["bpm"])
+    except (TypeError, ValueError):
+        return None
+    return bpm if bpm > 0 else None
 
 
 def _find_lead_sheet(
@@ -661,6 +668,9 @@ def make_arrangement(entry_id: str, body: ArrangeRequest) -> dict[str, Any]:
         source_ref=source_ref,
         title=str(getattr(entry, "title", "") or ""),
         artifact_id=f"{source_ref}__{style}__musicxml",
+        # A band score lays every staff out at the song's tempo, so its bars
+        # line up with the audio whatever tempo each stem MIDI was written at.
+        reference_bpm=_analysis_bpm(store, entry_id),
     )
     if not result.get("ok"):
         raise HTTPException(501, result)

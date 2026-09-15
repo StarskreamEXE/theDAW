@@ -4,6 +4,7 @@
 import assert from 'node:assert/strict';
 import { clipMeterToTasmo, pianoNoteToTasmo, tasmoMeterToClip, tasmoNotesToPiano } from './projectClient.ts';
 import type { MeterSegment, PolyLane } from './meterMap.ts';
+import type { LaneBend } from './pitchBend.ts';
 import type { PianoNote } from '../state/pianoRollStore.ts';
 
 const MAP: MeterSegment[] = [
@@ -101,6 +102,42 @@ const withoutIds = (notes: readonly PianoNote[] = []) => notes.map(({ id: _id, .
       { id: 'x-1', note: 62, step: 4, length: 1, velocity: 100, lane: 2 },
     ],
   );
+}
+
+// Each lane's pitch bend round-trips through the JSON shape: a linear point stores no shape, and loaded points get new ids.
+{
+  const bends: LaneBend[] = [
+    { lane: 0, range: 2, points: [{ id: 'a', step: 0, value: 0, shape: 'linear' }, { id: 'b', step: 4.5, value: 1, shape: 'hold' }] },
+    { lane: 1, range: 12, points: [{ id: 'c', step: 2, value: -0.5, shape: 'smooth' }] },
+  ];
+  const saved = clipMeterToTasmo({ sourceBends: bends });
+  assert.deepEqual(saved, {
+    roll_bends: [
+      { lane: 0, range: 2, points: [{ step: 0, value: 0 }, { step: 4.5, value: 1, shape: 'hold' }] },
+      { lane: 1, range: 12, points: [{ step: 2, value: -0.5, shape: 'smooth' }] },
+    ],
+  });
+  const loaded = tasmoMeterToClip(JSON.parse(JSON.stringify(saved)));
+  const strip = (list: readonly LaneBend[] = []) => list.map((b) => ({ ...b, points: b.points.map(({ id: _id, ...p }) => p) }));
+  assert.deepEqual(strip(loaded.sourceBends), strip(bends));
+  assert.deepEqual(loaded.sourceBends?.map((b) => b.points.map((p) => p.id)), [['rb0-0', 'rb0-1'], ['rb1-0']]);
+  // No bend writes none, and a file without one loads none.
+  assert.deepEqual(clipMeterToTasmo({ sourceBends: [] }), {});
+  assert.deepEqual(tasmoMeterToClip({ roll_bends: [] }), {});
+  assert.deepEqual(tasmoMeterToClip({ roll_bends: null }), {});
+}
+
+// Malformed bends from a hand-edited file stay out.
+{
+  const loaded = tasmoMeterToClip({
+    roll_bends: [
+      null,
+      { lane: -1, range: 2, points: [{ step: 0, value: 1 }] },
+      { lane: 1, range: 'x', points: [{ step: 'a', value: 1 }, null, { step: 3, value: 9, shape: 'zigzag' }] },
+      { lane: 2, range: 2, points: 'nope' },
+    ],
+  } as unknown as Parameters<typeof tasmoMeterToClip>[0]);
+  assert.deepEqual(loaded.sourceBends, [{ lane: 1, range: 2, points: [{ id: 'rb1-2', step: 3, value: 1, shape: 'linear' }] }]);
 }
 
 console.log('projectImport mapping tests passed');

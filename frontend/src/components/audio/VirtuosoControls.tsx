@@ -253,6 +253,7 @@ export const VirtuosoControls: React.FC<{ songEntryId?: string; onStatus?: (text
           </button>
           <button
             type="button"
+            data-tour="midi-meter"
             aria-pressed={meterFace}
             title="Meter: time signatures, groups, lanes, syncopation and generators"
             className={`${STRIP_KEY} ${keyTone({ on: meterFace })}`}

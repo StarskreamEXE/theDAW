@@ -81,6 +81,13 @@ export interface LibraryEntry {
   embeddedTags?: Record<string, unknown>;
 }
 
+/**
+ * True when an entry is audio. `kind` is optional and an entry without one is
+ * audio, the library's original citizen, so every audio-only list asks here
+ * and never compares `kind` to 'audio' directly.
+ */
+export const isAudioEntry = (entry: Pick<LibraryEntry, 'kind'>): boolean => (entry.kind ?? 'audio') === 'audio';
+
 /** Subset of fields a client is allowed to PATCH. Must match the
  * backend's USER_MUTABLE_FIELDS set in `backend/modules/library/store.py`. */
 export interface LibraryEntryPatch {

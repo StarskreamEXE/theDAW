@@ -161,11 +161,15 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({
     <div
       ref={menuRef}
       role="menu"
-      className="fixed z-200 bg-[#0a080f] border border-purple-500/40 rounded shadow-[0_8px_24px_rgba(0,0,0,0.6)] py-1 text-[10px] font-mono select-none"
+      // z-10000: over the assistant orb (z 9999) in the window's bottom-left
+      // corner, which a tall menu opened from a low lane reaches.
+      className="fixed z-10000 overflow-y-auto bg-[#0a080f] border border-purple-500/40 rounded shadow-[0_8px_24px_rgba(0,0,0,0.6)] py-1 font-sans text-xs font-bold select-none"
       // maxWidth caps the menu so a long title/label actually truncates instead
       // of stretching the menu hundreds of px wide (which then clamps far from
-      // the cursor); minWidth keeps short menus from looking cramped.
-      style={{ left: pos.x, top: pos.y, minWidth, maxWidth: 'min(22rem, 90vw)' }}
+      // the cursor); minWidth keeps short menus from looking cramped. maxHeight
+      // keeps the edge gap above and below, so a menu taller than the window
+      // scrolls inside itself.
+      style={{ left: pos.x, top: pos.y, minWidth, maxWidth: 'min(22rem, 90vw)', maxHeight: 'calc(100vh - 12px)' }}
       onClick={(e) => e.stopPropagation()}
       onContextMenu={(e) => {
         // Suppress the browser's native right-click menu when the user
@@ -176,7 +180,7 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({
       }}
     >
       {title && (
-        <div className="px-3 py-1.5 text-[8px] uppercase tracking-widest text-zinc-600 border-b border-white/5 mb-0.5 truncate">
+        <div className="px-3 py-1.5 font-display text-xs font-bold uppercase tracking-wider text-zinc-400 border-b border-white/5 mb-0.5 truncate">
           {title}
         </div>
       )}
@@ -188,7 +192,7 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({
           return (
             <div
               key={idx}
-              className="px-3 py-1 text-[8px] uppercase tracking-widest text-zinc-600"
+              className="px-3 py-1 font-display text-xs font-bold uppercase tracking-wider text-zinc-400"
             >
               {item.label}
             </div>
@@ -212,7 +216,7 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({
               <span className="truncate">{item.label}</span>
             </span>
             {item.hint != null && (
-              <span className="shrink-0 text-zinc-600 text-[8px] normal-case">
+              <span className="shrink-0 text-zinc-500 normal-case tabular-nums">
                 {item.hint}
               </span>
             )}
