@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useId } from 'react';
 import { Sparkles, Send, X } from 'lucide-react';
 import type { ProcessingConfig, NoteEvent, ScaleType } from './types';
 import { askAssistant, type AssistantContext } from './geminiAssistant';
-import { KEY_ON, KEY_REST, MINI_ICON_KEY, MINI_KEY, keyTone } from '../midiDockKit';
+import { FLYOUT_KEY, KEY_ON, KEY_REST, MINI_ICON_KEY, keyTone, useDockTip } from '../midiDockKit';
 
 interface PianoRollControls {
     notes: NoteEvent[];
@@ -52,7 +52,13 @@ export const AssistantOrb: React.FC<AssistantOrbProps> = ({
     const [isThinking, setIsThinking] = useState(false);
     const listRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLInputElement>(null);
-    const triggerRef = useRef<HTMLButtonElement>(null);
+    const triggerTip = useDockTip({
+        word: 'Architect',
+        description: 'AI that changes the settings, notes, tempo and key',
+        label: 'Architect assistant',
+        expanded: isOpen,
+    });
+    const triggerRef = triggerTip.anchorRef;
     const panelId = `v2m-assistant-${useId().replace(/:/g, '')}`;
 
     // Keep the newest message in view. Scrolls the list itself: scrollIntoView
@@ -167,11 +173,12 @@ export const AssistantOrb: React.FC<AssistantOrbProps> = ({
                 aria-expanded={isOpen}
                 aria-controls={panelId}
                 aria-label="Architect assistant"
-                title="Architect assistant: AI that changes the settings, notes, tempo and key"
+                aria-describedby={triggerTip.describedBy}
                 className={`${MINI_ICON_KEY} ${keyTone({ on: isOpen })}`}
             >
                 <Sparkles aria-hidden="true" className="w-3 h-3" />
             </button>
+            {triggerTip.tip}
 
             {/* Chat Interface. `inert` keeps the closed (faded) card out of Tab
                 order and away from assistive tech. */}
@@ -193,7 +200,7 @@ export const AssistantOrb: React.FC<AssistantOrbProps> = ({
                 <div className="px-3 py-2 border-b border-white/10 flex justify-between items-center bg-black/40">
                     <div className="flex items-center gap-2">
                         <Sparkles aria-hidden="true" size={14} className="text-[rgb(var(--et-accent))]" />
-                        <span className="text-[10px] font-mono font-semibold uppercase tracking-widest et-ink">Architect</span>
+                        <span className="text-[12px] font-display font-extrabold uppercase et-ink">Architect</span>
                     </div>
                     <button
                         type="button"
@@ -207,7 +214,7 @@ export const AssistantOrb: React.FC<AssistantOrbProps> = ({
                 </div>
 
                 {/* Status Bar */}
-                <div className="px-3 py-1.5 bg-black/20 border-b border-white/10 flex items-center justify-between text-[10px] font-mono">
+                <div className="px-3 py-1.5 bg-black/20 border-b border-white/10 flex items-center justify-between text-[12px] font-semibold tabular-nums">
                     <span className="et-ink-3">
                         {pianoRollControls.notes.length} notes | {pianoRollControls.bpm} BPM
                     </span>
@@ -227,7 +234,7 @@ export const AssistantOrb: React.FC<AssistantOrbProps> = ({
                                 {m.text}
                                 {m.actions && m.actions.length > 0 && (
                                     <div className="mt-2 pt-2 border-t border-white/5">
-                                        <div className="text-[9px] text-[rgb(var(--et-accent))] font-mono">
+                                        <div className="text-[12px] font-semibold text-[rgb(var(--et-accent))]">
                                             {m.actions.map((action, j) => (
                                                 <div key={j}>✓ {action}</div>
                                             ))}
@@ -257,7 +264,7 @@ export const AssistantOrb: React.FC<AssistantOrbProps> = ({
                                 type="button"
                                 onClick={() => setInput(q.command)}
                                 title={q.command}
-                                className={`${MINI_KEY} ${KEY_REST}`}
+                                className={`${FLYOUT_KEY} ${KEY_REST}`}
                             >
                                 <span>{q.label}</span>
                             </button>
@@ -268,12 +275,14 @@ export const AssistantOrb: React.FC<AssistantOrbProps> = ({
                 {/* Input */}
                 <div className="p-3 border-t border-white/10 bg-black/40">
                     <div className="flex gap-2">
+                        <label htmlFor="vocal2midi-assistant-input" className="sr-only">
+                            Assistant command
+                        </label>
                         <input
                             ref={inputRef}
                             type="text"
                             id="vocal2midi-assistant-input"
                             name="vocal2midi-assistant-input"
-                            aria-label="Assistant command"
                             value={input}
                             onChange={(e) => setInput(e.target.value)}
                             onKeyDown={handleKeyDown}

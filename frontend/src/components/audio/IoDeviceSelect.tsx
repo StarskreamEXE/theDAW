@@ -63,6 +63,10 @@ const DeviceSelect: React.FC<{
   legend?: string;
   labelClassName?: string;
   className?: string;
+  /** Replaces the settings modal's SELECT look (a surface with its own type, the MIDI dock). */
+  selectClassName?: string;
+  /** Size and family of the status notes under the select; their colours stay. */
+  hintClassName?: string;
 }> = ({
   id,
   label,
@@ -78,6 +82,8 @@ const DeviceSelect: React.FC<{
   legend,
   labelClassName = 'text-[11px] font-mono uppercase tracking-wider text-zinc-400 shrink-0',
   className = '',
+  selectClassName = SELECT,
+  hintClassName = 'text-[11px] font-mono',
 }) => (
   <>
     <label htmlFor={id} className={showLabel ? labelClassName : 'sr-only'}>
@@ -91,7 +97,7 @@ const DeviceSelect: React.FC<{
       aria-label={label}
       title={unsupported || title || label}
       disabled={disabled || !!unsupported}
-      className={`${SELECT} ${className}`}
+      className={`${selectClassName} ${className}`}
       style={{ colorScheme: 'dark' }}
     >
       {options.map((o) => (
@@ -100,15 +106,15 @@ const DeviceSelect: React.FC<{
         </option>
       ))}
     </select>
-    {unsupported && <span className="text-[11px] font-mono text-amber-300/80">{unsupported}</span>}
+    {unsupported && <span className={`${hintClassName} text-amber-300/80`}>{unsupported}</span>}
     {!unsupported && missing && (
-      <span className="inline-flex items-center gap-1 text-[11px] font-mono text-amber-300">
-        <AlertTriangle className="w-3 h-3 shrink-0" />
-        not connected — using the system default
+      <span className={`inline-flex items-center gap-1 ${hintClassName} text-amber-300`}>
+        <AlertTriangle aria-hidden="true" className="w-3 h-3 shrink-0" />
+        <span>not connected — using the system default</span>
       </span>
     )}
     {!unsupported && !labelsKnown && (
-      <span className="text-[11px] font-mono text-zinc-500">
+      <span className={`${hintClassName} text-zinc-500`}>
         device names appear once something opens the mic
       </span>
     )}
@@ -150,7 +156,9 @@ export const IoSurfaceSelect: React.FC<{
   legend?: string;
   labelClassName?: string;
   className?: string;
-}> = ({ surface, id, label, showLabel, legend, labelClassName, className }) => {
+  selectClassName?: string;
+  hintClassName?: string;
+}> = ({ surface, id, label, showLabel, legend, labelClassName, className, selectClassName, hintClassName }) => {
   const def = surfaceById(surface);
   const kind = def?.kind ?? 'audioIn';
   const resolved: Resolved = useResolvedSurface(surface);
@@ -186,6 +194,8 @@ export const IoSurfaceSelect: React.FC<{
       legend={legend}
       labelClassName={labelClassName}
       className={className}
+      selectClassName={selectClassName}
+      hintClassName={hintClassName}
     />
   );
 };

@@ -7,8 +7,8 @@
  *           as keys for three choices or fewer and a menu for more
  *   ADD     a change at the playhead's bar (off when that bar starts after the
  *           roll ends); the trash key removes the selected one
- *   LANES   one key per lane in its roll look; + adds a lane, the trash key
- *           removes the active one
+ *   LANES   one key per lane in its roll look (a menu past five lanes); + adds
+ *           a lane, the trash key removes the active one
  *   LOOP    the active lane's loop in steps (Shift steps a bar)
  *   SYNC / ACCENT  the Virtuoso amounts, their ranges widening into spare width
  *   GEN     LOOM's rules written into the active lane, from a flyout
@@ -22,7 +22,10 @@
  */
 import React from 'react';
 import { create } from 'zustand';
-import { AudioWaveform, Blocks, ChevronLeft, ChevronRight, Dices, Minus, Plus, Send, Trash2 } from 'lucide-react';
+import {
+  ArrowLeftToLine, ArrowRightToLine, AudioWaveform, Blocks, ChevronLeft, ChevronRight, DiamondMinus, DiamondPlus, Dices, ListPlus, ListX, Minus,
+  Plus, Send,
+} from 'lucide-react';
 import { laneName, usePianoRollStore } from '../../state/pianoRollStore';
 import { useVirtuosoStore } from '../../state/virtuosoStore';
 import { logError, logInfo, logWarn } from '../../state/logStore';
@@ -37,8 +40,8 @@ import {
   stepLoop, stepOption, type GateChoice, type GenSettings, type LaneForm, type MeterEdit,
 } from '../../lib/meterFace';
 import {
-  DockFlyout, FIELD, FIELD_LEGEND, FIELD_VALUE, FLYOUT_CARD, KEY_REST, MINI_ICON_KEY, MINI_KEY, RANGE, STRIP_ICON_KEY,
-  STRIP_KEY, Sep, StripKey, keyTone,
+  DockFlyout, FIELD, FIELD_GROW, FIELD_LEGEND, FIELD_SELECT, FIELD_VALUE, FLYOUT_CARD, FLYOUT_KEY, FLYOUT_LEGEND, FLYOUT_VALUE, KEY_REST,
+  MINI_GLYPH, MINI_ICON_KEY, MINI_KEY, RANGE_FILL, STRIP_GLYPH, Sep, StripKey, keyTone,
 } from './midiDockKit';
 
 type Level = 'info' | 'warn' | 'error';
@@ -48,6 +51,9 @@ const useMatchBusy = create<{ busy: boolean }>(() => ({ busy: false }));
 
 /** GROUPS draws keys up to this many choices, and a menu past it. */
 const GROUP_KEYS_MAX = 3;
+/** LANES draws a key per lane up to this many lanes, and a menu past it, so the
+ *  row keeps its width however many lanes are added. */
+const LANE_KEYS_MAX = 5;
 
 /* ── lane swatches: PianoRoll.tsx's lane forms, in the one accent ─────────── */
 
@@ -74,41 +80,55 @@ const LaneSwatch: React.FC<{ form: LaneForm }> = ({ form }) => (
 interface StepperProps {
   id: string;
   legend?: string;
+  /** What the field holds: the legend's and readout's title, and each key's DockTip description. */
   title: string;
   value: string;
   downLabel: string;
   upLabel: string;
+  /** The keys' glyphs, minus and plus by default. A second stepper in the same row
+   *  passes its own pair, so no two keys in the row share a glyph. */
+  downIcon?: React.ReactNode;
+  upIcon?: React.ReactNode;
   /** `byBar` is true on a Shift-click. */
   onStep: (dir: -1 | 1, byBar: boolean) => void;
   downDisabled?: boolean;
   upDisabled?: boolean;
   valueClass?: string;
+  /** Inside the GEN card: the 12px legend and readout. */
+  flyout?: boolean;
 }
 
-const Stepper: React.FC<StepperProps> = ({ id, legend, title, value, downLabel, upLabel, onStep, downDisabled, upDisabled, valueClass = 'min-w-4' }) => (
-  <div className={FIELD} title={title}>
-    {legend && <span className={FIELD_LEGEND}>{legend}</span>}
-    <button
-      type="button"
-      className={`${MINI_ICON_KEY} ${KEY_REST}`}
+/** The −/+ keys are one control with the readout between them, named by their
+ *  own DockTips; the field carries no title, so no key shows two tooltips. A key
+ *  its press takes to the limit passes keyboard focus to its pair. */
+const Stepper: React.FC<StepperProps> = ({ id, legend, title, value, downLabel, upLabel, downIcon, upIcon, onStep, downDisabled, upDisabled, valueClass = 'min-w-4', flyout }) => (
+  <div className={FIELD}>
+    {legend && <span className={flyout ? FLYOUT_LEGEND : FIELD_LEGEND} title={title}>{legend}</span>}
+    <StripKey
+      mini
+      iconOnly
       aria-label={downLabel}
       aria-describedby={`${id}-value`}
+      description={title}
       disabled={downDisabled}
+      passFocusOnDisable
       onClick={(e) => onStep(-1, e.shiftKey)}
-    >
-      <Minus aria-hidden="true" className="w-3 h-3" />
-    </button>
-    <span id={`${id}-value`} aria-live="polite" className={`${FIELD_VALUE} ${valueClass}`}>{value}</span>
-    <button
-      type="button"
-      className={`${MINI_ICON_KEY} ${KEY_REST}`}
+      icon={downIcon ?? <Minus className={MINI_GLYPH} />}
+      legend={downLabel}
+    />
+    <span id={`${id}-value`} aria-live="polite" title={title} className={`${flyout ? FLYOUT_VALUE : FIELD_VALUE} ${valueClass}`}>{value}</span>
+    <StripKey
+      mini
+      iconOnly
       aria-label={upLabel}
       aria-describedby={`${id}-value`}
+      description={title}
       disabled={upDisabled}
+      passFocusOnDisable
       onClick={(e) => onStep(1, e.shiftKey)}
-    >
-      <Plus aria-hidden="true" className="w-3 h-3" />
-    </button>
+      icon={upIcon ?? <Plus className={MINI_GLYPH} />}
+      legend={upLabel}
+    />
   </div>
 );
 
@@ -147,7 +167,7 @@ const GATE_KEYS: Array<{ kind: GateKind; legend: string; title: string }> = [
   { kind: 'lap', legend: 'Lap', title: 'Lap: only the chosen passes of every period play' },
 ];
 
-/** Each unit key's accessible name; the key prints "/4". */
+/** What each unit key means; its accessible name is the printed "/4" followed by this. */
 const UNIT_NAMES: Record<number, string> = { 4: 'Quarter-note beat', 8: 'Eighth-note beat', 16: 'Sixteenth-note beat' };
 
 const barsText = (first: number, last: number): string => (first === last ? `${first + 1}` : `${first + 1}-${last + 1}`);
@@ -297,33 +317,35 @@ export const MeterFace: React.FC<MeterFaceProps> = ({ songEntryId, onStatus }) =
 
   return (
     <>
-      <div className={FIELD} title="Bars of the selected meter change">
-        <button
-          type="button"
-          className={`${MINI_ICON_KEY} ${KEY_REST}`}
+      <div className={FIELD}>
+        <StripKey
+          mini
+          iconOnly
           aria-label="Previous meter change"
           aria-describedby="mf-bars-value"
-          title="Previous meter change"
+          description="Select the meter change before this one"
           disabled={selected === 0}
+          passFocusOnDisable
           onClick={() => setSel(selected - 1)}
-        >
-          <ChevronLeft aria-hidden="true" className="w-3 h-3" />
-        </button>
-        <span className={FIELD_LEGEND}>Bars</span>
-        <span id="mf-bars-value" aria-live="polite" className={`${FIELD_VALUE} min-w-6`}>
+          icon={<ChevronLeft className={MINI_GLYPH} />}
+          legend="Previous meter change"
+        />
+        <span className={FIELD_LEGEND} title="Bars of the selected meter change; 7+ runs from bar 7 to the end">Bars</span>
+        <span id="mf-bars-value" aria-live="polite" title="Bars of the selected meter change" className={`${FIELD_VALUE} min-w-6`}>
           {segmentLabel(segs, selected, totalSteps, pickupSteps)}
         </span>
-        <button
-          type="button"
-          className={`${MINI_ICON_KEY} ${KEY_REST}`}
+        <StripKey
+          mini
+          iconOnly
           aria-label="Next meter change"
           aria-describedby="mf-bars-value"
-          title="Next meter change"
+          description="Select the meter change after this one"
           disabled={selected >= segs.length - 1}
+          passFocusOnDisable
           onClick={() => setSel(selected + 1)}
-        >
-          <ChevronRight aria-hidden="true" className="w-3 h-3" />
-        </button>
+          icon={<ChevronRight className={MINI_GLYPH} />}
+          legend="Next meter change"
+        />
       </div>
 
       <Stepper
@@ -340,17 +362,15 @@ export const MeterFace: React.FC<MeterFaceProps> = ({ songEntryId, onStatus }) =
 
       <div role="group" aria-label="Unit" className="shrink-0 inline-flex gap-px">
         {UNITS.map((d) => (
-          <button
+          <StripKey
             key={d}
-            type="button"
             aria-pressed={meter.den === d}
-            aria-label={UNIT_NAMES[d]}
-            title={`Unit: ${UNIT_NAMES[d]}s`}
-            className={`${STRIP_KEY} ${keyTone({ on: meter.den === d })}`}
+            aria-label={`/${d}: ${UNIT_NAMES[d]}`}
+            description={`Unit: ${UNIT_NAMES[d].toLowerCase()}s`}
+            on={meter.den === d}
             onClick={() => writeMap(setUnit(segs, selected, d))}
-          >
-            <span aria-hidden="true">/{d}</span>
-          </button>
+            legend={`/${d}`}
+          />
         ))}
       </div>
 
@@ -383,7 +403,7 @@ export const MeterFace: React.FC<MeterFaceProps> = ({ songEntryId, onStatus }) =
             name="mf-groups"
             value={groupsNow}
             onChange={(e) => writeMap(setGroups(segs, selected, parseGroupsValue(e.target.value)))}
-            className="h-4.5 max-w-20 bg-transparent border-none outline-none text-[10px] font-mono et-ink cursor-pointer"
+            className={`${FIELD_SELECT} max-w-20`}
           >
             {groups.map((g) => <option key={g.value} value={g.value}>{g.label}</option>)}
           </select>
@@ -391,65 +411,80 @@ export const MeterFace: React.FC<MeterFaceProps> = ({ songEntryId, onStatus }) =
       )}
 
       <StripKey
+        iconOnly
         onClick={onAdd}
         disabled={addPastEnd}
         aria-label="Add a meter change at the playhead"
-        title={
+        description={
           addPastEnd
             ? `Bar ${addBar + 1} starts after the roll ends. Lengthen the roll or move the playhead back, then add.`
             : `Start a change at bar ${addBar + 1} with ${meterLabel(meter)}, then edit it.`
         }
-        icon={<Plus className="w-3 h-3" />}
+        icon={<DiamondPlus className={STRIP_GLYPH} />}
         legend="Add"
       />
-      <button
-        type="button"
+      <StripKey
+        iconOnly
         onClick={onRemove}
         disabled={seg.bar === 0}
+        passFocusOnDisable
         aria-label={`Remove the meter change at bar ${seg.bar + 1}`}
-        title={seg.bar === 0 ? 'Bar 1 always keeps a meter' : `Remove the meter change at bar ${seg.bar + 1}`}
-        className={`${STRIP_ICON_KEY} ${KEY_REST}`}
-      >
-        <Trash2 aria-hidden="true" className="w-3 h-3" />
-      </button>
+        description={seg.bar === 0 ? 'Bar 1 always keeps a meter' : `Remove the meter change at bar ${seg.bar + 1}`}
+        icon={<DiamondMinus className={STRIP_GLYPH} />}
+        legend="Remove"
+      />
 
       <Sep />
 
-      <div role="group" aria-label="Lanes" className="shrink-0 inline-flex gap-px">
-        {lanes.map((l) => (
-          <button
-            key={l.id}
-            type="button"
-            aria-pressed={l.id === activeLane}
-            aria-label={`Lane ${l.name}`}
-            title={`Lane ${l.name}: ${l.cycleSteps ? `loops every ${l.cycleSteps} steps` : 'runs the whole roll'}. New notes go into the pressed lane.`}
-            className={`${STRIP_KEY} ${keyTone({ on: l.id === activeLane })}`}
-            onClick={() => usePianoRollStore.getState().setActiveLane(l.id)}
+      {lanes.length <= LANE_KEYS_MAX ? (
+        <div role="group" aria-label="Lanes" className="shrink-0 inline-flex gap-px">
+          {lanes.map((l) => (
+            <StripKey
+              key={l.id}
+              aria-pressed={l.id === activeLane}
+              aria-label={`Lane ${l.name}`}
+              description={`Lane ${l.name}: ${l.cycleSteps ? `loops every ${l.cycleSteps} steps` : 'runs the whole roll'}. New notes go into the pressed lane.`}
+              on={l.id === activeLane}
+              onClick={() => usePianoRollStore.getState().setActiveLane(l.id)}
+              icon={<LaneSwatch form={forms.get(l.id) ?? 'solid'} />}
+              legend={l.name}
+              legendClassName="max-w-12 truncate"
+            />
+          ))}
+        </div>
+      ) : (
+        <div className={FIELD} title="Lane: new notes go into the chosen lane; each lane after A loops on its own">
+          <label htmlFor="mf-lane" className={FIELD_LEGEND}>Lane</label>
+          <LaneSwatch form={forms.get(lane.id) ?? 'solid'} />
+          <select
+            id="mf-lane"
+            name="mf-lane"
+            value={lane.id}
+            onChange={(e) => usePianoRollStore.getState().setActiveLane(Number(e.target.value))}
+            className={`${FIELD_SELECT} max-w-16`}
           >
-            <LaneSwatch form={forms.get(l.id) ?? 'solid'} />
-            <span className="max-w-12 truncate">{l.name}</span>
-          </button>
-        ))}
-      </div>
-      <button
-        type="button"
+            {lanes.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
+          </select>
+        </div>
+      )}
+      <StripKey
+        iconOnly
         onClick={onAddLane}
-        aria-label="Add a lane"
-        title={`Add a lane that loops one bar of ${meterLabel(segs[0].meter)}, and draw into it`}
-        className={`${STRIP_ICON_KEY} ${KEY_REST}`}
-      >
-        <Plus aria-hidden="true" className="w-3 h-3" />
-      </button>
-      <button
-        type="button"
+        aria-label="Add lane"
+        description={`Add a lane that loops one bar of ${meterLabel(segs[0].meter)}, and draw into it`}
+        icon={<ListPlus className={STRIP_GLYPH} />}
+        legend="Add lane"
+      />
+      <StripKey
+        iconOnly
         onClick={onRemoveLane}
         disabled={activeLane === 0}
+        passFocusOnDisable
         aria-label={`Remove lane ${lane.name}`}
-        title={activeLane === 0 ? 'Lane A always stays' : `Remove lane ${lane.name}; its notes move to lane A`}
-        className={`${STRIP_ICON_KEY} ${KEY_REST}`}
-      >
-        <Trash2 aria-hidden="true" className="w-3 h-3" />
-      </button>
+        description={activeLane === 0 ? 'Lane A always stays' : `Remove lane ${lane.name}; its notes move to lane A`}
+        icon={<ListX className={STRIP_GLYPH} />}
+        legend="Remove lane"
+      />
 
       <Stepper
         id="mf-loop"
@@ -459,6 +494,8 @@ export const MeterFace: React.FC<MeterFaceProps> = ({ songEntryId, onStatus }) =
         valueClass="min-w-5"
         downLabel={`Shorter loop for lane ${lane.name}`}
         upLabel={`Longer loop for lane ${lane.name}`}
+        downIcon={<ArrowLeftToLine className={MINI_GLYPH} />}
+        upIcon={<ArrowRightToLine className={MINI_GLYPH} />}
         downDisabled={lane.id === 0 || lane.cycleSteps === 1}
         upDisabled={lane.id === 0 || lane.cycleSteps == null}
         onStep={onLoop}
@@ -467,12 +504,13 @@ export const MeterFace: React.FC<MeterFaceProps> = ({ songEntryId, onStatus }) =
       <Sep />
 
       {/* The ranges take the row's spare width up to the field's cap; GEN's
-          auto margin takes what is left, so GEN and MATCH stay at the end. */}
+          auto margin takes what is left, so GEN and MATCH stay at the end. A
+          short row narrows each range to 32px and no further. */}
       {([
         { k: 'sync', legend: 'Sync', value: sync, title: 'Syncopation amount: moves strong-beat notes onto the anticipations' },
         { k: 'accent', legend: 'Accent', value: accent, title: 'Accent amount: lifts the notes that start a group' },
       ] as const).map(({ k, legend, value, title }) => (
-        <div key={k} className={`${FIELD} grow max-w-72`} title={title}>
+        <div key={k} className={`${FIELD_GROW} max-w-72`} title={title}>
           <label htmlFor={`mf-${k}`} className={FIELD_LEGEND}>{legend}</label>
           <input
             id={`mf-${k}`}
@@ -482,35 +520,38 @@ export const MeterFace: React.FC<MeterFaceProps> = ({ songEntryId, onStatus }) =
             max={100}
             value={Math.round(value * 100)}
             onChange={(e) => setAmount(k, (parseInt(e.target.value, 10) || 0) / 100)}
-            className={`${RANGE} grow`}
+            className={RANGE_FILL}
           />
-          <span className={`${FIELD_VALUE} w-5`}>{Math.round(value * 100)}</span>
+          <span className={`${FIELD_VALUE} w-5.5`}>{Math.round(value * 100)}</span>
         </div>
       ))}
 
       <StripKey
         ref={genKeyRef}
+        iconOnly
         onClick={() => setGenOpen((v) => !v)}
         aria-haspopup="dialog"
         aria-expanded={genOpen}
         aria-controls="mf-gen"
-        title="Generate: write notes into the active lane with one of LOOM's rules"
+        aria-label="Gen: write notes into the active lane"
+        description="Generate: write notes into the active lane with one of LOOM's rules"
         on={genOpen}
-        icon={<Blocks className="w-3 h-3" />}
+        icon={<Blocks className={STRIP_GLYPH} />}
         legend="Gen"
         className="ml-auto"
       />
       <StripKey
+        iconOnly
         onClick={() => void onMatch()}
         disabled={!songEntryId}
         aria-busy={matchBusy}
         aria-label="Match the meter to the song"
-        title={
+        description={
           songEntryId
             ? "Match: take the meter map, pickup, tempo and lanes from the song's rhythm analysis (analyzing it first when needed)"
             : "Choose a song from the song field's list to match its meter"
         }
-        icon={<AudioWaveform className={`w-3 h-3 ${matchBusy ? 'animate-pulse' : ''}`} />}
+        icon={<AudioWaveform className={`${STRIP_GLYPH} ${matchBusy ? 'animate-pulse' : ''}`} />}
         legend="Match"
       />
 
@@ -520,15 +561,19 @@ export const MeterFace: React.FC<MeterFaceProps> = ({ songEntryId, onStatus }) =
         onClose={() => setGenOpen(false)}
         placement="above"
         align="end"
+        ceilingSelector="[data-dock-ceiling]"
+        floorSelector="[data-dock-floor]"
         id="mf-gen"
         role="dialog"
         aria-label="Gen: write notes with a LOOM rule"
         className={`w-120 max-w-[92vw] ${FLYOUT_CARD}`}
       >
-        <div className="flex flex-col gap-1.5 p-2">
-          <div className="flex items-center gap-2 pb-1.5 border-b border-white/8">
-            <span className="text-[9px] font-black uppercase tracking-[0.18em] et-ink">Gen</span>
-            <span className="inline-flex items-center gap-1 text-[10px] font-mono et-ink-2" title={targetTitle}>
+        {/* Tight vertical spacing: at a default-height dock the card fits between
+            the ruler / Voice header line and 4px above the row without scrolling. */}
+        <div className="flex flex-col gap-1 px-1.5 pt-1 pb-1">
+          <div className="flex items-center gap-2 pb-1 border-b border-white/8">
+            <span className="text-[12px] font-display font-extrabold uppercase et-ink">Gen</span>
+            <span className="inline-flex items-center gap-1 text-[12px] font-semibold et-ink-2 tabular-nums" title={targetTitle}>
               <LaneSwatch form={forms.get(target.lane) ?? 'solid'} />
               <span>{target.name}</span>
               <span className="et-ink-3">{targetRange}</span>
@@ -536,7 +581,7 @@ export const MeterFace: React.FC<MeterFaceProps> = ({ songEntryId, onStatus }) =
           </div>
 
           <div className="flex items-start gap-1">
-            <span id="mf-gen-rule-legend" className={`${FIELD_LEGEND} w-10 shrink-0 pt-1`}>Rule</span>
+            <span id="mf-gen-rule-legend" className={`${FLYOUT_LEGEND} w-12 shrink-0 pt-1.5`}>Rule</span>
             <div role="group" aria-labelledby="mf-gen-rule-legend" className="flex flex-wrap gap-px">
               {GEN_RULES.map((r) => (
                 <button
@@ -544,7 +589,7 @@ export const MeterFace: React.FC<MeterFaceProps> = ({ songEntryId, onStatus }) =
                   type="button"
                   aria-pressed={gen.kind === r.kind}
                   title={`${r.legend}: ${r.title}`}
-                  className={`${MINI_KEY} ${keyTone({ on: gen.kind === r.kind })}`}
+                  className={`${FLYOUT_KEY} ${keyTone({ on: gen.kind === r.kind })}`}
                   onClick={() => setGen({ kind: r.kind })}
                 >
                   <span>{r.legend}</span>
@@ -553,12 +598,13 @@ export const MeterFace: React.FC<MeterFaceProps> = ({ songEntryId, onStatus }) =
             </div>
           </div>
 
-          <div className="flex items-center gap-1 flex-wrap pl-11">
+          <div className="flex items-center gap-1 flex-wrap pl-13">
             {genOptionSpecs(gen.kind).map((spec) => {
               const value = spec.key === 'steps' ? ruleSteps : Number(opts[spec.key] ?? 0);
               return (
                 <Stepper
                   key={spec.key}
+                  flyout
                   id={`mf-gen-${spec.key}`}
                   legend={spec.legend}
                   title={spec.title}
@@ -574,7 +620,7 @@ export const MeterFace: React.FC<MeterFaceProps> = ({ songEntryId, onStatus }) =
           </div>
 
           <div className="flex items-center gap-1 flex-wrap">
-            <span id="mf-gen-gate-legend" className={`${FIELD_LEGEND} w-10 shrink-0`}>Gate</span>
+            <span id="mf-gen-gate-legend" className={`${FLYOUT_LEGEND} w-12 shrink-0`}>Gate</span>
             <div role="group" aria-labelledby="mf-gen-gate-legend" className="flex gap-px">
               {GATE_KEYS.map((g) => (
                 <button
@@ -582,7 +628,7 @@ export const MeterFace: React.FC<MeterFaceProps> = ({ songEntryId, onStatus }) =
                   type="button"
                   aria-pressed={gen.gate === g.kind}
                   title={g.title}
-                  className={`${MINI_KEY} ${keyTone({ on: gen.gate === g.kind })}`}
+                  className={`${FLYOUT_KEY} ${keyTone({ on: gen.gate === g.kind })}`}
                   onClick={() => setGen({ gate: g.kind })}
                 >
                   <span>{g.legend}</span>
@@ -591,6 +637,7 @@ export const MeterFace: React.FC<MeterFaceProps> = ({ songEntryId, onStatus }) =
             </div>
             {gen.gate === 'chance' && (
               <Stepper
+                flyout
                 id="mf-gen-pct"
                 title="Percent of steps the die lets through"
                 value={`${gen.pct}%`}
@@ -605,6 +652,7 @@ export const MeterFace: React.FC<MeterFaceProps> = ({ songEntryId, onStatus }) =
             {gen.gate === 'lap' && (
               <>
                 <Stepper
+                  flyout
                   id="mf-gen-period"
                   legend="Period"
                   title="Passes in one period of the lap gate"
@@ -619,7 +667,7 @@ export const MeterFace: React.FC<MeterFaceProps> = ({ songEntryId, onStatus }) =
                     setGen({ period, laps: laps.length ? laps : [1] });
                   }}
                 />
-                <span id="mf-gen-laps-legend" className={FIELD_LEGEND}>Laps</span>
+                <span id="mf-gen-laps-legend" className={FLYOUT_LEGEND}>Laps</span>
                 <div role="group" aria-labelledby="mf-gen-laps-legend" className="flex gap-px">
                   {Array.from({ length: gen.period }, (_, i) => i + 1).map((n) => {
                     const on = gen.laps.includes(n);
@@ -630,7 +678,7 @@ export const MeterFace: React.FC<MeterFaceProps> = ({ songEntryId, onStatus }) =
                         aria-pressed={on}
                         aria-label={`Lap ${n}`}
                         title={`Pass ${n} of every ${gen.period} ${on ? 'plays' : 'rests'}`}
-                        className={`${MINI_KEY} ${keyTone({ on })}`}
+                        className={`${FLYOUT_KEY} ${keyTone({ on })}`}
                         onClick={() => setGen({ laps: on ? gen.laps.filter((x) => x !== n) : [...gen.laps, n].sort((a, b) => a - b) })}
                       >
                         <span>{n}</span>
@@ -641,7 +689,7 @@ export const MeterFace: React.FC<MeterFaceProps> = ({ songEntryId, onStatus }) =
               </>
             )}
             <div className={FIELD} title="Seed: the same seed writes the same notes">
-              <label htmlFor="mf-gen-seed" className={FIELD_LEGEND}>Seed</label>
+              <label htmlFor="mf-gen-seed" className={FLYOUT_LEGEND}>Seed</label>
               <input
                 id="mf-gen-seed"
                 name="mf-gen-seed"
@@ -650,7 +698,7 @@ export const MeterFace: React.FC<MeterFaceProps> = ({ songEntryId, onStatus }) =
                 max={999999}
                 value={gen.seed}
                 onChange={(e) => setGen({ seed: Math.max(0, Math.min(999999, parseInt(e.target.value, 10) || 0)) })}
-                className="w-16 h-4 bg-transparent border-none outline-none text-[10px] font-mono et-ink tabular-nums"
+                className="w-16 h-4 bg-transparent border-none outline-none text-[12px] font-bold et-ink tabular-nums"
               />
               <button
                 type="button"
@@ -665,7 +713,7 @@ export const MeterFace: React.FC<MeterFaceProps> = ({ songEntryId, onStatus }) =
           </div>
 
           <div className="flex items-center gap-1">
-            <span className={`${FIELD_LEGEND} w-10 shrink-0`} aria-hidden="true">Pass</span>
+            <span className={`${FLYOUT_LEGEND} w-12 shrink-0`} aria-hidden="true">Pass</span>
             <div
               role="img"
               aria-label={`First pass: ${previewHits} of ${ruleSteps} steps play`}
@@ -675,15 +723,16 @@ export const MeterFace: React.FC<MeterFaceProps> = ({ songEntryId, onStatus }) =
                 <span key={i} className={`flex-1 min-w-px rounded-xs ${hit ? 'h-4 bg-[rgb(var(--et-accent))]' : 'h-2 bg-white/10'}`} />
               ))}
             </div>
-            <span className={`${FIELD_VALUE} min-w-10`}>{previewHits}/{ruleSteps}</span>
+            <span className={`${FLYOUT_VALUE} min-w-10`}>{previewHits}/{ruleSteps}</span>
           </div>
 
-          <div className="flex items-center gap-2 pt-1.5 border-t border-white/8">
+          <div className="flex items-center gap-2 pt-1 border-t border-white/8">
             <StripKey
+              flyout
               onClick={onWrite}
               on
               aria-label={`Write the rule into lane ${target.name}`}
-              title={`${targetTitle}, replacing the lane's notes there`}
+              description={`${targetTitle}, replacing the lane's notes there`}
               icon={<Send className="w-3 h-3" />}
               legend="Write"
             />

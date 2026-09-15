@@ -551,6 +551,19 @@ left undone, with the reason. None blocks those branches.
   `index_first_axis`, which FA3 has no equivalent for) and its speedup targets datacentre cards —
   nothing for Turing or Ampere. Revisit only with a hardware reason. — M — `pyproject.toml`,
   `stable_audio_3/models/transformer.py:22-39`
+- [ ] **Small mono labels outside the MIDI dock (added 2026-09-13).** The midi-dock-readable
+  branch takes everything inside `[data-keyscope="piano-roll"]` to 12px Orbitron legends and the
+  bold sans. Outside it, the Shell wordmark, the Mobile Access / companion popover, the Panels and
+  LOG bars, the `IoDeviceSelect` defaults the settings modal uses, the groove `LibraryPicker`
+  the SHAPE row's PICK key opens (a modal portaled to the page body), the `MidiMapper` pill the
+  SEQUENCE tab floats top-right (9px Orbitron), and `KnownFilesMenu`'s compact Recent trigger
+  that every surface outside the dock uses (9px Orbitron) still draw 8-11px, much of it IBM Plex
+  Mono. Take them to the same type in a pass the user can check. — S —
+  `frontend/src/components/layout/Shell.tsx:311,396,446-600,824-857`,
+  `frontend/src/components/audio/IoDeviceSelect.tsx:83,86`,
+  `frontend/src/components/audio/LibraryPicker.tsx:584-816`,
+  `frontend/src/components/audio/MidiMapper.tsx` (the pill variant's `text-[9px]`),
+  `frontend/src/components/ui/KnownFilesMenu.tsx:265` (the non-flyout size)
 
 ## P1 — from the user, 2026-09-11 (marked done only when the user says so)
 

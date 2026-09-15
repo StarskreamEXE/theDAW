@@ -20,10 +20,14 @@ const VOICE_GROUPS = Array.from(new Set(SYNTH_VOICES.map((v) => v.group)));
  * `compact` is the MIDI dock strip's form: a piano glyph in place of the visible
  * word, a narrow select, and the loading / failure notes as glyphs whose text is
  * in their title and in a screen-reader-only span.
+ *
+ * `legendClassName` sets the visible "Instrument" label's type in the full
+ * form, so a toolbar can print it like its other legends (the ARP face).
  */
-export const InstrumentPicker: React.FC<{ idPrefix?: string; compact?: boolean }> = ({
+export const InstrumentPicker: React.FC<{ idPrefix?: string; compact?: boolean; legendClassName?: string }> = ({
   idPrefix = 'pr-instrument',
   compact = false,
+  legendClassName = 'text-xs font-semibold text-white/50',
 }) => {
   const useSoundfont = useSoundfontStore((s) => s.useSoundfont);
   const activeProgram = useSoundfontStore((s) => s.activeProgram);
@@ -105,7 +109,7 @@ export const InstrumentPicker: React.FC<{ idPrefix?: string; compact?: boolean }
 
   return (
     <div className="flex items-center gap-1.5">
-      <label htmlFor={idPrefix} className="text-xs text-white/50">
+      <label htmlFor={idPrefix} className={legendClassName}>
         Instrument
       </label>
       <select
@@ -114,14 +118,14 @@ export const InstrumentPicker: React.FC<{ idPrefix?: string; compact?: boolean }
         aria-label="MIDI instrument"
         value={value}
         onChange={onChange}
-        className="form-select px-2 py-1 text-xs max-w-44"
+        className="form-select px-2 py-1 text-xs font-semibold max-w-44"
         style={{ colorScheme: 'dark' }}
       >
         {options}
       </select>
-      {loading && <span className="text-xs text-white/40">loading…</span>}
+      {loading && <span className="text-xs font-semibold text-white/40">loading…</span>}
       {loadError && (
-        <span className="text-xs text-red-300" title={loadError}>
+        <span className="text-xs font-semibold text-red-300" title={loadError}>
           soundfont failed
         </span>
       )}
