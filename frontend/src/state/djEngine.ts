@@ -31,6 +31,7 @@
 import type { StretchNode } from 'signalsmith-stretch';
 import { getEngineCtx, getMasterGain } from './playerStore';
 import { logError } from './logStore';
+import { summingDelaysSec } from '../lib/rackEffects';
 
 export type DeckId = 'A' | 'B';
 
@@ -210,16 +211,22 @@ function deckInputNode(d: Deck): AudioNode {
 
 /** Re-balance the two decks' output latency so a key-locked deck (which adds the
  *  stretch node's latency) stays beat-aligned with a non-key-locked one: delay
- *  each deck up to the larger of the two engaged stretch latencies. */
+ *  each deck up to the larger of the two engaged stretch latencies.
+ *
+ *  That is the general summing rule at N = 2, so it runs on the shared one
+ *  (`lib/rackEffects.summingDelaysSec`) rather than a second copy of the
+ *  arithmetic — the same function the EDIT mixer aligns its tracks with. The
+ *  numbers are identical to the hand-rolled form; `liveMixer.latency.test.ts`
+ *  pins that against the previous code, transcribed verbatim. */
 function updateLatencyComp(): void {
   const ctx = getEngineCtx();
   const da = decks['A'];
   const db = decks['B'];
   const la = da?.keylock ? da.stretchLatency : 0;
   const lb = db?.keylock ? db.stretchLatency : 0;
-  const maxL = Math.max(la, lb);
-  if (da) da.delayComp.delayTime.setTargetAtTime(Math.max(0, maxL - la), ctx.currentTime, 0.01);
-  if (db) db.delayComp.delayTime.setTargetAtTime(Math.max(0, maxL - lb), ctx.currentTime, 0.01);
+  const [ca, cb] = summingDelaysSec([la, lb]);
+  if (da) da.delayComp.delayTime.setTargetAtTime(ca, ctx.currentTime, 0.01);
+  if (db) db.delayComp.delayTime.setTargetAtTime(cb, ctx.currentTime, 0.01);
 }
 
 /** Push the key-lock pitch correction (cancel the playbackRate pitch shift). */

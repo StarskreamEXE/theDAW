@@ -13,6 +13,19 @@ import {
   holdsAfterRelease, modeAfterStop, recordsWhileHeld, sampleCurve, upsertAutomationPoint,
   writeSpan, writesUntouched, type AutomationMode,
 } from '../lib/automationModes';
+import {
+  MASTER_ID,
+  addBus as graphAddBus,
+  addSend as graphAddSend,
+  emptyGraph,
+  ensureTrackNode,
+  removeNode as graphRemoveNode,
+  removeSend as graphRemoveSend,
+  setOutput as graphSetOutput,
+  setSendGain as graphSetSendGain,
+  type RoutingGraph,
+  type RoutingRefusal,
+} from './routingGraph';
 
 export type { AutomationMode } from '../lib/automationModes';
 
@@ -177,6 +190,27 @@ export interface EditorTrack {
    *  browser — becomes audible). The originals are stashed here for unfreeze; the
    *  live fxChain is emptied because every effect is baked into the stem. */
   frozenOriginal?: { clips: AudioClip[]; fxChain: ChainEntry[] };
+}
+
+/**
+ * A mix bus: a summing point with its own insert rack, fader and mute, between
+ * whatever routes into it and whatever it routes out to.
+ *
+ * The bus's PLACE in the signal flow is not here — it is an edge in `routing`,
+ * exactly like a track's. This slice is only the bus's own mixer strip, so the
+ * two stay separable: deleting the strip (`removeBus`) and rewiring around it
+ * (`removeNode`) are one action, but "what feeds this" is never duplicated.
+ *
+ * `fxChain` is required (not `ChainEntry[] | undefined` like `EditorTrack`'s):
+ * a bus exists only because the user created it, so there is no pre-rack
+ * document shape to stay compatible with.
+ */
+export interface EditorBus {
+  id: string;
+  name: string;
+  fxChain: ChainEntry[];
+  volume: number; // 0..1
+  mute: boolean;
 }
 
 /* ── Automation (Phase E) ─────────────────────────────────────────────────────
@@ -395,6 +429,19 @@ interface EditorStoreState {
   /** Master-bus insert FX chain (real-time psychoacoustic rack). Session-local —
    *  liveMixer routes the editor mix through it before the shared engine master. */
   masterFxChain: ChainEntry[];
+  /**
+   * Signal routing: which node each track/bus feeds, and every send. Document
+   * state — in `docSnapshot`, in undo, in the autosave manifest — because it is
+   * part of what a project IS, not how it is being viewed.
+   *
+   * The store keeps it consistent with `tracks` itself, so no caller has to:
+   * every track-creating path (`loadProject`, `addTrack`, and the initial
+   * document) calls `ensureTrackNode`, and `removeTrack` calls `removeNode`.
+   * A track with no node would be a track the mixer cannot place.
+   */
+  routing: RoutingGraph;
+  /** Mix-bus strips. Their PLACE in the flow is in `routing`; see `EditorBus`. */
+  buses: EditorBus[];
   /** Automation lanes (Phase E): one per automated parameter. */
   automationLanes: AutomationLane[];
   /** How a control move is recorded: read / touch / latch / write. See
@@ -424,7 +471,18 @@ interface EditorStoreState {
   // Mutations
   /** Replace the whole timeline with a loaded project (atomic; one fresh
    *  document — undo history is reset). Used when opening a .tasmo. */
-  loadProject: (payload: { tracks: EditorTrack[]; clips: AudioClip[]; bpm?: number }) => void;
+  loadProject: (payload: {
+    tracks: EditorTrack[];
+    clips: AudioClip[];
+    bpm?: number;
+    /** The project's saved graph, if it has one. A project WITHOUT one — every
+     *  document written before routing existed — is migrated: `emptyGraph()`
+     *  plus a node per track. A project WITH one keeps it, reconciled against
+     *  this payload: a node is added for any track/bus it lacks, and any node
+     *  belonging to neither is pruned (see `migrateRouting`). */
+    routing?: RoutingGraph;
+    buses?: EditorBus[];
+  }) => void;
   addTrack: (overrides?: Partial<EditorTrack>) => string;
   removeTrack: (id: string) => void;
   updateTrack: (id: string, updates: Partial<EditorTrack>) => void;
@@ -481,6 +539,49 @@ interface EditorStoreState {
   setBpm: (b: number) => void;
   setInpaintSelection: (sel: InpaintSelection | null) => void;
   clearInpaintSelection: () => void;
+
+  /* ── Routing + buses ───────────────────────────────────────────────────────
+     The STRUCTURAL ones (`addBus`, `removeBus`, `setTrackOutput`, `addSend`,
+     `removeSend`) each record ONE undo step: they call `beginUndoStep()` first,
+     so two of them inside the 300 ms coalescing window are still two steps. The
+     VALUE ones do not — `updateBus` never, `setSendGain` unless the caller says
+     it is not coalescing — because a fader or knob ride must be one step, not
+     one per pointer move. The two that can be REFUSED return the model's `RoutingRefusal`
+     for the UI to toast, and `null` when applied; the graph is untouched on a
+     refusal, down to the object identity. The others cannot be refused by the
+     model — `removeNode` / `setSendGain` / `removeSend` return a graph, not a
+     `RoutingResult` — so they return `void` rather than a `null` that could
+     never be anything else. */
+
+  /** Create a mix bus (strip + graph node, feeding the master). Returns its id. */
+  addBus: (name?: string) => string;
+  /** Delete a bus. Anything whose output pointed at it is re-homed to the
+   *  master by `removeNode`, so deleting a bus never silences what fed it. */
+  removeBus: (id: string) => void;
+  /** Rename / refader / mute a bus strip. Records NO undo step of its own, like
+   *  `updateTrack`: a fader ride is a continuous gesture, and the 300 ms
+   *  coalescer is what makes the whole ride one step. An unknown id is a no-op
+   *  — it must not conjure a graph node for a strip that does not exist. */
+  updateBus: (id: string, updates: Partial<Omit<EditorBus, 'id'>>) => void;
+  /** Point a node's main output at another node. Named for its caller (a track
+   *  in the routing picker), but the model treats a bus's output identically,
+   *  so a bus id works as `fromId` too. */
+  setTrackOutput: (fromId: string, toId: string) => RoutingRefusal | null;
+  /** Add a post-pan send with its own gain. One send per (from, to) pair. */
+  addSend: (fromId: string, toId: string, gain?: number) => RoutingRefusal | null;
+  /** Move an existing send's gain. A send that does not exist is a no-op.
+   *  Pass `{ coalesce: true }` from a continuous KNOB DRAG so the whole gesture
+   *  stays one undo step (the pointer-down already cut the burst); a discrete
+   *  edit — a typed value, a reset — omits it and gets a step of its own. */
+  setSendGain: (fromId: string, toId: string, gain: number, opts?: { coalesce?: boolean }) => void;
+  /** Drop a send. A send that does not exist is a no-op. */
+  removeSend: (fromId: string, toId: string) => void;
+
+  // Bus FX racks (mirror the per-track ones)
+  addBusEffect: (busId: string, effectId: string) => void;
+  removeBusEffect: (busId: string, entryId: string) => void;
+  toggleBusEffect: (busId: string, entryId: string) => void;
+  updateBusEffectParams: (busId: string, entryId: string, params: Record<string, number>) => void;
 
   // Master FX rack
   addMasterEffect: (effectId: string) => void;
@@ -612,7 +713,59 @@ interface EditorHistorySnapshot {
   automationLanes: AutomationLane[];
   markers: TimelineMarker[];
   bpm: number;
+  /** Routing is document state: undoing a "route drums into the drum bus" must
+   *  take the edge back, and it must take the bus strip back with it — hence
+   *  both slices, restored together. */
+  routing: RoutingGraph;
+  buses: EditorBus[];
 }
+
+/**
+ * The graph a loaded document should hold: whatever it saved (when it saved
+ * one), reconciled against the document it is being loaded WITH.
+ *
+ * This is the whole migration, and it is two-sided:
+ *
+ *  - ADD. Every project on disk today predates routing and so arrives with
+ *    `existing` undefined — it gets `emptyGraph()` plus one node per track,
+ *    which is exactly the hard-coded "every track to the master" the mixer did
+ *    before there was a graph to describe it. A project that DOES carry a graph
+ *    keeps it, including its buses and sends; the `ensureTrackNode` sweep only
+ *    adds what is missing (a hand-edited file, or an importer that appended a
+ *    track after the graph was built), because a track with no node is a track
+ *    `wireRouting` cannot place.
+ *  - PRUNE. A node whose strip is in NEITHER `tracks` nor `buses` is dropped.
+ *    Without this a graph outlives the document it describes: loading project B
+ *    over project A leaves A's track nodes behind, `validateGraph` reports them,
+ *    `topoOrder` still orders them, and the stalest of them can even swallow a
+ *    send aimed at a live node with the same id. `removeNode` is what does the
+ *    dropping, so anything whose output pointed at a pruned node is re-homed to
+ *    the master rather than orphaned.
+ */
+const migrateRouting = (
+  tracks: EditorTrack[],
+  existing?: RoutingGraph,
+  buses: readonly EditorBus[] = [],
+): RoutingGraph => {
+  const sane = existing && Array.isArray(existing.nodes) && Array.isArray(existing.edges);
+  let g: RoutingGraph = sane
+    ? { nodes: (existing as RoutingGraph).nodes.slice(), edges: (existing as RoutingGraph).edges.slice() }
+    : emptyGraph();
+  // A saved graph with no master node cannot be ordered (every output edge
+  // would dangle), so put one back rather than trusting the file.
+  if (!g.nodes.some((n) => n.id === MASTER_ID)) {
+    g = { nodes: [...emptyGraph().nodes, ...g.nodes], edges: g.edges };
+  }
+  const live = new Set<string>([MASTER_ID]);
+  for (const t of tracks) live.add(t.id);
+  for (const b of buses) live.add(b.id);
+  for (const id of g.nodes.map((n) => n.id)) {
+    if (!live.has(id)) g = graphRemoveNode(g, id);
+  }
+  for (const t of tracks) g = ensureTrackNode(g, t.id, t.name);
+  for (const b of buses) g = graphAddBus(g, b.id, b.name);
+  return g;
+};
 
 const DEFAULT_COLORS = ['#8b5cf6', '#a855f7', '#ec4899', '#06b6d4', '#10b981', '#facc15', '#f97316', '#ef4444'];
 
@@ -653,21 +806,28 @@ const docSnapshot = (s: EditorStoreState): EditorHistorySnapshot => ({
   automationLanes: s.automationLanes,
   markers: s.markers,
   bpm: s.bpm,
+  routing: s.routing,
+  buses: s.buses,
 });
 
+/** The track the store ships with, before any project is loaded. */
+const INITIAL_TRACK: EditorTrack = {
+  id: 'track-1',
+  name: 'Track 1',
+  nameAutoGenerated: true,
+  volume: 0.8,
+  pan: 0,
+  mute: false,
+  solo: false,
+  color: DEFAULT_COLORS[0],
+};
+
 export const useEditorStore = create<EditorStoreState>()((set, get) => ({
-  tracks: [
-    {
-      id: 'track-1',
-      name: 'Track 1',
-      nameAutoGenerated: true,
-      volume: 0.8,
-      pan: 0,
-      mute: false,
-      solo: false,
-      color: DEFAULT_COLORS[0],
-    },
-  ],
+  tracks: [INITIAL_TRACK],
+  // The first document is routed from the first frame: liveMixer places nodes
+  // by walking this graph, so a track missing from it is a silent track.
+  routing: migrateRouting([INITIAL_TRACK]),
+  buses: [],
   clips: [],
   selectedClipId: null,
   tool: 'move',
@@ -695,17 +855,8 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   _redo: [],
   dirty: false,
 
-  loadProject: ({ tracks, clips, bpm }) => {
-    const fallbackTrack: EditorTrack = {
-      id: 'track-1',
-      name: 'Track 1',
-      nameAutoGenerated: true,
-      volume: 0.8,
-      pan: 0,
-      mute: false,
-      solo: false,
-      color: DEFAULT_COLORS[0],
-    };
+  loadProject: ({ tracks, clips, bpm, routing, buses }) => {
+    const fallbackTrack: EditorTrack = INITIAL_TRACK;
     // Suppress undo recording for the bulk swap, then start the loaded project as
     // a fresh document (empty undo/redo) so the user can't undo back into the
     // previous session's tracks.
@@ -715,9 +866,18 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     // off trackId/entryId, so carrying them across a load left lanes pointing at
     // tracks that no longer exist. This also makes "New Project" (Shell.tsx, which
     // calls loadProject with empty tracks/clips) actually empty.
+    //
+    // Routing is the one per-project extra that is NOT cleared: clearing it
+    // would leave every loaded track unplaceable. It is migrated instead —
+    // `migrateRouting` builds the "everything to the master" graph for a project
+    // that has none (which is every project written before this existed) and
+    // completes one that does.
+    const loadedTracks = tracks.length ? tracks : [fallbackTrack];
     historyApplying = true;
     set({
-      tracks: tracks.length ? tracks : [fallbackTrack],
+      tracks: loadedTracks,
+      routing: migrateRouting(loadedTracks, routing, buses ?? []),
+      buses: buses ?? [],
       clips,
       selectedClipId: null,
       playheadSec: 0,
@@ -743,22 +903,25 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
 
   addTrack: (overrides) => {
     const id = `track-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    set((s) => ({
-      tracks: [
-        ...s.tracks,
-        {
-          id,
-          name: `Track ${s.tracks.length + 1}`,
-          nameAutoGenerated: true,
-          volume: 0.8,
-          pan: 0,
-          mute: false,
-          solo: false,
-          color: DEFAULT_COLORS[s.tracks.length % DEFAULT_COLORS.length],
-          ...overrides,
-        },
-      ],
-    }));
+    set((s) => {
+      const track: EditorTrack = {
+        id,
+        name: `Track ${s.tracks.length + 1}`,
+        nameAutoGenerated: true,
+        volume: 0.8,
+        pan: 0,
+        mute: false,
+        solo: false,
+        color: DEFAULT_COLORS[s.tracks.length % DEFAULT_COLORS.length],
+        ...overrides,
+      };
+      return {
+        tracks: [...s.tracks, track],
+        // A new track is routed to the master from the moment it exists, so it
+        // is audible without the routing picker ever being opened.
+        routing: ensureTrackNode(s.routing, id, track.name),
+      };
+    });
     logInfo('editor', `Added track: ${id}`);
     return id;
   },
@@ -768,6 +931,10 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       tracks: s.tracks.filter((t) => t.id !== id),
       clips: s.clips.filter((c) => c.trackId !== id),
       automationLanes: s.automationLanes.filter((l) => l.target.trackId !== id),
+      // Drops the node AND every edge that touched it — including sends INTO a
+      // deleted track, which would otherwise be a dangling edge `topoOrder`
+      // cannot resolve.
+      routing: graphRemoveNode(s.routing, id),
       selectedClipId: s.clips.some((c) => c.id === s.selectedClipId && c.trackId === id) ? null : s.selectedClipId,
     }));
     logInfo('editor', `Removed track: ${id}`);
@@ -1048,6 +1215,119 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   setBpm: (b) => set({ bpm: Math.max(40, Math.min(240, b)) }),
   setInpaintSelection: (sel) => set({ inpaintSelection: sel }),
   clearInpaintSelection: () => set({ inpaintSelection: null }),
+
+  // ── Routing + buses ────────────────────────────────────────────────────────
+
+  addBus: (name) => {
+    const id = `bus-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    beginUndoStep();
+    set((s) => {
+      const bus: EditorBus = {
+        id,
+        name: name && name.trim() ? name.trim() : `Bus ${s.buses.length + 1}`,
+        fxChain: [],
+        volume: 0.8,
+        mute: false,
+      };
+      return { buses: [...s.buses, bus], routing: graphAddBus(s.routing, id, bus.name) };
+    });
+    logInfo('editor', `Added bus: ${id}`);
+    return id;
+  },
+
+  removeBus: (id) => {
+    beginUndoStep();
+    set((s) => ({
+      buses: s.buses.filter((b) => b.id !== id),
+      routing: graphRemoveNode(s.routing, id),
+      // `AutomationTarget.trackId` is the node id, and track ids and bus ids
+      // share one namespace (both are uid strings, and `routing` keys nodes by
+      // exactly this value) — so a lane pointed at a deleted BUS is matched by
+      // the same filter `removeTrack` uses. If the two namespaces ever split,
+      // this filter and `removeTrack`'s must split with them.
+      automationLanes: s.automationLanes.filter((l) => l.target.trackId !== id),
+    }));
+    logInfo('editor', `Removed bus: ${id}`);
+  },
+
+  updateBus: (id, updates) =>
+    // No `beginUndoStep()`: this is the bus's `updateTrack`, and a fader ride
+    // that opened a step per pointer move would make undo unusable.
+    set((s) => {
+      // Guarded on the strip existing. `graphAddBus` is `ensureNode`, which
+      // CREATES the node when it is absent — so an unknown id would otherwise
+      // conjure a bus node with no strip behind it, which `wireRouting` would
+      // then skip forever and `validateGraph` would report as damage.
+      if (!s.buses.some((b) => b.id === id)) return {};
+      const buses = s.buses.map((b) => (b.id === id ? { ...b, ...updates, id: b.id } : b));
+      // A rename has to reach the graph too — the node's `name` is what a
+      // routing picker lists, and a stale one would name a bus that is gone.
+      const routing = updates.name ? graphAddBus(s.routing, id, updates.name) : s.routing;
+      return { buses, routing };
+    }),
+
+  setTrackOutput: (fromId, toId) => {
+    beginUndoStep();
+    const res = graphSetOutput(get().routing, fromId, toId);
+    if (!res.ok) return res.reason;
+    set({ routing: res.graph });
+    return null;
+  },
+
+  addSend: (fromId, toId, gain) => {
+    beginUndoStep();
+    const res = graphAddSend(get().routing, fromId, toId, gain ?? 0);
+    if (!res.ok) return res.reason;
+    set({ routing: res.graph });
+    return null;
+  },
+
+  setSendGain: (fromId, toId, gain, opts) => {
+    // Same rule as `stretchClipToFit` / `setAutomationPointCurve`: a drag says
+    // `coalesce` and folds into the step its pointer-down opened; anything else
+    // cuts a step of its own.
+    if (!opts?.coalesce) beginUndoStep();
+    set((s) => ({ routing: graphSetSendGain(s.routing, fromId, toId, gain) }));
+  },
+
+  removeSend: (fromId, toId) => {
+    beginUndoStep();
+    set((s) => ({ routing: graphRemoveSend(s.routing, fromId, toId) }));
+  },
+
+  // Bus FX racks — the per-track actions with `buses` in place of `tracks`.
+  addBusEffect: (busId, effectId) =>
+    set((s) => ({
+      buses: s.buses.map((b) =>
+        b.id === busId
+          ? { ...b, fxChain: [...b.fxChain, { id: uid(), effect: effectId, params: rackEffectDefaults(effectId), enabled: true }] }
+          : b,
+      ),
+    })),
+
+  removeBusEffect: (busId, entryId) =>
+    set((s) => ({
+      buses: s.buses.map((b) => (b.id === busId ? { ...b, fxChain: b.fxChain.filter((e) => e.id !== entryId) } : b)),
+      automationLanes: s.automationLanes.filter((l) => l.target.entryId !== entryId),
+    })),
+
+  toggleBusEffect: (busId, entryId) =>
+    set((s) => ({
+      buses: s.buses.map((b) =>
+        b.id === busId
+          ? { ...b, fxChain: b.fxChain.map((e) => (e.id === entryId ? { ...e, enabled: !e.enabled } : e)) }
+          : b,
+      ),
+    })),
+
+  updateBusEffectParams: (busId, entryId, params) =>
+    set((s) => ({
+      buses: s.buses.map((b) =>
+        b.id === busId
+          ? { ...b, fxChain: b.fxChain.map((e) => (e.id === entryId ? { ...e, params } : e)) }
+          : b,
+      ),
+    })),
 
   addMasterEffect: (effectId) =>
     set((s) => ({
@@ -1483,6 +1763,8 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       automationLanes: prev.automationLanes,
       markers: prev.markers,
       bpm: prev.bpm,
+      routing: prev.routing,
+      buses: prev.buses,
       _undo: s._undo.slice(0, -1),
       _redo: [...s._redo, current],
       // undo/redo run under historyApplying, so the dirty subscription skips
@@ -1508,6 +1790,8 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       automationLanes: next.automationLanes,
       markers: next.markers,
       bpm: next.bpm,
+      routing: next.routing,
+      buses: next.buses,
       _undo: [...s._undo, current],
       _redo: s._redo.slice(0, -1),
       dirty: true,
@@ -1546,7 +1830,9 @@ useEditorStore.subscribe((state, prev) => {
     state.masterVstChain === prev.masterVstChain &&
     state.automationLanes === prev.automationLanes &&
     state.markers === prev.markers &&
-    state.bpm === prev.bpm
+    state.bpm === prev.bpm &&
+    state.routing === prev.routing &&
+    state.buses === prev.buses
   ) return;
   const now = performance.now();
   const coalesce = now - lastDocChangeAt < HISTORY_COALESCE_MS;

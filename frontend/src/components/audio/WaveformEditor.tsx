@@ -17,10 +17,13 @@ import { useMetamorphPanelRequest } from '../../state/metamorphPanelRequestStore
 import { MagentaToolStage } from './MagentaToolStage';
 import { MAGENTA_TOOLS, magentaToolById, type MagentaTool } from '../../lib/magentaToolCatalog';
 import { AutomationLane } from './AutomationLane';
-import { RACK_EFFECTS, getRackEffect, buildEffectChain, ensureChopModule, teleportXYZ, SPATIAL_TELEPORT, type ChainHandle } from '../../lib/rackEffects';
-import { sliceChunks } from '../../lib/audioAnalysis';
-import { decodeClipBlob, peekDecoded } from '../../lib/decodeCache';
-import { applyFadeAutomation, type FadeCurve } from '../../lib/clipFade';
+import { RACK_EFFECTS, getRackEffect, buildEffectChain, ensureChopModule } from '../../lib/rackEffects';
+import { decodeClipBlob } from '../../lib/decodeCache';
+import { type FadeCurve } from '../../lib/clipFade';
+import {
+  BOUNCE_SAMPLE_RATE, encodeBounce, renderBounce, renderExtentSec,
+  type BounceRequest, type BounceScope, type RenderDeps,
+} from '../../lib/renderCore';
 import { crossfadeRegions } from '../../lib/crossfade';
 import {
   MIN_CLIP_SEC,
@@ -30,7 +33,6 @@ import {
   toTimelineView,
   fromTimelineOffset,
 } from '../../lib/clipDragMath';
-import { computeClipSchedule } from '../../state/liveMixer';
 import { effectiveZoom } from '../../lib/canvasScale';
 import { ownsKey } from '../../lib/keyScope';
 import { encodeWav } from '../../lib/wavEncode';
@@ -1840,10 +1842,6 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const totalDuration = getTotalDurationSec();
   const timelineWidthPx = Math.max(totalDuration * zoom, 1000);
 
-  const trackById = useMemo(
-    () => new Map(tracks.map((t) => [t.id, t] as const)),
-    [tracks],
-  );
   const selectedClipIdSet = useMemo(() => new Set(selectedClipIds), [selectedClipIds]);
 
   const selectedClipCount = selectedClipIds.length || (selectedClipId ? 1 : 0);
@@ -2059,6 +2057,29 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     }
   }, [bleedPartnerFor, clips, tracks]);
 
+  /**
+   * The seven fields `lib/renderCore` reads for a bounce: the document, and the
+   * three real implementations it will not reach for itself (the shared decode
+   * cache, the rack builder, the live mixer's per-clip scheduler — the same one
+   * playback uses, which is what keeps a bounce and a preview the same audio).
+   *
+   * Read from the store at CALL time rather than closed over, so all three
+   * bounces below see the document as it is when the user presses the button
+   * and this callback never has to be rebuilt.
+   */
+  const renderDeps = useCallback((): RenderDeps => {
+    const st = useEditorStore.getState();
+    return {
+      clips: st.clips,
+      tracks: st.tracks,
+      masterFxChain: st.masterFxChain,
+      automationLanes: st.automationLanes,
+      decode: decodeClipBlob,
+      buildChain: buildEffectChain,
+      scheduleSources: liveMixer.scheduleClipSources,
+    };
+  }, []);
+
   const sendSelectionToInit = useCallback(async () => {
     const selection = getSelectionForInit();
     if (selection.length === 0) {
@@ -2067,51 +2088,19 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     }
     setIsRendering(true);
     try {
-      const sr = 44100;
-      const totalDur = Math.max(...selection.map((c) => c.startSec + c.durationSec), 1);
-      const offline = new OfflineAudioContext(2, Math.ceil(totalDur * sr), sr);
-      // Decoded buffers come from the shared cache (lib/decodeCache), so a clip
-      // already decoded for playback or an earlier bounce is not decoded again.
-      const decodeCtx = new AudioContext({ sampleRate: 44100 });
-      try {
-        for (const clip of selection) await decodeClipBlob(decodeCtx, clip.audioBlob);
-      } finally {
-        decodeCtx.close().catch(() => {});
-      }
-
-      for (const clip of selection) {
-        if (clip.muted) continue; // muted clips are excluded from the mashup, matching commitEdit and live playback
-        const track = trackById.get(clip.trackId);
-        if (!track || track.mute) continue;
-        const buf = peekDecoded(decodeCtx, clip.audioBlob);
-        if (!buf) continue;
-        // Same per-clip schedule the live mixer plays: one entry, or one per warp
-        // segment, each with its own source span and playback rate.
-        const schedule = computeClipSchedule(clip, buf.duration);
-        if (!schedule) continue;
-        const gain = offline.createGain();
-        const panner = offline.createStereoPanner();
-        panner.pan.value = Math.max(-1, Math.min(1, track.pan));
-        gain.connect(panner).connect(offline.destination);
-
-        // This path folds track volume into the clip gain node, so the envelope
-        // peak is track volume * clip gain. One envelope for the whole clip,
-        // from lib/clipFade — the same one the live preview hears.
-        applyFadeAutomation(gain.gain, clip, clip.startSec, 0, {
-          peak: track.volume * clipPeakGain(clip),
-          effectiveDurationSec: schedule.durationSec,
-        });
-        for (const seg of schedule.segments) {
-          const src = offline.createBufferSource();
-          src.buffer = buf;
-          src.playbackRate.value = seg.playbackRate;
-          src.connect(gain);
-          src.start(clip.startSec + seg.targetStart, seg.sourceOffset, seg.sourceDuration);
-        }
-      }
-
-      const rendered = await offline.startRendering();
-      const blob = encodeWav(rendered);
+      // No inserts and no automation, but the track mix DOES apply — a mashup
+      // sent to Init should sound like what the user has balanced on the
+      // timeline. Solo is ignored: this bounces exactly what was selected.
+      const req: BounceRequest = {
+        scope: { kind: 'selection', clipIds: selection.map((c) => c.id) },
+        sampleRate: BOUNCE_SAMPLE_RATE,
+        includeFx: false,
+        includeAutomation: false,
+        includeTrackMix: true,
+        float32: false,
+      };
+      const rendered = await renderBounce(req, renderDeps());
+      const blob = encodeBounce(rendered, req);
       const clipLabels = selection.map((c) => c.label);
       const mixDur = rendered.duration;
       const fileName = selection.length === 1
@@ -2134,7 +2123,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     } finally {
       setIsRendering(false);
     }
-  }, [getSelectionForInit, onSwitchTab, trackById]);
+  }, [getSelectionForInit, onSwitchTab, renderDeps]);
 
   const handleTrackHeaderPointerDown = useCallback((e: React.PointerEvent, trackId: string) => {
     const target = e.target as HTMLElement;
@@ -2638,194 +2627,19 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     const start = performance.now();
     logInfo('editor', `Mixing ${clips.length} clips on ${tracks.length} tracks…`);
     try {
-      const dur = getTotalDurationSec();
-      const sr = 44100;
-      const offline = new OfflineAudioContext(2, Math.ceil(dur * sr), sr);
-      const anySolo = tracks.some((t) => t.solo);
-      // Decode with a regular AudioContext — more reliable than OfflineAudioContext.decodeAudioData.
-      // Buffers come from the shared cache (lib/decodeCache), so a clip already
-      // decoded for playback or an earlier bounce is not decoded again.
-      const decodeCtx = new AudioContext({ sampleRate: 44100 });
-      try {
-        for (const c of clips) await decodeClipBlob(decodeCtx, c.audioBlob);
-      } finally {
-        decodeCtx.close().catch(() => {});
-      }
-      // If any enabled insert chain uses the chop worklet, register it on the
-      // offline context first so the bounce builds the real node (the factory
-      // would otherwise fall back to passthrough and the chop would not bake in).
-      const usesChop = [masterFxChain, ...tracks.map((t) => t.fxChain ?? [])]
-        .some((ch) => ch.some((e) => e.effect === 'chop' && e.enabled));
-      if (usesChop) {
-        try { await ensureChopModule(offline); } catch { /* falls back to passthrough */ }
-      }
-
-      // Master bus + insert rack -> destination, mirroring liveMixer's routing so
-      // the bounce carries the SAME psychoacoustic FX the user hears in preview.
-      const masterBus = offline.createGain();
-      const masterFx = buildEffectChain(offline, masterBus, offline.destination, masterFxChain);
-
-      // Automation (Phase E5): bake the recorded lanes into the offline render. The
-      // offline context renders from t=0, so a breakpoint's timeline time IS its
-      // offline time. Native vol/pan ride an AudioParam timeline; FX params step at
-      // each breakpoint via suspend/resume (no real-time loop runs offline).
-      const lanes = useEditorStore.getState().automationLanes.filter((l) => l.enabled && l.points.length > 0);
-      // The SAME event list live playback puts on the AudioParam (liveMixer's
-      // laneEnvelopeEvents), with the offline pinning: the render starts at t=0 and
-      // the context clock IS the timeline, so fromSec / startCtxTime / startOffset /
-      // now are all 0. That is what makes a CURVED breakpoint bounce the way it
-      // sounds — the hand-written loop this replaces emitted a linear ramp per
-      // point and flattened every curve on export.
-      const scheduleParamLane = (param: AudioParam, lane: AutomationLaneT, clampFn: (v: number) => number) => {
-        liveMixer.applyEnvelopeEvents(param, liveMixer.laneEnvelopeEvents(lane, 0, 0, 0, 0), clampFn);
+      // Everything: the master rack and every track's rack, the automation
+      // lanes, mute AND solo. The one full-fidelity bounce — the freeze path
+      // below reuses it so a frozen master matches the export exactly.
+      const req: BounceRequest = {
+        scope: { kind: 'master' },
+        sampleRate: BOUNCE_SAMPLE_RATE,
+        includeFx: true,
+        includeAutomation: true,
+        includeTrackMix: true,
+        float32: false,
       };
-
-      // One gain + insert chain + panner per audible track; panners feed the bus.
-      const trackNodeById = new Map<string, { gain: GainNode; panner: StereoPannerNode; fx: ChainHandle }>();
-      for (const track of tracks) {
-        if (track.mute) continue;
-        if (anySolo && !track.solo) continue;
-        const tgain = offline.createGain();
-        const volLane = lanes.find((l) => l.target.kind === 'trackVolume' && l.target.trackId === track.id);
-        if (volLane) scheduleParamLane(tgain.gain, volLane, (v) => Math.max(0, v));
-        else tgain.gain.value = track.volume;
-        const panner = offline.createStereoPanner();
-        const panLane = lanes.find((l) => l.target.kind === 'trackPan' && l.target.trackId === track.id);
-        if (panLane) scheduleParamLane(panner.pan, panLane, (v) => Math.max(-1, Math.min(1, v)));
-        else panner.pan.value = Math.max(-1, Math.min(1, track.pan));
-        const fx = buildEffectChain(offline, tgain, panner, track.fxChain ?? []); // tgain -> [fx] -> panner
-        panner.connect(masterBus);
-        trackNodeById.set(track.id, { gain: tgain, panner, fx });
-      }
-
-      for (const c of clips) {
-        if (c.muted) continue; // muted clips are excluded from the bounce, matching live playback
-        const tn = trackNodeById.get(c.trackId);
-        if (!tn) continue; // track muted or hidden by an active solo
-        const buf = peekDecoded(decodeCtx, c.audioBlob);
-        if (!buf) continue;
-        // Same per-clip schedule the live mixer plays: one entry, or one per warp
-        // segment, each with its own source span and playback rate.
-        const schedule = computeClipSchedule(c, buf.duration);
-        if (!schedule) continue;
-
-        // Per-clip gain carries the fade envelope scaled to the clip's own gain
-        // (peak = clip gain, unity by default). Track volume lives on the track
-        // gain so per-track FX process the post-fade signal exactly as they do live.
-        // The envelope comes from lib/clipFade, applied once over the whole clip.
-        const clipGain = offline.createGain();
-        applyFadeAutomation(clipGain.gain, c, c.startSec, 0, {
-          peak: clipPeakGain(c),
-          effectiveDurationSec: schedule.durationSec,
-        });
-        clipGain.connect(tn.gain);
-        for (const seg of schedule.segments) {
-          const src = offline.createBufferSource();
-          src.buffer = buf;
-          src.playbackRate.value = seg.playbackRate;
-          src.connect(clipGain);
-          src.start(c.startSec + seg.targetStart, seg.sourceOffset, seg.sourceDuration);
-        }
-      }
-
-      // Spatializer Teleport: schedule the same onset-driven panner jumps the live
-      // preview makes, so the bounce matches. The offline ctx renders from t=0, so
-      // each event's `when` is simply its timeline time.
-      const chunkCache = new Map<Blob, ReturnType<typeof sliceChunks>>();
-      for (const track of tracks) {
-        const tn = trackNodeById.get(track.id);
-        if (!tn) continue;
-        const teleEntries = (track.fxChain ?? []).filter(
-          (e) => e.enabled && e.effect === 'spatializer' && Math.round(e.params?.motion ?? 0) === SPATIAL_TELEPORT,
-        );
-        if (teleEntries.length === 0) continue;
-        const insts = tn.fx.instances();
-        // Muted clips render no audio, so their onsets must not drive jumps.
-        const trackClips = clips.filter((c) => c.trackId === track.id && !c.muted);
-        for (const entry of teleEntries) {
-          const li = insts.find((x) => x.id === entry.id);
-          if (!li?.inst.scheduleTeleport) continue;
-          const spread = entry.params?.motionDepth ?? 5;
-          const events: { when: number; x: number; y: number; z: number }[] = [];
-          let idx = 0;
-          for (const c of trackClips) {
-            const buf = peekDecoded(decodeCtx, c.audioBlob);
-            if (!buf) continue;
-            const offset = Math.min(c.offsetIntoSource, Math.max(0, buf.duration - 0.01));
-            const cdur = Math.min(c.durationSec, buf.duration - offset);
-            if (cdur <= 0) continue;
-            let chunks = chunkCache.get(c.audioBlob);
-            if (!chunks) { chunks = sliceChunks(buf); chunkCache.set(c.audioBlob, chunks); }
-            for (const chunk of chunks) {
-              if (chunk.tSec < offset || chunk.tSec >= offset + cdur) continue;
-              const pos = teleportXYZ(idx, chunk.loudness, chunk.brightness, spread);
-              events.push({ when: c.startSec + (chunk.tSec - offset), x: pos.x, y: pos.y, z: pos.z });
-              idx += 1;
-            }
-          }
-          if (events.length > 0) {
-            events.sort((a, b) => a.when - b.when);
-            li.inst.scheduleTeleport(events);
-          }
-        }
-      }
-
-      // FX-param automation bake: group the FX lanes by their effect entry, then
-      // step the params at each breakpoint via suspend/resume (the live lookahead
-      // writer does not run offline). Native vol/pan were already scheduled above.
-      const fxTargets: { handle: ChainHandle; entryId: string; baseParams: Record<string, number>; lanes: AutomationLaneT[] }[] = [];
-      const groupFx = (
-        kind: 'trackFx' | 'masterFx',
-        handle: ChainHandle,
-        chain: { id: string; enabled: boolean; params: Record<string, number> }[],
-        trackId?: string,
-      ) => {
-        for (const entry of chain) {
-          if (!entry.enabled) continue;
-          const entryLanes = lanes.filter(
-            (l) => l.target.kind === kind && l.target.entryId === entry.id && (kind === 'masterFx' || l.target.trackId === trackId),
-          );
-          if (entryLanes.length > 0) fxTargets.push({ handle, entryId: entry.id, baseParams: entry.params, lanes: entryLanes });
-        }
-      };
-      groupFx('masterFx', masterFx, masterFxChain);
-      for (const track of tracks) {
-        const tn = trackNodeById.get(track.id);
-        if (!tn) continue;
-        groupFx('trackFx', tn.fx, track.fxChain ?? [], track.id);
-      }
-
-      if (fxTargets.length > 0) {
-        const applyFxAt = (t: number) => {
-          for (const tgt of fxTargets) {
-            const merged: Record<string, number> = { ...tgt.baseParams };
-            for (const lane of tgt.lanes) {
-              const v = sampleLane(lane, t);
-              if (v != null && lane.target.paramKey) merged[lane.target.paramKey] = v;
-            }
-            tgt.handle.updateParams(tgt.entryId, merged);
-          }
-        };
-        applyFxAt(0); // initial state at the top of the render
-        // Union of breakpoint times, quantized to the render quantum, in (0, dur).
-        const q = 128 / sr;
-        const times = new Set<number>();
-        for (const tgt of fxTargets) {
-          for (const lane of tgt.lanes) {
-            for (const p of lane.points) {
-              if (p.t <= 0 || p.t >= dur) continue;
-              times.add(Math.min(dur - q, Math.ceil(p.t / q) * q));
-            }
-          }
-        }
-        for (const tq of [...times].sort((a, b) => a - b)) {
-          if (tq <= 0 || tq >= dur) continue;
-          offline.suspend(tq).then(() => { applyFxAt(tq); offline.resume(); }).catch(() => {});
-        }
-      }
-
-      const rendered = await offline.startRendering();
-      const wavBlob = encodeWav(rendered);
+      const rendered = await renderBounce(req, renderDeps());
+      const wavBlob = encodeBounce(rendered, req);
       // Freeze path: hand the rendered master back to the caller (it post-processes
       // through the VST chain and caches it) without saving/downloading.
       if (opts?.silent) {
@@ -2862,7 +2676,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     } finally {
       setIsCommitting(false);
     }
-  }, [clips, tracks, getTotalDurationSec, mixdownName, masterFxChain]);
+  }, [clips, tracks, mixdownName, renderDeps]);
 
   // --- Master VST freeze (render-on-change) ----------------------------------
   const editorBpm = useEditorStore((s) => s.bpm);
@@ -2976,67 +2790,27 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         return null;
       }
       const vsts = (track.fxChain ?? []).filter((e) => e.enabled && e.effect === 'vst3' && e.vst);
-      const dur = Math.max(...trackClips.map((c) => c.startSec + c.durationSec), 0.1);
-      const sr = 44100;
-      const offline = new OfflineAudioContext(2, Math.ceil(dur * sr), sr);
-
-      // Decode clips with a real AudioContext (more reliable than offline decode),
-      // via the shared cache (lib/decodeCache) so a clip already decoded for
-      // playback or an earlier bounce is not decoded again.
-      const decodeCtx = new AudioContext({ sampleRate: sr });
-      try {
-        for (const c of trackClips) await decodeClipBlob(decodeCtx, c.audioBlob);
-      } finally {
-        decodeCtx.close().catch(() => {});
-      }
-
-      // Bake the live rack effects (VST entries are applied on the backend after).
-      const rackChain = (track.fxChain ?? []).filter((e) => e.effect !== 'vst3');
-      if (rackChain.some((e) => e.effect === 'chop' && e.enabled)) {
-        try {
-          await ensureChopModule(offline);
-        } catch {
-          /* falls back to passthrough */
-        }
-      }
-      const trackInput = offline.createGain();
-      const fx = buildEffectChain(offline, trackInput, offline.destination, rackChain);
-      for (const c of trackClips) {
-        if (c.muted) continue; // muted clips stay out of the printed stem, matching live playback
-        const buf = peekDecoded(decodeCtx, c.audioBlob);
-        if (!buf) continue;
-        // Same per-clip schedule the live mixer plays: one entry, or one per warp
-        // segment, each with its own source span and playback rate. One fade
-        // envelope from lib/clipFade covers the clip however it is segmented.
-        const schedule = computeClipSchedule(c, buf.duration);
-        if (!schedule) continue;
-        const clipGain = offline.createGain();
-        applyFadeAutomation(clipGain.gain, c, c.startSec, 0, {
-          peak: clipPeakGain(c),
-          effectiveDurationSec: schedule.durationSec,
-        });
-        clipGain.connect(trackInput);
-        for (const seg of schedule.segments) {
-          const src = offline.createBufferSource();
-          src.buffer = buf;
-          src.playbackRate.value = seg.playbackRate;
-          src.connect(clipGain);
-          src.start(c.startSec + seg.targetStart, seg.sourceOffset, seg.sourceDuration);
-        }
-      }
-
-      let rendered: AudioBuffer;
-      try {
-        rendered = await offline.startRendering();
-      } finally {
-        fx.dispose();
-      }
-      // Float only when a VST chain follows: /api/vst/process-file answers in
-      // float precisely so a chain does not requantize between stages, and
-      // encoding the input at 16 bits would put the loss back at every hop.
-      // With no plugins the stem goes straight to the timeline, where 16-bit
-      // at half the size is the right answer.
-      let blob: Blob = encodeWav(rendered, { float32: vsts.length > 0 });
+      // A stem is the track's RAW audio through its own rack: no automation,
+      // and no track volume / pan / mute / solo — the timeline plays the
+      // printed stem back through the fader it was already going through.
+      // Hosted VST3 entries are stripped by the core and applied on the backend
+      // below, which is also why the encode is float when any of them exist.
+      const scope: BounceScope = { kind: 'track', trackId };
+      const dur = renderExtentSec(st.clips, scope);
+      const req: BounceRequest = {
+        scope,
+        sampleRate: BOUNCE_SAMPLE_RATE,
+        includeFx: true,
+        includeAutomation: false,
+        includeTrackMix: false,
+        // /api/vst/process-file answers in float precisely so a chain does not
+        // requantize between stages; encoding the input at 16 bits would put
+        // the loss back at every hop. With no plugins the stem goes straight to
+        // the timeline, where 16-bit at half the size is the right answer.
+        float32: vsts.length > 0,
+      };
+      const rendered = await renderBounce(req, renderDeps());
+      let blob: Blob = encodeBounce(rendered, req);
 
       // VST3 chain on the backend, in signal-chain order.
       let current = new File([blob], 'track-stem.wav', { type: 'audio/wav' });
@@ -3065,7 +2839,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       const { peaks } = await computePeaks(blob, 240);
       return { audioBlob: blob, durationSec: dur, peaks };
     },
-    [],
+    [renderDeps],
   );
 
   const freezeTrackAction = useCallback(

@@ -9,7 +9,11 @@
  * track volume / pan / mute / solo are audible MID-playback:
  *
  *     BufferSource ─▶ clipGain (fade in/out) ─▶ trackGain (volume, live)
- *                                                   └▶ panner (pan, live) ─▶ master
+ *                                                   └▶ panner (pan, live) ─▶ comp (PDC) ─▶ ⟨routed⟩
+ *
+ * ⟨routed⟩ is not a constant any more: where a track's comp delay lands is an
+ * EDGE in `state/routingGraph` — the master bus, or a mix bus, plus any number
+ * of sends tapped off the same point. See the "Routing" section below.
  *
  * trackGain + panner are shared per track and updated in place when the EDIT
  * (or SLIDE) faders move — that's the whole point. clipGain carries each clip's
@@ -44,6 +48,7 @@ import { clampCurve, interpolatePoints, sampleCurve, type CurvePoint } from '../
 import {
   usePlayerStore,
   getEngineCtx,
+  getEngineOutputInfo,
   getMasterGain,
   setLiveTransport,
   registerChainProbe,
@@ -61,13 +66,38 @@ import {
 } from '../lib/soundfontEngine';
 import { applyFadeAutomation, type AudioParamLike, type FadeClip } from '../lib/clipFade';
 import { warpSegments, type WarpMarker, type WarpSegment } from '../lib/audioWarp';
-import { buildEffectChain, teleportXYZ, SPATIAL_TELEPORT, type ChainHandle } from '../lib/rackEffects';
+import {
+  buildEffectChain,
+  chainLatencyReport,
+  summingDelaysSec,
+  teleportXYZ,
+  SPATIAL_TELEPORT,
+  type ChainHandle,
+  type ChainLatencyReport,
+  type RackEffectDef,
+} from '../lib/rackEffects';
 import { sliceChunks, type AudioChunk } from '../lib/audioAnalysis';
 import { decodeClipBlob, peekDecoded } from '../lib/decodeCache';
 import type { ChainEntry } from './effectChainStore';
+import {
+  CONN_SEND,
+  MASTER_ID,
+  outputOf,
+  sendsFrom,
+  topoOrder,
+  type RoutingGraph,
+} from './routingGraph';
 
 const EDITOR_ENTRY_ID = 'editor-timeline'; // reuse so existing footer/playhead wiring keeps working
 const RAMP_TC = 0.015; // setTargetAtTime time-constant for click-free param moves
+/** Time constant the per-track compensation delay moves on. Same value the DJ
+ *  decks have always used for their two-deck version of this (djEngine
+ *  `updateLatencyComp`), so both alignments glide identically. */
+const COMP_TC = 0.01;
+/** Ceiling on the compensation `DelayNode`, in seconds. A second is orders of
+ *  magnitude past any plausible insert-chain latency and costs only the node's
+ *  (lazily allocated) buffer. */
+const COMP_MAX_DELAY = 1.0;
 
 // Decoded buffers live in lib/decodeCache, shared with the offline renderers,
 // so a clip decoded here for playback is not decoded a second time by a bounce.
@@ -83,14 +113,65 @@ interface TrackNodes {
   /** Mute/solo factor (0 or 1), always driven live (never automated). */
   muteGain: GainNode;
   panner: StereoPannerNode;
+  /** Plugin-delay compensation, spliced panner -> comp -> the summing bus. Holds
+   *  `max(chain latency) - this track's own`, so every track meets the slowest
+   *  one. 0 (transparent) until some chain declares latency. See
+   *  `syncTrackLatency`. */
+  comp: DelayNode;
   /** Per-track insert FX, spliced gain -> muteGain -> [fx] -> panner. */
   fx: ChainHandle;
   fxFullSig: string; // topology + params (skip no-op reconciles)
   fxTopoSig: string; // topology only (rebuild trigger)
 }
 
+/**
+ * One mix bus's live strip: `input -> [insert FX] -> gain -> muteGain -> output`.
+ *
+ * Three track-only stages are absent — no source (a bus is fed by other nodes,
+ * not by clips), no panner (a bus sums already-panned stereo) and no
+ * compensation delay (the delay that aligns a bus with its siblings belongs on
+ * the TRACKS feeding it, which is where `syncTrackLatency` puts it).
+ *
+ * THE RACK ALSO SITS ON THE OTHER SIDE OF THE FADER. A track is
+ * `gain -> muteGain -> [fx] -> panner`: post-fader inserts. A bus is
+ * `[fx] -> gain -> muteGain`: PRE-fader inserts, which is the conventional bus
+ * shape (you set a bus compressor once and then ride the bus fader under it),
+ * but it is an inversion and it has two audible consequences:
+ *
+ *  - A bus MUTE is post-FX, so muting a bus CUTS ITS TAILS — a reverb on a bus
+ *    stops dead. Muting a TRACK is pre-FX and its tails ring out. Same word,
+ *    opposite behaviour, on purpose.
+ *  - A bus FADER does not drive its own inserts. Pulling a bus fader down does
+ *    not make its compressor let go, because the compressor is upstream of it;
+ *    pulling a TRACK fader down does.
+ *
+ * `input` and `output` are separate nodes even though nothing sits outside the
+ * chain: `wireRoutingGraph` needs one node it can `disconnect()` on a rewire
+ * without tearing the strip apart, and one node every input can land on
+ * regardless of what the rack is currently doing.
+ */
+export interface BusNodes {
+  /** What everything routed INTO this bus connects to. */
+  input: GainNode;
+  /** The bus's insert rack, spliced input -> [fx] -> gain. */
+  fx: ChainHandle;
+  /** Volume fader. */
+  gain: GainNode;
+  /** Mute gate (0 or 1), driven live. */
+  muteGain: GainNode;
+  /** What this bus feeds downstream. */
+  output: GainNode;
+  fxFullSig: string; // topology + params (skip no-op reconciles)
+  fxTopoSig: string; // topology only (rebuild trigger)
+}
+
 // ---- live session state (module singletons; one editor timeline at a time) --
 let trackNodes = new Map<string, TrackNodes>();
+/** Live bus strips, keyed by `EditorBus.id`. */
+let busNodes = new Map<string, BusNodes>();
+/** One gain node per send, keyed `sendKey(from, to)`, so `setSendGain` reaches
+ *  the exact node without a rebuild. */
+let sendGains = new Map<string, GainNode>();
 let sources: AudioBufferSourceNode[] = [];
 let rafId = 0;
 let startCtxTime = 0; // ctx.currentTime at the moment playback (re)started
@@ -100,6 +181,7 @@ let playing = false;
 let playToken = 0; // guards against overlapping async play() calls
 let unsubEditor: (() => void) | null = null;
 let lastMixSig = '';
+let lastCompSig = ''; // last alignment written by syncTrackLatency (skip no-op writes)
 let lastTimePush = 0; // throttle playerStore.currentTime writes
 let midiTimers: number[] = []; // setTimeout handles for scheduled MIDI note on/off
 // Per-clip mute gates retained at schedule time, keyed by clip id. Structural
@@ -118,6 +200,14 @@ let masterBus: GainNode | null = null;
 let masterChain: ChainHandle | null = null;
 let lastMasterSig = '';     // topology only (rebuild trigger)
 let lastMasterFullSig = ''; // topology + params (skip no-op ticks)
+
+// Routing reconciliation signatures. Split so the store subscription can tell
+// a STRUCTURAL move (rebuild nodes / rewire) from a VALUE move (write a param),
+// the same split the FX chains already use.
+let lastBusMembershipSig = ''; // which buses exist, in order (node rebuild)
+let lastRoutingSig = '';       // nodes + edges MINUS send gains (rewire)
+let lastBusMixSig = '';        // bus faders + mutes (live write)
+let lastSendGainSig = '';      // send amounts (live write)
 
 const clamp = (x: number, a: number, b: number) => Math.max(a, Math.min(b, x));
 
@@ -222,6 +312,10 @@ function applyMixLive(): void {
     n.muteGain.gain.setTargetAtTime(muteSoloFactor(t, anySolo), ctx.currentTime, RAMP_TC);
     if (!automated.has(panKey)) n.panner.pan.setTargetAtTime(clamp(t.pan, -1, 1), ctx.currentTime, RAMP_TC);
   }
+  // Bus faders and mutes are mixer values like the track ones, so they ride the
+  // same push. A bus has no automation lane and no pan, so there is nothing to
+  // skip and nothing else to write. (No buses: the loop inside does nothing.)
+  applyBusMix(useEditorStore.getState().buses, (id) => busNodes.get(id), ctx.currentTime);
 }
 
 /** Decode every clip's blob we'll need (cached by Blob identity + sample rate). */
@@ -239,6 +333,218 @@ function chainTopoSig(chain: ChainEntry[]): string {
   let s = '';
   for (const e of chain) s += `${e.id}:${e.effect}:${e.enabled ? 1 : 0}|`;
   return s;
+}
+
+/* ── Routing: buses, sends, outputTo ──────────────────────────────────────────
+   Until this, `buildTrackNodes` hard-coded every track's destination to the
+   session master bus. The destination is now an EDGE in `state/routingGraph`,
+   and the four functions below are the whole of turning that model into Web
+   Audio connections. They are pure over injected seams — no store, no engine —
+   so the wiring is assertable with fake nodes (state/liveMixer.routing.test.ts)
+   and the module-level wrappers further down are the only part that touches
+   the singletons.
+
+   The contract these implement is `state/routingGraph.ts`'s, and its header
+   records where the DESIGN came from: Ardour `libs/ardour/internal_return.cc`
+   (GPL-2.0-or-later) for "a bus is a normal node that sums its inputs, and a
+   send is a post-fader tap with its own gain rather than a second output". That
+   description is the only thing carried across — no Ardour source was read or
+   copied while writing this file, and the taps here are post-pan/post-comp
+   because that is where THIS mixer's per-track chain ends. */
+
+/** A track's or bus's own strip, as the compensation writer sees it. */
+export interface RampParam {
+  setTargetAtTime(value: number, startTime: number, timeConstant: number): unknown;
+}
+
+/** The bus fields the live graph reads. `EditorBus` satisfies it. */
+export interface MixBus {
+  id: string;
+  fxChain?: ChainEntry[];
+  volume: number;
+  mute: boolean;
+}
+
+/** Build one bus strip: `input -> [fx] -> gain -> muteGain -> output`. The
+ *  output is left UNCONNECTED — `wireRoutingGraph` places it, because where a
+ *  bus goes is a property of the graph, not of the strip. */
+export function createBusNodes(ctx: BaseAudioContext, bus: MixBus): BusNodes {
+  const input = ctx.createGain();
+  const gain = ctx.createGain();
+  gain.gain.value = clamp(bus.volume, 0, 1);
+  const muteGain = ctx.createGain();
+  // Opened at the stored value rather than at unity: a project loaded with a
+  // muted bus must be muted on the first sample, not on the first live push.
+  muteGain.gain.value = bus.mute ? 0 : 1;
+  const output = ctx.createGain();
+  const chain = bus.fxChain ?? [];
+  const fx = buildEffectChain(ctx, input, gain, chain); // input -> [fx] -> gain
+  gain.connect(muteGain).connect(output);
+  return {
+    input,
+    fx,
+    gain,
+    muteGain,
+    output,
+    fxFullSig: JSON.stringify(chain),
+    fxTopoSig: chainTopoSig(chain),
+  };
+}
+
+/** Key for a send's gain node. One send per (from, to) pair, so the pair is the
+ *  identity — the model refuses a second one as `'duplicate'`. */
+export function sendKey(from: string, to: string): string {
+  return `${from}|${to}`;
+}
+
+/** The node lookups `wireRoutingGraph` needs. The live mixer resolves them off
+ *  its own maps; a test resolves them off fakes. */
+export interface RoutingEndpoints {
+  /** What a node FEEDS DOWNSTREAM: a track's comp delay, a bus's output. */
+  outputNodeOf: (id: string) => AudioNode | undefined;
+  /** What a node RECEIVES INTO: a bus's input, or the master summing bus. */
+  inputNodeOf: (id: string) => AudioNode | undefined;
+  /** Make a fresh gain node for one send, opened at that send's amount. */
+  makeSendGain: (gain: number) => GainNode;
+  /**
+   * Every id that HAS a live strip, whatever the graph says. Read only on the
+   * degraded path, and it is what makes the fallback's promise true: a damaged
+   * file can be missing a node for a track that exists and is playing, and
+   * iterating the graph alone would leave that track's comp delay connected to
+   * nothing at all — silence, which is precisely what the fallback exists to
+   * prevent.
+   */
+  liveIds: () => Iterable<string>;
+}
+
+/**
+ * Connect the whole graph, and return the send gain nodes keyed by `sendKey`.
+ *
+ * Nodes are visited in `topoOrder`, so every source is connected before the
+ * node that sums it. Each non-master node gets exactly one main-output edge
+ * (`outputOf`, which reads a missing edge as "feeds the master" so a half-built
+ * graph is still audible) plus one dedicated gain node per send, tapped off the
+ * SAME output as the main path.
+ *
+ * `topoOrder` throws on a cycle or a malformed graph. The mutators prevent
+ * both, but a `.tasmo` or an autosave manifest reaches the mixer without any
+ * mutator having vetted it, so the throw degrades to the pre-routing mix —
+ * every strip straight to the master, no sends — and is logged. The degraded
+ * pass walks the UNION of the graph's nodes and `ends.liveIds()`, so a strip the
+ * damaged graph forgot is still connected. Silence is never an outcome: a user
+ * whose project file is damaged must still hear their audio.
+ */
+export function wireRoutingGraph(
+  graph: RoutingGraph,
+  ends: RoutingEndpoints,
+): Map<string, GainNode> {
+  const gains = new Map<string, GainNode>();
+  const master = ends.inputNodeOf(MASTER_ID);
+
+  let order: string[];
+  let degraded = false;
+  try {
+    order = topoOrder(graph);
+  } catch (e) {
+    degraded = true;
+    // The UNION of the graph's nodes and the strips that actually exist. A
+    // graph we could not order is a graph we cannot trust to be complete
+    // either, so the live strips — not the file — decide who gets connected.
+    const seen = new Set<string>();
+    order = [];
+    for (const id of [...graph.nodes.map((n) => n.id), ...ends.liveIds()]) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      order.push(id);
+    }
+    logError(
+      'editor',
+      `Routing graph could not be ordered (${e instanceof Error ? e.message : String(e)}) — ` +
+        'falling back to every track straight to the master.',
+    );
+  }
+
+  for (const id of order) {
+    if (id === MASTER_ID) continue;
+    const out = ends.outputNodeOf(id);
+    if (!out) continue; // a node in the graph with no live strip (nothing to place)
+    const destId = degraded ? MASTER_ID : (outputOf(graph, id) ?? MASTER_ID);
+    const dest = ends.inputNodeOf(destId) ?? master;
+    if (dest) out.connect(dest);
+    if (degraded) continue; // a graph we could not order gets no send taps either
+    for (const send of sendsFrom(graph, id)) {
+      const target = ends.inputNodeOf(send.to);
+      if (!target) continue; // a send at a node that no longer exists
+      const g = ends.makeSendGain(send.gain);
+      out.connect(g);
+      g.connect(target);
+      gains.set(sendKey(id, send.to), g);
+    }
+  }
+  return gains;
+}
+
+/** One bus strip, as the mix writer sees it. `BusNodes` satisfies it. */
+export interface BusMixNodes {
+  gain: { gain: RampParam };
+  muteGain: { gain: RampParam };
+}
+
+/** Push each bus's fader + mute onto its live strip (click-free). A bus with no
+ *  strip yet is skipped rather than throwing, exactly as tracks are. */
+export function applyBusMix(
+  buses: readonly MixBus[],
+  nodeFor: (busId: string) => BusMixNodes | undefined,
+  nowSec: number,
+): void {
+  for (const b of buses) {
+    const n = nodeFor(b.id);
+    if (!n) continue;
+    n.gain.gain.setTargetAtTime(clamp(b.volume, 0, 1), nowSec, RAMP_TC);
+    n.muteGain.gain.setTargetAtTime(b.mute ? 0 : 1, nowSec, RAMP_TC);
+  }
+}
+
+/** Push every send's amount onto its gain node (click-free). A send whose node
+ *  is gone — a stale map between a graph edit and the rewire — is skipped. */
+export function applySendGains(
+  graph: RoutingGraph,
+  gainFor: (key: string) => { gain: RampParam } | undefined,
+  nowSec: number,
+): void {
+  for (const e of graph.edges) {
+    if (e.connType !== CONN_SEND) continue;
+    const node = gainFor(sendKey(e.from, e.to));
+    if (!node) continue;
+    node.gain.setTargetAtTime(e.gain, nowSec, RAMP_TC);
+  }
+}
+
+/** Anything with a `disconnect()`. Every Web Audio node satisfies it. */
+export interface Disconnectable { disconnect(): void }
+
+/** A bus strip, as teardown sees it. `BusNodes` satisfies it. */
+export interface DisposableBus {
+  fx: { dispose(): void };
+  input: Disconnectable;
+  gain: Disconnectable;
+  muteGain: Disconnectable;
+  output: Disconnectable;
+}
+
+/** Tear down every bus strip and every send gain. Leaving either behind on a
+ *  rebuild would leave a second, orphaned path into the master — the bus's
+ *  contribution summed twice. */
+export function disposeBusNodes(
+  buses: Iterable<DisposableBus>,
+  sends: Iterable<Disconnectable>,
+): void {
+  for (const b of buses) {
+    try { b.fx.dispose(); b.input.disconnect(); b.gain.disconnect(); b.muteGain.disconnect(); b.output.disconnect(); } catch { /* gone */ }
+  }
+  for (const g of sends) {
+    try { g.disconnect(); } catch { /* gone */ }
+  }
 }
 
 /** (Re)build the session-local master bus + insert rack and route it into the
@@ -277,32 +583,441 @@ function applyMasterChainLive(): void {
 function applyTrackChainsLive(): void {
   const tracks = useEditorStore.getState().tracks;
   const byId = new Map<string, EditorTrack>(tracks.map((t): [string, EditorTrack] => [t.id, t]));
+  let chainsMoved = false;
   for (const [id, n] of trackNodes) {
     const chain = byId.get(id)?.fxChain ?? [];
     const full = JSON.stringify(chain);
     if (full === n.fxFullSig) continue;
     n.fxFullSig = full;
+    chainsMoved = true;
     const topo = chainTopoSig(chain);
     if (topo !== n.fxTopoSig) { n.fxTopoSig = topo; n.fx.rebuild(chain); }
     else for (const e of chain) n.fx.updateParams(e.id, e.params);
   }
+  // A track ADDED or REMOVED mid-playback changes the inputs of the sum without
+  // moving any surviving track's signature: a new track has no node for the loop
+  // above to compare against, and a removed one just stops being looked up — yet
+  // `syncTrackLatency` computes `max()` over the STORE, so both change what every
+  // other track must wait for. Compare the id sets so neither slips through.
+  // (Equal sizes + every store id present == equal sets; both sides are unique.)
+  const membershipMoved =
+    tracks.length !== trackNodes.size || tracks.some((t) => !trackNodes.has(t.id));
+  // Add / remove / reorder / bypass obviously changes what a chain declares, and
+  // so can a param edit: `RackLatencySpec` may be a function of the entry's
+  // params. So re-align on ANY of that and let `syncTrackLatency` decide whether
+  // the numbers actually moved.
+  if (chainsMoved || membershipMoved) syncTrackLatency();
 }
 
-/** Dispose every track's FX handle + nodes (oscillators in some effects must be
- *  stopped explicitly). Leaves the trackNodes map for the caller to replace. */
-function disposeTrackNodes(): void {
-  for (const n of trackNodes.values()) {
-    try { n.fx.dispose(); n.gain.disconnect(); n.muteGain.disconnect(); n.panner.disconnect(); } catch { /* gone */ }
+/** Reconcile each BUS's live insert chain with the store — the track version
+ *  above, over `buses`. A bus chain's latency lags every track routed into it,
+ *  so a move here re-aligns the tracks, not the bus. */
+function applyBusChainsLive(): void {
+  const buses = useEditorStore.getState().buses;
+  const byId = new Map<string, MixBus>(buses.map((b): [string, MixBus] => [b.id, b]));
+  let chainsMoved = false;
+  for (const [id, n] of busNodes) {
+    const chain = byId.get(id)?.fxChain ?? [];
+    const full = JSON.stringify(chain);
+    if (full === n.fxFullSig) continue;
+    n.fxFullSig = full;
+    chainsMoved = true;
+    const topo = chainTopoSig(chain);
+    if (topo !== n.fxTopoSig) { n.fxTopoSig = topo; n.fx.rebuild(chain); }
+    else for (const e of chain) n.fx.updateParams(e.id, e.params);
+  }
+  if (chainsMoved) syncTrackLatency();
+}
+
+/* Reconciliation signatures. Structure (which strips exist, and which edges
+   connect them) forces node work; values (fader, mute, send amount) are pushed
+   onto the running graph. Send GAINS are deliberately excluded from the
+   structural signature — riding a send fader must not rebuild anything.
+
+   Exported because that split IS the live behaviour and is worth pinning on its
+   own: `applyRoutingLive` runs only inside a playing session, so a test can
+   reach the decision (rebuild vs update) through these four and nothing else.
+   See state/liveMixer.routing.test.ts, "the rebuild/update decision table". */
+
+export function busMembershipSig(buses: readonly MixBus[]): string {
+  let s = '';
+  for (const b of buses) s += `${b.id}|`;
+  return s;
+}
+
+export function routingStructureSig(g: RoutingGraph): string {
+  let s = '';
+  for (const n of g.nodes) s += `${n.id}:${n.kind}|`;
+  s += '::';
+  for (const e of g.edges) s += `${e.from}>${e.to}:${e.connType}:${e.targetEntryId ?? ''}|`;
+  return s;
+}
+
+export function busMixSig(buses: readonly MixBus[]): string {
+  let s = '';
+  for (const b of buses) s += `${b.id}:${b.volume}:${b.mute ? 1 : 0}|`;
+  return s;
+}
+
+export function sendGainSig(g: RoutingGraph): string {
+  let s = '';
+  for (const e of g.edges) if (e.connType === CONN_SEND) s += `${e.from}>${e.to}:${e.gain}|`;
+  return s;
+}
+
+/** Seed the reconciliation signatures from the store, so the first subscription
+ *  tick after a `start()` does not rebuild a graph that was just built. */
+function resetRoutingSigs(): void {
+  const s = useEditorStore.getState();
+  lastBusMembershipSig = busMembershipSig(s.buses);
+  lastRoutingSig = routingStructureSig(s.routing);
+  lastBusMixSig = busMixSig(s.buses);
+  lastSendGainSig = sendGainSig(s.routing);
+}
+
+/**
+ * Reconcile the live routing with the store. Structural moves (a bus created or
+ * deleted, an output repointed, a send added or removed) rebuild or rewire;
+ * everything else is a value written onto the running graph, so riding a send
+ * fader or muting a bus mid-playback costs no node work and makes no click.
+ */
+function applyRoutingLive(): void {
+  const s = useEditorStore.getState();
+  const ctx = getEngineCtx();
+  let rewired = false;
+
+  const membership = busMembershipSig(s.buses);
+  if (membership !== lastBusMembershipSig) {
+    lastBusMembershipSig = membership;
+    buildBusNodes(s.buses);
+    rewired = true; // fresh strips have no output edges at all
+  }
+  const structure = routingStructureSig(s.routing);
+  if (rewired || structure !== lastRoutingSig) {
+    lastRoutingSig = structure;
+    wireRouting(s.routing);
+    rewired = true;
+  }
+
+  applyBusChainsLive();
+
+  const mix = busMixSig(s.buses);
+  if (rewired || mix !== lastBusMixSig) {
+    lastBusMixSig = mix;
+    applyBusMix(s.buses, (id) => busNodes.get(id), ctx.currentTime);
+  }
+  const sends = sendGainSig(s.routing);
+  if (rewired || sends !== lastSendGainSig) {
+    lastSendGainSig = sends;
+    applySendGains(s.routing, (key) => sendGains.get(key), ctx.currentTime);
+  }
+
+  // A reroute changes how much of the chain sits between a track and the
+  // master, so the alignment moves even though no rack did.
+  if (rewired) syncTrackLatency();
+}
+
+/* ── Plugin-delay compensation ────────────────────────────────────────────────
+   An insert chain that looks ahead pushes its track's output LATE — a
+   compressor's spec-mandated 6 ms pre-delay is the standard case — so summing a
+   compressed track with a dry one smears the downbeat. The fix is the rule
+   Tracktion's `SummingNode` applies (design only, from its described behaviour:
+   Tracktion Engine is GPL-3/commercial and nothing is copied from it): delay
+   each input of the sum by `max(latencies) - own`, so the slowest input sets the
+   meeting point and never waits. `lib/rackEffects.summingDelaysSec` is that
+   rule; the DJ decks apply it to their two decks and this applies it to the
+   editor's tracks.
+
+   The compensation sits on the far side of the panner, immediately before the
+   summing bus, so it delays a track's whole contribution exactly once. The
+   MASTER rack is downstream of the sum and therefore gets no per-track term.
+
+   A project where nothing declares latency is UNCHANGED, not merely close: the
+   spec gives `DelayNode.delayTime` a default of "0 (no delay)", and the only
+   clamp on it ("If DelayNode is part of a cycle, then the value of the delayTime
+   attribute is clamped to a minimum of one render quantum") does not apply here
+   — panner -> comp -> summing bus is acyclic. Source: W3C Web Audio API,
+   "The DelayNode Interface" > Attributes > delayTime
+   (https://webaudio.github.io/web-audio-api/), read 2026-09-15. Cited by name
+   because the spec's section numbers renumber as interfaces are added. */
+
+/** One track's share of the summing alignment. */
+export interface TrackCompRow {
+  trackId: string;
+  /** What this track's LIVE path to the master declares it lags by, in seconds:
+   *  its own insert chain, plus the insert chain of every bus between it and the
+   *  master. With no routing information it is just the track's own chain, which
+   *  is what a graph of "everything straight to the master" evaluates to anyway. */
+  latencySec: number;
+  /** What its compensation delay must hold to meet the slowest track. */
+  compSec: number;
+  /** `ChainEntry.id`s (NOT effect names) this figure did not count, i.e. every
+   *  entry `chainLatencyReport` marked `counted: false`. That is deliberately
+   *  BOTH reasons an entry can be excluded, which a consumer has to tell apart
+   *  itself by looking at the entry:
+   *
+   *   - BYPASSED. `buildEffectChain` routes it around, so it lags nothing live
+   *     AND nothing at freeze/bounce. Excluded and staying excluded — this is
+   *     also what makes a bypass toggle re-align the mixer.
+   *   - UNRESOLVABLE. Every hosted `vst3` entry, and effects imported from
+   *     another DAW: an inert passthrough in the live graph, so it lags nothing
+   *     HERE, but it WILL print at freeze/bounce. This is the live/bounce gap,
+   *     listed rather than silently dropped.
+   *
+   *  A consumer that only wants the second (a "this number excludes your
+   *  plugins" warning) must filter to the entries that are `enabled`. */
+  uncounted: string[];
+}
+
+/** The track fields the compensation math reads. `EditorTrack` satisfies it —
+ *  and a FROZEN track satisfies it with an empty `fxChain`, because freezing
+ *  prints the chain into the stem and stashes the original off to the side. */
+export interface LatencyTrack {
+  id: string;
+  fxChain?: ChainEntry[];
+}
+
+/** The bus fields the compensation math reads. `EditorBus` satisfies it. */
+export interface LatencyBus {
+  id: string;
+  fxChain?: ChainEntry[];
+}
+
+/** Where the signal actually goes, for the compensation math. Omit it and every
+ *  track is treated as meeting at the master directly — which is both the
+ *  pre-routing behaviour and what a default graph evaluates to. */
+export interface LatencyRouting {
+  graph: RoutingGraph;
+  buses: readonly LatencyBus[];
+}
+
+/**
+ * How much each track's compensation delay must hold, in the order given.
+ *
+ * PURE: no audio context, no store — the tracks, the registry seam, the sample
+ * rate and (optionally) the routing go in, the delays come out. `resolve`
+ * defaults to the real rack registry; `sampleRate` is passed through verbatim
+ * for declarations expressed in samples (none today) and may be omitted.
+ *
+ * With buses, a track's lag is no longer just its own chain: a bus's insert
+ * rack sits downstream of everything routed into it, so it lags every one of
+ * those tracks equally. The figure per track is therefore
+ * `chain(track) + Σ chain(bus)` along its `outputOf` path to the master, and
+ * the alignment is ONE `summingDelaysSec` over those totals, written at each
+ * track's own comp delay. Delaying at the track rather than at each summing
+ * node is equivalent here because a bus's chain is a constant added to every
+ * one of its inputs: equalising the totals at the master equalises them at
+ * every intermediate sum as well.
+ *
+ * SENDS ARE NOT COMPENSATED in this step. A send is a second path with a
+ * different length, so making both arrive together needs a delay on the send
+ * tap itself, not on the track — a later §3.6 step. A send today therefore
+ * arrives as early as its own path allows, which is what it did before buses
+ * existed (there were no sends at all).
+ */
+export function trackCompDelays(
+  tracks: readonly LatencyTrack[],
+  resolve?: (id: string) => RackEffectDef | undefined,
+  sampleRate?: number,
+  routing?: LatencyRouting,
+): TrackCompRow[] {
+  const opts = { resolve, sampleRate };
+  const reports = tracks.map((t) => chainLatencyReport(t.fxChain ?? [], opts));
+
+  // Each bus's own chain, evaluated once however many tracks pass through it.
+  const busReports = new Map<string, ChainLatencyReport>();
+  for (const b of routing?.buses ?? []) busReports.set(b.id, chainLatencyReport(b.fxChain ?? [], opts));
+
+  /** Everything downstream of `id`, up to (not including) the master. */
+  const downstream = (id: string): ChainLatencyReport => {
+    if (!routing) return { totalSec: 0, perEntry: [] };
+    let totalSec = 0;
+    const perEntry: ChainLatencyReport['perEntry'] = [];
+    let cur = outputOf(routing.graph, id);
+    // Bounded by the node count: `topoOrder` refuses a cyclic graph elsewhere,
+    // but this must not spin on one that reached us from a project file.
+    for (let hops = 0; cur !== null && cur !== MASTER_ID && hops <= routing.graph.nodes.length; hops += 1) {
+      const r = busReports.get(cur);
+      if (r) { totalSec += r.totalSec; perEntry.push(...r.perEntry); }
+      cur = outputOf(routing.graph, cur);
+    }
+    return { totalSec, perEntry };
+  };
+
+  const paths = tracks.map((t, i) => {
+    const below = downstream(t.id);
+    return {
+      totalSec: reports[i].totalSec + below.totalSec,
+      // A hosted VST3 on a BUS is the same live/bounce gap as one on the track,
+      // and it belongs to every track that passes through that bus.
+      uncounted: [...reports[i].perEntry, ...below.perEntry].filter((e) => !e.counted).map((e) => e.id),
+    };
+  });
+
+  const delays = summingDelaysSec(paths.map((p) => p.totalSec));
+  return tracks.map((t, i) => ({
+    trackId: t.id,
+    latencySec: paths[i].totalSec,
+    compSec: delays[i],
+    uncounted: paths[i].uncounted,
+  }));
+}
+
+/** The context surface a compensation delay needs. `AudioContext` satisfies it;
+ *  so does a stand-in, which is what makes the wiring testable (the real context
+ *  comes from `playerStore.ensureEngine()` off `window.AudioContext`). */
+export interface CompNodeFactory {
+  createDelay(maxDelayTime: number): DelayNode;
+}
+
+/** The comp node surface `applyCompDelays` writes. A `DelayNode` satisfies it. */
+export interface CompDelayNode {
+  delayTime: { setTargetAtTime(value: number, startTime: number, timeConstant: number): unknown };
+}
+
+/**
+ * Splice one track's compensation delay in: `panner -> comp -> destination`.
+ * Returns it at delayTime 0, which is a transparent passthrough — a project
+ * where nothing declares latency sounds exactly as it did, one node heavier.
+ *
+ * `dest` is OPTIONAL since routing landed: where a track goes is an edge in the
+ * graph, so `buildTrackNodes` leaves the comp's output unconnected and
+ * `wireRoutingGraph` places it. Callers that already know the destination (the
+ * two-node case, and the test that pins this splice) keep passing it.
+ */
+export function insertCompNode(ctx: CompNodeFactory, panner: AudioNode, dest?: AudioNode): DelayNode {
+  const comp = ctx.createDelay(COMP_MAX_DELAY);
+  panner.connect(comp);
+  if (dest) comp.connect(dest);
+  return comp;
+}
+
+/**
+ * Write the computed delays onto the live nodes. `setTargetAtTime` only — a
+ * `setValueAtTime` jump on a `DelayNode` re-reads the delay line discontinuously
+ * and clicks — and rows whose track has no live node yet are skipped rather than
+ * throwing (a track added mid-playback has no nodes until the next `start()`).
+ */
+export function applyCompDelays(
+  rows: readonly TrackCompRow[],
+  nodeFor: (trackId: string) => CompDelayNode | undefined,
+  nowSec: number,
+): void {
+  for (const r of rows) {
+    const node = nodeFor(r.trackId);
+    if (!node) continue;
+    node.delayTime.setTargetAtTime(r.compSec, nowSec, COMP_TC);
   }
 }
 
-/** Build (or rebuild) per track: gain -> [insert FX] -> panner -> master bus.
- *  Panners feed the session master bus (built first), not the engine master. */
+/**
+ * Re-align every live track against the current insert chains. Called wherever a
+ * track chain is built, rebuilt or toggled — a bypassed entry contributes 0, so
+ * flipping bypass re-syncs on its own.
+ *
+ * Computed over the STORE's tracks in store order, not over the node map, so the
+ * numbers `trackLatencyReport` hands to the UI are the numbers the mixer is
+ * actually holding. A store track with no node yet is simply not written.
+ */
+function syncTrackLatency(): void {
+  if (trackNodes.size === 0) return;
+  const ctx = getEngineCtx();
+  const s = useEditorStore.getState();
+  const rows = trackCompDelays(s.tracks, undefined, ctx.sampleRate, { graph: s.routing, buses: s.buses });
+  // Skip the writes when the alignment has not moved, so a knob turn (which
+  // reaches here because a declaration MAY depend on params) does not put a
+  // `setTargetAtTime` on every track for numbers that are already there.
+  const sig = rows.map((r) => `${r.trackId}=${r.compSec}`).join('|');
+  if (sig === lastCompSig) return;
+  lastCompSig = sig;
+  applyCompDelays(rows, (id) => trackNodes.get(id)?.comp, ctx.currentTime);
+}
+
+/**
+ * What the compensation is doing right now, for the UI and for the render-trim /
+ * meter / automation-read offsets that build on it. Pure over the editor store
+ * and the rack registry: it reads the engine's sample rate only if a graph
+ * already exists, and never constructs one just to answer.
+ */
+export function trackLatencyReport(): { maxSec: number; perTrack: TrackCompRow[] } {
+  const s = useEditorStore.getState();
+  const perTrack = trackCompDelays(
+    s.tracks,
+    undefined,
+    getEngineOutputInfo()?.sampleRate,
+    { graph: s.routing, buses: s.buses },
+  );
+  let maxSec = 0;
+  for (const r of perTrack) if (r.latencySec > maxSec) maxSec = r.latencySec;
+  return { maxSec, perTrack };
+}
+
+/** Tear down every bus strip and send gain and empty both maps. Separate from
+ *  `disposeTrackNodes` because the store subscription rebuilds the bus half on
+ *  its own when the bus set changes and the tracks are untouched. */
+function disposeBusGraph(): void {
+  disposeBusNodes(busNodes.values(), sendGains.values());
+  busNodes = new Map();
+  sendGains = new Map();
+}
+
+/** Dispose every track's FX handle + nodes (oscillators in some effects must be
+ *  stopped explicitly), and the bus/send half of the graph with them. Leaves the
+ *  trackNodes map for the caller to replace. */
+function disposeTrackNodes(): void {
+  for (const n of trackNodes.values()) {
+    try { n.fx.dispose(); n.gain.disconnect(); n.muteGain.disconnect(); n.panner.disconnect(); n.comp.disconnect(); } catch { /* gone */ }
+  }
+  // Buses and sends only exist to carry tracks, and a send gain left behind
+  // would keep a second path into the master alive after its source is gone.
+  disposeBusGraph();
+}
+
+/** (Re)build every bus strip. Call BEFORE `wireRouting`, which places them. */
+function buildBusNodes(buses: MixBus[]): void {
+  const ctx = getEngineCtx();
+  disposeBusGraph();
+  busNodes = new Map();
+  for (const b of buses) busNodes.set(b.id, createBusNodes(ctx, b));
+}
+
+/**
+ * (Re)connect every track and bus according to the graph. Idempotent: the main
+ * outputs are disconnected first, and the previous send gains are disposed, so
+ * calling this after a routing edit rewires rather than doubling.
+ *
+ * Only the OUTPUT side is torn down — a strip's internal wiring
+ * (`gain -> muteGain -> [fx] -> panner -> comp`) and its FX instances survive a
+ * reroute, which is what keeps a reverb tail alive when the user moves a track
+ * from the master to a bus mid-playback.
+ */
+function wireRouting(graph: RoutingGraph): void {
+  const ctx = getEngineCtx();
+  const master: AudioNode = masterBus ?? getMasterGain();
+  for (const n of trackNodes.values()) { try { n.comp.disconnect(); } catch { /* gone */ } }
+  for (const n of busNodes.values()) { try { n.output.disconnect(); } catch { /* gone */ } }
+  for (const g of sendGains.values()) { try { g.disconnect(); } catch { /* gone */ } }
+  sendGains = wireRoutingGraph(graph, {
+    outputNodeOf: (id) => trackNodes.get(id)?.comp ?? busNodes.get(id)?.output,
+    inputNodeOf: (id) => (id === MASTER_ID ? master : busNodes.get(id)?.input),
+    makeSendGain: (gain) => {
+      const g = ctx.createGain();
+      g.gain.value = gain;
+      return g;
+    },
+    liveIds: () => [...trackNodes.keys(), ...busNodes.keys()],
+  });
+}
+
+/** Build (or rebuild) per track: gain -> [insert FX] -> panner -> comp. Where the
+ *  comp goes is an EDGE now, not a constant, so it is left unconnected for
+ *  `wireRouting` to place; the delays are aligned by `syncTrackLatency` once all
+ *  of them exist. */
 function buildTrackNodes(tracks: EditorTrack[]): void {
   const ctx = getEngineCtx();
-  const dest: AudioNode = masterBus ?? getMasterGain();
   disposeTrackNodes();
   trackNodes = new Map();
+  lastCompSig = ''; // fresh nodes open at 0; the alignment must be written, not skipped
   const anySolo = tracks.some((t) => t.solo);
   for (const t of tracks) {
     const gain = ctx.createGain();
@@ -314,16 +1029,18 @@ function buildTrackNodes(tracks: EditorTrack[]): void {
     const chain = t.fxChain ?? [];
     gain.connect(muteGain);
     const fx = buildEffectChain(ctx, muteGain, panner, chain); // gain -> muteGain -> [fx] -> panner
-    panner.connect(dest);
+    const comp = insertCompNode(ctx, panner); // panner -> comp; wireRouting places the rest
     trackNodes.set(t.id, {
       gain,
       muteGain,
       panner,
+      comp,
       fx,
       fxFullSig: JSON.stringify(chain),
       fxTopoSig: chainTopoSig(chain),
     });
   }
+  syncTrackLatency(); // align the freshly built chains before anything plays
 }
 
 /** A MIDI clip = a piano-roll clip carrying its editable notes. */
@@ -1222,7 +1939,14 @@ async function start(fromSec: number): Promise<void> {
   setLiveTransport({ play, pause, stop, seek });
 
   buildMasterBus();
+  // Order matters: buildTrackNodes tears the whole graph down (buses and sends
+  // included), so the buses are built after it, and the wiring pass last — it
+  // is the only thing that connects a track or a bus to anything downstream.
   buildTrackNodes(ed.tracks);
+  buildBusNodes(ed.buses);
+  wireRouting(ed.routing);
+  resetRoutingSigs();
+  syncTrackLatency(); // now that the paths through the buses are known
   startCtxTime = ctx.currentTime;
   startOffsetSec = begin;
   lastTimePush = 0;
@@ -1263,6 +1987,12 @@ async function start(fromSec: number): Promise<void> {
       }
       if (state.masterFxChain !== prev.masterFxChain) {
         applyMasterChainLive(); // live master rack edits (add/remove/reorder/param)
+      }
+      // Routing and the bus strips: rebuild/rewire on a structural move, push
+      // values otherwise. Gated on the slice references for the same reason the
+      // others are — the 60 Hz playhead tick leaves both untouched.
+      if (state.routing !== prev.routing || state.buses !== prev.buses) {
+        applyRoutingLive();
       }
       // Arming (or disarming) a record mode MID-PLAYBACK. The hold clock's gate is
       // evaluated once per `start()`, so without this a user who presses play and
@@ -1389,6 +2119,13 @@ export function dispose(): void {
   if (masterBus) { try { masterBus.disconnect(); } catch { /* gone */ } masterBus = null; }
   lastMasterSig = '';
   lastMasterFullSig = '';
+  // Cleared, not re-seeded: the next start() builds a fresh graph and calls
+  // resetRoutingSigs itself, and a stale signature here would let the first
+  // subscription tick of that session skip a rewire it needs.
+  lastBusMembershipSig = '';
+  lastRoutingSig = '';
+  lastBusMixSig = '';
+  lastSendGainSig = '';
   setLiveTransport(null);
   // Mirror stop()/pause() and leave the shared player store consistent. Without
   // this, a dispose() while rolling left `isPlaying` stuck true: the footer kept

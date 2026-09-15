@@ -13,6 +13,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
+    "lint:scripts": "tsc --noEmit -p scripts/tsconfig.json",
     "screenshots": "tsx ../scripts/screenshots/capture.ts",
     "docs:coverage": "tsx ../scripts/screenshots/featureCoverage.ts",
     "test": "node scripts/run-tests.mjs",

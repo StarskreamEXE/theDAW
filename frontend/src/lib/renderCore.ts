@@ -41,7 +41,7 @@
  */
 import type { ChainEntry } from '../state/effectChainStore';
 import { sampleLane, type AudioClip, type AutomationLane, type EditorTrack } from '../state/editorStore';
-import { scheduleClipSources } from '../state/liveMixer';
+import { applyEnvelopeEvents, laneEnvelopeEvents, scheduleClipSources } from '../state/liveMixer';
 import { sliceChunks as defaultSliceChunks, type AudioChunk } from './audioAnalysis';
 import {
   SPATIAL_TELEPORT, buildEffectChain, ensureChopModule, teleportXYZ, type ChainHandle,
@@ -157,19 +157,27 @@ export function renderExtentSec(clips: AudioClip[], scope: BounceScope): number 
 
 /* ── Render ───────────────────────────────────────────────────────────────── */
 
-/** Write a lane onto a native AudioParam. The offline context renders from
- *  t = 0, so a breakpoint's timeline time IS its param time. The first value is
- *  held until its own breakpoint, then every later one is a linear ramp; the
- *  `1e-4` nudge keeps two breakpoints at the same instant in order. */
+/**
+ * Write a lane onto a native AudioParam — the SAME event list live playback
+ * puts on that param (`liveMixer.laneEnvelopeEvents`), with the offline
+ * pinning: the render starts at t = 0 and the context clock IS the timeline, so
+ * `fromSec` / `startCtxTime` / `startOffset` / `now` are all 0.
+ *
+ * This used to be a hand-written loop here — a `setValueAtTime` for the first
+ * value, a hold to its breakpoint, then one `linearRampToValueAtTime` per later
+ * point. For a lane with no curves that loop and the envelope agree (a hold is
+ * emitted as a flat ramp instead of a second `set`, which is the same audio),
+ * but a CURVED breakpoint flattened to a straight line, and every mixdown and
+ * VST freeze exported automation the user could not hear in preview. The
+ * component's `commitEdit` had already been moved onto the envelope builder;
+ * this had not, so adopting the core would have put the bug back. One rule, one
+ * implementation: the clamp reaches inside a curve too, which is why it is
+ * passed down rather than applied to the points up front.
+ */
 const scheduleParamLane = (
   param: AudioParam, lane: AutomationLane, clampFn: (v: number) => number,
 ): void => {
-  const pts = lane.points;
-  param.setValueAtTime(clampFn(pts[0].v), 0);
-  if (pts[0].t > 0) param.setValueAtTime(clampFn(pts[0].v), pts[0].t);
-  for (let i = 1; i < pts.length; i += 1) {
-    param.linearRampToValueAtTime(clampFn(pts[i].v), Math.max(pts[i].t, pts[i - 1].t + 1e-4));
-  }
+  applyEnvelopeEvents(param, laneEnvelopeEvents(lane, 0, 0, 0, 0), clampFn);
 };
 
 interface TrackNodes {

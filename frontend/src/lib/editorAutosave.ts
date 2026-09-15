@@ -26,8 +26,10 @@ import {
   useEditorStore,
   computePeaks,
   type AudioClip,
+  type EditorBus,
   type EditorTrack,
 } from '../state/editorStore';
+import type { RoutingGraph } from '../state/routingGraph';
 import { logError, logInfo, logWarn } from '../state/logStore';
 
 const DIR_NAME = 'thedaw-editor-autosave';
@@ -57,6 +59,14 @@ interface AutosaveManifest {
   automationLanes: unknown[];
   markers: unknown[];
   loop: { enabled: boolean; startSec: number; endSec: number };
+  /** Signal routing + the bus strips. OPTIONAL on read, always written: every
+   *  manifest saved before routing existed lacks both keys, and
+   *  `loadProject`'s migration is what turns that absence back into the
+   *  everything-to-the-master graph. Plain JSON by construction (`RoutingGraph`
+   *  holds no Map and no node handles), so it needs no serialized twin the way
+   *  clips do. */
+  routing?: RoutingGraph;
+  buses?: EditorBus[];
 }
 
 // ── Recovery offer store (drives the Shell notice) ───────────────────────────
@@ -200,6 +210,8 @@ async function buildManifest(assets: FileSystemDirectoryHandle): Promise<Autosav
     automationLanes: s.automationLanes as unknown[],
     markers: s.markers as unknown[],
     loop: { enabled: s.loopEnabled, startSec: s.loopStart, endSec: s.loopEnd },
+    routing: s.routing,
+    buses: s.buses,
   };
 }
 
@@ -353,7 +365,16 @@ async function restoreFromAutosave(): Promise<void> {
   );
 
   const store = useEditorStore.getState();
-  store.loadProject({ tracks, clips, bpm: manifest.bpm });
+  // routing/buses go through loadProject rather than the setState below, so the
+  // ONE migration path handles them: a manifest written before routing existed
+  // passes `undefined` here and is migrated exactly like an old `.tasmo`.
+  store.loadProject({
+    tracks,
+    clips,
+    bpm: manifest.bpm,
+    routing: manifest.routing,
+    buses: manifest.buses,
+  });
   // loadProject clears the per-project extras; put the autosaved ones back.
   // dirty stays TRUE: a restored autosave is by definition unsaved work.
   useEditorStore.setState({
@@ -427,7 +448,9 @@ export function initEditorAutosave(): void {
       state.bpm === prev.bpm &&
       state.loopEnabled === prev.loopEnabled &&
       state.loopStart === prev.loopStart &&
-      state.loopEnd === prev.loopEnd
+      state.loopEnd === prev.loopEnd &&
+      state.routing === prev.routing &&
+      state.buses === prev.buses
     ) {
       return;
     }

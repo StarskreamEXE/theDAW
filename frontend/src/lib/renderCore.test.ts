@@ -33,17 +33,30 @@ type ParamCall = [string, number, number];
 interface FakeParam {
   value: number;
   calls: ParamCall[];
+  /** `setValueCurveAtTime` carries a whole Float32Array, which does not fit the
+   *  `[name, v, t]` tuple, so its values land here — while `calls` still gets a
+   *  `['setValueCurveAtTime', start, duration]` entry, so a lane that mixes
+   *  curved and straight segments is still ONE ordered list. */
+  curves: { values: number[]; start: number; duration: number }[];
   setValueAtTime(v: number, t: number): FakeParam;
   linearRampToValueAtTime(v: number, t: number): FakeParam;
+  setValueCurveAtTime(values: Float32Array, start: number, duration: number): FakeParam;
 }
 
 const fakeParam = (): FakeParam => {
   const calls: ParamCall[] = [];
+  const curves: FakeParam['curves'] = [];
   const p: FakeParam = {
     value: 1,
     calls,
+    curves,
     setValueAtTime(v, t) { calls.push(['setValueAtTime', v, t]); return p; },
     linearRampToValueAtTime(v, t) { calls.push(['linearRampToValueAtTime', v, t]); return p; },
+    setValueCurveAtTime(values, start, duration) {
+      calls.push(['setValueCurveAtTime', start, duration]);
+      curves.push({ values: [...values], start, duration });
+      return p;
+    },
   };
   return p;
 };
@@ -484,13 +497,21 @@ async function noFxNeverBuildsAChain(): Promise<void> {
 
 /* ── 4b. The fade envelope, and where the track volume is NOT ─────────────── */
 
-/** An AudioParam that only records, as `liveMixer.schedule.test.ts` uses. */
+/** An AudioParam that only records, as `liveMixer.schedule.test.ts` uses. Its
+ *  method set MUST match `fakeParam`'s: `applyEnvelopeEvents` and
+ *  `applyFadeAutomation` both branch on whether `setValueCurveAtTime` exists,
+ *  so a recorder missing it would record a different (degraded) call list than
+ *  the graph under test and the comparison would pass for the wrong reason. */
 const recorder = (): AudioParamLike & { calls: ParamCall[] } => {
   const calls: ParamCall[] = [];
   return {
     calls,
     setValueAtTime(v: number, t: number) { calls.push(['setValueAtTime', v, t]); return this; },
     linearRampToValueAtTime(v: number, t: number) { calls.push(['linearRampToValueAtTime', v, t]); return this; },
+    setValueCurveAtTime(_values: Float32Array, start: number, duration: number) {
+      calls.push(['setValueCurveAtTime', start, duration]);
+      return this;
+    },
   };
 };
 
@@ -526,9 +547,19 @@ async function fadeEnvelopeAndClipGain(): Promise<void> {
       clipGain.gain.calls, expected.calls,
       `${scope.kind}: the envelope is exactly lib/clipFade's, peaking at the CLIP gain`,
     );
+    // Only the `set` / `ramp` tuples carry a VALUE in slot 1; a
+    // `setValueCurveAtTime` tuple carries its START TIME there, and reading
+    // that as a value would compare the wrong number. Its samples live in
+    // `curves` and are checked on their own.
     assert.ok(
-      clipGain.gain.calls.every(([, v]) => v === 0 || v === 0.25),
+      clipGain.gain.calls
+        .filter(([name]) => name !== 'setValueCurveAtTime')
+        .every(([, v]) => v === 0 || v === 0.25),
       `${scope.kind}: 0.4 * 0.25 never appears — the volume is not folded into the peak`,
+    );
+    assert.ok(
+      clipGain.gain.curves.every((c) => c.values.every((v) => v >= 0 && v <= 0.25)),
+      `${scope.kind}: nor inside a curved fade's samples`,
     );
   }
 }
@@ -639,9 +670,17 @@ async function automationReachesTheGraph(): Promise<void> {
   assert.equal(tGain.gain.value, 1, 'and the static value is left alone');
   assert.deepEqual(
     tPan.pan.calls,
-    [['setValueAtTime', -1, 0], ['setValueAtTime', -1, 0.5], ['linearRampToValueAtTime', 1, 1.5]],
+    [
+      ['setValueAtTime', -1, 0],
+      ['linearRampToValueAtTime', -1, 0.5],
+      ['linearRampToValueAtTime', 1, 1.5],
+    ],
+    // The hold is a FLAT RAMP rather than a second `setValueAtTime` — that is
+    // what `laneEnvelopeEvents` emits, and -1 ramped to -1 is the same audio as
+    // -1 held. Every other literal is the hand-written loop's, unchanged.
     'a pan lane holds its first value to its first breakpoint, clamped to +/-1',
   );
+  assert.deepEqual(tPan.pan.curves, [], 'a lane with no curves schedules no value curve');
 
   // The FX lane cannot ride an AudioParam (rack params are plain numbers), so
   // the render is suspended on each breakpoint's quantum and the params pushed.
@@ -658,6 +697,70 @@ async function automationReachesTheGraph(): Promise<void> {
       { entryId: 'e1', params: { mix: 1, rate: 4 } },
     ],
     'the lane value is merged over the entry\'s own params at t = 0 and at the step',
+  );
+}
+
+async function aCurvedLaneBouncesAsACurve(): Promise<void> {
+  // The regression this pins: the hand-written loop that used to live in
+  // `scheduleParamLane` emitted one linear ramp per breakpoint, so a CURVED
+  // segment exported as a straight line — the bounce did not sound like the
+  // preview. Measured at 0.163 peak / 1.3e-2 RMS on a real render before the
+  // fix. The lane now goes through `liveMixer.laneEnvelopeEvents`, which
+  // rasterises a curved segment into `setValueCurveAtTime`.
+  const lanes: AutomationLane[] = [
+    {
+      id: 'l-vol', enabled: true, target: { kind: 'trackVolume', trackId: 't1' },
+      points: [{ t: 0, v: 0.2, curve: 0.7 }, { t: 1, v: 0.9 }],
+    },
+    {
+      // Curved AND out of range, so the clamp is proven to reach INSIDE the
+      // rasterised values rather than only the `set` / `ramp` endpoints.
+      id: 'l-pan', enabled: true, target: { kind: 'trackPan', trackId: 't1' },
+      points: [{ t: 0, v: -3, curve: -0.6 }, { t: 2, v: 3 }],
+    },
+  ];
+  const h = harness({
+    tracks: [track({ id: 't1', volume: 0.5, pan: 0.5 })],
+    clips: [clip({ id: 'c1', trackId: 't1', durationSec: 2 })],
+    automationLanes: lanes,
+  });
+
+  await renderBounce(request({ kind: 'master' }, { includeFx: false }), h.deps);
+  const [, tGain, tPan] = h.ctxes[0].created;
+
+  assert.deepEqual(
+    tGain.gain.calls,
+    [['setValueAtTime', 0.2, 0], ['setValueCurveAtTime', 0, 1]],
+    'a curved volume segment is one value curve over the segment, not a ramp',
+  );
+  assert.equal(tGain.gain.curves.length, 1);
+  const vol = tGain.gain.curves[0];
+  // The values ride a Float32Array, so the endpoints are compared to float32
+  // precision rather than exactly — 0.9 stored as a float32 reads back as
+  // 0.89999997.
+  const near = (a: number, b: number) => Math.abs(a - b) < 1e-6;
+  assert.ok(vol.values.length >= 2, 'a value curve needs at least two samples');
+  assert.ok(near(vol.values[0], 0.2), 'the curve starts at the left breakpoint');
+  assert.ok(near(vol.values[vol.values.length - 1], 0.9), 'and ends exactly on the right one');
+  assert.ok(
+    vol.values.some((v, i) => {
+      const u = i / (vol.values.length - 1);
+      return Math.abs(v - (0.2 + 0.7 * u)) > 1e-3;
+    }),
+    'and it is not the straight line the old loop drew',
+  );
+
+  assert.deepEqual(
+    tPan.pan.calls,
+    [['setValueAtTime', -1, 0], ['setValueCurveAtTime', 0, 2]],
+    'a curved pan segment likewise',
+  );
+  const pan = tPan.pan.curves[0];
+  assert.ok(near(pan.values[0], -1), 'clamped at the start');
+  assert.ok(near(pan.values[pan.values.length - 1], 1), 'clamped at the end');
+  assert.ok(
+    pan.values.every((v) => v >= -1 && v <= 1),
+    'and every sample BETWEEN them is clamped too — the clamp reaches inside the curve',
   );
 }
 
@@ -862,6 +965,7 @@ async function main(): Promise<void> {
   await aWarpedClipGetsOneSourcePerSegment();
   await trackScope();
   await automationReachesTheGraph();
+  await aCurvedLaneBouncesAsACurve();
   await masterFxAutomationAndTheEndClamp();
   await automationOffSchedulesNothing();
   await teleportBakes();

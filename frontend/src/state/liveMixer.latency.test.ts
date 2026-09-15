@@ -1,0 +1,433 @@
+// Live plugin-delay compensation in the EDIT mixer (T09b).
+//
+// T09a gave every rack effect a declared `latencySec` and three pure helpers in
+// lib/rackEffects — `chainLatencyReport`, `chainLatencySec`, `summingDelaysSec`
+// — with no production callers. This file pins the two callers they now have.
+//
+// THE RULE (Tracktion `SummingNode`, design only — GPL; nothing copied): every
+// input of a sum is delayed by `max(latencies) - own`, so the slowest input sets
+// the meeting point and is never delayed. Before this, a track carrying a
+// compressor (6 ms of spec-mandated look-ahead) played 6 ms behind a track
+// without one, and the two DJ decks hand-rolled the same arithmetic for N = 2.
+//
+// What is pinned here:
+//
+//   1. `trackCompDelays` — the pure track-list -> per-track delay computation.
+//      A project that declares nothing gets all zeros (so the new DelayNode is
+//      transparent); a bypassed effect contributes nothing because it is routed
+//      AROUND live; an inert `vst3` entry contributes nothing live but IS
+//      reported, because it will print at freeze/bounce; a frozen track's live
+//      chain is empty, so it is simply a zero-latency input.
+//   2. `insertCompNode` — the wiring seam: exactly ONE node per track, spliced
+//      panner -> comp, opening at delayTime 0. Since T10b the DESTINATION is an
+//      edge in `state/routingGraph` and `wireRoutingGraph` connects it, so the
+//      production call passes no `dest` and this test exercises that shape.
+//   3. `applyCompDelays` — the writer: `setTargetAtTime` only (never a
+//      `setValueAtTime` jump), at the DJ engine's 0.01 s time constant.
+//   4. The DJ equality pin: the two-deck arithmetic `djEngine.updateLatencyComp`
+//      used before this ticket, transcribed verbatim below, must agree with
+//      `summingDelaysSec` on every combination it can see.
+//
+// Run: npx tsx src/state/liveMixer.latency.test.ts
+import assert from 'node:assert/strict';
+
+import {
+  applyCompDelays,
+  insertCompNode,
+  trackCompDelays,
+  trackLatencyReport,
+  type CompDelayNode,
+  type TrackCompRow,
+} from './liveMixer.ts';
+import { getRackEffect, summingDelaysSec, type RackEffectDef } from '../lib/rackEffects.ts';
+import { useEditorStore, type EditorTrack } from './editorStore.ts';
+import type { ChainEntry } from './effectChainStore.ts';
+
+/** The compressor's declared look-ahead, straight from the Web Audio spec via
+ *  the real registry — the number this whole feature exists to cancel. */
+const COMPRESSOR_SEC = 0.006;
+
+const close = (a: number, b: number, eps = 1e-9) => Math.abs(a - b) <= eps;
+
+const entry = (
+  id: string,
+  effect: string,
+  enabled = true,
+  params: Record<string, number> = {},
+): ChainEntry => ({ id, effect, params, enabled });
+
+const track = (id: string, fxChain?: ChainEntry[]) => ({ id, fxChain });
+
+const comps = (rows: TrackCompRow[]) => rows.map((r) => r.compSec);
+const latencies = (rows: TrackCompRow[]) => rows.map((r) => r.latencySec);
+
+/* ── a fake registry, for latencies the real rack does not declare ─────────── */
+
+const fakeDef = (id: string, latencySec: RackEffectDef['latencySec']): RackEffectDef => ({
+  id,
+  label: id,
+  group: 'Test',
+  description: id,
+  params: [],
+  latencySec,
+  make: () => { throw new Error('compensation must never build a graph'); },
+});
+
+const FAKE = new Map<string, RackEffectDef>([
+  ['slow', fakeDef('slow', 0.02)],
+  ['quick', fakeDef('quick', 0.005)],
+  // `RackLatencySpec` may be a FUNCTION of the entry's params. No shipping effect
+  // declares one yet, so without this the reason `applyTrackChainsLive` re-aligns
+  // on a param-only edit (and not just on a topology move) is never exercised.
+  ['lookahead', fakeDef('lookahead', (p) => p.lookahead)],
+]);
+const resolveFake = (id: string) => FAKE.get(id);
+
+/* ── 1. Nothing declared: the node must be transparent ────────────────────── */
+
+function noDeclarationsIsAllZero(): void {
+  // These two are REAL, resolvable rack effects that simply declare no latency —
+  // a delay line feeding a wet path alongside an undelayed dry path is not
+  // latency. The zeros below therefore mean "declares nothing", not "unknown id".
+  for (const id of ['reverb', 'delay']) {
+    assert.ok(getRackEffect(id), `${id} is a real rack effect`);
+    assert.equal(getRackEffect(id)!.latencySec, undefined, `${id} declares no latency`);
+  }
+  const rows = trackCompDelays([
+    track('t1', [entry('e1', 'reverb'), entry('e2', 'delay')]),
+    track('t2', []),
+    track('t3'),
+  ]);
+  assert.deepEqual(latencies(rows), [0, 0, 0], 'the rack declares latency only where it really lags');
+  assert.deepEqual(comps(rows), [0, 0, 0], 'so nothing waits for anything — the delay stays at 0');
+  assert.deepEqual(rows.map((r) => r.trackId), ['t1', 't2', 't3'], 'rows follow the track order given');
+  assert.deepEqual(rows.map((r) => r.uncounted), [[], [], []], 'and nothing was skipped to get there');
+}
+
+function anEmptyProjectIsEmpty(): void {
+  assert.deepEqual(trackCompDelays([]), [], 'no tracks, no rows');
+  const report = trackCompDelays([track('only')]);
+  assert.deepEqual(comps(report), [0], 'a lone track is its own meeting point');
+}
+
+/* ── 2. One compressor moves everyone else ───────────────────────────────── */
+
+function oneCompressorDelaysEveryOtherTrack(): void {
+  assert.equal(
+    getRackEffect('compressor')!.latencySec, COMPRESSOR_SEC,
+    'the constant below is the registry’s own number, not a copy that can drift',
+  );
+  assert.equal(getRackEffect('vst3'), undefined, 'a hosted plugin is not a rack effect, so it is inert live');
+  const rows = trackCompDelays([
+    track('drums', [entry('e1', 'compressor')]),
+    track('bass', []),
+    track('keys', [entry('e2', 'reverb')]),
+  ]);
+  assert.ok(close(rows[0].latencySec, COMPRESSOR_SEC), `the compressor declares 6 ms, got ${rows[0].latencySec}`);
+  assert.ok(close(rows[0].compSec, 0), 'the slowest track is the meeting point and never waits');
+  assert.ok(close(rows[1].compSec, COMPRESSOR_SEC), `bass waits 6 ms, got ${rows[1].compSec}`);
+  assert.ok(close(rows[2].compSec, COMPRESSOR_SEC), `keys waits 6 ms, got ${rows[2].compSec}`);
+}
+
+/** Two compressors in series on one track is 12 ms of look-ahead, not 6. */
+function seriesEffectsAccumulate(): void {
+  const rows = trackCompDelays([
+    track('bus', [entry('e1', 'compressor'), entry('e2', 'compressor')]),
+    track('dry', []),
+  ]);
+  assert.ok(close(rows[0].latencySec, 2 * COMPRESSOR_SEC), `series accumulates, got ${rows[0].latencySec}`);
+  assert.ok(close(rows[1].compSec, 2 * COMPRESSOR_SEC), `the dry track waits for both, got ${rows[1].compSec}`);
+}
+
+/* ── 3. Bypass is out of the path, so it delays nothing ──────────────────── */
+
+function aBypassedCompressorCountsZero(): void {
+  const rows = trackCompDelays([
+    track('drums', [entry('e1', 'compressor', false)]),
+    track('bass', []),
+  ]);
+  assert.deepEqual(latencies(rows), [0, 0], 'a bypassed effect is routed around, so it lags nothing');
+  assert.deepEqual(comps(rows), [0, 0], 'toggling bypass back off returns the mixer to zero delay');
+  // `uncounted` is every `counted: false` entry, which is BOTH reasons an entry
+  // can be excluded — a bypassed one belongs there alongside an inert VST3, and a
+  // consumer that only wants the live/bounce gap must filter on `enabled`.
+  assert.deepEqual(rows[0].uncounted, ['e1'], 'the bypassed entry is reported as uncounted, not hidden');
+}
+
+/** A bypass toggle re-aligns the mixer, driven through the two exported seams.
+ *
+ *  `syncTrackLatency` itself is module-private AND cannot run headless — it calls
+ *  `playerStore.getEngineCtx()`, which constructs a real `AudioContext` off
+ *  `window`. So the toggle is driven through the pieces it is assembled from:
+ *  the pure computation, then the writer onto stand-in nodes. What the live
+ *  function adds on top (reading the store, and the call from
+ *  `applyTrackChainsLive` when a chain signature moves) is straight-line wiring
+ *  over exactly these two calls. */
+function flippingBypassReAlignsTheMixer(): void {
+  const chainOf = (enabled: boolean) => [
+    track('drums', [entry('e1', 'compressor', enabled)]),
+    track('bass', []),
+  ];
+  const nodes = new Map([['drums', fakeNode('delay', 1)], ['bass', fakeNode('delay', 1)]]);
+  const lookup = (id: string) => nodes.get(id) as unknown as CompDelayNode | undefined;
+
+  // Bypassed: nothing lags, so nothing waits.
+  applyCompDelays(trackCompDelays(chainOf(false)), lookup, 1);
+  assert.equal(nodes.get('bass')!.delayTime.value, 0, 'while bypassed the dry track waits for nothing');
+
+  // Un-bypassed: the compressor is back in the path and bass must wait for it.
+  applyCompDelays(trackCompDelays(chainOf(true)), lookup, 2);
+  assert.ok(close(nodes.get('bass')!.delayTime.value, COMPRESSOR_SEC), 'enabling it makes the dry track wait 6 ms');
+  assert.equal(nodes.get('drums')!.delayTime.value, 0, 'and the compressed track never waits');
+
+  // And back again — the toggle is symmetric, not a one-way latch.
+  applyCompDelays(trackCompDelays(chainOf(false)), lookup, 3);
+  assert.equal(nodes.get('bass')!.delayTime.value, 0, 'bypassing again releases it');
+  assert.deepEqual(
+    nodes.get('bass')!.delayTime.calls.map((c) => c[1]), [1, 2, 3],
+    'each toggle wrote once, at the context time it was handed',
+  );
+}
+
+/* ── 3b. A declaration that depends on the entry's params ────────────────── */
+
+function aParamEditCanMoveTheAlignment(): void {
+  const rows = (lookahead: number) => trackCompDelays(
+    [track('fx', [entry('e1', 'lookahead', true, { lookahead })]), track('dry', [])],
+    resolveFake,
+  );
+
+  assert.deepEqual(comps(rows(0)), [0, 0], 'a zero look-ahead lags nothing');
+  const wide = rows(0.03);
+  assert.ok(close(wide[0].latencySec, 0.03), `the declaration reads the entry's params, got ${wide[0].latencySec}`);
+  assert.ok(close(wide[1].compSec, 0.03), 'so the dry track waits for the value the knob is at');
+  const narrow = rows(0.01);
+  assert.ok(close(narrow[1].compSec, 0.01), 'and follows the knob down again');
+}
+
+/* ── 4. Different declarations meet at the slowest ───────────────────────── */
+
+function differentLatenciesMeetAtTheSlowest(): void {
+  const rows = trackCompDelays(
+    [track('slowTrack', [entry('e1', 'slow')]), track('quickTrack', [entry('e2', 'quick')])],
+    resolveFake,
+  );
+  assert.deepEqual(latencies(rows), [0.02, 0.005]);
+  assert.ok(close(rows[0].compSec, 0), 'the slower input sets the meeting point');
+  assert.ok(close(rows[1].compSec, 0.015), `the faster input waits the difference, got ${rows[1].compSec}`);
+}
+
+/* ── 5. A frozen track's live chain is empty ─────────────────────────────── */
+
+function aFrozenTrackIsAZeroLatencyInput(): void {
+  // Freezing prints the clips + chain to a stem and EMPTIES `fxChain`, stashing
+  // the originals in `frozenOriginal` for unfreeze. The compensation reads the
+  // live chain only, so the stashed compressor must not resurrect as latency.
+  const frozen = {
+    id: 'frozen',
+    fxChain: [] as ChainEntry[],
+    frozenOriginal: { clips: [], fxChain: [entry('e1', 'compressor')] },
+  };
+  const rows = trackCompDelays([frozen, track('live', [entry('e2', 'compressor')])]);
+  assert.equal(rows[0].latencySec, 0, 'a printed stem lags by nothing live');
+  assert.ok(close(rows[0].compSec, COMPRESSOR_SEC), 'so it waits for the track that still has the compressor');
+  assert.ok(close(rows[1].compSec, 0));
+}
+
+/* ── 6. What the number does NOT cover is reported, not dropped ──────────── */
+
+function inertEntriesAreReportedUncounted(): void {
+  const rows = trackCompDelays([
+    track('hosted', [entry('e1', 'vst3'), entry('e2', 'compressor')]),
+    track('clean', [entry('e3', 'reverb')]),
+  ]);
+  assert.deepEqual(rows[0].uncounted, ['e1'], 'a hosted VST3 is inert live but listed, because it prints at bounce');
+  assert.ok(close(rows[0].latencySec, COMPRESSOR_SEC), 'and contributes nothing to the live figure');
+  assert.deepEqual(rows[1].uncounted, [], 'a resolvable enabled effect is counted');
+}
+
+/* ── 7. The read-out over the store ──────────────────────────────────────── */
+
+function theReportMirrorsTheStore(): void {
+  const before = useEditorStore.getState().tracks;
+  const mk = (id: string, fxChain: ChainEntry[]): EditorTrack => ({
+    id, name: id, nameAutoGenerated: false, volume: 1, pan: 0,
+    mute: false, solo: false, color: '#fff', fxChain,
+  });
+  try {
+    useEditorStore.setState({
+      tracks: [mk('a', [entry('e1', 'compressor')]), mk('b', []), mk('c', [entry('e2', 'vst3')])],
+    });
+    const report = trackLatencyReport();
+    assert.ok(close(report.maxSec, COMPRESSOR_SEC), `maxSec is the slowest chain, got ${report.maxSec}`);
+    assert.deepEqual(report.perTrack.map((r) => r.trackId), ['a', 'b', 'c']);
+    assert.ok(close(report.perTrack[0].compSec, 0));
+    assert.ok(close(report.perTrack[1].compSec, COMPRESSOR_SEC));
+    assert.deepEqual(report.perTrack[2].uncounted, ['e2'], 'the report carries what it could not count');
+
+    useEditorStore.setState({ tracks: [] });
+    assert.deepEqual(trackLatencyReport(), { maxSec: 0, perTrack: [] }, 'an empty project reports nothing');
+  } finally {
+    useEditorStore.setState({ tracks: before });
+  }
+}
+
+/* ── 8. The wiring: exactly one node per track, opening transparent ──────── */
+
+interface FakeNode {
+  kind: string;
+  maxDelayTime: number;
+  delayTime: { value: number; calls: [number, number, number][]; setTargetAtTime(v: number, t: number, tc: number): void };
+  outputs: FakeNode[];
+  connect(to: FakeNode): FakeNode;
+  disconnect(): void;
+}
+
+const fakeNode = (kind: string, maxDelayTime = 0): FakeNode => {
+  const calls: [number, number, number][] = [];
+  const node: FakeNode = {
+    kind,
+    maxDelayTime,
+    delayTime: {
+      value: 0,
+      calls,
+      setTargetAtTime(v: number, t: number, tc: number) { calls.push([v, t, tc]); node.delayTime.value = v; },
+    },
+    outputs: [],
+    connect(to: FakeNode) { node.outputs.push(to); return to; },
+    disconnect() { node.outputs.length = 0; },
+  };
+  return node;
+};
+
+const fakeCtx = () => {
+  const created: FakeNode[] = [];
+  return {
+    created,
+    createDelay(maxDelayTime: number) { const n = fakeNode('delay', maxDelayTime); created.push(n); return n; },
+  };
+};
+
+type CompCtxArg = Parameters<typeof insertCompNode>[0];
+type CompNodeArg = Parameters<typeof insertCompNode>[1];
+
+function theCompNodeIsSplicedBetweenPannerAndDestination(): void {
+  const ctx = fakeCtx();
+  const panner = fakeNode('panner');
+  const dest = fakeNode('destination');
+
+  // The PRODUCTION shape: `buildTrackNodes` passes no destination, because
+  // where a track goes is an edge in the routing graph and `wireRoutingGraph`
+  // is what connects it. Asserting the two-argument call keeps this test and
+  // the only real caller from drifting apart.
+  const comp = insertCompNode(ctx as unknown as CompCtxArg, panner as unknown as CompNodeArg);
+
+  assert.equal(ctx.created.length, 1, 'exactly one node is added per track');
+  assert.equal(comp as unknown, ctx.created[0], 'and it is the one handed back');
+  assert.equal(ctx.created[0].maxDelayTime, 1, 'a 1 s ceiling, well past any plausible plugin latency');
+  assert.equal(ctx.created[0].delayTime.value, 0, 'it opens at 0 — transparent until something declares latency');
+  assert.deepEqual(panner.outputs, [ctx.created[0]], 'the panner feeds the comp delay');
+  assert.deepEqual(ctx.created[0].outputs, [], 'and its output is left for the routing pass to place');
+
+  // Which the routing pass then does, exactly as `wireRoutingGraph` would.
+  (comp as unknown as FakeNode).connect(dest);
+  assert.deepEqual((comp as unknown as FakeNode).outputs, [dest], 'the comp delay feeds the sum once routed');
+  assert.deepEqual(dest.outputs, [], 'the destination is left alone');
+
+  // The explicit-destination form still splices in one step, for a caller that
+  // already knows where the signal goes.
+  const ctx2 = fakeCtx();
+  const p2 = fakeNode('panner');
+  const d2 = fakeNode('destination');
+  const c2 = insertCompNode(ctx2 as unknown as CompCtxArg, p2 as unknown as CompNodeArg, d2 as unknown as CompNodeArg);
+  assert.deepEqual((c2 as unknown as FakeNode).outputs, [d2], 'dest given: connected on the spot');
+}
+
+/* ── 9. The writer: setTargetAtTime only, at the DJ time constant ────────── */
+
+function delaysAreRampedNeverJumped(): void {
+  const nodes = new Map<string, FakeNode>([
+    ['a', fakeNode('delay', 1)],
+    ['b', fakeNode('delay', 1)],
+  ]);
+  const rows: TrackCompRow[] = [
+    { trackId: 'a', latencySec: COMPRESSOR_SEC, compSec: 0, uncounted: [] },
+    { trackId: 'b', latencySec: 0, compSec: COMPRESSOR_SEC, uncounted: [] },
+    { trackId: 'gone', latencySec: 0, compSec: COMPRESSOR_SEC, uncounted: [] },
+  ];
+
+  applyCompDelays(rows, (id) => nodes.get(id) as unknown as CompDelayNode | undefined, 12.5);
+
+  assert.deepEqual(nodes.get('a')!.delayTime.calls, [[0, 12.5, 0.01]], 'the slowest track is held at 0');
+  assert.deepEqual(
+    nodes.get('b')!.delayTime.calls, [[COMPRESSOR_SEC, 12.5, 0.01]],
+    'the faster one ramps to 6 ms at the DJ engine’s 0.01 s time constant',
+  );
+  // A track in the store with no live node yet (added mid-playback; its clips
+  // land on the next play) must be skipped, not throw.
+  assert.equal(nodes.size, 2, 'a row without a node writes nothing');
+}
+
+/* ── 10. End to end: a latency-free project stays transparent ────────────── */
+
+function aProjectThatDeclaresNothingStaysAtZero(): void {
+  const ctx = fakeCtx();
+  const tracks = [
+    track('t1', [entry('e1', 'reverb'), entry('e2', 'delay')]),
+    track('t2', [entry('e3', 'compressor', false)]),
+    track('t3'),
+  ];
+  const nodes = new Map(tracks.map((t) => [
+    t.id,
+    insertCompNode(ctx as unknown as CompCtxArg, fakeNode('panner') as unknown as CompNodeArg),
+  ]));
+
+  assert.equal(ctx.created.length, tracks.length, 'the node count rises by exactly one per track');
+
+  applyCompDelays(
+    trackCompDelays(tracks),
+    (id) => nodes.get(id) as unknown as CompDelayNode | undefined,
+    0,
+  );
+
+  for (const n of ctx.created) {
+    assert.deepEqual(n.delayTime.calls, [[0, 0, 0.01]], 'every track is written 0, never left unwritten');
+    assert.equal(n.delayTime.value, 0, 'so the delay line is a passthrough and the mix is unchanged');
+  }
+}
+
+/* ── 11. The DJ pin: the hand-rolled N=2 form, transcribed verbatim ──────── */
+
+/** `djEngine.updateLatencyComp`'s arithmetic at baseline cce9375, verbatim. */
+function legacyTwoDeckComp(la: number, lb: number): [number, number] {
+  const maxL = Math.max(la, lb);
+  return [Math.max(0, maxL - la), Math.max(0, maxL - lb)];
+}
+
+function theTwoDeckFormsAgree(): void {
+  const cases: [number, number][] = [[0, 0], [0.02, 0], [0, 0.02], [0.01, 0.02]];
+  for (const [la, lb] of cases) {
+    assert.deepEqual(
+      summingDelaysSec([la, lb]), legacyTwoDeckComp(la, lb),
+      `the decks get identical numbers for (${la}, ${lb})`,
+    );
+  }
+}
+
+noDeclarationsIsAllZero();
+anEmptyProjectIsEmpty();
+oneCompressorDelaysEveryOtherTrack();
+seriesEffectsAccumulate();
+aBypassedCompressorCountsZero();
+flippingBypassReAlignsTheMixer();
+aParamEditCanMoveTheAlignment();
+differentLatenciesMeetAtTheSlowest();
+aFrozenTrackIsAZeroLatencyInput();
+inertEntriesAreReportedUncounted();
+theReportMirrorsTheStore();
+theCompNodeIsSplicedBetweenPannerAndDestination();
+delaysAreRampedNeverJumped();
+aProjectThatDeclaresNothingStaysAtZero();
+theTwoDeckFormsAgree();
+
+console.log('liveMixer.latency: ok');
