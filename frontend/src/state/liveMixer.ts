@@ -59,15 +59,14 @@ import {
 } from '../lib/soundfontEngine';
 import { buildEffectChain, teleportXYZ, SPATIAL_TELEPORT, type ChainHandle } from '../lib/rackEffects';
 import { sliceChunks, type AudioChunk } from '../lib/audioAnalysis';
+import { decodeClipBlob, peekDecoded } from '../lib/decodeCache';
 import type { ChainEntry } from './effectChainStore';
 
-const DECODE_TIMEOUT_MS = 15000;
 const EDITOR_ENTRY_ID = 'editor-timeline'; // reuse so existing footer/playhead wiring keeps working
 const RAMP_TC = 0.015; // setTargetAtTime time-constant for click-free param moves
 
-// Decoded buffers cached by Blob identity. A WeakMap means a clip's buffer is
-// reclaimed once its Blob is gone, and an edited clip (new Blob) re-decodes.
-const decodeCache = new WeakMap<Blob, AudioBuffer>();
+// Decoded buffers live in lib/decodeCache, shared with the offline renderers,
+// so a clip decoded here for playback is not decoded a second time by a bounce.
 
 // Onset-sliced chunks cached by Blob identity (for the spatializer Teleport mode),
 // so the (cheap but non-trivial) analysis runs once per clip, not per play/seek.
@@ -221,19 +220,11 @@ function applyMixLive(): void {
   }
 }
 
-/** Decode every clip's blob we'll need (cached by Blob identity). */
+/** Decode every clip's blob we'll need (cached by Blob identity + sample rate). */
 async function ensureDecoded(clips: AudioClip[]): Promise<void> {
   const ctx = getEngineCtx();
   for (const clip of clips) {
-    if (decodeCache.has(clip.audioBlob)) continue;
-    const ab = await clip.audioBlob.arrayBuffer();
-    const decoded = await Promise.race([
-      ctx.decodeAudioData(ab.slice(0)),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('decodeAudioData timeout')), DECODE_TIMEOUT_MS),
-      ),
-    ]);
-    decodeCache.set(clip.audioBlob, decoded);
+    await decodeClipBlob(ctx, clip.audioBlob);
   }
 }
 
@@ -351,7 +342,7 @@ function scheduleClips(clips: AudioClip[], fromSec: number): void {
     if (liveMidiActive && isMidiClip(clip)) continue;
     const nodes = trackNodes.get(clip.trackId);
     if (!nodes) continue;
-    const buf = decodeCache.get(clip.audioBlob);
+    const buf = peekDecoded(ctx, clip.audioBlob);
     if (!buf) continue;
 
     const safeOffset = Math.min(clip.offsetIntoSource, Math.max(0, buf.duration - 0.01));
@@ -413,7 +404,7 @@ function scheduleClips(clips: AudioClip[], fromSec: number): void {
 
 /** Onset-sliced chunks for a clip's decoded buffer (cached by Blob identity). */
 function chunksFor(clip: AudioClip): AudioChunk[] {
-  const buf = decodeCache.get(clip.audioBlob);
+  const buf = peekDecoded(getEngineCtx(), clip.audioBlob);
   if (!buf) return [];
   let chunks = analysisCache.get(clip.audioBlob);
   if (!chunks) {
@@ -458,7 +449,7 @@ function scheduleTeleports(clips: AudioClip[], fromSec: number): void {
       const events: { when: number; x: number; y: number; z: number }[] = [];
       let idx = 0;
       for (const clip of trackClips) {
-        const buf = decodeCache.get(clip.audioBlob);
+        const buf = peekDecoded(ctx, clip.audioBlob);
         if (!buf) continue;
         const offset = Math.min(clip.offsetIntoSource, Math.max(0, buf.duration - 0.01));
         const dur = Math.min(clip.durationSec, buf.duration - offset);

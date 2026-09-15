@@ -139,8 +139,12 @@ These are bugs in shipped code, independent of any new feature.
 ## 3. Port plan, in dependency order
 
 Every "from" below is a file that exists in `oss-refs/` and was read
-line-by-line. `oss-refs/` is gitignored; nothing is vendored without an
-explicit decision.
+line-by-line. **"From" names the design reference, not a copy source.** Six
+of the seven references are copyleft (see §5 — licences); the only one whose
+code may be lifted is Soundscape (MIT). For everything else, "port" means:
+read the reference to understand the design, then implement that design in
+our own code, and cite the reference in a header comment as the design source.
+`oss-refs/` is gitignored; nothing is vendored.
 
 ### 3.1 Plugin engine — resolver, reconnect-bypass, live plugin routing
 **From** `ACE-Step-DAW/src/engine/PluginEngine.ts` (305 lines, TypeScript).
@@ -258,6 +262,32 @@ renderer process in the packaged app on a 16 GB laptop.
 **Fix:** one shared decode cache the renderers read from. Small, and it buys
 the headroom that makes §3.14 a "when needed", not a "now".
 
+**Landed (T04, `lib/decodeCache.ts`) — with a finding that narrows the win.**
+The premise above ("renderers decode at the device rate") was wrong: all
+three offline renderers pin `new AudioContext({ sampleRate: 44100 })` while
+the engine context is created at the device rate (`playerStore.ts:86`,
+commonly 48 kHz on Windows). Sharing one buffer regardless of rate would
+resample 44.1→48→44.1 material that needed no resampling and would make a
+bounce's bytes depend on whether play had been pressed first. So the cache
+is keyed by Blob **and** sample rate; a caller only ever gets a buffer
+decoded at its own rate. Consequences, stated exactly:
+- **44.1 kHz output device:** full live↔bounce sharing; the OOM case above
+  is fixed.
+- **48 kHz output device:** live↔bounce sharing does not apply. What is
+  fixed everywhere is bounce↔bounce (freezing eight tracks decodes each clip
+  once, not eight times) and the leaked 15 s timer. **Peak** memory is
+  unchanged at 2N; **steady-state** rises by up to one 44.1 kHz buffer per
+  clip, because renderer buffers are now retained for the Blob's lifetime
+  instead of freed after the render.
+- The real fix is a product decision, not a cache trick: **run the offline
+  renderers at the engine rate** (then everything shares) — which changes the
+  sample rate of exported WAVs on 48 kHz machines — or resample at export.
+  Tracked as a follow-up; not decided here.
+- Also left for a follow-up: `cropAudioBlob` (`WaveformEditor.tsx` ~:171)
+  and `extractRegionWav` (~:1325) still decode a clip blob outside the cache
+  (transient one-shot decodes; caching them adds retention with no reuse
+  partner today).
+
 ### 3.14 Disk streaming — #66 — deferred, but Electron makes it real
 theDAW ships as `thedaw-desktop` (Electron 42, `electron-ui/`), so "browser
 buffering" is not the constraint. Two things Electron gives us that a web page
@@ -307,8 +337,30 @@ the protocol handler.
 
 ## 5. Rules for anyone executing this
 
-- `oss-refs/` is **reference only** and gitignored. Nothing is copied in
-  without noting the source file and its licence in the commit.
+### Licences of the references (checked 2026-09-15 in the clones)
+
+| reference | licence | may we copy code? |
+|---|---|---|
+| ACE-Step-DAW | **AGPL-3.0-or-later** (`package.json`, `LICENSE`) | **No.** Design only. Copying it would put theDAW under AGPL, network-use clause included. |
+| Tracktion Engine | GPL-3.0-or-later / commercial (`LICENSE.md`) | **No.** Design only. |
+| Ardour | GPL (`COPYING`) | **No.** Design only. |
+| LMMS | GPL (`LICENSE.txt`) | **No.** Design only. |
+| Stargate | GPL (`LICENSE`) | **No.** Design only. |
+| OpenDaw | GPL (`LICENSE`) | **No.** Design only. |
+| Soundscape | **MIT** (`LICENSE`, © 2026 Anthony Liddle) | **Yes**, with the MIT notice and the source file named in a header comment. |
+
+- `oss-refs/` is **reference only** and gitignored. From the six copyleft
+  references, **no code is copied — not a function, not a snippet.** Read
+  them for the design (data shapes, the algorithm, the invariants), then
+  write our own implementation and cite the reference file as the design
+  source in a header comment. From Soundscape only, code may be lifted with
+  the MIT notice and file path in the header. A builder ticket that says
+  "port" must be read with this rule; a reviewer finding of copied copyleft
+  code is **blocking**.
+- What has shipped so far is compliant: batch 1 is original; batch 2's chain
+  change is our own rebuild-based structure citing the ACE design; batch 2's
+  lazy `?url` import is a language idiom; T05 carries an explicit licence
+  gate and implements from the mathematical spec.
 - Do not write the audit's proposed snippets for **#04, #06, #15, #17, #27,
   #34, #47, #52, #60, #61, #66, #67** — each is either weaker than code we
   already ship or inadequate against the real implementation. #69's

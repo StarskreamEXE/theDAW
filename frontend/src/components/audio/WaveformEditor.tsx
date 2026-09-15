@@ -19,6 +19,7 @@ import { MAGENTA_TOOLS, magentaToolById, type MagentaTool } from '../../lib/mage
 import { AutomationLane } from './AutomationLane';
 import { RACK_EFFECTS, getRackEffect, buildEffectChain, ensureChopModule, teleportXYZ, SPATIAL_TELEPORT, type ChainHandle } from '../../lib/rackEffects';
 import { sliceChunks } from '../../lib/audioAnalysis';
+import { decodeClipBlob, peekDecoded } from '../../lib/decodeCache';
 import { effectiveZoom } from '../../lib/canvasScale';
 import { ownsKey } from '../../lib/keyScope';
 import { encodeWav } from '../../lib/wavEncode';
@@ -95,7 +96,6 @@ const ADD_ENTRY_ICON: Record<AddToTrackEntry['id'], React.ReactNode> = {
   paste: <Copy className="w-3 h-3" />,
   'new-track': <Plus className="w-3 h-3" />,
 };
-const DECODE_TIMEOUT_MS = 15000;
 
 // Track/clip colors for exploded stems, keyed by Demucs/LARSNET stem name.
 const STEM_TRACK_COLORS: Record<string, string> = {
@@ -1323,10 +1323,12 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   // Render the clip's current region (offset..offset+duration) to a WAV File so the
   // backend stretches only what the clip actually plays, not the whole source.
   const extractRegionWav = useCallback(async (clip: AudioClip): Promise<File> => {
+    // 44100 puts this in the same shared-cache lane as the offline renderers, so
+    // a stretch after a bounce (or a bounce after a stretch) reuses the buffer.
+    // `ac` stays open past the decode — createBuffer below still needs it.
     const ac = new AudioContext({ sampleRate: 44100 });
     try {
-      const ab = await clip.audioBlob.arrayBuffer();
-      const buf = await ac.decodeAudioData(ab.slice(0));
+      const buf = await decodeClipBlob(ac, clip.audioBlob);
       const sr = buf.sampleRate;
       const start = Math.max(0, Math.floor((clip.offsetIntoSource ?? 0) * sr));
       const len = Math.max(1, Math.min(buf.length - start, Math.ceil(clip.durationSec * sr)));
@@ -1838,18 +1840,11 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       const sr = 44100;
       const totalDur = Math.max(...selection.map((c) => c.startSec + c.durationSec), 1);
       const offline = new OfflineAudioContext(2, Math.ceil(totalDur * sr), sr);
-      const blobCache = new Map<Blob, AudioBuffer>();
+      // Decoded buffers come from the shared cache (lib/decodeCache), so a clip
+      // already decoded for playback or an earlier bounce is not decoded again.
       const decodeCtx = new AudioContext({ sampleRate: 44100 });
       try {
-        for (const clip of selection) {
-          if (blobCache.has(clip.audioBlob)) continue;
-          const ab = await clip.audioBlob.arrayBuffer();
-          const decoded = await Promise.race([
-            decodeCtx.decodeAudioData(ab.slice(0)),
-            new Promise<never>((_, reject) => setTimeout(() => reject(new Error('decodeAudioData timeout')), DECODE_TIMEOUT_MS)),
-          ]);
-          blobCache.set(clip.audioBlob, decoded);
-        }
+        for (const clip of selection) await decodeClipBlob(decodeCtx, clip.audioBlob);
       } finally {
         decodeCtx.close().catch(() => {});
       }
@@ -1858,7 +1853,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         if (clip.muted) continue; // muted clips are excluded from the mashup, matching commitEdit and live playback
         const track = trackById.get(clip.trackId);
         if (!track || track.mute) continue;
-        const buf = blobCache.get(clip.audioBlob);
+        const buf = peekDecoded(decodeCtx, clip.audioBlob);
         if (!buf) continue;
         const src = offline.createBufferSource();
         src.buffer = buf;
@@ -2028,8 +2023,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     try {
       const ctx = getEngineCtx();
       if (ctx.state === 'suspended') void ctx.resume();
-      const buf = await clip.audioBlob.arrayBuffer();
-      const audioBuf = await ctx.decodeAudioData(buf.slice(0));
+      const audioBuf = await decodeClipBlob(ctx, clip.audioBlob);
       const src = ctx.createBufferSource();
       src.buffer = audioBuf;
       // Route through the shared master → analyser → destination chain. No gain
@@ -2053,8 +2047,8 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   /* ── Clip clipboard + grid-aware edit actions ────────────────────────────────
      The clipboard holds the clip records themselves. Blobs (and cached peak
      arrays) are shared by reference with the source clips, not copied: they are
-     only ever read, and liveMixer's decode cache is keyed by Blob identity, so a
-     pasted clip costs no extra decode and no extra memory. */
+     only ever read, and the shared decode cache is keyed by Blob identity (and
+     sample rate), so a pasted clip costs no extra decode and no extra memory. */
   const clipboardRef = useRef<AudioClip[]>([]);
 
   /** The clips a keyboard action applies to: the multi-selection if there is one,
@@ -2419,21 +2413,11 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       const offline = new OfflineAudioContext(2, Math.ceil(dur * sr), sr);
       const anySolo = tracks.some((t) => t.solo);
       // Decode with a regular AudioContext — more reliable than OfflineAudioContext.decodeAudioData.
-      const blobCache = new Map<Blob, AudioBuffer>();
+      // Buffers come from the shared cache (lib/decodeCache), so a clip already
+      // decoded for playback or an earlier bounce is not decoded again.
       const decodeCtx = new AudioContext({ sampleRate: 44100 });
       try {
-        for (const c of clips) {
-          if (!blobCache.has(c.audioBlob)) {
-            const ab = await c.audioBlob.arrayBuffer();
-            const decoded = await Promise.race([
-              decodeCtx.decodeAudioData(ab.slice(0)),
-              new Promise<never>((_, reject) =>
-                setTimeout(() => reject(new Error('decodeAudioData timeout')), DECODE_TIMEOUT_MS),
-              ),
-            ]);
-            blobCache.set(c.audioBlob, decoded);
-          }
-        }
+        for (const c of clips) await decodeClipBlob(decodeCtx, c.audioBlob);
       } finally {
         decodeCtx.close().catch(() => {});
       }
@@ -2487,7 +2471,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         if (c.muted) continue; // muted clips are excluded from the bounce, matching live playback
         const tn = trackNodeById.get(c.trackId);
         if (!tn) continue; // track muted or hidden by an active solo
-        const buf = blobCache.get(c.audioBlob);
+        const buf = peekDecoded(decodeCtx, c.audioBlob);
         if (!buf) continue;
         const safeOffset = Math.min(c.offsetIntoSource, Math.max(0, buf.duration - 0.01));
         const safeDur = Math.min(c.durationSec, buf.duration - safeOffset);
@@ -2536,7 +2520,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
           const events: { when: number; x: number; y: number; z: number }[] = [];
           let idx = 0;
           for (const c of trackClips) {
-            const buf = blobCache.get(c.audioBlob);
+            const buf = peekDecoded(decodeCtx, c.audioBlob);
             if (!buf) continue;
             const offset = Math.min(c.offsetIntoSource, Math.max(0, buf.duration - 0.01));
             const cdur = Math.min(c.durationSec, buf.duration - offset);
@@ -2772,22 +2756,12 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       const sr = 44100;
       const offline = new OfflineAudioContext(2, Math.ceil(dur * sr), sr);
 
-      // Decode clips with a real AudioContext (more reliable than offline decode).
-      const blobCache = new Map<Blob, AudioBuffer>();
+      // Decode clips with a real AudioContext (more reliable than offline decode),
+      // via the shared cache (lib/decodeCache) so a clip already decoded for
+      // playback or an earlier bounce is not decoded again.
       const decodeCtx = new AudioContext({ sampleRate: sr });
       try {
-        for (const c of trackClips) {
-          if (!blobCache.has(c.audioBlob)) {
-            const ab = await c.audioBlob.arrayBuffer();
-            const decoded = await Promise.race([
-              decodeCtx.decodeAudioData(ab.slice(0)),
-              new Promise<never>((_, rej) =>
-                setTimeout(() => rej(new Error('decodeAudioData timeout')), DECODE_TIMEOUT_MS),
-              ),
-            ]);
-            blobCache.set(c.audioBlob, decoded);
-          }
-        }
+        for (const c of trackClips) await decodeClipBlob(decodeCtx, c.audioBlob);
       } finally {
         decodeCtx.close().catch(() => {});
       }
@@ -2805,7 +2779,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       const fx = buildEffectChain(offline, trackInput, offline.destination, rackChain);
       for (const c of trackClips) {
         if (c.muted) continue; // muted clips stay out of the printed stem, matching live playback
-        const buf = blobCache.get(c.audioBlob);
+        const buf = peekDecoded(decodeCtx, c.audioBlob);
         if (!buf) continue;
         const safeOffset = Math.min(c.offsetIntoSource, Math.max(0, buf.duration - 0.01));
         const safeDur = Math.min(c.durationSec, buf.duration - safeOffset);
