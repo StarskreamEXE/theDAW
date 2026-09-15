@@ -24,6 +24,17 @@ lanes live. Our tree simply predates them.
 **Catching up to daniel closes #36 and #37 outright and upgrades #05 and #42
 for free. It closes none of the 15 genuinely-absent features.**
 
+### Status (fork `personal/main`)
+| when | commit | done |
+|---|---|---|
+| 2026-09-15 | `919d295` | §1 caught up to `danieljtrujillo/main` (56 commits merged; one conflict, `EffectWindows.tsx`, resolved to daniel's `chainInState`) |
+| 2026-09-15 | `ab5fae5` | **D1** `pitch_shift` → rubberband pitch, **D4** split fades, **D7** master-VST undo, **D9** autosave `beforeunload`/`pagehide` flush; `editorStore.test.ts` |
+| 2026-09-15 | `4ae431c` | **D8** piano-roll undo/redo, **D3** bypass keeps the instance, **D2** inert VST entries reported via `ChainHandle.inertIds()`; `virtuosoTransform.test.ts` green (lazy `?url`); suite 103/0. Run record `docs/runs/P-20260915-batch2.md` |
+| in flight | batch 3 | §3.13 decode-cache unification (T04), §3.2 tempo+meter module (T05) |
+
+Remaining from §2: D5 (fade envelope 4×, folds into §3.3), D6 (four renderers,
+folds into §3.5), D10, D11, D12 (→ T05), D13–D19.
+
 ---
 
 ## 1. Catch up to `danieljtrujillo/main` — do this first
