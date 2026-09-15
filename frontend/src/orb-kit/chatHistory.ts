@@ -59,7 +59,9 @@ export function loadConversations(): StoredConversation[] {
 }
 
 /** Write the full list (sorted + capped). On quota error, trims oldest and
- *  retries until it fits. Returns the list actually persisted. */
+ *  retries until it fits. Returns the list actually persisted. On total
+ *  failure (even a single conversation will not fit) it returns the list
+ *  still in storage, so a failed write is never treated as saved. */
 function writeAll(list: StoredConversation[]): StoredConversation[] {
     let capped = [...list]
         .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
@@ -73,7 +75,8 @@ function writeAll(list: StoredConversation[]): StoredConversation[] {
             capped = capped.slice(0, capped.length - 1); // drop the oldest, retry
         }
     }
-    return capped;
+    // Nothing was written — report what storage actually holds, not `capped`.
+    return loadConversations();
 }
 
 /** First non-empty user line, trimmed to a short title. */
@@ -120,6 +123,17 @@ export function setActiveId(id: string | null): void {
     try {
         if (id) localStorage.setItem(ACTIVE_KEY, id);
         else localStorage.removeItem(ACTIVE_KEY);
+    } catch {
+        /* localStorage unavailable — nothing to do */
+    }
+}
+
+/** Wipe ALL saved conversations + the active pointer off this machine. Backs
+ *  the "Clear all history" affordance so transcripts do not persist forever. */
+export function clearAllConversations(): void {
+    try {
+        localStorage.removeItem(CONV_KEY);
+        localStorage.removeItem(ACTIVE_KEY);
     } catch {
         /* localStorage unavailable — nothing to do */
     }

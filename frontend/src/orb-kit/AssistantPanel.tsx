@@ -16,6 +16,7 @@ import {
     getActiveId,
     setActiveId,
     deriveTitle,
+    clearAllConversations,
     type StoredConversation,
 } from './chatHistory';
 import { useStatusBarStore } from '../state/statusBarStore';
@@ -159,7 +160,8 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
     const initialAssistantSelection = useMemo(readInitialAssistantSelection, []);
     // Chat history: restore the last-active conversation on mount so a reload
     // or app restart keeps the transcript (persisted to localStorage below).
-    const activeConvIdRef = useRef<string>(getActiveId() || uuid());
+    const activeConvIdRef = useRef<string>('');
+    if (!activeConvIdRef.current) activeConvIdRef.current = getActiveId() || uuid();
     const [messages, setMessages] = useState<Message[]>(
         () => getConversation(activeConvIdRef.current)?.messages ?? [],
     );
@@ -510,25 +512,39 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
         // Debounced persist of the active conversation. Streaming mutates
         // `messages` per token, so writes are coalesced to ~half a second.
-        if (messages.length === 0) return;
+        // Any pending timer is cleared first so a stale write can't fire after
+        // "New chat" / resume has swapped the active id out from under it.
         if (persistTimerRef.current) window.clearTimeout(persistTimerRef.current);
+        if (messages.length === 0) return;
+        // Snapshot at schedule time: the timer must write to the conversation
+        // these messages belong to, not whichever id is active 500ms later.
+        const convId = activeConvIdRef.current;
+        const sessionId = conversationIdRef.current;
+        const snapshot = messages;
         persistTimerRef.current = window.setTimeout(() => {
-            const existing = getConversation(activeConvIdRef.current);
+            const existing = getConversation(convId);
+            const last = snapshot[snapshot.length - 1];
+            // skip a no-op write (e.g. the mount effect for a restored chat) — it would only
+            // rebrand provider/model and bump updatedAt, silently reshuffling history.
+            if (existing && existing.messages.length === snapshot.length
+                && existing.messages[existing.messages.length - 1]?.id === last?.id) return;
             const now = Date.now();
             const record: StoredConversation = {
-                id: activeConvIdRef.current,
-                title: existing?.title || deriveTitle(messages),
-                messages,
+                id: convId,
+                title: existing?.title || deriveTitle(snapshot),
+                messages: snapshot,
                 provider: selectedProvider,
                 model: selectedModel,
                 claudeMode,
-                sessionId: conversationIdRef.current,
+                sessionId,
                 createdAt: existing?.createdAt ?? now,
                 updatedAt: now,
             };
-            setActiveId(activeConvIdRef.current);
+            setActiveId(convId);
             setConversations(upsertConversation(record));
+            persistTimerRef.current = null;
         }, 500);
+        return () => { if (persistTimerRef.current) window.clearTimeout(persistTimerRef.current); };
     }, [messages, selectedProvider, selectedModel, claudeMode]);
 
     const sendMessage = async (text: string) => {
@@ -782,6 +798,15 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
         setShowHistory(false);
     };
 
+    // "Clear all": wipe every saved transcript from localStorage, then start
+    // a fresh empty conversation so the panel doesn't show a deleted chat.
+    const handleClearAll = () => {
+        if (!window.confirm('Delete ALL saved chats from this browser?')) return;
+        clearAllConversations();
+        setConversations([]);
+        handleClearHistory();
+    };
+
     const resumeConversation = (conv: StoredConversation) => {
         activeConvIdRef.current = conv.id;
         setActiveId(conv.id);
@@ -922,13 +947,24 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                 <div className="border-b border-border bg-surface/95 max-h-72 overflow-y-auto custom-scrollbar">
                     <div className="flex items-center justify-between px-3 py-2 border-b border-white/5">
                         <span className="text-[10px] font-semibold text-muted uppercase tracking-wide">History</span>
-                        <button
-                            onClick={handleClearHistory}
-                            className="inline-flex items-center gap-1 text-[10px] text-primary hover:text-white transition-colors"
-                            title="Start a new chat"
-                        >
-                            <Plus size={12} /> New chat
-                        </button>
+                        <div className="flex items-center gap-3">
+                            <button
+                                onClick={handleClearHistory}
+                                className="inline-flex items-center gap-1 text-[10px] text-primary hover:text-white transition-colors"
+                                title="Start a new chat"
+                            >
+                                <Plus size={12} /> New chat
+                            </button>
+                            <button
+                                type="button"
+                                onClick={handleClearAll}
+                                title="Delete all saved chats"
+                                aria-label="Clear all history"
+                                className="inline-flex items-center gap-1 text-[10px] text-rose-400/80 hover:text-rose-300 transition-colors"
+                            >
+                                Clear all
+                            </button>
+                        </div>
                     </div>
                     {conversations.length === 0 ? (
                         <div className="px-3 py-3 text-[10px] text-muted italic">No saved conversations yet.</div>
@@ -1184,11 +1220,14 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                                                     },
                                                     code({ className, children, ...props }: any) {
                                                         const match = /language-(\w+)/.exec(className || '')
-                                                        const text = String(children).replace(/\n$/, '')
+                                                        const raw = String(children)
+                                                        const text = raw.replace(/\n$/, '')
                                                         // react-markdown v10 removed the `inline` prop, so infer block
                                                         // vs inline: a fenced block has a language class or a newline.
-                                                        // Inline code stays a <code> so it never nests a <div> in a <p>.
-                                                        const isBlock = Boolean(match) || text.includes('\n')
+                                                        // Test the RAW children: a one-line fence still ends in "\n",
+                                                        // which `text` has stripped. Inline code stays a <code> so it
+                                                        // never nests a <div> in a <p>.
+                                                        const isBlock = Boolean(match) || raw.includes('\n')
                                                         return isBlock ? (
                                                             <div className="relative group">
                                                                 <button

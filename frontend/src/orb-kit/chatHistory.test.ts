@@ -29,6 +29,7 @@ import {
     getActiveId,
     setActiveId,
     deriveTitle,
+    clearAllConversations,
     type StoredConversation,
 } from './chatHistory.ts';
 
@@ -92,5 +93,14 @@ deleteConversation('a');
 assert.equal(getConversation('a'), null);
 assert.equal(getActiveId(), null, 'deleting the active convo clears activeId');
 assert.equal(loadConversations().length, 1);
+
+// clearAllConversations wipes every stored convo + the active pointer
+upsertConversation(conv('c', 'third chat', 4000));
+upsertConversation(conv('d', 'fourth chat', 5000));
+setActiveId('d');
+assert.equal(loadConversations().length, 3, 'b, c, d stored before clear');
+clearAllConversations();
+assert.deepEqual(loadConversations(), [], 'clear wipes all conversations');
+assert.equal(getActiveId(), null, 'clear wipes the active id');
 
 console.log('chatHistory: all assertions passed');
