@@ -169,6 +169,28 @@ def allowed_roots() -> list[Path]:
     return [*_static_roots(), *_session_roots]
 
 
+# A staged SwayCommand template names its song by the absolute path the song had
+# on the author's machine. When nothing is at that path here, the server serves
+# the copy of the song theDAW ships instead. Only server code registers these,
+# from templates it read off disk; a request can never add one.
+_stand_ins: dict[str, Path] = {}
+
+
+def _stand_in_key(p: Path) -> str:
+    return os.path.normcase(str(p))
+
+
+def register_stand_in(missing: str | os.PathLike[str], shipped: Path) -> bool:
+    """Serve ``shipped`` for ``missing`` whenever no file exists at ``missing``."""
+    src = _safe_resolve(missing)
+    dst = _safe_resolve(shipped)
+    if src is None or dst is None or not dst.is_file():
+        return False
+    _stand_ins[_stand_in_key(src)] = dst
+    log.info("project.media_access: %s plays from %s", src, dst)
+    return True
+
+
 def resolve_media_path(raw: str) -> Path | None:
     """Return the real location of ``raw`` when it is inside an allowed root.
 
@@ -179,6 +201,9 @@ def resolve_media_path(raw: str) -> Path | None:
     p = _safe_resolve(raw)
     if p is None:
         return None
+    stand_in = _stand_ins.get(_stand_in_key(p))
+    if stand_in is not None and not p.is_file():
+        return stand_in
     for root in allowed_roots():
         # Containment is checked AFTER resolution, so ``..`` and symlinks
         # cannot point the final path outside the root that let it through.

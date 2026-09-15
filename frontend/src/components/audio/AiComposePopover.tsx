@@ -2,7 +2,7 @@ import React, { useRef, useState } from 'react';
 import { Sparkles, Loader2 } from 'lucide-react';
 import { generatePianoFromParams, type AiComposeResult } from '../../lib/aiComposeClient';
 import { logError, logInfo } from '../../state/logStore';
-import { DockFlyout, FLYOUT_CARD, KEY_REST, RailKey } from './midiDockKit';
+import { DockFlyout, FLYOUT_CARD, KEY_REST, RAIL_GLYPH, RailKey } from './midiDockKit';
 
 const KEYS = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
 const MODES = [
@@ -31,9 +31,9 @@ const STYLES = [
   'Prog',
 ];
 
-const legendCls = 'text-[8px] font-mono uppercase tracking-widest et-ink-3';
+const legendCls = 'text-[12px] font-display font-bold uppercase et-ink-3';
 const fieldCls =
-  'bg-black/60 border border-white/10 rounded px-1.5 py-1 text-[10px] text-zinc-200 outline-none focus:border-[rgb(var(--et-accent)/0.6)]';
+  'bg-black/60 border border-white/10 rounded px-1.5 py-1 text-[12px] font-semibold text-zinc-200 outline-none focus:border-[rgb(var(--et-accent)/0.6)]';
 
 /**
  * AI COMPOSE control for the Piano Roll. The AI key in the MIDI dock's action
@@ -92,9 +92,9 @@ export const AiComposePopover: React.FC<{
         aria-expanded={open}
         aria-controls="piano-roll-ai-compose-popover"
         aria-label="AI compose"
-        title="Generate a piano part with AI from parameters"
+        description="Write a piano part with AI from the parameters in its card"
         on={open}
-        icon={<Sparkles className="w-3 h-3" />}
+        icon={<Sparkles className={RAIL_GLYPH} />}
         legend="AI"
       />
 
@@ -103,10 +103,11 @@ export const AiComposePopover: React.FC<{
         anchorRef={keyRef}
         onClose={() => setOpen(false)}
         placement="right"
+        floorSelector="[data-dock-floor]"
         id="piano-roll-ai-compose-popover"
         role="dialog"
         aria-label="AI compose parameters"
-        className={`w-72 p-2.5 flex flex-col gap-2 ${FLYOUT_CARD}`}
+        className={`w-80 p-2.5 flex flex-col gap-2 ${FLYOUT_CARD}`}
       >
         <div className="flex flex-col gap-1">
           <label htmlFor="ai-compose-prompt" className={legendCls}>
@@ -119,7 +120,7 @@ export const AiComposePopover: React.FC<{
             onChange={(e) => setPrompt(e.target.value)}
             rows={2}
             placeholder="e.g. dramatic minor-key intro that builds to virtuosic runs"
-            className="bg-black/40 border border-white/10 rounded px-2 py-1 text-[10px] text-zinc-200 placeholder:text-zinc-600 outline-none resize-none focus:border-[rgb(var(--et-accent)/0.6)]"
+            className="bg-black/40 border border-white/10 rounded px-2 py-1 text-[12px] font-semibold text-zinc-200 placeholder:text-zinc-600 outline-none resize-none focus:border-[rgb(var(--et-accent)/0.6)]"
           />
         </div>
 
@@ -227,12 +228,12 @@ export const AiComposePopover: React.FC<{
             onChange={(e) => setComplexity((parseInt(e.target.value) || 0) / 100)}
             className="flex-1 accent-[rgb(var(--et-accent))]"
           />
-          <span className="text-[9px] font-mono et-ink w-8 text-right">
+          <span className="text-[12px] font-bold et-ink w-8 text-right tabular-nums">
             {Math.round(complexity * 100)}%
           </span>
         </div>
 
-        <label htmlFor="ai-compose-bass" className="flex items-center gap-2 text-[10px] text-zinc-300 cursor-pointer">
+        <label htmlFor="ai-compose-bass" className="flex items-center gap-2 text-[12px] font-semibold text-zinc-300 cursor-pointer">
           <input
             id="ai-compose-bass"
             name="ai-compose-bass"
@@ -244,11 +245,15 @@ export const AiComposePopover: React.FC<{
           Distinct left-hand bass line
         </label>
 
+        {/* aria-disabled while composing, never the native attribute: the key keeps
+            keyboard focus through the request, and a press does nothing until it ends. */}
         <button
           type="button"
-          onClick={() => void generate()}
-          disabled={busy}
-          className={`w-full mt-0.5 flex items-center justify-center gap-2 px-2 py-1.5 rounded-xs border-b text-[10px] font-black uppercase tracking-widest disabled:*:opacity-40 ${KEY_REST}`}
+          onClick={() => {
+            if (!busy) void generate();
+          }}
+          aria-disabled={busy || undefined}
+          className={`w-full mt-0.5 flex items-center justify-center gap-2 px-2 py-1.5 rounded-xs border-b text-[12px] font-display font-extrabold uppercase aria-disabled:cursor-default aria-disabled:*:opacity-40 ${KEY_REST}`}
         >
           {busy ? (
             <>
@@ -260,7 +265,7 @@ export const AiComposePopover: React.FC<{
             </>
           )}
         </button>
-        <p className="text-[8px] font-mono et-ink-3 leading-tight">
+        <p className="text-[12px] font-semibold et-ink-3 leading-snug">
           Replaces the roll with the generated part. Needs a Gemini API key set in Settings.
         </p>
       </DockFlyout>

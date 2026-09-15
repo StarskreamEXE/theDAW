@@ -260,8 +260,11 @@ export const FeatureNotes: React.FC = () => {
 
   if (!visible.length) return null;
 
+  // z-75: over the transport footer and the dock strips the notes point at
+  // (z-50), under EDIT's effect control windows (z 81 and up), modals and menus,
+  // so a hint never covers a window the user opened.
   return createPortal(
-    <div className="pointer-events-none fixed inset-0 z-1000" aria-live="off">
+    <div className="pointer-events-none fixed inset-0 z-75" aria-live="off">
       {visible.map((def) => (
         <Note key={def.id} def={def} zoom={zoom} onDismiss={dismiss} />
       ))}

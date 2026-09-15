@@ -97,7 +97,7 @@ function GanFrame({ url, name, id }: { url: string; name: string; id?: string })
             />
           )}
           <div className="absolute inset-0 bg-[#07080c]/35 animate-pulse pointer-events-none" />
-          <span className="absolute bottom-2 left-1/2 -translate-x-1/2 text-[9px] font-mono uppercase tracking-widest text-indigo-200/70">
+          <span className="absolute bottom-2 left-1/2 -translate-x-1/2 font-display text-xs font-bold uppercase tracking-wider text-indigo-200/70">
             loading {name}…
           </span>
         </div>
@@ -147,8 +147,8 @@ export function GanPluginStage({ url, name }: { url: string | null; name: string
     return (
       <div className="h-full w-full min-h-0 flex flex-col items-center justify-center gap-2 text-center px-4">
         <Blocks className="w-6 h-6 text-zinc-700" />
-        <span className="text-[11px] text-zinc-500">Open a .gan plugin to load it here.</span>
-        <span className="text-[9px] font-mono text-zinc-600">portable GANTASMO web-plugins</span>
+        <span className="font-sans text-xs font-bold text-zinc-500">Open a .gan plugin to load it here.</span>
+        <span className="font-sans text-xs font-bold text-zinc-500">portable GANTASMO web-plugins</span>
       </div>
     );
   }
@@ -178,19 +178,19 @@ export function GanPluginStage({ url, name }: { url: string | null; name: string
     <div className="h-full w-full min-h-0 flex flex-col overflow-hidden bg-[#07080c]">
       <div className="flex items-center gap-2 px-2 py-1 shrink-0">
         <Blocks className="w-3 h-3 text-indigo-300 shrink-0" />
-        <span className="text-[10px] font-black uppercase tracking-widest text-indigo-300 truncate">{title}</span>
+        <span className="font-display text-xs font-bold uppercase tracking-wider text-indigo-300 truncate">{title}</span>
         <button
           onClick={togglePopOut}
           title={win ? 'Pop the plugin back into the app' : 'Pop out into its own window (like a VST editor)'}
           aria-label={win ? 'Pop plugin back in' : 'Pop plugin out into its own window'}
           aria-pressed={!!win}
-          className="ml-auto inline-flex items-center gap-1 text-[10px] text-zinc-500 hover:text-indigo-300 transition-colors shrink-0"
+          className="ml-auto inline-flex items-center gap-1 font-sans text-xs font-bold text-zinc-500 hover:text-indigo-300 transition-colors shrink-0"
         >
           <ExternalLink className="w-3.5 h-3.5" /> {win ? 'Pop back in' : 'Pop out'}
         </button>
       </div>
       {popupBlocked && !win && (
-        <div className="mx-2 mb-1 px-2 py-1 rounded border border-amber-500/50 bg-amber-500/15 text-amber-200 text-[9px] font-mono shrink-0">
+        <div className="mx-2 mb-1 px-2 py-1 rounded border border-amber-500/50 bg-amber-500/15 text-amber-200 font-sans text-xs font-bold shrink-0">
           Pop-up blocked — allow pop-ups for this site, then click Pop out again.
         </div>
       )}
@@ -198,12 +198,12 @@ export function GanPluginStage({ url, name }: { url: string | null; name: string
         <>
           <div className="flex-1 min-h-0 flex flex-col items-center justify-center gap-3 text-indigo-200">
             <ExternalLink className="w-5 h-5" />
-            <span className="text-[10px] font-mono uppercase tracking-widest">
+            <span className="font-display text-xs font-bold uppercase tracking-wider">
               {name ?? 'Plugin'} is in a separate window
             </span>
             <button
               onClick={() => setWin(null)}
-              className="px-3 py-1.5 rounded border border-indigo-500/40 bg-indigo-500/15 text-indigo-200 hover:bg-indigo-500/25 text-[9px] font-black uppercase tracking-widest"
+              className="px-3 py-1.5 rounded border border-indigo-500/40 bg-indigo-500/15 text-indigo-200 hover:bg-indigo-500/25 font-display text-xs font-bold uppercase tracking-wider"
             >
               Pop back in
             </button>

@@ -13,7 +13,7 @@
  *   Make (Create):  make.prompt (text), make.model (select, options populated
  *   with the same built-ins + registered local checkpoints as the desktop
  *   picker), make.duration (fader), make.generate (button — desktop CREATE
- *   toggle semantics: idle starts a run, generating cancels the watch), and
+ *   toggle semantics: idle starts a run, generating is STOP and cancels it), and
  *   make.generating (readonly toggle mirroring generateStore.isGenerating).
  *
  *   Make (Chimera): stack a mashup from recent library takes using only
@@ -370,10 +370,10 @@ export const makeControlSource: XrControlSource = {
       const { useGenerateStore, buildGenerateParamsFromState } = await generate();
       const { useGenerateParamsStore } = await params();
       const gen = useGenerateStore.getState();
-      // Same toggle contract as the desktop CREATE button: a press while a
-      // run is live cancels the watch instead of stacking another job.
+      // Same toggle contract as the desktop CREATE key: a press while a run
+      // is live is STOP (it cancels the run) instead of stacking another job.
       if (gen.isGenerating) {
-        gen.cancelPolling();
+        gen.cancelGeneration();
         return true;
       }
       void gen.submitGeneration(buildGenerateParamsFromState(useGenerateParamsStore.getState()));

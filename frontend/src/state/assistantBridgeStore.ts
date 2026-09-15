@@ -95,7 +95,7 @@ function runAction(action: AssistantAction): string {
         }
 
         case 'abort_generation':
-            useGenerateStore.getState().cancelPolling();
+            useGenerateStore.getState().cancelGeneration();
             return 'Generation aborted';
 
         case 'navigate': {

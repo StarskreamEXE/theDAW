@@ -11,6 +11,9 @@
  * this module existed, so previews and bounces stay consistent.
  */
 import { parseMidi } from './midi';
+import type { SmfWheel } from './midiWrite';
+import type { RollRenderBends } from './pitchBend';
+import { stepNotesToRender, voiceContext, type VoiceBend } from './pitchBendVoice';
 import { encodeWav } from './wavEncode';
 import { isSoundfontActive, getActiveSynthVoice, renderNotesToBlobSF, renderMidiBufferToBlobSF } from './soundfontEngine';
 import { getSynthVoice } from './synthVoices';
@@ -25,6 +28,10 @@ export interface RenderNote {
   durationSec: number;
   /** Velocity 1-127. */
   velocity: number;
+  /** MIDI channel a soundfont render plays the note on; 0 when absent. A lane with a bend has its own. */
+  channel?: number;
+  /** The pitch bend a built-in voice follows (a soundfont render bends through RenderOptions.wheel). */
+  bend?: VoiceBend;
 }
 
 export interface RenderOptions {
@@ -37,6 +44,8 @@ export interface RenderOptions {
    *  instrument the live scheduler plays it with — otherwise a clip assigned an
    *  instrument after it was created exports as whatever was selected at insert. */
   program?: number;
+  /** Pitch wheels by channel for a soundfont render (the built-in voices bend through each note's `bend`). */
+  wheel?: SmfWheel[];
 }
 
 /**
@@ -74,20 +83,23 @@ export const triggerSynthVoice = (
 /**
  * Trigger the currently-selected built-in voice: a procedural synth voice if one
  * is active (EDM bank), else the basic sawtooth. Soundfont selection is handled
- * separately (callers check `isSoundfontActive()` first). Same signature as
- * `triggerSynthVoice` so it's a drop-in for preview + render.
+ * separately (callers check `isSoundfontActive()` first). The signature of
+ * `triggerSynthVoice` so it's a drop-in for preview + render, plus an optional
+ * `bend` the voice follows (lib/pitchBendVoice).
  */
-export const triggerActiveVoice: typeof triggerSynthVoice = (
-  ctx,
-  dest,
-  midi,
-  velocity,
-  when,
-  duration,
-  master,
-) => {
+export const triggerActiveVoice = (
+  ctx: BaseAudioContext,
+  dest: AudioNode,
+  midi: number,
+  velocity: number,
+  when: number,
+  duration: number,
+  master: number,
+  bend?: VoiceBend,
+): void => {
   const voice = getSynthVoice(getActiveSynthVoice());
-  (voice ? voice.trigger : triggerSynthVoice)(ctx, dest, midi, velocity, when, duration, master);
+  const voiceCtx = voiceContext(ctx, bend, when, duration);
+  (voice ? voice.trigger : triggerSynthVoice)(voiceCtx, dest, midi, velocity, when, duration, master);
 };
 
 /** Encode an AudioBuffer to a WAV Blob. Kept as a named re-export because
@@ -130,28 +142,28 @@ const renderNotesBuiltin = async (
   const totalSec = Math.max(0.1, maxEnd + tail);
   const offline = new OfflineAudioContext(2, Math.ceil(totalSec * sr), sr);
   for (const n of notes) {
-    triggerActiveVoice(offline, offline.destination, n.midi, n.velocity, n.startSec, n.durationSec, 1);
+    triggerActiveVoice(offline, offline.destination, n.midi, n.velocity, n.startSec, n.durationSec, 1, n.bend);
   }
   const rendered = await offline.startRendering();
   return { blob: encodeWavBlob(rendered), duration: rendered.duration };
 };
 
-/** Render step-grid notes (piano roll / step sequencer) to a WAV Blob. */
+/** Render step-grid notes (piano roll / step sequencer) to a WAV Blob. With
+ *  `bends` (lib/pitchBend rollRenderBends) each note follows its lane's bend. */
 export const renderStepNotesToBlob = async (
-  notes: Array<{ note: number; velocity: number; step: number; length: number }>,
+  notes: Array<{ note: number; velocity: number; step: number; length: number; lane?: number }>,
   bpm: number,
   totalSteps: number,
-  opts: { program?: number } = {},
+  opts: { program?: number; bends?: RollRenderBends } = {},
 ): Promise<{ blob: Blob; duration: number }> => {
   const stepSec = 60 / Math.max(40, bpm) / 4; // 16th-note seconds
-  const renderNotes: RenderNote[] = notes.map((n) => ({
-    midi: n.note,
-    velocity: n.velocity,
-    startSec: n.step * stepSec,
-    durationSec: n.length * stepSec,
-  }));
+  const render = stepNotesToRender(notes, stepSec, opts.bends);
   // Pad to the pattern's nominal length so trailing rests are preserved.
-  const result = await renderNotesToBlob(renderNotes, { tailSec: 0.6, program: opts.program });
+  const result = await renderNotesToBlob(render.notes, {
+    tailSec: 0.6,
+    program: opts.program,
+    ...(render.wheel.length ? { wheel: render.wheel } : {}),
+  });
   const nominal = totalSteps * stepSec;
   return { blob: result.blob, duration: Math.max(result.duration, nominal) };
 };

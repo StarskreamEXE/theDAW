@@ -118,10 +118,13 @@ export const EffectControls: React.FC<EffectControlsProps> = ({
     const ctlId = `${idPrefix}-${slug(p.key)}`;
     if (kind === 'toggle') {
       const on = value >= 0.5;
+      // The legend names the pad; its visible On / Off is the state, which
+      // aria-pressed already carries.
+      const legendId = `${ctlId}-label`;
       return (
         <div key={p.key} className="flex flex-col items-center gap-1 min-w-0" title={p.tip}>
-          <span className="text-[8px] font-bold uppercase tracking-wider text-zinc-400 leading-none truncate max-w-full">{label}</span>
-          <SlidePad on={on} onClick={() => set(p.key, on ? 0 : 1)} title={p.tip ?? `${label}: ${on ? 'on' : 'off'}`} className="min-w-12 h-7">
+          <span id={legendId} className="font-sans text-xs font-bold text-zinc-400 leading-none truncate max-w-full">{label}</span>
+          <SlidePad on={on} onClick={() => set(p.key, on ? 0 : 1)} title={p.tip ?? `${label}: ${on ? 'on' : 'off'}`} ariaLabelledBy={legendId} textSize="text-xs" className="min-w-12 h-7 font-sans">
             {on ? 'On' : 'Off'}
           </SlidePad>
         </div>
@@ -131,13 +134,13 @@ export const EffectControls: React.FC<EffectControlsProps> = ({
       const idx = optionIndex(p, value);
       return (
         <div key={p.key} className="flex flex-col gap-1 min-w-0" title={p.tip}>
-          <label htmlFor={ctlId} className="text-[8px] font-bold uppercase tracking-wider text-zinc-400 leading-none truncate">{label}</label>
+          <label htmlFor={ctlId} className="font-sans text-xs font-bold text-zinc-400 leading-none truncate">{label}</label>
           <select
             id={ctlId}
             name={ctlId}
             value={idx}
             onChange={(e) => set(p.key, optionValue(p, Number(e.target.value)))}
-            className="form-select px-1.5 py-1 text-[10px] font-mono min-w-24"
+            className="form-select px-1.5 py-1 font-sans text-xs font-bold min-w-24"
             style={{ colorScheme: 'dark' }}
           >
             {p.options.map((opt, i) => (
@@ -151,7 +154,7 @@ export const EffectControls: React.FC<EffectControlsProps> = ({
       const labelId = `${ctlId}-label`;
       return (
         <div key={p.key} className="flex items-center gap-2 basis-full min-w-0" title={p.tip}>
-          <span id={labelId} className="text-[9px] font-mono text-zinc-500 w-16 shrink-0 truncate">{label}</span>
+          <span id={labelId} className="font-sans text-xs font-bold text-zinc-400 w-16 shrink-0 truncate">{label}</span>
           <SlideTrack
             id={ctlId}
             value={value}
@@ -163,7 +166,7 @@ export const EffectControls: React.FC<EffectControlsProps> = ({
             className="flex-1"
             onChange={(v) => set(p.key, v)}
           />
-          <span className="text-[9px] font-mono text-zinc-400 w-16 shrink-0 text-right tabular-nums">{formatParamValue(p, value)}</span>
+          <span className="font-sans text-xs font-bold text-zinc-300 w-16 shrink-0 text-right tabular-nums">{formatParamValue(p, value)}</span>
         </div>
       );
     }
@@ -198,8 +201,8 @@ export const EffectControls: React.FC<EffectControlsProps> = ({
               <Power className="w-3 h-3" />
             </button>
           )}
-          <span className="text-[10px] font-mono uppercase tracking-wider text-zinc-200 truncate" title={schema.description}>{schema.label}</span>
-          <span className={`text-[7px] font-black uppercase tracking-widest px-1 rounded border bg-black/40 shrink-0 ${badge.cls}`}>{badge.text}</span>
+          <span className="font-display text-xs font-bold uppercase tracking-wider text-zinc-200 truncate" title={schema.description}>{schema.label}</span>
+          <span className={`font-display text-xs font-bold uppercase tracking-wide px-1 rounded border bg-black/40 shrink-0 ${badge.cls}`}>{badge.text}</span>
         </div>
       )}
 
@@ -213,7 +216,7 @@ export const EffectControls: React.FC<EffectControlsProps> = ({
               name={presetId}
               value=""
               onChange={(e) => { onPreset(e.target.value); e.target.value = ''; }}
-              className="form-select px-1.5 py-0.5 text-[9px] font-mono min-w-0 max-w-40"
+              className="form-select px-1.5 py-0.5 font-sans text-xs font-bold min-w-0 max-w-40"
               style={{ colorScheme: 'dark' }}
               title="Load a preset (merged onto the current settings)"
             >
@@ -250,7 +253,7 @@ export const EffectControls: React.FC<EffectControlsProps> = ({
       </div>
 
       {schema.note && (
-        <p className="text-[8px] font-mono text-zinc-500 italic leading-snug">{schema.note}</p>
+        <p className="font-sans text-xs font-bold text-zinc-500 leading-snug">{schema.note}</p>
       )}
 
       {/* XY pads (declared pairs). */}
@@ -284,7 +287,7 @@ export const EffectControls: React.FC<EffectControlsProps> = ({
             className={expanded ? 'rounded border border-white/5 bg-black/30 p-2 flex flex-col gap-1.5 min-w-0' : 'flex flex-col gap-1 min-w-0'}
           >
             {showGroupCaptions && g.name && (
-              <span className="text-[8px] font-black uppercase tracking-widest text-zinc-500 leading-none">{g.name}</span>
+              <span className="font-display text-xs font-bold uppercase tracking-wider text-zinc-400 leading-none">{g.name}</span>
             )}
             <div className={`flex flex-wrap items-end gap-x-2 gap-y-2 ${expanded ? '' : 'justify-start'}`}>
               {g.params.map((p) => renderControl(p, g.name))}

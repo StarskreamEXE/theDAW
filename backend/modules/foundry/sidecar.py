@@ -173,6 +173,8 @@ def _pid_listening_on_port(port: int) -> Optional[int]:
             ["netstat", "-ano", "-p", "tcp"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5.0,
             shell=False,
             env=child_env(),

@@ -104,9 +104,18 @@ async function buildManifest(): Promise<XrManifestEntry[]> {
 }
 
 async function publishManifest(): Promise<void> {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const sock = ws;
+  if (!sock || sock.readyState !== WebSocket.OPEN) return;
+  const version = manifestVersion;
   const entries = await buildManifest();
-  ws.send(JSON.stringify({ type: 'manifest', version: manifestVersion, entries }));
+  // A source can lazy-load while the manifest builds. Meanwhile the socket can
+  // close (onclose nulls `ws`, and a send on it threw an uncaught TypeError),
+  // the bus can reconnect, or a newer source can register. Each of those starts
+  // its own publish: a reconnected socket publishes on open, and a registration
+  // publishes itself. So this build sends only when its socket and version are
+  // still current, and a socket never gets a duplicate or an older manifest.
+  if (ws !== sock || sock.readyState !== WebSocket.OPEN || version !== manifestVersion) return;
+  sock.send(JSON.stringify({ type: 'manifest', version, entries }));
 }
 
 /** Mirror a host-side value move to XR so its widget follows theDAW state. */

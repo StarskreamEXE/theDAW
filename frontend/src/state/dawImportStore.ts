@@ -16,6 +16,7 @@ import { usePerformRoutingStore } from './performRouting';
 import { useProjectStore } from './projectStore';
 import { logError, logInfo } from './logStore';
 import { useStatusBarStore } from './statusBarStore';
+import type { PostStatusOptions } from './statusNoticeStore';
 
 interface DawImportState {
   isOpen: boolean;
@@ -39,7 +40,7 @@ interface DawImportState {
   reset: () => void;
 }
 
-const status = (text: string) => useStatusBarStore.getState().setText(text);
+const status = (text: string, options?: PostStatusOptions) => useStatusBarStore.getState().setText(text, options);
 
 export const useDawImportStore = create<DawImportState>()((set, get) => ({
   isOpen: false,
@@ -79,14 +80,15 @@ export const useDawImportStore = create<DawImportState>()((set, get) => ({
       } else if (hasHint(detected.daw)) {
         const hint = await dawApi.hint(detected.daw);
         set({ hint, busy: false });
-        status(`${detected.daw.toUpperCase()}: export-to-audio required`);
+        // The label is the DAW's name, so the level is given here.
+        status(`${detected.daw.toUpperCase()}: export-to-audio required`, { level: 'warn' });
       } else {
         set({ busy: false, error: `Unsupported project type: ${detected.format || 'unknown'}` });
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Import failed.';
       set({ busy: false, error: msg });
-      status(`IMPORT FAILED: ${msg}`);
+      status(`IMPORT FAILED: ${msg}`, { source: 'dawimport' });
       logError('dawimport', msg);
     }
   },
@@ -116,7 +118,7 @@ export const useDawImportStore = create<DawImportState>()((set, get) => ({
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Failed to open .tasmo.';
       set({ busy: false, error: msg });
-      status(`OPEN FAILED: ${msg}`);
+      status(`OPEN FAILED: ${msg}`, { source: 'dawimport' });
       logError('dawimport', msg);
     }
   },
@@ -169,7 +171,7 @@ export const useDawImportStore = create<DawImportState>()((set, get) => ({
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Import into theDAW failed.';
       set({ busy: false, error: msg });
-      status(`IMPORT FAILED: ${msg}`);
+      status(`IMPORT FAILED: ${msg}`, { source: 'dawimport' });
       logError('dawimport', msg);
     }
   },

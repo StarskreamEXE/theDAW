@@ -75,6 +75,11 @@ def parse_score_path(path: str, display_name: str | None = None) -> dict[str, An
         raise RuntimeError("music21 is not installed") from e
 
     score = converter.parse(str(src))
+    # A sheet engraved here prints its tempo as a whole number and carries the
+    # exact tempo in <sound tempo>, which music21 does not read back.
+    from backend.modules.notation.tempo_marks import restore_sounding_tempi
+
+    restore_sounding_tempi(score, src)
 
     # Play out repeats / D.C. / D.S. so the imported roll matches the full piece.
     try:

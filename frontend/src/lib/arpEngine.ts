@@ -15,8 +15,10 @@
 import { getEngineCtx, getMasterGain } from '../state/playerStore';
 import { DEFAULT_METER_MAP, barAt, stepsPerBar, type MeterSegment } from './meterMap';
 import { triggerActiveVoice } from './midiSynth';
+import { ARP_LIVE_CHANNEL, BEND_CENTER, DEFAULT_BEND_RANGE, loopedBendAutomation, loopedWheelEvents, type PlayedBend } from './pitchBend';
+import { BEND_TAIL_SEC, type VoiceBend } from './pitchBendVoice';
 import { isSoundfontActive, getActiveProgram } from './soundfontEngine';
-import { previewNoteSF } from './soundfontEngine';
+import { previewNoteSF, sfPitchWheel, sfPitchWheelRange } from './soundfontEngine';
 
 /* ── music theory ─────────────────────────────────────────────────────────── */
 
@@ -340,6 +342,13 @@ export class ArpPlayerEngine {
   private chordStep = 0;
   private bassActive = false;
   private meter: ArpMeter | undefined;
+  /** The curve the voices follow (the roll's lane A as it plays), looping every `bendPeriod` steps. */
+  private bend: PlayedBend | null = null;
+  private bendPeriod = 0;
+  /** The soundfont wheel: the range last sent on ARP_LIVE_CHANNEL (null when untouched), the latest message time, and whether the next step first sends where the curve is. */
+  private wheelRange: number | null = null;
+  private lastWheelTime = 0;
+  private wheelFresh = true;
 
   onTick: ((t: ArpTick) => void) | null = null;
   onStop: (() => void) | null = null;
@@ -347,6 +356,20 @@ export class ArpPlayerEngine {
   /** Count the rag's odd 16ths from each bar start of `meter`; undefined restores 4/4 from step 0. */
   setMeter(meter?: ArpMeter): void {
     this.meter = meter;
+  }
+
+  /**
+   * Follow a pitch bend: `bend` is the roll's lane A curve as the roll plays it,
+   * looping every `periodSteps` (the roll's length), and the arpeggiator's step
+   * counter is its place on that curve. A built-in voice follows it through
+   * automation; the soundfont through the wheel of ARP_LIVE_CHANNEL, the
+   * channel the arpeggiator's soundfont notes play on. Null plays unbent.
+   */
+  setBend(bend: PlayedBend | null | undefined, periodSteps: number): void {
+    this.bend = bend && bend.points.length && periodSteps > 0 ? bend : null;
+    this.bendPeriod = periodSteps;
+    this.wheelFresh = true;
+    if (!this.bend) this._releaseWheel();
   }
 
   constructor(cfg: Partial<ArpConfig> = {}) {
@@ -399,6 +422,7 @@ export class ArpPlayerEngine {
     this.step = 0;
     this.chordStep = 0;
     this.bassActive = false;
+    this.wheelFresh = true;
     this.nextNoteTime = ctx.currentTime + 0.06;
     this._tick();
   }
@@ -410,22 +434,58 @@ export class ArpPlayerEngine {
       window.clearInterval(this.timer);
       this.timer = null;
     }
+    this._releaseWheel();
     this.onStop?.();
   }
 
-  private _voice(midi: number, when: number, duration: number, velocity: number): void {
+  /** `pos` is the step the voice belongs to, which sounds on the grid at `gridTime`; swing and humanize move `when`, not the curve. */
+  private _voice(midi: number, when: number, duration: number, velocity: number, pos: number, gridTime: number): void {
     const ctx = getEngineCtx();
     if (isSoundfontActive()) {
-      const delayMs = Math.max(0, (when - ctx.currentTime) * 1000);
-      window.setTimeout(() => void previewNoteSF(midi, velocity, duration), delayMs);
+      // Timed at `when` on the arpeggiator's own channel, which _scheduleWheel bends for the same times.
+      void previewNoteSF(midi, velocity, duration, ARP_LIVE_CHANNEL, when);
       return;
     }
     void getActiveProgram();
-    triggerActiveVoice(ctx, getMasterGain(), midi, velocity, when, duration, 0.85);
+    let bend: VoiceBend | undefined;
+    if (this.bend) {
+      const stepSec = this.stepDur();
+      const { events, originStep } = loopedBendAutomation(this.bend, this.bendPeriod, pos + (when - gridTime) / stepSec, (duration + BEND_TAIL_SEC) / stepSec);
+      bend = { events, originStep, stepSec };
+    }
+    triggerActiveVoice(ctx, getMasterGain(), midi, velocity, when, duration, 0.85, bend);
   }
 
-  /** Schedule one 16th step, mirroring the original scheduleRepeat body. */
-  private _scheduleStep(when: number): void {
+  /** The arpeggiator channel's wheel messages for grid step `pos`, which sounds at `gridTime`, when the soundfont plays and a bend is set. */
+  private _scheduleWheel(pos: number, gridTime: number): void {
+    if (!this.bend || !isSoundfontActive()) return;
+    const stepSec = this.stepDur();
+    if (this.wheelRange !== this.bend.range) {
+      sfPitchWheelRange(ARP_LIVE_CHANNEL, this.bend.range);
+      this.wheelRange = this.bend.range;
+    }
+    const now = getEngineCtx().currentTime;
+    for (const e of loopedWheelEvents(this.bend.points, this.bendPeriod, pos, pos + 1, this.wheelFresh, this.bend.range)) {
+      const t = Math.max(now, gridTime + (e.abs - pos) * stepSec);
+      sfPitchWheel(ARP_LIVE_CHANNEL, e.raw, t);
+      this.lastWheelTime = Math.max(this.lastWheelTime, t);
+    }
+    this.wheelFresh = false;
+  }
+
+  /** The arpeggiator channel's wheel back at the centre and the default range, after every message already sent. */
+  private _releaseWheel(): void {
+    if (this.wheelRange === null) return;
+    const at = Math.max(getEngineCtx().currentTime, this.lastWheelTime) + 0.001;
+    sfPitchWheel(ARP_LIVE_CHANNEL, BEND_CENTER, at);
+    sfPitchWheelRange(ARP_LIVE_CHANNEL, DEFAULT_BEND_RANGE, at);
+    this.wheelRange = null;
+  }
+
+  /** Schedule one 16th step, mirroring the original scheduleRepeat body. `gridTime` is the step's time before swing and humanize. */
+  private _scheduleStep(when: number, gridTime: number = when): void {
+    const pos = this.step;
+    this._scheduleWheel(pos, gridTime);
     const chordCount = this.cfg.chords.length;
     const arpLen = Math.max(1, this.arpeggio.length);
     const currChord = this.chordStep % chordCount;
@@ -445,7 +505,7 @@ export class ArpPlayerEngine {
       const bassOctave = chord.rel_octave + 2;
       const bassMidiVal = noteNameToMidi(chord.note, bassOctave);
       const bassDur = arpLen * this.cfg.arpRepeat * this.stepDur();
-      this._voice(bassMidiVal, when, bassDur * 0.96, 96);
+      this._voice(bassMidiVal, when, bassDur * 0.96, 96, pos, gridTime);
       bassMidi = bassMidiVal;
     }
 
@@ -456,7 +516,7 @@ export class ArpPlayerEngine {
     }
 
     const trebleMidi = noteNameToMidi(arpNote.note, arpNote.rel_octave + this.cfg.octaveBase);
-    this._voice(trebleMidi, when, this.stepDur() * 0.9, 104);
+    this._voice(trebleMidi, when, this.stepDur() * 0.9, 104, pos, gridTime);
 
     this.onTick?.({ when, chordIndex: currChord, trebleMidi, bassMidi });
   }
@@ -474,7 +534,7 @@ export class ArpPlayerEngine {
       // (incremented inside _scheduleStep).
       const swingOff = ragOffsetSteps(this.step, this.cfg.swing, this.meter) * dur;
       const humanize = (1 - this.cfg.quantize) * (Math.random() - 0.5) * dur * 0.5;
-      this._scheduleStep(this.nextNoteTime + swingOff + humanize);
+      this._scheduleStep(this.nextNoteTime + swingOff + humanize, this.nextNoteTime);
       this.nextNoteTime += dur;
     }
   };

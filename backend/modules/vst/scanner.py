@@ -282,6 +282,8 @@ def _probe_subprocess(path: str, timeout_s: float) -> tuple[str, dict | None]:
             capture_output=True,
             timeout=timeout_s,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             creationflags=flags,
             env=child_env(),
         )

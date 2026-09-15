@@ -22,7 +22,7 @@
  * VST / gan sessions do close on tab switch (existing app-wide rules) and
  * their windows degrade to the reopen card.
  */
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { create } from 'zustand';
 import {
@@ -51,17 +51,38 @@ export type FxScope =
 
 const scopeKey = (s: FxScope): string => (s.kind === 'track' ? `track:${s.trackId}` : s.kind);
 
-export function chainForScope(scope: FxScope): ChainEntry[] {
-  const st = useEditorStore.getState();
+/** The chain of a lane that has never had an insert. One shared array, so a
+ *  store selector that resolves to it returns the same reference on every read.
+ *  Frozen and read-only, so a write to it throws before it can reach every
+ *  chainless lane. */
+const NO_ENTRIES: readonly ChainEntry[] = Object.freeze([]);
+
+/** The chain a scope names in a given editor state. A track gets `fxChain`
+ *  only when something first writes it, so every new lane (MIDI, audio or
+ *  empty) resolves to NO_ENTRIES. FxChainList subscribes through this: a new
+ *  `[]` per read made useSyncExternalStore see a changed snapshot on every
+ *  check, re-render without end and throw "Maximum update depth exceeded" the
+ *  moment the rack opened on such a lane, which unmounted the whole app. */
+export function chainInState(
+  st: ReturnType<typeof useEditorStore.getState>,
+  scope: FxScope,
+): readonly ChainEntry[] {
   if (scope.kind === 'master') return st.masterFxChain;
   if (scope.kind === 'masterVst') return st.masterVstChain;
-  return st.tracks.find((t) => t.id === scope.trackId)?.fxChain ?? [];
+  return st.tracks.find((t) => t.id === scope.trackId)?.fxChain ?? NO_ENTRIES;
 }
 
-/** One label resolver for every effect kind — mirrors MIX's chain cards. */
+export function chainForScope(scope: FxScope): readonly ChainEntry[] {
+  return chainInState(useEditorStore.getState(), scope);
+}
+
+/** One label resolver for every effect kind. A rack effect takes its rack label,
+ *  the same one the Add effect select and the header menu list, so an id shared
+ *  with a backend effect ('delay': "Delay", the backend's "Stereo Delay") reads
+ *  the same in the menu and in its row. */
 export function effectEntryLabel(entry: ChainEntry): string {
   if (entry.vst) return entry.vst.plugin_name;
-  return EFFECT_LABELS[entry.effect] || getRackEffect(entry.effect)?.label || entry.label || entry.effect;
+  return getRackEffect(entry.effect)?.label || EFFECT_LABELS[entry.effect] || entry.label || entry.effect;
 }
 
 const entryKind = (entry: ChainEntry): 'vst' | 'gan' | 'fx' =>
@@ -76,6 +97,16 @@ interface EffectWindowRec {
   /** Viewport px; null until first drag → cascaded default position. */
   x: number | null;
   y: number | null;
+  /** Viewport px beside the FX list the window opened from; null when it
+   *  opened from elsewhere, and it then opens at the right edge. */
+  ox: number | null;
+  oy: number | null;
+}
+
+/** The viewport point an effect window opens at until it is dragged. */
+export interface EffectWindowOrigin {
+  x: number;
+  y: number;
 }
 
 interface EffectWindowState {
@@ -84,7 +115,7 @@ interface EffectWindowState {
   /** The 'ares' entry currently driving the one app-wide gan session. */
   aresOwnerEntryId: string | null;
   aresOwnerScope: FxScope | null;
-  open: (scope: FxScope, entryId: string) => void;
+  open: (scope: FxScope, entryId: string, origin?: EffectWindowOrigin) => void;
   close: (entryId: string) => void;
   bringToFront: (entryId: string) => void;
   move: (entryId: string, x: number, y: number) => void;
@@ -96,14 +127,17 @@ export const useEffectWindowStore = create<EffectWindowState>((set, get) => ({
   topZ: 80,
   aresOwnerEntryId: null,
   aresOwnerScope: null,
-  open: (scope, entryId) => {
+  open: (scope, entryId, origin) => {
     const s = get();
     if (s.windows.some((w) => w.entryId === entryId)) {
       s.bringToFront(entryId);
       return;
     }
     set({
-      windows: [...s.windows, { entryId, scope, z: s.topZ + 1, x: null, y: null }],
+      windows: [
+        ...s.windows,
+        { entryId, scope, z: s.topZ + 1, x: null, y: null, ox: origin?.x ?? null, oy: origin?.y ?? null },
+      ],
       topZ: s.topZ + 1,
     });
   },
@@ -156,8 +190,9 @@ export function openEffectWindow(
   scope: FxScope,
   entry: ChainEntry,
   openVst: (scope: FxScope, entry: ChainEntry) => void,
+  origin?: EffectWindowOrigin,
 ): void {
-  useEffectWindowStore.getState().open(scope, entry.id);
+  useEffectWindowStore.getState().open(scope, entry.id, origin);
   if (entry.vst) openVst(scope, entry);
   else if (entry.effect === 'ares') takeAresOwnership(scope, entry.id);
 }
@@ -263,8 +298,24 @@ const EffectWindowCard: React.FC<{
           : { width: 'min(540px, 92vw)', maxHeight: '78vh' }
         : { width: 'min(500px, 92vw)', maxHeight: '78vh' };
 
-  const defaultX = 110 + (index % 6) * 40;
-  const defaultY = 96 + (index % 6) * 34;
+  // An undragged window opens beside the FX list it came from, or at the right
+  // edge when it opened from elsewhere, clear of the track headers either way.
+  // CSS clamp keeps it on screen without measuring. The offsets cascade windows
+  // opened one after another; the vertical one sits outside the clamp, so each
+  // window's title bar and close button stay clear of the next window.
+  const cascade = index % 6;
+  const widthCss = String(size.width);
+  const heightCss = String(size.height ?? size.maxHeight ?? '200px');
+  const position: React.CSSProperties =
+    win.x != null && win.y != null
+      ? { left: win.x, top: win.y }
+      : {
+          left:
+            win.ox != null
+              ? `clamp(8px, ${win.ox + cascade * 40}px, calc(100vw - ${widthCss} - 8px))`
+              : `max(8px, calc(100vw - ${widthCss} - ${48 + cascade * 40}px))`,
+          top: `calc(clamp(8px, ${win.oy ?? 96}px, calc(100vh - ${heightCss} - 8px)) + ${cascade * 34}px)`,
+        };
 
   const startDrag = (e: React.PointerEvent) => {
     const el = rootRef.current;
@@ -302,7 +353,7 @@ const EffectWindowCard: React.FC<{
       role="dialog"
       aria-label={`${label} controls`}
       className={`fixed hardware-card bg-black/95 border ${tint.border} rounded-lg shadow-2xl flex flex-col overflow-hidden`}
-      style={{ left: win.x ?? defaultX, top: win.y ?? defaultY, zIndex: win.z, ...size }}
+      style={{ ...position, zIndex: win.z, ...size }}
       onMouseDown={() => bringToFront(win.entryId)}
     >
       {/* Title bar — the drag handle. Same chrome for every effect kind. */}
@@ -313,7 +364,7 @@ const EffectWindowCard: React.FC<{
         {kind === 'vst' ? <Plug className={`w-3.5 h-3.5 ${tint.text}`} />
           : kind === 'gan' ? <Blocks className={`w-3.5 h-3.5 ${tint.text}`} />
             : <SlidersHorizontal className={`w-3.5 h-3.5 ${tint.text}`} />}
-        <span className={`text-[10px] font-mono uppercase tracking-wider truncate ${tint.text}`}>{label}</span>
+        <span className={`font-display text-xs font-bold uppercase tracking-wider truncate ${tint.text}`}>{label}</span>
         {win.scope.kind !== 'masterVst' && kind !== 'vst' && (
           <button
             onClick={() => toggleEntry(win.scope, entry.id)}
@@ -349,12 +400,12 @@ const EffectWindowCard: React.FC<{
         ) : (
           <div className="p-4 flex flex-col items-center gap-2 text-center">
             <Plug className="w-5 h-5 text-teal-300/60" />
-            <span className="text-[10px] font-mono text-zinc-400">
+            <span className="font-sans text-xs font-bold text-zinc-400">
               {entry.vst?.raw_state ? 'Custom settings saved.' : 'Native editor closed.'}
             </span>
             <button
               onClick={() => host.openVst(win.scope, entry)}
-              className="px-3 py-1.5 rounded border border-teal-500/40 bg-teal-500/15 text-teal-200 hover:bg-teal-500/25 text-[9px] font-black uppercase tracking-widest"
+              className="px-3 py-1.5 rounded border border-teal-500/40 bg-teal-500/15 text-teal-200 hover:bg-teal-500/25 font-display text-xs font-bold uppercase tracking-wider"
             >
               Open plugin GUI
             </button>
@@ -372,12 +423,12 @@ const EffectWindowCard: React.FC<{
           <div className="p-2 overflow-y-auto min-h-0 flex flex-col gap-2">
             <div className="flex items-center gap-2 rounded border border-indigo-500/20 bg-indigo-500/5 px-2 py-1.5">
               <Blocks className="w-4 h-4 text-indigo-300/70 shrink-0" />
-              <span className="text-[9px] font-mono text-zinc-400 flex-1 min-w-0 truncate">
+              <span className="font-sans text-xs font-bold text-zinc-400 flex-1 min-w-0 truncate">
                 {aresOwnerEntryId ? 'The surface is driving another Ares insert.' : 'Surface closed — knobs below drive this insert directly.'}
               </span>
               <button
                 onClick={() => takeAresOwnership(win.scope, entry.id)}
-                className="shrink-0 px-2 py-1 rounded border border-indigo-500/40 bg-indigo-500/15 text-indigo-200 hover:bg-indigo-500/25 text-[9px] font-black uppercase tracking-widest"
+                className="shrink-0 px-2 py-1 rounded border border-indigo-500/40 bg-indigo-500/15 text-indigo-200 hover:bg-indigo-500/25 font-display text-xs font-bold uppercase tracking-wider"
               >
                 {aresOwnerEntryId ? 'Take over surface' : 'Open surface'}
               </button>
@@ -470,8 +521,8 @@ export const EffectWindowsHost: React.FC<EffectWindowsHostProps> = (props) => {
 
 export interface FxChainListProps {
   scope: FxScope;
-  /** Open (or focus) an entry's control window. */
-  onOpenEntry: (scope: FxScope, entry: ChainEntry) => void;
+  /** Open (or focus) an entry's control window at `origin`, beside this list. */
+  onOpenEntry: (scope: FxScope, entry: ChainEntry, origin?: EffectWindowOrigin) => void;
   /** Add a built-in rack effect (undefined hides the rack-add select). */
   onAddEffect?: (effectId: string) => void;
   /** Add a VST3 (undefined hides the plugin browser). */
@@ -480,13 +531,11 @@ export interface FxChainListProps {
   vstScanning?: boolean;
   onRescanVst?: () => void;
   emptyHint?: string;
+  /** Scroll the rows inside whatever height the holding panel leaves them, and
+   *  keep the add controls below the rows in view. For a flex-column panel with
+   *  a max-height, such as EDIT's track FX rack. */
+  scrollRows?: boolean;
 }
-
-// Stable reference for the "no chain yet" case. Returning a fresh `[]` from the
-// zustand selector below makes useSyncExternalStore see a new snapshot every
-// render (reference equality) → "getSnapshot should be cached" → infinite
-// re-render loop. One shared empty array keeps the snapshot stable.
-const EMPTY_CHAIN: readonly ChainEntry[] = Object.freeze([]);
 
 export const FxChainList: React.FC<FxChainListProps> = ({
   scope,
@@ -497,22 +546,43 @@ export const FxChainList: React.FC<FxChainListProps> = ({
   vstScanning = false,
   onRescanVst,
   emptyHint = 'No effects yet — add one below.',
+  scrollRows = false,
 }) => {
-  // Subscribe so rows live-update with the chain.
-  const chain = useEditorStore((s) => {
-    if (scope.kind === 'master') return s.masterFxChain;
-    if (scope.kind === 'masterVst') return s.masterVstChain;
-    return s.tracks.find((t) => t.id === scope.trackId)?.fxChain ?? EMPTY_CHAIN;
-  });
+  // Subscribe so rows live-update with the chain. chainInState returns a stable
+  // reference for a lane with no chain yet; see its comment.
+  const chain = useEditorStore((s) => chainInState(s, scope));
   const openWindows = useEffectWindowStore((s) => s.windows);
   const [showVstBrowser, setShowVstBrowser] = useState(false);
+  const addEffectId = `fx-add-effect-${useId()}`;
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const rowsRef = useRef<HTMLDivElement | null>(null);
+  // A row added while the rows scroll lands at the bottom, out of view; bring
+  // it into view so the effect just added is the one on screen.
+  const rowCountRef = useRef(chain.length);
+  useLayoutEffect(() => {
+    const grew = chain.length > rowCountRef.current;
+    rowCountRef.current = chain.length;
+    const rows = rowsRef.current;
+    if (grew && scrollRows && rows) rows.scrollTop = rows.scrollHeight;
+  }, [chain.length, scrollRows]);
+  // Where a row's control window opens: just right of the panel holding this
+  // list (the list sits inside the panel's 12px padding), level with the list.
+  const windowOrigin = (): EffectWindowOrigin | undefined => {
+    const r = listRef.current?.getBoundingClientRect();
+    return r ? { x: Math.round(r.right + 20), y: Math.round(r.top) } : undefined;
+  };
 
   return (
-    <div className="flex flex-col gap-1.5">
+    <div ref={listRef} className={`flex flex-col gap-1.5 ${scrollRows ? 'min-h-0' : ''}`}>
       {chain.length === 0 ? (
-        <p className="text-[9px] text-zinc-600 italic">{emptyHint}</p>
+        <p className="font-sans text-xs font-bold text-zinc-500">{emptyHint}</p>
       ) : (
-        <div className="flex flex-col gap-1">
+        // A scrolling list shows a visible thumb: the app's 5px bg-white/5 thumb
+        // does not show, and a cut-off list then reads as the whole chain.
+        <div
+          ref={rowsRef}
+          className={`flex flex-col gap-1 ${scrollRows ? 'min-h-7 overflow-y-auto pr-0.5 [scrollbar-width:thin] [scrollbar-color:rgba(168,85,247,0.8)_rgba(255,255,255,0.08)]' : ''}`}
+        >
           {chain.map((entry, i) => {
             const kind = entryKind(entry);
             const tint = KIND_TINT[kind];
@@ -539,14 +609,14 @@ export const FxChainList: React.FC<FxChainListProps> = ({
                 )}
                 {/* Row body — clicking opens the entry's control window. */}
                 <button
-                  onClick={() => onOpenEntry(scope, entry)}
+                  onClick={() => onOpenEntry(scope, entry, windowOrigin())}
                   title={`Open ${effectEntryLabel(entry)} controls`}
                   className="flex-1 min-w-0 flex items-center gap-1.5 text-left"
                 >
-                  <span className="flex-1 min-w-0 text-[9px] font-mono text-zinc-200 truncate">
+                  <span className="flex-1 min-w-0 font-sans text-xs font-bold text-zinc-200 truncate">
                     {effectEntryLabel(entry)}
                   </span>
-                  <span className={`shrink-0 text-[7px] font-black uppercase tracking-widest px-1 rounded border ${tint.border} ${tint.text} bg-black/40`}>
+                  <span className={`shrink-0 font-display text-xs font-bold uppercase tracking-wide px-1 rounded border ${tint.border} ${tint.text} bg-black/40`}>
                     {kind === 'vst' ? 'VST' : kind === 'gan' ? 'GAN' : 'FX'}
                   </span>
                 </button>
@@ -581,30 +651,34 @@ export const FxChainList: React.FC<FxChainListProps> = ({
 
       {/* ONE add area: built-ins and VSTs together, no separate sections. */}
       {(onAddEffect || onAddVst) && (
-        <div className="flex flex-col gap-1 border-t border-white/10 pt-1.5">
+        <div className="shrink-0 flex flex-col gap-1 border-t border-white/10 pt-1.5">
           <div className="flex items-center gap-1.5">
             {onAddEffect && (
-              <select
-                value=""
-                aria-label="Add effect"
-                onChange={(e) => {
-                  if (e.target.value) onAddEffect(e.target.value);
-                  e.target.value = '';
-                }}
-                className="form-select flex-1 min-w-0 px-1.5 py-1 text-[10px]"
-              >
-                <option value="">+ Add effect…</option>
-                {RACK_EFFECTS.map((def) => (
-                  <option key={def.id} value={def.id}>{def.label}</option>
-                ))}
-              </select>
+              <>
+                <label htmlFor={addEffectId} className="sr-only">Add effect</label>
+                <select
+                  id={addEffectId}
+                  name="fx-add-effect"
+                  value=""
+                  onChange={(e) => {
+                    if (e.target.value) onAddEffect(e.target.value);
+                    e.target.value = '';
+                  }}
+                  className="form-select flex-1 min-w-0 px-1.5 py-1 font-sans font-bold text-xs"
+                >
+                  <option value="">+ Add effect…</option>
+                  {RACK_EFFECTS.map((def) => (
+                    <option key={def.id} value={def.id}>{def.label}</option>
+                  ))}
+                </select>
+              </>
             )}
             {onAddVst && (
               <button
                 onClick={() => setShowVstBrowser((v) => !v)}
                 aria-pressed={showVstBrowser}
                 title="Add a VST3 plugin"
-                className={`shrink-0 inline-flex items-center gap-1 px-2 py-1 rounded border text-[9px] font-black uppercase tracking-widest transition-colors ${
+                className={`shrink-0 inline-flex items-center gap-1 px-2 py-1 rounded border font-display text-xs font-bold uppercase tracking-wider transition-colors ${
                   showVstBrowser ? 'border-teal-500/40 bg-teal-500/15 text-teal-200' : 'border-white/10 text-zinc-400 hover:bg-white/5 hover:text-white'
                 }`}
               >
@@ -615,20 +689,21 @@ export const FxChainList: React.FC<FxChainListProps> = ({
           {onAddVst && showVstBrowser && (
             <div className="flex flex-col gap-0.5">
               <div className="flex items-center justify-between">
-                <span className="mono-label">Plugins ({vstPlugins.length})</span>
+                <span className="font-display text-xs font-bold uppercase tracking-wider text-zinc-400">Plugins ({vstPlugins.length})</span>
                 {onRescanVst && (
                   <button
                     onClick={onRescanVst}
                     disabled={vstScanning}
                     className="btn-ghost inline-flex items-center gap-1 disabled:opacity-40"
                     title="Rescan VST3 folders"
+                    aria-label="Rescan VST3 folders"
                   >
                     {vstScanning ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
                   </button>
                 )}
               </div>
               {vstPlugins.length === 0 ? (
-                <p className="text-[8px] font-mono text-zinc-600 leading-relaxed">
+                <p className="font-sans text-xs font-bold text-zinc-500 leading-relaxed">
                   {vstScanning ? 'Scanning…' : 'No VST3 plugins found. Set your plugin folders in Settings, then rescan.'}
                 </p>
               ) : (
@@ -640,7 +715,7 @@ export const FxChainList: React.FC<FxChainListProps> = ({
                         key={pl.path}
                         onClick={() => onAddVst(pl)}
                         title={inChain ? `Open ${pl.name} controls` : `Insert ${pl.name}`}
-                        className={`flex items-center gap-1.5 text-left px-1.5 py-1 rounded text-[9px] font-mono truncate transition-colors border ${
+                        className={`flex items-center gap-1.5 text-left px-1.5 py-1 rounded font-sans text-xs font-bold truncate transition-colors border ${
                           inChain ? 'bg-teal-500/15 text-teal-300 border-teal-500/30' : 'text-zinc-400 hover:bg-white/5 hover:text-white border-transparent'
                         }`}
                       >

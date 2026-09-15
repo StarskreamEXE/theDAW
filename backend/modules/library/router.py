@@ -234,6 +234,21 @@ def get_entry(entry_id: str) -> dict[str, Any]:
     return data
 
 
+@router.get("/entries/{entry_id}/path")
+def get_entry_audio_path(entry_id: str) -> dict[str, Any]:
+    """The absolute path of an entry's audio file on this machine.
+
+    The footer's track menu reads it for Show in folder and Copy file path. A
+    reference-in-place import resolves to the file where the user keeps it."""
+    store = get_store()
+    if store.get_entry(entry_id) is None:
+        raise HTTPException(404, f"Entry {entry_id!r} not found")
+    audio_path = store.get_audio_path(entry_id)
+    if audio_path is None or not audio_path.is_file():
+        raise HTTPException(404, f"Entry {entry_id!r} has no audio file on disk")
+    return {"id": entry_id, "path": str(audio_path.resolve())}
+
+
 @router.get("/audio/{entry_id}")
 async def stream_audio(entry_id: str) -> Response:
     # CHANGED: support CDN-backed entries — if no local file exists but
