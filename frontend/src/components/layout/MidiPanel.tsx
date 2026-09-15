@@ -18,6 +18,7 @@
  * inside the REC key. No synthesis here.
  */
 
+import { useMidiSongBoxRequest } from '../../state/midiSongBoxStore';
 import {
   Activity,
   AudioLines,
@@ -274,6 +275,18 @@ export const MidiPanel: React.FC = () => {
     setAssetQuery(title);
     setAssetOpen(false);
   }, []);
+
+  // A song sent from outside the dock (the footer track menu) replaces whatever
+  // the box holds, and the Vocal2MIDI column that shows the box comes on. A
+  // request made while the tab was closed is taken when the panel mounts.
+  const songBoxRequest = useMidiSongBoxRequest((s) => s.pending);
+  useEffect(() => {
+    if (!songBoxRequest) return;
+    useMidiSongBoxRequest.getState().consume();
+    const requested = useLibraryStore.getState().entries.find((e) => e.id === songBoxRequest);
+    pickAsset(songBoxRequest, requested?.title ?? songBoxRequest);
+    setVoiceOn(true);
+  }, [songBoxRequest, pickAsset, setVoiceOn]);
 
   // Library entries whose title matches the current search text (cap the list).
   const assetMatches = (() => {

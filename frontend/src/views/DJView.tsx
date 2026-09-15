@@ -44,6 +44,7 @@ import type { SurfaceLayout } from '../state/surfaceLayoutStore';
 import { useAppUiStore } from '../state/appUiStore';
 import { useSetlistStore, type SetlistEntry } from '../state/setlistStore';
 import { useDjAutomix } from '../state/djAutomixStore';
+import { useDjDeckLoad } from '../state/djDeckLoadStore';
 import { useLibraryStore } from '../state/libraryStore';
 import type { LibraryEntry } from '../state/libraryStore';
 import { useDjAnalysisStore } from '../state/djAnalysisStore';
@@ -913,6 +914,15 @@ export const DJView: React.FC = () => {
     useDjAutomix.getState().consumeStop();
     setAutomixOn(false);
   }, [automixPendingStop]);
+
+  // Deck-load bridge: the footer track menu asked for a library entry on a
+  // deck. A request made while DJ was closed lands here when the tab mounts.
+  const deckLoadPending = useDjDeckLoad((s) => s.pending);
+  useEffect(() => {
+    if (!deckLoadPending) return;
+    useDjDeckLoad.getState().consume();
+    (deckLoadPending.deck === 'A' ? setDeckATrack : setDeckBTrack)(deckLoadPending.entryId);
+  }, [deckLoadPending]);
 
   // Automix (D7): auto-sequence the active set across the 2 decks — beatmatch
   // the next track and crossfade at each tail, then advance. Pure orchestration

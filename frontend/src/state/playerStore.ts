@@ -40,6 +40,10 @@ let _monitor: GainNode | null = null;
 let _audioEl: HTMLAudioElement | null = null;
 let _mediaSrc: MediaElementAudioSourceNode | null = null;
 let _objectUrl: string | null = null;
+// What load() put behind _objectUrl. The live editor mixer writes the store's
+// label and entry id without loading anything, so the URL only belongs to the
+// track on screen while these still match the store (see getLoadedAudioUrl).
+let _loadedMeta: { label: string; entryId: string | null } | null = null;
 // Set by load() to a real library entry id; the first 'play' event after a
 // load counts one play for it (then clears, so resume/seek do not re-count).
 let _pendingPlayCountId: string | null = null;
@@ -316,6 +320,20 @@ export const setQueueOnEnded = (cb: (() => void) | null): void => {
   _onEnded = cb;
 };
 
+/**
+ * The object URL of the bytes the footer track was loaded from, or null when
+ * the track on screen has none: nothing loaded yet, or the EDIT timeline
+ * playing live through the mixer (it writes the store's label and entry id
+ * without calling load()). `fetch()` on the URL returns the Blob, which is how
+ * a stem, a MIX render or the MIDI beat reaches the footer's track menu.
+ */
+export const getLoadedAudioUrl = (): string | null => {
+  if (!_objectUrl || !_loadedMeta) return null;
+  const { currentLabel, currentEntryId, hasTrack } = usePlayerStore.getState();
+  if (!hasTrack || currentLabel !== _loadedMeta.label || currentEntryId !== _loadedMeta.entryId) return null;
+  return _objectUrl;
+};
+
 // Auto-warm-up: the first time the user interacts with the page in
 // ANY way (click / keydown / pointerdown / touchstart), flip the gesture
 // flag and resume any suspended AudioContext. Eliminates the console
@@ -406,6 +424,7 @@ export const usePlayerStore = create<PlayerStoreState>()((set, get) => ({
       _objectUrl = null;
     }
     _objectUrl = URL.createObjectURL(blob);
+    _loadedMeta = { label: meta.label, entryId: meta.entryId ?? null };
     audioEl.src = _objectUrl;
     audioEl.loop = get().isLooping;
     set({

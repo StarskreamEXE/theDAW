@@ -90,6 +90,9 @@ export async function sendAudioToEditor(
       durationSec: duration,
       startSec: tail,
       color: trackColor,
+      // Keeps the clip tied to its library entry, so EDIT's Separate Stems
+      // reuses that entry's cached stems instead of importing the clip again.
+      libraryEntryId: audio.entryId,
     });
     editor.cachePeaks(clipId, peaks);
     return clipId;

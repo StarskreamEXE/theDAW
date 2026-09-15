@@ -13,6 +13,7 @@ import { SlideTrack } from './SlideTrack';
 import { SemanticWave } from './SemanticWave';
 import { MetamorphPanel } from './MetamorphPanel';
 import { useMorphStore } from '../../state/morphEngine';
+import { useMetamorphPanelRequest } from '../../state/metamorphPanelRequestStore';
 import { MagentaToolStage } from './MagentaToolStage';
 import { MAGENTA_TOOLS, magentaToolById, type MagentaTool } from '../../lib/magentaToolCatalog';
 import { AutomationLane } from './AutomationLane';
@@ -1699,6 +1700,15 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     }
     return [];
   }, [clips, selectedClipIds, selectedTrackIds, selectedClipId]);
+
+  // The footer track menu loads Metamorph A or B from outside EDIT and asks for
+  // the panel; a request made before EDIT mounted is taken on mount.
+  const metamorphRequested = useMetamorphPanelRequest((s) => s.pending);
+  useEffect(() => {
+    if (!metamorphRequested) return;
+    useMetamorphPanelRequest.getState().consume();
+    setShowMetamorph(true);
+  }, [metamorphRequested]);
 
   // ── Granular bleed straight from the clip menu ─────────────────────────
   // Metamorph (granular identity bleed) used to live only in the TOOLS
