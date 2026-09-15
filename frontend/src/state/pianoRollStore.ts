@@ -132,6 +132,32 @@ interface PianoRollState {
    *  Lanes given take the bends of lanes that go with them, and a lane that
    *  arrives starts unbent (MATCH, and the METER face's ADD LANE). */
   applyMeter: (meter: Partial<RollMeter>, merge?: boolean) => void;
+
+  // Undo / redo. Snapshots capture the document slices below; because every
+  // mutation replaces arrays immutably, a snapshot just references the prior
+  // arrays (no cloning). Rapid bursts (a note drag, a bend drag) coalesce into
+  // one step. _undo/_redo are exposed so the UI can reflect availability.
+  _undo: RollHistorySnapshot[];
+  _redo: RollHistorySnapshot[];
+  undo: () => void;
+  redo: () => void;
+}
+
+/** The document slices tracked by undo / redo.
+ *  The meter, the lanes and the bends are part of what the roll IS, so they
+ *  belong here. Selection, the playhead, transport, the active lane, the linked
+ *  clip and the recorded range deliberately do NOT — they are view and transport
+ *  state, and putting them in the stack makes undo unusable mid-session. */
+interface RollHistorySnapshot {
+  notes: PianoNote[];
+  bpm: number;
+  totalSteps: number;
+  lowestNote: number;
+  highestNote: number;
+  meterMap: MeterSegment[];
+  pickupSteps: number;
+  lanes: PolyLane[];
+  bends: LaneBend[];
 }
 
 const DEFAULT_STEPS = 256;
@@ -266,6 +292,24 @@ const seed = (): PianoNote[] => {
   return arr;
 };
 
+// ── Undo / redo plumbing (module-scoped) ─────────────────────────────────────
+const HISTORY_LIMIT = 100;
+const HISTORY_COALESCE_MS = 300; // changes closer than this fold into one undo step
+let historyApplying = false;     // true while undo/redo writes, so it doesn't self-record
+let lastDocChangeAt = -Infinity;
+
+const docSnapshot = (s: PianoRollState): RollHistorySnapshot => ({
+  notes: s.notes,
+  bpm: s.bpm,
+  totalSteps: s.totalSteps,
+  lowestNote: s.lowestNote,
+  highestNote: s.highestNote,
+  meterMap: s.meterMap,
+  pickupSteps: s.pickupSteps,
+  lanes: s.lanes,
+  bends: s.bends,
+});
+
 export const usePianoRollStore = create<PianoRollState>()((set, get) => ({
   notes: seed(),
   bpm: 120,
@@ -282,6 +326,8 @@ export const usePianoRollStore = create<PianoRollState>()((set, get) => ({
   lanes: sanitizeLanes(DEFAULT_LANES),
   activeLane: 0,
   bends: [],
+  _undo: [],
+  _redo: [],
 
   setBpm: (bpm) => set({ bpm: Math.max(40, Math.min(240, bpm)) }),
   setTotalSteps: (totalSteps) =>
@@ -485,7 +531,72 @@ export const usePianoRollStore = create<PianoRollState>()((set, get) => ({
     })),
   setBendRange: (lane, semitones) =>
     set((s) => (hasLane(s.lanes, lane) ? { bends: withLaneBend(s.bends, lane, () => ({ range: semitones })) } : {})),
+
+  undo: () => {
+    const s = get();
+    if (s._undo.length === 0) return;
+    const prev = s._undo[s._undo.length - 1];
+    const current = docSnapshot(s);
+    historyApplying = true;
+    set({
+      ...prev,
+      // A lane the step is going back to may not have the active one.
+      activeLane: prev.lanes.some((l) => l.id === s.activeLane) ? s.activeLane : 0,
+      _undo: s._undo.slice(0, -1),
+      _redo: [...s._redo, current],
+    });
+    historyApplying = false;
+    lastDocChangeAt = -Infinity; // the next real edit starts a fresh undo step
+  },
+
+  redo: () => {
+    const s = get();
+    if (s._redo.length === 0) return;
+    const next = s._redo[s._redo.length - 1];
+    const current = docSnapshot(s);
+    historyApplying = true;
+    set({
+      ...next,
+      activeLane: next.lanes.some((l) => l.id === s.activeLane) ? s.activeLane : 0,
+      _undo: [...s._undo, current],
+      _redo: s._redo.slice(0, -1),
+    });
+    historyApplying = false;
+    lastDocChangeAt = -Infinity;
+  },
 }));
+
+// Record undo history whenever a tracked document slice changes. Only the FIRST
+// change of a burst captures the pre-change snapshot, so a continuous gesture (a
+// note drag, a resize, a bend-point drag) collapses into a single undo step.
+// Selection, the playhead, transport, the active lane and the recorded range
+// don't touch these slices, so they never pollute history. undo/redo set
+// historyApplying so their own writes aren't recorded.
+usePianoRollStore.subscribe((state, prev) => {
+  if (historyApplying) return;
+  if (
+    state.notes === prev.notes &&
+    state.bpm === prev.bpm &&
+    state.totalSteps === prev.totalSteps &&
+    state.lowestNote === prev.lowestNote &&
+    state.highestNote === prev.highestNote &&
+    state.meterMap === prev.meterMap &&
+    state.pickupSteps === prev.pickupSteps &&
+    state.lanes === prev.lanes &&
+    state.bends === prev.bends
+  ) return;
+  const now = performance.now();
+  const coalesce = now - lastDocChangeAt < HISTORY_COALESCE_MS;
+  lastDocChangeAt = now;
+  if (coalesce) return; // mid-burst; the burst start captured the undo point
+  historyApplying = true;
+  usePianoRollStore.setState((s) => {
+    const undo = [...s._undo, docSnapshot(prev)];
+    if (undo.length > HISTORY_LIMIT) undo.shift();
+    return { _undo: undo, _redo: [] };
+  });
+  historyApplying = false;
+});
 
 /** The roll's meter fields, for a bounce payload, a project save or an export. */
 export const rollMeterOf = (s: Pick<PianoRollState, 'meterMap' | 'pickupSteps' | 'lanes'>): RollMeter => ({

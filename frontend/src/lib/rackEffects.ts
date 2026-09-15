@@ -2109,10 +2109,14 @@ export const rackEffectDefaults = (id: string): Record<string, number> => {
   return out;
 };
 
-const withDefaults = (id: string, params: Record<string, number>): Record<string, number> => ({
-  ...rackEffectDefaults(id),
-  ...params,
-});
+/** Catalog defaults of `def`, overridden by the entry's authored params. Takes
+ *  the definition rather than the id so the chain builder and its resolver
+ *  always agree on which catalog an entry's defaults come from. */
+const withDefaults = (def: RackEffectDef, params: Record<string, number>): Record<string, number> => {
+  const out: Record<string, number> = {};
+  for (const p of def.params) out[p.key] = p.default;
+  return { ...out, ...params };
+};
 
 /* ── chain builder ─────────────────────────────────────────────────────────── */
 
@@ -2122,10 +2126,27 @@ export interface ChainHandle {
   /** Push live param values into one running effect without a rebuild. */
   updateParams: (entryId: string, params: Record<string, number>) => void;
   /** Live effect instances keyed by ChainEntry.id — lets the caller reach an
-   *  instance for transport-synced scheduling (e.g. the spatializer's teleport). */
+   *  instance for transport-synced scheduling (e.g. the spatializer's teleport).
+   *  Includes bypassed entries: their instance is kept, just unwired. */
   instances: () => { id: string; effect: string; inst: RackEffectInstance }[];
+  /** Ids of entries this chain cannot render live: an ENABLED entry whose
+   *  effect id is not a rack effect — every hosted `vst3` entry, and effects
+   *  imported from another DAW. They are inert passthroughs here and only
+   *  print at freeze/bounce, so the UI can say that instead of the entry
+   *  appearing to process. `buildEffectChain` always provides this; it is
+   *  optional so the interface stays source-compatible with older callers. */
+  inertIds?: () => string[];
   /** Disconnect and dispose everything (leaves input/output untouched). */
   dispose: () => void;
+}
+
+/** Optional seams for `buildEffectChain`. The app passes none. */
+export interface BuildChainOptions {
+  /** Resolve an effect id to its definition (default: the rack registry).
+   *  This is a test seam: the real factories build concrete Web Audio nodes
+   *  that no fake context can satisfy, so `rackEffects.chain.test.ts` injects
+   *  fake single-node effects here to assert the wiring. */
+  resolve?: (id: string) => RackEffectDef | undefined;
 }
 
 interface LiveInstance {
@@ -2139,21 +2160,47 @@ interface LiveInstance {
 }
 
 /**
- * Wire `entries` in series between caller-owned `input` and `output`. Enabled
- * effects only; a disabled or absent chain is a clean `input -> output` pass.
- * Instances persist across rebuilds where the effect id at a slot is unchanged,
- * so param tweaks stay click-free.
+ * Wire `entries` in series between caller-owned `input` and `output`. An empty
+ * chain (or one with nothing renderable enabled) is a clean `input -> output`
+ * pass. Instances persist across rebuilds where the effect id at an entry id is
+ * unchanged, so param tweaks stay click-free.
+ *
+ * Two rules the naive "filter to enabled-and-known, build that" version got
+ * wrong, both modelled on oss-refs/ACE-Step-DAW/src/engine/PluginEngine.ts
+ * (`setPluginBypassed`, `getOutputNode`, `rebuildChain`'s registry miss):
+ *
+ *  - **Bypass is routing, not teardown.** An `enabled: false` entry keeps its
+ *    instance and its params; the chain simply connects its predecessor to its
+ *    successor around it, exactly as `setPluginBypassed` does. Re-enabling puts
+ *    the SAME instance back in the path with its reverb tail, delay buffer and
+ *    worklet state intact. Disposal happens only when the entry leaves the
+ *    chain or the handle is disposed.
+ *  - **An unknown effect id is inert, not invisible.** Entries whose id is not
+ *    in the rack (every hosted `vst3` entry) contribute no node — but they are
+ *    reported through `inertIds()` and warned about once each, so the UI can
+ *    say "renders at freeze/bounce, inert live" rather than letting the entry
+ *    look like it is processing. The enabled effects around one still wire in
+ *    order.
  */
 export function buildEffectChain(
   ctx: BaseAudioContext,
   input: AudioNode,
   output: AudioNode,
   entries: ChainEntry[],
+  opts: BuildChainOptions = {},
 ): ChainHandle {
   const instances = new Map<string, LiveInstance>(); // keyed by ChainEntry.id
+  const resolveDef = opts.resolve ?? ((id: string) => RACK_BY_ID.get(id));
+  /** `entryId:effectId` pairs already warned about, so a 60 Hz rebuild loop
+   *  cannot spam — keyed on the pair, so an entry that is later pointed at a
+   *  different unknown effect is reported again. */
+  const warned = new Set<string>();
+  let inert: string[] = [];
 
   const clearWiring = () => {
     try { input.disconnect(); } catch { /* nothing wired */ }
+    // Every instance, bypassed ones included — a bypassed instance must leave
+    // no edge behind, and its only upstream is input or another instance out.
     for (const { inst } of instances.values()) {
       try { inst.output.disconnect(); } catch { /* gone */ }
     }
@@ -2161,32 +2208,51 @@ export function buildEffectChain(
 
   const rebuild = (next: ChainEntry[]) => {
     clearWiring();
-    const enabled = next.filter((e) => e.enabled && RACK_BY_ID.has(e.effect));
 
-    // Dispose instances that are no longer present.
-    const keepIds = new Set(enabled.map((e) => e.id));
+    // Split the chain into what this graph can render and what it cannot.
+    const renderable: { entry: ChainEntry; def: RackEffectDef }[] = [];
+    const inertNow: string[] = [];
+    for (const e of next) {
+      const def = resolveDef(e.effect);
+      if (def) { renderable.push({ entry: e, def }); continue; }
+      if (!e.enabled) continue; // switched off by intent — nothing to report
+      inertNow.push(e.id);
+      const warnKey = `${e.id}:${e.effect}`;
+      if (warned.has(warnKey)) continue;
+      warned.add(warnKey);
+      console.warn(
+        `[rackEffects] chain entry ${e.id} (${e.label ?? e.effect}) has no live rack effect ` +
+          `for id "${e.effect}" — it passes audio through untouched in the live graph and ` +
+          `only renders at freeze/bounce.`,
+      );
+    }
+    inert = inertNow;
+
+    // Dispose only what LEFT the chain. A bypassed entry is still in it.
+    const keepIds = new Set(renderable.map((r) => r.entry.id));
     for (const [id, li] of instances) {
       if (!keepIds.has(id)) { li.inst.dispose(); instances.delete(id); }
     }
 
-    if (enabled.length === 0) {
-      input.connect(output);
-      return;
-    }
-
     let prev: AudioNode = input;
-    for (const e of enabled) {
+    for (const { entry: e, def } of renderable) {
       let li = instances.get(e.id);
-      if (!li || li.effect !== e.effect) {
-        if (li) li.inst.dispose();
-        const def = RACK_BY_ID.get(e.effect)!;
-        const params = withDefaults(e.effect, e.params);
+      if (li && li.effect !== e.effect) { li.inst.dispose(); instances.delete(e.id); li = undefined; }
+      // A bypassed entry that has no instance yet stays uninstantiated —
+      // building oscillators/worklets for an effect that is switched off costs
+      // CPU for silence. One that DOES have an instance keeps it (that is the
+      // whole point of bypass), and keeps taking param pushes so re-enabling
+      // is already in sync.
+      if (!li && !e.enabled) continue;
+      if (!li) {
+        const params = withDefaults(def, e.params);
         li = { effect: e.effect, inst: def.make(ctx, params), params };
         instances.set(e.id, li);
       } else {
-        li.params = withDefaults(e.effect, e.params);
+        li.params = withDefaults(def, e.params);
         li.inst.setParams(li.params);
       }
+      if (!e.enabled) continue; // kept alive, routed around
       prev.connect(li.inst.input);
       prev = li.inst.output;
     }
@@ -2205,8 +2271,10 @@ export function buildEffectChain(
     },
     instances: () =>
       Array.from(instances.entries()).map(([id, li]) => ({ id, effect: li.effect, inst: li.inst })),
+    inertIds: () => [...inert],
     dispose: () => {
       clearWiring();
+      inert = []; // a dead chain renders nothing, so it has nothing inert to report
       for (const { inst } of instances.values()) inst.dispose();
       instances.clear();
     },

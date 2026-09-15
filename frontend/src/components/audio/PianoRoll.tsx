@@ -1098,6 +1098,8 @@ export const PianoRoll: React.FC<{
   const updateNote = usePianoRollStore((s) => s.updateNote);
   const setSelectedNote = usePianoRollStore((s) => s.setSelectedNote);
   const clear = usePianoRollStore((s) => s.clear);
+  const undo = usePianoRollStore((s) => s.undo);
+  const redo = usePianoRollStore((s) => s.redo);
   const noteMenu = useContextMenu<PianoNote>();
   const masterRef = useMasterGainRef();
 
@@ -1281,6 +1283,29 @@ export const PianoRoll: React.FC<{
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [selectedNoteId, removeNote]);
+
+  // Undo / redo for the roll's document. Ctrl/Cmd+Z = undo, Ctrl/Cmd+Shift+Z or
+  // Ctrl+Y = redo. Registered on the CAPTURE phase so that when the roll owns the
+  // key it can stopImmediatePropagation() before the EDIT timeline's own
+  // bubble-phase window listener runs — otherwise one Ctrl+Z would step both the
+  // timeline's history and the roll's, since both surfaces are mounted at once.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const k = e.key.toLowerCase();
+      if (k !== 'z' && k !== 'y') return;
+      const t = e.target as HTMLElement | null;
+      if (t?.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"]')) return;
+      if (!ownsKey('piano-roll')) return;
+      if (rootRef.current?.offsetParent === null) return; // roll hidden (ARP face showing)
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      if (k === 'y' || e.shiftKey) redo();
+      else undo();
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [undo, redo]);
 
   const handleGridScroll = () => {
     if (keyboardRowsRef.current && gridScrollRef.current) {

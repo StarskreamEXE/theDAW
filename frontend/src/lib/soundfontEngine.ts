@@ -13,7 +13,6 @@
 import { create } from 'zustand';
 import { WorkletSynthesizer, audioBufferToWav } from 'spessasynth_lib';
 import { BasicMIDI } from 'spessasynth_core';
-import processorUrl from 'spessasynth_lib/dist/spessasynth_processor.min.js?url';
 import { getEngineCtx, getMasterGain } from '../state/playerStore';
 import { RANGE_LSB_SPESSA, bendRangeMessages } from './midi';
 import { notesToSmf, type SmfWheel } from './midiWrite';
@@ -88,6 +87,28 @@ function loadDefaultSoundfont(): Promise<ArrayBuffer> {
   return sfPromise;
 }
 
+/**
+ * URL of the SpessaSynth AudioWorklet processor, resolved lazily.
+ *
+ * Vite rewrites this `?url` specifier to the same emitted asset whether it is
+ * written as a static or a dynamic import, so the URL handed to `addModule` is
+ * unchanged. Importing it dynamically means merely importing this module no
+ * longer evaluates a Vite-only specifier, which Node/tsx (the frontend test
+ * runner) cannot resolve. Memoized, so the dynamic import is evaluated once.
+ */
+let processorUrlPromise: Promise<string> | null = null;
+function getProcessorUrl(): Promise<string> {
+  if (!processorUrlPromise) {
+    processorUrlPromise = import('spessasynth_lib/dist/spessasynth_processor.min.js?url')
+      .then((m) => m.default)
+      .catch((e: unknown) => {
+        processorUrlPromise = null;
+        throw e;
+      });
+  }
+  return processorUrlPromise;
+}
+
 let liveSynth: WorkletSynthesizer | null = null;
 let liveSynthPromise: Promise<WorkletSynthesizer> | null = null;
 const channelProgram = new Map<number, number>();
@@ -95,7 +116,7 @@ function getLiveSynth(): Promise<WorkletSynthesizer> {
   if (!liveSynthPromise) {
     liveSynthPromise = (async () => {
       const ctx = getEngineCtx();
-      await ctx.audioWorklet.addModule(processorUrl);
+      await ctx.audioWorklet.addModule(await getProcessorUrl());
       const synth = new WorkletSynthesizer(ctx);
       synth.connect(getMasterGain());
       const sf = await loadDefaultSoundfont();
@@ -180,7 +201,7 @@ async function renderMidiToBlob(
   const midi = BasicMIDI.fromArrayBuffer(midiBytes, 'render');
   const length = Math.max(1, Math.ceil(sampleRate * (midi.duration + tailSec)));
   const ctx = new OfflineAudioContext({ numberOfChannels: 2, sampleRate, length });
-  await ctx.audioWorklet.addModule(processorUrl);
+  await ctx.audioWorklet.addModule(await getProcessorUrl());
   const synth = new WorkletSynthesizer(ctx, { eventsEnabled: false });
   synth.connect(ctx.destination);
   await synth.startOfflineRender({
