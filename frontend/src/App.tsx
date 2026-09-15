@@ -9,17 +9,7 @@ import { Shell } from './components/layout/Shell';
 import { useOnboardingStore, shouldAutoStart } from './onboarding/onboardingStore';
 import { useHomeScreenStore } from './components/home/HomeScreen';
 import { PlayerFooter } from './components/audio/PlayerFooter';
-import { BootScreen } from './components/layout/BootScreen';
-// The boot cinematic (liquid-chrome goo + 3D "theDAW by GANTASMO") is intact and
-// one flag away. It is LAZY on purpose: as a static import it dragged three.js,
-// a 1.2 MB GLB, a WebGL PMREM bake and a bloom composer into the boot path, in
-// FRONT of the boot screen they were meant to cover — so the first thing the
-// user saw was a black rectangle for as long as all that took. Flip this to
-// true to run the cinematic again; it then loads only when the screen mounts.
-const BOOT_CINEMATIC: boolean = false;
-const LoadingScreen = lazy(() =>
-  import('./components/layout/LoadingScreen').then((m) => ({ default: m.LoadingScreen })),
-);
+import { ParticleSplash } from './components/layout/ParticleSplash';
 import { GantasmoOrb } from './orb-kit/react/GantasmoOrb';
 // The assistant panel pulls in react-markdown + @google/genai; keep it out of
 // the first-paint bundle by lazy-loading it and only mounting it once the user
@@ -84,22 +74,20 @@ export default function App() {
     y: 500,
   }));
   const [skipped, setSkipped] = useState(false);
-  // The boot cinematic forms over ~7s after its assets load. Hold the screen at
-  // least that long so it plays in full even when the backend binds in under a
-  // second, then hand off once the backend is also ready (it stays as long as
-  // the backend takes). This is the cinematic's real runtime, not a delay.
-  // The boot cinematic reports when its formation has fully resolved (via
-  // onComplete); the screen then holds until the backend is also ready. A safety
-  // timeout guarantees handoff even if the cinematic stalls (e.g. an asset never
-  // loads), so the app can never hang on the boot screen.
-  // A `?nocinematic` query param (used by the screenshot/capture harness) skips
-  // the boot cinematic, so captures don't sit through its ~7s runtime and it
-  // never appears in the shots.
+  // The boot sequence (public/splash/index.html, hosted by ParticleSplash)
+  // runs about 14 s: the particle face forms, becomes the wordmark, shows the
+  // GANTASMO credit and spins out. The screen holds until the page reports
+  // complete AND the backend is ready, so the sequence plays in full even when
+  // the backend binds in under a second. A safety timeout guarantees handoff
+  // if the page never reports (an asset that never loads), so the app can
+  // never hang on the boot screen.
+  // A `?nocinematic` query param (used by the screenshot/capture harness)
+  // skips the wait on the sequence, so captures do not sit through it.
   const [cinematicDone, setCinematicDone] = useState(
     typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('nocinematic'),
   );
   useEffect(() => {
-    const t = setTimeout(() => setCinematicDone(true), 20000);
+    const t = setTimeout(() => setCinematicDone(true), 24000);
     return () => clearTimeout(t);
   }, []);
 
@@ -618,19 +606,10 @@ export default function App() {
             transition={{ duration: 0.4 }}
             className="fixed inset-0 z-200"
           >
-            {BOOT_CINEMATIC ? (
-              <Suspense fallback={<BootScreen onSkip={() => setSkipped(true)} />}>
-                <LoadingScreen
-                  onSkip={() => setSkipped(true)}
-                  onComplete={() => setCinematicDone(true)}
-                />
-              </Suspense>
-            ) : (
-              <BootScreen
-                onSkip={() => setSkipped(true)}
-                onComplete={() => setCinematicDone(true)}
-              />
-            )}
+            <ParticleSplash
+              onSkip={() => setSkipped(true)}
+              onComplete={() => setCinematicDone(true)}
+            />
           </motion.div>
         )}
       </AnimatePresence>

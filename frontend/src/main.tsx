@@ -53,8 +53,8 @@ createRoot(document.getElementById('root')!).render(
   </StrictMode>,
 );
 
-// Drop the instant inline splash once React has painted its own (ferro) loading
-// screen on top — a frame after mount so there's no flash of blank between them.
+// Drop the instant inline cover once React has painted the boot sequence on
+// top, a frame after mount so there is no flash of blank between them.
 requestAnimationFrame(() => {
   requestAnimationFrame(() => {
     const splash = document.getElementById('boot-splash');
