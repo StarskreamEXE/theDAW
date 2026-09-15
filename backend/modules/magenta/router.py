@@ -258,14 +258,13 @@ async def _bring_up_sidecar(
                     )
                 await loop.run_in_executor(None, sidecar.stop_engine)
                 await loop.run_in_executor(None, sidecar.start_engine)
-            # A load that dies of RESOURCE_EXHAUSTED gets ONE more go with the
-            # growing allocator. JAX sizes its arena once, at import, from the
-            # VRAM free at that instant; anything holding the card for that
-            # instant leaves the engine short for the life of the process, and
-            # it then dies on an allocation as small as 96 MiB with the card
-            # almost empty. Restarting under THEDAW_MAGENTA_GROW takes memory
-            # as it is needed instead, so the same card loads the same model.
-            for attempt in ("preallocate", "grow"):
+            # A load that runs out of GPU memory on one card gets ONE more go
+            # split across every card the machine has, when it has more than
+            # one: each parameter tensor is cut in half and each card holds its
+            # half (sidecars/magenta/weights.py). A load that runs out on one
+            # card of a one-card machine, or runs out split, is a model this
+            # machine cannot hold, and the message says which model fits.
+            for attempt in ("one-card", "split"):
                 deadline = time.monotonic() + timeout
                 while time.monotonic() < deadline:
                     await asyncio.sleep(2.0)
@@ -278,28 +277,29 @@ async def _bring_up_sidecar(
                         on_state("starting", str(h.get("status")))
                     if sidecar.engine_state(h, None) != "error":
                         continue
-                    free_gb = await loop.run_in_executor(None, sidecar.gpu_free_gb)
-                    kind = _classify_engine_error(h, free_gb)
+                    kind = _classify_engine_error(h)
+                    gpus = int(h.get("gpus") or 1)
                     retry = (
-                        attempt == "preallocate"
+                        attempt == "one-card"
                         and kind.get("error_kind") == "gpu_oom"
-                        and str(h.get("allocator") or "preallocate") != "grow"
+                        and gpus > 1
+                        and not h.get("sharded")
                     )
                     if retry:
                         log.warning(
-                            "magenta: engine load ran out of GPU memory with "
-                            "%s GiB free; restarting it with the growing "
-                            "allocator",
-                            "unknown" if free_gb is None else f"{free_gb:.1f}",
+                            "magenta: engine load ran out of GPU memory on one "
+                            "card (%s); restarting it split across %d cards",
+                            _gpu_line(h),
+                            gpus,
                         )
                         if on_state:
                             on_state(
                                 "starting",
-                                "restarting the engine with the growing allocator",
+                                f"the model did not fit one card; restarting it split across {gpus} cards",
                             )
                         await loop.run_in_executor(None, sidecar.stop_engine)
                         await loop.run_in_executor(
-                            None, functools.partial(sidecar.start_engine, grow=True)
+                            None, functools.partial(sidecar.start_engine, shard=True)
                         )
                         break
                     hint = kind.get("fix") or (
@@ -415,42 +415,94 @@ async def _start_engine_on_gpu_lane() -> None:
     _start_note = ""
 
 
-#: A card with at least this much free is not the reason a load ran out, in GiB.
-_ROOMY_VRAM_GB = 4.0
+_GIB = 2**30
 
 
-def _oom_fix(free_gb: float | None, allocator: str) -> str:
-    """What to do about a load that ran out of GPU memory, given what the card
-    actually had free when it happened.
+def _gpu_line(h: dict) -> str:
+    """The engine's own account of its GPU memory, in one line: bytes in use of
+    the bytes JAX lets it take, at the moment it failed (or now). Empty when the
+    engine reported nothing, which is an engine older than this route."""
+    stats = h.get("gpu_at_error") or h.get("gpu") or {}
+    in_use = stats.get("bytes_in_use")
+    limit = stats.get("bytes_limit")
+    if not isinstance(in_use, int):
+        return ""
+    if isinstance(limit, int) and limit > 0:
+        return f"{in_use / _GIB:.2f} GiB in use of the {limit / _GIB:.2f} GiB JAX could take"
+    return f"{in_use / _GIB:.2f} GiB in use"
 
-    The old message asserted that something else was on the card. It said that
-    whatever the card held, so a user watching 1.3 of 11 GiB in use was told to
-    wait for a job that was not running. Measure first, then say.
+
+def _oom_fix(h: dict, free_gb: float | None = None) -> str:
+    """What to do about a load that ran out of GPU memory, from the engine's own
+    numbers.
+
+    The engine runs in WSL, and nvidia-smi on the Windows side does not
+    reliably reflect it: it reported 9.3 GiB free while JAX had 8.21 GiB in use
+    of an 8.25 GiB cap. So the message is written from what the engine reports
+    about itself (/health: gpu_at_error, sharded, gpus, plan), and the Windows
+    figure appears only when the engine reported nothing, labelled as what it
+    is.
     """
-    if allocator == "grow":
-        # It already took memory as it needed it, so the card is the limit.
-        room = "" if free_gb is None else f" Only {free_gb:.1f} GiB was free."
+    gpus = int(h.get("gpus") or 1)
+    sharded = bool(h.get("sharded"))
+    plan = h.get("plan") or {}
+    per_card = plan.get("per_card_bytes")
+    line = _gpu_line(h)
+    had = f"The engine had {line} when it ran out." if line else ""
+    needs = (
+        f" The model needs about {per_card / _GIB:.1f} GiB per card before the compile and the stream."
+        if isinstance(per_card, int)
+        else ""
+    )
+    if sharded:
         return (
-            "The GPU does not have room for this checkpoint." + room + " Pick a "
-            "smaller model in Settings → Models, or close what else is using the "
-            "card and press Restart engine."
-        )
-    if free_gb is not None and free_gb >= _ROOMY_VRAM_GB:
+            f"{had}{needs} That was split across {gpus} cards, so this machine "
+            "cannot hold this model. Pick MRT2 Small in Settings → Models."
+        ).strip()
+    if gpus > 1:
+        # Only reached when the split retry itself could not start.
         return (
-            f"The card had {free_gb:.1f} GiB free, so this is not a shortage: JAX "
-            "sizes its memory arena once, when it starts, from whatever was free "
-            "at that instant — something held the card for that moment and the "
-            "engine stayed short of memory afterwards. Press Restart engine; the "
-            "retry takes memory as it needs it instead."
-        )
-    held = "" if free_gb is None else f" {free_gb:.1f} GiB was free."
+            f"{had}{needs} This card cannot hold the model on its own. Press "
+            "Restart engine to load it split across both cards, or pick MRT2 "
+            "Small in Settings → Models."
+        ).strip()
+    if line:
+        return (
+            f"{had}{needs} This card cannot hold this model. Pick MRT2 Small in "
+            "Settings → Models."
+        ).strip()
+    # An engine that reported nothing about its memory: say what Windows saw,
+    # and say what that number cannot see.
+    seen = (
+        f" Windows saw {free_gb:.1f} GiB free on the card, which may not count what the WSL engine held."
+        if free_gb is not None
+        else ""
+    )
     return (
         "The GPU ran out of memory while the engine loaded its checkpoint."
-        + held
-        + " Something else is on the card (a stem separation, whisper, MIDI "
-        "transcription or the SA3 model). Wait for it to finish, then press "
-        "Restart engine — the load waits its turn for the GPU."
+        + seen
+        + " Restart the engine; if it fails again, pick MRT2 Small in Settings → Models."
     )
+
+
+def engine_error_fix(h: dict) -> str | None:
+    """The sentence that tells the user what to do about the engine's error,
+    written from the engine's own numbers, or None for no error. The Settings
+    card prints this in place of the raw JAX error."""
+    return _classify_engine_error(h).get("fix")
+
+
+def engine_layout_line(h: dict) -> str | None:
+    """How a running engine holds the model and how fast it runs it, for the
+    Settings card: "runs at 0.76x realtime, bf16 params on one card". None
+    until the engine has reported a timed warm-up."""
+    rtf = h.get("realtime_factor")
+    if not isinstance(rtf, (int, float)):
+        return None
+    gpus = int(h.get("gpus") or 1)
+    where = f"split across {gpus} cards" if h.get("sharded") else "on one card"
+    params = str(h.get("params_dtype") or "bf16")
+    return f"runs at {rtf:g}x realtime, {params} params {where}"
 
 
 def _classify_engine_error(h: dict, free_gb: float | None = None) -> dict:
@@ -458,10 +510,7 @@ def _classify_engine_error(h: dict, free_gb: float | None = None) -> dict:
     err = str(h.get("error") or h.get("status") or "")
     low = err.lower()
     if "resource_exhausted" in low or "out of memory" in low or "oom" in low:
-        return {
-            "error_kind": "gpu_oom",
-            "fix": _oom_fix(free_gb, str(h.get("allocator") or "preallocate")),
-        }
+        return {"error_kind": "gpu_oom", "fix": _oom_fix(h, free_gb)}
     if "checkpoint" in low or "no such file" in low or "not found" in low:
         return {
             "error_kind": "checkpoint_missing",

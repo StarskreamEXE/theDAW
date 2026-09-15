@@ -41,32 +41,28 @@ import hashlib
 import io
 import json
 import os
+import sys
 import threading
 import time
 import traceback
 
-# GPU allocator (must be set before jax is imported). Three modes, because
-# JAX's default sizes its arena ONCE, from what is free at import:
+# GPU allocator (must be set before jax is imported).
 #
-#   default            BFC + preallocation. The fast path, and the one the
-#                      engine has the card to itself for (the backend parks
-#                      Stable Audio to CPU before bringing this up). Its cost is
-#                      that the arena is whatever share of free VRAM existed at
-#                      import — if anything held the card for that instant the
-#                      arena stays small for the life of the process, and the
-#                      load then dies on a 96 MiB allocation with the card
-#                      almost empty. That is what THEDAW_MAGENTA_GROW is for.
-#   THEDAW_MAGENTA_GROW=1
-#                      BFC that grows on demand (preallocation off). Still the
-#                      BFC allocator, so the streaming loop is not paying the
-#                      per-op cost of "platform"; it just takes what it needs
-#                      when it needs it. The backend retries a load that died of
-#                      RESOURCE_EXHAUSTED in this mode.
-#   THEDAW_MAGENTA_LOWMEM=1
-#                      preallocation off AND the "platform" allocator, which
-#                      JAX documents as "very slow, not recommended for general
-#                      use" because it allocates and frees per op. Last resort
-#                      on a card that cannot hold the arena at all.
+# The default is the BFC allocator WITHOUT preallocation: it takes VRAM as the
+# model needs it and keeps what it has, so after the load and the first steps
+# there is no per-op allocation, and the streaming loop pays nothing for it.
+# Preallocation — the old default — grabbed 75% of the card at import, which on
+# an 11 GB card is an 8.25 GiB ceiling fixed before the model was even opened;
+# mrt2_base as fp32 filled that ceiling with the checkpoint half loaded. The cap
+# is 95% of the card now, and only a cap: with no up-front grab it never asks
+# for more than is physically free.
+#
+#   THEDAW_MAGENTA_PREALLOCATE=1   the old behaviour, for comparison.
+#   THEDAW_MAGENTA_LOWMEM=1        preallocation off AND the "platform"
+#                                  allocator, which JAX documents as "very slow,
+#                                  not recommended for general use" (it allocates
+#                                  and frees per op). A last resort.
+#
 # Read inline, with no helper and no name bound out here: a `def` or a
 # module-level assignment above the imports puts every one of them past the top
 # of the file. A conditional does not.
@@ -79,17 +75,18 @@ if os.environ.get("THEDAW_MAGENTA_LOWMEM", "").strip().lower() in (
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
     os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
     ALLOCATOR_MODE = "lowmem"
-elif os.environ.get("THEDAW_MAGENTA_GROW", "").strip().lower() in (
+elif os.environ.get("THEDAW_MAGENTA_PREALLOCATE", "").strip().lower() in (
     "1",
     "true",
     "yes",
     "on",
 ):
-    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-    ALLOCATOR_MODE = "grow"
-else:
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "true")
     ALLOCATOR_MODE = "preallocate"
+else:
+    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    ALLOCATOR_MODE = "grow"
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.95")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
 import numpy as np
@@ -97,6 +94,11 @@ import soundfile as sf
 import uvicorn
 from fastapi import FastAPI, Form, UploadFile
 from fastapi.responses import JSONResponse, Response
+
+# The layout rules live beside this file; the sidecar runs by path from WSL,
+# so its own directory is put on the path before they are imported.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import weights as checkpoint_layout
 
 FPS = 25  # model emits 25 frames/s (40 ms each)
 PORT = int(os.environ.get("MRT2_PORT", "8777"))
@@ -106,6 +108,148 @@ MODEL = os.environ.get("MRT2_MODEL", "mrt2_small")
 # regardless), so a big chunk cuts host<->device round-trips ~10x vs the old 25
 # (1s). The MIDI/notes path keeps the caller's fine chunk_frames for note timing.
 NO_NOTES_CHUNK = max(1, int(os.environ.get("THEDAW_MAGENTA_NO_NOTES_CHUNK", "250")))
+# How the checkpoint sits on the GPU (weights.py has the rules and the why):
+#   THEDAW_MAGENTA_PARAMS=bf16|fp32   the depthformer's params. bf16 is the
+#                                     default: the model computes in bf16
+#                                     whatever the params are, and fp32 params
+#                                     are twice the bytes for nothing.
+#   THEDAW_MAGENTA_SHARD=1            cut every tensor across all the cards JAX
+#                                     sees, each holding its share.
+PARAMS_DTYPE = (
+    "fp32"
+    if os.environ.get("THEDAW_MAGENTA_PARAMS", "").strip().lower() == "fp32"
+    else "bf16"
+)
+SHARD = os.environ.get("THEDAW_MAGENTA_SHARD", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# The frames the warm-up times after the compile, so /health can say how far
+# past realtime this card runs the model (2 s of audio at FPS).
+WARMUP_TIMED_FRAMES = 2 * FPS
+# What a load needs beyond its resident params: the compile's scratch and the
+# streaming state. mrt2_base as bf16 is 4.68 GiB resident and 5.05 GiB in use
+# once ready on one card, and the compile peaked at 6.50 GiB.
+LOAD_HEADROOM = 1.4
+
+
+def _memory_stats(jax) -> dict:
+    """What JAX holds on every device right now, in bytes. This is the number
+    that is true for this process; nvidia-smi on the Windows side does not
+    reliably reflect a WSL process's allocations."""
+    per = []
+    for d in jax.devices():
+        try:
+            st = d.memory_stats() or {}
+            per.append(
+                {
+                    "device": str(d),
+                    "bytes_in_use": st.get("bytes_in_use"),
+                    "peak_bytes_in_use": st.get("peak_bytes_in_use"),
+                    "bytes_limit": st.get("bytes_limit"),
+                }
+            )
+        except Exception as e:  # noqa: BLE001 — a device with no stats still lists
+            per.append({"device": str(d), "error": str(e)[:120]})
+
+    def total(key: str):
+        vals = [x[key] for x in per if isinstance(x.get(key), int)]
+        return sum(vals) if vals else None
+
+    return {
+        "per_device": per,
+        "bytes_in_use": total("bytes_in_use"),
+        "peak_bytes_in_use": total("peak_bytes_in_use"),
+        "bytes_limit": total("bytes_limit"),
+    }
+
+
+def _checkpoint_plan(size: str, devices: int) -> dict | None:
+    """What the load is about to put on each card, read from the checkpoint's
+    header before a single tensor moves. Best-effort: None when the file or the
+    registry cannot be read, and the load goes ahead regardless."""
+    try:
+        import json as _json
+        import struct
+
+        from magenta_rt import paths
+        from magenta_rt.jax import system as mrt_system
+
+        path = paths.checkpoints_dir() / mrt_system._CHECKPOINT_REGISTRY[size]
+        with open(path, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            header = _json.loads(f.read(n))
+        header.pop("__metadata__", None)
+        leaves = {k: (v["dtype"], tuple(v["shape"])) for k, v in header.items()}
+        return checkpoint_layout.plan(leaves, devices)
+    except Exception as e:  # noqa: BLE001 — a plan is a courtesy, never a gate
+        print(f"[magenta] checkpoint plan unavailable: {e}", flush=True)
+        return None
+
+
+def _install_lean_loader(jax, params_dtype: str, shard: bool) -> tuple[int, str]:
+    """Replace magenta_rt's weight loader and model class so the checkpoint
+    lands on the GPU the way weights.py lays it out.
+
+    The stock loader (safetensors.flax.load_file) puts every tensor on the
+    device as the fp32 the file holds, all at once. This one reads a tensor at
+    a time as numpy, casts the depthformer's to bf16 on the host, and places it
+    — on one card, or cut along one axis across all of them. The model class is
+    told its params are bf16 so anything it creates itself agrees.
+
+    Returns (devices used, a one-line description for the log).
+    """
+    import flax.traverse_util as flaxtu
+    import jax.numpy as jnp
+    import ml_dtypes
+    import numpy as np
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+    from magenta_rt.jax import model as mrt_model
+    from magenta_rt.jax import system as mrt_system
+    from safetensors import safe_open
+
+    devices = jax.devices()
+    ndev = len(devices) if shard else 1
+    mesh = Mesh(np.array(devices[:ndev]), ("m",)) if ndev > 1 else None
+
+    def load(path):
+        out = {}
+        with safe_open(str(path), framework="np") as f:
+            for key in f.keys():
+                arr = f.get_tensor(key)
+                dtype_name = (
+                    "F32" if arr.dtype == np.float32 else str(arr.dtype).upper()
+                )
+                if params_dtype == "bf16" and checkpoint_layout.should_halve(
+                    key, dtype_name
+                ):
+                    arr = arr.astype(ml_dtypes.bfloat16)
+                if mesh is not None:
+                    spec = PartitionSpec(
+                        *checkpoint_layout.partition_spec(tuple(arr.shape), ndev)
+                    )
+                    out[key] = jax.device_put(arr, NamedSharding(mesh, spec))
+                else:
+                    out[key] = jnp.asarray(arr)
+                del arr
+        return flaxtu.unflatten_dict({tuple(k.split("/")): v for k, v in out.items()})
+
+    mrt_system._load_jax_weights = load
+
+    if params_dtype == "bf16":
+        stock = mrt_model.get_model_class
+
+        def get_model_class(name: str):
+            base = stock(name)
+            return type(f"{base.__name__}BF16", (base,), {"param_dtype": jnp.bfloat16})
+
+        mrt_model.get_model_class = get_model_class
+
+    how = f"{params_dtype} params"
+    how += f", split across {ndev} cards" if ndev > 1 else ", one card"
+    return ndev, how
 
 
 class Engine:
@@ -118,6 +262,16 @@ class Engine:
         self.error: str | None = None
         self.device = "?"
         self.sample_rate = 48000
+        # How the weights sit on the GPU, and what the GPU holds: for /health,
+        # and for the app to say the true thing when a load fails.
+        self.params_dtype = PARAMS_DTYPE
+        self.sharded = SHARD
+        self.gpus: int | None = None
+        self.plan: dict | None = None
+        self.gpu: dict | None = None
+        self.gpu_at_error: dict | None = None
+        # Frames generated per second over realtime, from the timed warm-up.
+        self.realtime_factor: float | None = None
         self.lock = threading.Lock()
         self._embed_cache: dict[str, object] = {}
         # Current evolving piece for extend/morph: {state, emb, key, samples, sr}.
@@ -171,18 +325,69 @@ class Engine:
                 from magenta_rt.jax.system import MagentaRT2System as MagentaRT2
 
             self.device = str(jax.devices()[0])
-            self.status = f"loading {MODEL} + compiling (one-time)"
+            self.gpus = len(jax.devices())
+            # Decide the split before a tensor moves. The one-card plan against
+            # what JAX may take on one card: a model that will not fit with
+            # room for the compile and the stream goes straight to the split
+            # when there is a second card, instead of failing a minute into a
+            # one-card load first. Measured on two 2080 Tis, the split runs at
+            # less than half the one-card speed (0.33x against 0.76x realtime
+            # for mrt2_base), so it is never chosen for a model one card holds.
+            shard = SHARD
+            one_card = _checkpoint_plan(MODEL, 1)
+            limit = (_memory_stats(jax).get("per_device") or [{}])[0].get("bytes_limit")
+            if not shard and self.gpus > 1 and one_card and isinstance(limit, int):
+                need = int(one_card["resident_bytes"] * LOAD_HEADROOM)
+                if need > limit:
+                    shard = True
+                    print(
+                        f"[magenta] {MODEL} needs about {need / 2**30:.2f} GiB on one card and "
+                        f"JAX may take {limit / 2**30:.2f} GiB there: loading it split across "
+                        f"{self.gpus} cards",
+                        flush=True,
+                    )
+            used, how = _install_lean_loader(jax, PARAMS_DTYPE, shard)
+            self.sharded = used > 1
+            self.plan = one_card if used == 1 else _checkpoint_plan(MODEL, used)
+            if self.plan:
+                gib = 2**30
+                print(
+                    f"[magenta] {MODEL}: {self.plan['on_disk_bytes'] / gib:.2f} GiB on disk, "
+                    f"{self.plan['resident_bytes'] / gib:.2f} GiB resident as {how}, "
+                    f"{self.plan['per_card_bytes'] / gib:.2f} GiB per card",
+                    flush=True,
+                )
+            self.status = f"loading {MODEL} ({how}) + compiling (one-time)"
             self.mrt = MagentaRT2(size=MODEL)
             self.sample_rate = int(getattr(self.mrt, "_sample_rate", 48000))
-            # Warm up so the first real request is fast.
+            self.gpu = _memory_stats(jax)
+            # Warm up so the first real request is fast; the first call carries
+            # the compile, the second is timed so /health can say how far past
+            # realtime this card runs the model.
             emb = self.mrt.embed_style("warm up", use_mapper=True)
             self.mrt.generate(style=emb, frames=FPS)
+            t0 = time.time()
+            self.mrt.generate(style=emb, frames=WARMUP_TIMED_FRAMES)
+            took = max(1e-6, time.time() - t0)
+            self.realtime_factor = round((WARMUP_TIMED_FRAMES / FPS) / took, 2)
+            self.gpu = _memory_stats(jax)
             self.ready = True
             self.status = "ready"
-            print(f"[magenta] READY on {self.device} (model={MODEL})", flush=True)
+            in_use = self.gpu.get("bytes_in_use")
+            print(
+                f"[magenta] READY on {self.device} (model={MODEL}, {how}, "
+                f"{(in_use or 0) / 2**30:.2f} GiB in use, {self.realtime_factor}x realtime)",
+                flush=True,
+            )
         except Exception as e:  # noqa: BLE001 — surface load failures in /health
             self.error = f"{type(e).__name__}: {e}"
             self.status = "error: " + self.error
+            try:
+                import jax as _jax
+
+                self.gpu_at_error = _memory_stats(_jax)
+            except Exception:  # noqa: BLE001 — no stats is still an error report
+                self.gpu_at_error = None
             traceback.print_exc()
 
     @staticmethod
@@ -290,11 +495,20 @@ async def health():
         "model": MODEL,
         "device": ENGINE.device,
         "sample_rate": ENGINE.sample_rate,
-        # Which allocator this process started with. A load that dies of
-        # RESOURCE_EXHAUSTED under "preallocate" is worth one retry under
-        # "grow"; one that dies under "grow" is a card that is genuinely too
-        # small or genuinely full, and the backend says so instead of retrying.
+        # How this process holds the model, and what it holds: the allocator
+        # mode, the params' dtype, whether the tensors are cut across cards and
+        # how many cards JAX sees; the layout the checkpoint header promised;
+        # JAX's own byte counts now and, after a failed load, at the moment it
+        # failed. The backend writes its OOM message from these — nvidia-smi
+        # on the Windows side does not reliably reflect a WSL process.
         "allocator": ALLOCATOR_MODE,
+        "params_dtype": ENGINE.params_dtype,
+        "sharded": ENGINE.sharded,
+        "gpus": ENGINE.gpus,
+        "plan": ENGINE.plan,
+        "gpu": ENGINE.gpu,
+        "gpu_at_error": ENGINE.gpu_at_error,
+        "realtime_factor": ENGINE.realtime_factor,
     }
 
 
