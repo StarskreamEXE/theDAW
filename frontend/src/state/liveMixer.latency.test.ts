@@ -277,6 +277,12 @@ function theReportMirrorsTheStore(): void {
 interface FakeNode {
   kind: string;
   maxDelayTime: number;
+  /** The two channel fields `insertCompNode` writes. Seeded at values NO real
+   *  node opens on (a `DelayNode` is 2 / 'max'), so an assertion that they hold
+   *  2 / 'explicit' can only pass if the splice actually wrote them — reading a
+   *  default back would prove nothing. */
+  channelCount: number;
+  channelCountMode: string;
   delayTime: { value: number; calls: [number, number, number][]; setTargetAtTime(v: number, t: number, tc: number): void };
   outputs: FakeNode[];
   connect(to: FakeNode): FakeNode;
@@ -288,6 +294,8 @@ const fakeNode = (kind: string, maxDelayTime = 0): FakeNode => {
   const node: FakeNode = {
     kind,
     maxDelayTime,
+    channelCount: 0,
+    channelCountMode: 'unset',
     delayTime: {
       value: 0,
       calls,
@@ -328,6 +336,17 @@ function theCompNodeIsSplicedBetweenPannerAndDestination(): void {
   assert.equal(ctx.created[0].delayTime.value, 0, 'it opens at 0 — transparent until something declares latency');
   assert.deepEqual(panner.outputs, [ctx.created[0]], 'the panner feeds the comp delay');
   assert.deepEqual(ctx.created[0].outputs, [], 'and its output is left for the routing pass to place');
+
+  // The delay lines are sized ONCE, by this declaration. On the default
+  // `channelCountMode: 'max'` a DelayNode sizes them to its input and a count
+  // that drops mid-pass reallocates them, dropping the samples still inside —
+  // T18 measured max |Δ| 0.327 over the last 247 samples of a clip offline and
+  // pinned the same two fields on the offline comp. A StereoPannerNode's output
+  // is hard-coded to 2 channels (Web Audio API §1.30.4), so live this is a no-op
+  // today; it is here so the node stays safe if a panner-less strip ever appears,
+  // which offline already has (`includeTrackMix: false`, the mono stem).
+  assert.equal(ctx.created[0].channelCount, 2, 'the comp declares stereo');
+  assert.equal(ctx.created[0].channelCountMode, 'explicit', 'and refuses to follow its input');
 
   // Which the routing pass then does, exactly as `wireRoutingGraph` would.
   (comp as unknown as FakeNode).connect(dest);

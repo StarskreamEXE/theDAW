@@ -21,6 +21,14 @@ import { nodeDef, type GraphEdge, type GraphNode, type NodeKind, type NodeRunSta
 import { useLibraryStore } from '../state/libraryStore';
 import { getEngineCtx, getMasterGain } from '../state/playerStore';
 import {
+  createModEngine,
+  normalizedDepth,
+  type ModEngine,
+  type ModRoute,
+  type ModShape,
+  type ModTarget,
+} from './modulation';
+import {
   getRackEffect,
   rackEffectDefaults,
   ensureChopModule,
@@ -70,6 +78,16 @@ const SYNC_BEATS: Record<string, number> = {
   '1bar': 4,
   '2bar': 8,
   '4bar': 16,
+};
+
+/** The graph's LFO shape names are OscillatorTypes; the modulation engine's are
+ *  its own. Anything unrecognised is a sine, exactly as the old ticker's
+ *  fall-through `Math.sin` branch was. */
+const MOD_SHAPE: Record<string, ModShape> = {
+  sine: 'sine',
+  triangle: 'tri',
+  sawtooth: 'saw',
+  square: 'square',
 };
 
 const lfoRateHz = (params: Record<string, string | number>, bpm: number): number => {
@@ -390,9 +408,9 @@ export async function startLiveGraph(
   let audioWires = 0;
   let modWires = 0;
   // Rack FX params are plain numbers (not AudioParams), so an LFO wired into a
-  // Rack FX mod port modulates at CONTROL rate: a 30 Hz ticker computes the
-  // LFO's wave from the audio clock and pushes base+wave·depth onto the
-  // target's `modParam` key, clamped to the param's descriptor range.
+  // Rack FX mod port modulates at CONTROL rate: `lib/modulation`'s 33 ms ticker
+  // computes the LFO's wave from the audio clock and pushes base+wave·depth onto
+  // the target's `modParam` key, clamped to the param's descriptor range.
   const controlMods: Array<{ lfoId: string; targetId: string }> = [];
   for (const e of edges) {
     const from = nodeById.get(e.from);
@@ -429,44 +447,103 @@ export async function startLiveGraph(
   }
   log(`LIVE — ${inst.size} node(s), ${audioWires} audio + ${modWires} mod wire(s), ${bpm} BPM`);
 
-  // Control-rate mod ticker (Rack FX targets only). Phase comes from the
-  // audio clock so it stays coherent with the audio-rate LFO hookups.
-  let modTimer: number | null = null;
-  if (controlMods.length) {
-    modTimer = window.setInterval(() => {
-      const t = ctx.currentTime - t0;
-      const bpmNow = num(loutNodeParams().bpm, 120);
-      for (const m of controlMods) {
-        const lfoNode = latestNodes.find((x) => x.id === m.lfoId);
-        const target = latestNodes.find((x) => x.id === m.targetId);
-        const rack = inst.get(m.targetId);
-        if (!lfoNode || !target || !rack) continue;
-        const key = String(target.params.modParam ?? '').trim();
-        if (!key) continue;
-        const desc = getRackEffect(String(target.params.effect || ''))?.params.find((p) => p.key === key);
-        const base = num(target.params[key], desc?.default ?? 0);
-        const rate = lfoRateHz(lfoNode.params, bpmNow);
-        const depth = num(lfoNode.params.depth, 0.5);
-        const cyc = (rate * t) % 1;
-        const shape = String(lfoNode.params.shape || 'sine');
-        const wave =
-          shape === 'square' ? (cyc < 0.5 ? 1 : -1)
-          : shape === 'sawtooth' ? 2 * cyc - 1
-          : shape === 'triangle' ? 4 * Math.abs(cyc - 0.5) - 1
-          : Math.sin(2 * Math.PI * cyc);
-        let v = base + wave * depth;
-        if (desc) v = Math.max(desc.min, Math.min(desc.max, v));
-        rack.apply({ ...target.params, [key]: v });
+  // Control-rate mod ticker (Rack FX targets only) — now `lib/modulation`'s
+  // shared engine rather than a private setInterval and a private shape switch.
+  // Phase still comes from the audio clock (t0-relative), the tick is still
+  // 33 ms, the shapes are still the same four, and the clamp is still the rack
+  // param's own descriptor. Depth travels normalised onto the descriptor span
+  // (`normalizedDepth`), which the engine multiplies straight back out, so the
+  // write is `base + wave·depth` — exact for a param with no descriptor (span 1),
+  // and to ~1e-13 relative for one with a descriptor, pinned to 1e-9 in
+  // `modulation.test.ts`.
+  //
+  // TWO deliberate deltas from the old ticker, both stated where they happen:
+  //   1. the engine does not re-write a target whose value did not move — which
+  //      is why `updateParams` below calls `invalidate()` after pushing static
+  //      params at a node, or a flat stretch of a shape would look stalled;
+  //   2. phase wraps for a NEGATIVE t (the ~120 ms of ticks before t0), where
+  //      the bare modulo used to run the triangle up to 1.2. For t >= 0 the
+  //      phase is the bare `x % 1`, bit for bit.
+  //
+  // The AUDIO-rate branch above is deliberately NOT routed through the engine's
+  // `connectAudioRate`: a NodeF.I. mod port takes an AudioNode, not an
+  // AudioParam (`xfade.pos` fans one signal into two gains through an inverter),
+  // and the signal is the `lfo` NODE's own oscillator — shared by every edge
+  // leaving it, started on the same t0 edge as every other source, and re-tuned
+  // live by `updateParams`. Building a second oscillator per edge would change
+  // all four of those.
+  const modEngine: ModEngine | null = controlMods.length
+    ? createModEngine({
+        now: () => ctx.currentTime - t0,
+        base: (target) => {
+          if (target.kind !== 'rackParam') return 0;
+          const node = latestNodes.find((x) => x.id === target.entryId);
+          if (!node) return 0;
+          const desc = getRackEffect(String(node.params.effect || ''))?.params.find((p) => p.key === target.paramKey);
+          return num(node.params[target.paramKey], desc?.default ?? 0);
+        },
+        apply: (_key, value, target) => {
+          if (target.kind !== 'rackParam') return;
+          const node = latestNodes.find((x) => x.id === target.entryId);
+          const rack = inst.get(target.entryId);
+          if (!node || !rack) return;
+          rack.apply({ ...node.params, [target.paramKey]: value });
+        },
+      })
+    : null;
+
+  /** Re-read every control-rate mod off the current node params. The old ticker
+   *  did this once per tick; the engine holds routes instead, so it happens on
+   *  arming and again whenever an inspector edit lands. Same inputs, same
+   *  numbers — including an empty `modParam`, which still modulates nothing. */
+  const syncControlMods = (): void => {
+    if (!modEngine) return;
+    const bpmNow = num(loutNodeParams().bpm, 120);
+    const known = new Set(modEngine.routes().map((r) => r.id));
+    controlMods.forEach((m, i) => {
+      const id = `cm${i}`;
+      const lfoNode = latestNodes.find((x) => x.id === m.lfoId);
+      const target = latestNodes.find((x) => x.id === m.targetId);
+      const key = target ? String(target.params.modParam ?? '').trim() : '';
+      if (!lfoNode || !target || !key || !inst.has(m.targetId)) {
+        modEngine.removeRoute(id);
+        return;
       }
-    }, 33);
-  }
+      const desc = getRackEffect(String(target.params.effect || ''))?.params.find((p) => p.key === key);
+      // No descriptor means no clamp, exactly as before — an open range also
+      // makes the span 1, so the depth passes through in the param's own units.
+      const modTarget: ModTarget = {
+        kind: 'rackParam',
+        scope: 'bus',
+        entryId: m.targetId,
+        paramKey: key,
+        min: desc ? desc.min : -Infinity,
+        max: desc ? desc.max : Infinity,
+      };
+      const route: ModRoute = {
+        id,
+        source: {
+          kind: 'lfo',
+          shape: MOD_SHAPE[String(lfoNode.params.shape || 'sine')] ?? 'sine',
+          rateHz: lfoRateHz(lfoNode.params, bpmNow),
+          depth: normalizedDepth(num(lfoNode.params.depth, 0.5), modTarget),
+        },
+        target: modTarget,
+        amount: 1,
+        bipolar: true,
+      };
+      if (known.has(id)) modEngine.updateRoute(id, { source: route.source, target: route.target, amount: 1, bipolar: true });
+      else modEngine.addRoute(route);
+    });
+  };
+  syncControlMods();
 
   let stopped = false;
   return {
     stop: () => {
       if (stopped) return;
       stopped = true;
-      if (modTimer !== null) window.clearInterval(modTimer);
+      modEngine?.dispose();
       for (const i of inst.values()) i.disconnectAll();
       for (const n of live) cb.onStatus(n.id, 'idle');
       log('LIVE stopped');
@@ -475,6 +552,14 @@ export async function startLiveGraph(
       if (stopped) return;
       latestNodes = latestNodes.map((x) => (x.id === node.id ? node : x));
       inst.get(node.id)?.apply(node.params);
+      // That apply just pushed the node's STATIC params through `setParams`,
+      // which resets a modulated key to its base. The engine's memo still holds
+      // the last MODULATED value, so without this a shape that is flat for a
+      // while (a square, or a sine sitting on its clamp) would compute the same
+      // number, skip the write, and leave the param stranded at its base until
+      // the wave happened to move. Forget the memo and let the next tick write.
+      modEngine?.invalidate();
+      syncControlMods();
     },
   };
 }

@@ -41,7 +41,17 @@ import { useModuleStore } from './state/moduleStore';
 import { useDownloadStore } from './state/downloadStore';
 import { useLayoutPrefs } from './state/layoutPrefsStore';
 import { triggerPianoNoteFromMidi } from './lib/pianoTrigger';
-import { publishMidi } from './state/midiBus';
+import { publishMidi, subscribeToMidi } from './state/midiBus';
+// Live MIDI capture (see the mount below). Every module here is already in this
+// file's eager import graph via Shell/pianoTrigger EXCEPT `recordingStore`,
+// which has to be loaded anyway for anything to record.
+import { startMidiCapture } from './lib/midiCapture';
+import { punchMode, useRecordingStore } from './state/recordingStore';
+import { beginUndoStep, computePeaks, useEditorStore } from './state/editorStore';
+import { currentTransportSec } from './state/liveMixer';
+import { renderStepNotesToBlob } from './lib/midiSynth';
+import { ensureSoundfontReady, getActiveProgram, isSoundfontActive } from './lib/soundfontEngine';
+import { postStatus } from './state/statusNoticeStore';
 import { startQuestMidi, stopQuestMidi } from './state/questMidiClient';
 import { startXrControl, stopXrControl, registerXrControlSource } from './state/xrControlClient';
 import { djControlSource } from './state/xrControlDjSource';
@@ -360,6 +370,64 @@ export default function App() {
       useIoDevicesStore.getState().setMidiPorts([]);
     };
   }, [midiEnabled, midiInputKey]);
+
+  // ── Live MIDI capture ──────────────────────────────────────────
+  // The bus above carries every inbound message; this is the one thing that
+  // KEEPS one. A pass on an armed MIDI-instrument track becomes a piano-roll
+  // clip at the transport second it was played at (lib/midiCapture).
+  //
+  // Mounted once, unconditionally, and deliberately NOT gated on `midiEnabled`:
+  // that flag guards `requestMIDIAccess` only, while the bus also carries the
+  // Quest bridge and the synthetic Sway surface — a pass played through either
+  // is still a pass. Live monitoring (`triggerPianoNoteFromMidi`, above) is
+  // untouched: capture reads the bus, it does not consume it.
+  useEffect(
+    () =>
+      startMidiCapture({
+        subscribeMidi: subscribeToMidi,
+        subscribeStatus: (cb) => useRecordingStore.subscribe(() => { cb(); }),
+        status: () => useRecordingStore.getState().status,
+        armedTrackIds: () => useRecordingStore.getState().armedTrackIds,
+        tracks: () => useEditorStore.getState().tracks,
+        clips: () => useEditorStore.getState().clips,
+        transportSec: currentTransportSec,
+        bpm: () => useEditorStore.getState().bpm,
+        // `recordingStore`'s own `punchWindow()` is module-private, so the SAME
+        // derivation is restated here from its two exported inputs — the punch
+        // mode and the editor's loop region — rather than editing that store to
+        // export it. An open edge is infinite, exactly as it is there.
+        //
+        // One divergence to close: that store FREEZES its window at the press,
+        // so a punch mode (or loop region) changed mid-pass cannot desync what
+        // lands; this block reads at the `recording` flip instead, which is the
+        // same instant for a pass with no count-in but NOT for one with one.
+        // When that store exports its frozen pass window, this whole block is
+        // replaced by reading it — the correct fix, and not ours to make here.
+        punchWindow: () => {
+          const punch = punchMode();
+          if (punch === 'off') return null;
+          const { loopEnabled, loopStart, loopEnd } = useEditorStore.getState();
+          if (!loopEnabled) return null;
+          if (!Number.isFinite(loopStart) || !Number.isFinite(loopEnd) || loopEnd <= loopStart) return null;
+          return {
+            from: punch === 'out' ? -Infinity : loopStart,
+            to: punch === 'in' ? Infinity : loopEnd,
+          };
+        },
+        // The last term of WaveformEditor's `effectiveProgramFor`, resolved the
+        // same way its MIDI-insert path does: the picker's program only while
+        // soundfonts are on.
+        globalProgram: () => (isSoundfontActive() ? getActiveProgram() : undefined),
+        ensureSoundfontReady,
+        beginUndoStep,
+        addClipToTrack: (clip) => useEditorStore.getState().addClipToTrack(clip),
+        applyClipRender: (id, updates, peaks) => useEditorStore.getState().applyClipRender(id, updates, peaks),
+        renderStepNotes: (notes, bpm, totalSteps, opts) => renderStepNotesToBlob(notes, bpm, totalSteps, opts),
+        computePeaks,
+        postStatus,
+      }),
+    [],
+  );
 
   // Auto-enable the Sway DAW-control mirror when the Audima Sway is the detected
   // controller — until the user manually toggles it, after which their choice

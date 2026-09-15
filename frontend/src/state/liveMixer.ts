@@ -76,6 +76,7 @@ import {
   teleportXYZ,
   SPATIAL_TELEPORT,
   type ChainHandle,
+  type ChainLatencyOptions,
   type ChainLatencyReport,
   type RackEffectDef,
 } from '../lib/rackEffects';
@@ -607,6 +608,11 @@ function applyMasterChainLive(): void {
   const full = JSON.stringify(chain);
   if (full === lastMasterFullSig) return;
   lastMasterFullSig = full;
+  // The master rack is downstream of the sum, so it has no comp row and
+  // `syncTrackLatency` is never called for it — but a master FX lane still has
+  // to know how much of this chain sits ahead of its entry. Master only: this
+  // fires on every master knob drag and the track chains cannot have moved.
+  refreshMasterAutomationDelays();
   const sig = chainTopoSig(chain);
   if (sig !== lastMasterSig) {
     lastMasterSig = sig;
@@ -922,9 +928,34 @@ export interface CompDelayNode {
  * graph, so `buildTrackNodes` leaves the comp's output unconnected and
  * `wireRoutingGraph` places it. Callers that already know the destination (the
  * two-node case, and the test that pins this splice) keep passing it.
+ *
+ * CHANNEL COUNT — why this `DelayNode` is pinned to stereo. A `DelayNode` on the
+ * default `channelCountMode: 'max'` sizes its delay lines to its input's channel
+ * count, so a count that DROPS mid-pass reallocates them and loses the samples
+ * still inside; T18 measured that offline (max |Δ| 0.327 over the last 247
+ * samples of a clip, as its sources went inactive) and pinned `channelCount = 2`
+ * + `channelCountMode = 'explicit'` on the offline comp. The same pin is applied
+ * here, so the live and offline comps are the same node.
+ *
+ * Belt and braces. Today it changes nothing: the input is ALWAYS the strip's
+ * `StereoPannerNode` — `buildTrackNodes` is the only production caller and every
+ * live strip has one — and per the W3C Web Audio API §1.30 "The output of this
+ * node is hard-coded to stereo (2 channels) and cannot be configured" (§1.30.4
+ * Channel Limitations: "producing exactly 2 channels"), read 2026-09-15, so the
+ * count is already a constant 2 whatever the sources do and forcing 2 is a
+ * no-op on the audio. The pin is what holds if that stops being true: `panner`
+ * is typed `AudioNode`, and the offline renderer ALREADY has a panner-less strip
+ * (`includeTrackMix: false` — a mono stem, where inserting a panner would
+ * down-mix by 3 dB). The day a live strip does the same, the node is already
+ * safe instead of depending on a caller's discipline.
  */
 export function insertCompNode(ctx: CompNodeFactory, panner: AudioNode, dest?: AudioNode): DelayNode {
   const comp = ctx.createDelay(COMP_MAX_DELAY);
+  // See CHANNEL COUNT above. Unconditional: the delay lines are sized once, by
+  // this declaration, and no input can resize them out from under the samples
+  // already in flight.
+  comp.channelCount = 2;
+  comp.channelCountMode = 'explicit';
   panner.connect(comp);
   if (dest) comp.connect(dest);
   return comp;
@@ -948,6 +979,141 @@ export function applyCompDelays(
   }
 }
 
+/* ── automation delays: where a lane's param sits INSIDE the chain ────────────
+   `trackCompDelays` answers "how long until this track reaches the sum". The
+   block below answers the other half, which is what automation needs: how much
+   of that latency sits AHEAD of the thing a lane actually writes into. The fader
+   IS the chain input and has none; the panner has the whole insert chain in
+   front of it; effect k has the effects before it. Same `chainLatencyReport`
+   walk, re-run at the same moments. */
+
+/**
+ * Seconds of declared latency AHEAD of each entry in one series chain, keyed by
+ * `ChainEntry.id` — a prefix sum over `chainLatencyReport(...).perEntry`.
+ *
+ * This is the amount a param write on that entry has to be read BACK by: the
+ * audio arriving at entry k right now entered the chain `prefix[k]` seconds ago,
+ * so the value to write now is the one the lane held then. The first entry is
+ * always 0; a bypassed or unresolvable entry contributes 0, because it is routed
+ * around (or inert) and delays nothing; an id the chain does not contain is
+ * absent from the record — read it as `?? 0`.
+ *
+ * Pure — no Web Audio, no store — so the live writer, the offline bounce and a
+ * test all get the same numbers out of the same chain.
+ */
+export function entryPrefixLatencies(
+  entries: ChainEntry[],
+  opts: ChainLatencyOptions = {},
+): Record<string, number> {
+  return prefixFromReport(chainLatencyReport(entries, opts));
+}
+
+function prefixFromReport(report: ChainLatencyReport): Record<string, number> {
+  const out: Record<string, number> = {};
+  let ahead = 0;
+  for (const e of report.perEntry) {
+    // First occurrence wins. Chain ids are unique by construction; if a
+    // malformed project ever repeats one, the EARLIER position is the
+    // conservative answer (it can only under-delay, never over-).
+    if (!(e.id in out)) out[e.id] = ahead;
+    ahead += e.latencySec;
+  }
+  return out;
+}
+
+/** Where every automation target on ONE chain sits, in seconds of audio. */
+interface ChainAutomationDelays {
+  /** The whole chain's latency — what the PANNER, sitting after it, waits for. */
+  panSec: number;
+  /** Per-entry prefix sums for the FX lanes (see `entryPrefixLatencies`). */
+  prefix: Record<string, number>;
+}
+
+const NO_CHAIN_DELAYS: ChainAutomationDelays = { panSec: 0, prefix: {} };
+
+/** Cache, keyed by track id with one slot for the master rack, gated on a chain
+ *  signature: the ~40 Hz FX writer reads these every frame while a chain only
+ *  changes when the user edits it. Refreshed wherever the alignment is
+ *  (`syncTrackLatency`, which every chain/membership/routing move already
+ *  reaches) PLUS where a MASTER chain move is detected (`applyMasterChainLive`)
+ *  — the master rack is downstream of the sum, so it has no comp row and the
+ *  alignment pass never hears about it. */
+let trackChainDelays = new Map<string, { sig: string; value: ChainAutomationDelays }>();
+let masterChainDelays: { sig: string; value: ChainAutomationDelays } = { sig: ' ', value: NO_CHAIN_DELAYS };
+
+/** Topology AND params: `RackLatencySpec` may be a function of an entry's params,
+ *  so a knob turn can move these numbers. The same `JSON.stringify` gate the live
+ *  chain reconcilers above already run on every store tick. */
+const chainDelaySig = (entries: ChainEntry[], sampleRate: number | undefined): string =>
+  `${sampleRate ?? ''}|${JSON.stringify(entries)}`;
+
+const computeChainDelays = (
+  entries: ChainEntry[], sampleRate: number | undefined,
+): ChainAutomationDelays => {
+  const report = chainLatencyReport(entries, { sampleRate });
+  return { panSec: report.totalSec, prefix: prefixFromReport(report) };
+};
+
+/** Recompute (or re-use) the MASTER rack's automation delays. Split from the
+ *  track pass so `applyMasterChainLive` — which fires on a master knob drag —
+ *  does not re-stringify every track's chain to answer a question about one. */
+function refreshMasterAutomationDelays(): void {
+  const chain = useEditorStore.getState().masterFxChain;
+  const sampleRate = getEngineOutputInfo()?.sampleRate;
+  const sig = chainDelaySig(chain, sampleRate);
+  if (sig === masterChainDelays.sig) return;
+  masterChainDelays = { sig, value: computeChainDelays(chain, sampleRate) };
+}
+
+/** Recompute (or re-use) every live chain's automation delays. Cheap when
+ *  nothing moved: one signature per chain and no walk. */
+function refreshAutomationDelays(): void {
+  const s = useEditorStore.getState();
+  const sampleRate = getEngineOutputInfo()?.sampleRate;
+  // Rebuilt rather than mutated, so a removed track's row cannot linger.
+  const next = new Map<string, { sig: string; value: ChainAutomationDelays }>();
+  for (const t of s.tracks) {
+    const entries = t.fxChain ?? [];
+    const sig = chainDelaySig(entries, sampleRate);
+    const prev = trackChainDelays.get(t.id);
+    next.set(t.id, prev && prev.sig === sig ? prev : { sig, value: computeChainDelays(entries, sampleRate) });
+  }
+  trackChainDelays = next;
+  refreshMasterAutomationDelays();
+}
+
+/**
+ * How much later than the clip carrying it a PAN breakpoint on `trackId` must be
+ * written, in seconds.
+ *
+ * The track's OWN insert chain, and only that. The panner sits between the rack
+ * and the comp delay, so everything downstream of it — the comp, a bus's rack,
+ * the master — is BEHIND the param and cannot make it early.
+ * (`TrackCompRow.latencySec` is the whole path to the sum: the right number for
+ * the comp, and too big by the downstream buses' latency for this.)
+ */
+function panDelaySecFor(trackId: string | undefined): number {
+  if (!trackId) return 0;
+  return trackChainDelays.get(trackId)?.value.panSec ?? 0;
+}
+
+/** How far BACK an FX lane on this entry has to read its value, in seconds. */
+function fxPrefixSecFor(master: boolean, trackId: string | undefined, entryId: string): number {
+  if (master) return masterChainDelays.value.prefix[entryId] ?? 0;
+  if (!trackId) return 0;
+  return trackChainDelays.get(trackId)?.value.prefix[entryId] ?? 0;
+}
+
+/** Timeline position the FX writer reads a lane at: the frame's transport
+ *  position `t`, pulled back by the latency ahead of that effect and held inside
+ *  the project. Exported because it is the statement `applyFxAutomationFrame` is
+ *  made of, and the frame itself cannot be driven without a live context and a
+ *  rolling transport. */
+export function fxLaneSampleTime(t: number, prefixSec: number, totalSec: number): number {
+  const back = Number.isFinite(prefixSec) && prefixSec > 0 ? prefixSec : 0;
+  return clamp(t - back, 0, totalSec);
+}
+
 /**
  * Re-align every live track against the current insert chains. Called wherever a
  * track chain is built, rebuilt or toggled — a bypassed entry contributes 0, so
@@ -958,6 +1124,12 @@ export function applyCompDelays(
  * actually holding. A store track with no node yet is simply not written.
  */
 function syncTrackLatency(): void {
+  // Ahead of BOTH early returns, like `refreshOutputLatency`: the automation
+  // delays are read by `scheduleAutomation` (which `start()` calls immediately
+  // after this) and by the FX writer, neither of which cares whether the COMP
+  // values moved. Signature-gated per chain inside, so this is a no-op walk when
+  // nothing changed.
+  refreshAutomationDelays();
   if (trackNodes.size === 0) {
     // No live nodes to write to — but the OFFSET still has to be right, because
     // the next `start()` schedules against it before anything is rebuilt.
@@ -1032,13 +1204,23 @@ let outputLatency = 0;
  *     on the audio that entered at `n` and the two travel the `maxSec` together
  *     (`scheduleAutomation` → `laneEnvelopeEvents` maps a breakpoint at timeline
  *     `p.t` to the same node time the clip scheduler maps it to).
- *     PAN and an in-chain FX param are a separate matter: `panner` sits AFTER
- *     the inserts, and `applyFxAutomationFrame` writes into an effect that may
- *     have other effects ahead of it, so each of those leads its audio by
- *     whatever latency is upstream of it — a PER-PARAM offset that a single
- *     output-wide number cannot carry and this one does not claim to. It is
- *     pre-existing node placement, recorded as a follow-up, and unaffected by
- *     anything here.
+ *     PAN and an in-chain FX param are a PER-PARAM offset, which a single
+ *     output-wide number cannot carry and this one does not claim to — they
+ *     carry their own. `panner` sits AFTER the inserts, so its envelope is
+ *     scheduled `panSec` late (`laneEnvelopeEvents`'s `delaySec`, from
+ *     `panDelaySecFor`); `applyFxAutomationFrame` writes into an effect that may
+ *     have others ahead of it, so it reads each lane `prefix(entry)` back
+ *     (`entryPrefixLatencies` → `fxLaneSampleTime`). A pan lane and a TRACK FX
+ *     lane therefore land on the audio they were drawn for.
+ *     TWO THINGS ARE STILL UNCOMPENSATED. A SEND: the lane on the effect a send
+ *     is tapped into carries that effect's prefix and nothing about the send's
+ *     own path. And a MASTER-RACK lane's remaining `maxSec`: the master chain's
+ *     INPUT is the post-comp sum (`comp -> masterBus -> masterChain`), so the
+ *     audio reaching a master effect entered its track's chain `maxSec` ago ON
+ *     TOP OF that effect's own prefix — `prefix(entry)` alone leaves such a lane
+ *     early by exactly this number. Adding it to the master prefix is a design
+ *     call (it couples a per-frame read to the alignment, and the offline
+ *     bounce's equivalent is the render trim), deliberately NOT taken here.
  *   - THE RECORDER'S ANCHOR needs no offset either. A take captured at transport
  *     `n` is heard at `n + maxSec` like every other source, so
  *     `currentTransportSec()` stays un-shifted and placing a take at it is
@@ -1606,6 +1788,22 @@ function isAscending(points: readonly CurvePoint[]): boolean {
  *     happen, a segment already under way degrades here: the anchor holds the
  *     value at `fromSec` and the curve covers only the part still ahead, sampled
  *     as a window onto the same shape.
+ *
+ * `delaySec` is how much AUDIO sits between the chain input and this param — the
+ * reason a lane's events are not always written on the clip scheduler's clock.
+ * `gain` (volume) IS the chain input, so it passes 0 and emits exactly the list
+ * it always has. The PANNER is downstream of the inserts (`clipGain -> gain ->
+ * muteGain -> [fx] -> panner -> comp`), so the audio reaching it at context time
+ * `x` entered the chain at `x - latency(fx)`; a breakpoint authored for timeline
+ * `p.t` therefore belongs at `toCtx(p.t) + latency(fx)`, which is what a non-zero
+ * `delaySec` places it at. Only the FUTURE events move: the anchor is the value
+ * under the param RIGHT NOW and stays at `now`. Everything downstream of that —
+ * the `whenCtx <= now` collapse, the cursor spacing, a segment already under way
+ * degrading to the part still ahead — falls out of the shifted map unchanged,
+ * and `toTimeline` is its exact inverse so a degraded curve's sampled window
+ * still describes the stretch of timeline its duration covers. A negative or
+ * non-finite value is treated as 0: it could only drag an event backwards into
+ * audio that has already gone past.
  */
 export function laneEnvelopeEvents(
   lane: EnvelopeLane,
@@ -1613,6 +1811,7 @@ export function laneEnvelopeEvents(
   startCtxTime: number,
   startOffsetSec: number,
   now: number,
+  delaySec = 0,
 ): EnvelopeEvent[] {
   if (lane.points.length === 0) return [];
   // Ascending order is load-bearing here — `cursor` only keeps events out of a
@@ -1623,8 +1822,9 @@ export function laneEnvelopeEvents(
   // a copy — stable, so points sharing a `t` keep their authored order — and only
   // when the lane actually needs it, so the normal path allocates nothing.
   const pts = isAscending(lane.points) ? lane.points : [...lane.points].sort((a, b) => a.t - b.t);
-  const toCtx = (t: number) => startCtxTime + (t - startOffsetSec);
-  const toTimeline = (x: number) => startOffsetSec + (x - startCtxTime);
+  const d = Number.isFinite(delaySec) && delaySec > 0 ? delaySec : 0;
+  const toCtx = (t: number) => startCtxTime + (t - startOffsetSec) + d;
+  const toTimeline = (x: number) => startOffsetSec + (x - startCtxTime) - d;
 
   const out: EnvelopeEvent[] = [{ kind: 'set', when: now, v: sampleCurve(pts, fromSec) ?? pts[0].v }];
   // Nothing may be scheduled at or before `cursor`: it is `now` until the first
@@ -1711,13 +1911,31 @@ export function applyEnvelopeEvents(
 
 /** Re-arm ONE native lane's envelope on its AudioParam from `fromSec`. Used by
  *  play/seek (via `scheduleAutomation`) and by a touch punch-out, which hands the
- *  param back to the lane the gesture just wrote into. */
+ *  param back to the lane the gesture just wrote into.
+ *
+ *  VOLUME is written at the chain input and takes no delay — its breakpoints land
+ *  on the same node time the clip scheduler maps them to. PAN is written after the
+ *  inserts, so its whole envelope is pushed out by the chain's own latency and
+ *  lands on the audio it was drawn for. The delay is a cached lookup
+ *  (`refreshAutomationDelays`), not a walk — this runs once per lane per
+ *  play/seek/punch-out.
+ *
+ *  Which is also the limit of it: `delaySec` is BAKED INTO the event list at
+ *  schedule time, so a chain edited mid-playback moves the comp delays (through
+ *  `syncTrackLatency`) but leaves an already-armed pan envelope on the old shift
+ *  until the next play, seek or touch punch-out re-arms it. That is the existing
+ *  re-arm policy for every native lane — the envelope is written once and not
+ *  rewritten per frame — not a new gap opened here. */
 function scheduleLaneNative(lane: AutomationLane, fromSec: number): void {
   const param = nativeParamFor(lane.target);
   if (!param) return;
   const now = getEngineCtx().currentTime;
+  const delaySec = lane.target.kind === 'trackPan' ? panDelaySecFor(lane.target.trackId) : 0;
   param.cancelScheduledValues(now);
-  applyEnvelopeEvents(param, laneEnvelopeEvents(lane, fromSec, startCtxTime, startOffsetSec, now));
+  applyEnvelopeEvents(
+    param,
+    laneEnvelopeEvents(lane, fromSec, startCtxTime, startOffsetSec, now, delaySec),
+  );
 }
 
 /** Schedule every enabled native lane's envelope from `fromSec`. */
@@ -1751,7 +1969,13 @@ function scheduleAutomation(fromSec: number): void {
 /** One lookahead frame: write each enabled FX lane's current value into its live
  *  effect param. Values are grouped per effect entry first, so a multi-param
  *  effect (e.g. OWL-Pad x + y) gets ONE merged update instead of competing
- *  single-key updates that would each reset the other key to its static value. */
+ *  single-key updates that would each reset the other key to its static value.
+ *
+ *  Each lane is read at its OWN time. An entry with 6 ms of compressor ahead of
+ *  it is being fed audio that entered the chain 6 ms ago, so it is handed the
+ *  value that audio was drawn for — `fxLaneSampleTime(t, prefix, totalDur)`. The
+ *  first entry in a chain has no prefix and is exact, which is why this used to
+ *  be right for the common project and early for every other one. */
 function applyFxAutomationFrame(): void {
   if (!playing) return;
   const ctx = getEngineCtx();
@@ -1768,7 +1992,7 @@ function applyFxAutomationFrame(): void {
     if (!lane.enabled || lane.points.length === 0) continue;
     const { kind, trackId, entryId, paramKey } = lane.target;
     if ((kind !== 'trackFx' && kind !== 'masterFx') || !entryId || !paramKey) continue;
-    const v = sampleLane(lane, t);
+    const v = sampleLane(lane, fxLaneSampleTime(t, fxPrefixSecFor(kind === 'masterFx', trackId, entryId), totalDur));
     if (v == null) continue;
     const mapKey = `${kind}|${trackId ?? ''}|${entryId}`;
     let acc = byEntry.get(mapKey);

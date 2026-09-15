@@ -776,6 +776,66 @@ const HISTORY_COALESCE_MS = 300; // changes closer than this fold into one undo 
 let historyApplying = false;     // true while undo/redo writes, so it doesn't self-record
 let lastDocChangeAt = -Infinity;
 
+/* ── The coalesce KEY ────────────────────────────────────────────────────────
+ * The window alone used to decide, so ANY two document writes that landed
+ * within 300 ms folded into one undo step: a fader ride followed by a clip move
+ * was one entry, and two surfaces writing at once became one. The window is now
+ * a necessary condition, not a sufficient one — two writes coalesce only if they
+ * also carry the SAME key, which is the identity of the control being ridden.
+ *
+ * The key is derived HERE, at the action level, not at the call sites: a
+ * component's `{ coalesce: true }` still means "I am a continuous gesture", and
+ * the key is what makes that flag safe to honour.
+ *
+ * `null` is the anonymous key every non-gesture write shares. Anonymous writes
+ * coalesce with each other exactly as they always did (a record pass placing
+ * many takes is one step) but never with a keyed gesture beside them.
+ */
+let currentCoalesceKey: string | null = null; // key the NEXT tracked write carries
+let lastCoalesceKey: string | null = null;    // key of the step currently open
+let coalesceContinues = false;                // the next write says "same gesture" outright
+
+/** Key the next document write this action is about to make. */
+const coalesceAs = (key: string | null): void => {
+  currentCoalesceKey = key;
+};
+
+/** Key the next write AND let it join whatever step is open, whatever that
+ *  step's key is. This is the caller's explicit `{ coalesce: true }`: a drag
+ *  whose pointer-down already cut one burst for the whole gesture, and which may
+ *  legitimately span two controls (a mixer strip rides a bus fader and a send
+ *  knob inside one pointer capture). The key is still set, so the FIRST write of
+ *  such a gesture — the one that opens the step — is named. */
+const coalesceWithOpenStep = (key: string | null): void => {
+  currentCoalesceKey = key;
+  coalesceContinues = true;
+};
+
+/** The control an automation target records, named the same way the control's
+ *  own write is named. A mixer fader ride writes the track AND (when armed) the
+ *  lane on every frame; both are the same gesture, so both get this key. */
+const controlKeyForTarget = (target: AutomationTarget): string => {
+  switch (target.kind) {
+    case 'trackVolume': return `track:${target.trackId ?? ''}:volume`;
+    case 'trackPan': return `track:${target.trackId ?? ''}:pan`;
+    case 'trackFx': return `track:${target.trackId ?? ''}:fx:${target.entryId ?? ''}`;
+    case 'masterFx': return `master:fx:${target.entryId ?? ''}`;
+  }
+};
+
+/** The continuously-ridden fields of a strip. An update that touches only these
+ *  is a fader/pan gesture and is keyed by the control; anything else (a rename, a
+ *  mute, a solo, a freeze) is a discrete edit and stays anonymous, so it can
+ *  never be swallowed by the ride it lands beside. */
+const CONTINUOUS_STRIP_PARAMS: readonly string[] = ['volume', 'pan'];
+
+const stripGestureParams = (updates: object): string[] | null => {
+  const keys = Object.keys(updates);
+  if (keys.length === 0) return null;
+  if (!keys.every((k) => CONTINUOUS_STRIP_PARAMS.includes(k))) return null;
+  return keys.sort();
+};
+
 /**
  * Cut the coalescing burst: the NEXT document change records an undo step of
  * its own instead of folding into whatever happened in the last 300 ms.
@@ -784,9 +844,16 @@ let lastDocChangeAt = -Infinity;
  * rule would swallow a gesture that starts right after another edit, so the
  * pointer-down that begins a gesture calls this first. (undo/redo already reset
  * the clock for the same reason.)
+ *
+ * `key` names the gesture the cut opens, so the frames that follow it fold in
+ * and a neighbouring gesture does not. Called with no argument — which is every
+ * existing call site, in components and in `recordingStore` — the step is
+ * anonymous, which is exactly what a menu action wants.
  */
-export const beginUndoStep = (): void => {
+export const beginUndoStep = (key?: string): void => {
   lastDocChangeAt = -Infinity;
+  currentCoalesceKey = key ?? null;
+  coalesceContinues = false;
 };
 
 const docSnapshot = (s: EditorStoreState): EditorHistorySnapshot => ({
@@ -887,7 +954,7 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       dirty: false,
     });
     historyApplying = false;
-    lastDocChangeAt = -Infinity;
+    beginUndoStep(); // a fresh document: no clock, no open gesture
     logInfo('editor', `Loaded project: ${tracks.length} track(s), ${clips.length} clip(s)`);
   },
 
@@ -930,10 +997,15 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     logInfo('editor', `Removed track: ${id}`);
   },
 
-  updateTrack: (id, updates) =>
+  updateTrack: (id, updates) => {
+    // A fader/pan ride is keyed by the control, so its frames fold together and
+    // nothing else folds into them. A rename or a mute is anonymous.
+    const params = stripGestureParams(updates);
+    coalesceAs(params ? `track:${id}:${params.join('+')}` : null);
     set((s) => ({
       tracks: s.tracks.map((t) => (t.id === id ? { ...t, ...updates } : t)),
-    })),
+    }));
+  },
 
   freezeTrack: (trackId, stem) => {
     set((s) => {
@@ -1019,10 +1091,14 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     return id;
   },
 
-  updateClip: (id, updates) =>
+  updateClip: (id, updates) => {
+    // Every clip gesture — move, trim, fade drag, stretch — is keyed by the clip
+    // it is moving, so one drag is one step and the next clip's drag is another.
+    coalesceAs(`clip:${id}`);
     set((s) => ({
       clips: s.clips.map((c) => (c.id === id ? { ...c, ...updates } : c)),
-    })),
+    }));
+  },
 
   removeClip: (id) => {
     const clip = get().clips.find((c) => c.id === id);
@@ -1133,7 +1209,8 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     // time would leave an undo entry per animation frame. The drag says
     // `coalesce` (its pointer-down already cut the burst once, for the whole
     // gesture); every other caller gets its own step.
-    if (!opts?.coalesce) beginUndoStep();
+    if (opts?.coalesce) coalesceWithOpenStep(`clip:${id}`);
+    else beginUndoStep(`clip:${id}`);
     const clip = get().clips.find((c) => c.id === id);
     if (!clip) return;
     if (!Number.isFinite(newDurationSec) || newDurationSec < MIN_CLIP_SEC) return;
@@ -1202,7 +1279,9 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   setPlayhead: (s) => set({ playheadSec: Math.max(0, s) }),
   setPlaying: (p) => set({ isPlaying: p }),
   setSnap: (s) => set({ snap: s }),
-  setBpm: (b) => set({ bpm: Math.max(40, Math.min(240, b)) }),
+  // The tempo field is a continuous control (a spinner held down, a typed edit
+  // one digit at a time), so its writes share one key and fold into one step.
+  setBpm: (b) => { coalesceAs('bpm'); set({ bpm: Math.max(40, Math.min(240, b)) }); },
   setInpaintSelection: (sel) => set({ inpaintSelection: sel }),
   clearInpaintSelection: () => set({ inpaintSelection: null }),
 
@@ -1240,10 +1319,13 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     logInfo('editor', `Removed bus: ${id}`);
   },
 
-  updateBus: (id, updates) =>
+  updateBus: (id, updates) => {
     // No `beginUndoStep()`: this is the bus's `updateTrack`, and a fader ride
-    // that opened a step per pointer move would make undo unusable.
-    set((s) => {
+    // that opened a step per pointer move would make undo unusable. Keyed like a
+    // track strip: a fader ride by the control, a rename anonymous.
+    const params = stripGestureParams(updates);
+    coalesceAs(params ? `bus:${id}:${params.join('+')}` : null);
+    return set((s) => {
       // Guarded on the strip existing. `graphAddBus` is `ensureNode`, which
       // CREATES the node when it is absent — so an unknown id would otherwise
       // conjure a bus node with no strip behind it, which `wireRouting` would
@@ -1254,7 +1336,8 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       // routing picker lists, and a stale one would name a bus that is gone.
       const routing = updates.name ? graphAddBus(s.routing, id, updates.name) : s.routing;
       return { buses, routing };
-    }),
+    });
+  },
 
   setTrackOutput: (fromId, toId) => {
     beginUndoStep();
@@ -1276,7 +1359,8 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     // Same rule as `stretchClipToFit` / `setAutomationPointCurve`: a drag says
     // `coalesce` and folds into the step its pointer-down opened; anything else
     // cuts a step of its own.
-    if (!opts?.coalesce) beginUndoStep();
+    if (opts?.coalesce) coalesceWithOpenStep(`send:${fromId}|${toId}`);
+    else beginUndoStep(`send:${fromId}|${toId}`);
     set((s) => ({ routing: graphSetSendGain(s.routing, fromId, toId, gain) }));
   },
 
@@ -1310,14 +1394,16 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       ),
     })),
 
-  updateBusEffectParams: (busId, entryId, params) =>
+  updateBusEffectParams: (busId, entryId, params) => {
+    coalesceAs(`bus:${busId}:fx:${entryId}`); // one knob drag on one entry = one step
     set((s) => ({
       buses: s.buses.map((b) =>
         b.id === busId
           ? { ...b, fxChain: b.fxChain.map((e) => (e.id === entryId ? { ...e, params } : e)) }
           : b,
       ),
-    })),
+    }));
+  },
 
   addMasterEffect: (effectId) =>
     set((s) => ({
@@ -1349,10 +1435,14 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       masterFxChain: s.masterFxChain.map((e) => (e.id === entryId ? { ...e, enabled: !e.enabled } : e)),
     })),
 
-  updateMasterEffectParams: (entryId, params) =>
+  updateMasterEffectParams: (entryId, params) => {
+    // The same key `controlKeyForTarget` gives a masterFx lane, so an armed knob
+    // drag's rack write and lane write are one gesture, not two per frame.
+    coalesceAs(`master:fx:${entryId}`);
     set((s) => ({
       masterFxChain: s.masterFxChain.map((e) => (e.id === entryId ? { ...e, params } : e)),
-    })),
+    }));
+  },
 
   // --- Master VST3 chain (rendered/frozen, not live Web-Audio) ---
   addMasterVst: (plugin) =>
@@ -1364,12 +1454,15 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       frozenMaster: null,
     })),
 
-  setMasterVstRawState: (entryId, rawState) =>
+  setMasterVstRawState: (entryId, rawState) => {
+    // A native editor streams its state out as the user turns a knob in it.
+    coalesceAs(`master:vst:${entryId}`);
     set((s) => ({
       masterVstChain: s.masterVstChain.map((e) =>
         e.id === entryId && e.vst ? { ...e, vst: { ...e.vst, raw_state: rawState } } : e,
       ),
-    })),
+    }));
+  },
 
   removeMasterVst: (entryId) =>
     set((s) => ({
@@ -1442,16 +1535,21 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       ),
     })),
 
-  updateTrackEffectParams: (trackId, entryId, params) =>
+  updateTrackEffectParams: (trackId, entryId, params) => {
+    // The same key `controlKeyForTarget` gives a trackFx lane — see
+    // `updateMasterEffectParams`.
+    coalesceAs(`track:${trackId}:fx:${entryId}`);
     set((s) => ({
       tracks: s.tracks.map((t) =>
         t.id === trackId
           ? { ...t, fxChain: (t.fxChain ?? []).map((e) => (e.id === entryId ? { ...e, params } : e)) }
           : t,
       ),
-    })),
+    }));
+  },
 
-  setTrackVstRawState: (trackId, entryId, rawState) =>
+  setTrackVstRawState: (trackId, entryId, rawState) => {
+    coalesceAs(`track:${trackId}:vst:${entryId}`); // see setMasterVstRawState
     set((s) => ({
       tracks: s.tracks.map((t) =>
         t.id === trackId
@@ -1463,7 +1561,8 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
             }
           : t,
       ),
-    })),
+    }));
+  },
 
   rebuildTrackEffect: (trackId, entryId, effectId) =>
     set((s) => ({
@@ -1497,8 +1596,10 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   beginAutomationTouch: (target, t, v) => {
     if (!recordsWhileHeld(get().automationMode)) return;
     // The gesture is ONE undo step: this cuts the 300 ms coalescing burst, and
-    // every frame that follows folds into the step this first write opens.
-    beginUndoStep();
+    // every frame that follows folds into the step this first write opens. The
+    // key is the CONTROL's, not the lane's, because an armed mixer fader writes
+    // both on every frame and the two are one gesture.
+    beginUndoStep(controlKeyForTarget(target));
     set((s) => {
       const key = automationTargetKey(target);
       const existing = s.automationLanes.find((l) => automationTargetKey(l.target) === key);
@@ -1512,8 +1613,9 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     });
   },
 
-  moveAutomationTouch: (target, t, v) =>
-    set((s) => {
+  moveAutomationTouch: (target, t, v) => {
+    coalesceAs(controlKeyForTarget(target)); // same gesture as the control write
+    return set((s) => {
       const key = automationTargetKey(target);
       const hold = s.automationHolds[key];
       if (!hold) return {};
@@ -1521,10 +1623,12 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
         automationLanes: writeHoldSpan(s.automationLanes, key, hold.lastT, t, v),
         automationHolds: { ...s.automationHolds, [key]: { ...hold, value: v, lastT: t } },
       };
-    }),
+    });
+  },
 
-  endAutomationTouch: (target, t) =>
-    set((s) => {
+  endAutomationTouch: (target, t) => {
+    coalesceAs(controlKeyForTarget(target)); // the last frame of the same gesture
+    return set((s) => {
       const key = automationTargetKey(target);
       const hold = s.automationHolds[key];
       if (!hold) return {};
@@ -1545,10 +1649,27 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
         automationLanes: writeHoldSpan(s.automationLanes, key, hold.lastT, t, hold.value),
         automationHolds: rest,
       };
-    }),
+    });
+  },
 
-  advanceAutomationHolds: (t) =>
-    set((s) => {
+  advanceAutomationHolds: (t) => {
+    // The frame timer never STARTS anything: a hold exists only because
+    // `beginAutomationTouch` or `beginAutomationPass` opened a step for it, and
+    // one pass may hold many targets at once. So the frame write joins whatever
+    // step is open rather than naming a control of its own — the pass's own key
+    // when it is a pass, the gesture's when a single fader is being ridden.
+    //
+    // Two guards. The keys are set only when a hold actually exists, because the
+    // idle path below returns the state object ITSELF and no subscriber runs, so
+    // nothing would consume them. And the step is joined only when it is a NAMED
+    // one: both openers name theirs, so an ANONYMOUS step next to a pass is some
+    // menu action the user did mid-pass, and folding the rest of the pass into it
+    // would make one undo of that action roll the pass back too.
+    if (Object.keys(get().automationHolds).length > 0) {
+      if (lastCoalesceKey !== null) coalesceWithOpenStep('automation:pass');
+      else coalesceAs('automation:pass');
+    }
+    return set((s) => {
       // Runs on the transport's frame timer. Returning the state object ITSELF
       // makes zustand's Object.is check short-circuit, so an idle transport wakes
       // no subscriber and allocates nothing.
@@ -1562,11 +1683,12 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
         automationHolds[key] = { ...hold, lastT: t };
       }
       return { automationLanes, automationHolds };
-    }),
+    });
+  },
 
   beginAutomationPass: (t) => {
     if (!writesUntouched(get().automationMode)) return;
-    beginUndoStep(); // the whole pass is one undo step
+    beginUndoStep('automation:pass'); // the whole pass is one undo step
     set((s) => {
       const automationHolds: Record<string, AutomationHold> = { ...s.automationHolds };
       const automationLanes = s.automationLanes.map((l) => {
@@ -1626,7 +1748,8 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     // last one (see setClipFadeCurve). A curve DRAG says `coalesce`: its
     // pointer-down already cut the burst once, for the whole gesture, and
     // beginning a step per pointermove would leave an undo entry per frame.
-    if (!opts?.coalesce) beginUndoStep();
+    if (opts?.coalesce) coalesceWithOpenStep(`automation:${laneId}:curve`);
+    else beginUndoStep(`automation:${laneId}:curve`);
     set((s) => {
       const lane = s.automationLanes.find((l) => l.id === laneId);
       if (!lane || index < 0 || index >= lane.points.length) return {};
@@ -1642,8 +1765,9 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     });
   },
 
-  recordAutomationPoint: (target, t, v) =>
-    set((s) => {
+  recordAutomationPoint: (target, t, v) => {
+    coalesceAs(controlKeyForTarget(target)); // the non-hold record path, same control
+    return set((s) => {
       const key = automationTargetKey(target);
       const existing = s.automationLanes.find((l) => automationTargetKey(l.target) === key);
       if (existing) {
@@ -1659,7 +1783,8 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
           { id: uid(), target, points: [{ t, v }], enabled: true },
         ],
       };
-    }),
+    });
+  },
 
   addAutomationPoint: (laneId, t, v) =>
     set((s) => ({
@@ -1668,8 +1793,13 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       ),
     })),
 
-  updateAutomationPoint: (laneId, index, t, v) =>
-    set((s) => ({
+  updateAutomationPoint: (laneId, index, t, v) => {
+    // A breakpoint DRAG: the lane editor calls this on every pointermove with no
+    // `beginUndoStep()` of its own, so without a key each frame would be undoable.
+    // Keyed by the lane, not the index, because the index reflows as the point
+    // crosses its neighbours mid-drag.
+    coalesceAs(`automation:${laneId}:point`);
+    return set((s) => ({
       automationLanes: s.automationLanes.map((l) => {
         if (l.id !== laneId || index < 0 || index >= l.points.length) return l;
         // The point keeps its SHAPE when it moves. Rebuilding it as a bare
@@ -1682,7 +1812,8 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
         const without = l.points.filter((_, i) => i !== index);
         return { ...l, points: upsertPoint(without, t, v, l.points[index].curve) };
       }),
-    })),
+    }));
+  },
 
   removeAutomationPoint: (laneId, index) =>
     set((s) => ({
@@ -1727,10 +1858,12 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     })),
   removeMarker: (id) => set((s) => ({ markers: s.markers.filter((m) => m.id !== id) })),
   renameMarker: (id, label) => set((s) => ({ markers: s.markers.map((m) => (m.id === id ? { ...m, label } : m)) })),
-  moveMarker: (id, t) =>
+  moveMarker: (id, t) => {
+    coalesceAs(`marker:${id}`); // a marker DRAG, one step per marker moved
     set((s) => ({
       markers: s.markers.map((m) => (m.id === id ? { ...m, t: Math.max(0, t) } : m)).sort((x, y) => x.t - y.t),
-    })),
+    }));
+  },
 
   undo: () => {
     const s = get();
@@ -1756,7 +1889,7 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       dirty: true,
     });
     historyApplying = false;
-    lastDocChangeAt = -Infinity; // the next real edit starts a fresh undo step
+    beginUndoStep(); // the next real edit starts a fresh undo step
   },
 
   redo: () => {
@@ -1780,7 +1913,7 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       dirty: true,
     });
     historyApplying = false;
-    lastDocChangeAt = -Infinity;
+    beginUndoStep();
   },
 
   markSaved: () => set({ dirty: false }),
@@ -1915,6 +2048,14 @@ export const automationLaneFeed = createAutomationLaneFeed({
 // pollute history. undo/redo set historyApplying so their own writes aren't recorded.
 useEditorStore.subscribe((state, prev) => {
   if (historyApplying) return;
+  // Read AND CLEAR the key first, above the slice check: an action that set a key
+  // and then wrote nothing tracked (a `moveAutomationTouch` with no hold behind
+  // it, a refused stretch) must not leave it behind for the next, unrelated write
+  // to inherit. Every notification consumes the key, whether it records or not.
+  const key = currentCoalesceKey;
+  const continues = coalesceContinues;
+  currentCoalesceKey = null;
+  coalesceContinues = false;
   if (
     state.tracks === prev.tracks &&
     state.clips === prev.clips &&
@@ -1927,8 +2068,11 @@ useEditorStore.subscribe((state, prev) => {
     state.buses === prev.buses
   ) return;
   const now = performance.now();
-  const coalesce = now - lastDocChangeAt < HISTORY_COALESCE_MS;
+  // Same window as ever, plus the key: a write folds into the open step only when
+  // it is the same gesture — or when the caller said outright that it is.
+  const coalesce = now - lastDocChangeAt < HISTORY_COALESCE_MS && (continues || key === lastCoalesceKey);
   lastDocChangeAt = now;
+  if (!coalesce) lastCoalesceKey = key;
   // The same slices that constitute an undo step constitute "the project", so
   // this is also where the document becomes dirty. Skip the write entirely when
   // there is nothing to record AND nothing to flag — otherwise a 50 Hz clip drag

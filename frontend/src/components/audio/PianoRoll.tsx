@@ -33,6 +33,7 @@ import {
 import { BEND_TAIL_SEC, type VoiceBend } from '../../lib/pitchBendVoice';
 import { midiFileToRoll, rollToMidiFile } from '../../lib/rollMidi';
 import { playedRollNotes, rollClipFields } from '../../lib/rollClip';
+import { copyNotes, duplicateNotes, pasteNotes, type NoteClipboardPayload } from '../../lib/noteClipboard';
 import { syncopationByBar } from '../../lib/syncopation';
 import { BendLane } from './BendLane';
 import { MidiMapper } from './MidiMapper';
@@ -118,7 +119,17 @@ const LANE_FORMS: readonly LaneForm[] = [
 ];
 
 const ROLL_HELP =
-  'Click empty cell = add · Click note = select / second click = delete · Drag right edge = resize · Delete key removes selection · Right-click note for actions · Ctrl+wheel = zoom · Shift+wheel = scroll';
+  'Click empty cell = add · Click note = select / second click = delete · Drag right edge = resize · Delete key removes selection · Ctrl/Cmd+C = copy · Ctrl/Cmd+X = cut · Ctrl/Cmd+V = paste at the insertion point (the playhead while playing, otherwise the last step you clicked) · Ctrl/Cmd+D = duplicate after the selection · Right-click note for actions · Ctrl+wheel = zoom · Shift+wheel = scroll';
+
+/**
+ * The roll's note clipboard: module-level, so it survives a remount and is
+ * shared by every roll instance, and IN-APP — never `navigator.clipboard`. The
+ * roll's note is an internal shape with no agreed text form, so a system
+ * clipboard round trip needs a serialisation format, a parser and a version;
+ * that is a ticket of its own (see lib/noteClipboard.ts). Nothing here leaves
+ * the page.
+ */
+let noteClipboard: NoteClipboardPayload | null = null;
 
 // triggerPianoNote / triggerPianoNoteFromMidi live in lib/pianoTrigger so the
 // global Web MIDI listener + Sway surface can play a note without importing this
@@ -1092,6 +1103,7 @@ export const PianoRoll: React.FC<{
   const pickupSteps = usePianoRollStore((s) => s.pickupSteps);
   const lanes = usePianoRollStore((s) => s.lanes);
   const activeLane = usePianoRollStore((s) => s.activeLane);
+  const editingClipId = usePianoRollStore((s) => s.editingClipId);
 
   const addNote = usePianoRollStore((s) => s.addNote);
   const removeNote = usePianoRollStore((s) => s.removeNote);
@@ -1210,6 +1222,7 @@ export const PianoRoll: React.FC<{
     const targetNote = yToNote(y);
     const targetStep = xToStep(x);
     if (targetStep < 0 || targetStep >= totalSteps) return;
+    insertStepRef.current = targetStep;
     // If clicked on an existing note → select it, or remove it when it was
     // already selected before this press. Only stored notes count; a lane
     // repeat is drawn, not stored, and clicks pass through it.
@@ -1236,11 +1249,21 @@ export const PianoRoll: React.FC<{
   // note only when it was selected before the press and the press did not
   // resize it, so the first click selects and a second click deletes.
   const pressRef = useRef<{ id: string; wasSelected: boolean } | null>(null);
+  // Where a paste lands. The roll has NO edit cursor — its only step marker is
+  // the transport playhead (`currentStep`), which is reset to 0 on play and is
+  // stale once playback stops — so the insertion point is the playhead while the
+  // roll is sounding and the last clicked step otherwise (an empty cell, or the
+  // step a clicked note starts on), which is the roll's own "last click
+  // position". A clip load replaces every note, so the point goes back to the
+  // top with them — the step it held belonged to the roll that just left.
+  const insertStepRef = useRef(0);
+  useEffect(() => { insertStepRef.current = 0; }, [editingClipId]);
   // Right-drag a note to extend its length.
   const resizeRef = useRef<{ id: string; startX: number; initialLength: number } | null>(null);
   const onNotePointerDown = (e: React.PointerEvent, note: PianoNote, edge: 'right' | 'body') => {
     e.stopPropagation();
     pressRef.current = { id: note.id, wasSelected: usePianoRollStore.getState().selectedNoteId === note.id };
+    insertStepRef.current = note.step;
     setSelectedNote(note.id);
     if (edge === 'right') {
       resizeRef.current = { id: note.id, startX: e.clientX, initialLength: note.length };
@@ -1284,24 +1307,72 @@ export const PianoRoll: React.FC<{
     return () => window.removeEventListener('keydown', onKey);
   }, [selectedNoteId, removeNote]);
 
-  // Undo / redo for the roll's document. Ctrl/Cmd+Z = undo, Ctrl/Cmd+Shift+Z or
-  // Ctrl+Y = redo. Registered on the CAPTURE phase so that when the roll owns the
-  // key it can stopImmediatePropagation() before the EDIT timeline's own
-  // bubble-phase window listener runs — otherwise one Ctrl+Z would step both the
-  // timeline's history and the roll's, since both surfaces are mounted at once.
+  // Undo / redo and the note clipboard. Ctrl/Cmd+Z = undo, Ctrl/Cmd+Shift+Z or
+  // Ctrl+Y = redo, Ctrl/Cmd+C / X / V / D = copy / cut / paste / duplicate.
+  // Registered on the CAPTURE phase so that when the roll owns the key it can
+  // stopImmediatePropagation() before the EDIT timeline's own bubble-phase
+  // window listener runs — otherwise one Ctrl+Z would step both the timeline's
+  // history and the roll's, since both surfaces are mounted at once.
+  //
+  // Each clipboard edit is ONE write of `notes` (replaceAll), which is one undo
+  // step: the store's history subscriber snapshots the pre-change document on
+  // the first change of a burst, so a cut (copy + delete) and a paste each
+  // record exactly one step. The selection write that follows a paste touches no
+  // tracked slice, so it adds no step of its own.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!(e.ctrlKey || e.metaKey)) return;
       const k = e.key.toLowerCase();
-      if (k !== 'z' && k !== 'y') return;
+      if (k !== 'z' && k !== 'y' && k !== 'c' && k !== 'x' && k !== 'v' && k !== 'd') return;
       const t = e.target as HTMLElement | null;
       if (t?.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"]')) return;
       if (!ownsKey('piano-roll')) return;
       if (rootRef.current?.offsetParent === null) return; // roll hidden (ARP face showing)
+      if (k === 'z' || k === 'y') {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        if (k === 'y' || e.shiftKey) redo();
+        else undo();
+        return;
+      }
+      // The ONE escape from here on: a live text selection, which the browser
+      // copies as text (the same test EDIT's own handler makes).
+      if ((k === 'c' || k === 'x') && !(window.getSelection()?.isCollapsed ?? true)) return;
+      // The roll owns the key, so it swallows it even when there is nothing to
+      // copy or paste. EDIT's window listener runs on the bubble phase with no
+      // ownsKey gate, so a c/x/v/d that fell through from here would cut, paste
+      // or duplicate a CLIP while the user was working in the roll.
       e.preventDefault();
       e.stopImmediatePropagation();
-      if (k === 'y' || e.shiftKey) redo();
-      else undo();
+      const s = usePianoRollStore.getState();
+      // The roll selects one note at a time (`selectedNoteId`); the helpers take
+      // a set of ids, so a marquee selection later needs no change here.
+      const selectedIds = s.selectedNoteId ? [s.selectedNoteId] : [];
+      const range = { lowestNote: s.lowestNote, highestNote: s.highestNote, totalSteps: s.totalSteps };
+      if (k === 'c' || k === 'x') {
+        const payload = copyNotes(s.notes, selectedIds);
+        if (!payload) return; // nothing selected: the clipboard keeps what it had
+        noteClipboard = payload;
+        if (k === 'x') {
+          const cut = new Set(payload.notes.map((n) => n.id));
+          s.replaceAll(s.notes.filter((n) => !cut.has(n.id)));
+        }
+        return;
+      }
+      const added = k === 'v'
+        ? (noteClipboard ? pasteNotes(noteClipboard, s.isPlaying ? Math.floor(s.currentStep) : insertStepRef.current, range) : [])
+        : duplicateNotes(s.notes, selectedIds, range);
+      if (added.length === 0) return;
+      s.replaceAll([...s.notes, ...added]);
+      // The earliest pasted note takes the selection, so a repeated Ctrl/Cmd+D
+      // marches forward instead of stacking copies on the original.
+      s.setSelectedNote(added[0].id);
+      // A paste moves the insertion point PAST the block it just wrote, so a
+      // second Ctrl/Cmd+V lands after it instead of stacking an identical set in
+      // place. A duplicate leaves the point on the copy it selected.
+      insertStepRef.current = k === 'v'
+        ? added.reduce((m, n) => Math.max(m, n.step + n.length), 0)
+        : added[0].step;
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);

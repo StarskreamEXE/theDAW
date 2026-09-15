@@ -28,6 +28,16 @@
  *     there is no legacy render to A/B a routed one against. Its reference is
  *     the core's own FLAT render of the same project, scaled by the gain the
  *     live graph is specified to apply — see `routedProject`.
+ *
+ * T18 (plan §3.8 step 3a, completion) makes that shift PER TRACK, and one
+ * number per case can no longer state it. The master scope now holds
+ * `maxSec - own` on each strip's compensation delay, so every track lands where
+ * the timeline says rather than only the slowest one — a mix of a compressed
+ * and a dry track is a DIFFERENT file from the legacy body's, by 6 ms on the
+ * dry track, and that difference is the fix. Those cases state a shift per
+ * LATENCY GROUP instead and their reference is assembled by
+ * `alignedLegacyMix`: one legacy render per group, each shifted by its own
+ * declared latency, summed. Case E is the two-track minimum of it.
  */
 import {
   BOUNCE_SAMPLE_RATE, encodeBounce, renderBounce, renderExtentSec, trimLeadingSec,
@@ -218,6 +228,35 @@ function buildProject(opts: { solo: boolean; laneCurve: number }): Project {
   };
 }
 
+/* ── Case E's project: the two-track minimum of the skew T18 closes ───────── */
+
+/** One compressed track and one dry one, nothing else — no master rack, no
+ *  automation, no routing. Two tracks is the whole bug: the compressor lags S1
+ *  by 6 ms, so before T18 the bounce printed S1 late, took `maxSec` off the
+ *  front, landed S1 and threw S2 6 ms EARLY. Nothing else is in the project
+ *  because nothing else needs to be, and because the master rack is the one
+ *  thing that would stop the per-track reference below being exact (see
+ *  `alignedLegacyMix`).
+ *
+ *  `S2-tail` ends ON the render's last sample (the 30 s floor of
+ *  `renderExtentSec`), and it is on the DRY track — the one whose comp delay
+ *  pushes it 6 ms past the end of the window. A context sized to the window
+ *  stops before that audio is rendered and the trim then zero-fills it, so this
+ *  clip is what asserts the context is padded by the latency it will trim. */
+function skewProject(): Project {
+  const wet = track({ id: 'S1', name: 'compressed', volume: 0.8, pan: -0.3, fxChain: [COMPRESSOR] });
+  const dry = track({ id: 'S2', name: 'dry', volume: 0.7, pan: 0.35 });
+  const clips: AudioClip[] = [
+    clip({
+      id: 'S1-mono', trackId: 'S1', audioBlob: MONO,
+      startSec: 0.25, durationSec: 3, fadeInSec: 0.3, fadeOutSec: 0.4, gain: 0.9,
+    }),
+    clip({ id: 'S2-stereo', trackId: 'S2', audioBlob: STEREO, startSec: 0.5, durationSec: 3 }),
+    clip({ id: 'S2-tail', trackId: 'S2', audioBlob: STEREO, startSec: 27, durationSec: 3 }),
+  ];
+  return { clips, tracks: [wet, dry], masterFxChain: [], automationLanes: [] };
+}
+
 /* ── Case D's project: ONE track, so the whole render is on the routed path ── */
 
 const ROUTED_SEND_GAIN = 0.5;
@@ -297,6 +336,113 @@ function scaled(r: Rendered, factor: number, req: BounceRequest): Rendered {
   return { blob: encodeBounce(rendered, req), rendered };
 }
 
+/** One set of tracks that all declare the same latency, and what they declare.
+ *  The unit `alignedLegacyMix` shifts by — per TRACK is the same thing with one
+ *  track in each group. */
+interface LatencyGroup { ownSec: number; trackIds: string[] }
+
+/**
+ * The legacy mix, re-assembled with every track where the compensation delays
+ * now put it: ONE legacy render per latency group (the project's clips filtered
+ * to that group's tracks), each shifted forward by that group's own declared
+ * latency, summed.
+ *
+ * That is the definition of per-track compensation, written out as arithmetic
+ * the harness owns: a track that declares `own` is `own` late in the legacy
+ * body, and the core now delays it by `maxSec - own` and takes `maxSec` off the
+ * whole file, so it should land exactly where the legacy render of that track
+ * alone lands after `own` is shifted off it. Nothing here reads the renderer.
+ *
+ * WHY IT IS SOUND, and where it is not exact. Every track's own strip is
+ * independent — its rack, fader and panner see nothing but that track — and the
+ * summing bus is a plain add: adding two float32 parts here rounds exactly as
+ * the master bus's own add does, so a split-and-re-summed mix with no master
+ * rack is bit-identical to the whole one — measured at 0.000e+0 over all
+ * 1 323 000 samples of case E's project while this was being built.
+ * What is NOT split cleanly is a MASTER rack: the core convolves the sum while
+ * this convolves each part. Convolution is linear so the two agree, but through
+ * a different order of float32 FFT rounding, so case B lands a shade off
+ * bit-identical while case E (no master rack) is exact. The gate is 1e-4 and
+ * the residual is the FFT's, not the renderer's — which is the reason case E
+ * exists as its own case at all.
+ *
+ * Solo and mute need no special handling: each part goes through the same
+ * `legacyCommitEdit`, which applies them exactly as it does for the whole mix,
+ * so a group whose tracks a solo silences contributes silence to the sum — as
+ * it does to the core render.
+ */
+async function alignedLegacyMix(
+  p: Project, groups: LatencyGroup[], req: BounceRequest,
+): Promise<Rendered> {
+  // A track left out of every group would be missing from the reference and
+  // the diff would blame the renderer for it. Muted ones are legitimately out
+  // (they are in neither side); a solo is not checked here because it silences
+  // a track INSIDE its part, exactly as it does in the core render.
+  const covered = new Set(groups.flatMap((g) => g.trackIds));
+  const missed = p.tracks.filter((t) => !t.mute && !covered.has(t.id)).map((t) => t.id);
+  if (missed.length > 0) {
+    throw new Error(`ab: latency groups do not cover unmuted track(s) ${missed.join(', ')}`);
+  }
+
+  const parts: AudioBuffer[] = [];
+  for (const g of groups) {
+    const ids = new Set(g.trackIds);
+    const clips = p.clips.filter((c) => ids.has(c.trackId));
+    // An empty group would render the 60 s empty-timeline length instead of the
+    // mix's, and the shape mismatch would read as a renderer bug.
+    if (clips.length === 0) throw new Error(`ab: latency group [${g.trackIds.join(', ')}] has no clips`);
+    // A PAN LANE MOVES WITH THE TRACK, and shifting the rendered buffer is not
+    // enough to say so. Since T19b the core writes a pan breakpoint at
+    // `p.t + chainLatencySec(track chain)` — the panner is after the inserts, so
+    // a lane authored for timeline `p.t` has to wait for them — while the legacy
+    // body writes it at `p.t` flat. Shifting the whole part forward by `ownSec`
+    // moves the legacy-placed envelope along with the audio it was applied to,
+    // which puts it `ownSec` EARLY against the audio. Pre-shifting the points by
+    // the same `ownSec` reproduces the new placement, and the part's own shift
+    // then lands both together.
+    //
+    // `ownSec` is the right number for these projects because a group's figure
+    // IS each member's own track-chain latency: no case here routes a compressed
+    // track through a bus, so nothing downstream of the panner is in it. Add a
+    // bus to a case and this has to split into path latency (the part's shift)
+    // and chain latency (the lane's).
+    //
+    // FX lanes need no shift today: case B's is on the FIRST entry of its chain,
+    // whose prefix is 0, and `fxLaneSampleTime` moves a step only by the entries
+    // AHEAD of the one it writes.
+    const lanes = g.ownSec > 0
+      ? p.automationLanes.map((l) => (l.target.kind === 'trackPan' && ids.has(l.target.trackId)
+        ? { ...l, points: l.points.map((pt) => ({ ...pt, t: pt.t + g.ownSec })) }
+        : l))
+      : p.automationLanes;
+    const part = await seeded(() => legacyCommitEdit({ ...p, clips, automationLanes: lanes }));
+    parts.push(trimLeadingSec(part.rendered, g.ownSec));
+  }
+  const [first] = parts;
+  for (const part of parts) {
+    if (part.length !== first.length || part.numberOfChannels !== first.numberOfChannels) {
+      throw new Error('ab: latency groups rendered different shapes');
+    }
+  }
+  const chans: Float32Array[] = [];
+  for (let ch = 0; ch < first.numberOfChannels; ch += 1) {
+    const out = new Float32Array(first.length);
+    for (const part of parts) {
+      const d = part.getChannelData(ch);
+      for (let i = 0; i < out.length; i += 1) out[i] += d[i];
+    }
+    chans.push(out);
+  }
+  const rendered = {
+    duration: first.duration,
+    length: first.length,
+    sampleRate: first.sampleRate,
+    numberOfChannels: first.numberOfChannels,
+    getChannelData: (ch: number) => chans[ch],
+  } as unknown as AudioBuffer;
+  return { blob: encodeBounce(rendered, req), rendered };
+}
+
 /* ── Compare ─────────────────────────────────────────────────────────────── */
 
 interface Delta { channel: number; maxAbs: number; rms: number; samples: number }
@@ -356,7 +502,7 @@ async function compare(a: Blob, b: Blob, trimSec: number): Promise<Diff> {
 /* ── Cases ───────────────────────────────────────────────────────────────── */
 
 interface CaseResult {
-  renderer: 'A' | 'B' | 'C' | 'D';
+  renderer: 'A' | 'B' | 'C' | 'D' | 'E';
   name: string;
   /** Diff of the WAV files the app writes (16-bit PCM for all three today). */
   deltas: Delta[];
@@ -372,11 +518,15 @@ interface CaseResult {
 async function runCases(): Promise<CaseResult[]> {
   const out: CaseResult[] = [];
   const add = async (
-    renderer: 'A' | 'B' | 'C' | 'D', name: string,
+    renderer: 'A' | 'B' | 'C' | 'D' | 'E', name: string,
     run: () => Promise<{
       legacy: Rendered; core: Rendered; extra?: string;
       /** How far forward T14's render trim is EXPECTED to have moved the core
-       *  side, in seconds. Stated by the case, never read off the renderer. */
+       *  side, in seconds, over and above whatever the reference already
+       *  accounts for. Stated by the case, never read off the renderer. A case
+       *  whose tracks declare DIFFERENT latencies cannot say it in one number —
+       *  it hands `alignedLegacyMix` a shift per latency group and leaves this
+       *  at 0, because the reference is then already aligned. */
       expectTrimSec?: number;
     }>,
   ) => {
@@ -417,7 +567,15 @@ async function runCases(): Promise<CaseResult[]> {
     });
   }
 
-  /* B — master. Two solo states, and a linear vs curved volume lane. */
+  /* B — master. Two solo states, and a linear vs curved volume lane.
+
+     The mix is MIXED-LATENCY: T1, T4 and T5 carry the compressor and T3 carries
+     nothing, so since T18 the core holds 6 ms on T3's strip and lands all four
+     where the timeline says. The legacy body cannot do that, so the reference is
+     assembled per latency group (`alignedLegacyMix`) and the case's own further
+     shift is 0 — the groups have already been shifted by their own figures.
+     Sending T4/T5 into the wet group in the soloed variant is harmless: the
+     solo silences them inside each part exactly as it does in the core. */
   for (const solo of [false, true]) {
     for (const laneCurve of [0, 0.7]) {
       await add('B', `master · compressor+reverb · volLane(curve=${laneCurve}) + fxLane · solo=${solo}`, async () => {
@@ -426,11 +584,21 @@ async function runCases(): Promise<CaseResult[]> {
           scope: { kind: 'master' }, sampleRate: BOUNCE_SAMPLE_RATE,
           includeFx: true, includeAutomation: true, includeTrackMix: true, float32: false,
         };
-        const legacy = await seeded(() => legacyCommitEdit(p));
+        const legacy = await alignedLegacyMix(p, [
+          { ownSec: COMPRESSOR_LATENCY_SEC, trackIds: ['T1', 'T4', 'T5'] },
+          { ownSec: 0, trackIds: ['T3'] },
+        ], req);
         const c = await seeded(() => core(p, req));
-        // T1 carries the compressor in both solo states, so the slowest audible
-        // chain declares 6 ms whichever way the dial is turned.
-        return { legacy, core: c, expectTrimSec: COMPRESSOR_LATENCY_SEC };
+        return {
+          legacy,
+          core: c,
+          expectTrimSec: 0,
+          extra: 'reference = the legacy mix re-assembled per latency group: the compressed '
+            + 'tracks shifted by 6 ms, the dry one by 0. The master reverb is convolved per '
+            + 'part rather than over the sum, so the residual is the FFT\'s rounding — about '
+            + '3e-7, one float32 ULP at these amplitudes. Case E is the same assertion with '
+            + 'no master rack, and is exact.',
+        };
       });
     }
   }
@@ -495,6 +663,45 @@ async function runCases(): Promise<CaseResult[]> {
       legacy: scaled(flat, (1 + ROUTED_SEND_GAIN) * ROUTED_BUS_VOLUME, req),
       core: routed,
       extra: `reference = the core's own routing-less render x ${(1 + ROUTED_SEND_GAIN) * ROUTED_BUS_VOLUME}`,
+    };
+  });
+
+  /* E — THE T18 CASE, stated per TRACK. One compressed track, one dry one, and
+     nothing else in the project: no master rack, so the reference decomposes
+     exactly (see `alignedLegacyMix`) and the case can claim bit-identity rather
+     than "within the gate".
+
+     S1 declares 6 ms and S2 declares nothing, so:
+
+       - S1 is the slowest path. Its comp holds 0, the file is trimmed by 6 ms,
+         and it lands where the legacy render of S1 alone lands once 6 ms is
+         shifted off it.
+       - S2 is the one T14 could not place. Its comp holds the 6 ms, so after
+         the same trim it lands on its legacy render shifted by EXACTLY 0 —
+         where before T18 it printed 6 ms early. That zero is the whole ticket.
+
+     Run the same case against a core with the comp splice removed and S2's
+     delta is the dry track itself, six milliseconds out — far over the gate. */
+  await add('E', 'master · one compressed + one dry track · per-track compensation', async () => {
+    const p = skewProject();
+    const req: BounceRequest = {
+      scope: { kind: 'master' }, sampleRate: BOUNCE_SAMPLE_RATE,
+      includeFx: true, includeAutomation: false, includeTrackMix: true, float32: false,
+    };
+    const legacy = await alignedLegacyMix(p, [
+      { ownSec: COMPRESSOR_LATENCY_SEC, trackIds: ['S1'] },
+      { ownSec: 0, trackIds: ['S2'] },
+    ], req);
+    const c = await seeded(() => core(p, req));
+    return {
+      legacy,
+      core: c,
+      expectTrimSec: 0,
+      extra: 'reference = legacy(S1) shifted by 0.006 + legacy(S2) shifted by 0 — '
+        + 'each track where per-track compensation puts it, summed. S2 also holds a clip '
+        + 'ending on the render\'s last sample, so this asserts the padded context too: '
+        + 'un-padded, S2\'s comp pushes that clip\'s last 6 ms past the end of the window '
+        + 'and the trim zero-fills it.',
     };
   });
 

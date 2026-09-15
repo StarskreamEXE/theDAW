@@ -25,8 +25,13 @@
 //     That is why the last sample is pinned exactly to the segment's end value
 //     rather than left to floating-point luck.
 import assert from 'node:assert/strict';
-import { laneEnvelopeEvents, applyEnvelopeEvents, type EnvelopeEvent } from './liveMixer.ts';
+import {
+  laneEnvelopeEvents, applyEnvelopeEvents, entryPrefixLatencies, fxLaneSampleTime,
+  type EnvelopeEvent,
+} from './liveMixer.ts';
 import { interpolatePoints, type CurvePoint } from '../lib/automationModes.ts';
+import type { RackEffectDef } from '../lib/rackEffects.ts';
+import type { ChainEntry } from './effectChainStore.ts';
 
 /* ── An AudioParam that only records ──────────────────────────────────────── */
 
@@ -338,6 +343,163 @@ function emptyLaneIsNoEvents(): void {
   assert.deepEqual(laneEnvelopeEvents({ points: [] }, 0, 0, 0, 0), []);
 }
 
+/* ── 8. `delaySec` — a param that sits DOWNSTREAM of the inserts ──────────── */
+//
+// The live chain is `clipGain -> gain -> muteGain -> [fx] -> panner -> comp`, so
+// the audio arriving at the PANNER right now entered the chain `latency(fx)`
+// seconds ago. A pan breakpoint written for timeline `p.t` therefore has to be
+// scheduled `latency(fx)` LATER than the clip that carries that moment, or it
+// acts on audio that is still upstream of it. Volume sits at the chain head and
+// takes no delay at all, which is why this is an argument and not a constant.
+
+/** `live`, with a chain latency between the chain input and the param. */
+const delayed = (points: CurvePoint[], fromSec: number, delaySec: number, now = 100) =>
+  laneEnvelopeEvents({ points }, fromSec, now, fromSec, now, delaySec);
+
+function delayShiftsEveryFutureEventButNotTheAnchor(): void {
+  const points: CurvePoint[] = [{ t: 0, v: 0.2 }, { t: 2, v: 0.8 }, { t: 4, v: 0.5 }];
+  const evs = delayed(points, 0, 0.006);
+  assert.deepEqual(kinds(evs), ['set', 'ramp', 'ramp'], 'a delay changes WHEN, never WHAT');
+
+  const a = evs[0];
+  assert.ok(a.kind === 'set');
+  assert.deepEqual([a.v, a.when], [0.2, 100], 'the anchor is the value under the param NOW — it does not move');
+
+  const r1 = evs[1];
+  const r2 = evs[2];
+  assert.ok(r1.kind === 'ramp' && r2.kind === 'ramp');
+  assert.ok(close(r1.when, 102.006), `the breakpoint at timeline 2 lands 6 ms late: ${r1.when}`);
+  assert.ok(close(r2.when, 104.006), `and so does the one after it: ${r2.when}`);
+
+  // Volume is the chain head: it passes 0 and is byte-identical to before.
+  assert.deepEqual(delayed(points, 0, 0), live(points, 0));
+
+  // The pin, stated on one breakpoint: with a 6 ms chain a PAN breakpoint at
+  // timeline 1.0 is applied at startCtxTime + 1.0 + 0.006; the VOLUME lane's
+  // same breakpoint at startCtxTime + 1.0.
+  const one: CurvePoint[] = [{ t: 0, v: 0 }, { t: 1, v: 1 }];
+  const pan = delayed(one, 0, 0.006);
+  const vol = delayed(one, 0, 0);
+  assert.ok(pan[1].kind === 'ramp' && vol[1].kind === 'ramp');
+  assert.ok(close(pan[1].when, 101.006), `pan: ${pan[1].when}`);
+  assert.equal(vol[1].when, 101, 'volume');
+}
+
+/** The argument is optional and defaults to 0, so every existing caller — and
+ *  the offline bounce, which has always passed four zeros — emits exactly the
+ *  list it emitted before this existed. A negative or non-finite delay is a bug
+ *  upstream, and must not be allowed to drag an event backwards. */
+function omittingTheDelayIsExactlyTodaysList(): void {
+  const points: CurvePoint[] = [
+    { t: 0, v: 0.1, curve: 0.5 }, { t: 1, v: 0.9 }, { t: 2.5, v: 0.3, curve: -0.4 }, { t: 4, v: 0.7 },
+  ];
+  assert.deepEqual(delayed(points, 0.5, 0), live(points, 0.5));
+  assert.deepEqual(delayed(points, 0.5, -1), delayed(points, 0.5, 0), 'a negative delay is 0');
+  assert.deepEqual(delayed(points, 0.5, Number.NaN), delayed(points, 0.5, 0), 'a non-finite delay is 0');
+  assert.deepEqual(laneEnvelopeEvents({ points: [] }, 0, 0, 0, 0, 0.006), [], 'an empty lane is still nothing');
+}
+
+/** A curved segment moves WHOLE: same duration, same samples, later start. The
+ *  shape is a property of the lane, not of where the param sits. */
+function aDelayedCurveMovesWholeAndKeepsItsShape(): void {
+  const p0: CurvePoint = { t: 0, v: 0.2, curve: 0.75 };
+  const p1: CurvePoint = { t: 2, v: 0.9 };
+  const plain = live([p0, p1], 0);
+  const shifted = delayed([p0, p1], 0, 0.006);
+  const c0 = plain[1];
+  const c = shifted[1];
+  assert.ok(c0.kind === 'curve' && c.kind === 'curve');
+  assert.ok(close(c.start, c0.start + 0.006), `the curve starts 6 ms later: ${c.start} vs ${c0.start}`);
+  assert.ok(close(c.duration, c0.duration), `and covers the same stretch: ${c.duration} vs ${c0.duration}`);
+  assert.deepEqual([...c.values], [...c0.values], 'the samples are unchanged — only their clock is');
+}
+
+/** A segment already under way still degrades to the part ahead of `now` — the
+ *  delay cannot lift a start back above the context clock — and the window it
+ *  DOES cover is read fractionally earlier, because that is where the audio now
+ *  arriving at the param came from. */
+function aDelayedCurveStillDegradesWhenItStartsBeforeNow(): void {
+  const points: CurvePoint[] = [{ t: 0, v: 0, curve: 0.5 }, { t: 4, v: 1 }];
+  const evs = laneEnvelopeEvents({ points }, 0, 100, 0, 101.5, 0.006);
+  const c = evs[1];
+  assert.ok(c.kind === 'curve');
+  assert.equal(c.start, 101.5, 'never before `now`, delay or no delay');
+  assert.ok(close(c.duration, 2.506), `the rest of the segment, pushed 6 ms out: ${c.duration}`);
+  assert.ok(
+    close(c.values[0], interpolatePoints(points[0], points[1], 1.5 - 0.006), 1e-6),
+    `resumes at the value the ARRIVING audio was written for: ${c.values[0]}`,
+  );
+  const plain = laneEnvelopeEvents({ points }, 0, 100, 0, 101.5);
+  const p = plain[1];
+  assert.ok(p.kind === 'curve');
+  assert.ok(c.values[0] < p.values[0], 'on a rising segment that is fractionally behind the un-delayed read');
+}
+
+/* ── 9. entryPrefixLatencies — how much chain is AHEAD of each effect ─────── */
+//
+// An effect k>1 in a series chain has the effects before it between the chain
+// input and itself, so a param written into it now acts on audio that entered
+// the chain the sum of THOSE latencies ago. That sum is a prefix sum over
+// `chainLatencyReport(...).perEntry`, and it is what the ~40 Hz FX writer has to
+// read the lane at. (Compressor declares the Web Audio spec's fixed 6 ms
+// look-ahead; reverb and delay declare nothing.)
+
+const entry = (id: string, effect: string, enabled = true): ChainEntry =>
+  ({ id, effect, params: {}, enabled });
+
+function prefixLatencyIsTheSumOfEverythingAhead(): void {
+  const chain = [entry('c', 'compressor'), entry('r', 'reverb'), entry('d', 'delay')];
+  assert.deepEqual(
+    entryPrefixLatencies(chain),
+    { c: 0, r: 0.006, d: 0.006 },
+    'the first effect is exact; everything after it waits for the compressor',
+  );
+  // Order is the whole point: the same three effects with the compressor LAST
+  // leave every earlier entry exact.
+  assert.deepEqual(
+    entryPrefixLatencies([entry('r', 'reverb'), entry('d', 'delay'), entry('c', 'compressor')]),
+    { r: 0, d: 0, c: 0 },
+  );
+}
+
+/** A bypassed entry is routed AROUND by the chain builder, so it delays nothing
+ *  and nothing behind it waits for it. */
+function aBypassedEntryDelaysNothing(): void {
+  const chain = [entry('c', 'compressor', false), entry('r', 'reverb'), entry('d', 'delay')];
+  assert.deepEqual(entryPrefixLatencies(chain), { c: 0, r: 0, d: 0 });
+}
+
+/** An id with no live definition (a hosted VST3, an imported DAW's effect, a
+ *  typo) is an inert passthrough live, so it contributes 0 — and an id that is
+ *  not in the chain at all reads as no delay rather than `undefined`. */
+function anUnresolvableEntryContributesNothing(): void {
+  const prefix = entryPrefixLatencies([entry('v', 'vst3'), entry('c', 'compressor'), entry('x', 'not-an-effect')]);
+  assert.deepEqual(prefix, { v: 0, c: 0, x: 0.006 });
+  assert.equal(prefix['never-in-this-chain'] ?? 0, 0, 'an absent id is no delay');
+  assert.deepEqual(entryPrefixLatencies([]), {}, 'an empty chain has no entries to place');
+}
+
+/** The resolver seam `chainLatencyReport` takes is passed straight through, so
+ *  the offline render (and a test) can declare latency without the registry. */
+function theResolverSeamIsHonoured(): void {
+  const def = { id: 'mine', params: [], latencySec: 0.01 } as unknown as RackEffectDef;
+  const resolve = (id: string) => (id === 'mine' ? def : undefined);
+  assert.deepEqual(
+    entryPrefixLatencies([entry('a', 'mine'), entry('b', 'mine'), entry('c', 'mine')], { resolve }),
+    { a: 0, b: 0.01, c: 0.02 },
+  );
+}
+
+/* ── 10. The time the FX writer reads a lane at ──────────────────────────── */
+
+function theFxFrameReadsTheLaneWhereTheArrivingAudioEnteredTheChain(): void {
+  assert.ok(close(fxLaneSampleTime(2, 0.006, 10), 1.994), 'back by the chain ahead of the effect');
+  assert.equal(fxLaneSampleTime(2, 0, 10), 2, 'the first effect in a chain is exact');
+  assert.equal(fxLaneSampleTime(0.002, 0.006, 10), 0, 'never before the top of the timeline');
+  assert.equal(fxLaneSampleTime(12, 0, 10), 10, 'and never past the end of it');
+  assert.equal(fxLaneSampleTime(2, Number.NaN, 10), 2, 'a non-finite prefix reads as no delay');
+}
+
 linearLaneIsSetAndRamps();
 midLaneStartAnchorsAtTheSampledValue();
 pointsBehindThePlayheadAreJustTheAnchor();
@@ -353,5 +515,14 @@ applyWritesTheParamInOrder();
 applyClampsCurveSamplesToo();
 applyFallsBackToRampsWithoutCurveSupport();
 emptyLaneIsNoEvents();
+delayShiftsEveryFutureEventButNotTheAnchor();
+omittingTheDelayIsExactlyTodaysList();
+aDelayedCurveMovesWholeAndKeepsItsShape();
+aDelayedCurveStillDegradesWhenItStartsBeforeNow();
+prefixLatencyIsTheSumOfEverythingAhead();
+aBypassedEntryDelaysNothing();
+anUnresolvableEntryContributesNothing();
+theResolverSeamIsHonoured();
+theFxFrameReadsTheLaneWhereTheArrivingAudioEnteredTheChain();
 
 console.log('liveMixer.envelope: ok');

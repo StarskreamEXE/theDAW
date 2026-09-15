@@ -1,0 +1,721 @@
+/**
+ * midiCapture — driven entirely by fakes: a hand-advanced transport clock, a
+ * fake MIDI bus the test publishes onto by hand, fake recording/editor stores,
+ * and a fake step-note renderer. No MIDI device is opened, no DOM is required
+ * and no store is imported.
+ *
+ * The load-bearing assertions are:
+ *   - a note is stamped with the TRANSPORT second at message time, so the clock
+ *     is advanced between the note-on and the note-off and the note has to span
+ *     the difference;
+ *   - a note-on with velocity 0 is a note-off (and a note held through STOP is
+ *     still a note);
+ *   - an armed AUDIO track captures nothing — the mic engine keeps it.
+ */
+import assert from 'node:assert/strict';
+import {
+  NO_MIDI_MESSAGE,
+  PUNCH_EMPTY_MIDI_MESSAGE,
+  STEPS_PER_BEAT,
+  capturesMidi,
+  createNoteCapture,
+  cropNotesToWindow,
+  isMidiCaptureClip,
+  notesToRoll,
+  parseMidiMessage,
+  resetMidiTakeSeq,
+  silentWavBlob,
+  startMidiCapture,
+  stepSeconds,
+  type CaptureClip,
+  type CaptureTrack,
+  type CapturedNote,
+  type MidiCaptureDeps,
+  type StepRenderNote,
+} from './midiCapture.ts';
+import type { AudioClip } from '../state/editorStore.ts';
+import type { MidiBusMessage } from '../state/midiBus.ts';
+
+const near = (a: number, b: number, msg: string): void => {
+  assert.ok(Math.abs(a - b) < 1e-9, `${msg}: ${a} !== ${b}`);
+};
+
+const flush = async (): Promise<void> => {
+  for (let i = 0; i < 6; i += 1) await Promise.resolve();
+};
+
+/* --------------------------------- parsing -------------------------------- */
+{
+  assert.deepEqual(parseMidiMessage([0x90, 60, 100]), {
+    kind: 'noteOn',
+    channel: 0,
+    note: 60,
+    velocity: 100,
+  });
+  // Velocity 0 on a note-on IS a note-off. The whole point of this branch.
+  assert.equal(parseMidiMessage([0x90, 60, 0]).kind, 'noteOff', 'note-on velocity 0 is a note-off');
+  assert.equal(parseMidiMessage([0x80, 60, 64]).kind, 'noteOff');
+  // Running channels: the low nibble is the channel on every command.
+  for (let ch = 0; ch < 16; ch += 1) {
+    const on = parseMidiMessage([0x90 | ch, 48 + ch, 7]);
+    assert.equal(on.kind, 'noteOn', `channel ${ch} note-on`);
+    assert.equal(on.channel, ch, `channel ${ch} decoded`);
+    assert.equal(parseMidiMessage([0x80 | ch, 48 + ch, 0]).channel, ch, `channel ${ch} note-off`);
+  }
+  const cc = parseMidiMessage([0xb3, 74, 21]);
+  assert.deepEqual(cc, { kind: 'cc', channel: 3, note: 74, velocity: 21 });
+  // Program change / aftertouch / pitch bend are channel messages we do not act on.
+  assert.equal(parseMidiMessage([0xc0, 42]).kind, 'other', 'program change is other');
+  assert.equal(parseMidiMessage([0xe0, 0, 64]).kind, 'other', 'pitch bend is other');
+  // System real-time (clock, start, stop) has no channel.
+  assert.deepEqual(parseMidiMessage([0xf8]), { kind: 'other', channel: 0, note: 0, velocity: 0 });
+  assert.deepEqual(parseMidiMessage([0xfa]), { kind: 'other', channel: 0, note: 0, velocity: 0 });
+  // A data byte in position 0 is garbage here, not running status: Web MIDI
+  // hands over complete messages.
+  assert.equal(parseMidiMessage([60, 100]).kind, 'other', 'a headless message is not decoded');
+  assert.equal(parseMidiMessage([]).kind, 'other', 'an empty message is survived');
+  // Missing data bytes read as 0 rather than NaN.
+  assert.deepEqual(parseMidiMessage([0x90]), { kind: 'noteOff', channel: 0, note: 0, velocity: 0 });
+  // Uint8Array is what Web MIDI actually delivers.
+  assert.equal(parseMidiMessage(new Uint8Array([0x91, 64, 90])).kind, 'noteOn');
+  assert.equal(parseMidiMessage(new Uint8Array([0x91, 64, 90])).channel, 1);
+}
+
+/* ------------------------------ note capture ------------------------------ */
+{
+  // A note spans the transport seconds at its ON and its OFF — NOT the bus
+  // message's own `t`, which is deliberately nonsense here.
+  let sec = 0;
+  const cap = createNoteCapture({ now: () => sec });
+  cap.open();
+  sec = 2.5;
+  cap.onMessage({ data: [0x90, 60, 100], t: 999999 });
+  assert.equal(cap.pending(), 1, 'the note is held');
+  sec = 3.25;
+  cap.onMessage({ data: [0x80, 60, 0], t: 111111 });
+  assert.equal(cap.pending(), 0);
+  const notes = cap.close();
+  assert.equal(notes.length, 1);
+  near(notes[0].startSec, 2.5, 'startSec is the transport second at the note-on');
+  near(notes[0].endSec, 3.25, 'endSec is the transport second at the note-off');
+  assert.equal(notes[0].velocity, 100);
+  assert.deepEqual(cap.close(), [], 'a second close returns nothing');
+}
+
+{
+  // The same pitch on two channels is two notes, not one stuck one.
+  let sec = 0;
+  const cap = createNoteCapture({ now: () => sec });
+  cap.open();
+  cap.onMessage([0x90, 60, 100]); // ch 0 on
+  sec = 0.5;
+  cap.onMessage([0x91, 60, 40]); // ch 1 on, SAME pitch
+  assert.equal(cap.pending(), 2, 'per (channel, note), so both are held');
+  sec = 1;
+  cap.onMessage([0x81, 60, 0]); // ch 1 off
+  assert.equal(cap.pending(), 1, 'the channel-0 note is still down');
+  sec = 2;
+  const notes = cap.close();
+  assert.equal(notes.length, 2);
+  near(notes[0].startSec, 0, 'channel 0 started first');
+  near(notes[0].endSec, 2, 'a note held at close() ends at close()');
+  near(notes[1].startSec, 0.5, 'channel 1 started later');
+  near(notes[1].endSec, 1, 'and closed on its own note-off');
+  assert.equal(notes[1].velocity, 40);
+}
+
+{
+  // A velocity-0 note-on closes the note exactly as 0x80 does.
+  let sec = 0;
+  const cap = createNoteCapture({ now: () => sec });
+  cap.open();
+  cap.onMessage([0x90, 72, 88]);
+  sec = 1.5;
+  cap.onMessage([0x90, 72, 0]);
+  assert.equal(cap.pending(), 0, 'velocity-0 note-on released the note');
+  const notes = cap.close();
+  assert.equal(notes.length, 1);
+  near(notes[0].endSec, 1.5, 'and did so at that second');
+}
+
+{
+  // Messages outside a pass are ignored; CC never becomes a note; a retrigger
+  // without an intervening off closes the old note and starts a new one.
+  let sec = 0;
+  const cap = createNoteCapture({ now: () => sec });
+  cap.onMessage([0x90, 60, 100]);
+  assert.equal(cap.pending(), 0, 'a note before open() is not captured');
+  cap.open();
+  cap.onMessage([0xb0, 64, 127]);
+  cap.onMessage([0xf8]);
+  assert.equal(cap.pending(), 0, 'CC and clock are not notes');
+  cap.onMessage([0x90, 55, 60]);
+  sec = 1;
+  cap.onMessage([0x90, 55, 90]); // retrigger, no off
+  assert.equal(cap.pending(), 1, 'still one note down after a retrigger');
+  sec = 2;
+  const notes = cap.close();
+  assert.equal(notes.length, 2, 'the retrigger split it into two notes');
+  near(notes[0].endSec, 1, 'the first ends where the second begins');
+  assert.equal(notes[1].velocity, 90);
+  // A stray note-off for a pitch that was never down changes nothing.
+  cap.open();
+  cap.onMessage([0x80, 21, 0]);
+  assert.deepEqual(cap.close(), [], 'an unmatched note-off is dropped');
+}
+
+/* --------------------------- seconds -> roll steps ------------------------- */
+{
+  assert.equal(STEPS_PER_BEAT, 4, 'a step is a 16th — midiSynth renders 60/bpm/4');
+  near(stepSeconds(120), 0.125, 'a 16th at 120 BPM');
+  // At 120 BPM a step is 0.125 s. startSec 4 is step 0.
+  const notes: CapturedNote[] = [
+    { note: 60, velocity: 100, startSec: 4, endSec: 4.5 }, // step 0, 4 steps
+    { note: 64, velocity: 80, startSec: 4.26, endSec: 4.3 }, // 2.08 -> step 2, 0.32 -> 1 step min
+    { note: 67, velocity: 64, startSec: 5, endSec: 5 }, // a tap: zero length
+  ];
+  const { rollNotes, totalSteps } = notesToRoll(notes, { bpm: 120, startSec: 4 });
+  assert.equal(rollNotes.length, 3);
+  assert.deepEqual(
+    rollNotes.map((n) => [n.note, n.step, n.length, n.velocity]),
+    [
+      [60, 0, 4, 100],
+      [64, 2, 1, 80],
+      [67, 8, 1, 64],
+    ],
+    'nearest-step rounding, one-step minimum, relative to startSec',
+  );
+  assert.deepEqual(rollNotes.map((n) => n.id), ['mc-0', 'mc-1', 'mc-2'], 'ids are unique in the roll');
+  assert.equal(totalSteps, 9, 'the grid is as long as the last note ends');
+  assert.deepEqual(notesToRoll([], { bpm: 120, startSec: 0 }), { rollNotes: [], totalSteps: 0 });
+  // A note before startSec cannot land on a negative step.
+  const early = notesToRoll([{ note: 60, velocity: 1, startSec: -1, endSec: 0.1 }], { bpm: 120, startSec: 0 });
+  assert.equal(early.rollNotes[0].step, 0, 'clamped to the grid origin');
+  // The divisor follows the BPM handed in; no second tempo owner.
+  const fast = notesToRoll([{ note: 60, velocity: 100, startSec: 0, endSec: 0.25 }], { bpm: 240, startSec: 0 });
+  assert.equal(fast.rollNotes[0].length, 4, 'the same half second is 4 steps at 240 BPM');
+  const eighths = notesToRoll([{ note: 60, velocity: 100, startSec: 0, endSec: 0.5 }], {
+    bpm: 120,
+    startSec: 0,
+    stepsPerBeat: 2,
+  });
+  assert.equal(eighths.rollNotes[0].length, 2, 'stepsPerBeat is honoured');
+  // Out-of-range values are clamped rather than written onto the roll raw.
+  const clamped = notesToRoll([{ note: 300, velocity: 0, startSec: 0, endSec: 1 }], { bpm: 120, startSec: 0 });
+  assert.equal(clamped.rollNotes[0].note, 127);
+  assert.equal(clamped.rollNotes[0].velocity, 1);
+}
+
+/* ---------------------------------- punch --------------------------------- */
+{
+  const notes: CapturedNote[] = [
+    { note: 60, velocity: 100, startSec: 0, endSec: 2 }, // straddles the in point
+    { note: 62, velocity: 100, startSec: 3, endSec: 4 }, // wholly inside
+    { note: 64, velocity: 100, startSec: 7, endSec: 9 }, // straddles the out point
+    { note: 65, velocity: 100, startSec: 12, endSec: 13 }, // wholly after
+    { note: 67, velocity: 100, startSec: 5, endSec: 5 }, // a tap inside
+  ];
+  assert.equal(cropNotesToWindow(notes, null).length, 5, 'no window keeps everything');
+  const inOut = cropNotesToWindow(notes, { from: 1, to: 8 });
+  assert.deepEqual(
+    inOut.map((n) => [n.note, n.startSec, n.endSec]),
+    [
+      [60, 1, 2],
+      [62, 3, 4],
+      [64, 7, 8],
+      [67, 5, 5],
+    ],
+    'the part inside is kept, the part outside trimmed, the one outside dropped',
+  );
+  // An open edge, as punch in / punch out give.
+  const inOnly = cropNotesToWindow(notes, { from: 1, to: Infinity });
+  assert.equal(inOnly.length, 5, 'punch in keeps everything after the in point');
+  near(inOnly[0].startSec, 1, 'and still trims the straddling note');
+  const outOnly = cropNotesToWindow(notes, { from: -Infinity, to: 8 });
+  assert.equal(outOnly.length, 4, 'punch out drops what starts after the out point');
+  // A note that only grazes an edge has no sounding time inside.
+  assert.deepEqual(
+    cropNotesToWindow([{ note: 60, velocity: 100, startSec: 0, endSec: 2 }], { from: 2, to: 5 }),
+    [],
+    'a note ending exactly at the in point is dropped',
+  );
+  assert.equal(
+    cropNotesToWindow([{ note: 60, velocity: 100, startSec: 2, endSec: 2 }], { from: 2, to: 5 }).length,
+    1,
+    'but a zero-length tap AT the in point survives',
+  );
+}
+
+/* ----------------------------- armed-track rule --------------------------- */
+{
+  const midiClip = (trackId: string, startSec: number): CaptureClip => ({
+    trackId,
+    startSec,
+    sourceKind: 'piano-roll',
+    sourcePianoRoll: [{ id: 'n', note: 60, step: 0, length: 1, velocity: 100 }],
+  });
+  const audioClip = (trackId: string, startSec: number): CaptureClip => ({
+    trackId,
+    startSec,
+    sourceKind: 'audio',
+  });
+  assert.equal(isMidiCaptureClip(midiClip('t', 0)), true);
+  assert.equal(isMidiCaptureClip(audioClip('t', 0)), false);
+  assert.equal(
+    isMidiCaptureClip({ trackId: 't', startSec: 0, sourceKind: 'piano-roll', sourcePianoRoll: [] }),
+    false,
+    'a piano-roll clip with no notes is not a MIDI clip',
+  );
+
+  const plain: CaptureTrack = { id: 't1', color: '#fff' };
+  const instrument: CaptureTrack = { id: 't2', color: '#fff', instrumentProgram: 4 };
+  assert.equal(capturesMidi(instrument, []), true, 'an instrument track captures, clips or not');
+  assert.equal(capturesMidi(plain, []), false, 'an armed track with NO clips keeps the mic');
+  assert.equal(capturesMidi(plain, [audioClip('t1', 0)]), false, 'an audio track keeps the mic');
+  assert.equal(capturesMidi(plain, [midiClip('t1', 0)]), true, 'a track whose latest clip is MIDI captures');
+  assert.equal(
+    capturesMidi(plain, [midiClip('t1', 0), audioClip('t1', 10)]),
+    false,
+    'the LATEST clip decides, and it is audio',
+  );
+  assert.equal(
+    capturesMidi(plain, [audioClip('t1', 0), midiClip('t1', 10)]),
+    true,
+    'the LATEST clip decides, and it is MIDI',
+  );
+  assert.equal(
+    capturesMidi(plain, [midiClip('other', 99)]),
+    false,
+    "another track's clips do not decide this one",
+  );
+}
+
+/* ---------------------------- placeholder audio --------------------------- */
+{
+  // The placeholder a captured clip carries until its render lands has to be a
+  // REAL WAV: WaveformEditor decodes peaks for every clip that has none, and a
+  // zero-byte blob makes that throw on every pass.
+  const blob = silentWavBlob();
+  assert.equal(blob.type, 'audio/wav');
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  const samples = Math.ceil(44100 * 0.1);
+  assert.equal(bytes.length, 44 + samples * 2, '0.1 s of 44.1 kHz mono 16-bit + a 44-byte header');
+  const tag = (off: number): string => String.fromCharCode(...bytes.slice(off, off + 4));
+  assert.equal(tag(0), 'RIFF');
+  assert.equal(tag(8), 'WAVE');
+  assert.equal(tag(12), 'fmt ');
+  assert.equal(tag(36), 'data');
+  const view = new DataView(bytes.buffer);
+  assert.equal(view.getUint32(4, true), 36 + samples * 2, 'the RIFF size covers the payload');
+  assert.equal(view.getUint16(20, true), 1, 'PCM');
+  assert.equal(view.getUint16(22, true), 1, 'mono');
+  assert.equal(view.getUint32(24, true), 44100);
+  assert.equal(view.getUint16(34, true), 16, '16-bit');
+  assert.equal(view.getUint32(40, true), samples * 2, 'the data chunk size matches the payload');
+  assert.ok(bytes.slice(44).every((b) => b === 0), 'and it is silence');
+}
+
+/* --------------------------------- runtime -------------------------------- */
+
+interface Harness {
+  deps: MidiCaptureDeps;
+  dispose: () => void;
+  /** Move the transport. */
+  sec: (s: number) => void;
+  /** Flip the recording status and notify the subscriber. */
+  setStatus: (s: string) => void;
+  /** Publish onto the fake bus. */
+  send: (data: number[]) => void;
+  clips: Array<Omit<AudioClip, 'id'> & { id: string }>;
+  renders: Array<{ id: string; updates: Partial<AudioClip>; peaks?: Float32Array }>;
+  notices: string[];
+  undoSteps: () => number;
+  /** How many times the soundfont warm-up was awaited. */
+  warmups: () => number;
+  rendered: Array<{ notes: StepRenderNote[]; bpm: number; totalSteps: number; program?: number }>;
+  midiSubs: number;
+}
+
+const harness = (opts: {
+  tracks: CaptureTrack[];
+  existingClips?: CaptureClip[];
+  armed: string[];
+  bpm?: number;
+  punch?: { from: number; to: number } | null;
+  /** The soundfont picker's program, when soundfonts are on. */
+  globalProgram?: number;
+}): Harness => {
+  let sec = 0;
+  let status = 'idle';
+  let undo = 0;
+  let warmed = 0;
+  const midiListeners = new Set<(m: MidiBusMessage) => void>();
+  const statusListeners = new Set<() => void>();
+  const clips: Array<Omit<AudioClip, 'id'> & { id: string }> = [];
+  const renders: Array<{ id: string; updates: Partial<AudioClip>; peaks?: Float32Array }> = [];
+  const notices: string[] = [];
+  const rendered: Array<{ notes: StepRenderNote[]; bpm: number; totalSteps: number; program?: number }> = [];
+  let nextId = 0;
+
+  const h: Harness = {
+    deps: {
+      subscribeMidi: (cb) => {
+        midiListeners.add(cb);
+        return () => midiListeners.delete(cb);
+      },
+      subscribeStatus: (cb) => {
+        statusListeners.add(cb);
+        return () => statusListeners.delete(cb);
+      },
+      status: () => status,
+      armedTrackIds: () => opts.armed,
+      tracks: () => opts.tracks,
+      clips: () => opts.existingClips ?? [],
+      transportSec: () => sec,
+      bpm: () => opts.bpm ?? 120,
+      punchWindow: () => opts.punch ?? null,
+      globalProgram: () => opts.globalProgram,
+      ensureSoundfontReady: async () => {
+        warmed += 1;
+        return true;
+      },
+      beginUndoStep: () => {
+        undo += 1;
+      },
+      addClipToTrack: (clip) => {
+        nextId += 1;
+        const id = `clip-${nextId}`;
+        clips.push({ ...clip, id });
+        return id;
+      },
+      applyClipRender: (id, updates, peaks) => {
+        renders.push({ id, updates, peaks });
+      },
+      renderStepNotes: async (notes, bpm, totalSteps, o) => {
+        rendered.push({ notes, bpm, totalSteps, program: o?.program });
+        return { blob: new Blob(['wav'], { type: 'audio/wav' }), duration: totalSteps * stepSeconds(bpm) };
+      },
+      computePeaks: async (_blob, bins) => ({ peaks: new Float32Array(bins ?? 0), duration: 1 }),
+      postStatus: (text) => {
+        notices.push(text);
+      },
+    },
+    dispose: () => {},
+    sec: (s) => {
+      sec = s;
+    },
+    setStatus: (s) => {
+      status = s;
+      for (const cb of [...statusListeners]) cb();
+    },
+    send: (data) => {
+      for (const cb of [...midiListeners]) cb({ data, t: 0 });
+    },
+    clips,
+    renders,
+    notices,
+    undoSteps: () => undo,
+    warmups: () => warmed,
+    rendered,
+    get midiSubs() {
+      return midiListeners.size;
+    },
+  };
+  h.dispose = startMidiCapture(h.deps);
+  return h;
+};
+
+const MIDI_TRACK: CaptureTrack = { id: 'midi-1', color: '#7c3aed', instrumentProgram: 0 };
+const AUDIO_TRACK: CaptureTrack = { id: 'aud-1', color: '#22d3ee' };
+
+{
+  // A pass lands a MIDI clip on the armed instrument track at the transport
+  // second the pass started, as ONE undo step, with the audio applied after.
+  resetMidiTakeSeq();
+  const h = harness({ tracks: [MIDI_TRACK, AUDIO_TRACK], armed: ['midi-1', 'aud-1'] });
+  h.sec(8);
+  h.setStatus('recording');
+  h.sec(8.5);
+  h.send([0x90, 60, 100]);
+  h.sec(9);
+  h.send([0x80, 60, 0]);
+  h.sec(9.25);
+  h.send([0x90, 67, 90]); // still held when the pass ends
+  h.sec(9.75);
+  h.setStatus('stopping');
+
+  assert.equal(h.clips.length, 1, 'one clip — the armed AUDIO track captured nothing');
+  const clip = h.clips[0];
+  assert.equal(clip.trackId, 'midi-1');
+  assert.equal(clip.label, 'MIDI take 1');
+  near(clip.startSec, 8, 'the clip sits at the transport second the pass opened at');
+  assert.equal(clip.sourceKind, 'piano-roll');
+  assert.equal(clip.sourceBpm, 120);
+  assert.equal(clip.instrumentProgram, 0);
+  assert.equal(clip.offsetIntoSource, 0);
+  assert.deepEqual(
+    clip.sourceRollNotes?.map((n) => [n.note, n.step, n.length]),
+    [
+      [60, 4, 4], // 0.5 s in, 0.5 s long -> step 4, 4 steps
+      [67, 10, 4], // 1.25 s in, held to 1.75 s
+    ],
+    'both notes, the held one closed at the pass end',
+  );
+  assert.deepEqual(
+    clip.sourcePianoRoll?.map((n) => n.id),
+    clip.sourceRollNotes?.map((n) => n.id),
+    'the roll notes and the sounding notes are the same list',
+  );
+  assert.notEqual(clip.sourcePianoRoll, clip.sourceRollNotes, 'but two arrays, never shared');
+  assert.equal(clip.sourceTotalSteps, 14);
+  near(clip.durationSec, 14 * 0.125, 'the clip is as long as its grid');
+  assert.equal(h.undoSteps(), 1, 'one undo step for the pass');
+  // The placeholder has to survive WaveformEditor's decode-peaks effect until
+  // the render lands: a real WAV, and peaks already on it so it is skipped.
+  assert.ok(clip.audioBlob.size > 44, 'the placeholder is a real WAV, not a zero-byte blob');
+  assert.equal(clip.mimeType, 'audio/wav');
+  assert.equal(clip.peaks?.length, 240, 'and it ships flat peaks, so the decode effect skips it');
+
+  await flush();
+  assert.equal(h.warmups(), 1, 'the soundfont is warmed before the render');
+  assert.equal(h.rendered.length, 1, 'the audio is rendered after the clip lands');
+  assert.equal(h.rendered[0].totalSteps, 14);
+  assert.equal(h.rendered[0].program, 0);
+  assert.equal(h.renders.length, 1, 'and applied through applyClipRender');
+  assert.equal(h.renders[0].id, clip.id);
+  assert.ok(h.renders[0].updates.audioBlob instanceof Blob, 'with the rendered blob');
+  assert.equal(h.renders[0].updates.renderedProgram, 0, 'stamped with the program it was rendered with');
+  assert.equal(h.renders[0].peaks?.length, 240, 'and its peaks');
+  assert.deepEqual(h.notices, [], 'nothing to say about a pass that landed');
+  h.dispose();
+}
+
+{
+  // Nothing played: no clip, no undo step, one notice.
+  resetMidiTakeSeq();
+  const h = harness({ tracks: [MIDI_TRACK], armed: ['midi-1'] });
+  h.sec(2);
+  h.setStatus('recording');
+  h.sec(5);
+  h.setStatus('stopping');
+  assert.equal(h.clips.length, 0, 'an empty capture lands nothing');
+  assert.equal(h.undoSteps(), 0, 'and does not open an undo step');
+  assert.deepEqual(h.notices, [NO_MIDI_MESSAGE]);
+  h.dispose();
+}
+
+{
+  // An armed AUDIO-only track never opens a capture, so the bus goes nowhere
+  // and the mic engine keeps the pass.
+  resetMidiTakeSeq();
+  const h = harness({ tracks: [AUDIO_TRACK], armed: ['aud-1'] });
+  h.setStatus('recording');
+  h.sec(1);
+  h.send([0x90, 60, 100]);
+  h.sec(2);
+  h.send([0x80, 60, 0]);
+  h.setStatus('stopping');
+  assert.equal(h.clips.length, 0, 'an audio track captures no MIDI');
+  assert.deepEqual(h.notices, [], 'and says nothing — this was never a MIDI pass');
+  h.dispose();
+}
+
+{
+  // A track whose latest clip is a MIDI clip captures without an instrument.
+  resetMidiTakeSeq();
+  const h = harness({
+    tracks: [{ id: 'roll-1', color: '#f0f' }],
+    existingClips: [
+      {
+        trackId: 'roll-1',
+        startSec: 0,
+        sourceKind: 'piano-roll',
+        sourcePianoRoll: [{ id: 'n', note: 60, step: 0, length: 1, velocity: 90 }],
+      },
+    ],
+    armed: ['roll-1'],
+  });
+  h.sec(0);
+  h.setStatus('recording');
+  h.sec(0.5);
+  h.send([0x90, 62, 77]);
+  h.sec(1);
+  h.send([0x90, 62, 0]);
+  h.setStatus('stopping');
+  assert.equal(h.clips.length, 1, 'the MIDI track captured');
+  assert.equal(h.clips[0].instrumentProgram, undefined, 'and carries no program it never had');
+  await flush();
+  assert.equal(h.rendered[0].program, undefined);
+  assert.equal(h.renders[0].updates.renderedProgram, undefined, 'nothing to stamp');
+  h.dispose();
+}
+
+{
+  // A track with NO instrument of its own renders through the global picker's
+  // program and is stamped with it. Without that, `effectiveProgramFor` reports
+  // the picker's program, `renderedProgram` is empty, and WaveformEditor
+  // re-renders the clip the instant it appears.
+  resetMidiTakeSeq();
+  const h = harness({
+    tracks: [{ id: 'roll-2', color: '#f0f' }],
+    existingClips: [
+      {
+        trackId: 'roll-2',
+        startSec: 0,
+        sourceKind: 'piano-roll',
+        sourcePianoRoll: [{ id: 'n', note: 60, step: 0, length: 1, velocity: 90 }],
+      },
+    ],
+    armed: ['roll-2'],
+    globalProgram: 40,
+  });
+  h.setStatus('recording');
+  h.sec(0.5);
+  h.send([0x90, 62, 77]);
+  h.sec(1);
+  h.send([0x80, 62, 0]);
+  h.setStatus('stopping');
+  assert.equal(
+    h.clips[0].instrumentProgram,
+    undefined,
+    'the picker is NOT pinned onto the clip — it must keep following the picker',
+  );
+  await flush();
+  assert.equal(h.rendered[0].program, 40, 'but the bounce uses the resolved program');
+  assert.equal(h.renders[0].updates.renderedProgram, 40, 'and is stamped with it');
+  h.dispose();
+}
+
+{
+  // The track's own instrument beats the global picker, as effectiveProgramFor
+  // resolves it.
+  resetMidiTakeSeq();
+  const h = harness({ tracks: [MIDI_TRACK], armed: ['midi-1'], globalProgram: 40 });
+  h.setStatus('recording');
+  h.sec(0.5);
+  h.send([0x90, 60, 100]);
+  h.sec(1);
+  h.send([0x80, 60, 0]);
+  h.setStatus('stopping');
+  await flush();
+  assert.equal(h.rendered[0].program, 0, "the track's own program wins");
+  assert.equal(h.renders[0].updates.renderedProgram, 0);
+  h.dispose();
+}
+
+{
+  // Two armed MIDI tracks: one pass, two clips, still ONE undo step.
+  resetMidiTakeSeq();
+  const h = harness({
+    tracks: [MIDI_TRACK, { id: 'midi-2', color: '#0ff', instrumentProgram: 32 }],
+    armed: ['midi-1', 'midi-2'],
+  });
+  h.setStatus('recording');
+  h.sec(0.5);
+  h.send([0x90, 60, 100]);
+  h.sec(1);
+  h.send([0x80, 60, 0]);
+  h.setStatus('stopping');
+  assert.equal(h.clips.length, 2, 'both armed MIDI tracks took the pass');
+  assert.deepEqual(h.clips.map((c) => c.label), ['MIDI take 1', 'MIDI take 2']);
+  assert.equal(h.undoSteps(), 1, 'one press is one undo step however many tracks');
+  h.dispose();
+}
+
+{
+  // Punch: the notes are cropped to the window and the clip starts at the in
+  // point, exactly as placeTakes crops a take.
+  resetMidiTakeSeq();
+  const h = harness({ tracks: [MIDI_TRACK], armed: ['midi-1'], punch: { from: 4, to: 6 } });
+  h.sec(2);
+  h.setStatus('recording');
+  h.sec(3); // before the in point
+  h.send([0x90, 60, 100]);
+  h.sec(5); // released inside
+  h.send([0x80, 60, 0]);
+  h.sec(5.5); // wholly inside
+  h.send([0x90, 62, 90]);
+  h.sec(5.75);
+  h.send([0x80, 62, 0]);
+  h.sec(8);
+  h.setStatus('idle');
+  assert.equal(h.clips.length, 1);
+  near(h.clips[0].startSec, 4, 'the clip starts at the punch-in point, not at the press');
+  assert.deepEqual(
+    h.clips[0].sourceRollNotes?.map((n) => [n.note, n.step, n.length]),
+    [
+      [60, 0, 8], // 4 -> 5 s, one second = 8 steps
+      [62, 12, 2], // 5.5 -> 5.75 s
+    ],
+    'the part before the in point is trimmed off the first note',
+  );
+  h.dispose();
+}
+
+{
+  // Punch that keeps nothing: the notes were played, so the notice says so.
+  resetMidiTakeSeq();
+  const h = harness({ tracks: [MIDI_TRACK], armed: ['midi-1'], punch: { from: 20, to: 30 } });
+  h.setStatus('recording');
+  h.sec(1);
+  h.send([0x90, 60, 100]);
+  h.sec(2);
+  h.send([0x80, 60, 0]);
+  h.setStatus('stopping');
+  assert.equal(h.clips.length, 0);
+  assert.deepEqual(h.notices, [PUNCH_EMPTY_MIDI_MESSAGE], 'not "no MIDI received" — MIDI was received');
+  h.dispose();
+}
+
+{
+  // The status flip is what opens and closes. A repeat of the same status does
+  // nothing, and 'counting' (the count-in) is not yet a pass.
+  resetMidiTakeSeq();
+  const h = harness({ tracks: [MIDI_TRACK], armed: ['midi-1'] });
+  h.setStatus('counting');
+  h.sec(1);
+  h.send([0x90, 60, 100]);
+  h.sec(2);
+  h.send([0x80, 60, 0]);
+  h.setStatus('counting');
+  assert.equal(h.clips.length, 0, 'a count-in captures nothing');
+  h.setStatus('recording');
+  h.setStatus('recording');
+  h.sec(3);
+  h.send([0x90, 64, 100]);
+  h.sec(4);
+  h.send([0x80, 64, 0]);
+  h.setStatus('stopping');
+  h.setStatus('idle');
+  assert.equal(h.clips.length, 1, 'exactly one clip — stopping then idle is one close');
+  assert.equal(h.clips[0].sourceRollNotes?.length, 1, 'and only what was played while recording');
+  h.dispose();
+}
+
+{
+  // Nothing armed at all: no capture, no notice.
+  resetMidiTakeSeq();
+  const h = harness({ tracks: [MIDI_TRACK], armed: [] });
+  h.setStatus('recording');
+  h.send([0x90, 60, 100]);
+  h.setStatus('idle');
+  assert.equal(h.clips.length, 0);
+  assert.deepEqual(h.notices, []);
+  h.dispose();
+}
+
+{
+  // The disposer unsubscribes; a pass in flight is dropped, not landed.
+  resetMidiTakeSeq();
+  const h = harness({ tracks: [MIDI_TRACK], armed: ['midi-1'] });
+  assert.equal(h.midiSubs, 1);
+  h.setStatus('recording');
+  h.sec(1);
+  h.send([0x90, 60, 100]);
+  h.dispose();
+  assert.equal(h.midiSubs, 0, 'the bus subscription is gone');
+  h.setStatus('idle');
+  assert.equal(h.clips.length, 0, 'a disposed mount lands nothing');
+}
+
+console.log('midiCapture: ok');

@@ -36,21 +36,61 @@
  * MASTER scope walks the graph: a track stem and a clip selection are
  * pre-routing by definition (see `renderBounce`). The printed file is then
  * shifted forward by the largest latency the chains it built declare
- * (`trimLeadingSec`), so the SLOWEST path lands where live playback puts it.
+ * (`trimLeadingSec`), so the mix lands where live playback puts it.
  *
- * That last claim is deliberately narrow. Live playback compensates PER TRACK
- * (`liveMixer.applyCompDelays` holds `max - own` on each strip), so every track
- * arrives together, `maxSec` late, and §3.8's transport reads back by `maxSec`.
- * This render inserts no compensation delays at all — it never has — so track i
- * still prints at `own_i`, and taking `maxSec` off the front lands the slowest
- * path exactly and prints every other track `maxSec - own_i` EARLY. A dry track
- * sitting next to one compressed track therefore moves from exact to 6 ms early.
- * The inter-track skew is unchanged by T14, only its offset is: before, the
- * fastest track was exact and the slowest 6 ms late. The case that matters is
- * the one this fixes outright — a freeze STEM is re-placed on the timeline by
- * `editorStore.freezeTrack`, and a stem is one path, so its trim is exact.
- * Closing the skew means giving the offline graph the same per-track comp
- * delays live has; that is a follow-up, not something this file pretends to do.
+ * SINCE T18 that shift is exact for EVERY track rather than for the slowest one
+ * alone. Live playback compensates PER TRACK (`liveMixer.applyCompDelays` holds
+ * `max - own` on each strip), so every track arrives together, `maxSec` late,
+ * and §3.8's transport reads back by `maxSec`. The master scope now splices the
+ * same delay into each strip — `latency + comp == maxSec` on every path — so
+ * one `maxSec` off the front lands all of them. Before, track i printed at
+ * `own_i` and the single offset landed the slowest path exactly while printing
+ * every other track `maxSec - own_i` EARLY: a dry track sitting next to one
+ * compressed track was 6 ms out, which is the skew this closes.
+ *
+ * SINCE T19b the AUTOMATION is aligned too, and PER PARAM rather than per file.
+ * The trim above is one number for the whole render, which is the right shape
+ * for a track — everything on a strip moves together — and the wrong shape for
+ * a param that sits partway down one. Two of them do:
+ *   - A PAN lane. The panner is after the inserts, so a breakpoint authored for
+ *     timeline `p.t` is written at `p.t + chainLatencySec(chain)`
+ *     (`scheduleParamLane`'s `delaySec` → `liveMixer.laneEnvelopeEvents`). The
+ *     fader is the chain INPUT and still takes none.
+ *   - A RACK lane. The stepping loop writes into an effect that may have others
+ *     ahead of it, so each target reads its lane at `t - prefix(entry)` and its
+ *     step times move forward by the same prefix (`entryPrefixLatencies` →
+ *     `fxLaneSampleTime`). The first entry in a chain has no prefix, which is
+ *     why the un-compensated loop was exact for the common project and early
+ *     for every other one.
+ * Both are the functions `state/liveMixer.ts` drives the live engine with (T19),
+ * called rather than re-derived, so a pan or track-FX breakpoint lands on the
+ * same audio in the preview and in the printed file.
+ * WHAT IS LEFT, for automation: a SEND's lane, which carries the latency of the
+ * effect it is tapped off and nothing about the send's own path; and a
+ * MASTER-RACK lane, whose input is the post-comp sum, so the audio reaching it
+ * is a further `renderLatencySec(compRows)` behind — exactly the figure
+ * `trimLeadingSec` takes off the front, and adding it to the master prefix is a
+ * design call deliberately not taken here (it is the same residual the live
+ * mixer's header records, measured against the trim rather than against the
+ * output device).
+ *
+ * WHAT IS STILL OUTSIDE THE NUMBER, and deliberately:
+ *   - SENDS are not compensated. A send is a second path of a different length,
+ *     so equalising it needs a delay on the tap itself, not on the track
+ *     (§3.6's T09b) — `trackCompDelays` says the same of live playback, and the
+ *     bounce inherits its arithmetic rather than inventing another.
+ *   - THE MASTER RACK, and the output device (T16). The master rack is
+ *     downstream of the sum, so it lags every track equally and compensating
+ *     for it would be compensating for the whole mix twice.
+ *   - A SAMPLE. Offline the comps hold whole SAMPLES: the trim rounds to a
+ *     sample (`trimLeadingSec`) and a `DelayNode` asked for a fraction of one
+ *     interpolates — i.e. it resamples the track to place it a fraction of a
+ *     sample better than the trim can take back. So a track lands within HALF a
+ *     sample of the meeting point, and any two tracks land within ONE sample of
+ *     each other, where the gap between them used to be the whole difference
+ *     between their chains (6 ms = 264.6 samples at 44.1 kHz).
+ * A freeze STEM is one path, so its trim was always exact; the stem scope
+ * builds no comp delay and is untouched by this.
  *
  * DESIGN SOURCES (read for their design only — NO code was copied from either):
  *   - Tracktion Engine `modules/tracktion_engine/model/export/
@@ -75,13 +115,15 @@ import {
   sampleLane, type AudioClip, type AutomationLane, type EditorBus, type EditorTrack,
 } from '../state/editorStore';
 import {
-  applyEnvelopeEvents, laneEnvelopeEvents, scheduleClipSources, trackCompDelays, wireRoutingGraph,
-  type RoutingEndpoints,
+  applyEnvelopeEvents, entryPrefixLatencies, fxLaneSampleTime, laneEnvelopeEvents,
+  scheduleClipSources, trackCompDelays, wireRoutingGraph,
+  type RoutingEndpoints, type TrackCompRow,
 } from '../state/liveMixer';
 import { MASTER_ID, topoOrder, type RoutingGraph } from '../state/routingGraph';
 import { sliceChunks as defaultSliceChunks, type AudioChunk } from './audioAnalysis';
 import {
-  SPATIAL_TELEPORT, buildEffectChain, ensureChopModule, teleportXYZ, type ChainHandle,
+  SPATIAL_TELEPORT, buildEffectChain, chainLatencySec, ensureChopModule, teleportXYZ,
+  type ChainHandle,
 } from './rackEffects';
 import { encodeWav } from './wavEncode';
 
@@ -91,6 +133,13 @@ export const BOUNCE_SAMPLE_RATE = 44100;
 
 /** Channel count of every bounce. All three renderers hard-coded stereo. */
 const BOUNCE_CHANNELS = 2;
+
+/** Ceiling on a compensation `DelayNode`, in seconds — the same 1 s ceiling
+ *  `liveMixer`'s `COMP_MAX_DELAY` gives the live strips (it is private there,
+ *  so the number is restated rather than reached for). Orders of magnitude past
+ *  any plausible insert-chain latency, and it costs only the node's lazily
+ *  allocated buffer. */
+const COMP_MAX_DELAY_SEC = 1.0;
 
 /** What a bounce covers. The three variants are the three call sites:
  *  the whole timeline, one track (a freeze stem), or a hand-picked selection. */
@@ -170,6 +219,15 @@ export interface RenderDeps {
   /** Register the chop worklet on the render context before the rack is built,
    *  so an enabled chop entry bakes in instead of degrading to passthrough. */
   ensureChop?: (ctx: BaseAudioContext) => Promise<void>;
+  /**
+   * The per-track compensation delay, `liveMixer.insertCompNode`'s node in this
+   * graph. A seam of its own rather than another `ctx.createGain()`-style call
+   * because a `DelayNode` is the one node here that a stand-in context cannot
+   * fake by shape: `delayTime` is an AudioParam, and a driver that hands out
+   * plain recorders (`renderCore.routing.test.ts`) supplies its own. Defaults
+   * to the real `ctx.createDelay`, so a production call site passes nothing.
+   */
+  makeCompDelay?: (ctx: BaseAudioContext) => DelayNode;
   /** Onset slicing, for the spatializer's teleport schedule. */
   sliceChunks?: (buf: AudioBuffer) => AudioChunk[];
 }
@@ -223,11 +281,23 @@ export function renderExtentSec(clips: AudioClip[], scope: BounceScope): number 
  * this had not, so adopting the core would have put the bug back. One rule, one
  * implementation: the clamp reaches inside a curve too, which is why it is
  * passed down rather than applied to the points up front.
+ *
+ * `delaySec` is how much AUDIO sits between the chain input and this param, and
+ * it is the same argument the live writer passes (T19). A track's fader IS the
+ * chain input, so a VOLUME lane passes 0 and emits exactly the list it always
+ * has; the PANNER sits after the inserts (`gain -> [fx] -> panner`), so the
+ * audio reaching it at render time `x` entered the strip at `x - latency(fx)`
+ * and a breakpoint authored for timeline `p.t` belongs at `p.t + latency(fx)`.
+ * Only FUTURE events move — the anchor is the value the param starts the render
+ * holding — and with the offline pin `(0, 0, 0, 0)` that anchor is at 0, so the
+ * lead cannot push anything off the front of the file. `trimLeadingSec` then
+ * takes the SAME lead off the whole render, which is why this is not double
+ * compensation: the audio and the envelope move together and land together.
  */
 const scheduleParamLane = (
-  param: AudioParam, lane: AutomationLane, clampFn: (v: number) => number,
+  param: AudioParam, lane: AutomationLane, clampFn: (v: number) => number, delaySec = 0,
 ): void => {
-  applyEnvelopeEvents(param, laneEnvelopeEvents(lane, 0, 0, 0, 0), clampFn);
+  applyEnvelopeEvents(param, laneEnvelopeEvents(lane, 0, 0, 0, 0, delaySec), clampFn);
 };
 
 interface TrackNodes {
@@ -236,11 +306,11 @@ interface TrackNodes {
    *  `StereoPannerNode` at pan 0 would still down-mix a mono source by 3 dB. */
   panner: StereoPannerNode | null;
   fx: ChainHandle | null;
-  /** What this track FEEDS DOWNSTREAM — the panner when there is one, else the
-   *  rack's (or the fader's) own output. Handed to `wireRoutingGraph` as the
-   *  strip's `outputNodeOf`; the live mixer hands it the comp delay, which is
-   *  the same position in the strip (there are no comp delays offline — see
-   *  `trimLeadingSec`). */
+  /** What this track FEEDS DOWNSTREAM before compensation — the panner when
+   *  there is one, else an explicit unity gain (master scope) or the master bus
+   *  itself. In the MASTER scope a comp `DelayNode` is spliced after it and it
+   *  is the comp, not this, that `wireRoutingGraph` places — exactly the
+   *  position the live strip puts it in (`liveMixer.insertCompNode`). */
   tail: AudioNode;
 }
 
@@ -271,24 +341,44 @@ interface RenderedChain {
 /**
  * How far the printed file lags the timeline, in seconds: the largest declared
  * latency along any path the render actually built, which is exactly what
- * `liveMixer.trackLatencyReport().maxSec` reports for live playback.
+ * `liveMixer.trackLatencyReport().maxSec` reports for live playback — and,
+ * since every strip now holds `maxSec - own` (see `renderBounce`), where every
+ * track in the file actually sits.
  *
- * It is computed over the chains that WERE built, not over the document: a
- * muted track, a track a solo silenced, and every chain under `includeFx: false`
- * contribute nothing to the file and so must not move it.
+ * Read off the SAME rows the comp delays are written from, so the two cannot
+ * drift: the rows are computed over the chains that WERE built, not over the
+ * document — a muted track, a track a solo silenced, and every chain under
+ * `includeFx: false` contribute nothing to the file and so must not move it.
  *
  * The MASTER rack is deliberately absent, for the same reason it is absent from
  * the live figure — it is downstream of the sum, so it lags every track equally
  * and compensating for it would be compensating for the whole mix twice.
  */
-function renderLatencySec(
-  tracks: RenderedChain[], sampleRate: number, routing?: { graph: RoutingGraph; buses: RenderedChain[] },
-): number {
+function renderLatencySec(rows: readonly TrackCompRow[]): number {
   let max = 0;
-  for (const row of trackCompDelays(tracks, undefined, sampleRate, routing)) {
+  for (const row of rows) {
     if (row.latencySec > max) max = row.latencySec;
   }
   return max;
+}
+
+/**
+ * Whether a routing graph can be topologically ordered — i.e. whether
+ * `wireRoutingGraph` will honour it or flatten it. Asked twice by one render
+ * (once to size the context, once to decide whether a bus is in a track's
+ * path), and it must answer the same both times, so it is one function rather
+ * than two `try`s. A graph that will not order is rendered with every strip
+ * straight to the master and NO bus in any path; billing its racks anyway would
+ * put latency the file does not contain into both the comps and the trim.
+ */
+function graphOrders(graph?: RoutingGraph): boolean {
+  if (!graph) return false;
+  try {
+    topoOrder(graph);
+    return true;
+  } catch {
+    return false; // degraded: wireRoutingGraph logs it and flattens the graph
+  }
 }
 
 /**
@@ -301,37 +391,46 @@ function renderLatencySec(
  * and a bounce of a compressed mix lands late against the timeline it came
  * from. This takes it off the front.
  *
- * WHAT IT DOES NOT DO. There are no per-track compensation delays in the
- * offline graph, so this is ONE offset on a mix whose tracks are not aligned
- * with each other: at `sec = maxSec` the slowest path lands exactly and every
- * other track prints `maxSec - own` EARLY. The skew between two tracks is
- * exactly what it was before the trim existed — a dry track beside a compressed
- * one is 6 ms out either way — and only which of the two is exact has changed.
- * A single-path render (a freeze stem) has no skew to have, so its trim is
- * exact. Removing the skew needs comp delays offline; see the module header.
+ * ONE offset for the WHOLE file, and since T18 that is all it has to be: the
+ * master scope holds `maxSec - own` on every strip's comp delay before this
+ * runs, so at `sec = maxSec` every track lands, not merely the slowest one. A
+ * single-path render (a freeze stem) has no skew to have and needs no comp, so
+ * its trim was exact before and is exact now.
+ *
+ * WHAT IT DOES NOT DO: sends, the master rack and the output device are all
+ * outside `maxSec` by design — see the module header, which lists what is left
+ * and why each one is left.
  *
  * PURE: no context, no store — a buffer and a number go in, a new buffer comes
- * out and the input is untouched. The length is preserved by zero-padding the
- * tail rather than by returning a shorter buffer, because the length is the
- * bounce's contract: `renderExtentSec` is what the library entry, the freeze
- * stem and the Save As all report, and a file 265 samples short of it would
- * disagree with every one of them.
+ * out and the input is untouched. The OUTPUT LENGTH is the bounce's contract:
+ * `renderExtentSec` is what the library entry, the freeze stem and the Save As
+ * all report, and a file 265 samples short of it would disagree with every one
+ * of them. `outLength` states it, and defaults to the input's — `renderBounce`
+ * passes the requested window because it renders `maxSec` PAST that window (so
+ * the last `maxSec` of the music exists to be shifted into place), and a caller
+ * with an un-padded buffer wants the old "shift, keep the length" behaviour.
+ * Either way a shortfall at the tail is zero-filled rather than shortening the
+ * file.
  *
- * `sec <= 0` hands back the SAME buffer, so a project that declares no latency
- * is not merely close to unchanged — it is the identical object the context
- * rendered, never copied and never re-quantised.
+ * A zero shift that is also a no-op on the length hands back the SAME buffer,
+ * so a project that declares no latency is not merely close to unchanged — it
+ * is the identical object the context rendered, never copied and never
+ * re-quantised.
  */
-export function trimLeadingSec(buffer: AudioBuffer, sec: number): AudioBuffer {
+export function trimLeadingSec(buffer: AudioBuffer, sec: number, outLength?: number): AudioBuffer {
   // Nearest sample: a declaration is a time, not a sample count, and 6 ms at
   // 44.1 kHz is 264.6 samples. Rounding down would leave a fraction of the lag
   // in every file.
   const skip = Math.round(Math.max(0, sec) * buffer.sampleRate);
-  if (skip <= 0) return buffer;
-  const { length, sampleRate, numberOfChannels } = buffer;
+  const length = Math.max(0, outLength ?? buffer.length);
+  if (skip <= 0 && length === buffer.length) return buffer;
+  const { sampleRate, numberOfChannels } = buffer;
   const channels: Float32Array[] = [];
   for (let ch = 0; ch < numberOfChannels; ch += 1) {
     const out = new Float32Array(length); // zero-filled: the pad is free
-    if (skip < length) out.set(buffer.getChannelData(ch).subarray(skip, length), 0);
+    const src = buffer.getChannelData(ch);
+    const take = Math.min(length, src.length - skip);
+    if (take > 0) out.set(src.subarray(skip, skip + take), 0);
     channels.push(out);
   }
   // A plain object rather than `ctx.createBuffer`: this function is pure, and
@@ -372,10 +471,70 @@ export async function renderBounce(req: BounceRequest, deps: RenderDeps): Promis
   const sr = req.sampleRate;
   const scoped = clipsInScope(deps.clips, scope);
   const lengthSec = renderExtentSec(deps.clips, scope) + Math.max(0, req.tailSec ?? 0);
+  /** The length the FILE is, and the bounce's contract — see `trimLeadingSec`. */
+  const outLength = Math.ceil(lengthSec * sr);
+
+  // ── Which tracks, and which of their entries ─────────────────────────────
+  // Ahead of the context because the context's LENGTH depends on their chains.
+  const trackUniverse = scope.kind === 'track'
+    ? deps.tracks.filter((t) => t.id === scope.trackId)
+    : deps.tracks;
+
+  /** A track stem strips hosted VST3 entries: they cannot run in the browser
+   *  and the consumer posts the stem through them on the backend afterwards.
+   *  The master bounce leaves them in — `buildEffectChain` reports them as
+   *  inert passthroughs, which is what the UI reads. */
+  const chainFor = (t: EditorTrack): ChainEntry[] => (scope.kind === 'track'
+    ? (t.fxChain ?? []).filter((e) => e.effect !== 'vst3')
+    : (t.fxChain ?? []));
+
+  /**
+   * HOW MUCH PAST THE WINDOW THE RENDER HAS TO RUN, in seconds.
+   *
+   * Every track's audio sits `maxSec` late in the RAW render — its own chain
+   * plus the comp delay that makes up the difference — so the last `maxSec` of
+   * the requested window falls past the end of a context sized to the window
+   * and is never rendered at all. `trimLeadingSec` then zero-fills the gap it
+   * left. Before T18 that cost the SLOWEST track its tail; with the comps in it
+   * costs EVERY track one, which on a project past the 30 s floor (where the
+   * window ends at the last clip) is the last 6 ms of the music. So the context
+   * runs `maxSec` longer and the trim cuts back to `outLength` afterwards: the
+   * extra is rendered, read and dropped, and the file's length is unchanged.
+   *
+   * THE MASTER SCOPE ONLY, which is where the comps are. A stem and a selection
+   * are printed `own` late by their own racks and trimmed by the same figure, so
+   * their last `own` falls off the end too — but that is T14's behaviour, not
+   * this change's, and the legacy bodies the A/B harness compares against
+   * truncate identically (padding a stem puts case C over the gate, which is the
+   * harness correctly reporting that the bounce and the body it replaced no
+   * longer agree). Fixing it there is a call of its own; this ticket leaves the
+   * stem path exactly as it found it.
+   *
+   * An UPPER BOUND, deliberately, and not the figure the trim uses. It has to
+   * be known before the context exists, while the real rows are computed after
+   * the strips are built — over the chains that were actually built, at
+   * `ctx.sampleRate`. So this is measured over every track in the scope with
+   * mute, solo and `perClipMix` ignored, at the REQUESTED rate: a superset of
+   * the built chains, so never short. Over-padding costs render time and
+   * nothing else, since the output is cut to `outLength` either way.
+   */
+  const padSec = req.includeFx && scope.kind === 'master'
+    ? renderLatencySec(trackCompDelays(
+      trackUniverse.map((t) => ({ id: t.id, fxChain: chainFor(t) })),
+      undefined,
+      sr,
+      // A bus rack is in a track's path only where the graph is walked AND
+      // orderable — the same two conditions `routingActive` / `routedPaths`
+      // put on the real rows below.
+      graphOrders(deps.routing)
+        ? { graph: deps.routing as RoutingGraph, buses: deps.buses ?? [] }
+        : undefined,
+    ))
+    : 0;
 
   const makeContext = deps.makeContext
     ?? ((channels, length, rate) => new OfflineAudioContext(channels, length, rate));
-  const ctx = makeContext(BOUNCE_CHANNELS, Math.ceil(lengthSec * sr), sr);
+  const ctx = makeContext(BOUNCE_CHANNELS, outLength + Math.ceil(padSec * sr), sr);
 
   // ── Decode ───────────────────────────────────────────────────────────────
   const makeDecodeContext = deps.makeDecodeContext
@@ -390,21 +549,30 @@ export async function renderBounce(req: BounceRequest, deps: RenderDeps): Promis
     decodeCtx.close().catch(() => {});
   }
 
-  // ── Which tracks, and which of their entries ─────────────────────────────
-  const trackUniverse = scope.kind === 'track'
-    ? deps.tracks.filter((t) => t.id === scope.trackId)
-    : deps.tracks;
-
-  /** A track stem strips hosted VST3 entries: they cannot run in the browser
-   *  and the consumer posts the stem through them on the backend afterwards.
-   *  The master bounce leaves them in — `buildEffectChain` reports them as
-   *  inert passthroughs, which is what the UI reads. */
-  const chainFor = (t: EditorTrack): ChainEntry[] => (scope.kind === 'track'
-    ? (t.fxChain ?? []).filter((e) => e.effect !== 'vst3')
-    : (t.fxChain ?? []));
-
   /** A track stem has no master bus to run a master rack on. */
   const useMasterFx = req.includeFx && scope.kind !== 'track';
+
+  /**
+   * How late this track's PAN envelope is written, in seconds: the track's OWN
+   * insert chain and nothing else.
+   *
+   * The strip is `gain -> [fx] -> panner -> comp -> routed`, so everything
+   * downstream of the panner — the compensation delay, a bus's rack, the master
+   * rack — is BEHIND the param and cannot make it early. That is why this is
+   * `chainLatencySec(chainFor(trk))` and NOT the `latencySec` on the track's
+   * `TrackCompRow`, which is the whole path to the sum and too big by the buses'
+   * share. (Live playback draws the same distinction: `liveMixer`'s pan delay is
+   * the track chain, its comp row is the path.)
+   *
+   * Measured over the chain that is actually BUILT, like the comp rows and the
+   * trim: under `includeFx: false` there is no rack in the graph, so there is
+   * nothing for the panner to wait for. A `track` scope's stem strips its hosted
+   * VST3 entries before the render and they declare nothing either way, but the
+   * question is moot there — a stem has no track mix and so no panner.
+   */
+  const panLeadSec = (trk: EditorTrack): number => (req.includeFx
+    ? chainLatencySec(chainFor(trk), { sampleRate: ctx.sampleRate })
+    : 0);
 
   const anySolo = deps.tracks.some((t) => t.solo);
   const honoursMute = req.includeTrackMix;
@@ -529,20 +697,25 @@ export async function renderBounce(req: BounceRequest, deps: RenderDeps): Promis
 
       panner = ctx.createStereoPanner();
       const panLane = lanes.find((l) => l.target.kind === 'trackPan' && l.target.trackId === trk.id);
-      if (panLane) scheduleParamLane(panner.pan, panLane, clampPan);
+      // The one lane on this strip that is NOT written on the clip scheduler's
+      // clock: the panner is downstream of the inserts (see `panLeadSec`).
+      if (panLane) scheduleParamLane(panner.pan, panLane, clampPan, panLeadSec(trk));
       else panner.pan.value = clampPan(trk.pan);
     }
 
-    // gain -> [rack] -> panner -> (wherever the graph says), with the panner
-    // dropped when the track mix is off. Without routing that destination is
-    // the master bus and the rack feeds it directly, exactly as before; WITH
-    // routing the tail is left unconnected for `wireRoutingGraph` to place, and
-    // a strip with no panner gets an explicit unity gain to be placed BY — a
-    // node the pass can connect, where `masterBus` would have been the
-    // hard-wired destination this ticket exists to remove. A unity `GainNode`
-    // is transparent (`gain` defaults to 1 and multiplying by 1 is exact), and
-    // it is created only on this path, so a routing-less render is unchanged.
-    const tail: AudioNode = panner ?? (routingActive ? ctx.createGain() : masterBus);
+    // gain -> [rack] -> panner -> (the comp delay, then wherever the graph
+    // says), with the panner dropped when the track mix is off. The tail is
+    // left unconnected here and placed below, after the comps exist.
+    //
+    // A strip with no panner gets an explicit unity gain to be placed BY
+    // whenever this render could have to place it — every MASTER strip (the
+    // comp splices onto it, and where the strip goes is the graph's business
+    // when there is one), where `masterBus` would be a hard-wired destination
+    // that can be neither compensated nor routed. A unity `GainNode` is
+    // transparent (`gain` defaults to 1 and multiplying by 1 is exact). The two
+    // pre-routing scopes keep feeding the master bus directly, exactly as
+    // before: a stem and a selection have no graph and nothing to align.
+    const tail: AudioNode = panner ?? (scope.kind === 'master' ? ctx.createGain() : masterBus);
     let fx: ChainHandle | null = null;
     if (req.includeFx) {
       const chain = chainFor(trk);
@@ -552,9 +725,102 @@ export async function renderBounce(req: BounceRequest, deps: RenderDeps): Promis
     } else {
       gain.connect(tail);
     }
-    if (!routingActive) panner?.connect(masterBus);
     trackNodeById.set(trk.id, { gain, panner, fx, tail });
   }
+
+  // ── How late each strip is, and how late the file will be ────────────────
+  // `routedPaths` is whether the graph ACTUALLY ordered. `wireRoutingGraph`
+  // degrades a graph it cannot order to every strip straight to the master with
+  // no bus in any path, and the alignment has to degrade with it: handed the
+  // unvetted graph, `trackCompDelays` would walk a cycle until it runs out of
+  // hops and bill a bus's rack once per hop — tens of milliseconds of "latency"
+  // for racks that are not in the rendered file at all. The comps would hold it
+  // and the trim would then delete that much of the head of the user's audio.
+  // Asked here rather than taken from the pass because `wireRoutingGraph`
+  // reports its verdict by logging, not by returning it — and asked through the
+  // same `graphOrders` the context's padding asked, so the two cannot disagree
+  // about whether a bus is in anybody's path.
+  const routedPaths = routingActive && graphOrders(deps.routing);
+
+  // Measured off the chains this render built AND the paths it actually wired.
+  // A selection, a stem, and a graph that could not be ordered are all unrouted
+  // (see `routingActive` / `routedPaths`), so none of them carries a bus's
+  // latency: a stem is its own chain alone, and a damaged graph is exactly what
+  // the degraded mix put in the path. ONE row set feeds both the comp delays
+  // and the trim, so the file's offset and the strips' delays cannot disagree.
+  const compRows = trackCompDelays(
+    renderedTrackChains,
+    undefined, // the real rack registry
+    ctx.sampleRate, // the rate the file is actually at, not the one requested
+    routedPaths ? { graph: deps.routing as RoutingGraph, buses: renderedBusChains } : undefined,
+  );
+
+  // ── Per-track compensation delays ────────────────────────────────────────
+  // `liveMixer.insertCompNode`'s splice, offline: `tail -> comp -> (wherever
+  // the strip goes)`, holding `maxSec - own` so every track meets the slowest
+  // one and the single trim below lands all of them. Only the MASTER scope: a
+  // stem is one path and a selection is pre-routing (see `routingActive`), and
+  // a BUS needs none either — a bus's rack is counted on every track path
+  // through it, so equalising at the tracks equalises at the bus as well.
+  //
+  // Set, not ramped: `applyCompDelays` uses `setTargetAtTime` because a jump on
+  // a live `DelayNode` re-reads the delay line and clicks. An offline context
+  // starts at 0 with nothing in the line to click, and a ramp would BE audible
+  // — it would slide the track into place over the first 10 ms of the file.
+  //
+  // Rounded to whole samples, because the trim is (`trimLeadingSec`): a
+  // `DelayNode` asked for 264.6 samples interpolates between two of them, so an
+  // un-rounded comp would resample the track to place it a fraction of a sample
+  // better than the trim can take back. Whole samples leave the audio bit for
+  // bit what it was, moved.
+  //
+  // Nothing to align, nothing inserted: when every comp is 0 no delay node is
+  // built at all, so a project that declares no latency renders exactly what it
+  // rendered before. Node for node too, with ONE stated exception — a master
+  // render with `includeTrackMix: false` now always allocates the unity gain
+  // that a strip without a panner is placed by (see the strip builder), where
+  // before it fed the master bus directly. Unity gain is exact, so the audio is
+  // identical; the graph is one node per strip heavier.
+  const compDelays = new Map<string, DelayNode>();
+  if (scope.kind === 'master' && compRows.some((r) => r.compSec > 0)) {
+    const makeCompDelay = deps.makeCompDelay
+      ?? ((c: BaseAudioContext) => c.createDelay(COMP_MAX_DELAY_SEC));
+    for (const row of compRows) {
+      const nodes = trackNodeById.get(row.trackId);
+      if (!nodes) continue;
+      const comp = makeCompDelay(ctx);
+      // PINNED TO THE BOUNCE'S CHANNEL COUNT, and this is not cosmetic. A
+      // `DelayNode` defaults to `channelCountMode: 'max'`, so its channel count
+      // follows its input — and when the clip sources upstream of a strip run
+      // out, that input goes INACTIVE and the count it computes drops. Chrome
+      // reallocates the delay's per-channel lines on that change and the
+      // samples still inside them are lost.
+      //
+      // MEASURED, twice, on a real Chromium: through this file's own graph with
+      // `includeTrackMix: true` (so the comp's upstream is a StereoPannerNode,
+      // permanently 2-channel while it is running) and again in a hand-built
+      // `source -> gain -> panner -> delay` graph. Both lost the last 247
+      // samples of the clip — max |Δ| 3.3e-1, a third of full scale, neither
+      // the delayed signal nor silence — and both were exact with these two
+      // lines. A 2-channel upstream does NOT protect the node: what drops is
+      // the count the delay computes from an input it no longer considers
+      // active, not the panner's own output. A bounce is stereo from end to end
+      // (`BOUNCE_CHANNELS`), so saying so explicitly keeps the node a pure time
+      // shift for its whole tail. Case E of the A/B harness is the pin.
+      comp.channelCount = BOUNCE_CHANNELS;
+      comp.channelCountMode = 'explicit';
+      comp.delayTime.value = Math.round(row.compSec * ctx.sampleRate) / ctx.sampleRate;
+      nodes.tail.connect(comp);
+      compDelays.set(row.trackId, comp);
+    }
+  }
+
+  /** What a strip hands downstream: its comp delay when it has one, else its
+   *  own tail. The one place the rest of this function asks. */
+  const stripOutput = (id: string): AudioNode | undefined => {
+    const nodes = trackNodeById.get(id);
+    return nodes && (compDelays.get(id) ?? nodes.tail);
+  };
 
   // ── Where everything goes ────────────────────────────────────────────────
   // ONE wiring pass for the whole app: the same `wireRoutingGraph` the live
@@ -563,24 +829,9 @@ export async function renderBounce(req: BounceRequest, deps: RenderDeps): Promis
   // main path, and a graph it cannot order degrading to every strip straight to
   // the master (logged, never silent). Re-deriving any of that here is what
   // would let the bounce and the preview drift apart again.
-  //
-  // `routedPaths` is whether the graph ACTUALLY ordered. `wireRoutingGraph`
-  // degrades a graph it cannot order to every strip straight to the master with
-  // no bus in any path, and the trim below has to degrade with it: handed the
-  // unvetted graph, `trackCompDelays` would walk a cycle until it runs out of
-  // hops and bill a bus's rack once per hop — tens of milliseconds of "latency"
-  // for racks that are not in the rendered file at all, and the trim would then
-  // delete that much of the head of the user's audio. Asked here rather than
-  // taken from the pass because `wireRoutingGraph` reports its verdict by
-  // logging, not by returning it.
-  let routedPaths = false;
   if (routingActive) {
-    try {
-      topoOrder(deps.routing as RoutingGraph);
-      routedPaths = true;
-    } catch { /* degraded: wireRoutingGraph logs it and flattens the graph */ }
     const ends: RoutingEndpoints = {
-      outputNodeOf: (id) => trackNodeById.get(id)?.tail ?? busStrips.get(id)?.output,
+      outputNodeOf: (id) => stripOutput(id) ?? busStrips.get(id)?.output,
       inputNodeOf: (id) => (id === MASTER_ID ? masterBus : busStrips.get(id)?.input),
       makeSendGain: (amount) => {
         const g = ctx.createGain();
@@ -592,6 +843,16 @@ export async function renderBounce(req: BounceRequest, deps: RenderDeps): Promis
       liveIds: () => [...trackNodeById.keys(), ...busStrips.keys()],
     };
     wireRoutingGraph(deps.routing as RoutingGraph, ends);
+  } else {
+    // No graph to walk: every strip lands on the master bus, as it always has.
+    // Deferred to here rather than done as each strip is built, so the comp
+    // delay goes BETWEEN the two rather than being spliced onto a live edge.
+    // A strip whose tail IS the master bus (a stem, a selection with no track
+    // mix) is already connected and carries no comp.
+    for (const id of trackNodeById.keys()) {
+      const out = stripOutput(id);
+      if (out && out !== masterBus) out.connect(masterBus);
+    }
   }
 
   // ── The clips ────────────────────────────────────────────────────────────
@@ -665,11 +926,19 @@ export async function renderBounce(req: BounceRequest, deps: RenderDeps): Promis
     entryId: string;
     baseParams: Record<string, number>;
     lanes: AutomationLane[];
+    /** Seconds of declared latency AHEAD of this entry in its own chain — the
+     *  amount the audio arriving at it right now is behind the render clock.
+     *  See `groupFx`; 0 for the first entry in every chain. */
+    prefixSec: number;
   }[] = [];
   if (req.includeAutomation && req.includeFx) {
     const groupFx = (
       kind: 'trackFx' | 'masterFx', handle: ChainHandle, chain: ChainEntry[], trackId?: string,
     ) => {
+      // ONCE PER CHAIN, not once per step: a prefix sum is a walk of the whole
+      // chain through the rack registry, and the stepping loop below asks for
+      // every target's figure at every breakpoint of every lane.
+      const prefix = entryPrefixLatencies(chain, { sampleRate: ctx.sampleRate });
       for (const e of chain) {
         if (!e.enabled) continue;
         const entryLanes = lanes.filter(
@@ -677,7 +946,10 @@ export async function renderBounce(req: BounceRequest, deps: RenderDeps): Promis
             && (kind === 'masterFx' || l.target.trackId === trackId),
         );
         if (entryLanes.length > 0) {
-          fxTargets.push({ handle, entryId: e.id, baseParams: e.params, lanes: entryLanes });
+          fxTargets.push({
+            handle, entryId: e.id, baseParams: e.params, lanes: entryLanes,
+            prefixSec: prefix[e.id] ?? 0,
+          });
         }
       }
     };
@@ -690,11 +962,19 @@ export async function renderBounce(req: BounceRequest, deps: RenderDeps): Promis
   }
 
   if (fxTargets.length > 0) {
+    // EACH TARGET READS ITS LANE AT ITS OWN TIME. The audio a step writes into
+    // an effect with `prefixSec` of chain ahead of it entered the strip that
+    // long ago, so the value to write at render time `t` is the one the lane
+    // held at `t - prefixSec` — `liveMixer.fxLaneSampleTime`, the same function
+    // the live ~40 Hz writer reads its lanes through. It clamps into
+    // `[0, lengthSec]`, so a step near the top of the render reads the lane's
+    // value AT 0 rather than going behind the start of the timeline.
     const applyFxAt = (t: number) => {
       for (const tgt of fxTargets) {
+        const at = fxLaneSampleTime(t, tgt.prefixSec, lengthSec);
         const merged: Record<string, number> = { ...tgt.baseParams };
         for (const lane of tgt.lanes) {
-          const v = sampleLane(lane, t);
+          const v = sampleLane(lane, at);
           if (v != null && lane.target.paramKey) merged[lane.target.paramKey] = v;
         }
         tgt.handle.updateParams(tgt.entryId, merged);
@@ -702,13 +982,22 @@ export async function renderBounce(req: BounceRequest, deps: RenderDeps): Promis
     };
     applyFxAt(0); // initial state at the top of the render
     // Union of breakpoint times, quantised to the render quantum, in (0, length).
+    //
+    // SHIFTED BY THE SAME PREFIX, and that half is not optional: a breakpoint
+    // authored for timeline `p.t` takes effect on this entry at render time
+    // `p.t + prefixSec`, so an un-shifted union would suspend at `p.t` while the
+    // sampler above read `p.t - prefixSec` — the breakpoint's own value would
+    // never be written and the lane would jump to it at the NEXT breakpoint.
+    // Clipped to `(0, lengthSec)` after the shift, so a point the lead carries
+    // into the render gets a step and one it carries past the end does not.
     const q = 128 / sr;
     const times = new Set<number>();
     for (const tgt of fxTargets) {
       for (const lane of tgt.lanes) {
         for (const p of lane.points) {
-          if (p.t <= 0 || p.t >= lengthSec) continue;
-          times.add(Math.min(lengthSec - q, Math.ceil(p.t / q) * q));
+          const at = p.t + tgt.prefixSec;
+          if (at <= 0 || at >= lengthSec) continue;
+          times.add(Math.min(lengthSec - q, Math.ceil(at / q) * q));
         }
       }
     }
@@ -718,21 +1007,15 @@ export async function renderBounce(req: BounceRequest, deps: RenderDeps): Promis
     }
   }
 
-  // How late the file will be, measured off the chains this render built AND
-  // the paths it actually wired. A selection, a stem, and a graph that could
-  // not be ordered are all unrouted (see `routingActive` / `routedPaths`), so
-  // none of them carries a bus's latency: a stem trims by its own chain alone,
-  // and a damaged graph trims by exactly what the degraded mix put in the path.
-  const trimSec = req.includeFx
-    ? renderLatencySec(
-      renderedTrackChains,
-      ctx.sampleRate, // the rate the file is actually at, not the one requested
-      routedPaths ? { graph: deps.routing as RoutingGraph, buses: renderedBusChains } : undefined,
-    )
-    : 0;
+  // How late the file is: the slowest path in the rows the comps were written
+  // from, which — because they were — is now where EVERY track sits.
+  const trimSec = req.includeFx ? renderLatencySec(compRows) : 0;
 
   try {
-    return trimLeadingSec(await ctx.startRendering(), trimSec);
+    // `outLength`, not the context's: the render ran `padSec` past the window
+    // so that the last `maxSec` of the music would exist to be pulled into
+    // place, and that overshoot is dropped here rather than shipped.
+    return trimLeadingSec(await ctx.startRendering(), trimSec, outLength);
   } finally {
     // `renderTrackStem` disposed its chain and the other two leaked theirs.
     // Disposal happens after the render has finished, so it cannot change a
