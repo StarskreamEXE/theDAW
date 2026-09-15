@@ -20,10 +20,13 @@ const KEY_INNER_PX = 80 - 4;
 /** The least room a legend keeps from each side of the key. */
 const LEGEND_SIDE_PX = 3;
 /**
- * The label of a dimmed key: one that waits on the other workspace's studio
- * run, or UNDERFIT's TRAIN, whose runs start in the dashboard.
+ * The label of a key dimmed by something outside itself: one waiting on the
+ * other workspace's studio run, and UNDERFIT's TRAIN when the dashboard has no
+ * run to repeat or is out of reach. TRAIN's own "starting a run…" is not one of
+ * these — that key is latched on its own run, like every other busy key.
  */
-const WAITING = /: waiting for the (EDIT process|MIX chain) to finish$|^Train: /;
+const WAITING =
+  /: waiting for the (EDIT process|MIX chain) to finish$|^Train: (set up the first run|the Underfit dashboard is not answering|restart the backend)/;
 
 const IDLE: ActionKeyInput = {
   centerTab: 'make',
@@ -35,6 +38,8 @@ const IDLE: ActionKeyInput = {
   isChainProcessing: false,
   trainingRun: null,
   trainingLink: 'ok',
+  lastRunName: null,
+  startingRun: false,
   vjTargetActive: false,
 };
 
@@ -206,21 +211,41 @@ const face = (input: ActionKeyInput): ActionKeyFace => {
   assert.equal(face({ ...run, progressPct: Number.NaN }).progressText, null);
 }
 
-// (f) UNDERFIT, replayed in underfitRunsStore's order: no live run (TRAIN rests
-// dimmed and says where runs start), a dashboard run goes live (STOP, latched,
-// pulsing foot, named), the press sends its kill (busy while it is out), the
-// run is killed (TRAIN again).
+// (f) UNDERFIT, replayed in underfitRunsStore's order: no dashboard run at all
+// (TRAIN rests dimmed, since the first run needs the dashboard's form), a run
+// exists (TRAIN repeats it, named), the press is out (busy), a run goes live
+// (STOP, latched, pulsing foot, named), the press sends its kill (busy while it
+// is out), the run is killed (TRAIN again).
 {
   const tab = { ...IDLE, centerTab: 'underfit' };
   const rest = face(tab);
   assert.equal(rest.legend, 'TRAIN');
-  assert.equal(rest.disabled, true, 'nothing to start from the footer');
+  assert.equal(rest.disabled, true, 'with no run to repeat there is nothing to start');
   assert.equal(rest.on, false);
-  assert.equal(rest.label, 'Train: start a run in the Underfit dashboard above; this key stops it while it trains');
+  assert.match(rest.label, /^Train: set up the first run in the Underfit dashboard above/);
   assert.match(face({ ...tab, trainingLink: 'dashboard-down' }).label, /^Train: the Underfit dashboard is not answering/);
-  assert.match(face({ ...tab, trainingLink: 'backend-old' }).label, /restart the backend so this key can stop it$/);
+  assert.match(face({ ...tab, trainingLink: 'backend-old' }).label, /restart the backend so this key can start and stop runs$/);
 
-  const running = face({ ...tab, trainingRun: { name: 'drums-lora', others: 0, stopping: false } });
+  // A run exists: the key repeats its settings, and names the run it copies.
+  const repeat = face({ ...tab, lastRunName: 'drums-lora' });
+  assert.equal(repeat.legend, 'TRAIN');
+  assert.equal(repeat.glyph, 'train');
+  assert.equal(repeat.disabled, false, 'a press starts a run');
+  assert.equal(repeat.on, false);
+  assert.equal(repeat.label, 'Train again with the settings of "drums-lora"');
+
+  // A run to repeat is no use while the dashboard is unreachable.
+  assert.equal(face({ ...tab, lastRunName: 'drums-lora', trainingLink: 'dashboard-down' }).disabled, true);
+  assert.equal(face({ ...tab, lastRunName: 'drums-lora', trainingLink: 'backend-old' }).disabled, true);
+
+  // The start request is out: latched and busy, so a second press sends nothing.
+  const starting = face({ ...tab, lastRunName: 'drums-lora', startingRun: true });
+  assert.equal(starting.legend, 'TRAIN');
+  assert.equal(starting.on && starting.disabled, true);
+  assert.equal(starting.label, 'Train: starting a run…');
+  assert.deepEqual(starting.progress, { kind: 'pending' });
+
+  const running = face({ ...tab, lastRunName: 'drums-lora', trainingRun: { name: 'drums-lora', others: 0, stopping: false } });
   assert.equal(running.legend, 'STOP');
   assert.equal(running.glyph, 'stop');
   assert.equal(running.on, true);
@@ -238,7 +263,7 @@ const face = (input: ActionKeyInput): ActionKeyFace => {
   assert.equal(stopping.on && stopping.disabled, true, 'busy while the kill is out, so a second press sends nothing');
   assert.equal(stopping.label, 'Stop the Underfit training run "drums-lora": stopping…');
 
-  assert.equal(face(tab).legend, 'TRAIN', 'the killed run leaves the key');
+  assert.equal(face({ ...tab, lastRunName: 'drums-lora' }).legend, 'TRAIN', 'the killed run leaves the key');
 }
 
 // (g) EDIT: a running process cannot be started again, so the key is busy and
