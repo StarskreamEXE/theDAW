@@ -9,6 +9,12 @@ import { MIN_CLIP_SEC } from '../lib/clipDragMath';
 import type { WarpMarker } from '../lib/audioWarp';
 import type { ChainEntry, VstNode } from './effectChainStore';
 import { rackEffectDefaults } from '../lib/rackEffects';
+import {
+  holdsAfterRelease, modeAfterStop, recordsWhileHeld, sampleCurve, upsertAutomationPoint,
+  writeSpan, writesUntouched, type AutomationMode,
+} from '../lib/automationModes';
+
+export type { AutomationMode } from '../lib/automationModes';
 
 export type ToolMode = 'move' | 'cut' | 'split';
 
@@ -189,10 +195,30 @@ export interface AutomationTarget {
   paramKey?: string;
 }
 
-/** One breakpoint: timeline seconds -> value (in the param's natural units). */
+/** One breakpoint: timeline seconds -> value (in the param's natural units).
+ *  Structurally identical to `automationModes.CurvePoint`, which is what the pure
+ *  model works in; the two are assignable both ways. */
 export interface AutomationPoint {
   t: number;
   v: number;
+  /** Shape of the segment that STARTS at this point, in [-1, 1]. Absent (the
+   *  only form every lane written before curves existed has) = 0 = linear.
+   *  Positive reaches the next value early, negative late. Evaluated by
+   *  lib/automationModes `curveShape`. */
+  curve?: number;
+}
+
+/** One target held (or held-after-release) during a record pass. Transient pass
+ *  state: deliberately OUTSIDE the undo snapshot and the autosave manifest — a
+ *  half-finished fader ride is not part of the document. */
+export interface AutomationHold {
+  target: AutomationTarget;
+  /** The value being written forward. */
+  value: number;
+  /** Timeline time the hold has written up to; the next write spans from here. */
+  lastT: number;
+  /** True once the control was let go and the mode kept the target (latch/write). */
+  released: boolean;
 }
 
 export interface AutomationLane {
@@ -276,51 +302,77 @@ export const freezeSignature = (doc: {
 export const automationTargetKey = (target: AutomationTarget): string =>
   `${target.kind}|${target.trackId ?? ''}|${target.entryId ?? ''}|${target.paramKey ?? ''}`;
 
-/** Linear-interpolated lane value at time `t`; null when the lane has no points.
- *  Holds the first/last value outside the breakpoint range. */
-export const sampleLane = (lane: AutomationLane, t: number): number | null => {
-  const pts = lane.points;
-  if (pts.length === 0) return null;
-  if (t <= pts[0].t) return pts[0].v;
-  const last = pts[pts.length - 1];
-  if (t >= last.t) return last.v;
-  let lo = 0;
-  let hi = pts.length - 1;
-  while (lo + 1 < hi) {
-    const mid = (lo + hi) >> 1;
-    if (pts[mid].t <= t) lo = mid;
-    else hi = mid;
-  }
-  const a = pts[lo];
-  const b = pts[hi];
-  const f = (t - a.t) / Math.max(1e-6, b.t - a.t);
-  return a.v + (b.v - a.v) * f;
-};
+/** Lane value at time `t`; null when the lane has no points. Holds the first/last
+ *  value outside the breakpoint range, and shapes each interior segment by its
+ *  left point's `curve` — which for a lane with no curves is the identical linear
+ *  ramp this has always returned (`curveShape(u, 0) === u`). */
+export const sampleLane = (lane: AutomationLane, t: number): number | null => sampleCurve(lane.points, t);
 
 /** Minimum spacing between recorded breakpoints (thins ~50 Hz gestures). */
 const MIN_POINT_DT = 0.02;
 
-/** Insert (or replace a near neighbor's value) keeping `points` sorted + thinned. */
-const upsertPoint = (points: AutomationPoint[], t: number, v: number): AutomationPoint[] => {
-  let lo = 0;
-  let hi = points.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (points[mid].t < t) lo = mid + 1;
-    else hi = mid;
+/** Insert (or replace a near neighbor's value) keeping `points` sorted + thinned.
+ *  The rule itself lives in lib/automationModes so the held-target span write and
+ *  the point actions here cannot drift apart. */
+const upsertPoint = (points: AutomationPoint[], t: number, v: number, curve?: number): AutomationPoint[] =>
+  upsertAutomationPoint(points, t, v, MIN_POINT_DT, curve);
+
+/**
+ * Where the pre-punch anchor goes: as close to `t - MIN_POINT_DT` as the upsert's
+ * merge rule allows, so the punch-in anchor at `t` cannot swallow it.
+ *
+ * `t - MIN_POINT_DT` is NOT good enough on its own. The subtraction rounds, and
+ * for ~96% of timeline positions (t = 5 among them) it rounds UP, leaving an exact
+ * gap a hair BELOW MIN_POINT_DT — and the merge rule is a strict `<`, so the
+ * punch-in write would replace the pre-anchor instead of sitting next to it.
+ * Stepping down by one ulp (one iteration in practice; the loop is belt and
+ * braces) makes the gap provably >= MIN_POINT_DT. The shift is ~1e-16 s.
+ */
+const prePunchTime = (t: number): number => {
+  let preT = t - MIN_POINT_DT;
+  for (let i = 0; i < 4 && t - preT < MIN_POINT_DT; i += 1) {
+    preT -= Math.max(Number.MIN_VALUE, Math.abs(preT) * Number.EPSILON);
   }
-  const idx = lo;
-  const left = idx > 0 ? points[idx - 1] : null;
-  const right = idx < points.length ? points[idx] : null;
-  const next = points.slice();
-  if (left && t - left.t < MIN_POINT_DT) {
-    next[idx - 1] = { t: left.t, v };
-  } else if (right && right.t - t < MIN_POINT_DT) {
-    next[idx] = { t: right.t, v };
-  } else {
-    next.splice(idx, 0, { t, v });
+  return preT;
+};
+
+/** Apply one hold's forward write to the lane it owns. A hold always has a lane
+ *  (it was created by a gesture that made one, or seeded from an existing one),
+ *  so a missing lane simply means there is nothing to write into. */
+const writeHoldSpan = (
+  lanes: AutomationLane[],
+  key: string,
+  fromT: number,
+  toT: number,
+  v: number,
+): AutomationLane[] => {
+  let hit = false;
+  const next = lanes.map((l) => {
+    if (automationTargetKey(l.target) !== key) return l;
+    hit = true;
+    return { ...l, points: writeSpan(l.points, fromT, toT, v, MIN_POINT_DT) };
+  });
+  return hit ? next : lanes;
+};
+
+/** The value a parameter is actually sitting at, for a lane that has no points to
+ *  sample. Null when the target no longer resolves (a deleted track or FX entry). */
+const storedValueForTarget = (
+  s: Pick<EditorStoreState, 'tracks' | 'masterFxChain'>,
+  target: AutomationTarget,
+): number | null => {
+  const { kind, trackId, entryId, paramKey } = target;
+  if (kind === 'trackVolume' || kind === 'trackPan') {
+    const track = s.tracks.find((t) => t.id === trackId);
+    if (!track) return null;
+    return kind === 'trackVolume' ? track.volume : track.pan;
   }
-  return next;
+  if (!entryId || !paramKey) return null;
+  const chain = kind === 'masterFx'
+    ? s.masterFxChain
+    : s.tracks.find((t) => t.id === trackId)?.fxChain;
+  const v = chain?.find((e) => e.id === entryId)?.params?.[paramKey];
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
 };
 
 interface EditorStoreState {
@@ -345,8 +397,20 @@ interface EditorStoreState {
   masterFxChain: ChainEntry[];
   /** Automation lanes (Phase E): one per automated parameter. */
   automationLanes: AutomationLane[];
-  /** Write/arm mode: while on, moving an armed control during playback records. */
+  /** How a control move is recorded: read / touch / latch / write. See
+   *  lib/automationModes for what each one promises. */
+  automationMode: AutomationMode;
+  /**
+   * @deprecated Derived mirror of `automationMode !== 'read'`, kept in sync in the
+   * same `set` as the mode so the consumers written against the old boolean keep
+   * working. Read `automationMode` instead — the boolean cannot tell touch from
+   * latch from write.
+   */
   automationWrite: boolean;
+  /** Targets currently held (or held-after-release) by the running record pass,
+   *  keyed by `automationTargetKey`. Transient: NOT in the undo snapshot and NOT
+   *  in the autosave manifest. */
+  automationHolds: Record<string, AutomationHold>;
   /** Master-bus VST3 chain (hosted via pedalboard). NOT a Web-Audio rack — these
    *  apply when the master is rendered ("frozen"); see frozenMaster + previewMode. */
   masterVstChain: ChainEntry[];
@@ -445,7 +509,35 @@ interface EditorStoreState {
   rebuildTrackEffect: (trackId: string, entryId: string, effectId: string) => void;
 
   // Automation (Phase E)
+  setAutomationMode: (mode: AutomationMode) => void;
+  /** @deprecated Reaches `setAutomationMode(on ? 'latch' : 'read')`. */
   setAutomationWrite: (on: boolean) => void;
+  /** Begin a gesture on `target`: create the lane if it has none, write the first
+   *  point, and hold the target. No-op in `read`. Starts a fresh undo step, so
+   *  the whole gesture that follows folds into one. */
+  beginAutomationTouch: (target: AutomationTarget, t: number, v: number) => void;
+  /** Continue a gesture: write `v` forward across everything between the hold's
+   *  last write and `t`. Inert with no hold behind it. */
+  moveAutomationTouch: (target: AutomationTarget, t: number, v: number) => void;
+  /** Let the control go. `touch` writes the last span and punches out; `latch`
+   *  and `write` keep the target, holding its released value. */
+  endAutomationTouch: (target: AutomationTarget, t: number) => void;
+  /** One frame of the record pass: every hold writes its value forward to `t`.
+   *  With no holds this returns the state untouched (same object, no subscriber
+   *  wakes), because it runs on the transport's frame timer. */
+  advanceAutomationHolds: (t: number) => void;
+  /** Play start. In `write` — and only there — every enabled lane is armed as a
+   *  released hold at the value it has at `t`, which is what makes a write pass
+   *  overwrite everything it rolls over. */
+  beginAutomationPass: (t: number) => void;
+  /** Transport stop: drop every hold and apply the mode's stop rule (`write`
+   *  demotes to `latch`). */
+  endAutomationPass: () => void;
+  /** Shape the segment that starts at `index`, in [-1, 1]; 0 clears it.
+   *  Pass `{ coalesce: true }` from a continuous DRAG so the whole gesture stays
+   *  one undo step; any other caller gets a step of its own (see
+   *  `stretchClipToFit`, which carries the same rule). */
+  setAutomationPointCurve: (laneId: string, index: number, curve: number, opts?: { coalesce?: boolean }) => void;
   recordAutomationPoint: (target: AutomationTarget, t: number, v: number) => void;
   addAutomationPoint: (laneId: string, t: number, v: number) => void;
   updateAutomationPoint: (laneId: string, index: number, t: number, v: number) => void;
@@ -592,7 +684,9 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   previewMode: 'live',
   frozenMaster: null,
   automationLanes: [],
+  automationMode: 'read',
   automationWrite: false,
+  automationHolds: {},
   loopEnabled: false,
   loopStart: 0,
   loopEnd: 0,
@@ -632,6 +726,8 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       bpm: bpm && Number.isFinite(bpm) ? Math.max(40, Math.min(240, bpm)) : get().bpm,
       markers: [],
       automationLanes: [],
+      // A record pass cannot survive the document it was writing into.
+      automationHolds: {},
       loopEnabled: false,
       loopStart: 0,
       loopEnd: 0,
@@ -1117,7 +1213,171 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       ),
     })),
 
-  setAutomationWrite: (on) => set({ automationWrite: on }),
+  setAutomationMode: (mode) =>
+    // The derived boolean is written in the SAME set as the mode, so no consumer
+    // can ever observe the two disagreeing.
+    //
+    // Switching to a mode that does not record ALSO ends the pass. Neither
+    // moveAutomationTouch nor advanceAutomationHolds re-checks the mode (they
+    // are driven by the pointer and the frame timer and must stay cheap), so a
+    // hold left behind by a mid-pass switch to 'read' would go on overwriting
+    // the lane until the transport stopped — the exact opposite of hands off.
+    set({
+      automationMode: mode,
+      automationWrite: mode !== 'read',
+      ...(recordsWhileHeld(mode) ? {} : { automationHolds: {} }),
+    }),
+
+  setAutomationWrite: (on) => get().setAutomationMode(on ? 'latch' : 'read'),
+
+  beginAutomationTouch: (target, t, v) => {
+    if (!recordsWhileHeld(get().automationMode)) return;
+    // The gesture is ONE undo step: this cuts the 300 ms coalescing burst, and
+    // every frame that follows folds into the step this first write opens.
+    beginUndoStep();
+    set((s) => {
+      const key = automationTargetKey(target);
+      const existing = s.automationLanes.find((l) => automationTargetKey(l.target) === key);
+      const automationLanes = existing
+        ? s.automationLanes.map((l) => (l.id === existing.id ? { ...l, points: upsertPoint(l.points, t, v) } : l))
+        : [...s.automationLanes, { id: uid(), target, points: [{ t, v }], enabled: true }];
+      return {
+        automationLanes,
+        automationHolds: { ...s.automationHolds, [key]: { target, value: v, lastT: t, released: false } },
+      };
+    });
+  },
+
+  moveAutomationTouch: (target, t, v) =>
+    set((s) => {
+      const key = automationTargetKey(target);
+      const hold = s.automationHolds[key];
+      if (!hold) return {};
+      return {
+        automationLanes: writeHoldSpan(s.automationLanes, key, hold.lastT, t, v),
+        automationHolds: { ...s.automationHolds, [key]: { ...hold, value: v, lastT: t } },
+      };
+    }),
+
+  endAutomationTouch: (target, t) =>
+    set((s) => {
+      const key = automationTargetKey(target);
+      const hold = s.automationHolds[key];
+      if (!hold) return {};
+      if (holdsAfterRelease(s.automationMode)) {
+        // Latch/write keep the target, now released — but the span up to `t` is
+        // written HERE rather than left to the next frame, because there may not
+        // be one: a release followed immediately by a stop would otherwise lose
+        // everything between the last move and the release. Advancing `lastT` to
+        // `t` makes this idempotent with the frame that does follow.
+        return {
+          automationLanes: writeHoldSpan(s.automationLanes, key, hold.lastT, t, hold.value),
+          automationHolds: { ...s.automationHolds, [key]: { ...hold, released: true, lastT: t } },
+        };
+      }
+      // Touch punches out here: one last span, then the lane is the lane again.
+      const { [key]: _dropped, ...rest } = s.automationHolds;
+      return {
+        automationLanes: writeHoldSpan(s.automationLanes, key, hold.lastT, t, hold.value),
+        automationHolds: rest,
+      };
+    }),
+
+  advanceAutomationHolds: (t) =>
+    set((s) => {
+      // Runs on the transport's frame timer. Returning the state object ITSELF
+      // makes zustand's Object.is check short-circuit, so an idle transport wakes
+      // no subscriber and allocates nothing.
+      const keys = Object.keys(s.automationHolds);
+      if (keys.length === 0) return s;
+      let automationLanes = s.automationLanes;
+      const automationHolds: Record<string, AutomationHold> = {};
+      for (const key of keys) {
+        const hold = s.automationHolds[key];
+        automationLanes = writeHoldSpan(automationLanes, key, hold.lastT, t, hold.value);
+        automationHolds[key] = { ...hold, lastT: t };
+      }
+      return { automationLanes, automationHolds };
+    }),
+
+  beginAutomationPass: (t) => {
+    if (!writesUntouched(get().automationMode)) return;
+    beginUndoStep(); // the whole pass is one undo step
+    set((s) => {
+      const automationHolds: Record<string, AutomationHold> = { ...s.automationHolds };
+      const automationLanes = s.automationLanes.map((l) => {
+        if (!l.enabled) return l;
+        const key = automationTargetKey(l.target);
+        if (automationHolds[key]) return l; // already held by a live gesture
+        // A write pass records WHAT YOU HEAR, so the stored control position wins
+        // over what the lane used to say. During the pass the scheduler leaves
+        // every held lane alone and the parameter plays its stored value — seeding
+        // from the lane instead would overwrite the lane with a value nobody is
+        // hearing. The lane is the fallback for the case with no control behind
+        // it at all (an FX param key whose chain entry is gone).
+        const laneAtT = sampleLane(l, t);
+        const value = storedValueForTarget(s, l.target) ?? laneAtT;
+        if (value === null) return l;
+        automationHolds[key] = { target: l.target, value, lastT: t, released: true };
+
+        // TWO anchors, and the pass writes nothing behind them.
+        //
+        // The punch-in anchor at `t` is what stops the first frame's write from
+        // landing a frame late and redrawing the segment that reaches it all the
+        // way back to the previous breakpoint — a pass punched in at 5 s used to
+        // change the lane at 1 s, which it never rolled over.
+        //
+        // But the punch-in carries the HEARD value, which is generally not what
+        // the lane said at `t`, so the segment leading INTO it would still ramp
+        // toward the new value. The pre-punch anchor pins the lane's own value
+        // just before `t`, so the change is a step at the punch-in and everything
+        // earlier plays exactly as it did. It is written FIRST, so the punch-in
+        // upsert sees it as a left neighbour a full MIN_POINT_DT away.
+        //
+        // It is skipped when there is nothing to protect (no earlier point, or the
+        // two values already agree), and when the nearest earlier point is within
+        // 2 * MIN_POINT_DT — there the thinning rule leaves no room for a distinct
+        // anchor, and a breakpoint that close is already holding the old value.
+        let points = l.points;
+        let prevT = -Infinity;
+        for (const p of points) if (p.t < t && p.t > prevT) prevT = p.t;
+        if (laneAtT !== null && laneAtT !== value && t - prevT >= 2 * MIN_POINT_DT) {
+          const preT = prePunchTime(t);
+          const preV = sampleLane(l, preT);
+          if (preV !== null) points = upsertPoint(points, preT, preV);
+        }
+        return { ...l, points: upsertPoint(points, t, value) };
+      });
+      return { automationLanes, automationHolds };
+    });
+  },
+
+  endAutomationPass: () =>
+    set((s) => {
+      const mode = modeAfterStop(s.automationMode);
+      return { automationHolds: {}, automationMode: mode, automationWrite: mode !== 'read' };
+    }),
+
+  setAutomationPointCurve: (laneId, index, curve, opts) => {
+    // A menu/keyboard choice is its own undo step, however close it lands to the
+    // last one (see setClipFadeCurve). A curve DRAG says `coalesce`: its
+    // pointer-down already cut the burst once, for the whole gesture, and
+    // beginning a step per pointermove would leave an undo entry per frame.
+    if (!opts?.coalesce) beginUndoStep();
+    set((s) => {
+      const lane = s.automationLanes.find((l) => l.id === laneId);
+      if (!lane || index < 0 || index >= lane.points.length) return {};
+      const c = Math.max(-1, Math.min(1, Number.isFinite(curve) ? curve : 0));
+      const p = lane.points[index];
+      // 0 is linear, and linear is the ABSENT key — one canonical shape on disk.
+      const next: AutomationPoint = c === 0 ? { t: p.t, v: p.v } : { t: p.t, v: p.v, curve: c };
+      return {
+        automationLanes: s.automationLanes.map((l) =>
+          l.id === laneId ? { ...l, points: l.points.map((q, i) => (i === index ? next : q)) } : l,
+        ),
+      };
+    });
+  },
 
   recordAutomationPoint: (target, t, v) =>
     set((s) => {
@@ -1149,8 +1409,15 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     set((s) => ({
       automationLanes: s.automationLanes.map((l) => {
         if (l.id !== laneId || index < 0 || index >= l.points.length) return l;
+        // The point keeps its SHAPE when it moves. Rebuilding it as a bare
+        // {t, v} silently flattened the segment the point owns.
+        //
+        // `curve` is passed through UNDEFINED when the point has none, not as an
+        // explicit 0: an explicit 0 outranks a merged neighbour's curve, so
+        // dragging a curve-less point to within MIN_POINT_DT of a curved one
+        // would have wiped that neighbour's shape.
         const without = l.points.filter((_, i) => i !== index);
-        return { ...l, points: upsertPoint(without, t, v) };
+        return { ...l, points: upsertPoint(without, t, v, l.points[index].curve) };
       }),
     })),
 

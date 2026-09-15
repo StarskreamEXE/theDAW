@@ -37,8 +37,10 @@ import {
   clipPeakGain,
   type AudioClip,
   type EditorTrack,
+  type AutomationLane,
   type AutomationTarget,
 } from './editorStore';
+import { clampCurve, interpolatePoints, sampleCurve, type CurvePoint } from '../lib/automationModes';
 import {
   usePlayerStore,
   getEngineCtx,
@@ -57,7 +59,7 @@ import {
   resetMidiRouting,
   useSoundfontStore,
 } from '../lib/soundfontEngine';
-import { applyFadeAutomation, type FadeClip } from '../lib/clipFade';
+import { applyFadeAutomation, type AudioParamLike, type FadeClip } from '../lib/clipFade';
 import { warpSegments, type WarpMarker, type WarpSegment } from '../lib/audioWarp';
 import { buildEffectChain, teleportXYZ, SPATIAL_TELEPORT, type ChainHandle } from '../lib/rackEffects';
 import { sliceChunks, type AudioChunk } from '../lib/audioAnalysis';
@@ -692,23 +694,213 @@ function nativeParamFor(target: AutomationTarget): AudioParam | null {
   return null;
 }
 
-/** Schedule each enabled native lane's envelope onto its AudioParam from `fromSec`:
- *  anchor the value at the playhead, then ramp through every later breakpoint. */
+/** One scheduled change on an AudioParam. `curve` is a rasterised segment for
+ *  `setValueCurveAtTime`; the other two are the plain set/ramp pair the lanes
+ *  have always emitted. */
+export type EnvelopeEvent =
+  | { kind: 'set'; when: number; v: number }
+  | { kind: 'ramp'; when: number; v: number }
+  | { kind: 'curve'; start: number; duration: number; values: Float32Array };
+
+/** The part of an automation lane the envelope needs. `AutomationLane` satisfies
+ *  it structurally, which keeps the event builder testable without a store. */
+export interface EnvelopeLane {
+  points: readonly CurvePoint[];
+}
+
+/** Rasterisation density for a curved segment, and the bounds on the count. The
+ *  minimum is the spec's: fewer than 2 values throws InvalidStateError. */
+const CURVE_SAMPLES_PER_SEC = 200;
+const CURVE_SAMPLES_MIN = 2;
+const CURVE_SAMPLES_MAX = 512;
+/** Smallest gap forced between two scheduled events, so a project carrying two
+ *  breakpoints at the same instant cannot produce a zero-duration curve —
+ *  `setValueCurveAtTime` throws RangeError unless `duration` is strictly
+ *  positive. Same 1e-4 the offline bounce has always used. */
+const MIN_EVENT_DT = 1e-4;
+
+/** True when `points` is already in ascending `t` order (the common case). */
+function isAscending(points: readonly CurvePoint[]): boolean {
+  for (let i = 1; i < points.length; i += 1) if (points[i].t < points[i - 1].t) return false;
+  return true;
+}
+
+/**
+ * The event list one automation lane puts on its AudioParam — the ONE definition,
+ * shared by live playback and by the offline bounces.
+ *
+ * `fromSec` is the timeline position playback resumes at; `startCtxTime` /
+ * `startOffsetSec` are the transport's context-clock↔timeline pinning (both 0 for
+ * an OfflineAudioContext, which renders from t=0); `now` is the context clock.
+ *
+ * Shape: an anchor `set` at `now` carrying the lane's value under the playhead,
+ * then one event per breakpoint still ahead. A segment whose LEFT point has a
+ * non-zero `curve` becomes a single `curve` sampled off `interpolatePoints`;
+ * every other segment stays the `ramp` it was, so a curve-less lane emits exactly
+ * what it emitted before this function existed.
+ *
+ * The `curve` events obey the Web Audio API spec's rules for
+ * `setValueCurveAtTime` (https://webaudio.github.io/web-audio-api/
+ * #dom-audioparam-setvaluecurveattime, read 2026-09-15; MDN's AudioParam page
+ * agrees):
+ *   - "If setValueCurveAtTime() is called for time T and duration D and there are
+ *     any events having a time strictly greater than T, but strictly less than
+ *     T+D, then a NotSupportedError exception MUST be thrown … it's ok to schedule
+ *     a value curve exactly at the time of another event." Segments here are
+ *     contiguous — each curve starts exactly where the previous event lands — so
+ *     nothing ever falls strictly inside a curve's window.
+ *   - The anchor is placed at `now` and every later event at or after it, so the
+ *     anchor precedes the first curve (and may sit exactly on its start).
+ *   - `values` needs at least 2 entries and `duration` must be finite and
+ *     strictly positive; hence the clamps above.
+ *   - "After the end of the curve time interval the value will remain constant at
+ *     the final curve value … An implicit call to setValueAtTime() is made at time
+ *     T0+TD with value V[N−1]". The last sample is therefore pinned exactly to the
+ *     segment's end value rather than left to the rasteriser's rounding, so the
+ *     ramp that follows departs from the breakpoint the user drew.
+ *   - `startTime` earlier than `currentTime` is clamped to `currentTime` by the
+ *     implementation, which would silently SHIFT a curve. Rather than let that
+ *     happen, a segment already under way degrades here: the anchor holds the
+ *     value at `fromSec` and the curve covers only the part still ahead, sampled
+ *     as a window onto the same shape.
+ */
+export function laneEnvelopeEvents(
+  lane: EnvelopeLane,
+  fromSec: number,
+  startCtxTime: number,
+  startOffsetSec: number,
+  now: number,
+): EnvelopeEvent[] {
+  if (lane.points.length === 0) return [];
+  // Ascending order is load-bearing here — `cursor` only keeps events out of a
+  // curve's window because each breakpoint is later than the last, and
+  // `sampleCurve` binary-searches. The store's writers all keep lanes sorted, but a
+  // hand-edited or imported project need not, and an out-of-order point would
+  // otherwise drop a `set` BEHIND a curve already placed (NotSupportedError). Sort
+  // a copy — stable, so points sharing a `t` keep their authored order — and only
+  // when the lane actually needs it, so the normal path allocates nothing.
+  const pts = isAscending(lane.points) ? lane.points : [...lane.points].sort((a, b) => a.t - b.t);
+  const toCtx = (t: number) => startCtxTime + (t - startOffsetSec);
+  const toTimeline = (x: number) => startOffsetSec + (x - startCtxTime);
+
+  const out: EnvelopeEvent[] = [{ kind: 'set', when: now, v: sampleCurve(pts, fromSec) ?? pts[0].v }];
+  // Nothing may be scheduled at or before `cursor`: it is `now` until the first
+  // future event is placed and the END of the last placed event after that. It is
+  // what keeps each curve's window free of other events.
+  let cursor = now;
+
+  for (let i = 0; i < pts.length; i += 1) {
+    const p = pts[i];
+    if (p.t <= fromSec) continue; // behind the playhead — the anchor already covers it
+    const whenCtx = toCtx(p.t);
+    if (whenCtx <= now) {
+      // Behind the CONTEXT clock (a re-schedule that arrived late): take the value
+      // immediately rather than ramping backwards into the past.
+      out.push({ kind: 'set', when: now, v: p.v });
+      continue;
+    }
+    const when = Math.max(whenCtx, cursor + MIN_EVENT_DT);
+    const prev = i > 0 ? pts[i - 1] : null;
+    const curve = prev ? clampCurve(prev.curve) : 0;
+    if (!prev || curve === 0) {
+      out.push({ kind: 'ramp', when, v: p.v });
+      cursor = when;
+      continue;
+    }
+    const segStartCtx = toCtx(prev.t);
+    const start = Math.max(segStartCtx, cursor);
+    const duration = when - start;
+    if (!(duration > 0)) {
+      out.push({ kind: 'ramp', when, v: p.v });
+      cursor = when;
+      continue;
+    }
+    // Timeline window the rasterisation covers. It starts at the segment's own left
+    // point, or wherever the playhead cut into it; it ends at the right point,
+    // EXCEPT when `when` was bumped off `whenCtx` to keep the event ordered, in
+    // which case the window is stretched by the same amount so `duration` and the
+    // sampled span describe the same stretch of time (the two clocks run 1:1, so
+    // the bump is the same number of seconds on both).
+    const t0 = start <= segStartCtx ? prev.t : toTimeline(start);
+    const t1 = when === whenCtx ? p.t : p.t + (when - whenCtx);
+    const n = Math.max(
+      CURVE_SAMPLES_MIN,
+      Math.min(CURVE_SAMPLES_MAX, Math.ceil(duration * CURVE_SAMPLES_PER_SEC)),
+    );
+    const values = new Float32Array(n);
+    for (let k = 0; k < n; k += 1) {
+      values[k] = interpolatePoints(prev, p, t0 + (t1 - t0) * (k / (n - 1)));
+    }
+    values[n - 1] = p.v; // exact end value (see the spec note above)
+    out.push({ kind: 'curve', start, duration, values });
+    cursor = when;
+  }
+  return out;
+}
+
+/** Write an event list onto a param. `clampValue` (the offline bounces' range
+ *  clamp) reaches INSIDE a curve too — a curved pan lane must not be the one path
+ *  that escapes it. */
+export function applyEnvelopeEvents(
+  param: AudioParamLike,
+  events: readonly EnvelopeEvent[],
+  clampValue?: (v: number) => number,
+): void {
+  const fix = clampValue ?? ((v: number) => v);
+  for (const e of events) {
+    if (e.kind === 'set') { param.setValueAtTime(fix(e.v), e.when); continue; }
+    if (e.kind === 'ramp') { param.linearRampToValueAtTime(fix(e.v), e.when); continue; }
+    const values = clampValue ? e.values.map(clampValue) : e.values;
+    if (param.setValueCurveAtTime) { param.setValueCurveAtTime(values, e.start, e.duration); continue; }
+    // No value-curve support on this param: walk the same samples as ramps, so the
+    // SHAPE survives instead of the segment silently flattening to a straight line.
+    // The leading `set` matters — `setValueCurveAtTime` does nothing until `start`,
+    // so without it the first ramp would start sliding from the anchor at `now`,
+    // which for a degraded sub-curve (start > now) is a slope the curve does not
+    // have. Pinning the value at `start` makes the param HOLD until the curve
+    // begins, exactly as the real call does.
+    param.setValueAtTime(values[0], e.start);
+    for (let k = 1; k < values.length; k += 1) {
+      param.linearRampToValueAtTime(values[k], e.start + e.duration * (k / (values.length - 1)));
+    }
+  }
+}
+
+/** Re-arm ONE native lane's envelope on its AudioParam from `fromSec`. Used by
+ *  play/seek (via `scheduleAutomation`) and by a touch punch-out, which hands the
+ *  param back to the lane the gesture just wrote into. */
+function scheduleLaneNative(lane: AutomationLane, fromSec: number): void {
+  const param = nativeParamFor(lane.target);
+  if (!param) return;
+  const now = getEngineCtx().currentTime;
+  param.cancelScheduledValues(now);
+  applyEnvelopeEvents(param, laneEnvelopeEvents(lane, fromSec, startCtxTime, startOffsetSec, now));
+}
+
+/** Schedule every enabled native lane's envelope from `fromSec`. */
 function scheduleAutomation(fromSec: number): void {
-  const ctx = getEngineCtx();
-  const now = ctx.currentTime;
-  for (const lane of useEditorStore.getState().automationLanes) {
+  const ed = useEditorStore.getState();
+  const holds = ed.automationHolds;
+  for (const lane of ed.automationLanes) {
     if (!lane.enabled || lane.points.length === 0) continue;
     if (lane.target.kind !== 'trackVolume' && lane.target.kind !== 'trackPan') continue;
-    const param = nativeParamFor(lane.target);
-    if (!param) continue;
-    param.cancelScheduledValues(now);
-    param.setValueAtTime(sampleLane(lane, fromSec) ?? param.value, now);
-    for (const p of lane.points) {
-      if (p.t <= fromSec) continue;
-      const whenCtx = startCtxTime + (p.t - startOffsetSec);
-      if (whenCtx <= now) param.setValueAtTime(p.v, now);
-      else param.linearRampToValueAtTime(p.v, whenCtx);
+    // A HELD target is being ridden — by a hand on the fader, or by a latch/write
+    // hold that outlives the release. Its param is where the hold put it, and
+    // re-scheduling the lane here would fight the hold for the same AudioParam, so
+    // the hold wins and the lane stays off it. `endAutomationPass` clears the
+    // holds on stop/pause, so in practice this only fires for a SEEK taken during
+    // a latch or write pass — which is exactly the case where the held value is
+    // meant to keep running across the seek.
+    if (holds[automationTargetKey(lane.target)]) continue;
+    // One bad lane must not take the transport down with it. This runs inside
+    // `start()` BEFORE `playing = true`, so an exception escaping here would leave
+    // the sources already scheduled and audible with no clock, no playhead and a
+    // Play button that thinks nothing is running. A lane that cannot be scheduled
+    // is simply a lane that does not play.
+    try {
+      scheduleLaneNative(lane, fromSec);
+    } catch (e) {
+      logError('editor', `Automation lane skipped: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 }
@@ -721,6 +913,11 @@ function applyFxAutomationFrame(): void {
   if (!playing) return;
   const ctx = getEngineCtx();
   const t = clamp(startOffsetSec + (ctx.currentTime - startCtxTime), 0, totalDur);
+  // Held targets first. A latch/write hold keeps writing its value forward into
+  // its lane for as long as the transport rolls, and the FX pass below reads the
+  // lanes — so the hold has to land before the read, not after it. This is a
+  // no-op (same state object back) when nothing is held.
+  useEditorStore.getState().advanceAutomationHolds(t);
   const ed = useEditorStore.getState();
 
   const byEntry = new Map<string, { master: boolean; trackId?: string; entryId: string; values: Record<string, number> }>();
@@ -754,10 +951,17 @@ function applyFxAutomationFrame(): void {
 
 function startFxAutomation(): void {
   stopFxAutomation();
-  const hasFxLane = useEditorStore.getState().automationLanes.some(
+  const ed = useEditorStore.getState();
+  const hasFxLane = ed.automationLanes.some(
     (l) => l.enabled && (l.target.kind === 'trackFx' || l.target.kind === 'masterFx'),
   );
-  if (hasFxLane) autoFxTimer = window.setInterval(applyFxAutomationFrame, 25); // ~40 Hz
+  // The same timer is the HOLD clock. An armed mode (touch/latch/write) has to run
+  // it even in a project with no FX lane at all, because a latch or write hold
+  // writes its value forward frame by frame — without the timer a held fader would
+  // leave a single breakpoint at the moment it was released and nothing after it.
+  if (hasFxLane || ed.automationMode !== 'read') {
+    autoFxTimer = window.setInterval(applyFxAutomationFrame, 25); // ~40 Hz
+  }
 }
 
 function stopFxAutomation(): void {
@@ -771,9 +975,20 @@ export function currentTransportSec(): number {
   return clamp(startOffsetSec + (ctx.currentTime - startCtxTime), 0, totalDur);
 }
 
-/** Drive a native param live while recording, so the move is heard immediately;
- *  cancels the scheduled envelope for the rest of this pass (latch behavior). The
- *  caller records the point into the lane, which is re-scheduled on the next play. */
+/**
+ * Drive a native (vol/pan) param live for the BEGIN and MOVE of a gesture, so the
+ * move is heard the moment the hand makes it.
+ *
+ * It drops whatever the lane had scheduled ahead of now and glides the param to
+ * `value` — and then the param simply STAYS there. That is all this function
+ * decides; it is not a mode. What happens on RELEASE is the mode's business:
+ * `touch` punches out through `automationReleaseNative`, which re-arms the lane,
+ * while `latch` and `write` never call it, and the value left here is the hold.
+ * The breakpoints themselves are written by the store, not here.
+ *
+ * (The comment this replaces claimed the call WAS latch behaviour. It was not:
+ * nothing held after release and nothing punched out — D15.)
+ */
 export function automationTouchNative(target: AutomationTarget, value: number): void {
   if (!playing) return;
   const param = nativeParamFor(target);
@@ -781,6 +996,26 @@ export function automationTouchNative(target: AutomationTarget, value: number): 
   const ctx = getEngineCtx();
   param.cancelScheduledValues(ctx.currentTime);
   param.setTargetAtTime(value, ctx.currentTime, RAMP_TC);
+}
+
+/**
+ * Punch out of a gesture on a native target: hand the AudioParam back to its lane
+ * by re-scheduling that ONE lane's envelope from the current transport position.
+ *
+ * Only `touch` calls this (see `holdsAfterRelease`) — in latch and write the
+ * released value is supposed to keep running, so leaving the param exactly where
+ * `automationTouchNative` left it IS the hold. Safe to call for a target with no
+ * lane, a disabled lane, or a stopped transport: it does nothing.
+ */
+export function automationReleaseNative(target: AutomationTarget): void {
+  if (!playing) return;
+  if (target.kind !== 'trackVolume' && target.kind !== 'trackPan') return;
+  const key = automationTargetKey(target);
+  const lane = useEditorStore.getState().automationLanes.find(
+    (l) => automationTargetKey(l.target) === key,
+  );
+  if (!lane || !lane.enabled || lane.points.length === 0) return;
+  scheduleLaneNative(lane, currentTransportSec());
 }
 
 /**
@@ -934,6 +1169,7 @@ function finishAtEnd(): void {
   clearSources();
   stopClock();
   playing = false;
+  useEditorStore.getState().endAutomationPass(); // running off the end ends the pass too
   usePlayerStore.setState({ isPlaying: false, currentTime: totalDur });
   useEditorStore.getState().setPlayhead(totalDur);
 }
@@ -1028,6 +1264,21 @@ async function start(fromSec: number): Promise<void> {
       if (state.masterFxChain !== prev.masterFxChain) {
         applyMasterChainLive(); // live master rack edits (add/remove/reorder/param)
       }
+      // Arming (or disarming) a record mode MID-PLAYBACK. The hold clock's gate is
+      // evaluated once per `start()`, so without this a user who presses play and
+      // THEN picks latch, in a project with no FX lane, gets no timer at all and no
+      // hold ever advances. Re-running the starter re-evaluates the gate in both
+      // directions — it stops the timer again when the mode goes back to read and
+      // nothing else needs it.
+      if (state.automationMode !== prev.automationMode) {
+        startFxAutomation();
+        // Arming `write` mid-play has to mean what arming it before play means:
+        // every enabled lane is seeded from here on. (`beginAutomationPass` is a
+        // no-op in the other three modes, but the check keeps that visible.)
+        if (state.automationMode === 'write') {
+          useEditorStore.getState().beginAutomationPass(currentTransportSec());
+        }
+      }
       // Clip mute is the one clip property applied live; every other clip edit
       // is structural and lands on the next (re)schedule.
       if (state.clips !== prev.clips) {
@@ -1045,15 +1296,29 @@ async function start(fromSec: number): Promise<void> {
 
 /* ------------------------------- public API ------------------------------- */
 
+/** Open a record pass at `fromSec`. In `write` this arms every enabled lane so the
+ *  pass overwrites what it rides over; every other mode is untouched by it. Both
+ *  play entries do it — the footer transport calls `play`, the editor's own Play
+ *  button calls `playAsync`, and a write pass has to start either way. Loop
+ *  restarts and seeks go through `start` directly and so do NOT re-arm: they are
+ *  the same pass. */
+function beginPass(fromSec: number): void {
+  useEditorStore.getState().beginAutomationPass(fromSec);
+}
+
 /** Begin live playback from the current editor playhead. */
 export function play(): void {
-  void start(useEditorStore.getState().playheadSec);
+  const from = useEditorStore.getState().playheadSec;
+  beginPass(from);
+  void start(from);
 }
 
 /** Awaitable play (resolves once decode + scheduling are done) — lets the
  *  editor show a brief "Rendering" state on the first play of new clips. */
 export async function playAsync(): Promise<void> {
-  await start(useEditorStore.getState().playheadSec);
+  const from = useEditorStore.getState().playheadSec;
+  beginPass(from);
+  await start(from);
 }
 
 /** Pause in place (keeps the playhead). */
@@ -1064,6 +1329,9 @@ export function pause(): void {
   clearSources();
   stopClock();
   playing = false;
+  // The pass ends with the transport: holds are released, and a `write` mode
+  // demotes itself to `latch` so the next play does not overwrite everything again.
+  useEditorStore.getState().endAutomationPass();
   useEditorStore.getState().setPlayhead(elapsed);
   usePlayerStore.setState({ isPlaying: false, currentTime: elapsed });
 }
@@ -1073,6 +1341,7 @@ export function stop(): void {
   clearSources();
   stopClock();
   playing = false;
+  useEditorStore.getState().endAutomationPass();
   useEditorStore.getState().setPlayhead(0);
   usePlayerStore.setState({ isPlaying: false, currentTime: 0 });
 }

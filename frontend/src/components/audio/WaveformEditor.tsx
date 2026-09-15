@@ -36,7 +36,8 @@ import { ownsKey } from '../../lib/keyScope';
 import { encodeWav } from '../../lib/wavEncode';
 import type { AudioDragItem } from '../../lib/audioDnD';
 import { useExternalDragStore } from '../../state/externalDragStore';
-import { useEditorStore, beginUndoStep, computePeaks, freezeSignature, sampleLane, clipPeakGain, clipSourceSpanSec, clipStretchRate, snapStepSec, SNAP_DIVISIONS, TRACK_HEIGHT_MIN, TRACK_HEIGHT_MAX, type AudioClip, type EditorTrack, type SnapDivision, type AutomationTarget, type AutomationLane as AutomationLaneT, type TimelineMarker } from '../../state/editorStore';
+import { useEditorStore, beginUndoStep, computePeaks, freezeSignature, sampleLane, automationTargetKey, clipPeakGain, clipSourceSpanSec, clipStretchRate, snapStepSec, SNAP_DIVISIONS, TRACK_HEIGHT_MIN, TRACK_HEIGHT_MAX, type AudioClip, type EditorTrack, type SnapDivision, type AutomationTarget, type AutomationLane as AutomationLaneT, type TimelineMarker } from '../../state/editorStore';
+import { AUTOMATION_MODES, holdsAfterRelease, type AutomationMode } from '../../lib/automationModes';
 import { useLibraryStore, type LibraryEntry } from '../../state/libraryStore';
 import { LIBRARY_ID_MIME, dropHasLibraryOrFiles, entriesFromDrop } from '../../lib/libraryDrop';
 import { useVstStore } from '../../state/vstStore';
@@ -663,6 +664,60 @@ const MarkerFlag: React.FC<{
   );
 };
 
+/* How long a recording gesture may sit still before it is treated as released.
+   Only the wheel actually needs it — it has no release event of any kind — so the
+   deadline is gated on `pointerHeld` below and never fires while a button is
+   down. A quarter second is short enough that a wheel flick punches out promptly. */
+const GESTURE_IDLE_MS = 250;
+
+/* Is a pointer button down anywhere right now?
+ *
+ * A fader held motionless mid-ride is ordinary playing, not the end of a gesture:
+ * you stop on a value to hear it before moving again. Without this the idle
+ * deadline would punch out under your finger — an unwanted punch-out/punch-in in
+ * touch, and an early hold in latch/write. So the deadline only ENDS a gesture
+ * when no pointer is down; while one is, it re-arms and waits for the real
+ * pointerup. Keyboard and wheel gestures are unaffected: no button is down for
+ * them, so they still close on the deadline (or on keyup).
+ *
+ * `blur` clears the flag too. The flag latching ON is the dangerous failure: the
+ * idle callback would re-arm for ever, the hold would keep overwriting the lane
+ * ahead of the playhead, and the listeners and timer would live until unmount. A
+ * window that loses focus mid-drag does not always deliver the pointerup (nor a
+ * pointercancel), so `blur` is the backstop that guarantees the flag falls.
+ *
+ * The watch is REFCOUNTED, not tied to one editor instance: the flag and the
+ * listeners are module state, so a second mounted editor closing its last gesture
+ * must not tear the watch out from under the first one's live drag.
+ *
+ * The listeners are BUBBLE phase on `window` deliberately: the pointerdown that
+ * opens a drag is still propagating when SlideTrack's React handler runs (React
+ * attaches at its root container, below window), and a listener added to a node
+ * the event has not reached yet is still invoked when it gets there — so the very
+ * pointerdown that started the gesture sets the flag. */
+let pointerHeld = false;
+let pointerWatchRefs = 0;
+const markPointerDown = () => { pointerHeld = true; };
+const markPointerUp = () => { pointerHeld = false; };
+const acquirePointerWatch = () => {
+  pointerWatchRefs += 1;
+  if (pointerWatchRefs > 1) return;
+  window.addEventListener('pointerdown', markPointerDown);
+  window.addEventListener('pointerup', markPointerUp);
+  window.addEventListener('pointercancel', markPointerUp);
+  window.addEventListener('blur', markPointerUp);
+};
+const releasePointerWatch = () => {
+  if (pointerWatchRefs === 0) return;
+  pointerWatchRefs -= 1;
+  if (pointerWatchRefs > 0) return;
+  pointerHeld = false;
+  window.removeEventListener('pointerdown', markPointerDown);
+  window.removeEventListener('pointerup', markPointerUp);
+  window.removeEventListener('pointercancel', markPointerUp);
+  window.removeEventListener('blur', markPointerUp);
+};
+
 /* A native (volume / pan) track fader, plus the badge that admits when the
    fader is NOT what drives the sound. An enabled automation lane owns its
    AudioParam: liveMixer schedules the envelope onto the param and applyMixLive
@@ -823,9 +878,16 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const vstPlugins = useVstStore((s) => s.plugins);
   const vstScanning = useVstStore((s) => s.scanning);
   const scanVst = useVstStore((s) => s.scan);
-  const automationWrite = useEditorStore((s) => s.automationWrite);
-  const setAutomationWrite = useEditorStore((s) => s.setAutomationWrite);
-  const recordAutomationPoint = useEditorStore((s) => s.recordAutomationPoint);
+  const automationMode = useEditorStore((s) => s.automationMode);
+  const setAutomationMode = useEditorStore((s) => s.setAutomationMode);
+  // The one derived read the rest of this component uses: "is anything armed to
+  // record?". Everything that used to ask the old `automationWrite` boolean asks
+  // this instead — the boolean cannot tell touch from latch from write, and three
+  // of the four modes are not "write".
+  const automationArmed = automationMode !== 'read';
+  const beginAutomationTouch = useEditorStore((s) => s.beginAutomationTouch);
+  const moveAutomationTouch = useEditorStore((s) => s.moveAutomationTouch);
+  const endAutomationTouch = useEditorStore((s) => s.endAutomationTouch);
   const automationLanes = useEditorStore((s) => s.automationLanes);
   const addAutomationPoint = useEditorStore((s) => s.addAutomationPoint);
   const updateAutomationPoint = useEditorStore((s) => s.updateAutomationPoint);
@@ -853,21 +915,118 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const [automationEdit, setAutomationEdit] = useState(false);
   const [activeLaneId, setActiveLaneId] = useState<string | null>(null);
 
-  // Move a track fader. While automation write is on and the transport is rolling,
-  // the move records a breakpoint (timestamped off the audio clock) and is driven
-  // onto the live param so it is heard as it is recorded.
-  const writeFader = (kind: 'trackVolume' | 'trackPan', trackId: string, v: number) => {
-    updateTrack(trackId, kind === 'trackVolume' ? { volume: v } : { pan: v });
-    if (automationWrite && liveMixer.isPlaying()) {
-      const target = { kind, trackId };
-      recordAutomationPoint(target, liveMixer.currentTransportSec(), v);
-      liveMixer.automationTouchNative(target, v);
+  // ── Automation gestures ───────────────────────────────────────────────────
+  //
+  // A record mode is a statement about a GESTURE — touch punches out when you let
+  // go, latch holds what you let go of — so the store needs begin / move / end,
+  // not a stream of anonymous values.
+  //
+  // Neither control the editor automates gives us that boundary: SlideTrack (the
+  // track faders) and the rack's knobs both report a bare `onChange` and nothing
+  // else. So the gesture BEGINS on the first change for a target and ENDS on the
+  // first of three things: a pointerup/pointercancel, a keyup, or GESTURE_IDLE_MS
+  // of silence WITH no pointer down (see `pointerHeld` — a paused drag is still a
+  // drag, and the deadline re-arms under a held button rather than punching out).
+  //
+  // All three are needed, because SlideTrack changes its value from THREE inputs:
+  // a pointer drag, the arrow/Home/End keys, and a non-passive wheel handler. A
+  // keyboard or wheel move has no pointer sequence at all, so with only the
+  // pointer listeners a single ArrowUp in TOUCH would open a hold that never
+  // closes — and a hold that never closes keeps deleting every breakpoint ahead
+  // of the playhead for the rest of the pass, with the param never handed back.
+  // The idle timer is the backstop for the wheel, which has no "up" event of any
+  // kind — and it is gated on `pointerHeld`, so a drag that pauses mid-ride keeps
+  // its gesture and only the input that cannot report a release is timed out.
+  //
+  // One listener set per live target, all removed the instant the gesture ends, so
+  // nothing accumulates; a multi-key drag (an OWL-Pad moves x and y at once) opens
+  // one gesture per key and the single release closes them all.
+  type Gesture = { end: () => void; off: () => void; touch: () => void };
+  const gesturesRef = useRef<Map<string, Gesture> | null>(null);
+  const liveGestures = () => (gesturesRef.current ??= new Map<string, Gesture>());
+  useEffect(() => () => {
+    // Unmounting mid-gesture must not leave the target held in the store: end each
+    // one properly rather than just dropping its listeners. `end` removes itself
+    // from the map, so iterate a snapshot.
+    const live = gesturesRef.current;
+    if (!live) return;
+    for (const g of [...live.values()]) g.end();
+    live.clear();
+  }, []);
+
+  /** First value of a gesture on `target` begins it; every later value moves it.
+   *  The release is wired here, fires exactly once, and punches out only in the
+   *  modes that punch out. */
+  const touchAutomation = (target: AutomationTarget, v: number) => {
+    const key = automationTargetKey(target);
+    const live = liveGestures();
+    const open = live.get(key);
+    if (open) {
+      open.touch(); // still moving — push the idle deadline out
+      moveAutomationTouch(target, liveMixer.currentTransportSec(), v);
+      return;
     }
+    beginAutomationTouch(target, liveMixer.currentTransportSec(), v);
+    let idle = 0;
+    const end = () => {
+      const entry = live.get(key);
+      if (!entry) return; // already ended (pointerup then pointercancel, say)
+      live.delete(key); // gone from the map before anything else runs, so a
+      entry.off();      // re-entrant end() takes the guard above and stops
+      // Balanced even if the transport stopped mid-drag: the store drops an end
+      // for a target it is not holding, and the release below is a no-op when
+      // nothing is playing.
+      endAutomationTouch(target, liveMixer.currentTransportSec());
+      // Touch punches out here — the lane takes its AudioParam back from the
+      // hand. Latch and write keep the released value; not re-arming the lane IS
+      // the hold.
+      if (!holdsAfterRelease(useEditorStore.getState().automationMode)) {
+        liveMixer.automationReleaseNative(target);
+      }
+    };
+    const touch = () => {
+      window.clearTimeout(idle);
+      idle = window.setTimeout(() => {
+        // A button is still down: the ride is paused, not over. Wait again.
+        if (pointerHeld) { touch(); return; }
+        end();
+      }, GESTURE_IDLE_MS);
+    };
+    // A key release only ends a KEYBOARD gesture. Bare `end` here meant any key
+    // let go during a held-button ride — Space for the transport, a modifier, any
+    // shortcut — punched the gesture out, and the next move opened a fresh one
+    // with its own undo step.
+    const endOnKey = () => { if (!pointerHeld) end(); };
+    const off = () => {
+      window.clearTimeout(idle);
+      window.removeEventListener('pointerup', end);
+      window.removeEventListener('pointercancel', end);
+      window.removeEventListener('keyup', endOnKey);
+      releasePointerWatch();
+    };
+    window.addEventListener('pointerup', end);
+    window.addEventListener('pointercancel', end);
+    window.addEventListener('keyup', endOnKey);
+    acquirePointerWatch();
+    live.set(key, { end, off, touch });
+    touch(); // arm the idle deadline for the inputs that have no release event
   };
 
-  // Apply an FX param change, and while writing + playing, record each param key
-  // that actually changed into its own lane (an OWL-Pad drag moves x and y at once,
-  // so both are captured). Playback is driven by the FX lookahead writer.
+  // Move a track fader. While a record mode is armed and the transport is rolling,
+  // the move is a gesture on the lane (timestamped off the audio clock) and is
+  // driven onto the live param so it is heard as it is recorded.
+  const writeFader = (kind: 'trackVolume' | 'trackPan', trackId: string, v: number) => {
+    updateTrack(trackId, kind === 'trackVolume' ? { volume: v } : { pan: v });
+    if (!automationArmed || !liveMixer.isPlaying()) return;
+    const target: AutomationTarget = { kind, trackId };
+    touchAutomation(target, v);
+    liveMixer.automationTouchNative(target, v);
+  };
+
+  // Apply an FX param change, and while armed + playing, drive each param key that
+  // actually changed as its own gesture on its own lane (an OWL-Pad drag moves x
+  // and y at once, so both are captured). Playback is driven by the FX lookahead
+  // writer, which is also what advances a held key between frames.
   const writeFxParams = (
     scope: { kind: 'master' } | { kind: 'track'; trackId: string },
     entryId: string,
@@ -879,15 +1038,14 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         : tracks.find((t) => t.id === scope.trackId)?.fxChain?.find((e) => e.id === entryId)?.params;
     if (scope.kind === 'master') updateMasterEffectParams(entryId, p);
     else updateTrackEffectParams(scope.trackId, entryId, p);
-    if (!automationWrite || !liveMixer.isPlaying() || !prev) return;
-    const t = liveMixer.currentTransportSec();
+    if (!automationArmed || !liveMixer.isPlaying() || !prev) return;
     for (const key of Object.keys(p)) {
       if (prev[key] === p[key]) continue;
       const target: AutomationTarget =
         scope.kind === 'master'
           ? { kind: 'masterFx', entryId, paramKey: key }
           : { kind: 'trackFx', trackId: scope.trackId, entryId, paramKey: key };
-      recordAutomationPoint(target, t, p[key]);
+      touchAutomation(target, p[key]);
     }
   };
   const addMasterEffect = useEditorStore((s) => s.addMasterEffect);
@@ -910,12 +1068,12 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   // The FX/fader overlay should visually follow the playhead ONLY when a lane is
   // actually in charge — automation-READ with at least one enabled, non-empty
   // lane. Subscribe to playheadSec just for that narrow case, so ordinary
-  // playback (no lanes / write mode — the common case) never pays the per-frame
-  // re-render the playhead note above avoids. Stopped counts too: a lane still
-  // owns the param when the transport is parked, and playheadSec then only moves
-  // on a seek, so following it costs nothing.
+  // playback (no lanes / an armed mode — the common case) never pays the
+  // per-frame re-render the playhead note above avoids. Stopped counts too: a
+  // lane still owns the param when the transport is parked, and playheadSec then
+  // only moves on a seek, so following it costs nothing.
   const automationFollowActive =
-    !automationWrite &&
+    !automationArmed &&
     automationLanes.some((l) => l.enabled && l.points.length > 0);
   const followPlayhead = useEditorStore((s) => (automationFollowActive ? s.playheadSec : 0));
 
@@ -924,7 +1082,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   // write the stored params).
   const fxDisplayParams = useCallback(
     (scope: { kind: 'master' } | { kind: 'track'; trackId: string }, entryId: string): Record<string, number> | undefined => {
-      if (!isEditorPlaying || automationWrite) return undefined; // read mode follows; write mode shows your hands
+      if (!isEditorPlaying || automationArmed) return undefined; // read follows the lane; an armed mode shows your hands
       const out: Record<string, number> = {};
       for (const lane of automationLanes) {
         if (!lane.enabled || lane.points.length === 0) continue;
@@ -940,21 +1098,21 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       }
       return Object.keys(out).length ? out : undefined;
     },
-    [isEditorPlaying, automationWrite, automationLanes, followPlayhead],
+    [isEditorPlaying, automationArmed, automationLanes, followPlayhead],
   );
 
   // What a native (volume/pan) track fader should SHOW, and whether the fader is
   // still the thing that decides. An enabled lane owns the AudioParam whether or
   // not the transport is rolling, so "stopped" is no reason to fall back to the
   // stored value — that is how a fader ends up reading 0.8 over a track the lane
-  // has pinned near silence. Automation WRITE is the one exception: there the
+  // has pinned near silence. An ARMED record mode is the one exception: there the
   // fader IS your hands and the lane is recording them.
   const faderDisplay = (
     kind: 'trackVolume' | 'trackPan',
     trackId: string,
     stored: number,
   ): { value: number; automated: boolean } => {
-    if (automationWrite) return { value: stored, automated: false };
+    if (automationArmed) return { value: stored, automated: false };
     const lane = automationLanes.find(
       (l) => l.enabled && l.points.length > 0 && l.target.kind === kind && l.target.trackId === trackId,
     );
@@ -2512,13 +2670,14 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       // offline time. Native vol/pan ride an AudioParam timeline; FX params step at
       // each breakpoint via suspend/resume (no real-time loop runs offline).
       const lanes = useEditorStore.getState().automationLanes.filter((l) => l.enabled && l.points.length > 0);
+      // The SAME event list live playback puts on the AudioParam (liveMixer's
+      // laneEnvelopeEvents), with the offline pinning: the render starts at t=0 and
+      // the context clock IS the timeline, so fromSec / startCtxTime / startOffset /
+      // now are all 0. That is what makes a CURVED breakpoint bounce the way it
+      // sounds — the hand-written loop this replaces emitted a linear ramp per
+      // point and flattened every curve on export.
       const scheduleParamLane = (param: AudioParam, lane: AutomationLaneT, clampFn: (v: number) => number) => {
-        const pts = lane.points;
-        param.setValueAtTime(clampFn(pts[0].v), 0);
-        if (pts[0].t > 0) param.setValueAtTime(clampFn(pts[0].v), pts[0].t); // hold first value, then ramp
-        for (let i = 1; i < pts.length; i += 1) {
-          param.linearRampToValueAtTime(clampFn(pts[i].v), Math.max(pts[i].t, pts[i - 1].t + 1e-4));
-        }
+        liveMixer.applyEnvelopeEvents(param, liveMixer.laneEnvelopeEvents(lane, 0, 0, 0, 0), clampFn);
       };
 
       // One gain + insert chain + panner per audible track; panners feed the bus.
@@ -3998,18 +4157,39 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             <Wand2 className="w-3 h-3" /> TOOLS <ChevronDown className="w-2.5 h-2.5" />
           </button>
 
-          {/* Mode toggles — icon-only, grouped like the tool/undo clusters.
-              The words live in the tooltips; the states live in the colors. */}
+          {/* Mode cluster, grouped like the tool/undo clusters: the record-mode
+              select (four states, so it names itself), then the icon-only toggles
+              whose words live in the tooltips and whose states live in the colors. */}
           <div className="flex bg-black/40 p-0.5 rounded border border-white/5 gap-0.5">
-            <button
-              onClick={() => setAutomationWrite(!automationWrite)}
-              aria-pressed={automationWrite}
-              aria-label="Automation write"
-              title="WRITE — automation write: while playing, ride a fader or FX control to record it"
-              className={`p-1 px-2 rounded transition-colors ${automationWrite ? 'bg-red-600/30 text-red-300' : 'text-zinc-500 hover:text-white hover:bg-white/5'}`}
+            {/* Record mode. A two-state button could only ever say on/off, and
+                there are FOUR modes whose whole point is how they differ, so this
+                is a native <select> — which needs a real id/name and a <label
+                htmlFor>, sr-only because the chosen mode is the visible text
+                (same pattern as the footer's count-in select). */}
+            <label htmlFor="automation-mode" className="sr-only">Automation record mode</label>
+            <select
+              id="automation-mode"
+              name="automationMode"
+              value={automationMode}
+              onChange={(e) => setAutomationMode(e.target.value as AutomationMode)}
+              title="Automation record mode — READ plays the lanes back; TOUCH records while you hold a control and hands it back when you let go; LATCH keeps writing the released value until you stop; WRITE arms every lane from the moment you press play"
+              className="bg-transparent text-zinc-400 font-display text-xs font-bold uppercase tracking-wider px-1 py-0.5 rounded focus:outline-hidden focus:ring-1 focus:ring-red-500/60 hover:text-white"
             >
-              <Circle className={`w-3 h-3 ${automationWrite ? 'fill-current animate-pulse' : ''}`} />
-            </button>
+              {AUTOMATION_MODES.map((m) => (
+                // Capitalised rather than shouted, so the accessible name a screen
+                // reader announces is "Touch", not "TOUCH" — the uppercase is the
+                // toolbar's typography, not part of the word.
+                <option key={m} value={m} className="bg-[#0d0a14] text-zinc-200">
+                  {m[0].toUpperCase() + m.slice(1)}
+                </option>
+              ))}
+            </select>
+            {/* Not a control any more — just the armed light beside the select. */}
+            {automationArmed && (
+              <span aria-hidden className="flex items-center px-0.5 text-red-400">
+                <Circle className="w-3 h-3 fill-current animate-pulse" />
+              </span>
+            )}
             <button
               onClick={() => setAutomationEdit((v) => {
                 const next = !v;

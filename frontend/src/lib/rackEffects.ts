@@ -99,6 +99,17 @@ export interface RackXYPad {
   y: string;
 }
 
+/**
+ * How much latency an effect adds, in SECONDS. A constant for most effects that
+ * have any; a function when it depends on the effect's own params or on the
+ * context sample rate (a look-ahead expressed in samples, say). `sampleRate` is
+ * whatever the caller supplied — it is not invented, so a declaration that
+ * needs one must handle `undefined`.
+ */
+export type RackLatencySpec =
+  | number
+  | ((params: Record<string, number>, sampleRate?: number) => number);
+
 export interface RackEffectDef {
   id: string;
   label: string;
@@ -112,6 +123,17 @@ export interface RackEffectDef {
   presets?: readonly RackEffectPreset[];
   /** Declared XY pads; each pair also stays reachable as individual controls. */
   xy?: readonly RackXYPad[];
+  /** Latency this effect adds to the signal, in seconds. ABSENT MEANS 0 — an
+   *  effect only declares a value when its OUTPUT ONSET actually lags its
+   *  input, i.e. it looks ahead or buffers. An internal delay line that only
+   *  feeds a wet path alongside an undelayed dry path is not latency: the dry
+   *  signal still leaves at t=0, so the effect is time-aligned and declaring a
+   *  number would push the whole chain late. The one effect with no dry path,
+   *  `spatializer` (100 % wet through an HRTF `PannerNode`), still declares
+   *  nothing: HRTF convolution latency is implementation-defined rather than
+   *  fixed by the spec, so there is no honest constant to put here.
+   *  See `chainLatencySec`. */
+  latencySec?: RackLatencySpec;
 }
 
 /* ── small helpers ─────────────────────────────────────────────────────────── */
@@ -1970,6 +1992,14 @@ export const RACK_EFFECTS: readonly RackEffectDef[] = [
       { label: 'Drum Smash', values: { threshold: -30, ratio: 10, knee: 2, attack: 2, release: 60, makeup: 6 } },
       { label: 'Peak Stop', values: { threshold: -6, ratio: 20, knee: 0, attack: 1, release: 50, makeup: 0 } },
     ],
+    // The Web Audio API specifies DynamicsCompressorNode as having a "Fixed
+    // look-ahead (this means that a DynamicsCompressorNode adds a fixed latency
+    // to the signal chain)", and its normative internal graph realises that
+    // pre-delay as `new DelayNode(context, {delayTime: 0.006})` — 6 ms, given in
+    // seconds and independent of sample rate and of every compressor param.
+    // Source: W3C Web Audio API, §1.19.4 DynamicsCompressorNode "Processing"
+    // (https://webaudio.github.io/web-audio-api/), read 2026-09-15.
+    latencySec: 0.006,
     make: makeCompressor,
   },
   {
@@ -2117,6 +2147,132 @@ const withDefaults = (def: RackEffectDef, params: Record<string, number>): Recor
   for (const p of def.params) out[p.key] = p.default;
   return { ...out, ...params };
 };
+
+/* ── declared latency ──────────────────────────────────────────────────────────
+   The two pure pieces plugin delay compensation is built from. Nothing here
+   touches Web Audio, so the live graph, the offline bounce and the DJ decks can
+   all ask the same question and get the same answer.
+
+   The summing rule below is the design of Tracktion Engine's SummingNode
+   (oss-refs/tracktion_engine/modules/tracktion_graph/tracktion_graph/nodes/
+   tracktion_SummingNode.h — GPL-3/commercial; read for its behaviour only,
+   NOTHING COPIED): a node that sums several inputs takes the MAXIMUM of their
+   latencies as its own, then inserts a latency node on every input carrying the
+   difference, so all inputs line up before they are added. `djEngine.ts`'s
+   `updateLatencyComp` is today's hand-rolled two-input special case of exactly
+   this rule.
+
+   The compressor's declared value is cited at its registry entry: the W3C Web
+   Audio API spec, §1.19.4 DynamicsCompressorNode "Processing", which fixes the
+   look-ahead pre-delay at 0.006 s. */
+
+/** Seams for the latency accumulator. The app passes none. */
+export interface ChainLatencyOptions {
+  /** Resolve an effect id to its definition (default: the rack registry). The
+   *  same test seam `buildEffectChain` takes, so latency can be asserted with
+   *  no AudioContext in sight. */
+  resolve?: (id: string) => RackEffectDef | undefined;
+  /** Context sample rate, for declarations expressed in samples. Passed through
+   *  verbatim; when omitted, such a declaration receives `undefined`. */
+  sampleRate?: number;
+}
+
+/** What one chain entry contributed, and why it did not. */
+export interface ChainLatencyEntry {
+  /** ChainEntry.id. */
+  id: string;
+  /** ChainEntry.effect (the rack id, or `vst3` / an imported DAW's effect). */
+  effect: string;
+  /** Seconds this entry contributed to `totalSec` — 0 whenever `counted` is
+   *  false, so the per-entry numbers always add up to the total. */
+  latencySec: number;
+  /** True only for an entry that is enabled AND resolvable. A false here is the
+   *  UI's cue that the total does not describe this entry. */
+  counted: boolean;
+}
+
+export interface ChainLatencyReport {
+  totalSec: number;
+  perEntry: ChainLatencyEntry[];
+}
+
+/** Evaluate one definition's declaration against an entry's effective params. */
+const declaredLatencySec = (
+  def: RackEffectDef,
+  entryParams: Record<string, number>,
+  sampleRate: number | undefined,
+): number => {
+  const spec = def.latencySec;
+  if (spec === undefined) return 0;
+  const v = typeof spec === 'function' ? spec(withDefaults(def, entryParams), sampleRate) : spec;
+  return Number.isFinite(v) ? v : 0;
+};
+
+/**
+ * Per-entry breakdown of a chain's latency, so the UI can show what a compensation
+ * number covers and — more importantly — what it does not.
+ *
+ * An entry counts only when it is BOTH enabled and resolvable:
+ *
+ *  - A bypassed entry is routed AROUND by `buildEffectChain`, so however much
+ *    latency its effect declares, it is not in the path and delays nothing.
+ *  - An unresolvable id (every hosted `vst3` entry, and effects imported from
+ *    another DAW) is an inert passthrough in the live graph, so it delays
+ *    nothing live either. It is listed with `counted: false` rather than
+ *    dropped, because it WILL contribute at freeze/bounce and a user staring at
+ *    a compensation figure needs to know it was excluded.
+ */
+export function chainLatencyReport(
+  entries: ChainEntry[],
+  opts: ChainLatencyOptions = {},
+): ChainLatencyReport {
+  const resolveDef = opts.resolve ?? ((id: string) => RACK_BY_ID.get(id));
+  let totalSec = 0;
+  const perEntry: ChainLatencyEntry[] = [];
+  for (const e of entries) {
+    const def = e.enabled ? resolveDef(e.effect) : undefined;
+    if (!def) {
+      perEntry.push({ id: e.id, effect: e.effect, latencySec: 0, counted: false });
+      continue;
+    }
+    const latencySec = Math.max(0, declaredLatencySec(def, e.params, opts.sampleRate));
+    totalSec += latencySec;
+    perEntry.push({ id: e.id, effect: e.effect, latencySec, counted: true });
+  }
+  return { totalSec, perEntry };
+}
+
+/**
+ * Total latency an insert chain adds, in seconds — the amount a downstream sum
+ * has to wait for it. Series effects accumulate; see `chainLatencyReport` for
+ * which entries count and why.
+ */
+export function chainLatencySec(entries: ChainEntry[], opts: ChainLatencyOptions = {}): number {
+  return chainLatencyReport(entries, opts).totalSec;
+}
+
+/**
+ * Delay to insert on each input of a sum so they all line up, given each input's
+ * own latency in seconds and in the same order. The slowest input sets the
+ * meeting point and is never delayed; everything earlier waits the difference.
+ * Empty in, empty out. Pure — the caller owns the delay nodes.
+ *
+ * Every input is normalised to a finite, non-negative number FIRST, so a NaN or
+ * a negative latency can neither skew the meeting point nor escape into a
+ * result: these values are fed straight to `AudioParam.setTargetAtTime`, which
+ * throws on a non-finite target, and a caller must never have to sanitise the
+ * output of a compensation calculation.
+ *
+ * (Tracktion `SummingNode`'s rule, generalised from the two-deck special case in
+ * `djEngine.updateLatencyComp`. Design only; nothing copied.)
+ */
+export function summingDelaysSec(latencies: number[]): number[] {
+  if (latencies.length === 0) return [];
+  const own = latencies.map((l) => (Number.isFinite(l) ? Math.max(0, l) : 0));
+  let maxL = 0;
+  for (const l of own) if (l > maxL) maxL = l;
+  return own.map((l) => Math.max(0, maxL - l));
+}
 
 /* ── chain builder ─────────────────────────────────────────────────────────── */
 
