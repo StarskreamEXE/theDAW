@@ -240,8 +240,8 @@ branches rewrites, noted per item.
 - [ ] **No emoji on the action keys: CREATE, PROCESS, PROCESS STACK and the
   rest.** A repo-wide scan of `frontend/src` and `electron-ui` for characters in
   U+1F000–U+1FAFF finds emoji in only two places: `SlidePanel.tsx:195` (the
-  slot lock, `🔒` / `🔓`) and the bundled Underfit dashboard the UNDERFIT tab
-  embeds (`🥜`, `📖`, `💪`, `⭐`, `📂` in
+  slot lock) and the bundled Underfit dashboard the UNDERFIT tab embeds (five of
+  them in
   `electron-ui/release/win-unpacked/resources/python/underfit/dashboard/index.html`).
   Nothing emoji-bearing sits on the footer's action key
   (`components/layout/ProcessingLog.tsx:335-530`, the glyphs are SVG paths in
