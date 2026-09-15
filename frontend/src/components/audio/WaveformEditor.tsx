@@ -987,13 +987,22 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const closeFxRack = useTrackFxRackStore((s) => s.close);
   // Leaving EDIT closes the rack.
   useEffect(() => () => useTrackFxRackStore.getState().close(), []);
-  /** The rack's anchor for a click at (x, y): at the click, moved right of the
-   *  track header column so every lane's header controls, its F button among
-   *  them, stay clickable while the rack is open. */
+  /** The rack's anchor for a click at (x, y), for a caller with no element of
+   *  its own to hang under (the lane's context menu). */
   const fxRackAnchor = (trackId: string, x?: number, y?: number): TrackFxRackAnchor => {
     if (x == null || y == null) return { trackId };
-    const headerRight = trackHeaderColRef.current?.getBoundingClientRect().right ?? 0;
-    return { trackId, x: Math.max(x, Math.round(headerRight) + 8), y };
+    return { trackId, x, y };
+  };
+  /**
+   * The rack's anchor under the key that opened it: its left edge, 4px below
+   * it — the placement TOOLS uses for its menu, so the two open the same way.
+   * The rack used to open at the pointer, pushed out past the track header
+   * column, which put it nowhere near the key that asked for it.
+   * popoverPlacement keeps it on screen and above the transport from there.
+   */
+  const fxRackUnder = (trackId: string, el: HTMLElement): TrackFxRackAnchor => {
+    const r = el.getBoundingClientRect();
+    return { trackId, x: Math.round(r.left), y: Math.round(r.bottom) + 4 };
   };
   // Open a VST entry's REAL native GUI; the sink stores the captured raw_state
   // on the right chain (a track's fxChain or the master VST chain).
@@ -2637,7 +2646,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         },
       });
       // Also put the file on disk. Save As opens in the folder last used for
-      // audio; not awaited, so COMMIT EDIT is free again while the dialog is up.
+      // audio; not awaited, so MIXDOWN is free again while the dialog is up.
       void saveFile({ blob: wavBlob, suggestedName: title.replace(/[<>:"/\\|?*]/g, '_'), kind: 'audio' });
 
       const ms = (performance.now() - start).toFixed(0);
@@ -3956,7 +3965,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             title="Render all clips to a single audio file and save it to the library"
           >
             {isCommitting ? <Upload className="w-3 h-3 animate-pulse" /> : <Save className="w-3 h-3" />}
-            {isCommitting ? 'COMMITTING…' : 'COMMIT EDIT'}
+            {isCommitting ? 'MIXING DOWN…' : 'MIXDOWN'}
           </button>
         </div>
       </div>
@@ -4466,7 +4475,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                       className={`w-4 h-4 rounded font-display text-xs font-bold leading-none flex items-center justify-center ${t.solo ? 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/50' : 'bg-black/40 text-zinc-500 border border-white/5 hover:text-white'}`}
                     >S</button>
                     <button
-                      onClick={(e) => toggleFxRack(fxRackAnchor(t.id, e.clientX, e.clientY))}
+                      onClick={(e) => toggleFxRack(fxRackUnder(t.id, e.currentTarget))}
                       aria-label={`Track ${t.name} insert FX`}
                       aria-pressed={fxPanel?.trackId === t.id}
                       title="Track insert FX rack"
@@ -4723,7 +4732,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                         onDoubleClick={(e) => e.stopPropagation()}
                         onClick={(e) => {
                           e.stopPropagation();
-                          openFxRack(fxRackAnchor(clip.trackId, e.clientX, e.clientY));
+                          openFxRack(fxRackUnder(clip.trackId, e.currentTarget));
                         }}
                         aria-label={`Open track FX for clip ${clip.label}`}
                         className="px-1 h-3.5 rounded-sm font-display text-xs font-bold leading-none flex items-center bg-black/40 text-zinc-300 border border-white/10 hover:text-purple-300 hover:border-purple-500/50"
