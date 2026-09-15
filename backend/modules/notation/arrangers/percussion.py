@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 log = logging.getLogger(__name__)
 
@@ -178,8 +178,11 @@ def _initial_tempo(pm: Any) -> float:
     return _DEFAULT_TEMPO
 
 
-def _quarters(pm: Any, seconds: float) -> float:
-    """Seconds → quarter lengths through the file's own tempo map."""
+def _quarters(pm: Any, seconds: float, bpm: Optional[float] = None) -> float:
+    """Seconds → quarter lengths at ``bpm``, or through the file's own tempo map
+    when no ``bpm`` is given."""
+    if bpm is not None:
+        return seconds * bpm / 60.0
     try:
         return float(pm.time_to_tick(seconds)) / float(pm.resolution)
     except Exception:  # noqa: BLE001
@@ -190,13 +193,13 @@ def _quantise(ql: float) -> float:
     return round(ql / _QUANT) * _QUANT
 
 
-def _hit_events(pm: Any) -> list[tuple[float, float, int]]:
+def _hit_events(pm: Any, bpm: Optional[float] = None) -> list[tuple[float, float, int]]:
     """(quantised offset, quantised duration, canonical pitch) per hit."""
     events: list[tuple[float, float, int]] = []
     for inst in _drum_instruments(pm):
         for n in inst.notes:
-            start = _quantise(_quarters(pm, n.start))
-            end = _quantise(_quarters(pm, max(n.end, n.start)))
+            start = _quantise(_quarters(pm, n.start, bpm))
+            end = _quantise(_quarters(pm, max(n.end, n.start), bpm))
             dur = max(_MIN_QL, end - start)
             events.append((start, dur, canonical_drum_pitch(n.pitch)))
     events.sort(key=lambda e: (e[0], e[2]))
@@ -215,11 +218,16 @@ def _make_unpitched(pitch: int) -> Any:
     return element
 
 
-def build_percussion_part(midi_path: Path, *, title: str = "Drums") -> Any:
+def build_percussion_part(
+    midi_path: Path, *, title: str = "Drums", bpm: Optional[float] = None
+) -> Any:
     """Build a ``music21.stream.Part`` percussion staff from a drum MIDI.
 
     PercussionClef + UnpitchedPercussion instrument, the file's first time
-    signature (default 4/4) and initial tempo; every hit becomes a
+    signature (default 4/4) and initial tempo. With ``bpm`` the staff is laid
+    out at that tempo instead: each hit sits at ``seconds * bpm / 60`` quarters
+    and the mark sounds at ``bpm``, so a band score can put the kit on the same
+    beat grid as its other staves. Every hit becomes a
     ``note.Unpitched`` at its DRUM_STAFF position (x / circle-x heads for
     cymbals), start/end quantised to 1/16 (min 0.25 QL, clipped to the next
     onset so nothing overlaps), simultaneous hits merged into a
@@ -238,11 +246,12 @@ def build_percussion_part(midi_path: Path, *, title: str = "Drums") -> Any:
     part.insert(0, clef.PercussionClef())
     part.insert(0, instrument.UnpitchedPercussion())
     part.insert(0, meter.TimeSignature(_time_signature(pm)))
-    # The sheet prints the tempo as a whole number. The file's exact tempo is
-    # the sounding tempo, because every hit's offset below is worked out at it.
-    part.insert(0, metronome_mark(_initial_tempo(pm)))
+    # The sheet prints the tempo as a whole number. The exact tempo every hit's
+    # offset below is worked out at is the sounding tempo.
+    grid_bpm = float(bpm) if bpm is not None and bpm > 0 else None
+    part.insert(0, metronome_mark(grid_bpm or _initial_tempo(pm)))
 
-    events = _hit_events(pm)
+    events = _hit_events(pm, grid_bpm)
     # Group simultaneous hits; dedupe identical staff positions in a group.
     groups: list[tuple[float, float, list[int]]] = []
     for start, dur, pitch in events:

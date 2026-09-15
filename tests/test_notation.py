@@ -1204,3 +1204,40 @@ def test_pack_route_packs_a_midi_source_too(
     if pdf_render.available()["ok"] or musescore_binary() is not None:
         assert any(n.endswith(".pdf") for n in names), names
     assert not list((entry_dir / "notation").glob("*__osmd_src.musicxml"))
+
+
+def test_arrange_route_lays_a_band_score_out_at_the_analysed_tempo(
+    notation_client: TestClient, tmp_path: Path
+):
+    """The arrange route hands the entry's analysed tempo to the band score, so
+    two 120 BPM basic-pitch stems land on the song's beat grid."""
+    from backend.modules.library import router as library_router_module
+    from tests.test_arrange import (
+        ANALYSED_BPM,
+        BASIC_PITCH_BPM,
+        assert_one_grid,
+        write_timed_midi,
+    )
+    from tests.test_library_store import _seed_generate_entry
+
+    _seed_generate_entry(tmp_path, "job_bg", 0)
+    entry_id = "job_bg_00"
+    store = library_router_module.get_store()
+    entry_dir = tmp_path / "job_bg" / "00"
+    artifact_ids: list[str] = []
+    onsets: list[float] = []
+    for stem, pitch in (("bass", 40), ("guitar", 67)):
+        midi = entry_dir / "midi" / f"{stem}.mid"
+        onsets = write_timed_midi(midi, BASIC_PITCH_BPM, pitch)
+        store.db.add_notation_artifact(
+            artifact_id=f"{stem}_mid", entry_id=entry_id, kind="midi", path=str(midi)
+        )
+        artifact_ids.append(f"{stem}_mid")
+    store.db.upsert_analysis(entry_id, {"bpm": ANALYSED_BPM})
+
+    r = notation_client.post(
+        f"/api/notation/{entry_id}/arrange",
+        json={"style": "band-score", "source_artifact_ids": artifact_ids},
+    )
+    assert r.status_code == 200, r.text
+    assert_one_grid(Path(r.json()["path"]), onsets, ANALYSED_BPM)

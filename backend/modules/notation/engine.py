@@ -53,6 +53,7 @@ from typing import Any, NamedTuple, Optional, Sequence
 from backend.modules.library.db import LibraryDB
 
 from . import pdf_render
+from .midi_read import is_midi, read_score
 from .tempo_marks import engrave_tempo_marks, restore_sounding_tempi
 from backend.lib.launch_token import child_env
 
@@ -618,9 +619,7 @@ def _stage_musicxml(source_path: Path, scratch: Path, title: str) -> Path:
     artifact, because a DB row must not point at a path that is then deleted.
     Raises on a music21 failure so the caller reports it.
     """
-    from music21 import converter  # type: ignore[import]
-
-    staged_score = converter.parse(str(source_path))
+    staged_score = read_score(source_path)
     clean = clean_title(title)
     if clean:
         try:
@@ -1362,15 +1361,16 @@ def _convert_to_abc(
             "hint": "uv sync --group dev",
         }
     try:
-        from music21 import converter  # type: ignore[import]
-
         from .exporters.abc_writer import score_to_abc
 
-        score = converter.parse(str(source_path))
+        score = read_score(source_path)
         try:
             score = score.quantize((4, 3), inPlace=False, recurse=True)
         except Exception as exc:  # noqa: BLE001 - quantize is best-effort
             log.debug("notation: abc quantize skipped for %s: %s", source_path, exc)
+        if is_midi(source_path):
+            # A MIDI reads as unbarred parts; the ABC body is written bar by bar.
+            score.makeNotation(inPlace=True)
         text = score_to_abc(
             score,
             title=clean_title(title),
@@ -1408,7 +1408,6 @@ def _convert_with_music21(
     title: str = "",
 ) -> dict[str, Any]:
     try:
-        from music21 import converter  # type: ignore[import]
         import music21  # type: ignore[import]
     except ImportError:
         return {
@@ -1430,7 +1429,7 @@ def _convert_with_music21(
             percussion = True
             score = build_percussion_score(source_path, title=clean_title(title))
         else:
-            score = converter.parse(str(source_path))
+            score = read_score(source_path)
             if score is None:
                 raise ValueError(f"music21 could not parse {source_path}")
             # A MusicXML source's marks lose their <sound tempo> in music21's
@@ -1721,12 +1720,16 @@ def midi_to_arrangement(
     source_ref: Optional[str] = None,
     artifact_id: Optional[str] = None,
     title: str = "",
+    reference_bpm: Optional[float] = None,
 ) -> dict[str, Any]:
     """Arrange one or more source MIDIs into a MusicXML score of ``style`` and
-    register it as a ``musicxml`` notation artifact."""
+    register it as a ``musicxml`` notation artifact.
+
+    ``reference_bpm`` is the song's analysed tempo; a band score lays every
+    staff out at it (see :func:`.arrangers.score_arrange.arrange`)."""
     from .arrangers.score_arrange import arrange
 
-    result = arrange(sources, style=style, title=title)
+    result = arrange(sources, style=style, title=title, reference_bpm=reference_bpm)
     if not result.get("ok"):
         return result
 
