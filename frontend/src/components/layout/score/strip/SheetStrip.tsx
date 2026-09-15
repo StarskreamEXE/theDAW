@@ -15,6 +15,7 @@ import {
   type CursorDriver,
   type ScoreTimeMap,
 } from '../../scoreTimeMap';
+import { readSoundingTempi, type SoundingTempo } from '../../soundingTempo';
 import {
   applyStripEngraving,
   clampZoom,
@@ -136,6 +137,9 @@ export const SheetStrip: React.FC<SheetStripProps> = ({ artifact, entry }) => {
   // mount holds an older generation and is refused the cursor.
   const osmdGenRef = useRef(0);
   const mapRef = useRef<ScoreTimeMap | null>(null);
+  // The loaded sheet's metronome marks and the tempo each sounds at; every
+  // time map rebuild integrates at these.
+  const soundingTempiRef = useRef<readonly SoundingTempo[]>([]);
   const xmapRef = useRef<StripXMap | null>(null);
   const driverRef = useRef<CursorDriver | null>(null);
   const highlighterRef = useRef<NoteHighlighter | null>(null);
@@ -260,7 +264,9 @@ export const SheetStrip: React.FC<SheetStripProps> = ({ artifact, entry }) => {
     }
     try {
       host.style.zoom = '';
-      if (opts.remap || !mapRef.current) mapRef.current = buildTimeMap(osmd);
+      if (opts.remap || !mapRef.current) {
+        mapRef.current = buildTimeMap(osmd, { soundingTempi: soundingTempiRef.current });
+      }
       osmd.Zoom = zoomRef.current;
       osmd.render();
       if (opts.fit) {
@@ -391,6 +397,7 @@ export const SheetStrip: React.FC<SheetStripProps> = ({ artifact, entry }) => {
         await osmd.load(prepared.xml);
         if (cancelled) return;
         osmdRef.current = osmd;
+        soundingTempiRef.current = readSoundingTempi(xml);
         const getCursor = () =>
           (osmdGenRef.current === generation ? osmdRef.current?.cursor ?? null : null);
         driverRef.current?.cancel();
@@ -527,7 +534,7 @@ export const SheetStrip: React.FC<SheetStripProps> = ({ artifact, entry }) => {
       <div className="relative flex-1 min-h-0">
         <div
           ref={scrollRef}
-          className="h-full overflow-x-auto overflow-y-auto bg-white flex [align-items:safe_center]"
+          className="h-full overflow-x-auto overflow-y-auto bg-white flex items-center-safe"
           role="region"
           aria-label="Score strip"
         >
