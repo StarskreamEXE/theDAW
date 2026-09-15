@@ -428,14 +428,10 @@ export const MixerStrips: React.FC = () => {
 
   return (
     <div className="flex flex-col gap-2 h-full min-h-0">
-      {buses.length > 0 && (
-        // The documented §3.6 step-3 gap: the live mixer follows the graph, the
-        // offline bounce does not yet. Remove this line in the ticket that
-        // adopts the graph offline.
-        <p className="text-[10px] font-mono text-amber-300/80">
-          Buses and sends play live; the offline bounce still renders every track to the master
-        </p>
-      )}
+      {/* The §3.6 step-3 divergence note stood here while the live mixer
+          followed the routing graph and the offline bounce did not. T14 gave
+          `lib/renderCore` the same `wireRoutingGraph` pass, so buses and sends
+          now print exactly as they play and there is nothing to warn about. */}
       <div ref={stripsRef} className="flex-1 min-h-0 flex gap-2 overflow-x-auto overflow-y-hidden pb-1">
         {tracks.map((t) => (
           <div key={t.id} className={STRIP}>

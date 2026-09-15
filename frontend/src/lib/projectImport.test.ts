@@ -1,6 +1,6 @@
-// The .tasmo mapping projectImport.ts uses for piano-roll clips. projectImport.ts
-// itself pulls the soundfont engine through a Vite `?url` import and does not
-// load under node, so its pure mappers live in projectClient.ts.
+// The .tasmo mapping projectImport.ts uses for piano-roll clips. These mappers
+// live in projectClient.ts alongside the rest of the .tasmo types; projectImport.ts
+// itself loads fine under node (see projectImport.routing.test.ts, which drives it).
 import assert from 'node:assert/strict';
 import { clipMeterToTasmo, pianoNoteToTasmo, tasmoMeterToClip, tasmoNotesToPiano } from './projectClient.ts';
 import type { MeterSegment, PolyLane } from './meterMap.ts';

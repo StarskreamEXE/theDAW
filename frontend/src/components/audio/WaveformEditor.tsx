@@ -261,10 +261,13 @@ const cropAudioBlob = async (
 ──────────────────────────────────────────────────────────────────────────── */
 
 /**
- * The seven fields `lib/renderCore` reads for a bounce: the document, and the
- * three real implementations it will not reach for itself (the shared decode
- * cache, the rack builder, the live mixer's per-clip scheduler — the same one
- * playback uses, which is what keeps a bounce and a preview the same audio).
+ * The nine fields `lib/renderCore` reads for a bounce: the document — clips,
+ * tracks, the master rack, the automation lanes, and (since T14) the routing
+ * graph with its buses, so the bounce sums through the same buses the live
+ * mixer does — and the three real implementations it will not reach for itself
+ * (the shared decode cache, the rack builder, the live mixer's per-clip
+ * scheduler — the same one playback uses, which is what keeps a bounce and a
+ * preview the same audio).
  *
  * Read from the store when the JOB RUNS, not when it was enqueued: a job that
  * waited behind another renders the document it actually starts against.
@@ -276,6 +279,8 @@ const currentRenderDeps = (): RenderDeps => {
     tracks: st.tracks,
     masterFxChain: st.masterFxChain,
     automationLanes: st.automationLanes,
+    routing: st.routing,
+    buses: st.buses,
     decode: decodeClipBlob,
     buildChain: buildEffectChain,
     scheduleSources: liveMixer.scheduleClipSources,
@@ -337,12 +342,20 @@ const mixdownTitle = (typed: string): string => {
 /** Attach the chunk-safety verdict for THIS request against the document it will
  *  render. The runner does not chunk (that is T11d, gated on this), but the jobs
  *  pill has to know whether a progress number is even possible before it shows
- *  an empty bar and calls it "0%". */
+ *  an empty bar and calls it "0%".
+ *
+ *  `st.buses` rides the 5th argument because a master bounce now builds the BUS
+ *  racks too (T14): the predicate has to judge every chain the render will
+ *  actually put in the path, and a `chunkUnsafe` effect on a bus is exactly as
+ *  unsafe as one on a track. `undefined` in the 4th slot keeps the default rack
+ *  registry — the seam is there for tests, not for this call site. */
 const bounceSeed = (
   seed: Omit<RenderJobSeed, 'chunkable' | 'chunkReasons'>,
 ): RenderJobSeed => {
   const st = useEditorStore.getState();
-  const { safe, reasons } = bounceIsChunkSafe(seed.request, st.tracks, st.masterFxChain);
+  const { safe, reasons } = bounceIsChunkSafe(
+    seed.request, st.tracks, st.masterFxChain, undefined, st.buses,
+  );
   return { ...seed, chunkable: safe, chunkReasons: reasons };
 };
 

@@ -14,9 +14,23 @@
  * Every render below therefore runs under a seeded `Math.random`, reset to the
  * same seed each time — the refactor is what is being measured, not the IR
  * noise the app deliberately re-rolls.
+ *
+ * T14 (plan §3.6 step 3b + §3.8 step 3a) adds two things to measure:
+ *
+ *   - THE RENDER TRIM. A bounce is now shifted forward by the latency its
+ *     chains declare, so a case whose rack declares any is deliberately NOT
+ *     sample-identical to the legacy body any more. `expectTrimSec` states that
+ *     shift up front and the legacy side is shifted by the same amount before
+ *     the diff — so the case still asserts "identical audio", it just says
+ *     WHERE. A case that got trimmed by a different amount than it claimed goes
+ *     straight over the gate, which is the regression this keeps.
+ *   - THE ROUTING GRAPH (case D). The legacy bodies have no routing at all, so
+ *     there is no legacy render to A/B a routed one against. Its reference is
+ *     the core's own FLAT render of the same project, scaled by the gain the
+ *     live graph is specified to apply — see `routedProject`.
  */
 import {
-  BOUNCE_SAMPLE_RATE, encodeBounce, renderBounce, renderExtentSec,
+  BOUNCE_SAMPLE_RATE, encodeBounce, renderBounce, renderExtentSec, trimLeadingSec,
   type BounceRequest, type BounceScope, type RenderDeps,
 } from '../../src/lib/renderCore';
 import { decodeClipBlob } from '../../src/lib/decodeCache';
@@ -24,8 +38,11 @@ import { buildEffectChain } from '../../src/lib/rackEffects';
 import { encodeWav } from '../../src/lib/wavEncode';
 import { scheduleClipSources } from '../../src/state/liveMixer';
 import type {
-  AudioClip, EditorTrack, AutomationLane as AutomationLaneT,
+  AudioClip, EditorBus, EditorTrack, AutomationLane as AutomationLaneT,
 } from '../../src/state/editorStore';
+import {
+  addBus, addSend, emptyGraph, ensureTrackNode, setOutput, type RoutingGraph,
+} from '../../src/state/routingGraph';
 import type { ChainEntry } from '../../src/state/effectChainStore';
 import {
   legacyCommitEdit, legacyRenderTrackStem, legacySendSelectionToInit,
@@ -102,6 +119,12 @@ const COMPRESSOR: ChainEntry = {
   enabled: true,
   params: { threshold: -24, ratio: 4, knee: 6, attack: 10, release: 150, makeup: 3 },
 };
+/** What the compressor DECLARES, written out here rather than read back from
+ *  `rackEffects`: the Web Audio spec gives `DynamicsCompressorNode` a fixed
+ *  6 ms look-ahead pre-delay. It is the only effect in this project that
+ *  declares any latency at all, so it is the whole of every case's expected
+ *  render trim — a chain of a compressor and a reverb still declares 6 ms. */
+const COMPRESSOR_LATENCY_SEC = 0.006;
 const REVERB: ChainEntry = {
   id: 'fx-verb',
   effect: 'reverb',
@@ -195,20 +218,82 @@ function buildProject(opts: { solo: boolean; laneCurve: number }): Project {
   };
 }
 
+/* ── Case D's project: ONE track, so the whole render is on the routed path ── */
+
+const ROUTED_SEND_GAIN = 0.5;
+const ROUTED_BUS_VOLUME = 0.5;
+
+/** Deliberately one track and no rack anywhere. A second track feeding the
+ *  master directly would be unscaled while the routed one is scaled, and there
+ *  would be no single factor to state; a rack would declare latency and put the
+ *  render trim into a case that is about the graph. */
+function routedProject(): Project {
+  const t = track({ id: 'R1', name: 'routed', volume: 0.8, pan: -0.3 });
+  const clips: AudioClip[] = [
+    clip({
+      id: 'R1-mono', trackId: 'R1', audioBlob: MONO,
+      startSec: 0.25, durationSec: 3, fadeInSec: 0.3, fadeOutSec: 0.4, gain: 0.9,
+    }),
+    clip({ id: 'R1-stereo', trackId: 'R1', audioBlob: STEREO, startSec: 1.5, durationSec: 2.5 }),
+  ];
+  return { clips, tracks: [t], masterFxChain: [], automationLanes: [] };
+}
+
+/** R1 -> RB, plus a send R1 -> RB. Built through the model's own mutators, so
+ *  an edge this harness asserts on is an edge the app can actually make. */
+const ROUTED: Routed = (() => {
+  let g = emptyGraph();
+  g = ensureTrackNode(g, 'R1', 'routed');
+  g = addBus(g, 'RB', 'Routed bus');
+  const out = setOutput(g, 'R1', 'RB');
+  if (!out.ok) throw new Error(`ab: R1 -> RB refused (${out.reason})`);
+  const send = addSend(out.graph as RoutingGraph, 'R1', 'RB', ROUTED_SEND_GAIN);
+  if (!send.ok) throw new Error(`ab: send R1 -> RB refused (${send.reason})`);
+  const buses: EditorBus[] = [
+    { id: 'RB', name: 'Routed bus', fxChain: [], volume: ROUTED_BUS_VOLUME, mute: false },
+  ];
+  return { routing: send.graph as RoutingGraph, buses };
+})();
+
 /* ── The new path: exactly the deps `WaveformEditor.renderDeps()` builds ──── */
 
-const depsFor = (p: Project): RenderDeps => ({
+interface Routed { routing: RoutingGraph; buses: EditorBus[] }
+
+const depsFor = (p: Project, routed?: Routed): RenderDeps => ({
   clips: p.clips,
   tracks: p.tracks,
   masterFxChain: p.masterFxChain,
   automationLanes: p.automationLanes,
+  routing: routed?.routing,
+  buses: routed?.buses,
   decode: decodeClipBlob,
   buildChain: buildEffectChain,
   scheduleSources: scheduleClipSources,
 });
 
-async function core(p: Project, req: BounceRequest): Promise<{ blob: Blob; rendered: AudioBuffer }> {
-  const rendered = await renderBounce(req, depsFor(p));
+async function core(p: Project, req: BounceRequest, routed?: Routed): Promise<Rendered> {
+  const rendered = await renderBounce(req, depsFor(p, routed));
+  return { blob: encodeBounce(rendered, req), rendered };
+}
+
+/** A rendered buffer times a constant, as a `Rendered` the comparison can eat.
+ *  Used to build case D's reference: the gain a routed path is SPECIFIED to
+ *  apply, written out by hand rather than taken from the code under test. */
+function scaled(r: Rendered, factor: number, req: BounceRequest): Rendered {
+  const chans: Float32Array[] = [];
+  for (let ch = 0; ch < r.rendered.numberOfChannels; ch += 1) {
+    const src = r.rendered.getChannelData(ch);
+    const out = new Float32Array(src.length);
+    for (let i = 0; i < src.length; i += 1) out[i] = src[i] * factor;
+    chans.push(out);
+  }
+  const rendered = {
+    duration: r.rendered.duration,
+    length: r.rendered.length,
+    sampleRate: r.rendered.sampleRate,
+    numberOfChannels: r.rendered.numberOfChannels,
+    getChannelData: (ch: number) => chans[ch],
+  } as unknown as AudioBuffer;
   return { blob: encodeBounce(rendered, req), rendered };
 }
 
@@ -250,14 +335,19 @@ function diffBuffers(label: string, a: AudioBuffer, b: AudioBuffer): Diff {
   return { deltas, mismatch };
 }
 
-async function compare(a: Blob, b: Blob): Promise<Diff> {
+/** `trimSec` shifts the LEGACY side forward before the diff, so a case can
+ *  claim the render trim T14 introduced and still assert identical audio. The
+ *  shift is the same pure function the bounce uses, applied to the 16-bit
+ *  decode — quantise-then-shift and shift-then-quantise are the same samples,
+ *  because the shift moves samples and never computes one. */
+async function compare(a: Blob, b: Blob, trimSec: number): Promise<Diff> {
   const ctx = new AudioContext({ sampleRate: SR });
   try {
     const [ba, bb] = await Promise.all([
       ctx.decodeAudioData(await a.arrayBuffer()),
       ctx.decodeAudioData(await b.arrayBuffer()),
     ]);
-    return diffBuffers('wav', ba, bb);
+    return diffBuffers('wav', trimLeadingSec(ba, trimSec), bb);
   } finally {
     ctx.close().catch(() => {});
   }
@@ -266,7 +356,7 @@ async function compare(a: Blob, b: Blob): Promise<Diff> {
 /* ── Cases ───────────────────────────────────────────────────────────────── */
 
 interface CaseResult {
-  renderer: 'A' | 'B' | 'C';
+  renderer: 'A' | 'B' | 'C' | 'D';
   name: string;
   /** Diff of the WAV files the app writes (16-bit PCM for all three today). */
   deltas: Delta[];
@@ -282,13 +372,19 @@ interface CaseResult {
 async function runCases(): Promise<CaseResult[]> {
   const out: CaseResult[] = [];
   const add = async (
-    renderer: 'A' | 'B' | 'C', name: string,
-    run: () => Promise<{ legacy: Rendered; core: Rendered; extra?: string }>,
+    renderer: 'A' | 'B' | 'C' | 'D', name: string,
+    run: () => Promise<{
+      legacy: Rendered; core: Rendered; extra?: string;
+      /** How far forward T14's render trim is EXPECTED to have moved the core
+       *  side, in seconds. Stated by the case, never read off the renderer. */
+      expectTrimSec?: number;
+    }>,
   ) => {
     try {
-      const { legacy, core: c, extra } = await run();
-      const wav = await compare(legacy.blob, c.blob);
-      const floats = diffBuffers('render', legacy.rendered, c.rendered);
+      const { legacy, core: c, extra, expectTrimSec } = await run();
+      const trim = expectTrimSec ?? 0;
+      const wav = await compare(legacy.blob, c.blob, trim);
+      const floats = diffBuffers('render', trimLeadingSec(legacy.rendered, trim), c.rendered);
       out.push({
         renderer, name, deltas: wav.deltas, floatDeltas: floats.deltas, extra,
         mismatches: [wav.mismatch, floats.mismatch].filter((m): m is string => m != null),
@@ -332,7 +428,9 @@ async function runCases(): Promise<CaseResult[]> {
         };
         const legacy = await seeded(() => legacyCommitEdit(p));
         const c = await seeded(() => core(p, req));
-        return { legacy, core: c };
+        // T1 carries the compressor in both solo states, so the slowest audible
+        // chain declares 6 ms whichever way the dial is turned.
+        return { legacy, core: c, expectTrimSec: COMPRESSOR_LATENCY_SEC };
       });
     }
   }
@@ -360,10 +458,45 @@ async function runCases(): Promise<CaseResult[]> {
       const coreDur = renderExtentSec(p.clips, scope);
       return {
         legacy, core: c,
+        // Every stem track here carries the compressor, and a stem trims by its
+        // OWN chain only — the hosted VST3 on T5 is stripped before the render
+        // and declares nothing either way.
+        expectTrimSec: COMPRESSOR_LATENCY_SEC,
         extra: `durationSec legacy=${legacy.durationSec} core=${coreDur} float32=${vsts.length > 0}`,
       };
     });
   }
+
+  /* D — the routing graph. There is no legacy body to A/B against: the three
+     inline renderers predate buses entirely and every one of them summed
+     straight to the master. So the reference is the core's own FLAT render of
+     the same project, times the gain the LIVE graph is specified to apply.
+
+     R1 -> RB (main output) AND R1 -> RB (send at 0.5), RB at volume 0.5:
+
+       - `wireRoutingGraph` taps a send off the SAME output node as the main
+         path rather than replacing it (pinned in
+         `state/liveMixer.routing.test.ts`), so RB's input sums R1 twice —
+         1.0 through the output edge and 0.5 through the send.
+       - a bus strip is `input -> [fx] -> gain -> muteGain -> output`, and with
+         an empty rack, an unmuted gate and volume 0.5 that is one 0.5 fader.
+
+     Expected: flat x (1 + 0.5) x 0.5 = flat x 0.75, sample for sample. No rack
+     anywhere, so no chain declares latency and the render trim is 0. */
+  await add('D', 'routed · R1 -> bus(vol 0.5) with a send(0.5) into the same bus', async () => {
+    const p = routedProject();
+    const req: BounceRequest = {
+      scope: { kind: 'master' }, sampleRate: BOUNCE_SAMPLE_RATE,
+      includeFx: false, includeAutomation: false, includeTrackMix: true, float32: false,
+    };
+    const flat = await seeded(() => core(p, req));
+    const routed = await seeded(() => core(p, req, ROUTED));
+    return {
+      legacy: scaled(flat, (1 + ROUTED_SEND_GAIN) * ROUTED_BUS_VOLUME, req),
+      core: routed,
+      extra: `reference = the core's own routing-less render x ${(1 + ROUTED_SEND_GAIN) * ROUTED_BUS_VOLUME}`,
+    };
+  });
 
   return out;
 }

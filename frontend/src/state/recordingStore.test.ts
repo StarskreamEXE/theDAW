@@ -36,6 +36,9 @@ import {
   musicalConstraints,
   resetRecording,
   setRecordingDeps,
+  mergeRecordingPrefs,
+  setRecordingPrefsStorage,
+  useRecordingPrefs,
   useRecordingStore,
 } from './recordingStore.ts';
 
@@ -45,7 +48,21 @@ const flush = async (): Promise<void> => {
 };
 
 const rs = () => useRecordingStore.getState();
+const rp = () => useRecordingPrefs.getState();
 const es = () => useEditorStore.getState();
+
+/* --------------------------- the preference storage ------------------------ */
+
+// Installed FIRST, before any block picks a mode: node has no `localStorage`,
+// so the real one would warn on every write. Counting `setItem` here is also
+// what pins that the HOT store never reaches storage — see the block at the end.
+const storageKeys: string[] = [];
+const fakeStorage: Record<string, string> = {};
+setRecordingPrefsStorage({
+  getItem: (k) => fakeStorage[k] ?? null,
+  setItem: (k, v) => { storageKeys.push(k); fakeStorage[k] = v; },
+  removeItem: (k) => { delete fakeStorage[k]; },
+});
 
 /* ------------------------------- fake engine ------------------------------- */
 
@@ -200,8 +217,15 @@ function harness(trackIds: readonly string[] = []): Harness {
     clips: [],
     _undo: [],
     _redo: [],
+    // No loop region, so the punch gate is inert unless a block sets one.
+    loopEnabled: false,
+    loopStart: 0,
+    loopEnd: 0,
   });
   usePlayerStore.setState({ isPlaying: false });
+  // `punch` is a PERSISTED preference, so `resetRecording()` deliberately
+  // leaves it alone — the harness is what returns it to the default.
+  useRecordingPrefs.setState({ punch: 'off' });
 
   const events: string[] = [];
   const engine = fakeEngine(events);
@@ -695,6 +719,342 @@ function harness(trackIds: readonly string[] = []): Harness {
   rs().stopRecording();
   await flush();
   assert.deepEqual(rs().levels, {});
+}
+
+/* --------------------------- punch in / punch out -------------------------- */
+
+/** One whole pass: press, let the recorders open, hand back `takes`, stop, and
+ *  let the decode that follows the placement settle. */
+async function pass(h: Harness, takes: Take[]): Promise<void> {
+  rs().recordPress();
+  await flush();
+  h.engine.resolveStart();
+  await flush();
+  h.engine.setTakes(takes);
+  rs().stopRecording();
+  await flush();
+  await flush();
+}
+
+/** The editor's loop region IS the punch region — there is no second owner. */
+function setLoop(start: number, end: number): void {
+  es().setLoopRegion(start, end);
+  assert.equal(es().loopEnabled, true, 'the fixture loop is long enough to enable');
+}
+
+// The default, and the only value a bad one falls back to.
+{
+  const h = harness([]);
+  void h;
+  assert.equal(rp().punch, 'off', 'punch is off until asked for');
+  rp().setPunch('in-out');
+  assert.equal(rp().punch, 'in-out');
+  rp().setPunch('nonsense' as never);
+  assert.equal(rp().punch, 'off', 'an unknown mode is not a mode');
+}
+
+// `in-out`: the take is cropped to BOTH edges of the loop region. The bytes are
+// untouched — the clip keeps the whole take as its source and slides its window
+// in with `offsetIntoSource`.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  setLoop(4, 10);
+  rp().setPunch('in-out');
+
+  await pass(h, [fakeTake('trk-a', 2, 12)]);
+
+  const clip = es().clips[0];
+  assert.ok(clip, 'a take that overlaps the window still lands');
+  assert.equal(clip.startSec, 4, 'the clip starts at loopStart');
+  assert.equal(clip.durationSec, 6, 'and ends at loopEnd');
+  assert.equal(clip.offsetIntoSource, 2, 'the head outside the window is trimmed, not discarded');
+  assert.equal(clip.sourceDuration, 10, 'the SOURCE is still the whole pass');
+  assert.equal(clip.audioBlob.size > 0, true);
+}
+
+// `in`: the lower edge only — recording starts at loopStart and runs on past
+// loopEnd to wherever the pass was stopped.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  setLoop(4, 10);
+  rp().setPunch('in');
+
+  await pass(h, [fakeTake('trk-a', 2, 12)]);
+
+  const clip = es().clips[0];
+  assert.equal(clip.startSec, 4);
+  assert.equal(clip.durationSec, 8, 'punch in does not punch out');
+  assert.equal(clip.offsetIntoSource, 2);
+  assert.equal(clip.sourceDuration, 10);
+}
+
+// `out`: the upper edge only — the take keeps its own anchor and is cut at
+// loopEnd.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  setLoop(4, 10);
+  rp().setPunch('out');
+
+  await pass(h, [fakeTake('trk-a', 2, 12)]);
+
+  const clip = es().clips[0];
+  assert.equal(clip.startSec, 2, 'punch out does not punch in');
+  assert.equal(clip.durationSec, 8);
+  assert.equal(clip.offsetIntoSource, 0, 'nothing is trimmed off the front');
+  assert.equal(clip.sourceDuration, 10);
+}
+
+// A take wholly INSIDE the window is passed through untouched.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  setLoop(4, 10);
+  rp().setPunch('in-out');
+
+  await pass(h, [fakeTake('trk-a', 5, 8)]);
+
+  const clip = es().clips[0];
+  assert.equal(clip.startSec, 5);
+  assert.equal(clip.durationSec, 3);
+  assert.equal(clip.offsetIntoSource, 0);
+}
+
+// A take wholly OUTSIDE it is dropped, and takes no take number with it.
+{
+  const h = harness(['trk-a', 'trk-b']);
+  es().updateTrack('trk-a', { armed: true });
+  es().updateTrack('trk-b', { armed: true });
+  setLoop(4, 10);
+  rp().setPunch('in-out');
+
+  await pass(h, [fakeTake('trk-a', 12, 14), fakeTake('trk-b', 6, 9)]);
+
+  const clips = es().clips;
+  assert.equal(clips.length, 1, 'the take outside the window never becomes a clip');
+  assert.equal(clips[0].trackId, 'trk-b');
+  assert.equal(clips[0].label, 'Take 1', 'a dropped take does not burn a take number');
+}
+
+// Punch armed with NO loop region: the press records normally and says so. The
+// pass is not refused and the status never leaves its ordinary path.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  es().clearLoop();
+  rp().setPunch('in-out');
+
+  await pass(h, [fakeTake('trk-a', 2, 12)]);
+
+  assert.match(
+    rs().lastNotice?.text ?? '',
+    /punch ignored: no loop region/i,
+    'the press explains why the punch did nothing',
+  );
+  assert.equal(rs().lastError, null, 'nothing FAILED — the notice is informational');
+  assert.equal(rs().status, 'idle');
+  const clip = es().clips[0];
+  assert.ok(clip, 'and the pass is recorded whole');
+  assert.equal(clip.startSec, 2);
+  assert.equal(clip.durationSec, 10);
+  assert.equal(clip.offsetIntoSource, 0);
+
+  // Give it a region and the notice goes away on the next press — it describes
+  // THAT press, like `lastError`, not a setting that is stuck wrong.
+  setLoop(4, 10);
+  await pass(h, [fakeTake('trk-a', 2, 12)]);
+  assert.equal(rs().lastNotice, null, 'the notice is cleared by the press that no longer needs it');
+  assert.equal(es().clips[1].durationSec, 6, 'and that press punched');
+}
+
+// THE WRAP RULE. One press is one take per armed track — the engine records the
+// whole pass as a single blob however many times the transport rewound at
+// `loopEnd` — so a pass that wraps yields ONE clip, never one per lap. Its
+// CLOCK is the wrapped one T12b-a repairs (`endSec` lands earlier than
+// `startSec`), and a clock that rewound cannot bound a window: the take is
+// repaired from the decode and left UNCROPPED, exactly as with punch off.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  setLoop(4, 10);
+  rp().setPunch('in-out');
+  h.setDecodedDuration(7.5);
+
+  await pass(h, [fakeTake('trk-a', 9, 1)]);
+
+  const clips = es().clips;
+  assert.equal(clips.length, 1, 'one pass, one take, one clip');
+  assert.equal(clips[0].startSec, 9, 'the anchor was never in doubt');
+  assert.equal(clips[0].durationSec, 7.5, 'the T12b-a repair still owns the length');
+  assert.equal(clips[0].sourceDuration, 7.5);
+  assert.equal(clips[0].offsetIntoSource, 0, 'an unmeasured take is never cropped');
+}
+
+// Two presses are two takes, and each pass is still exactly one undo step.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  setLoop(4, 10);
+  rp().setPunch('in-out');
+  const undoDepth = () => (useEditorStore.getState() as unknown as { _undo: unknown[] })._undo.length;
+
+  const before = undoDepth();
+  await pass(h, [fakeTake('trk-a', 2, 12)]);
+  assert.equal(undoDepth(), before + 1, 'a punched pass is one undo step');
+  await pass(h, [fakeTake('trk-a', 3, 11)]);
+  assert.equal(es().clips.length, 2, 'two passes, two takes');
+  assert.equal(undoDepth(), before + 2);
+
+  es().undo();
+  assert.equal(es().clips.length, 1, 'one undo takes the LAST pass off, and only it');
+  assert.equal(es().clips[0].label, 'Take 1');
+}
+
+// Punch OFF with a loop region up: nothing is cropped.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  setLoop(4, 10);
+
+  await pass(h, [fakeTake('trk-a', 2, 12)]);
+
+  const clip = es().clips[0];
+  assert.equal(clip.startSec, 2, 'punch off is punch off, loop region or not');
+  assert.equal(clip.durationSec, 10);
+  assert.equal(clip.offsetIntoSource, 0);
+  assert.equal(rs().lastError, null, 'and there is nothing to say about it');
+  assert.equal(rs().lastNotice, null);
+}
+
+// THE WINDOW IS THE PRESS'S. Dragging the loop region — or changing the mode —
+// while the recorders are rolling must not reach back and re-cut a take that
+// was recorded under the old window.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  setLoop(4, 10);
+  rp().setPunch('in-out');
+
+  rs().recordPress();
+  await flush();
+  h.engine.resolveStart();
+  await flush();
+  // Mid-pass: the user drags the loop somewhere else and switches the mode off.
+  setLoop(20, 30);
+  rp().setPunch('off');
+  h.engine.setTakes([fakeTake('trk-a', 2, 12)]);
+  rs().stopRecording();
+  await flush();
+  await flush();
+
+  const clip = es().clips[0];
+  assert.equal(clip.startSec, 4, 'the crop is the window the press was made with');
+  assert.equal(clip.durationSec, 6);
+  assert.equal(clip.offsetIntoSource, 2);
+}
+
+// A pass the window kept NOTHING of does not vanish in silence.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  setLoop(4, 10);
+  rp().setPunch('in-out');
+
+  await pass(h, [fakeTake('trk-a', 12, 14)]);
+
+  assert.equal(es().clips.length, 0, 'nothing lands');
+  assert.match(rs().lastNotice?.text ?? '', /punch window empty/i, 'and the store says why');
+  assert.equal(rs().lastError, null, 'still not a failure');
+}
+
+// The SAME notice twice is two notices: a value-keyed consumer (the footer's
+// effect) must re-post, so the text alone is not the identity.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  es().clearLoop();
+  rp().setPunch('in-out');
+
+  await pass(h, [fakeTake('trk-a', 0, 1)]);
+  const first = rs().lastNotice;
+  await pass(h, [fakeTake('trk-a', 2, 3)]);
+  const second = rs().lastNotice;
+
+  assert.equal(first?.text, second?.text, 'the same thing happened twice');
+  assert.notEqual(first?.seq, second?.seq, 'and it is reported twice');
+  assert.notEqual(first, second, 'a fresh object, so an identity-keyed effect refires');
+}
+
+// A press with nothing armed clears a notice the previous press left behind —
+// it describes THAT press, and this one did not even open an input.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  es().clearLoop();
+  rp().setPunch('in-out');
+  await pass(h, [fakeTake('trk-a', 0, 1)]);
+  assert.ok(rs().lastNotice, 'the notice is up');
+
+  es().updateTrack('trk-a', { armed: false });
+  rs().recordPress();
+  await flush();
+  assert.equal(rs().lastError?.code, 'nothing-armed');
+  assert.equal(rs().lastNotice, null, 'and the stale notice went with it');
+}
+
+/* ---------------- the preference is NOT on the hot store ------------------- */
+
+// `persist` replaces `setState`, so persisting the hot store would serialise it
+// and hit storage on every meter frame — 20 writes a second per pass — and a
+// storage that throws would throw out of `recordPress`. The preference lives in
+// its own store; this pins that the hot one never reaches storage.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  rs().recordPress();
+  await flush();
+  h.engine.resolveStart();
+  await flush();
+
+  const before = storageKeys.length;
+  for (let i = 0; i < 40; i += 1) {
+    h.setWallMs(10_000 + i * LEVEL_WRITE_MS);
+    h.engine.emitLevel('trk-a', { peak: i / 40, rms: i / 80 });
+  }
+  assert.ok(rs().levels['trk-a'], 'the frames really did reach the store');
+  rs().stopRecording();
+  await flush();
+  assert.equal(
+    storageKeys.length,
+    before,
+    'a pass — meters, status flips, the placement and all — writes no storage',
+  );
+
+  // The preference itself still persists, which is what proves the counter works.
+  rp().setPunch('in-out');
+  assert.equal(storageKeys.length, before + 1, 'picking a mode is the only thing that does');
+  assert.equal(storageKeys[storageKeys.length - 1], 'thedaw-recording-prefs');
+  rp().setPunch('off');
+}
+
+// A persisted value this build does not know hydrates to `off` — never to a
+// window nothing can compute.
+// `mergeRecordingPrefs` IS the hydrate — it is the store's `merge` option — so
+// it is pinned directly. zustand 5.0.15 attaches no `persist` api to the store
+// (only setState / getState / getInitialState / subscribe), so its own hydrate
+// cannot be re-run from out here.
+{
+  const base = { punch: 'in-out' as const, setPunch: rp().setPunch };
+  assert.equal(mergeRecordingPrefs({ punch: 'sideways' }, base).punch, 'off', 'an unknown persisted mode is not a mode');
+  assert.equal(mergeRecordingPrefs({ punch: 42 }, base).punch, 'off');
+  assert.equal(mergeRecordingPrefs(null, base).punch, 'off', 'nothing persisted is off, not undefined');
+  assert.equal(mergeRecordingPrefs({}, base).punch, 'off');
+  // A good one survives, and the actions on `current` are kept.
+  const good = mergeRecordingPrefs({ punch: 'out' }, base);
+  assert.equal(good.punch, 'out');
+  assert.equal(typeof good.setPunch, 'function', 'hydrating does not drop the actions');
 }
 
 resetRecording();

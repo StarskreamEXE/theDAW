@@ -55,7 +55,14 @@ import {
   useMetronomeStore,
   type CountInBars,
 } from '../../state/metronomeStore';
-import { initRecording, useRecordingStore, type RecordingStatus } from '../../state/recordingStore';
+import {
+  PUNCH_CHOICES,
+  initRecording,
+  useRecordingPrefs,
+  useRecordingStore,
+  type PunchMode,
+  type RecordingStatus,
+} from '../../state/recordingStore';
 import { postStatus } from '../../state/statusNoticeStore';
 
 /**
@@ -76,6 +83,27 @@ const REPEAT_KEY_LABEL: Record<'off' | 'all' | 'one', string> = {
 
 /** Why the RECORD key is dead. Shown on the key and on its plate — see there. */
 const RECORD_NEEDS_ARM = 'Record: arm a track first - the red dot in its header';
+
+/** The punch window, on the key's NAME and title and in its select. `off` names
+ *  itself nowhere: a key that says nothing about punch is a key that is not
+ *  punching. It rides the `aria-label` as well as the title for the reason the
+ *  dead key's does (see RecordKey): a title is mouse-only, and below 2xl the
+ *  mode cannot be seen anywhere else. */
+const PUNCH_TITLE: Record<PunchMode, string> = {
+  off: '',
+  in: ' (punch in)',
+  out: ' (punch out)',
+  'in-out': ' (punch in-out)',
+};
+
+/** The select's own option texts. Short because the footer row is 48px and this
+ *  select sits beside the count-in one; the sr-only label says which is which. */
+const PUNCH_OPTION: Record<PunchMode, string> = {
+  off: 'Off',
+  in: 'In',
+  out: 'Out',
+  'in-out': 'In/Out',
+};
 
 /**
  * The RECORD key, on a matte plate of its own — PLAY's grammar, the way the
@@ -122,21 +150,24 @@ const RECORD_NEEDS_ARM = 'Record: arm a track first - the red dot in its header'
 const RecordKey: React.FC<{
   status: RecordingStatus;
   armedCount: number;
+  /** The punch window this press would write into — named in the title so the
+   *  key never records less than the user expected without saying so. */
+  punch: PunchMode;
   onPress: () => void;
   /** No legend, 32px — the below-xl form. */
   compact?: boolean;
   className?: string;
   tourId?: string;
-}> = ({ status, armedCount, onPress, compact = false, className = '', tourId }) => {
+}> = ({ status, armedCount, punch, onPress, compact = false, className = '', tourId }) => {
   const dead = status === 'idle' && armedCount === 0;
   const live = status === 'counting' || status === 'recording';
   const title = dead
     ? RECORD_NEEDS_ARM
-    : status === 'counting'
-      ? 'Counting in - press to cancel'
-      : status === 'idle'
-        ? `Record a take on ${armedCount} armed track${armedCount === 1 ? '' : 's'} (R)`
-        : 'Stop recording (R)';
+    : (status === 'counting'
+        ? 'Counting in - press to cancel'
+        : status === 'idle'
+          ? `Record a take on ${armedCount} armed track${armedCount === 1 ? '' : 's'} (R)`
+          : 'Stop recording (R)') + PUNCH_TITLE[punch];
   return (
     <div
       data-tour={tourId}
@@ -147,7 +178,11 @@ const RecordKey: React.FC<{
         type="button"
         onClick={onPress}
         disabled={dead}
-        aria-label={dead ? RECORD_NEEDS_ARM : status === 'idle' ? 'Record' : 'Stop recording'}
+        aria-label={
+          dead
+            ? RECORD_NEEDS_ARM
+            : (status === 'idle' ? 'Record' : 'Stop recording') + PUNCH_TITLE[punch]
+        }
         aria-pressed={status !== 'idle'}
         title={title}
         className={`${transportKey} w-full ${
@@ -658,7 +693,12 @@ export const PlayerFooter: React.FC = () => {
   const recStatus = useRecordingStore((s) => s.status);
   const recArmedCount = useRecordingStore((s) => s.armedTrackIds.length);
   const recError = useRecordingStore((s) => s.lastError);
+  const recNotice = useRecordingStore((s) => s.lastNotice);
   const recordPress = useRecordingStore((s) => s.recordPress);
+  // The punch window is the editor's LOOP region; this only picks which of its
+  // edges the pass may cross. `recordingStore` owns the crop.
+  const recPunch = useRecordingPrefs((s) => s.punch);
+  const setRecPunch = useRecordingPrefs((s) => s.setPunch);
   useEffect(() => { initRecording(); }, []);
   // A failure surfaces through the app's ONE status channel — the orb bubble
   // this footer already draws (statusNoticeStore -> OrbTipBubble), which also
@@ -668,6 +708,15 @@ export const PlayerFooter: React.FC = () => {
     if (!recError) return;
     postStatus(`RECORD FAILED: ${recError.message}`, { source: 'recording' });
   }, [recError]);
+  // The INFORMATIONAL half of the same channel: a press that is proceeding
+  // normally but has something to say (a punch mode with no loop region to
+  // punch into). "RECORD" is the whole label — `statusNoticeStore.statusLevel`
+  // reads the text before the first ": " and matches no error or warn word in
+  // it — so this lands at info, where "RECORD FAILED" lands at error.
+  useEffect(() => {
+    if (!recNotice) return;
+    postStatus(`RECORD: ${recNotice.text}`, { source: 'recording' });
+  }, [recNotice]);
   /**
    * R toggles record, on EDIT only. The EDIT timeline's own bare-letter keys
    * are v / c / s / m / l and Shift+F (WaveformEditor's EDIT_SHORTCUTS list);
@@ -1002,6 +1051,19 @@ export const PlayerFooter: React.FC = () => {
                 <option key={n} value={n}>{n === 0 ? 'Off' : `${n} bar${n === 1 ? '' : 's'}`}</option>
               ))}
             </select>
+            {/* PUNCH is NOT here, beside the count-in select it copies. It was,
+                and it cost the whole now-playing title AND put RECORD on the
+                transport plate: measured at 960px (Chrome, EDIT tab,
+                getBoundingClientRect) a w-16 select plus the row's 4px gap took
+                the title from batch 7's 32.4px to 0.4px — it is `flex-1
+                min-w-0`, so it collapses silently rather than overflowing — and
+                slid the
+                compact RECORD key to 338-370, 27.6px INSIDE the plate
+                (342.4-617.6), which is the exact failure RecordKey's comment
+                below was written about. This track has no room at any width:
+                from xl the orb bubble takes 192px of it and the title is down
+                to 8.4px before any key. So punch lives in the RIGHT track from
+                2xl — see there. */}
             {/* RECORD's below-xl home, glued to the plate's LEFT edge — see
                 RecordKey for the 960px measurement that put it here. Hidden
                 from xl, where the copy at the plate's right edge takes over. */}
@@ -1011,6 +1073,7 @@ export const PlayerFooter: React.FC = () => {
                 className="xl:hidden"
                 status={recStatus}
                 armedCount={recArmedCount}
+                punch={recPunch}
                 onPress={recordPress}
               />
             )}
@@ -1133,8 +1196,56 @@ export const PlayerFooter: React.FC = () => {
               className="hidden xl:flex mr-auto"
               status={recStatus}
               armedCount={recArmedCount}
+              punch={recPunch}
               onPress={recordPress}
             />
+          )}
+          {/* PUNCH, beside the RECORD key it belongs to, and from 2xl only —
+              NOT xl, and not beside the count-in select it copies. A native
+              select, so it keeps a real id/name and an sr-only <label htmlFor>
+              (CLAUDE.md rule 3); the WINDOW itself is the editor's loop region,
+              and this only picks which of its edges a take may cross.
+
+              A w-16 select costs 80px wherever it goes (64 + the track's gap),
+              and 2xl is the first width that HAS 80px. Measured in Chrome on
+              the EDIT tab, getBoundingClientRect, this build:
+                - 960:  in the LEFT track it took the now-playing title from
+                        32.4px to 0.4px — 32.4 being what batch 7 left after
+                        the compact RECORD key took the track's 68.4px title
+                        down — and pushed that key to 338-370, ON the transport
+                        plate (342.4-617.6), 27.6px of overlap. Not rendered
+                        now: title back to 32.4px, RECORD 302.4-334.4, 8px
+                        clear of the plate.
+                - 1024: not rendered. Title 64.4px, RECORD 334.4-366.4, 8px
+                        clear. Both widths: plate 0px off centre, 0px overflow.
+                - 1280: in THIS track it took "Up Next" from 70.4px to 0px and
+                        squeezed RECORD's clearance from 16px to 6.4px (the key
+                        slid 793.6->784). Not rendered now: RECORD back at
+                        793.6-841.6, 16px off the plate, "Up Next" 70.4px —
+                        this width is byte-for-byte what T12b-a measured.
+                - 1536: rendered, 985.6-1049.6, 16px right of the RECORD key
+                        (921.6-969.6, still 16px off the plate). "Up Next"
+                        126.4px -> 46.4px, which it can afford. Plate 0px off
+                        centre, 0px footer overflow.
+              Below 2xl the mode is not editable, only persisted — but the
+              RECORD key's title names it at EVERY width, so a punch set on a
+              wide screen never records short on a narrow one in silence. */}
+          {inEditorMode && (
+            <div className="hidden 2xl:flex shrink-0 items-center gap-1">
+              <label htmlFor="record-punch" className="sr-only">Punch recording window</label>
+              <select
+                id="record-punch"
+                name="recordPunch"
+                value={recPunch}
+                onChange={(e) => setRecPunch(e.target.value as PunchMode)}
+                title="Punch: record only inside the loop region"
+                className="w-16 rounded-md bg-white/5 border border-white/10 px-1 py-0.5 text-xs text-zinc-300 hover:text-white focus:outline-hidden focus:ring-1 focus:ring-[rgb(var(--et-accent))]"
+              >
+                {PUNCH_CHOICES.map((m) => (
+                  <option key={m} value={m}>{PUNCH_OPTION[m]}</option>
+                ))}
+              </select>
+            </div>
           )}
           {/* Up Next — mirror of the Now Playing block, right-aligned. Click loads
               the next track (no formal queue yet, so it's the next library entry —

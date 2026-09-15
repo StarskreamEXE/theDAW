@@ -467,6 +467,12 @@ export interface ChunkSafetyTrack {
   fxChain?: ChainEntry[];
 }
 
+/** The shape of a BUS this predicate needs. `EditorBus` satisfies it. */
+export interface ChunkSafetyBus {
+  id: string;
+  fxChain?: ChainEntry[];
+}
+
 /**
  * Could the bounce this request describes be rendered in chunks?
  *
@@ -481,6 +487,13 @@ export interface ChunkSafetyTrack {
  *    so they are not in the offline graph this predicate gates, and do not make
  *    it unsafe. The master and selection scopes leave them in, where they do.
  *  - `master` and `selection` cover the master rack plus every track's chain.
+ *  - `buses` cover the BUS racks, which since T14 the MASTER scope builds too
+ *    (`renderBounce` walks the routing graph). A bus rack is as capable of
+ *    carrying state across a chunk boundary as a track's. Neither of the other
+ *    two scopes is routed — a stem is pre-routing and a selection is a per-clip
+ *    mix straight to the master — so neither reads them. The argument is
+ *    OPTIONAL and defaults to none, which is the pre-bus behaviour and the
+ *    right answer for a document with no buses.
  *
  * Mute and solo are deliberately NOT modelled. `renderBounce` skips a silenced
  * track's rack, so ignoring them can only ever call a bounce unsafe that was in
@@ -491,6 +504,7 @@ export function bounceIsChunkSafe(
   tracks: ChunkSafetyTrack[],
   masterFxChain: ChainEntry[],
   resolve: ResolveRackDef = defaultResolve,
+  buses: ChunkSafetyBus[] = [],
 ): ChunkSafety {
   if (!req.includeFx) return { safe: true, reasons: [] };
 
@@ -503,6 +517,9 @@ export function bounceIsChunkSafe(
   for (const t of universe) {
     const chain = t.fxChain ?? [];
     chains.push(isStem ? chain.filter((e) => e.effect !== 'vst3') : chain);
+  }
+  if (scope.kind === 'master') {
+    for (const b of buses) chains.push(b.fxChain ?? []);
   }
 
   const reasons: string[] = [];

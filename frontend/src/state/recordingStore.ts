@@ -59,6 +59,43 @@
  * the blob's duration and `applyClipRender` writes it in. That write is
  * history-exempt, so the pass is still ONE undo step.
  *
+ * Punch in / punch out
+ * --------------------
+ * `punch` names the window the pass is allowed to WRITE into, and that window
+ * is the editor's existing loop region (`editorStore.loopEnabled` /
+ * `loopStart` / `loopEnd`) — there is no second region and no second owner.
+ * Ardour's gate is `record_enabled && location && (punch_in || punch_out)`
+ * (Ardour `session.cc:1797-1807`, GPL-3.0 — cited for the SHAPE of that rule
+ * only; the file was not opened, no code from it is present here, and we
+ * already had the `record_enabled` term as `armedTrackIds`). The `location`
+ * term is the loop region and the two booleans are this store's `punch`.
+ *
+ * It is applied at the TAKE level, not in the engine: the engine keeps
+ * recording the whole pass, so its `startSec` / `endSec` stay transport-true
+ * and a punch mode changed mid-pass can never desync a recorder. `placeTakes`
+ * then crops each take to the window — the clip keeps the whole take as its
+ * source and slides its window in with `offsetIntoSource`, so the bytes
+ * outside the punch are trimmed rather than destroyed and a drag of the clip's
+ * edge brings them back. A take lying wholly outside the window is dropped.
+ *
+ * The crop and the length repair above do NOT overlap, by construction: the
+ * crop needs a clock that measured the take, so it runs only when `measured`
+ * is true, which is exactly when the repair does not. An unmeasured take — an
+ * empty project, an early bail, or a pass that WRAPPED at `loopEnd` — is
+ * therefore laid down un-cropped and repaired from the decode, as before. That
+ * is also the wrap rule: one press is one take per armed track (the engine
+ * hands back a single blob however many laps the transport made), so a pass
+ * that wraps yields ONE clip, never one per lap.
+ *
+ * The window is fixed at the PRESS (`passPunchWindow`) and read again at the
+ * stop, so dragging the loop region or changing the mode mid-pass cannot reach
+ * back and re-cut a take that was recorded under the old one.
+ *
+ * `punch` is a persisted preference, like `metronomeStore`'s `countInBars` —
+ * but it lives in its OWN store (`useRecordingPrefs`), because `persist` writes
+ * storage on every `setState` of the store it wraps and THIS store is written
+ * 20 times a second per pass. See that store for the whole argument.
+ *
  * Seams
  * -----
  * Every outside reach is a `RecordingStoreDeps` entry with a real default, and
@@ -70,6 +107,7 @@
  */
 
 import { create } from 'zustand';
+import { createJSONStorage, persist } from 'zustand/middleware';
 import {
   RecordingError,
   createRecordingEngine,
@@ -103,6 +141,167 @@ import { EDITOR_TIMELINE_ID } from '../components/audio/trackMenuModel';
  */
 export type RecordingStatus = 'idle' | 'counting' | 'recording' | 'stopping';
 
+/**
+ * Which edges of the loop region the pass is allowed to write across.
+ *   - `off`    — no window; the whole pass lands.
+ *   - `in`     — from `loopStart` onward.
+ *   - `out`    — up to `loopEnd`.
+ *   - `in-out` — between the two.
+ */
+export type PunchMode = 'off' | 'in' | 'out' | 'in-out';
+
+/** The modes the UI offers, in the order it offers them. */
+export const PUNCH_CHOICES: readonly PunchMode[] = ['off', 'in', 'out', 'in-out'];
+
+/** What `lastNotice` carries when a punch mode is set but there is no region to
+ *  punch into. INFORMATIONAL, and deliberately NOT a `RecordingError`: the
+ *  press records normally, so the notice says why the mode did nothing rather
+ *  than claiming the pass failed. */
+export const PUNCH_IGNORED_MESSAGE = 'Punch ignored: no loop region - set one on the timeline first.';
+
+/** What `lastNotice` carries when the punch window kept nothing of a pass. The
+ *  recorders ran and the user pressed stop, so a silent timeline needs a word. */
+export const PUNCH_EMPTY_MESSAGE = 'Punch window empty: no take kept - the pass fell outside the loop region.';
+
+/** One informational word from a press. `seq` is what makes the SAME message
+ *  twice two notices: the footer keys its post on this object, and two presses
+ *  that both ignore the punch must both say so. */
+export interface RecordingNotice {
+  text: string;
+  seq: number;
+}
+
+/** Coerce anything — a stale persisted value included — to a real mode. */
+const asPunchMode = (v: unknown): PunchMode =>
+  (PUNCH_CHOICES as readonly unknown[]).includes(v) ? (v as PunchMode) : 'off';
+
+/* -------------------------------------------------------------------------- */
+/*                            the preference store                            */
+/* -------------------------------------------------------------------------- */
+
+export interface RecordingPrefsState {
+  /** The punch window's mode. */
+  punch: PunchMode;
+  /** Choose it. Anything unknown falls back to `off`. */
+  setPunch: (mode: PunchMode) => void;
+}
+
+/**
+ * The punch PREFERENCE, persisted — and deliberately a store of its OWN.
+ *
+ * `persist` replaces `api.setState`, so every write to the store it wraps
+ * serialises the state and hits `localStorage` synchronously. `useRecordingStore`
+ * is written 20 times a second per pass (the meter frames), plus on every status
+ * flip, and its actions are documented as never throwing — a storage that is
+ * full, disabled or in a locked-down iframe would throw out of `recordPress`
+ * and `placeTakes`. So the hot store stays UNWRAPPED and this one, written only
+ * when the user picks a mode, carries the persistence. The hot store reads it.
+ *
+ * `merge` validates on hydrate: a value this build does not know (a mode a
+ * future build added, or a hand-edited entry) becomes `off` rather than a
+ * window nothing can compute.
+ */
+/** The three methods `persist` asks of a storage. `localStorage` satisfies it. */
+export interface PrefsStorageLike {
+  getItem: (key: string) => string | null;
+  setItem: (key: string, value: string) => void;
+  removeItem: (key: string) => void;
+}
+
+/**
+ * Where the preference is written. A seam because zustand 5.0.15 attaches NO
+ * `persist` api to the store (only `setState` / `getState` / `getInitialState` /
+ * `subscribe` are there), so there is no other way for a host — or a test with
+ * no `localStorage` — to point it somewhere else. `null` restores the default.
+ */
+let prefsStorage: PrefsStorageLike | null = null;
+export function setRecordingPrefsStorage(storage: PrefsStorageLike | null): void {
+  prefsStorage = storage;
+}
+
+/** Where the preference goes when there is nowhere to put it — a server render,
+ *  a locked-down iframe, a browser with storage disabled. It keeps the value
+ *  for the session and loses it on reload, which is the right failure. */
+const memoryStorage = new Map<string, string>();
+
+const backend = (): PrefsStorageLike => {
+  if (prefsStorage) return prefsStorage;
+  try {
+    if (typeof localStorage !== 'undefined' && localStorage) return localStorage;
+  } catch {
+    /* accessing it can itself throw */
+  }
+  return {
+    getItem: (k) => memoryStorage.get(k) ?? null,
+    setItem: (k, v) => { memoryStorage.set(k, v); },
+    removeItem: (k) => { memoryStorage.delete(k); },
+  };
+};
+
+/**
+ * ONE object handed to `persist`, which resolves the real backend per call.
+ * `createJSONStorage` calls its getter ONCE and caches the result, so a getter
+ * that returned the backend directly would freeze whatever was available at
+ * import — and a `null` there makes zustand throw on every write rather than
+ * warn. Every method swallows: a storage that refuses must never throw out of
+ * `setPunch`.
+ */
+const prefsJsonBackend: PrefsStorageLike = {
+  getItem: (key) => {
+    try {
+      return backend().getItem(key);
+    } catch {
+      return null;
+    }
+  },
+  setItem: (key, value) => {
+    try {
+      backend().setItem(key, value);
+    } catch {
+      /* full, disabled, or denied: the preference is still live in memory */
+    }
+  },
+  removeItem: (key) => {
+    try {
+      backend().removeItem(key);
+    } catch {
+      /* as above */
+    }
+  },
+};
+
+/**
+ * What a persisted entry becomes on hydrate. Exported because it IS the
+ * validation: a value this build does not know (a mode a future build added, a
+ * hand-edited entry) has to become `off` rather than a window nothing can
+ * compute, and `persist` gives no way to drive its own hydrate from a test.
+ */
+export function mergeRecordingPrefs(
+  persisted: unknown,
+  current: RecordingPrefsState,
+): RecordingPrefsState {
+  return { ...current, punch: asPunchMode((persisted as { punch?: unknown } | null)?.punch) };
+}
+
+export const useRecordingPrefs = create<RecordingPrefsState>()(
+  persist(
+    (set) => ({
+      punch: 'off',
+      setPunch: (mode: PunchMode) => set({ punch: asPunchMode(mode) }),
+    }),
+    {
+      name: 'thedaw-recording-prefs',
+      version: 1,
+      storage: createJSONStorage(() => prefsJsonBackend),
+      partialize: (s) => ({ punch: s.punch }),
+      merge: (persisted, current) => mergeRecordingPrefs(persisted, current),
+    },
+  ),
+);
+
+/** The mode a press would punch with. */
+export const punchMode = (): PunchMode => useRecordingPrefs.getState().punch;
+
 export interface RecordingStoreState {
   status: RecordingStatus;
   /** Record-armed track ids, mirroring `editorStore`'s `armed` flags in order. */
@@ -113,10 +312,17 @@ export interface RecordingStoreState {
   /** The last failure, for the footer to surface. A fresh object every time, so
    *  the same failure twice is still two notices. */
   lastError: RecordingError | null;
+  /** The last INFORMATIONAL word from a press — something the user should know
+   *  about a pass that is otherwise proceeding normally. A separate channel
+   *  from `lastError` because the footer labels that one "RECORD FAILED", and a
+   *  notice posted under that label would be a lie about what happened. Set and
+   *  cleared on the press, exactly like `lastError`. */
+  lastNotice: RecordingNotice | null;
   /** Start a pass, or stop the one running. Never throws. */
   recordPress: () => void;
   /** Stop a pass (or cancel a count-in). Never throws. */
   stopRecording: () => void;
+  /** Dismiss whatever the last press had to say — the failure and the notice. */
   clearError: () => void;
 }
 
@@ -293,9 +499,24 @@ let transportRolled = false;
 let takeSeq = 0;
 let pendingLevels: Record<string, LevelFrame> = {};
 let lastLevelWrite = 0;
+/** The window THIS pass was pressed with, captured at the press. The crop runs
+ *  at the stop, and between the two the user may drag the loop region or change
+ *  the mode; neither may reach back and re-cut a take that was already recorded
+ *  under the old one. The press is also where the "no loop region" notice is
+ *  decided, so the notice and the crop always describe the same window. */
+let passPunchWindow: { from: number; to: number } | null = null;
+/** Bumped per notice, so the same text twice is still two notices. */
+let noticeSeq = 0;
+
+const notice = (text: string): RecordingNotice => {
+  noticeSeq += 1;
+  return { text, seq: noticeSeq };
+};
 
 const st = () => useRecordingStore.getState();
-const setState = (patch: Partial<RecordingStoreState>): void => useRecordingStore.setState(patch);
+const setState = (patch: Partial<RecordingStoreState>): void => {
+  useRecordingStore.setState(patch);
+};
 
 const asRecordingError = (e: unknown): RecordingError =>
   e instanceof RecordingError
@@ -373,16 +594,46 @@ async function finishPass(): Promise<void> {
 }
 
 /**
+ * The editor's loop region, or `null` when there is none to punch into. A
+ * region whose end is not past its start is no region: `setLoopRegion` itself
+ * refuses to enable one under 50 ms, and a degenerate one would crop every
+ * take to nothing.
+ */
+function loopRegion(): { start: number; end: number } | null {
+  const { loopEnabled, loopStart, loopEnd } = useEditorStore.getState();
+  if (!loopEnabled) return null;
+  if (!Number.isFinite(loopStart) || !Number.isFinite(loopEnd) || loopEnd <= loopStart) return null;
+  return { start: loopStart, end: loopEnd };
+}
+
+/**
+ * The transport-second window this pass may write into, or `null` when it may
+ * write anywhere (punch off, or no loop region). An open edge is infinite
+ * rather than clamped so the crop below is one expression for all three modes.
+ */
+function punchWindow(): { from: number; to: number } | null {
+  const punch = punchMode();
+  if (punch === 'off') return null;
+  const loop = loopRegion();
+  if (!loop) return null;
+  return {
+    from: punch === 'out' ? -Infinity : loop.start,
+    to: punch === 'in' ? Infinity : loop.end,
+  };
+}
+
+/**
  * Every take of ONE pass onto the timeline as ONE undo step.
  *
  * `beginUndoStep()` cuts the coalescing burst so the next document change opens
  * a fresh step; the adds that follow are synchronous, so they fold into that
  * one step and a single undo takes the whole pass back off the timeline.
  *
- * `sourceDuration` is the take's own length: a take IS its source, nothing is
- * trimmed off its front (`offsetIntoSource` is 0 by definition) and nothing
- * follows its end. Peaks are decoded afterwards and cached onto the clip — a
- * decode that fails costs the waveform drawing, never the take.
+ * `sourceDuration` is the take's own length: a take IS its source. With punch
+ * off nothing is trimmed off its front either (`offsetIntoSource` is 0) and
+ * nothing follows its end; a PUNCHED pass keeps that same source and trims the
+ * clip to the window instead. Peaks are decoded afterwards and cached onto the
+ * clip — a decode that fails costs the waveform drawing, never the take.
  *
  * That same decode is the repair for a take whose CLOCK never moved (see the
  * header): a zero length, or a pass whose transport never rolled, takes its
@@ -392,25 +643,50 @@ async function finishPass(): Promise<void> {
  */
 function placeTakes(takes: readonly Take[]): void {
   if (takes.length === 0) return;
+  const punchWin = passPunchWindow;
   beginUndoStep();
   let faulted: RecordingError | null = null;
+  let placed = 0;
+  let dropped = 0;
   for (const take of takes) {
     if (take.meta.error) faulted = take.meta.error;
     const place = takeClipPlacement(take);
     const editor = useEditorStore.getState();
     if (!editor.tracks.some((t) => t.id === place.trackId)) continue; // the track was deleted mid-pass
     const color = editor.tracks.find((t) => t.id === place.trackId)?.color ?? FALLBACK_CLIP_COLOR;
-    takeSeq += 1;
     const measured = place.durationSec > 0 && transportRolled;
+    // The punch crop. Only on a take the CLOCK measured: an unmeasured one has
+    // no true extent to intersect the window with (its length is about to come
+    // from the decode instead), so it is laid down whole — see the header.
+    let startSec = place.startSec;
+    let durationSec = place.durationSec;
+    let offsetIntoSource: number = place.offsetIntoSource;
+    if (measured && punchWin) {
+      const from = Math.max(place.startSec, punchWin.from);
+      const to = Math.min(place.startSec + place.durationSec, punchWin.to);
+      // Wholly outside the window: nothing was punched in, so nothing lands —
+      // and the take number is not burnt on a clip that does not exist.
+      if (to <= from) {
+        dropped += 1;
+        continue;
+      }
+      startSec = from;
+      durationSec = to - from;
+      offsetIntoSource = from - place.startSec;
+    }
+    takeSeq += 1;
+    placed += 1;
     const clipId = editor.addClipToTrack({
       trackId: place.trackId,
       label: `Take ${takeSeq}`,
       audioBlob: take.blob,
       mimeType: take.meta.mime,
+      // The SOURCE is the whole pass however the window cropped it: the bytes
+      // outside the punch are trimmed off the clip, not thrown away.
       sourceDuration: place.durationSec,
-      offsetIntoSource: place.offsetIntoSource,
-      durationSec: place.durationSec,
-      startSec: place.startSec,
+      offsetIntoSource,
+      durationSec,
+      startSec,
       color,
     });
     void deps
@@ -432,13 +708,22 @@ function placeTakes(takes: readonly Take[]): void {
   // A faulted take still LANDS — the spec flushes what it gathered — so the
   // fault is reported beside the clip rather than instead of it.
   if (faulted) setState({ lastError: faulted });
+  // Every take fell outside the window. The recorders ran, the user pressed
+  // stop, and the timeline is unchanged: without this the pass simply vanishes.
+  if (placed === 0 && dropped > 0) setState({ lastNotice: notice(PUNCH_EMPTY_MESSAGE) });
 }
 
+/**
+ * The HOT store: written on every status flip and 20 times a second per pass
+ * while the meters run. It carries no `persist` — see `useRecordingPrefs` for
+ * why the preference lives elsewhere.
+ */
 export const useRecordingStore = create<RecordingStoreState>()(() => ({
   status: 'idle',
   armedTrackIds: [],
   levels: {},
   lastError: null,
+  lastNotice: null,
 
   recordPress: () => {
     // Any state but idle: the key is a STOP. That covers a cancel during the
@@ -453,10 +738,19 @@ export const useRecordingStore = create<RecordingStoreState>()(() => ({
       // Not a throw: the press is a no-op the UI explains. The engine would
       // raise the same code from `start()`, but asking it would open nothing
       // and lose the press to an unhandled rejection.
-      setState({ lastError: new RecordingError('nothing-armed') });
+      setState({ lastError: new RecordingError('nothing-armed'), lastNotice: null });
       return;
     }
-    setState({ lastError: null });
+    // THE window for this pass, fixed here and read again at the stop.
+    passPunchWindow = punchWindow();
+    // A punch mode with nothing to punch into. The press is NOT refused —
+    // the pass records whole, exactly as with punch off — so this goes on
+    // the INFORMATIONAL channel and `lastError` stays null: nothing failed.
+    const ignored = punchMode() !== 'off' && !passPunchWindow;
+    setState({
+      lastError: null,
+      lastNotice: ignored ? notice(PUNCH_IGNORED_MESSAGE) : null,
+    });
 
     // `MetronomeScheduler.countIn` can call `onDone` SYNCHRONOUSLY and still
     // hand back a non-null cancel, on two paths `shouldCountIn` cannot see from
@@ -506,7 +800,7 @@ export const useRecordingStore = create<RecordingStoreState>()(() => ({
     void finishPass();
   },
 
-  clearError: () => setState({ lastError: null }),
+  clearError: () => setState({ lastError: null, lastNotice: null }),
 }));
 
 /* -------------------------------------------------------------------------- */
@@ -556,7 +850,9 @@ export function resetRecording(): void {
   stopPending = false;
   takeSeq = 0;
   transportRolled = false;
+  passPunchWindow = null;
+  noticeSeq = 0;
   pendingLevels = {};
   lastLevelWrite = 0;
-  setState({ status: 'idle', armedTrackIds: [], levels: {}, lastError: null });
+  setState({ status: 'idle', armedTrackIds: [], levels: {}, lastError: null, lastNotice: null });
 }

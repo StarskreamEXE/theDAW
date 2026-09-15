@@ -323,6 +323,10 @@ export const useProjectStore = create<ProjectState>()((set, get) => ({
           project_name: name,
           tempo: session.bpm,
           tracks: session.tracks,
+          // The mix buses the tracks' output_routing / send_amounts name. Without
+          // this the file could name a bus that had nowhere to live, and the
+          // session reopened with every edge collapsed onto the master.
+          buses: session.buses,
           controller_mappings: session.controllerMappings ?? null,
         };
         logInfo(

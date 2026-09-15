@@ -22,9 +22,12 @@
  *
  * Transport: a rAF clock advances a virtual playhead off the AudioContext
  * clock and mirrors it into playerStore.currentTime (footer time) and
- * editorStore.playheadSec (the moving line). The footer is UNCHANGED — it calls
- * the usual playerStore transport methods, which delegate here while a live
- * editor session is registered (see playerStore.setLiveTransport).
+ * editorStore.playheadSec (the moving line). Those two are not the same number
+ * once a chain declares latency: the footer clock is the transport POSITION,
+ * while the line is drawn back by `outputLatencySec()` so it shows the moment
+ * that is AUDIBLE. See `outputLatencySec` / `publishPlayhead`. The footer is
+ * UNCHANGED — it calls the usual playerStore transport methods, which delegate
+ * here while a live editor session is registered (see playerStore.setLiveTransport).
  *
  * The OFFLINE bounce is kept as-is for export / commit / send-to-init — those
  * genuinely need a rendered file. liveMixer only replaces the live PREVIEW.
@@ -116,7 +119,13 @@ interface TrackNodes {
   /** Plugin-delay compensation, spliced panner -> comp -> the summing bus. Holds
    *  `max(chain latency) - this track's own`, so every track meets the slowest
    *  one. 0 (transparent) until some chain declares latency. See
-   *  `syncTrackLatency`. */
+   *  `syncTrackLatency`.
+   *
+   *  METERING: any future PER-TRACK meter must tap AFTER this node. The master
+   *  meter is already fine because `levelsStore` taps the post-sum master chain
+   *  (`playerStore.getMeterTap`), which is downstream of every comp; a tap taken
+   *  from `panner` or earlier would read a track `latency + comp` early and so
+   *  show tracks lighting up out of step with each other and with the master. */
   comp: DelayNode;
   /** Per-track insert FX, spliced gain -> muteGain -> [fx] -> panner. */
   fx: ChainHandle;
@@ -247,12 +256,18 @@ function automatedNativeKeys(): Set<string> {
    its fader up. */
 registerChainProbe('editTimeline', () => {
   const automated = automatedNativeKeys();
-  const tracks = useEditorStore.getState().tracks;
+  const ed = useEditorStore.getState();
+  const { maxSec, perTrack } = trackLatencyReport();
+  const rowOf = new Map(perTrack.map((r) => [r.trackId, r]));
   return {
     playing,
     masterBus: masterBus ? masterBus.gain.value : null,
-    tracks: tracks.map((t) => {
+    // How far behind the transport the speakers are — the number the playhead is
+    // drawn back by, and the one the render trim uses. See `outputLatencySec`.
+    outputLatencySec: maxSec,
+    tracks: ed.tracks.map((t) => {
       const n = trackNodes.get(t.id);
+      const row = rowOf.get(t.id);
       return {
         name: t.name,
         fader: t.volume,
@@ -260,8 +275,31 @@ registerChainProbe('editTimeline', () => {
         volumeAutomated: automated.has(automationTargetKey({ kind: 'trackVolume', trackId: t.id })),
         muteGate: n ? n.muteGain.gain.value : null,
         pan: n ? n.panner.pan.value : t.pan,
+        // What this strip's path to the master declares it lags by, what its comp
+        // must hold to meet the slowest track (`latencySec + compSec == maxSec`),
+        // and what the DelayNode is REALLY holding — which trails `compSec` by
+        // the 0.01 s glide, and is null for a track with no live node yet.
+        latencySec: row ? row.latencySec : 0,
+        compSec: row ? row.compSec : 0,
+        compParam: n ? n.comp.delayTime.value : null,
+        uncounted: row ? row.uncounted : [],
       };
     }),
+    // The bus half of the graph (the T10b follow-up). A bus carries no comp of
+    // its own: its chain's latency is counted into every track routed through it
+    // (`trackCompDelays`'s downstream walk), so all the compensation is on the
+    // track strips above.
+    buses: ed.buses.map((b) => {
+      const n = busNodes.get(b.id);
+      return {
+        id: b.id,
+        name: b.name,
+        fader: b.volume,
+        param: n ? n.gain.gain.value : null,
+        muteGate: n ? n.muteGain.gain.value : null,
+      };
+    }),
+    sends: [...sendGains].map(([key, g]) => ({ key, gain: g.gain.value })),
   };
 });
 
@@ -920,10 +958,18 @@ export function applyCompDelays(
  * actually holding. A store track with no node yet is simply not written.
  */
 function syncTrackLatency(): void {
-  if (trackNodes.size === 0) return;
+  if (trackNodes.size === 0) {
+    // No live nodes to write to — but the OFFSET still has to be right, because
+    // the next `start()` schedules against it before anything is rebuilt.
+    refreshOutputLatency();
+    return;
+  }
   const ctx = getEngineCtx();
   const s = useEditorStore.getState();
   const rows = trackCompDelays(s.tracks, undefined, ctx.sampleRate, { graph: s.routing, buses: s.buses });
+  // Ahead of the signature gate below, which cannot see this number move; see
+  // `refreshOutputLatency`.
+  refreshOutputLatency(rows);
   // Skip the writes when the alignment has not moved, so a knob turn (which
   // reaches here because a declaration MAY depend on params) does not put a
   // `setTargetAtTime` on every track for numbers that are already there.
@@ -947,9 +993,89 @@ export function trackLatencyReport(): { maxSec: number; perTrack: TrackCompRow[]
     getEngineOutputInfo()?.sampleRate,
     { graph: s.routing, buses: s.buses },
   );
+  return { maxSec: maxLatencySec(perTrack), perTrack };
+}
+
+/** The slowest path in a computed row set — the meeting point every comp delay
+ *  is measured back from, and the output-wide offset of `outputLatencySec`. */
+function maxLatencySec(rows: readonly TrackCompRow[]): number {
   let maxSec = 0;
-  for (const r of perTrack) if (r.latencySec > maxSec) maxSec = r.latencySec;
-  return { maxSec, perTrack };
+  for (const r of rows) if (r.latencySec > maxSec) maxSec = r.latencySec;
+  return maxSec;
+}
+
+/** Cache behind `outputLatencySec()` — see `refreshOutputLatency`. */
+let outputLatency = 0;
+
+/**
+ * How far behind the transport the MIXER'S OUTPUT is, in seconds: the slowest
+ * path from a track's chain input to the summing bus. 0 for a project that
+ * declares no latency, so nothing built on this moves until something does.
+ *
+ * NOT the full mouth-to-ear figure. Two things are uncounted, both by design
+ * (`trackCompDelays` walks track and bus chains only):
+ *   - EVERYTHING DOWNSTREAM OF THE SUM — the master insert rack and the live
+ *     master FX. A compressor on the master lags its 6 ms too, but it lags every
+ *     track by the same amount and so needs no per-track comp; it is simply not
+ *     in this number.
+ *   - THE DEVICE ITSELF — `AudioContext.outputLatency` / `baseLatency`, the
+ *     driver and buffer round trip.
+ *
+ * The arithmetic, which is the whole reason this is ONE number and not a
+ * per-track table: audio entering track X's chain at node time `n` leaves the
+ * mixer at `n + latency(X) + comp(X)`, and `comp(X)` is `maxSec - latency(X)` by
+ * construction (`syncTrackLatency`, T09b) — so every track lands on `n + maxSec`.
+ * That is what the comps are for. Hence:
+ *
+ *   - AUTOMATION READS need no per-track offset. A native VOLUME breakpoint is
+ *     exact: `gain` is the chain input, so a value written at node time `n` lands
+ *     on the audio that entered at `n` and the two travel the `maxSec` together
+ *     (`scheduleAutomation` → `laneEnvelopeEvents` maps a breakpoint at timeline
+ *     `p.t` to the same node time the clip scheduler maps it to).
+ *     PAN and an in-chain FX param are a separate matter: `panner` sits AFTER
+ *     the inserts, and `applyFxAutomationFrame` writes into an effect that may
+ *     have other effects ahead of it, so each of those leads its audio by
+ *     whatever latency is upstream of it — a PER-PARAM offset that a single
+ *     output-wide number cannot carry and this one does not claim to. It is
+ *     pre-existing node placement, recorded as a follow-up, and unaffected by
+ *     anything here.
+ *   - THE RECORDER'S ANCHOR needs no offset either. A take captured at transport
+ *     `n` is heard at `n + maxSec` like every other source, so
+ *     `currentTransportSec()` stays un-shifted and placing a take at it is
+ *     already correct. (The INPUT round trip is a different number, and
+ *     `recordingEngine.takeClipPlacement` already carries it.)
+ *   - WHAT IS OFF is the timeline the user SEES against what is being HEARD:
+ *     with the transport at `t` the output is playing `t - maxSec`. The moving
+ *     line is a picture of the audible moment, so `publishPlayhead` subtracts
+ *     this; the transport position does not.
+ *   - METERS are already compensated: `levelsStore` taps `playerStore`'s
+ *     `getMeterTap()`, which is the end of the MASTER chain — post-sum and
+ *     therefore post-comp for every track. A future PER-TRACK meter would not
+ *     be, and must tap after `TrackNodes.comp` (noted there).
+ *
+ * Reads a cache, because `tick()` asks once per animation frame and
+ * `trackCompDelays` allocates a row per track. Render trim computes its own from
+ * `trackLatencyReport()` in `lib/renderCore` (T14), off the transport's clock.
+ */
+export function outputLatencySec(): number {
+  return outputLatency;
+}
+
+/**
+ * Recompute the cached offset and hand it back. Pass the rows when the caller
+ * has already computed them, so the alignment pass does not walk the chains
+ * twice.
+ *
+ * This sits AHEAD of `syncTrackLatency`'s `lastCompSig` gate, not behind it,
+ * because that signature is blind to this number: it is built from the COMP
+ * values, and a lone track whose chain goes from 0 to 6 ms keeps `compSec` at 0
+ * (it is its own meeting point) while `maxSec` moves 0 → 6 ms. Gating the
+ * refresh on the signature would leave the playhead uncompensated for exactly
+ * that project.
+ */
+export function refreshOutputLatency(rows?: readonly TrackCompRow[]): number {
+  outputLatency = maxLatencySec(rows ?? trackLatencyReport().perTrack);
+  return outputLatency;
 }
 
 /** Tear down every bus strip and send gain and empty both maps. Separate from
@@ -1845,6 +1971,42 @@ function stopClock(): void {
   rafId = 0;
 }
 
+/**
+ * Write the moving line for a transport position of `elapsedSec` in a pass that
+ * began at `fromSec`, and hand back what it wrote.
+ *
+ * This is the ONE place `playheadSec` moves during playback, and the only place
+ * the compensation offset is taken off the timeline: the line is a picture of
+ * what is AUDIBLE, and with the transport at `elapsedSec` the speakers are
+ * playing `elapsedSec - outputLatencySec()`. Everything that wants the transport
+ * POSITION — `currentTransportSec()` and the footer's `currentTime` beside this
+ * call — keeps the un-shifted number, for the reasons on `outputLatencySec`.
+ *
+ * The floor at `fromSec` is what keeps the press of Play from looking like a
+ * rewind: for the first `maxSec` of a pass the transport has not yet run the
+ * offset, and an unclamped cursor would sit BEHIND where playback started. The
+ * line simply holds there until the audio catches up with it, which is exactly
+ * what is true — nothing from this pass is audible yet.
+ *
+ * `playheadSec` is read for more than drawing, and those readers move with it
+ * deliberately. `WaveformEditor` anchors add-marker and insert-at-playhead on
+ * it, so a marker dropped while rolling now lands on the moment the user HEARD
+ * (up to `maxSec` earlier than before this) rather than on the moment the engine
+ * had already scheduled — which is the point. It also renders this beside the
+ * footer's transport timecode, so with a latent chain the two now differ by
+ * `maxSec`: one is where the ear is, the other is where the clock is, and both
+ * are honest.
+ *
+ * Exported because `tick()` cannot be driven headless (it needs a real
+ * AudioContext and a rAF); this is the statement the pin in
+ * `liveMixer.output.test.ts` exercises.
+ */
+export function publishPlayhead(elapsedSec: number, fromSec: number): number {
+  const cursor = Math.max(fromSec, elapsedSec - outputLatencySec());
+  useEditorStore.getState().setPlayhead(cursor);
+  return cursor;
+}
+
 /** rAF transport clock — advances the playhead off the AudioContext clock. */
 function tick(): void {
   if (!playing) return;
@@ -1872,8 +2034,10 @@ function tick(): void {
     return;
   }
 
-  // Playhead every frame (smooth line); footer time ~10 Hz is plenty.
-  useEditorStore.getState().setPlayhead(elapsed);
+  // Playhead every frame (smooth line); footer time ~10 Hz is plenty. The line
+  // is compensated (it shows the audible moment); the footer clock is the
+  // transport position, the same number `currentTransportSec()` reports.
+  publishPlayhead(elapsed, startOffsetSec);
   if (ctx.currentTime - lastTimePush > 0.1) {
     lastTimePush = ctx.currentTime;
     usePlayerStore.setState({ currentTime: elapsed });
@@ -1946,7 +2110,10 @@ async function start(fromSec: number): Promise<void> {
   buildBusNodes(ed.buses);
   wireRouting(ed.routing);
   resetRoutingSigs();
-  syncTrackLatency(); // now that the paths through the buses are known
+  // Now that the paths through the buses are known. This is also what refreshes
+  // `outputLatencySec()` for the pass about to start — the playhead reads it
+  // every frame and must not open on the previous project's number.
+  syncTrackLatency();
   startCtxTime = ctx.currentTime;
   startOffsetSec = begin;
   lastTimePush = 0;

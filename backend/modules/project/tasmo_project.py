@@ -125,6 +125,33 @@ class Track(BaseModel):
     send_amounts: dict[str, float] = {}
 
 
+class Bus(BaseModel):
+    """A mix bus: a summing point with its own insert rack, fader and mute.
+
+    A bus is NOT a ``Track`` with ``type="bus"``. A track carries clips, arm,
+    pan, solo and an order in the arrangement; a bus carries none of those, and
+    writing one as a track meant every loader had to filter the arrangement by
+    type and then invent the missing fields. The frontend's ``EditorBus`` is
+    this shape exactly (``state/editorStore.ts``).
+
+    Where the bus sits in the signal flow is ``output_routing`` — the id of the
+    bus it feeds, or ``None`` for the master — matching ``Track.output_routing``.
+    ``volume`` is a LINEAR fader multiplier (1.0 = unity), not dB like
+    ``Track.volume_db``, because the editor's bus strip is a 0..1 fader.
+
+    ``effect_chain`` is named to match ``Track`` and ``Clip`` rather than the
+    frontend's ``fxChain``: one .tasmo file should not spell the same list two
+    ways.
+    """
+
+    id: str
+    name: str
+    volume: float = 1.0
+    mute: bool = False
+    output_routing: str | None = None
+    effect_chain: list[EffectChainNode] = []
+
+
 class TasmoProject(BaseModel):
     """The complete .tasmo project model."""
 
@@ -141,6 +168,14 @@ class TasmoProject(BaseModel):
     time_signature: list[int] = [4, 4]
     sample_rate: int = 48000
     tracks: list[Track] = []
+    # Mix buses. Empty for a project that routes everything straight to the
+    # master, and absent entirely from files written before buses existed —
+    # which is why it is defaulted rather than required. Paired with
+    # `Track.output_routing` (the id of the bus a track feeds, or None for the
+    # master) and `Track.send_amounts` (bus id -> linear send gain): without the
+    # list, both of those could only ever name a bus that had nowhere to live,
+    # so a saved project reloaded with every edge collapsed onto the master.
+    buses: list[Bus] = []
     locators: list[Locator] = []
     automation: list[AutomationLane] = []
     generation_history: list[dict] = []

@@ -128,6 +128,34 @@ export interface TasmoTrackInput {
   color?: string | null;
   clips?: TasmoClipInput[];
   effect_chain?: EffectChainNode[];
+  /** Where this track's signal goes: the id of the bus it feeds, or `null` for
+   *  the master. Optional so a payload built before routing was written still
+   *  validates (the backend defaults it to None). */
+  output_routing?: string | null;
+  /** Bus id -> linear send gain. */
+  send_amounts?: Record<string, number>;
+}
+
+/**
+ * A mix bus. Mirrors `Bus` in backend/modules/project/tasmo_project.py and the
+ * frontend's `EditorBus`. `volume` is a LINEAR fader multiplier (1.0 = unity),
+ * NOT dB like a track's `volume_db`, and `effect_chain` is the same node shape a
+ * track's is. Its place in the flow is `output_routing`, exactly like a track's.
+ * The master is never a bus: it is the implied destination of a `null` output.
+ *
+ * Optionality here tracks the backend model EXACTLY, because this type is the
+ * save payload as well as the load result: `name` is required there, so a bus
+ * without one must not typecheck into a save that would 400, and `effect_chain`
+ * defaults to `[]` and rejects `null`, so the field is omittable but never
+ * nullable. Only `output_routing` is nullable, matching `str | None`.
+ */
+export interface TasmoBus {
+  id: string;
+  name: string;
+  volume?: number;
+  mute?: boolean;
+  output_routing?: string | null;
+  effect_chain?: EffectChainNode[];
 }
 
 export interface TasmoProjectInput {
@@ -137,6 +165,8 @@ export interface TasmoProjectInput {
   sample_rate?: number;
   author?: string;
   tracks?: TasmoTrackInput[];
+  /** The project's mix buses; omitted when it has none. */
+  buses?: TasmoBus[];
   source_daw?: string | null;
   import_warnings?: string[];
   /** Session-view scene names in row order; empty when there is no grid. */
@@ -204,6 +234,11 @@ export interface TasmoLoadedTrack {
   instrument_program?: number;
   clips: TasmoLoadedClip[];
   effect_chain?: EffectChainNode[];
+  /** The id of the bus this track feeds; `null`/absent = the master. Absent in
+   *  .tasmo files written before routing was persisted. */
+  output_routing?: string | null;
+  /** Bus id -> linear send gain; absent in those same older files. */
+  send_amounts?: Record<string, number>;
 }
 
 export interface TasmoProjectLoaded {
@@ -215,6 +250,8 @@ export interface TasmoProjectLoaded {
   source_daw?: string | null;
   source_daw_version?: string | null;
   tracks: TasmoLoadedTrack[];
+  /** The project's mix buses; absent in files written before buses existed. */
+  buses?: TasmoBus[];
   import_warnings?: string[];
   /** Session-view scene names in row order; empty when there is no grid. */
   scenes?: string[];

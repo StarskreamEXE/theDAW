@@ -13,8 +13,20 @@ import {
   useEditorStore,
   computePeaks,
   type AudioClip,
+  type EditorBus,
   type EditorTrack,
 } from '../state/editorStore';
+import {
+  addBus as graphAddBus,
+  addSend,
+  emptyGraph,
+  ensureTrackNode,
+  outputOf,
+  sendsFrom,
+  setOutput,
+  MASTER_ID,
+  type RoutingGraph,
+} from '../state/routingGraph';
 import type { PianoNote } from '../state/pianoRollStore';
 import { useAppUiStore } from '../state/appUiStore';
 import { renderNotesToBlob, type RenderNote } from './midiSynth';
@@ -26,6 +38,7 @@ import {
   type TasmoTrackInput,
   type TasmoClipInput,
   type EffectChainNode,
+  type TasmoBus,
   type TasmoControllerMappings,
   clipMeterToTasmo,
   pianoNoteToTasmo,
@@ -34,7 +47,7 @@ import {
 import { roundUpToBar } from './meterMap';
 import { getRackEffect, rackEffectDefaults } from './rackEffects';
 import { EFFECT_LABELS, type ChainEntry } from '../state/effectChainStore';
-import { logError, logInfo } from '../state/logStore';
+import { logError, logInfo, logWarn } from '../state/logStore';
 import { useSwayImportStore, startSwayImportDriver } from '../state/swayImportStore';
 import { usePerformRoutingStore } from '../state/performRouting';
 import { tasmoLoadedToDawProject } from './tasmoToSession';
@@ -285,6 +298,126 @@ const buildClip = async (
   };
 };
 
+// ── Routing + buses at the file boundary ─────────────────────────────────────
+//
+// `routing` is a graph (state/routingGraph.ts); the .tasmo format is flat, so
+// the two mappers below are the whole translation. A track/bus names ONE output
+// (`output_routing`, absent or null = the master) and any number of sends
+// (`send_amounts`, bus id -> linear gain), which is exactly `outputOf` +
+// `sendsFrom`. Mirrors `Track` / `Bus` in backend/modules/project/tasmo_project.py.
+//
+// The reader NEVER throws. A file is not a mutator-vetted graph: it can be
+// hand-edited into a loop, or name a bus that isn't there. Both are LOGGED and
+// SKIPPED, and the node keeps the output edge `ensureTrackNode`/`addBus` gave it
+// — the master. A project that opens one edge short is worth infinitely more
+// than a project that refuses to open.
+
+/** The largest send gain a file may set: +6 dB, the ceiling the send UI offers. */
+const SEND_GAIN_MAX = 2;
+
+/** A track's routing as the file carries it. */
+export interface TasmoRoutedTrack {
+  id: string;
+  name?: string;
+  /** The id of the bus this feeds; `null`/absent = the master. */
+  output_routing?: string | null;
+  /** Bus id -> linear send gain. */
+  send_amounts?: Record<string, number> | null;
+}
+
+/** One node's routing in the file shape. The master is written as `null`, never
+ *  as a node id — `MASTER_ID` is this app's name for it, not part of the format. */
+export function trackRoutingToTasmo(
+  graph: RoutingGraph,
+  nodeId: string,
+): { output_routing: string | null; send_amounts: Record<string, number> } {
+  const out = outputOf(graph, nodeId);
+  const sendAmounts: Record<string, number> = {};
+  for (const e of sendsFrom(graph, nodeId)) sendAmounts[e.to] = e.gain;
+  return { output_routing: out === null || out === MASTER_ID ? null : out, send_amounts: sendAmounts };
+}
+
+/**
+ * The bus strips in the file shape. Driven by the STRIP list, not the graph's
+ * nodes: the master is a node but never a bus, and a node with no strip behind
+ * it is document damage that must not be persisted as a phantom bus.
+ *
+ * LIMITATION, deliberate: a bus persists its `output_routing` and nothing else
+ * about its place in the graph. Sends LEAVING a bus, and sidechain edges of any
+ * kind, are NOT written — the format has no field for either, and no UI creates
+ * either today. The autosave manifest carries the whole `RoutingGraph` verbatim,
+ * so nothing a user can currently build is lost across a crash; it is only the
+ * `.tasmo` that is lossy, and only for edges that cannot yet exist. Adding
+ * `send_amounts` to the backend `Bus` is the change to make when bus sends get
+ * a UI — not before, so the format does not grow a field nothing writes.
+ */
+export function busesToTasmo(graph: RoutingGraph, buses: readonly EditorBus[]): TasmoBus[] {
+  return buses.map((b) => ({
+    id: b.id,
+    name: b.name,
+    volume: b.volume,
+    mute: b.mute,
+    output_routing: trackRoutingToTasmo(graph, b.id).output_routing,
+    effect_chain: (b.fxChain ?? []).map(chainEntryToEffectNode),
+  }));
+}
+
+/**
+ * Rebuild `routing` + the bus strips from a loaded file, in the one order that
+ * makes the mutators' guards meaningful: every track node, then every bus node
+ * (so an output can name either), then the outputs, then the sends (a send into
+ * a bus that an output already reaches is the case `wouldCycle` must see).
+ */
+export function tasmoToRouting(
+  tracks: readonly TasmoRoutedTrack[],
+  buses: readonly TasmoBus[] | undefined,
+): { routing: RoutingGraph; buses: EditorBus[] } {
+  const trackList = (tracks ?? []).filter((t) => t && t.id);
+  const busList = (buses ?? []).filter((b) => b && b.id);
+  let g = emptyGraph();
+  for (const t of trackList) g = ensureTrackNode(g, t.id, t.name || t.id);
+  for (const b of busList) g = graphAddBus(g, b.id, b.name || b.id);
+
+  for (const n of [...trackList, ...busList]) {
+    const to = n.output_routing;
+    if (!to || to === MASTER_ID) continue;
+    const r = setOutput(g, n.id, to);
+    if (r.ok) g = r.graph;
+    else logWarn('project', `Routing: output "${n.id}" -> "${to}" refused (${r.reason}); left feeding the master`);
+  }
+
+  for (const t of trackList) {
+    for (const [to, gain] of Object.entries(t.send_amounts ?? {})) {
+      if (typeof gain !== 'number' || !Number.isFinite(gain)) {
+        logWarn('project', `Routing: send "${t.id}" -> "${to}" has a non-numeric gain; dropped`);
+        continue;
+      }
+      // Clamped, not merely finite: a hand-edited 1e9 is a valid float and would
+      // reach the mixer as a gain that blows the graph's headroom apart. SEND_GAIN_MAX
+      // is +6 dB, the same ceiling the send UI offers.
+      const clamped = Math.max(0, Math.min(SEND_GAIN_MAX, gain));
+      if (clamped !== gain) {
+        logWarn('project', `Routing: send "${t.id}" -> "${to}" gain ${gain} clamped to ${clamped}`);
+      }
+      const r = addSend(g, t.id, to, clamped);
+      if (r.ok) g = r.graph;
+      else logWarn('project', `Routing: send "${t.id}" -> "${to}" refused (${r.reason}); dropped`);
+    }
+  }
+
+  const strips: EditorBus[] = busList.map((b) => ({
+    id: b.id,
+    name: b.name || b.id,
+    fxChain: (b.effect_chain ?? []).map(effectNodeToChainEntry),
+    // A missing or corrupt value takes the BACKEND's default (`Bus.volume = 1.0`,
+    // unity), not the store's default for a NEW bus (0.8) — a hand-written file
+    // must load to the same fader on both sides of the wire.
+    volume: typeof b.volume === 'number' && Number.isFinite(b.volume) ? b.volume : 1,
+    mute: !!b.mute,
+  }));
+  return { routing: g, buses: strips };
+}
+
 /**
  * Load a project into the EDIT timeline (replacing the current session), switch
  * to the EDIT tab, and return a summary. Throws only on a catastrophic failure;
@@ -300,12 +433,22 @@ export async function loadProjectIntoEditor(
   let effects = 0;
   let effectsLive = 0;
   let gridClips = 0;
+  // The routing half of each track, collected against the id the timeline
+  // actually gets (a file may carry a track with no id, which is uid()'d below)
+  // so the rebuilt graph names the same nodes the store does.
+  const routedTracks: TasmoRoutedTrack[] = [];
 
   for (let i = 0; i < project.tracks.length; i += 1) {
     const t: TasmoLoadedTrack = project.tracks[i];
     const trackId = t.id || uid('t');
     const color = t.color || TRACK_COLORS[i % TRACK_COLORS.length];
     const fxChain = (t.effect_chain ?? []).map(effectNodeToChainEntry);
+    routedTracks.push({
+      id: trackId,
+      name: t.name || `Track ${i + 1}`,
+      output_routing: t.output_routing,
+      send_amounts: t.send_amounts,
+    });
     effects += t.effect_chain?.length ?? 0;
     effectsLive += liveFxCount(t.effect_chain);
     outTracks.push({
@@ -341,7 +484,11 @@ export async function loadProjectIntoEditor(
     }
   }
 
-  useEditorStore.getState().loadProject({ tracks: outTracks, clips: outClips, bpm });
+  // routing/buses go through loadProject's payload rather than a setState, so a
+  // file written before they existed takes the ONE migration path there (see
+  // `migrateRouting`), exactly like a pre-routing autosave manifest.
+  const { routing, buses } = tasmoToRouting(routedTracks, project.buses);
+  useEditorStore.getState().loadProject({ tracks: outTracks, clips: outClips, bpm, routing, buses });
 
   // Restore persisted controller (Sway) auto-attach bindings so a re-opened
   // session re-wires the hardware to the same track/FX targets. Track ids are
@@ -417,6 +564,8 @@ export interface CapturedSession {
   bpm: number;
   clipCount: number;
   controllerMappings?: TasmoControllerMappings;
+  /** The project's mix buses. The master is never one of them. */
+  buses: TasmoBus[];
 }
 
 /** Snapshot the live Sway auto-attach bindings for persistence into a .tasmo,
@@ -482,6 +631,10 @@ export function captureEditorSession(): CapturedSession {
       color: t.color,
       clips,
       effect_chain: (t.fxChain ?? []).map(chainEntryToEffectNode),
+      // Where this track's signal goes. Without these two keys the file said
+      // nothing about routing at all, so a saved session reopened with every
+      // track collapsed onto the master and every send gone.
+      ...trackRoutingToTasmo(editor.routing, t.id),
     };
   });
 
@@ -491,5 +644,6 @@ export function captureEditorSession(): CapturedSession {
     bpm: editor.bpm,
     clipCount,
     controllerMappings: captureControllerMappings(),
+    buses: busesToTasmo(editor.routing, editor.buses),
   };
 }

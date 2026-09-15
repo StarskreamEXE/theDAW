@@ -12,6 +12,8 @@ import { dawImportAudioUrl } from '../../lib/dawImportClient';
 import { SurfacePlayKey } from '../ui/SurfacePlayKey';
 import type { DawClip, DawProject, DawTrack } from '../../lib/dawImportClient';
 import { performScenes, performSceneCount, performTracks } from '../../lib/performModel';
+import { beatClock, type ClockGrid } from '../../lib/beatClock';
+import { createLaunchQueue, launchSlotId, type LaunchAction, type LaunchTicket } from '../../lib/launchQueue';
 import { getEngineCtx, getMasterGain } from '../../state/playerStore';
 import { renderNotesToBlob, type RenderNote } from '../../lib/midiSynth';
 import { subscribeToMidi } from '../../state/midiBus';
@@ -93,6 +95,58 @@ const CLIP_COLORS = [
 
 const clipKey = (trackIndex: number, sceneIndex: number) => `${trackIndex}:${sceneIndex}`;
 
+/* --- Launch quantization on the shared clock --------------------------------
+   The grid used to quantize against its own `sessionStartRef`: a seconds-based
+   anchor taken on the first launch, invisible to LOOM / the colony / the DJ
+   pads, re-taken whenever the grid ran out of players (so a full stop moved the
+   downbeat), and bars-only because it multiplied `time_signature[0] * 60/bpm`
+   by hand. Launches now go through `launchQueue` over `beatClock`, which is the
+   same bar/beat grid every other surface already launches against. */
+
+/** How often the queue is pumped. Comfortably inside `LAUNCH_LEAD_SEC`. */
+const LAUNCH_TICK_MS = 15;
+/**
+ * How far ahead of its grid line a ticket is handed back, so the fire path has
+ * time to build the graph and call `source.start(at)` BEFORE `at` arrives.
+ * `beatClock`'s own `CLOCK_LEAD_SEC` (10 ms) is the margin for a time computed
+ * and used in the same turn; a launch is pumped by a JS timer, so the lead has
+ * to cover a tick plus its jitter instead.
+ */
+const LAUNCH_LEAD_SEC = 0.05;
+
+/** The quantization choices the toolbar offers, in grid order. */
+const LAUNCH_GRIDS: ReadonlyArray<{ value: ClockGrid; label: string }> = [
+  { value: 'now', label: 'Off' },
+  { value: 'beat', label: '1 Beat' },
+  { value: 'bar', label: '1 Bar' },
+  { value: '2bar', label: '2 Bars' },
+  { value: '4bar', label: '4 Bars' },
+];
+
+const isLaunchGrid = (value: string): value is ClockGrid =>
+  LAUNCH_GRIDS.some((g) => g.value === value);
+
+/** A clip resolved for launch, as `sceneClips` yields it. */
+interface SceneEntry {
+  clip: DawClip;
+  track: DawTrack;
+  trackIndex: number;
+  mixIndex: number;
+}
+
+/** What a queued ticket needs at fire time, kept beside the queue by slot id. */
+interface PendingLaunch {
+  mixIndex: number;
+  /** The row that was pressed — what the queued ring is drawn on. */
+  sceneIndex: number;
+  /** null for a stop (an empty slot, or a column the launched scene leaves out). */
+  entry: SceneEntry | null;
+  /** Scene launches own `activeScene`; a single-cell launch never touches it. */
+  origin: 'clip' | 'scene';
+  /** Bumped per press, so a decode that lands after a newer press is dropped. */
+  gen: number;
+}
+
 /** Clip colour comes from Live's palette when the parser decoded one; the
  *  position-derived CLIP_COLORS entry is only a fallback now. Colour is how a
  *  performer navigates a grid at speed, so a set should look like itself. */
@@ -159,6 +213,27 @@ const stopSessionPlayers = (players: SessionPlayer[]) => {
     // column's output to the master bus for the rest of the session.
     player.gain?.disconnect();
     player.panner?.disconnect();
+  });
+};
+
+/**
+ * Stop these players AT `at` instead of now, so a column hands over on its grid
+ * line: the outgoing clip's last sample and the incoming clip's first sample
+ * share an instant. Stopping immediately and starting at the next bar (what the
+ * old scene launch did) left a silent hole the length of the quantization.
+ *
+ * Teardown waits for `onended`, which a scheduled stop always fires — including
+ * on a looping source, which otherwise never ends on its own.
+ */
+const scheduleStopPlayers = (players: SessionPlayer[], at: number) => {
+  players.forEach((player) => {
+    player.source.onended = () => {
+      try { player.source.disconnect(); } catch { /* already disconnected */ }
+      // NOT the analyser — it belongs to the column's persistent FX chain.
+      player.gain?.disconnect();
+      player.panner?.disconnect();
+    };
+    try { player.source.stop(at); } catch { /* already stopped */ }
   });
 };
 
@@ -262,8 +337,11 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
    *  scalar activeScene could not represent Live's core move — holding a
    *  bassline while changing drums — so per-clip launch needs this. */
   const [trackScenes, setTrackScenes] = React.useState<Record<number, number>>({});
-  /** Launch quantization in bars; 0 = launch immediately. */
-  const [quantizeBars, setQuantizeBars] = React.useState(1);
+  /** Which grid line a launch lands on. `'now'` = the next pump. */
+  const [launchGrid, setLaunchGrid] = React.useState<ClockGrid>('bar');
+  /** Column -> the row whose press is waiting for its grid line. One entry per
+   *  column, because one column holds one intent. Drives the queued ring. */
+  const [queuedSlots, setQueuedSlots] = React.useState<Record<number, number>>({});
   const [selectedScene, setSelectedScene] = React.useState(0);
   const [launchError, setLaunchError] = React.useState<string | null>(null);
   const [lastAction, setLastAction] = React.useState<string | null>(null);
@@ -272,6 +350,9 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
   const [elapsedSeconds, setElapsedSeconds] = React.useState(0);
   const playersRef = React.useRef<SessionPlayer[]>([]);
   const bufferCacheRef = React.useRef<ClipBufferCache>(new Map());
+  /** Decoded buffers by cache key. The fire path has to be synchronous to hit
+   *  `at`, so it reads a resolved buffer here rather than awaiting a promise. */
+  const bufferReadyRef = React.useRef<Map<string, AudioBuffer>>(new Map());
   const launchTokenRef = React.useRef(0);
   const animationRef = React.useRef<number | null>(null);
   const startedAtRef = React.useRef<number | null>(null);
@@ -283,6 +364,51 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
   // Note-driven ccMods with `latch: true` that are currently toggled ON,
   // keyed by mod id. Session-only state, cleared when the mod disappears.
   const latchedRef = React.useRef<Set<string>>(new Set());
+
+  /* --- The launch queue ----------------------------------------------------
+     The queue owns nothing but intent; `at` always comes from `beatClock`, so
+     a PERFORM downbeat and a LOOM downbeat are the same instant. */
+  const launchQueue = React.useMemo(
+    () => createLaunchQueue({
+      nextGrid: (grid, from) => beatClock.nextGrid(grid, from),
+      now: () => getEngineCtx().currentTime,
+      lead: LAUNCH_LEAD_SEC,
+    }),
+    [],
+  );
+  /** Fire-time payload per slot id, replaced in lockstep with the queue. */
+  const pendingRef = React.useRef<Map<string, PendingLaunch>>(new Map());
+  /** The newest press generation per column, so a late decode can tell it lost. */
+  const columnGenRef = React.useRef<Map<number, number>>(new Map());
+  const genRef = React.useRef(0);
+  const pumpTimerRef = React.useRef<number | null>(null);
+  const pumpRef = React.useRef<() => void>(() => {});
+
+  /**
+   * Hand the set's tempo and meter to the shared clock, so "next bar" here
+   * means the bar the SET is in and not 120 bpm 4/4.
+   *
+   * Claimed on the first launch, not on mount: PERFORM's grid mounts as soon as
+   * a project is imported, and retuning the one clock at that moment would
+   * silently move LOOM's grid and shard durations under a user who has not
+   * pressed anything here yet. A press is the point at which this surface is
+   * the one making sound.
+   *
+   * The meter goes in as a MAP, not as `setBeatsPerBar`: that shorthand builds
+   * n/4, so a 7/8 set would come back as 7/4 (or, rounded through quarter
+   * notes, as 4/4) and every bar line would be wrong. A beat is a quarter note
+   * in the clock whatever the meter, which is why a 7/8 bar is 3.5 beats.
+   */
+  const meterNum = project.time_signature?.[0] ?? 4;
+  const meterDen = project.time_signature?.[1] ?? 4;
+  const clockClaimRef = React.useRef<string | null>(null);
+  const claimClock = React.useCallback(() => {
+    const key = `${project.tempo || 120}:${meterNum}/${meterDen}`;
+    if (clockClaimRef.current === key) return;
+    clockClaimRef.current = key;
+    beatClock.setBpm(project.tempo || 120, 'perform');
+    beatClock.setMeterMap([{ bar: 0, meter: { num: meterNum, den: meterDen, groups: [] } }]);
+  }, [project.tempo, meterNum, meterDen]);
 
   // The worklet-backed rack stages (chop, Ares grains, the Kargyraa Sub
   // octave divider) degrade to passthrough/silence when their module is not
@@ -326,6 +452,23 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
     setMasterLevel(0);
     setTrackLevels(Array.from({ length: tracks.length }, () => 0));
   }, [tracks.length]);
+
+  /** The queue only needs pumping while something is waiting in it, so an idle
+   *  grid costs no timer at all. `setInterval`, not rAF: in a hidden tab rAF is
+   *  parked outright, so a queued launch would never fire, while a background
+   *  interval is only clamped (to about 1 s) — late, not never. */
+  const stopPump = React.useCallback(() => {
+    if (pumpTimerRef.current != null) window.clearInterval(pumpTimerRef.current);
+    pumpTimerRef.current = null;
+  }, []);
+
+  const ensurePump = React.useCallback(() => {
+    if (pumpTimerRef.current == null) {
+      pumpTimerRef.current = window.setInterval(() => pumpRef.current(), LAUNCH_TICK_MS);
+    }
+  }, []);
+
+  React.useEffect(() => stopPump, [stopPump]);
 
   /* --- Per-track FX chains -------------------------------------------------
      Perform playback used to be completely dry: `grep device` over this file
@@ -411,55 +554,40 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
     return () => registerPerformChainPush(null);
   }, [ensureTrackChain]);
 
+  /** Stopping the transport is the one unquantized command: it clears every
+   *  pending intent so nothing fires into the silence afterwards. */
   const stopScene = React.useCallback(() => {
+    launchQueue.clear();
+    pendingRef.current.clear();
+    // Dropping every column's generation is what stops a clip that was still
+    // decoding when the transport stopped from starting itself afterwards.
+    columnGenRef.current.clear();
+    stopPump();
+    setQueuedSlots({});
     stopSessionPlayers(playersRef.current);
     playersRef.current = [];
     setActiveScene(null);
     setTrackScenes({});
     stopMeters();
-  }, [stopMeters]);
+  }, [launchQueue, stopMeters, stopPump]);
 
-  /* --- Launch quantization -------------------------------------------------
-     Everything used to start at `context.currentTime + 0.01`, so launching
-     against something already playing landed permanently off the grid. A
-     session clock is set on the first launch; later launches snap to the next
-     bar line relative to it, which is what makes layering usable. The toolbar's
-     quantization control feeds `quantizeBars` ('off' = launch immediately). */
-  const sessionStartRef = React.useRef<number | null>(null);
-  const nextLaunchTime = React.useCallback(
-    (context: AudioContext): number => {
-      const now = context.currentTime + 0.01;
-      if (quantizeBars <= 0) return now;
-      const beatSec = 60 / Math.max(20, project.tempo || 120);
-      const barSec = beatSec * (project.time_signature?.[0] || 4) * quantizeBars;
-      if (sessionStartRef.current == null || playersRef.current.length === 0) {
-        sessionStartRef.current = now;
-        return now;
-      }
-      const elapsed = now - sessionStartRef.current;
-      const bars = Math.ceil(elapsed / barSec);
-      return sessionStartRef.current + bars * barSec;
+  /** Queue one column's next intent, replacing whatever it was waiting on. */
+  const queueLaunch = React.useCallback(
+    (req: { mixIndex: number; sceneIndex: number; entry: SceneEntry | null; origin: 'clip' | 'scene' }) => {
+      // The first press is what makes this surface the clock's owner.
+      claimClock();
+      const action: LaunchAction = req.entry ? 'play' : 'stop';
+      const slotId = launchSlotId(req.mixIndex);
+      genRef.current += 1;
+      const gen = genRef.current;
+      columnGenRef.current.set(req.mixIndex, gen);
+      pendingRef.current.set(slotId, { ...req, gen });
+      launchQueue.queue(slotId, { grid: launchGrid, action });
+      setQueuedSlots((prev) => ({ ...prev, [req.mixIndex]: req.sceneIndex }));
+      ensurePump();
     },
-    [project.tempo, project.time_signature, quantizeBars],
+    [claimClock, ensurePump, launchGrid, launchQueue],
   );
-
-  /** Stop just one column, leaving everything else playing. Live puts this on
-   *  the track's stop button and on every empty clip slot. */
-  const stopTrack = React.useCallback((mixIndex: number) => {
-    const [stay, go] = playersRef.current.reduce<[SessionPlayer[], SessionPlayer[]]>(
-      (acc, p) => { acc[p.mixIndex === mixIndex ? 1 : 0].push(p); return acc; },
-      [[], []],
-    );
-    if (go.length === 0) return;
-    stopSessionPlayers(go);
-    playersRef.current = stay;
-    setTrackScenes((prev) => {
-      const next = { ...prev };
-      delete next[mixIndex];
-      return next;
-    });
-    if (stay.length === 0) setActiveScene(null);
-  }, []);
 
   React.useEffect(() => stopScene, [stopScene]);
 
@@ -493,7 +621,12 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
       return context.decodeAudioData(await rendered.blob.arrayBuffer());
     })();
     bufferCacheRef.current.set(key, task);
-    task.catch(() => bufferCacheRef.current.delete(key));
+    // Mirror the resolved buffer into a plain map: the launch fire path runs on
+    // a timer tick and cannot await, so it needs the buffer synchronously.
+    task.then(
+      (buffer) => { bufferReadyRef.current.set(key, buffer); },
+      () => { bufferCacheRef.current.delete(key); },
+    );
     return task;
   }, []);
 
@@ -554,68 +687,60 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
     animationRef.current = window.requestAnimationFrame(tickMeters);
   }, [tracks.length]);
 
+  /** Launch a whole row: every clip in it, plus a stop for every column the row
+   *  leaves empty, all queued on the SAME grid line. The old body stopped
+   *  everything immediately and then started at the next bar, so quantized
+   *  scene changes left a silent hole the length of the quantization. */
   const launchScene = React.useCallback(
     async (sceneIndex: number) => {
       const launchToken = launchTokenRef.current + 1;
       launchTokenRef.current = launchToken;
-      stopScene();
       setLaunchError(null);
       const clips = sceneClips(sceneIndex);
+      const context = getEngineCtx();
+      // Resuming must happen before the grid line is computed — a suspended
+      // context's `currentTime` does not move, so `nextGrid` would read a stale
+      // now and the whole scene would land in the past.
+      if (context.state === 'suspended') await context.resume();
       if (clips.length === 0) {
+        // An empty row still IS a launch in Live: it stops everything. On the
+        // grid like any other launch, not the instant the button goes down.
+        for (const player of playersRef.current) {
+          queueLaunch({ mixIndex: player.mixIndex, sceneIndex, entry: null, origin: 'scene' });
+        }
         setActiveScene(sceneIndex);
         return;
       }
-      const context = getEngineCtx();
-      if (context.state === 'suspended') await context.resume();
-      // Decode each clip independently: one bad/missing clip must not stop the
-      // rest of the scene from playing. Play what decoded, and log the specific
-      // reason for each that failed so the cause is visible in the log.
-      const results = await Promise.all(
-        clips.map(async ({ clip, track, trackIndex, mixIndex }) => {
-          try {
-            return { ok: true as const, buffer: await getClipBuffer(clip), clip, track, trackIndex, mixIndex };
-          } catch (e) {
-            return { ok: false as const, clip, reason: e instanceof Error ? e.message : String(e) };
-          }
-        }),
-      );
-      if (launchTokenRef.current !== launchToken) return;
-      const decoded = results.filter(
-        (r): r is { ok: true; buffer: AudioBuffer; clip: DawClip; track: DawTrack; trackIndex: number; mixIndex: number } => r.ok,
-      );
-      const failedClips = results.filter((r): r is { ok: false; clip: DawClip; reason: string } => !r.ok);
-      for (const f of failedClips) {
-        logError('perform', `Clip "${f.clip.name}" could not play: ${f.reason}`);
+      const launching = new Set(clips.map((c) => c.mixIndex));
+      // Plays first: a stop queued behind them sees the incoming players and so
+      // never mistakes the handover for "the session is empty now".
+      for (const entry of clips) {
+        void getClipBuffer(entry.clip).catch(() => { /* reported below */ });
+        queueLaunch({ mixIndex: entry.mixIndex, sceneIndex, entry, origin: 'scene' });
       }
-      const failed = failedClips.length;
-      const startAt = nextLaunchTime(context);
-      const anySolo = tracks.some((t, i) => (trackStateRef.current[i] ?? { solo: !!t.solo }).solo);
-      const nextPlayers = decoded.map(({ buffer, clip, track, trackIndex, mixIndex }) =>
-        startClipPlayer(context, {
-          buffer,
-          clip,
-          track: displayTrack(track, mixIndex),
-          trackIndex,
-          mixIndex,
-          sceneIndex,
-          startAt,
-          projectTempo: project.tempo || 120,
-          mix: mixRef.current.get(mixIndex),
-          destination: ensureTrackChain(mixIndex, track).input,
-          analyser: ensureTrackChain(mixIndex, track).analyser,
-          anySolo,
-        }),
-      );
-      playersRef.current = nextPlayers;
-      setActiveScene(sceneIndex);
-      setTrackScenes(Object.fromEntries(nextPlayers.map((p) => [p.mixIndex, sceneIndex])));
-      startedAtRef.current = performance.now();
-      if (animationRef.current == null) animationRef.current = window.requestAnimationFrame(tickMeters);
-      setLaunchError(
-        failed > 0 ? `${failed} of ${results.length} clip(s) could not be played.` : null,
-      );
+      for (const player of playersRef.current) {
+        if (!launching.has(player.mixIndex)) {
+          queueLaunch({ mixIndex: player.mixIndex, sceneIndex, entry: null, origin: 'scene' });
+        }
+      }
+      // Decoding does not block the launch any more, so the banner is settled
+      // separately. One bad clip must not stop the rest of the scene playing;
+      // each failure is still logged with its own reason.
+      const outcomes = await Promise.allSettled(clips.map((c) => getClipBuffer(c.clip)));
+      if (launchTokenRef.current !== launchToken) return;
+      let failed = 0;
+      outcomes.forEach((outcome, i) => {
+        if (outcome.status !== 'rejected') return;
+        failed += 1;
+        const reason = outcome.reason;
+        logError(
+          'perform',
+          `Clip "${clips[i].clip.name}" could not play: ${reason instanceof Error ? reason.message : String(reason)}`,
+        );
+      });
+      setLaunchError(failed > 0 ? `${failed} of ${outcomes.length} clip(s) could not be played.` : null);
     },
-    [getClipBuffer, sceneClips, stopScene, tickMeters, tracks, project.tempo, nextLaunchTime],
+    [getClipBuffer, queueLaunch, sceneClips],
   );
 
   /** Launch ONE cell, leaving every other column playing — Live's core move.
@@ -623,47 +748,21 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
    *  row, so there was no way to hold a bassline while changing drums. */
   const launchClip = React.useCallback(
     async (mixIndex: number, sceneIndex: number) => {
-      const entry = sceneClips(sceneIndex).find((c) => c.mixIndex === mixIndex);
-      if (!entry) {
-        // An empty slot IS a command in Live: it stops that track.
-        stopTrack(mixIndex);
-        return;
-      }
       const context = getEngineCtx();
       if (context.state === 'suspended') await context.resume();
-      let buffer: AudioBuffer;
-      try {
-        buffer = await getClipBuffer(entry.clip);
-      } catch (e) {
-        logError('perform', `Clip "${entry.clip.name}" could not play: ${e instanceof Error ? e.message : String(e)}`);
-        setLaunchError(`"${entry.clip.name}" could not be played.`);
-        return;
+      // An empty slot IS a command in Live: it stops that track, on the grid.
+      const entry = sceneClips(sceneIndex).find((c) => c.mixIndex === mixIndex) ?? null;
+      if (entry) {
+        setLaunchError(null);
+        // Start decoding on the press so the buffer is ready by the grid line.
+        void getClipBuffer(entry.clip).catch((e) => {
+          logError('perform', `Clip "${entry.clip.name}" could not play: ${e instanceof Error ? e.message : String(e)}`);
+          setLaunchError(`"${entry.clip.name}" could not be played.`);
+        });
       }
-      // Replace only this column's players.
-      const stay = playersRef.current.filter((p) => p.mixIndex !== mixIndex);
-      const go = playersRef.current.filter((p) => p.mixIndex === mixIndex);
-      stopSessionPlayers(go);
-      const player = startClipPlayer(context, {
-        buffer,
-        clip: entry.clip,
-        track: displayTrack(entry.track, mixIndex),
-        trackIndex: entry.trackIndex,
-        mixIndex,
-        sceneIndex,
-        startAt: nextLaunchTime(context),
-        projectTempo: project.tempo || 120,
-        mix: mixRef.current.get(mixIndex),
-        destination: ensureTrackChain(mixIndex, entry.track).input,
-        analyser: ensureTrackChain(mixIndex, entry.track).analyser,
-        anySolo: tracks.some((t, i) => (trackStateRef.current[i] ?? { solo: !!t.solo }).solo),
-      });
-      playersRef.current = [...stay, player];
-      setTrackScenes((prev) => ({ ...prev, [mixIndex]: sceneIndex }));
-      setLaunchError(null);
-      startedAtRef.current ??= performance.now();
-      if (animationRef.current == null) animationRef.current = window.requestAnimationFrame(tickMeters);
+      queueLaunch({ mixIndex, sceneIndex, entry, origin: 'clip' });
     },
-    [getClipBuffer, nextLaunchTime, project.tempo, sceneClips, stopTrack, tickMeters, tracks],
+    [getClipBuffer, queueLaunch, sceneClips],
   );
 
   // --- Live modulation from the Sway dims ------------------------------------
@@ -738,6 +837,96 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
     },
     [trackStateVersion],
   );
+
+  /* --- Firing a queued launch ----------------------------------------------
+     Runs on the pump tick, `lead` seconds ahead of the ticket's grid line, so
+     everything below schedules AT `ticket.at` rather than "now". */
+  const fireTicket = React.useCallback(
+    (ticket: LaunchTicket, context: AudioContext) => {
+      const pending = pendingRef.current.get(ticket.slotId);
+      pendingRef.current.delete(ticket.slotId);
+      if (!pending) return;
+      const { mixIndex, sceneIndex, entry, origin, gen } = pending;
+      setQueuedSlots((prev) => {
+        if (!(mixIndex in prev)) return prev;
+        const next = { ...prev };
+        delete next[mixIndex];
+        return next;
+      });
+
+      // Hand the column over on the line: the outgoing clip stops at exactly
+      // the instant the incoming one starts.
+      const stay = playersRef.current.filter((p) => p.mixIndex !== mixIndex);
+      const go = playersRef.current.filter((p) => p.mixIndex === mixIndex);
+      playersRef.current = stay;
+      if (go.length > 0) scheduleStopPlayers(go, ticket.at);
+
+      if (ticket.action === 'stop' || !entry) {
+        setTrackScenes((prev) => {
+          const next = { ...prev };
+          delete next[mixIndex];
+          return next;
+        });
+        // A SCENE's stop does not clear the active row: the launch that queued
+        // it already named the row, and the other columns of the same launch
+        // may not have fired yet. Only a single-cell stop can empty the grid.
+        if (origin === 'clip' && stay.length === 0) setActiveScene(null);
+        return;
+      }
+
+      const start = (buffer: AudioBuffer, startAt: number) => {
+        const player = startClipPlayer(context, {
+          buffer,
+          clip: entry.clip,
+          track: displayTrack(entry.track, mixIndex),
+          trackIndex: entry.trackIndex,
+          mixIndex,
+          sceneIndex,
+          startAt,
+          projectTempo: project.tempo || 120,
+          mix: mixRef.current.get(mixIndex),
+          destination: ensureTrackChain(mixIndex, entry.track).input,
+          analyser: ensureTrackChain(mixIndex, entry.track).analyser,
+          anySolo: tracksRef.current.some(
+            (t, i) => (trackStateRef.current[i] ?? { solo: !!t.solo }).solo,
+          ),
+        });
+        playersRef.current = [...playersRef.current, player];
+        setTrackScenes((prev) => ({ ...prev, [mixIndex]: sceneIndex }));
+        if (origin === 'scene') setActiveScene(sceneIndex);
+        startedAtRef.current ??= performance.now();
+        if (animationRef.current == null) animationRef.current = window.requestAnimationFrame(tickMeters);
+      };
+
+      const ready = bufferReadyRef.current.get(clipCacheKey(entry.clip));
+      if (ready) {
+        start(ready, Math.max(ticket.at, context.currentTime));
+        return;
+      }
+      // Pressed before the warm-up reached this cell: start it the moment it
+      // decodes, which is as close to the line as the decode allows. A newer
+      // press on the same column wins, so a slow clip never jumps the queue.
+      void getClipBuffer(entry.clip)
+        .then((buffer) => {
+          if (columnGenRef.current.get(mixIndex) !== gen) return;
+          const ctx = getEngineCtx();
+          start(buffer, Math.max(ticket.at, ctx.currentTime));
+        })
+        .catch(() => { /* logged by the press that queued it */ });
+    },
+    [displayTrack, ensureTrackChain, getClipBuffer, project.tempo, tickMeters],
+  );
+
+  // The pump: take everything due and fire it, then stand down once the queue
+  // is empty. Kept in a ref so the interval never has to be torn down and
+  // rebuilt as the callbacks above re-create.
+  React.useEffect(() => {
+    pumpRef.current = () => {
+      const context = getEngineCtx();
+      for (const ticket of launchQueue.advance(context.currentTime)) fireTicket(ticket, context);
+      if (launchQueue.pending().length === 0) stopPump();
+    };
+  }, [fireTicket, launchQueue, stopPump]);
 
   // Direct CC routes (auto-created from the set's own MIDI-learn mappings, or
   // assigned on the Sway deck). Ref'd so the single MIDI subscription below can
@@ -1022,23 +1211,22 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
           {/* Real time signature from the set, not a hardcoded "4 / 4". */}
           {`${project.time_signature?.[0] ?? 4} / ${project.time_signature?.[1] ?? 4}`}
         </div>
-        {/* Launch quantization is a real control now — it used to be the literal
-            text "1 Bar" while every launch fired immediately, so layering against
-            something already playing landed permanently off the grid. */}
-        <label htmlFor="perform-quantize" className="sr-only">Launch quantization</label>
+        {/* Launch quantization is a grid on the shared clock now, not a bar
+            count multiplied out by hand — so "next bar" means the same instant
+            here as it does in LOOM, and sub-bar lines exist at all. */}
+        <label htmlFor="session-quantize" className="sr-only">Launch quantization</label>
         <select
-          id="perform-quantize"
-          name="perform-quantize"
-          value={quantizeBars}
-          onChange={(e) => setQuantizeBars(Number(e.target.value))}
-          title="Launch quantization — clips start on the next bar line so layered launches stay in time"
+          id="session-quantize"
+          name="sessionQuantize"
+          value={launchGrid}
+          onChange={(e) => { if (isLaunchGrid(e.target.value)) setLaunchGrid(e.target.value); }}
+          title="Launch quantization — a press waits for the next line of this grid on the shared clock, so layered launches stay in time"
           className="h-6 px-2 border border-black/50 bg-[#15171b] text-zinc-300 text-[10px] font-bold outline-none cursor-pointer"
           style={{ colorScheme: 'dark' }}
         >
-          <option value={0}>Off</option>
-          <option value={1}>1 Bar</option>
-          <option value={2}>2 Bars</option>
-          <option value={4}>4 Bars</option>
+          {LAUNCH_GRIDS.map((g) => (
+            <option key={g.value} value={g.value}>{g.label}</option>
+          ))}
         </select>
         <div className="h-6 px-2 grid place-items-center border border-black/50 bg-[#15171b] text-zinc-300">
           {project.tempo.toFixed(2)}
@@ -1112,31 +1300,47 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
                     <span className="truncate text-[10px] font-bold">{String(sceneIndex + 1).padStart(2, '0')} {sceneName}</span>
                   </div>
                 </button>
-                {tracks.map((track, fallbackTrackIndex) => {
-                  const trackIndex = track.clips.find((clip) => clip.track_index != null)?.track_index ?? fallbackTrackIndex;
+                {tracks.map((track, mixIndex) => {
+                  // TWO index spaces meet here. `trackIndex` is the clip's
+                  // column in the SOURCE DAW and is only ever a lookup key;
+                  // `mixIndex` is this column's position in the mixer and is
+                  // the one every piece of launch state is keyed by, because
+                  // that is what `sceneClips` and the launch queue use. Mixing
+                  // them gave one column two slot ids on sets where they
+                  // diverge, and replace-not-stack stopped holding across the
+                  // scene and cell launch paths.
+                  const trackIndex = track.clips.find((clip) => clip.track_index != null)?.track_index ?? mixIndex;
                   const clip = clipLookup.get(clipKey(trackIndex, sceneIndex));
                   const color = CLIP_COLORS[sceneIndex % CLIP_COLORS.length];
+                  // Pressed, waiting for its grid line. The ring is on the cell
+                  // that was pressed, so the row a queued stop came from is
+                  // visible too.
+                  const isQueued = queuedSlots[mixIndex] === sceneIndex;
+                  const queuedRing = isQueued
+                    ? 'ring-2 ring-inset ring-white animate-pulse motion-reduce:animate-none'
+                    : '';
                   return (
                     <div
                       key={`${trackIndex}-${sceneIndex}`}
                       className={[
                         'border-r-2 border-b border-black/70 min-h-7 bg-[#30343b]',
-                        trackScenes[trackIndex] === sceneIndex ? 'ring-1 ring-inset ring-emerald-200' : '',
-                      ].join(' ')}
+                        trackScenes[mixIndex] === sceneIndex ? 'ring-1 ring-inset ring-emerald-200' : '',
+                      ].filter(Boolean).join(' ')}
                     >
                       {clip ? (
                         <button
                           type="button"
-                          onClick={() => void launchClip(trackIndex, sceneIndex)}
+                          onClick={() => void launchClip(mixIndex, sceneIndex)}
                           disabled={!isPlayableClip(clip)}
-                          aria-label={`Launch ${clip.name} on ${track.name}`}
+                          aria-label={isQueued ? `${clip.name} queued on ${track.name}` : `Launch ${clip.name} on ${track.name}`}
                           className={[
                             'h-7 w-full px-1.5 flex items-center gap-1 border text-left',
                             clipStyle(clip, color.clip),
+                            queuedRing,
                             !isPlayableClip(clip) ? 'opacity-45 cursor-not-allowed' : 'hover:brightness-110',
-                          ].join(' ')}
+                          ].filter(Boolean).join(' ')}
                           style={clip.color ? { backgroundColor: clip.color, borderColor: clip.color } : undefined}
-                          title={clipTitle(clip)}
+                          title={isQueued ? `${clip.name} — queued for the next launch line` : clipTitle(clip)}
                         >
                           <Play className="h-3 w-3 fill-current shrink-0" />
                           <span className="min-w-0 truncate text-[10px] font-bold">{clip.name}</span>
@@ -1145,10 +1349,13 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
                         /* An empty slot is a STOP button in Live, not dead space. */
                         <button
                           type="button"
-                          onClick={() => stopTrack(trackIndex)}
-                          aria-label={`Stop ${track.name}`}
-                          title={`Stop ${track.name}`}
-                          className="h-7 w-full bg-[#262a31] border border-black/20 flex items-center justify-center text-zinc-700 hover:text-zinc-200 hover:bg-[#2f343c]"
+                          onClick={() => void launchClip(mixIndex, sceneIndex)}
+                          aria-label={isQueued ? `Stop ${track.name} queued` : `Stop ${track.name}`}
+                          title={isQueued ? `Stop ${track.name} — queued for the next launch line` : `Stop ${track.name}`}
+                          className={[
+                            'h-7 w-full bg-[#262a31] border border-black/20 flex items-center justify-center text-zinc-700 hover:text-zinc-200 hover:bg-[#2f343c]',
+                            queuedRing,
+                          ].filter(Boolean).join(' ')}
                         >
                           <Square className="h-2.5 w-2.5 fill-current" />
                         </button>
