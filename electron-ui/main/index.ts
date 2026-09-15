@@ -463,11 +463,7 @@ function spawnBackend(): void {
       const text = raw.replace(/\r$/, '')
       if (!text) continue
       log(`[backend:stderr] ${text}`)
-      if (text.includes('WARNING') || text.includes('ERROR') || text.includes('Error')) {
-        sendLoadingLog(text, 'err')
-      } else {
-        sendLoadingLog(text, '')
-      }
+      sendLoadingLog(text, stderrLineClass(text))
     }
   })
 
@@ -721,6 +717,20 @@ function escapeForJS(s: string): string {
     .replace(/'/g, "\\'")
     .replace(/\n/g, '\\n')
     .replace(/\r/g, '\\r')
+}
+
+/** The LOG panel class for one backend stderr line. A Python logging line
+ *  opens with its level ("WARNING root: ...", uvicorn's "INFO:     ..."), and
+ *  that level decides: WARNING shows as a warning, ERROR and CRITICAL count as
+ *  errors, DEBUG and INFO as plain lines. A line with no level (a traceback
+ *  frame, a library print) counts as an error when it names one. */
+function stderrLineClass(text: string): string {
+  const level = /^(DEBUG|INFO|WARNING|ERROR|CRITICAL)\b/.exec(text)?.[1]
+  if (level === 'WARNING') return 'warn'
+  if (level === 'ERROR' || level === 'CRITICAL') return 'err'
+  if (level) return ''
+  if (text.includes('ERROR') || text.includes('Error')) return 'err'
+  return text.includes('WARNING') ? 'warn' : ''
 }
 
 function sendLoadingLog(msg: string, cls?: string): void {

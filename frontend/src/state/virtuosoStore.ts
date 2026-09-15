@@ -123,7 +123,12 @@ export const useVirtuosoStore = create<VirtuosoState>()(
         );
       };
 
-      const rebuildSongNow = (): void => {
+      /**
+       * Build the song from the source into the roll. A new song clears the
+       * roll's bend points; a rebuild of the song the roll already holds
+       * (`keepBends`) keeps the curves drawn over it.
+       */
+      const rebuildSongNow = (keepBends = false): void => {
         const s = get();
         if (!s.source || !s.source.length) return;
         const roll = usePianoRollStore.getState();
@@ -142,14 +147,14 @@ export const useVirtuosoStore = create<VirtuosoState>()(
         });
         _songMap = normalizeMeterMap(song.meterMap);
         _songOwned = sectionMeterBars(s.sections);
-        roll.importNotes(song.notes, roll.bpm, { meterMap: song.meterMap });
+        roll.importNotes(song.notes, roll.bpm, { meterMap: song.meterMap }, keepBends ? roll.bends : undefined);
       };
 
       const scheduleSongRebuild = (): void => {
         if (_rebuildTimer !== null) window.clearTimeout(_rebuildTimer);
         _rebuildTimer = window.setTimeout(() => {
           _rebuildTimer = null;
-          rebuildSongNow();
+          rebuildSongNow(true);
         }, 140);
       };
 

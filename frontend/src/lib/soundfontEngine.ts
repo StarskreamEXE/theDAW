@@ -15,7 +15,8 @@ import { WorkletSynthesizer, audioBufferToWav } from 'spessasynth_lib';
 import { BasicMIDI } from 'spessasynth_core';
 import processorUrl from 'spessasynth_lib/dist/spessasynth_processor.min.js?url';
 import { getEngineCtx, getMasterGain } from '../state/playerStore';
-import { notesToSmf } from './midiWrite';
+import { RANGE_LSB_SPESSA, bendRangeMessages } from './midi';
+import { notesToSmf, type SmfWheel } from './midiWrite';
 import type { RenderNote } from './midiSynth';
 
 /** Bundled default General MIDI soundfont, served from frontend/public. */
@@ -128,8 +129,26 @@ export async function ensureSoundfontReady(): Promise<boolean> {
   }
 }
 
-/** Preview a single note live through the soundfont. Failure-safe (no throw). */
-export async function previewNoteSF(midi: number, velocity: number, durationSec: number): Promise<void> {
+/**
+ * Switch a channel to `program` when it plays another one, and remember it, so
+ * every caller on that channel (a preview, the roll, EDIT's live MIDI) knows
+ * what the channel plays and switches it back when it needs its own.
+ */
+function setChannelProgram(synth: WorkletSynthesizer, ch: number, program: number): void {
+  const p = Math.max(0, Math.min(127, Math.round(program)));
+  if (channelProgram.get(ch) === p) return;
+  synth.programChange(ch, p);
+  channelProgram.set(ch, p);
+}
+
+/**
+ * Play a single note live through the soundfont on `channel` (0 unless the
+ * caller keeps a channel of its own), at audio-context time `when` (now when
+ * left out or already past) for `durationSec`. The note-on and note-off are
+ * timed on the synth, so a note lands with the wheel messages sent for the same
+ * time. Failure-safe (no throw).
+ */
+export async function previewNoteSF(midi: number, velocity: number, durationSec: number, channel = 0, when?: number): Promise<void> {
   try {
     const ctx = getEngineCtx();
     if (ctx.state === 'suspended') {
@@ -140,16 +159,13 @@ export async function previewNoteSF(midi: number, velocity: number, durationSec:
       }
     }
     const synth = await getLiveSynth();
-    synth.programChange(0, getActiveProgram());
+    const ch = channel & 0x0f;
+    setChannelProgram(synth, ch, getActiveProgram());
     const note = Math.round(midi);
-    synth.noteOn(0, note, Math.max(1, Math.min(127, Math.round(velocity))));
-    window.setTimeout(() => {
-      try {
-        synth.noteOff(0, note);
-      } catch {
-        /* ignore */
-      }
-    }, Math.max(40, durationSec * 1000));
+    // A time that passed while the synth loaded plays now, and the note keeps its length.
+    const start = Math.max(when ?? 0, ctx.currentTime);
+    synth.noteOn(ch, note, Math.max(1, Math.min(127, Math.round(velocity))), { time: start });
+    synth.noteOff(ch, note, { time: start + Math.max(0.04, durationSec) });
   } catch {
     /* swallow: the caller decides whether to fall back to the sawtooth */
   }
@@ -184,11 +200,11 @@ async function renderMidiToBlob(
 /** Render absolute-seconds notes to a WAV blob through the soundfont. */
 export async function renderNotesToBlobSF(
   notes: RenderNote[],
-  opts: { sampleRate?: number; tailSec?: number; program?: number } = {},
+  opts: { sampleRate?: number; tailSec?: number; program?: number; wheel?: SmfWheel[] } = {},
 ): Promise<{ blob: Blob; duration: number }> {
   // Honor an explicit program when the caller knows the clip's instrument; only
-  // fall back to the global picker when it doesn't.
-  const smf = notesToSmf(notes, opts.program ?? getActiveProgram());
+  // fall back to the global picker when it doesn't. Pitch wheels ride in the same file.
+  const smf = notesToSmf(notes, opts.program ?? getActiveProgram(), 0, [], 120, opts.wheel ?? []);
   return renderMidiToBlob(smf.buffer as ArrayBuffer, opts.sampleRate ?? 44100, opts.tailSec ?? 0.6);
 }
 
@@ -268,10 +284,7 @@ export function liveNoteOn(channel: number, program: number, midi: number, veloc
     return;
   }
   const ch = channel & 0x0f;
-  if (channelProgram.get(ch) !== program) {
-    s.programChange(ch, Math.max(0, Math.min(127, Math.round(program))));
-    channelProgram.set(ch, program);
-  }
+  setChannelProgram(s, ch, program);
   s.noteOn(ch, Math.round(midi), Math.max(1, Math.min(127, Math.round(velocity))));
 }
 
@@ -281,6 +294,37 @@ export function liveNoteOff(channel: number, midi: number): void {
   if (!s) return;
   try {
     s.noteOff(channel & 0x0f, Math.round(midi));
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Move a channel's pitch wheel on the live synth: raw 0-16383, 8192 the centre,
+ * at audio-context time `time` (now when absent). No-op until the synth is ready.
+ */
+export function sfPitchWheel(channel: number, raw: number, time?: number): void {
+  const s = liveSynth;
+  if (!s) return;
+  try {
+    s.pitchWheel(channel & 0x0f, Math.max(0, Math.min(16383, Math.round(raw))), time !== undefined ? { time } : undefined);
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Set a channel's pitch bend range on the live synth at `time` (now when
+ * absent): the RPN 0/0 messages of lib/midi bendRangeMessages, each at that
+ * time, with CC 38 in the 1/128 semitones SpessaSynth reads it as. No-op until
+ * the synth is ready.
+ */
+export function sfPitchWheelRange(channel: number, semitones: number, time?: number): void {
+  const s = liveSynth;
+  if (!s) return;
+  try {
+    const options = time !== undefined ? { time } : undefined;
+    for (const bytes of bendRangeMessages(channel, Math.max(0, semitones), RANGE_LSB_SPESSA)) s.sendMessage(bytes, 0, options);
   } catch {
     /* ignore */
   }

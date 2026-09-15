@@ -41,6 +41,13 @@ export interface SlidePadProps {
   style?: React.CSSProperties;
   /** Pad outline shape (default rounded; square/rect/circle/diagonal tris). */
   shape?: ButtonShape;
+  /** The pad's accessible name, for a pad whose visible text is a state word
+   *  (On / Off) that does not say what it switches. */
+  ariaLabel?: string;
+  /** Id of a visible legend that names the pad; wins over ariaLabel. */
+  ariaLabelledBy?: string;
+  /** Font-size utility for the legend. Defaults to the 9px DJ pad legend. */
+  textSize?: string;
   onClick?: (e: React.MouseEvent) => void;
   onContextMenu?: (e: React.MouseEvent) => void;
   onPointerDown?: (e: React.PointerEvent) => void;
@@ -50,6 +57,7 @@ export interface SlidePadProps {
 
 export function SlidePad({
   children, on, color, disabled, danger, title, className, style, shape,
+  ariaLabel, ariaLabelledBy, textSize = 'text-[9px]',
   onClick, onContextMenu, onPointerDown, onPointerUp, onPointerLeave,
 }: SlidePadProps) {
   const c = danger ? DANGER : (color ?? PURPLE);
@@ -67,6 +75,8 @@ export function SlidePad({
       disabled={disabled}
       title={title}
       aria-pressed={on}
+      aria-label={ariaLabelledBy ? undefined : ariaLabel}
+      aria-labelledby={ariaLabelledBy}
       onClick={onClick}
       onContextMenu={onContextMenu}
       onPointerDown={onPointerDown}
@@ -74,7 +84,7 @@ export function SlidePad({
       onPointerLeave={onPointerLeave}
       className={[
         'flex items-center justify-center gap-1 rounded-md border select-none',
-        'text-[9px] font-bold uppercase tracking-wider leading-none px-2 py-1.5',
+        `${textSize} font-bold uppercase tracking-wider leading-none px-2 py-1.5`,
         'transition-colors disabled:opacity-30 disabled:cursor-not-allowed',
         on ? '' : 'border-white/12 bg-black/40 text-zinc-400 hover:text-zinc-200 hover:border-white/25',
         className ?? '',

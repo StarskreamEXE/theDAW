@@ -3,10 +3,11 @@
 // (.tasmo JSON), reload, open in the roll again. projectImport.ts does not load
 // under node, so the save and the reload replay its projectClient mappers.
 import assert from 'node:assert/strict';
-import { clipRollLoad, playedRollNotes, rollClipFields, type RollClipInput, type RollLoadArgs } from './rollClip.ts';
+import { clipRenderInput, clipRollLoad, playedRollNotes, rollClipFields, type RollClipInput, type RollLoadArgs } from './rollClip.ts';
 import { clipMeterToTasmo, pianoNoteToTasmo, tasmoMeterToClip, tasmoNotesToPiano, type TasmoStepNote } from './projectClient.ts';
 import { rollMeterOf, usePianoRollStore, type PianoNote } from '../state/pianoRollStore.ts';
-import type { MeterSegment } from './meterMap.ts';
+import { unrollLanes, type MeterSegment } from './meterMap.ts';
+import { copyBends, type LaneBend } from './pitchBend.ts';
 
 const st = () => usePianoRollStore.getState();
 const M78: MeterSegment[] = [{ bar: 0, meter: { num: 7, den: 8, groups: [3, 2, 2] } }];
@@ -16,8 +17,16 @@ const BPM = 96;
 /** The pickup (4 steps) and four bars of 7/8 (14 steps each). */
 const TOTAL = 60;
 const withoutIds = (notes: readonly PianoNote[] = []) => notes.map(({ id: _id, ...n }) => n);
+/** Bends with their point ids left out: the file stores none, so reloaded points get new ones. */
+const withoutPointIds = (bends: readonly LaneBend[] = []) =>
+  bends.map((b) => ({ ...b, points: b.points.map(({ id: _id, ...p }) => p) }));
+/** Lane A ramps up and holds; lane B, which loops, eases down then ramps at a range of 12. */
+const BENDS: LaneBend[] = [
+  { lane: 0, range: 2, points: [{ id: 'bA0', step: 0, value: 0, shape: 'linear' }, { id: 'bA1', step: 6, value: 1, shape: 'hold' }] },
+  { lane: 1, range: 12, points: [{ id: 'bB0', step: 3, value: -0.5, shape: 'smooth' }, { id: 'bB1', step: 9, value: 0.5, shape: 'linear' }] },
+];
 
-// 1. The roll: 7/8 3+2+2, a pickup of 4, lane B looping every 12 steps, notes in both lanes.
+// 1. The roll: 7/8 3+2+2, a pickup of 4, lane B looping every 12 steps, notes and a pitch bend in both lanes.
 st().setBpm(BPM);
 st().setMeterMap(M78);
 st().setPickupSteps(4);
@@ -30,8 +39,10 @@ st().replaceAll([
   { id: 'b1', note: 38, step: 8, length: 2, velocity: 80, lane: 1 },
 ]);
 st().setTotalSteps(TOTAL);
+st().setBends(BENDS);
 
-const original = { meter: rollMeterOf(st()), notes: st().notes.map((n) => ({ ...n })) };
+const original = { meter: rollMeterOf(st()), notes: st().notes.map((n) => ({ ...n })), bends: copyBends(st().bends) };
+assert.deepEqual(original.bends, BENDS);
 assert.deepEqual(original.meter.meterMap, M78);
 assert.equal(original.meter.pickupSteps, 4);
 assert.deepEqual(original.meter.lanes, [...LANE_A, { id: 1, name: 'B', cycleSteps: 12 }]);
@@ -41,12 +52,13 @@ assert.equal(played.length, 2 + 2 * 5);
 
 /** loadFromClip's arguments carry the original roll. */
 const assertLoad = (args: RollLoadArgs, clipId: string) => {
-  const [id, notes, bpm, total, meter] = args;
+  const [id, notes, bpm, total, meter, bends] = args;
   assert.equal(id, clipId);
   assert.equal(bpm, BPM);
   assert.equal(total, TOTAL);
   assert.deepEqual(meter, original.meter);
   assert.deepEqual(withoutIds(notes), withoutIds(original.notes));
+  assert.deepEqual(withoutPointIds(bends), withoutPointIds(original.bends));
 };
 
 /** The roll holds the original, and its notes unroll once. */
@@ -54,6 +66,7 @@ const assertRoll = (clipId: string) => {
   assert.equal(st().editingClipId, clipId);
   assert.deepEqual(rollMeterOf(st()), original.meter);
   assert.deepEqual(withoutIds(st().notes), withoutIds(original.notes));
+  assert.deepEqual(withoutPointIds(st().bends), withoutPointIds(original.bends));
   assert.equal(st().totalSteps, TOTAL);
   assert.equal(st().bpm, BPM);
   const again = rollClipFields(st());
@@ -69,6 +82,8 @@ assert.deepEqual(fields.sourceLanes, original.meter.lanes);
 assert.deepEqual(fields.sourceRollNotes, original.notes);
 assert.equal(fields.sourceBpm, BPM);
 assert.equal(fields.sourceTotalSteps, TOTAL);
+assert.deepEqual(fields.sourceBends, original.bends);
+assert.notEqual(fields.sourceBends, st().bends);
 // EDIT plays the unrolled notes, with no lane left to loop.
 assert.deepEqual(fields.sourcePianoRoll, played);
 assert.equal(fields.sourcePianoRoll.some((n) => 'lane' in n), false);
@@ -82,13 +97,27 @@ const clip: RollClipInput = { id: 'clip-1', ...fields };
 const firstLoad = clipRollLoad(clip);
 assertLoad(firstLoad, 'clip-1');
 assert.deepEqual(firstLoad[1], original.notes);
+assert.deepEqual(firstLoad[5], original.bends);
 
-// 4. The roll has moved on to another clip in 4/4 when the user opens this one.
+// The clip's audio renders each note in its lane, so each lane's bend is in the bounce and in a re-render.
+{
+  const input = clipRenderInput(clip, TOTAL);
+  assert.deepEqual(input.notes, unrollLanes(original.notes, original.meter.lanes, TOTAL));
+  assert.deepEqual([...(input.bends?.played.keys() ?? [])], [0, 1]);
+  assert.deepEqual([...(input.bends?.channels ?? [])], [[0, 0], [1, 1]]);
+  // A clip with no bend renders the notes it plays.
+  assert.deepEqual(clipRenderInput({ ...clip, sourceBends: [] }, TOTAL), { notes: clip.sourcePianoRoll });
+}
+
+// 4. The roll has moved on to another clip in 4/4 when the user opens this one. It has lane A only,
+// and the load brings no bends, so every point goes: lane B's with its lane, lane A's with the notes
+// (lane A's range is the default, so nothing is left).
 st().loadFromClip('other', [{ id: 'x', note: 60, step: 0, length: 1, velocity: 90 }], 120, 16, {
   meterMap: M44,
   pickupSteps: 0,
   lanes: LANE_A,
 });
+assert.deepEqual(st().bends, []);
 st().loadFromClip(...firstLoad);
 assertRoll('clip-1');
 // A second bounce writes the same clip.
@@ -101,6 +130,7 @@ const saved: { midi_notes: TasmoStepNote[] } & ReturnType<typeof clipMeterToTasm
 assert.equal(saved.midi_notes.length, played.length);
 assert.equal(saved.midi_notes.some((n) => 'lane' in n), false);
 assert.deepEqual(saved.roll_notes?.map((n) => n.lane), [undefined, undefined, 1, 1]);
+assert.deepEqual(saved.roll_bends?.map((b) => [b.lane, b.range, b.points.length]), [[0, 2, 2], [1, 12, 2]]);
 
 // 6. Reload: buildClip takes the project tempo and the mapped fields.
 const reloaded: RollClipInput = {
@@ -138,7 +168,10 @@ assertRoll('clip-1');
   assert.deepEqual(meter, { meterMap: M44, pickupSteps: 0, lanes: LANE_A });
   // 20 steps rounds up to the end of the second 4/4 bar.
   assert.equal(total, 32);
+  // A clip bounced before the roll had pitch bend loads unbent.
+  assert.deepEqual(args[5], []);
   st().loadFromClip(...args);
+  assert.deepEqual(st().bends, []);
   assert.deepEqual(rollMeterOf(st()), meter);
   assert.equal(st().totalSteps, 32);
   // With no grid length either, the notes' end rounds up to a bar; with no notes, one bar.

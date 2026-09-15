@@ -8,9 +8,13 @@ DB rows / status transitions that happen when all engines are missing.
 
 from __future__ import annotations
 
+import importlib.metadata
 from pathlib import Path
 
+import pytest
+
 from backend.modules.midi.engine import (
+    _module_version,
     convert_to_midi,
     engine_capabilities,
     hint_for_stem,
@@ -58,6 +62,20 @@ def test_convert_to_midi_missing_input(tmp_path: Path):
     result = convert_to_midi(tmp_path / "nope.wav", tmp_path / "nope.mid")
     assert result["ok"] is False
     assert "audio not found" in result["error"]
+
+
+def test_module_version_reads_the_distribution_metadata():
+    """basic-pitch defines no ``__version__``; the MIDI row still records the
+    installed release."""
+    try:
+        expected = importlib.metadata.version("basic-pitch")
+    except importlib.metadata.PackageNotFoundError:
+        pytest.skip("basic-pitch is not installed")
+    assert _module_version("basic_pitch") == expected
+
+
+def test_module_version_of_a_missing_engine_is_unknown():
+    assert _module_version("no_such_midi_engine") == "unknown"
 
 
 def test_convert_entry_records_failures_when_no_engine(tmp_path: Path):

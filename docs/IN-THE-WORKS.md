@@ -231,6 +231,64 @@ driven in the live app yet; items stay here until that happens.
 
 ---
 
+## P1 — from the user, 2026-09-14 (marked done only when the user says so)
+
+Queued behind the sixteen branches waiting for review; the user asked for these
+before the merge to `gantasmo/main`. Three of them land on code that one of those
+branches rewrites, noted per item.
+
+- [ ] **No emoji on the action keys: CREATE, PROCESS, PROCESS STACK and the
+  rest.** A repo-wide scan of `frontend/src` and `electron-ui` for characters in
+  U+1F000–U+1FAFF finds emoji in only two places: `SlidePanel.tsx:195` (the
+  slot lock, `🔒` / `🔓`) and the bundled Underfit dashboard the UNDERFIT tab
+  embeds (`🥜`, `📖`, `💪`, `⭐`, `📂` in
+  `electron-ui/release/win-unpacked/resources/python/underfit/dashboard/index.html`).
+  Nothing emoji-bearing sits on the footer's action key
+  (`components/layout/ProcessingLog.tsx:335-530`, the glyphs are SVG paths in
+  `components/audio/transportGlyphs.tsx`). So the first step is to find what the
+  user is looking at in the running app — most likely the Underfit dashboard's
+  own buttons, since the UNDERFIT tab is the one workspace theDAW does not
+  draw. Then strip them. — S — `components/layout/SlidePanel.tsx:195`,
+  the Underfit dashboard's `index.html`
+- [ ] **No emoji on Discard.** Three Discard controls:
+  `components/audio/MicRecorder.tsx:360` (a `Trash2` icon plus the word),
+  `components/layout/AutosaveRecoveryNotice.tsx:64`,
+  `components/layout/sing/LyricsEditor.tsx:67`. None carries an emoji in the
+  current tree; check the running app and strip whatever is there. — XS
+- [ ] **No emoji on the bottom panel tab titles.** The ten tabs are built from
+  one table — Levels, Visualize, MIDI, Sequence, DRAW, Score, Sing, Lyric,
+  Details, SLIDE — each with a lucide icon, no emoji in the source. Same as
+  above: find what is on screen, then strip. — XS —
+  `components/layout/BottomMultiTabPanel.tsx:50-60`
+- [ ] **EDIT: FX and TOOLS are one kind of dropdown, and FX opens under its
+  button.** TOOLS is a button that opens the shared `ContextMenu` anchored at
+  `{ x: rect.left, y: rect.bottom + 4 }` — under itself
+  (`components/audio/WaveformEditor.tsx:3876-3889`, menu at `:4142-4160`). FX is
+  a clip-header button that opens the track FX rack through `openFxRack` /
+  `fxRackAnchor` (`components/audio/WaveformEditor.tsx:4720-4730`), a different
+  surface that lands to the left. Give FX the TOOLS treatment: the same trigger
+  form, the same `ContextMenu`, opening under the button. **Touches
+  `edit-lane-fx-midi-crash`**, which moves the rack onto `lib/popoverPlacement.ts`
+  and the open rack into `state/trackFxRackStore.ts` — do this after that branch
+  merges, on top of it. — S
+- [ ] **Icon-only controls with the word in a tooltip: IMPORT, Recent audio,
+  Play, Pause, All.** Each keeps its icon, drops its visible word, and names
+  itself in a hover tooltip and in `aria-label`. — S —
+  `components/layout/ImportMenu.tsx` (the IMPORT button and its Recent sibling,
+  `:274`), `components/audio/WaveformEditor.tsx:4556-4570` (the editor's Recent
+  audio and Recent MIDI menus), `components/ui/KnownFilesMenu.tsx` (the `label`
+  prop every Recent trigger renders), `components/audio/PlayerFooter.tsx` (the
+  transport), `views/MixView.tsx:618` (All). **Touches `midi-dock-readable` and
+  `footer-create-key`**, which already take the dock and the footer to
+  glyph-plus-DockTip; follow the same `DockTip` pattern rather than a second
+  tooltip mechanism.
+- [ ] **"Up Next" reads "Next".** The footer's right-hand block.
+  — XS — `components/audio/PlayerFooter.tsx:868`
+- [ ] **"COMMIT EDIT" reads "MIXDOWN".** The button and its busy caption
+  ("COMMITTING…" → "MIXING DOWN…"), and the orb tip that names it. — XS —
+  `components/audio/WaveformEditor.tsx:3959`,
+  `components/audio/OrbTipBubble.tsx:49`
+
 ## P1 — from the user, 2026-09-13 (marked done only when the user says so)
 
 - [ ] **METER MAP in DETAILS: draw the map.** The block shows the engine's

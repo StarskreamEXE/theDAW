@@ -1,5 +1,17 @@
 import { create } from 'zustand';
 import { normalizeMeterMap, roundUpToBar, type MeterSegment, type PolyLane } from '../lib/meterMap';
+import {
+  DEFAULT_BEND_RANGE,
+  MAX_BENT_LANES,
+  bentLanes,
+  capBentLanes,
+  clampBendRange,
+  sanitizeBendPoints,
+  sanitizeBends,
+  type BendPoint,
+  type BendPointInput,
+  type LaneBend,
+} from '../lib/pitchBend';
 
 export interface PianoNote {
   id: string;
@@ -45,6 +57,13 @@ interface PianoRollState {
   lanes: PolyLane[];
   /** The lane new notes go into. */
   activeLane: number;
+  /**
+   * Pitch bend by lane (lib/pitchBend): each lane's points and range, sorted by
+   * lane. A lane with no points and the default range has no entry. A bend
+   * moves with its lane and keeps its steps through meter and length changes,
+   * as notes do. At most MAX_BENT_LANES lanes have points.
+   */
+  bends: LaneBend[];
 
   setBpm: (bpm: number) => void;
   setTotalSteps: (s: number) => void;
@@ -58,11 +77,24 @@ interface PianoRollState {
   replaceAll: (notes: PianoNote[]) => void;
   clear: () => void;
   setEditingClip: (id: string | null) => void;
-  /** Load an editor clip. A `meter` field left out keeps the roll's current value. */
-  loadFromClip: (clipId: string, notes: PianoNote[], bpm: number, totalSteps: number, meter?: Partial<RollMeter>) => void;
+  /** Load an editor clip. A `meter` field left out keeps the roll's current value.
+   *  `bends` replaces every lane's bend (a lane the roll ends without is dropped, and
+   *  lanes past MAX_BENT_LANES lose their points); left out, every lane's points are
+   *  cleared and its range stays, as CLEAR does, since the notes they bent are gone. */
+  loadFromClip: (
+    clipId: string,
+    notes: PianoNote[],
+    bpm: number,
+    totalSteps: number,
+    meter?: Partial<RollMeter>,
+    bends?: readonly LaneBend[],
+  ) => void;
   /** Replace the grid with imported notes, auto-fitting length (to a bar line) AND
-   *  pitch range to the content. A `meter` field left out keeps the roll's current value. */
-  importNotes: (notes: PianoNote[], bpm?: number, meter?: Partial<RollMeter>) => void;
+   *  pitch range to the content. A `meter` field left out keeps the roll's current value.
+   *  `bends` replaces every lane's bend (a lane the roll ends without is dropped, and
+   *  lanes past MAX_BENT_LANES lose their points); left out, every lane's points are
+   *  cleared and its range stays, as CLEAR does, since the notes they bent are gone. */
+  importNotes: (notes: PianoNote[], bpm?: number, meter?: Partial<RollMeter>, bends?: readonly LaneBend[]) => void;
   /** Place a live recording WITHOUT shrinking the grid (keeps at least the 256
    *  default, rounded up to a bar), expanding the pitch range to fit, and marks the recorded span. */
   placeRecording: (notes: PianoNote[], range: { startStep: number; endStep: number }) => void;
@@ -74,11 +106,31 @@ interface PianoRollState {
   addLane: (cycleSteps?: number | null) => number;
   /** Set a lane's loop length; lane 0 never loops. */
   setLaneCycle: (id: number, cycleSteps: number | null) => void;
-  /** Remove a lane; its notes move to lane 0. Lane 0 cannot be removed. */
+  /** Remove a lane; its notes move to lane 0, and its bend too when lane 0 has no points. Lane 0 cannot be removed. */
   removeLane: (id: number) => void;
+  /** Replace every lane's bend. A bend for a lane the roll does not have is dropped, and lanes past MAX_BENT_LANES lose their points. */
+  setBends: (bends: readonly LaneBend[]) => void;
+  /** Replace one lane's points (sorted, one per step, values clamped to -1..1). A lane without points takes none while MAX_BENT_LANES lanes bend. */
+  setBendPoints: (lane: number, points: readonly BendPointInput[]) => void;
+  /**
+   * Add a point to a lane's curve, replacing a point at the same step. Returns the
+   * new point's id, or null when the roll has no such lane, or when the lane has no
+   * points while MAX_BENT_LANES lanes already bend (a MIDI file and the live synth
+   * have no channel left for it).
+   */
+  addBendPoint: (lane: number, point: Omit<BendPointInput, 'id'>) => string | null;
+  /** Move, re-value or re-shape a point. Landing on another point's step replaces that point. */
+  moveBendPoint: (lane: number, id: string, patch: Partial<Omit<BendPoint, 'id'>>) => void;
+  removeBendPoint: (lane: number, id: string) => void;
+  /** Remove a lane's points, or every lane's when `lane` is left out. Ranges stay. */
+  clearBend: (lane?: number) => void;
+  /** Set a lane's bend range in semitones (0-48, to the cent). */
+  setBendRange: (lane: number, semitones: number) => void;
   /** Write any of the meter map, pickup and lanes, then round the roll's length
    *  up to a bar line. `merge` false keeps a change that repeats the meter before
-   *  it (the METER face's ADD). setMeterMap and setPickupSteps go through here. */
+   *  it (the METER face's ADD). setMeterMap and setPickupSteps go through here.
+   *  Lanes given take the bends of lanes that go with them, and a lane that
+   *  arrives starts unbent (MATCH, and the METER face's ADD LANE). */
   applyMeter: (meter: Partial<RollMeter>, merge?: boolean) => void;
 }
 
@@ -132,6 +184,58 @@ const mergeMeter = (s: Pick<PianoRollState, 'meterMap' | 'pickupSteps' | 'lanes'
   };
 };
 
+const hasLane = (lanes: readonly PolyLane[], id: number): boolean => lanes.some((l) => l.id === id);
+
+/** `bends` with only the lanes in `lanes`. */
+const bendsForLanes = (bends: readonly LaneBend[], lanes: readonly PolyLane[]): LaneBend[] =>
+  bends.filter((b) => hasLane(lanes, b.lane));
+
+/** `bends` of the lanes in both `before` and `after`: a lane that goes takes its bend, and a lane that arrives starts unbent, whatever a lane with its id once had. */
+const bendsAcrossLanes = (bends: readonly LaneBend[], before: readonly PolyLane[], after: readonly PolyLane[]): LaneBend[] =>
+  bends.filter((b) => hasLane(before, b.lane) && hasLane(after, b.lane));
+
+/** True when lane `lane` may take points: it bends already, or fewer than MAX_BENT_LANES lanes do. */
+const mayBend = (s: Pick<PianoRollState, 'lanes' | 'bends'>, lane: number): boolean => {
+  const bent = bentLanes(s.lanes, s.bends);
+  return bent.has(lane) || bent.size < MAX_BENT_LANES;
+};
+
+/**
+ * `bends` with lane `lane` rewritten by `edit`, which gets the lane's bend (an
+ * empty one at the default range when it has none). Other lanes keep their
+ * objects; an edit that leaves no points and the default range removes the entry.
+ */
+const withLaneBend = (bends: readonly LaneBend[], lane: number, edit: (b: LaneBend) => Partial<LaneBend>): LaneBend[] => {
+  const current = bends.find((b) => b.lane === lane) ?? { lane, range: DEFAULT_BEND_RANGE, points: [] };
+  const patch = edit(current);
+  const next: LaneBend = {
+    lane,
+    range: clampBendRange(patch.range ?? current.range),
+    points: patch.points ? sanitizeBendPoints(patch.points, `bp${lane}`) : current.points,
+  };
+  const others = bends.filter((b) => b.lane !== lane);
+  const keep = next.points.length > 0 || next.range !== DEFAULT_BEND_RANGE;
+  return (keep ? [...others, next] : others).sort((a, b) => a.lane - b.lane);
+};
+
+/** Every lane's points removed, ranges kept. */
+const clearedBends = (bends: readonly LaneBend[]): LaneBend[] => sanitizeBends(bends.map((b) => ({ ...b, points: [] })));
+
+/**
+ * The bends a load or import that replaces the notes ends with: `incoming` for
+ * the lanes the roll ends with (capped at MAX_BENT_LANES), or with none given,
+ * the roll's own for the lanes it keeps with every point removed.
+ */
+const replacedBends = (
+  s: Pick<PianoRollState, 'lanes' | 'bends'>,
+  lanes: readonly PolyLane[],
+  incoming: readonly LaneBend[] | undefined,
+): LaneBend[] =>
+  incoming ? capBentLanes(bendsForLanes(sanitizeBends(incoming), lanes), lanes) : clearedBends(bendsAcrossLanes(s.bends, s.lanes, lanes));
+
+const uidBend = (): string =>
+  typeof crypto !== 'undefined' && crypto.randomUUID ? `bp-${crypto.randomUUID()}` : `bp-${Math.random().toString(36).slice(2)}-${Date.now()}`;
+
 /** Fit grid LENGTH (snapped up to a bar line of the meter map) to a note set, and
  *  keep the full piano range in view (expanded if content goes beyond it) so
  *  vertical scrolling always works and notes are never cropped. */
@@ -177,6 +281,7 @@ export const usePianoRollStore = create<PianoRollState>()((set, get) => ({
   pickupSteps: 0,
   lanes: sanitizeLanes(DEFAULT_LANES),
   activeLane: 0,
+  bends: [],
 
   setBpm: (bpm) => set({ bpm: Math.max(40, Math.min(240, bpm)) }),
   setTotalSteps: (totalSteps) =>
@@ -208,10 +313,11 @@ export const usePianoRollStore = create<PianoRollState>()((set, get) => ({
   setPlaying: (isPlaying) => set({ isPlaying }),
   setCurrentStep: (currentStep) => set({ currentStep }),
   replaceAll: (notes) => set({ notes, selectedNoteId: null }),
-  clear: () => set({ notes: [], selectedNoteId: null, editingClipId: null, recordedRange: null }),
+  clear: () =>
+    set((s) => ({ notes: [], selectedNoteId: null, editingClipId: null, recordedRange: null, bends: clearedBends(s.bends) })),
 
   setEditingClip: (editingClipId) => set({ editingClipId }),
-  loadFromClip: (clipId, incoming, bpm, totalSteps, meter) =>
+  loadFromClip: (clipId, incoming, bpm, totalSteps, meter, incomingBends) =>
     set((s) => {
       const notes = incoming.map((n) => ({ ...n }));
       const m = mergeMeter(s, meter);
@@ -219,6 +325,7 @@ export const usePianoRollStore = create<PianoRollState>()((set, get) => ({
       return {
         notes,
         ...m,
+        bends: replacedBends(s, m.lanes, incomingBends),
         bpm: Math.max(40, Math.min(240, bpm)),
         totalSteps: Math.min(
           MAX_STEPS,
@@ -233,16 +340,18 @@ export const usePianoRollStore = create<PianoRollState>()((set, get) => ({
       };
     }),
 
-  importNotes: (incoming, bpm, meter) =>
+  importNotes: (incoming, bpm, meter, incomingBends) =>
     set((s) => {
       const notes = incoming.map((n) => ({ ...n }));
       const m = mergeMeter(s, meter);
+      const bends = replacedBends(s, m.lanes, incomingBends);
       if (notes.length === 0) {
-        return { notes, ...m, selectedNoteId: null, currentStep: 0, isPlaying: false, recordedRange: null };
+        return { notes, ...m, bends, selectedNoteId: null, currentStep: 0, isPlaying: false, recordedRange: null };
       }
       return {
         notes,
         ...m,
+        bends,
         ...fitToNotes(notes, m.meterMap, m.pickupSteps),
         selectedNoteId: null,
         currentStep: 0,
@@ -283,22 +392,33 @@ export const usePianoRollStore = create<PianoRollState>()((set, get) => ({
     set((s) => {
       const m = mergeMeter(s, meter);
       const meterMap = meter.meterMap ? normalizeMeterMap(meter.meterMap, merge) : m.meterMap;
+      const bends = meter.lanes ? bendsAcrossLanes(s.bends, s.lanes, m.lanes) : s.bends;
       return {
         ...m,
         meterMap,
+        // The same object when no lane took a bend with it, so a player sees no bend edit.
+        bends: bends.length === s.bends.length ? s.bends : bends,
         totalSteps: Math.min(MAX_STEPS, roundUpToBar(meterMap, Math.max(MIN_STEPS, s.totalSteps), m.pickupSteps)),
       };
     }),
   setLanes: (lanes) =>
     set((s) => {
       const next = sanitizeLanes(lanes);
-      return { lanes: next, activeLane: next.some((l) => l.id === s.activeLane) ? s.activeLane : 0 };
+      return {
+        lanes: next,
+        activeLane: next.some((l) => l.id === s.activeLane) ? s.activeLane : 0,
+        bends: bendsForLanes(s.bends, next),
+      };
     }),
   setActiveLane: (id) => set((s) => (s.lanes.some((l) => l.id === id) ? { activeLane: id } : {})),
   addLane: (cycleSteps = null) => {
-    const { lanes } = get();
+    const { lanes, bends } = get();
     const id = lanes.reduce((m, l) => Math.max(m, l.id), 0) + 1;
-    set({ lanes: sanitizeLanes([...lanes, { id, name: laneName(id), cycleSteps: clampCycle(cycleSteps) }]) });
+    // A new lane starts unbent, whatever a lane with its id once had.
+    set({
+      lanes: sanitizeLanes([...lanes, { id, name: laneName(id), cycleSteps: clampCycle(cycleSteps) }]),
+      bends: bends.filter((b) => b.lane !== id),
+    });
     return id;
   },
   setLaneCycle: (id, cycleSteps) =>
@@ -306,6 +426,13 @@ export const usePianoRollStore = create<PianoRollState>()((set, get) => ({
   removeLane: (id) =>
     set((s) => {
       if (id === 0 || !s.lanes.some((l) => l.id === id)) return {};
+      // The lane's notes move to lane 0, and its bend goes with them when lane 0 has no points of its own.
+      const gone = s.bends.find((b) => b.lane === id);
+      const zero = s.bends.find((b) => b.lane === 0);
+      const rest = s.bends.filter((b) => b.lane !== id);
+      const bends = gone?.points.length && !zero?.points.length
+        ? withLaneBend(rest, 0, () => ({ range: gone.range, points: gone.points }))
+        : rest;
       return {
         lanes: s.lanes.filter((l) => l.id !== id),
         notes: s.notes.map((n) => {
@@ -314,8 +441,50 @@ export const usePianoRollStore = create<PianoRollState>()((set, get) => ({
           return rest;
         }),
         activeLane: s.activeLane === id ? 0 : s.activeLane,
+        bends,
       };
     }),
+
+  setBends: (bends) => set((s) => ({ bends: capBentLanes(bendsForLanes(sanitizeBends(bends), s.lanes), s.lanes) })),
+  setBendPoints: (lane, points) =>
+    set((s) =>
+      hasLane(s.lanes, lane) && (points.length === 0 || mayBend(s, lane))
+        ? { bends: withLaneBend(s.bends, lane, () => ({ points: points.map((p) => ({ ...p })) as BendPoint[] })) }
+        : {},
+    ),
+  addBendPoint: (lane, point) => {
+    const s = get();
+    if (!hasLane(s.lanes, lane) || !mayBend(s, lane)) return null;
+    const id = uidBend();
+    // Appended last, so it wins over a point already at its step.
+    set((s) => ({ bends: withLaneBend(s.bends, lane, (b) => ({ points: [...b.points, { ...point, id } as BendPoint] })) }));
+    return id;
+  },
+  moveBendPoint: (lane, id, patch) =>
+    set((s) => {
+      const bend = s.bends.find((b) => b.lane === lane);
+      const p = bend?.points.find((x) => x.id === id);
+      if (!bend || !p) return {};
+      const moved: BendPoint = {
+        id,
+        step: typeof patch.step === 'number' && Number.isFinite(patch.step) ? patch.step : p.step,
+        value: typeof patch.value === 'number' && Number.isFinite(patch.value) ? patch.value : p.value,
+        shape: patch.shape ?? p.shape,
+      };
+      return { bends: withLaneBend(s.bends, lane, (b) => ({ points: [...b.points.filter((x) => x.id !== id), moved] })) };
+    }),
+  removeBendPoint: (lane, id) =>
+    set((s) => {
+      const bend = s.bends.find((b) => b.lane === lane);
+      if (!bend?.points.some((x) => x.id === id)) return {};
+      return { bends: withLaneBend(s.bends, lane, (b) => ({ points: b.points.filter((x) => x.id !== id) })) };
+    }),
+  clearBend: (lane) =>
+    set((s) => ({
+      bends: lane === undefined ? clearedBends(s.bends) : withLaneBend(s.bends, lane, () => ({ points: [] })),
+    })),
+  setBendRange: (lane, semitones) =>
+    set((s) => (hasLane(s.lanes, lane) ? { bends: withLaneBend(s.bends, lane, () => ({ range: semitones })) } : {})),
 }));
 
 /** The roll's meter fields, for a bounce payload, a project save or an export. */

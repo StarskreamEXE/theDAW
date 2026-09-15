@@ -10,8 +10,14 @@
  * Time signatures are written only when given (the .mid export), and then at
  * the roll's tempo: notesToRollSmf puts the notes and the roll's meter on that
  * tempo's grid, where a roll step is PPQ / 4 ticks, so bar lines and notes agree.
+ *
+ * Pitch wheels are written only when given (a soundfont render of a roll with
+ * bends): each wheel's range as RPN 0/0 at tick 0 and its messages at their
+ * ticks, on its channel, with a note's `channel` choosing where it plays. The
+ * range's CC 38 counts 1/128 semitones, the way SpessaSynth reads it, since
+ * the soundfont render is what reads these wheels.
  */
-import { meterEventMetas } from './midi';
+import { RANGE_LSB_SPESSA, bendRangeMessages, meterEventMetas, pitchWheelMessage } from './midi';
 import { meterMapToMidiEvents, type MeterEvent, type MeterSegment } from './meterMap';
 import type { RenderNote } from './midiSynth';
 
@@ -46,10 +52,19 @@ export function rollMeterToSmfEvents(meterMap: readonly MeterSegment[], pickupSt
   return meterMapToMidiEvents(meterMap, PPQ, pickupSteps);
 }
 
+/** One channel's pitch wheel for notesToSmf: its range in semitones and its messages in seconds (raw 0-16383, 8192 the centre). */
+export interface SmfWheel {
+  channel: number;
+  range: number;
+  events: ReadonlyArray<{ sec: number; raw: number }>;
+}
+
 /**
  * Encode absolute-seconds notes as a single-track Standard MIDI File, with a
  * leading program change so the whole part plays on one GM instrument.
- * `signatures` sit on the grid of `bpm` (rollMeterToSmfEvents).
+ * `signatures` sit on the grid of `bpm` (rollMeterToSmfEvents). A note with a
+ * `channel` plays there, and `wheel` bends channels; every channel used gets
+ * the same program.
  */
 export function notesToSmf(
   notes: RenderNote[],
@@ -57,26 +72,44 @@ export function notesToSmf(
   channel = 0,
   signatures: readonly MeterEvent[] = [],
   bpm = DEFAULT_BPM,
+  wheel: readonly SmfWheel[] = [],
 ): Uint8Array {
   const ch = channel & 0x0f;
   const { usPerQuarter, secPerTick } = tempoGrid(bpm);
   interface Ev {
     tick: number;
-    order: number; // tie-break at equal ticks: meta (-1), then note-off (0), then note-on (1)
+    order: number; // tie-break at equal ticks: meta (-1), then program and note-off (0), range (0.25), wheel (0.5), then note-on (1)
     data: number[];
   }
   const evs: Ev[] = [{ tick: 0, order: 0, data: [0xc0 | ch, program & 0x7f] }];
+  const others = new Set<number>();
+  for (const n of notes) if (typeof n.channel === 'number') others.add(n.channel & 0x0f);
+  for (const w of wheel) others.add(w.channel & 0x0f);
+  others.delete(ch);
+  for (const c of [...others].sort((a, b) => a - b)) evs.push({ tick: 0, order: 0, data: [0xc0 | c, program & 0x7f] });
   for (const s of signatures) {
     const tick = Number.isFinite(s.tick) ? Math.max(0, Math.round(s.tick)) : 0;
     for (const data of meterEventMetas(s)) evs.push({ tick, order: -1, data });
+  }
+  for (const w of wheel) {
+    for (const data of bendRangeMessages(w.channel, w.range, RANGE_LSB_SPESSA)) evs.push({ tick: 0, order: 0.25, data });
+    let lastTick = -1;
+    for (const e of w.events) {
+      const tick = Number.isFinite(e.sec) ? Math.max(0, Math.round(e.sec / secPerTick)) : 0;
+      // Messages that land on one tick: the last one is the one in force, so it is the one written.
+      if (tick === lastTick) evs.pop();
+      evs.push({ tick, order: 0.5, data: pitchWheelMessage(w.channel, e.raw) });
+      lastTick = tick;
+    }
   }
   for (const n of notes) {
     const start = Math.max(0, Math.round(n.startSec / secPerTick));
     const end = Math.max(start + 1, Math.round((n.startSec + n.durationSec) / secPerTick));
     const note = Math.max(0, Math.min(127, Math.round(n.midi)));
     const vel = Math.max(1, Math.min(127, Math.round(n.velocity)));
-    evs.push({ tick: start, order: 1, data: [0x90 | ch, note, vel] });
-    evs.push({ tick: end, order: 0, data: [0x80 | ch, note, 0] });
+    const nch = typeof n.channel === 'number' ? n.channel & 0x0f : ch;
+    evs.push({ tick: start, order: 1, data: [0x90 | nch, note, vel] });
+    evs.push({ tick: end, order: 0, data: [0x80 | nch, note, 0] });
   }
   evs.sort((a, b) => a.tick - b.tick || a.order - b.order);
 

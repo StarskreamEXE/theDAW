@@ -28,6 +28,7 @@ import {
 import { NOTE_NAMES, SOUND_PROFILES, GENRE_PROFILES } from './constants';
 import {
   detectPitch, frequencyToMidi, cleanupNotes, snapToScale, processNotesWithProfile, generateMidiFile,
+  slideBendPoints, V2M_BEND_RANGE,
 } from './audioProcessing';
 import { quantizeNotes, transposeNotes, snapNotesToScale, changeKey, getKeyName } from './midiEditor';
 import { detectKeyAndScale, getRelatedKeys } from './musicTheory';
@@ -197,9 +198,21 @@ export const Vocal2MidiPanel: React.FC = () => {
 
   const bpm = audioAnalysis?.detectedBpm || config.manualBpm || 120;
 
+  // With Pitch bend on, the slides the MIDI export writes go to the roll's lane
+  // A at the range that export assumes. A write replaces every note in the roll,
+  // so every other lane's points go and keep their range; with no slides,
+  // importNotes clears every lane's points itself.
+  const pitchBendRef = useRef(config.experimentalPitchBend);
+  useEffect(() => { pitchBendRef.current = config.experimentalPitchBend; }, [config.experimentalPitchBend]);
+
   /** Write notes into theDAW's existing piano roll. */
   const applyToRoll = useCallback((notes: NoteEvent[], atBpm: number) => {
-    usePianoRollStore.getState().importNotes(toPianoNotes(notes, atBpm), atBpm);
+    const roll = usePianoRollStore.getState();
+    const points = pitchBendRef.current ? slideBendPoints(notes, atBpm) : [];
+    const bends = points.length
+      ? [...roll.bends.filter((b) => b.lane !== 0).map((b) => ({ ...b, points: [] })), { lane: 0, range: V2M_BEND_RANGE, points }]
+      : undefined;
+    roll.importNotes(toPianoNotes(notes, atBpm), atBpm, undefined, bends);
   }, []);
 
   /* ── recorder (ported YIN capture) ─────────────────────────────────────── */
