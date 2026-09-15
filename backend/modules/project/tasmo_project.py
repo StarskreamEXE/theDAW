@@ -42,6 +42,39 @@ class AutomationLane(BaseModel):
     points: list[AutomationPoint] = []
 
 
+class FollowAfter(BaseModel):
+    """When a clip's follow action comes due.
+
+    Two forms, kept in one model so the field is a plain nested object in the
+    JSON: a musical distance from the clip's start (``bars`` + ``beats``), or a
+    number of times the clip has played (``plays``). All three default to None
+    so a half-written entry still validates; the frontend reads ``plays`` first
+    and falls back to bars/beats (``lib/followAction.ts``).
+    """
+
+    bars: float | None = None
+    beats: float | None = None
+    plays: float | None = None
+
+
+class FollowAction(BaseModel):
+    """What a Session-grid clip does to its column once it has played.
+
+    ``a`` is the action ("stop" | "next" | "prev" | "first" | "last" | "any" |
+    "other" | "again"), ``b`` an optional second action, and ``chance`` the
+    probability of ``a`` (the rest is ``b``; with no ``b`` the rule is
+    one-sided). The action names are NOT validated here on purpose: storage is
+    tolerant so an older or hand-edited file still loads, and the app is the
+    strict half — ``parseFollowAction`` turns anything it cannot act on into no
+    rule at all rather than into some other rule.
+    """
+
+    after: FollowAfter = Field(default_factory=FollowAfter)
+    a: str = ""
+    b: str | None = None
+    chance: float = 1.0
+
+
 class Clip(BaseModel):
     id: str
     name: str
@@ -100,6 +133,12 @@ class Clip(BaseModel):
     track_index: int | None = None
     scene_index: int | None = None
     slot_index: int | None = None
+    # What this cell does to its column once it has played for a set period —
+    # the other half of what a clip-launch grid is. Placement alone reopened a
+    # saved set with every column playing one clip forever, because the rule
+    # that moved it on lived only in the browser tab. Defaulted to None, so
+    # .tasmo files written before follow actions existed still validate.
+    follow_action: FollowAction | None = None
     generation_prompt: str | None = None
     generation_seed: int | None = None
     generation_params: dict | None = None

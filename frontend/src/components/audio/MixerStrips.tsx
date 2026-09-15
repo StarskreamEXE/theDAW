@@ -46,7 +46,14 @@ import {
   type RoutingRefusal,
 } from '../../state/routingGraph';
 import { usePlaybackStore } from '../../state/playbackStore';
+import { disposeMeter, ensureMeter, sampleChannelLevels } from '../../state/levelsStore';
+import {
+  disposeStripMeters,
+  ensureStripMeters,
+  sampleStripLevels,
+} from '../../state/stripMeters';
 import { requireFeature } from '../../notices/featureGateStore';
+import { BarMeter, dbToNorm, fmtLevel } from './levels/meterModel';
 import { SlideTrack } from './SlideTrack';
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -217,6 +224,97 @@ function toastRefusal(what: string, reason: RoutingRefusal): void {
     autoDismissMs: 6000,
   });
 }
+
+/* ────────────────────────────────────────────────────────────────────────────
+   Strip meters
+
+   Until now the only thing metered in this app was the post-sum master, which
+   can say that something is loud but never WHICH strip. `state/stripMeters`
+   publishes one reading per live strip, tapped off the end of that strip's own
+   chain (see that file for why it has to be the end); the drawer turns those
+   readings into bars.
+
+   ONE rAF loop for the whole drawer, owned by `MixerStrips`, writing widths
+   straight onto the DOM. Not one loop per strip, and not React state: a mixer
+   with twenty strips would otherwise re-render the entire drawer sixty times a
+   second, and every fader, select and send row in it.
+   ──────────────────────────────────────────────────────────────────────────── */
+
+/** ~60 fps ceiling, as in the Levels panel — a 120 Hz display would otherwise
+ *  paint twice as often for no visible gain. */
+const MAX_FPS_INTERVAL_MS = 1000 / 60 - 1;
+/** ARIA is refreshed 10x a second, not 60. `role="meter"` is not a live region
+ *  so nothing is announced either way, but rewriting two attributes per strip
+ *  per frame is DOM churn for a number no reader can follow at that rate. */
+const ARIA_INTERVAL_MS = 100;
+
+/** The two bars one strip paints, plus its root (which carries the ARIA value). */
+interface StripMeterEls {
+  root: HTMLDivElement;
+  fill: HTMLElement;
+  tick: HTMLElement;
+}
+
+/** Every mounted strip meter, keyed by strip id: written by the components,
+ *  read by the single paint loop in `MixerStrips`. */
+type StripMeterRegistry = React.RefObject<Map<string, StripMeterEls>>;
+
+/**
+ * One strip's meter: an RMS fill for the body of the signal and a thin peak
+ * tick, so a strip that is clipping reads before the fill catches up.
+ *
+ * Presentational and inert. It renders once, registers its three elements, and
+ * never re-renders — the drawer's loop writes the widths onto the DOM directly,
+ * so a moving meter costs no React work and cannot re-render the controls
+ * underneath it.
+ *
+ * Rule 3: a meter is a CUSTOM control, so it carries `role="meter"` with its own
+ * `aria-label` and value attributes and is never wrapped in a `<label>` (a
+ * `<label>` does not associate with a non-native control). The shape and the
+ * classes are the take meter's from `WaveformEditor.tsx`'s `TrackInputMeter`, so
+ * the two meters in this app read as the same object.
+ */
+const StripMeter: React.FC<{
+  stripId: string;
+  name: string;
+  registry: StripMeterRegistry;
+}> = ({ stripId, name, registry }) => {
+  const rootRef = useRef<HTMLDivElement>(null);
+  const fillRef = useRef<HTMLElement>(null);
+  const tickRef = useRef<HTMLElement>(null);
+
+  // A stable effect rather than inline `ref` callbacks: an inline arrow is a new
+  // function identity on every render, so React would detach and re-attach every
+  // strip's elements on each keystroke of a fader ride — the same reason the
+  // focus effect further down queries the container instead.
+  useEffect(() => {
+    const map = registry.current;
+    const root = rootRef.current;
+    const fill = fillRef.current;
+    const tick = tickRef.current;
+    if (!map || !root || !fill || !tick) return;
+    map.set(stripId, { root, fill, tick });
+    return () => {
+      map.delete(stripId);
+    };
+  }, [registry, stripId]);
+
+  return (
+    <div
+      ref={rootRef}
+      role="meter"
+      aria-label={`${name} level`}
+      aria-valuemin={0}
+      aria-valuemax={1}
+      aria-valuenow={0}
+      aria-valuetext="-∞ dBFS"
+      className="relative h-1 w-full overflow-hidden rounded-xs bg-white/10"
+    >
+      <i ref={fillRef} className="absolute inset-y-0 left-0 block bg-red-500/60" style={{ width: '0%' }} />
+      <i ref={tickRef} className="absolute inset-y-0 w-0.5 bg-red-400" style={{ left: 'calc(0% - 1px)' }} />
+    </div>
+  );
+};
 
 /** Volume fader + mute, shared by the track, bus and master strips. */
 const LevelRow: React.FC<{
@@ -396,6 +494,118 @@ export const MixerStrips: React.FC = () => {
   const [focusBusId, setFocusBusId] = useState<string | null>(null);
   const stripsRef = useRef<HTMLDivElement | null>(null);
   const confirmRef = useRef<HTMLButtonElement | null>(null);
+  // Every mounted meter's elements. The drawer is only rendered while it is
+  // open, so this map's life is the drawer's.
+  const meterEls = useRef(new Map<string, StripMeterEls>());
+
+  // Hold the two taps for as long as the drawer is open. Both are refcounted:
+  // `ensureMeter` is the Levels tab's own master tap, so opening and closing the
+  // drawer over a live Levels panel must not detach it out from under the panel
+  // — and reusing it is also why there is no second analyser on the master.
+  //
+  // WHAT THE MASTER HOLD COSTS, since it is not only a bar. `ensureMeter`
+  // constructs the audio engine if it is not up yet (`levelsStore.setup` ->
+  // `playerStore.getEngineCtx`) and attaches the BS.1770 worklet, so opening the
+  // drawer STARTS the master meter's LUFS / true-peak integration and keeps it
+  // running for as long as the drawer is open. Closing it releases this hold,
+  // and if nothing else holds one (no Levels panel open) `levelsStore.disposeMeter`
+  // detaches the tap and calls `clearHolds` — which resets the max true-peak and
+  // max sample-peak readouts and empties the 60 s short-term history. Opening
+  // the Levels tab afterwards therefore starts from a clean integration, not
+  // from whatever the drawer accumulated.
+  useEffect(() => {
+    ensureStripMeters();
+    // Async because it may be loading the LUFS worklet. A rejection means the
+    // master bar simply sits at silence; the Levels tab is the place that
+    // explains why, and the strip bars are unaffected.
+    ensureMeter().catch(() => { /* master bar stays at silence */ });
+    return () => {
+      disposeStripMeters();
+      disposeMeter();
+    };
+  }, []);
+
+  // THE drawer's paint loop. One rAF for every strip, no React state, no store
+  // writes: it reads both taps once per frame, advances one `BarMeter` per strip
+  // and writes the two widths onto that strip's elements.
+  useEffect(() => {
+    const els = meterEls.current;
+    /** Ballistics per strip — created on first sight, dropped with the strip. */
+    const bars = new Map<string, BarMeter>();
+    let raf = 0;
+    let lastPaint = 0;
+    let lastAria = 0;
+    let docVisible = typeof document === 'undefined' ? true : !document.hidden;
+
+    const paint = (el: StripMeterEls, bar: BarMeter, aria: boolean): void => {
+      const peak = dbToNorm(bar.peakDb);
+      el.fill.style.width = `${dbToNorm(bar.rmsDb) * 100}%`;
+      el.tick.style.left = `calc(${peak * 100}% - 1px)`;
+      if (!aria) return;
+      el.root.setAttribute('aria-valuenow', peak.toFixed(3));
+      el.root.setAttribute('aria-valuetext', `${fmtLevel(bar.peakDb)} dBFS`);
+    };
+
+    const frame = (now: number): void => {
+      raf = 0;
+      if (!docVisible) return; // paused; the visibility handler restarts it
+      raf = requestAnimationFrame(frame);
+      if (now - lastPaint < MAX_FPS_INTERVAL_MS) return;
+      // Clamped so a frame the browser skipped (a tab that came back, a long
+      // task) cannot jump the ballistics; seeded at one frame on the first pass.
+      const dt = lastPaint ? Math.min(0.1, (now - lastPaint) / 1000) : 1 / 60;
+      lastPaint = now;
+      const aria = now - lastAria >= ARIA_INTERVAL_MS;
+      if (aria) lastAria = now;
+
+      const strips = sampleStripLevels();
+      const master = sampleChannelLevels();
+
+      for (const id of bars.keys()) if (!els.has(id)) bars.delete(id);
+      for (const [id, el] of els) {
+        let bar = bars.get(id);
+        if (!bar) {
+          bar = new BarMeter();
+          bars.set(id, bar);
+        }
+        if (id === MASTER_ID) {
+          // The master tap is per-channel: show the louder channel's peak over
+          // the stereo RMS, the same fold `levelsStore.getLevelsFrame` uses.
+          if (master) {
+            const rms = Math.sqrt((master.rmsL * master.rmsL + master.rmsR * master.rmsR) * 0.5);
+            bar.update(Math.max(master.peakL, master.peakR), rms, dt);
+          } else {
+            bar.update(0, 0, dt);
+          }
+        } else {
+          // No reading is metered as silence ON PURPOSE: a strip whose session
+          // was disposed, or one that has never played, falls away at the normal
+          // rate instead of freezing at whatever it last showed.
+          const lv = strips?.get(id);
+          if (lv) bar.update(lv.peak, lv.rms, dt);
+          else bar.update(0, 0, dt);
+        }
+        paint(el, bar, aria);
+      }
+    };
+
+    const start = (): void => {
+      if (!raf && docVisible) {
+        lastPaint = 0;
+        raf = requestAnimationFrame(frame);
+      }
+    };
+    const onVisibility = (): void => {
+      docVisible = !document.hidden;
+      start();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    start();
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, []);
 
   const route = (fromId: string, toId: string) => {
     const refusal = setTrackOutput(fromId, toId);
@@ -462,6 +672,10 @@ export const MixerStrips: React.FC = () => {
               onPick={(toId) => route(t.id, toId)}
             />
             <SendList graph={routing} buses={buses} nodeId={t.id} name={t.name} />
+            {/* Above the fader, below the sends: the bar reads the END of the
+                strip, so it already includes everything the controls above it
+                do and the fader right under it moves it. */}
+            <StripMeter stripId={t.id} name={t.name} registry={meterEls} />
             <LevelRow
               name={t.name}
               volume={t.volume}
@@ -544,6 +758,7 @@ export const MixerStrips: React.FC = () => {
               value={outputOf(routing, b.id) ?? MASTER_ID}
               onPick={(toId) => route(b.id, toId)}
             />
+            <StripMeter stripId={b.id} name={b.name} registry={meterEls} />
             <LevelRow
               name={b.name}
               volume={b.volume}
@@ -560,6 +775,10 @@ export const MixerStrips: React.FC = () => {
         <div className={`${STRIP} border-[rgb(var(--et-accent))]/40`}>
           <span className="truncate text-xs font-bold text-zinc-200">Master</span>
           <p className="text-[10px] font-mono uppercase tracking-wider text-zinc-600">end of chain</p>
+          {/* The master reuses the Levels tab's existing post-sum tap rather
+              than hanging a second analyser on the same signal — which is also
+              why both taps are refcounted. */}
+          <StripMeter stripId={MASTER_ID} name="Master" registry={meterEls} />
           <LevelRow
             name="Master"
             volume={masterVolume}

@@ -12,6 +12,7 @@
 
 import type { DawProject, DawTrack, DawClip, DawDevice } from './dawImportClient';
 import type { TasmoProjectLoaded } from './projectClient';
+import { parseFollowAction } from './followAction';
 
 export function tasmoLoadedToDawProject(loaded: TasmoProjectLoaded): DawProject {
   const bpm = loaded.tempo || 120;
@@ -49,6 +50,11 @@ export function tasmoLoadedToDawProject(loaded: TasmoProjectLoaded): DawProject 
         loop_start: c.loop_start ?? null,
         loop_end: c.loop_end ?? null,
         loop_on: (c.loop_end ?? 0) > (c.loop_start ?? 0),
+        // The clip's follow action, if the file carries one this build can act
+        // on. Storage is tolerant (every backend field is defaulted so an older
+        // file validates); interpretation is not, so an unknown kind loads as
+        // no rule rather than as some other rule.
+        followAction: parseFollowAction(c.follow_action),
       };
     });
     return {

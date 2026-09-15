@@ -9,6 +9,7 @@
 import assert from 'node:assert/strict';
 import { createLaunchQueue, launchSlotId, type LaunchQueueClock } from './launchQueue.ts';
 import { beatClock, type ClockGrid } from './beatClock.ts';
+import { dueAt, nextFollow, type FollowAction } from './followAction.ts';
 
 /** Seconds per grid line at 120 bpm, 4/4 — the same table `gridSec` builds. */
 const GRID_SEC: Record<Exclude<ClockGrid, 'now'>, number> = {
@@ -329,6 +330,55 @@ const ats = (ts: readonly { at: number }[]): number[] => ts.map((t) => t.at);
   assert.equal(q.pending().length, 2);
 }
 
+/* ----------------------- an explicit `at` on the spec ---------------------- */
+
+// A follow action already knows the instant it wants — the boundary of the clip
+// that is finishing — so it hands that over and the clock is never asked. Using
+// the grid instead would round the handover up to the next launch line and put
+// a hole the length of the quantization into the column.
+{
+  const { clock, gridCalls, at } = makeClock();
+  const q = createLaunchQueue(clock);
+  at(1.3);
+  assert.equal(q.queue('a', { grid: 'bar', action: 'play', at: 3.75 }).at, 3.75);
+  assert.deepEqual(gridCalls, []);
+}
+
+// An `at` already in the past is honoured as given: `advance` then fires it on
+// the very next pump, which is what a deadline the pump only just noticed means.
+{
+  const { clock, at } = makeClock();
+  const q = createLaunchQueue(clock);
+  at(5);
+  assert.equal(q.queue('a', { grid: 'bar', action: 'play', at: 4.2 }).at, 4.2);
+  assert.deepEqual(ids(q.advance(5)), ['a']);
+}
+
+// A non-finite `at` falls back to the grid exactly as if none had been given —
+// the same guard the clock's own output already has, since a NaN `at` compares
+// false against every deadline and would spin the pump forever.
+{
+  const { clock, gridCalls, at } = makeClock();
+  const q = createLaunchQueue(clock);
+  at(1.3);
+  assert.equal(q.queue('a', { grid: 'bar', action: 'play', at: Number.NaN }).at, 2);
+  assert.equal(q.queue('b', { grid: 'bar', action: 'play', at: Number.POSITIVE_INFINITY }).at, 2);
+  assert.equal(q.queue('c', { grid: 'bar', action: 'play', at: undefined }).at, 2);
+  assert.deepEqual(gridCalls.map((c) => c.grid), ['bar', 'bar', 'bar']);
+}
+
+// Replace-not-stack is unchanged by it: a user press landing between a follow's
+// deadline and its line replaces the follow, it does not queue behind it.
+{
+  const { clock, at } = makeClock();
+  const q = createLaunchQueue(clock);
+  at(1.3);
+  q.queue('track:0', { grid: 'bar', action: 'play', at: 3.75 });
+  q.queue('track:0', { grid: 'bar', action: 'play' });
+  assert.equal(q.pending().length, 1);
+  assert.deepEqual(ats(q.pending()), [2]);
+}
+
 /* ------------------ against the real clock, outside 4/4 -------------------- */
 
 // The grid hands `beatClock` the set's meter as a MAP, not a beats-per-bar
@@ -353,6 +403,58 @@ const ats = (ts: readonly { at: number }[]): number[] => ts.map((t) => t.at);
   assert.equal(q.queue('track:2', { grid: 'beat', action: 'play' }).at, 0.5);
   // All three land on real 7/8 bar/beat lines, in `at` order.
   assert.deepEqual(ats(q.pending()), [0.5, 1.75, 3.5]);
+}
+
+/* ------------- a follow action, end to end against the real clock ---------- */
+
+// The handover the grid's pump performs: a clip launched on a bar line, a rule
+// of "Next after 1 bar", and the deadline that comes out of it. The point of the
+// explicit `at` is that the follow lands ON the clip's boundary rather than
+// being re-quantized to the next launch line — so the outgoing clip's stop and
+// the incoming clip's start are the same instant and the column has no gap.
+{
+  beatClock.setMeterMap([{ bar: 0, meter: { num: 4, den: 4, groups: [] } }]);
+  beatClock.setBpm(120, 'perform');
+  beatClock.setAnchor(0, 0);
+  assert.equal(beatClock.barSec(0), 2);
+
+  // Row 0 was launched on the bar line at t=4 and is 2 s long.
+  const startedAt = 4;
+  const armed: FollowAction = { after: { bars: 1, beats: 0 }, a: 'next', chance: 1 };
+  const deadline = dueAt(armed, startedAt, 2, beatClock.barSec(), beatClock.gridSec('beat'));
+  assert.equal(deadline, 6);
+  // and 6 is a real bar line on the shared clock, not merely 2 s later.
+  assert.equal(beatClock.nextGrid('bar', 5.9), 6);
+
+  // The rule picks the next OCCUPIED row of that column (row 1 here).
+  const result = nextFollow(
+    { sceneIndex: 0, occupiedScenes: [0, 1], playsDone: 1, elapsedSec: 1.95, lengthSec: 2 },
+    armed,
+    () => 0,
+  );
+  assert.deepEqual(result, { kind: 'launch', sceneIndex: 1 });
+
+  // The pump notices it one lead early and queues it with that exact deadline.
+  let t = 5.96;
+  const q = createLaunchQueue({
+    nextGrid: (grid, from) => beatClock.nextGrid(grid, from),
+    now: () => t,
+    lead: 0.05,
+  });
+  const ticket = q.queue(launchSlotId(0), { grid: 'bar', action: 'play', at: deadline });
+  assert.equal(ticket.at, 6);
+  // It fires on this same pump, with its whole lead left to schedule in.
+  assert.deepEqual(ats(q.advance(t)), [6]);
+
+  // Going through the launch grid instead is what leaves the hole, in the two
+  // ways it happens: the set is quantized coarser than the rule's period...
+  t = 5.96;
+  assert.equal(q.queue(launchSlotId(0), { grid: '4bar', action: 'play' }).at, 8);
+  // ...and the pump noticing a deadline a hair after it passed, which rounds a
+  // handover that was due NOW up to a whole bar of silence.
+  t = 6.001;
+  assert.equal(q.queue(launchSlotId(0), { grid: 'bar', action: 'play' }).at, 8);
+  assert.equal(q.queue(launchSlotId(0), { grid: 'bar', action: 'play', at: deadline }).at, 6);
 }
 
 console.log('launchQueue: ok');

@@ -14,6 +14,8 @@ import type { DawClip, DawProject, DawTrack } from '../../lib/dawImportClient';
 import { performScenes, performSceneCount, performTracks } from '../../lib/performModel';
 import { beatClock, type ClockGrid } from '../../lib/beatClock';
 import { createLaunchQueue, launchSlotId, type LaunchAction, type LaunchTicket } from '../../lib/launchQueue';
+import { dueAt, nextFollow, type FollowAction, type FollowKind } from '../../lib/followAction';
+import { ContextMenu, useContextMenu, type ContextMenuItem } from '../ui/ContextMenu';
 import { getEngineCtx, getMasterGain } from '../../state/playerStore';
 import { renderNotesToBlob, type RenderNote } from '../../lib/midiSynth';
 import { subscribeToMidi } from '../../state/midiBus';
@@ -46,6 +48,11 @@ interface SessionPlayer {
   /** Which scene row this player came from, so the grid can show per-track
    *  playing state instead of one global "active scene". */
   sceneIndex: number;
+  /** One pass of this clip in WALL seconds (the trimmed window, divided by the
+   *  warp rate). A follow action's `{plays}` deadline is measured in these, so
+   *  it has to be the length the graph was actually given, not the clip's
+   *  nominal span. */
+  lengthSec: number;
 }
 
 type ClipBufferCache = Map<string, Promise<AudioBuffer>>;
@@ -126,6 +133,71 @@ const LAUNCH_GRIDS: ReadonlyArray<{ value: ClockGrid; label: string }> = [
 const isLaunchGrid = (value: string): value is ClockGrid =>
   LAUNCH_GRIDS.some((g) => g.value === value);
 
+/* --- Follow actions ---------------------------------------------------------
+   A clip's own answer to "what next", evaluated on this column when the clip has
+   played for the period its rule names. The decision itself is pure and lives in
+   `lib/followAction.ts` (with the Tracktion design citation); what the grid adds
+   is the arming, the deadline, and the fact that the launch goes through the
+   SAME queue a press does — so a press landing between the deadline and the line
+   replaces the follow instead of stacking behind it. */
+
+/** Kind names as the menu and the editor say them. */
+const FOLLOW_KIND_LABELS: Record<FollowKind, string> = {
+  stop: 'Stop',
+  next: 'Next',
+  prev: 'Previous',
+  first: 'First',
+  last: 'Last',
+  any: 'Any',
+  other: 'Other',
+  again: 'Again',
+};
+
+const FOLLOW_KINDS = Object.keys(FOLLOW_KIND_LABELS) as FollowKind[];
+
+const isFollowKind = (value: string): value is FollowKind =>
+  (FOLLOW_KINDS as readonly string[]).includes(value);
+
+/** What a column has armed off the clip it is playing. One per column, because
+ *  one column plays one clip. */
+interface ArmedFollow {
+  /** The instant the clip started — `ticket.at`, the line it landed on. */
+  startedAt: number;
+  lengthSec: number;
+  playsDone: number;
+  rule: FollowAction;
+  sceneIndex: number;
+}
+
+const plural = (n: number, unit: string): string => `${n} ${unit}${n === 1 ? '' : 's'}`;
+
+const describeAfter = (after: FollowAction['after']): string => {
+  if ('plays' in after) return plural(after.plays, 'play');
+  const parts: string[] = [];
+  if (after.bars) parts.push(plural(after.bars, 'bar'));
+  if (after.beats) parts.push(plural(after.beats, 'beat'));
+  // `dueAt` floors an empty rule at one beat, so say that rather than "after".
+  return parts.length > 0 ? parts.join(' ') : '1 beat';
+};
+
+/** One line of prose for a rule — the cell's tooltip and accessible name. */
+const describeFollow = (rule: FollowAction): string => {
+  const head = rule.b
+    ? `${Math.round(rule.chance * 100)}% ${FOLLOW_KIND_LABELS[rule.a]}, else ${FOLLOW_KIND_LABELS[rule.b]}`
+    : FOLLOW_KIND_LABELS[rule.a];
+  return `${head} after ${describeAfter(rule.after)}`;
+};
+
+/** The rule a preset writes: the clip's own period if it has one, so switching
+ *  between presets never silently retimes a rule the user already set. */
+const followPreset = (current: FollowAction | undefined, a: FollowKind): FollowAction => ({
+  after: current?.after ?? { bars: 1, beats: 0 },
+  a,
+  chance: 1,
+});
+
+const DEFAULT_FOLLOW: FollowAction = { after: { bars: 1, beats: 0 }, a: 'next', chance: 1 };
+
 /** A clip resolved for launch, as `sceneClips` yields it. */
 interface SceneEntry {
   clip: DawClip;
@@ -134,6 +206,9 @@ interface SceneEntry {
   mixIndex: number;
 }
 
+/** Who asked for a launch. Only a scene launch owns the active row. */
+type LaunchOrigin = 'clip' | 'scene' | 'follow';
+
 /** What a queued ticket needs at fire time, kept beside the queue by slot id. */
 interface PendingLaunch {
   mixIndex: number;
@@ -141,8 +216,9 @@ interface PendingLaunch {
   sceneIndex: number;
   /** null for a stop (an empty slot, or a column the launched scene leaves out). */
   entry: SceneEntry | null;
-  /** Scene launches own `activeScene`; a single-cell launch never touches it. */
-  origin: 'clip' | 'scene';
+  /** Scene launches own `activeScene`; a single-cell launch and a follow never
+   *  touch it. */
+  origin: LaunchOrigin;
   /** Bumped per press, so a decode that lands after a newer press is dropped. */
   gen: number;
 }
@@ -323,6 +399,9 @@ const startClipPlayer = (
     trackIndex: opts.trackIndex,
     mixIndex: opts.mixIndex,
     sceneIndex: opts.sceneIndex,
+    // `duration` is a span of the SOURCE; a warped clip plays it at
+    // `playbackRate`, so one pass takes that many fewer (or more) wall seconds.
+    lengthSec: Math.max(0, duration || available) / (source.playbackRate.value || 1),
   };
 };
 
@@ -383,6 +462,26 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
   const genRef = React.useRef(0);
   const pumpTimerRef = React.useRef<number | null>(null);
   const pumpRef = React.useRef<() => void>(() => {});
+  /** Column -> the follow action armed off the clip it is playing. */
+  const followRef = React.useRef<Map<number, ArmedFollow>>(new Map());
+  /** Column -> how many times IN A ROW it has launched the same row.
+   *
+   *  Bookkeeping, not a deadline: a `{plays: n}` rule resolves as `n x lengthSec`
+   *  from the launch (`dueAt`), so nothing compares against this count today. It
+   *  is what makes `FollowState.playsDone` truthful — the number a "plays so
+   *  far" readout on the cell, or a later accumulate-across-relaunches
+   *  semantic, would need. Kept apart from `followRef` because a follow disarms
+   *  itself the moment it fires, and the count has to survive that to reach the
+   *  launch it just queued. */
+  const playCountRef = React.useRef<Map<number, { sceneIndex: number; plays: number }>>(new Map());
+  const followTickRef = React.useRef<(context: AudioContext) => void>(() => {});
+  /** Bumped whenever a rule is edited. A rule lives ON the imported clip object
+   *  (that is what makes it reach `dawProjectToTasmo` and the file), and
+   *  mutating one changes nothing React can see, so the grid is told by hand. */
+  const [followVersion, setFollowVersion] = React.useState(0);
+  const followMenu = useContextMenu<{ mixIndex: number; sceneIndex: number }>();
+  /** Which cell the inline editor is open on, or null. */
+  const [followEditor, setFollowEditor] = React.useState<{ mixIndex: number; sceneIndex: number } | null>(null);
 
   /**
    * Hand the set's tempo and meter to the shared clock, so "next bar" here
@@ -562,6 +661,10 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
     // Dropping every column's generation is what stops a clip that was still
     // decoding when the transport stopped from starting itself afterwards.
     columnGenRef.current.clear();
+    // Every armed follow dies with the transport too, or the pump would keep
+    // itself alive to fire a relaunch into the silence.
+    followRef.current.clear();
+    playCountRef.current.clear();
     stopPump();
     setQueuedSlots({});
     stopSessionPlayers(playersRef.current);
@@ -573,16 +676,31 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
 
   /** Queue one column's next intent, replacing whatever it was waiting on. */
   const queueLaunch = React.useCallback(
-    (req: { mixIndex: number; sceneIndex: number; entry: SceneEntry | null; origin: 'clip' | 'scene' }) => {
+    (req: {
+      mixIndex: number;
+      sceneIndex: number;
+      entry: SceneEntry | null;
+      origin: LaunchOrigin;
+      /** A follow already knows its instant — the boundary of the clip that is
+       *  finishing — so it hands that over instead of taking the launch grid,
+       *  which would round the handover up and leave a hole. */
+      at?: number;
+    }) => {
       // The first press is what makes this surface the clock's owner.
       claimClock();
+      // A PRESS disarms the column's follow. The queue holds one intent per
+      // column, so a follow queued between the press and its line would REPLACE
+      // the press and the user's cell would never launch — and the follow tick
+      // runs ahead of `advance` on every pump, so that window is every window.
+      // The column re-arms in `start()` from whatever clip actually fires.
+      if (req.origin !== 'follow') followRef.current.delete(req.mixIndex);
       const action: LaunchAction = req.entry ? 'play' : 'stop';
       const slotId = launchSlotId(req.mixIndex);
       genRef.current += 1;
       const gen = genRef.current;
       columnGenRef.current.set(req.mixIndex, gen);
       pendingRef.current.set(slotId, { ...req, gen });
-      launchQueue.queue(slotId, { grid: launchGrid, action });
+      launchQueue.queue(slotId, { grid: launchGrid, action, at: req.at });
       setQueuedSlots((prev) => ({ ...prev, [req.mixIndex]: req.sceneIndex }));
       ensurePump();
     },
@@ -601,6 +719,71 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
           : [];
       }),
     [clipLookup, tracks],
+  );
+
+  /** Every row of ONE column that holds a playable clip, ascending — what a
+   *  follow action's `next` / `first` / `any` are relative to. `sceneClips` only
+   *  goes the other way (a row across every column), so a follow walking a
+   *  column had nothing to read. */
+  const columnScenes = React.useCallback(
+    (mixIndex: number): number[] => {
+      const track = tracks[mixIndex];
+      if (!track) return [];
+      const trackIndex = track.clips.find((clip) => clip.track_index != null)?.track_index ?? mixIndex;
+      const rows: number[] = [];
+      for (let scene = 0; scene < sceneCount; scene += 1) {
+        const clip = clipLookup.get(clipKey(trackIndex, scene));
+        if (clip && isPlayableClip(clip)) rows.push(scene);
+      }
+      return rows;
+    },
+    [clipLookup, sceneCount, tracks],
+  );
+
+  /** The clip in one cell, by the same two index spaces the grid renders with. */
+  const clipAt = React.useCallback(
+    (mixIndex: number, sceneIndex: number): DawClip | undefined => {
+      const track = tracks[mixIndex];
+      if (!track) return undefined;
+      const trackIndex = track.clips.find((clip) => clip.track_index != null)?.track_index ?? mixIndex;
+      return clipLookup.get(clipKey(trackIndex, sceneIndex));
+    },
+    [clipLookup, tracks],
+  );
+
+  /** A clip's rule, re-read after an edit (the rule lives on the clip object). */
+  const followOf = React.useCallback(
+    (clip: DawClip): FollowAction | undefined => {
+      void followVersion;
+      return clip.followAction;
+    },
+    [followVersion],
+  );
+
+  /**
+   * Write (or clear) one cell's rule.
+   *
+   * The rule is set ON the imported clip, which is what carries it into
+   * `dawProjectToTasmo` and from there into the file — a rule held in component
+   * state would vanish on the next save, which is the whole point of persisting
+   * it. Nothing React watches changes, so the grid is told by hand.
+   */
+  const setFollow = React.useCallback(
+    (mixIndex: number, sceneIndex: number, rule: FollowAction | undefined) => {
+      const clip = clipAt(mixIndex, sceneIndex);
+      if (!clip) return;
+      if (rule) clip.followAction = rule;
+      else delete clip.followAction;
+      // An already-armed follow must not outlive the rule it was armed from, so
+      // an edit mid-flight takes effect on the clip that is playing right now.
+      const armed = followRef.current.get(mixIndex);
+      if (armed && armed.sceneIndex === sceneIndex) {
+        if (rule) followRef.current.set(mixIndex, { ...armed, rule });
+        else followRef.current.delete(mixIndex);
+      }
+      setFollowVersion((v) => v + 1);
+    },
+    [clipAt],
   );
 
   const getClipBuffer = React.useCallback((clip: DawClip): Promise<AudioBuffer> => {
@@ -862,6 +1045,10 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
       if (go.length > 0) scheduleStopPlayers(go, ticket.at);
 
       if (ticket.action === 'stop' || !entry) {
+        // A stopped column has no clip to follow, and its play count starts over
+        // the next time one is launched there.
+        followRef.current.delete(mixIndex);
+        playCountRef.current.delete(mixIndex);
         setTrackScenes((prev) => {
           const next = { ...prev };
           delete next[mixIndex];
@@ -869,12 +1056,12 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
         });
         // A SCENE's stop does not clear the active row: the launch that queued
         // it already named the row, and the other columns of the same launch
-        // may not have fired yet. Only a single-cell stop can empty the grid.
-        if (origin === 'clip' && stay.length === 0) setActiveScene(null);
+        // may not have fired yet. Only a single-column stop can empty the grid.
+        if (origin !== 'scene' && stay.length === 0) setActiveScene(null);
         return;
       }
 
-      const start = (buffer: AudioBuffer, startAt: number) => {
+      const start = (buffer: AudioBuffer, startedAt: number) => {
         const player = startClipPlayer(context, {
           buffer,
           clip: entry.clip,
@@ -882,7 +1069,7 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
           trackIndex: entry.trackIndex,
           mixIndex,
           sceneIndex,
-          startAt,
+          startAt: startedAt,
           projectTempo: project.tempo || 120,
           mix: mixRef.current.get(mixIndex),
           destination: ensureTrackChain(mixIndex, entry.track).input,
@@ -896,6 +1083,29 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
         if (origin === 'scene') setActiveScene(sceneIndex);
         startedAtRef.current ??= performance.now();
         if (animationRef.current == null) animationRef.current = window.requestAnimationFrame(tickMeters);
+
+        // Arm this column's next move off the clip that just started. The count
+        // is bumped first so it is right whether or not this clip carries a
+        // rule: the user can arm one mid-run and have the plays already made on
+        // that row count towards it.
+        const counted = playCountRef.current.get(mixIndex);
+        const plays = counted && counted.sceneIndex === sceneIndex ? counted.plays + 1 : 1;
+        playCountRef.current.set(mixIndex, { sceneIndex, plays });
+        const rule = entry.clip.followAction;
+        if (!rule) {
+          followRef.current.delete(mixIndex);
+          return;
+        }
+        followRef.current.set(mixIndex, {
+          startedAt,
+          lengthSec: player.lengthSec,
+          playsDone: plays,
+          rule,
+          sceneIndex,
+        });
+        // The queue may well be empty now; the pump has to stay up for the
+        // follow's own deadline, which no ticket represents yet.
+        ensurePump();
       };
 
       const ready = bufferReadyRef.current.get(clipCacheKey(entry.clip));
@@ -914,17 +1124,77 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
         })
         .catch(() => { /* logged by the press that queued it */ });
     },
-    [displayTrack, ensureTrackChain, getClipBuffer, project.tempo, tickMeters],
+    [displayTrack, ensurePump, ensureTrackChain, getClipBuffer, project.tempo, tickMeters],
   );
 
-  // The pump: take everything due and fire it, then stand down once the queue
-  // is empty. Kept in a ref so the interval never has to be torn down and
-  // rebuilt as the callbacks above re-create.
+  /* --- Follow actions on the pump -------------------------------------------
+     Position is poll-only on the shared clock — `beatClock.subscribe` fires on a
+     state CHANGE, not on a beat, and the ticket's own rule is not to add one —
+     so a follow's deadline is noticed here, on the same 15 ms tick the queue is
+     pumped by. Each armed column is checked one lead ahead of its deadline; the
+     launch is then queued with that deadline as its explicit `at`, so the
+     outgoing clip's last sample and the incoming clip's first sample share an
+     instant exactly as a scene handover does. */
+  React.useEffect(() => {
+    followTickRef.current = (context) => {
+      if (followRef.current.size === 0) return;
+      const nowSec = context.currentTime;
+      // Bar 0's lengths. Correct for THIS surface only because `claimClock`
+      // installs a single-segment meter map, so every bar of a set is bar 0's
+      // bar; a grid that ever admitted a meter map with more than one segment
+      // would have to measure the bar the clip actually started in.
+      const barSec = beatClock.barSec();
+      const beatSec = beatClock.gridSec('beat');
+      // A copy: the loop queues launches, which re-arms entries as they fire.
+      for (const [mixIndex, armed] of [...followRef.current]) {
+        const deadline = dueAt(armed.rule, armed.startedAt, armed.lengthSec, barSec, beatSec);
+        if (deadline > nowSec + LAUNCH_LEAD_SEC) continue;
+        // One follow per launch, whatever it decides: the next arming comes
+        // from whatever clip this column ends up playing.
+        followRef.current.delete(mixIndex);
+        const result = nextFollow(
+          {
+            sceneIndex: armed.sceneIndex,
+            occupiedScenes: columnScenes(mixIndex),
+            playsDone: armed.playsDone,
+            elapsedSec: nowSec - armed.startedAt,
+            lengthSec: armed.lengthSec,
+          },
+          armed.rule,
+          Math.random,
+        );
+        if (import.meta.env.DEV) {
+          // The timing line the follow can be checked against: the deadline it
+          // was given, how far ahead of it the pump noticed, and what it chose.
+          console.info(
+            `[perform] follow col ${mixIndex} row ${armed.sceneIndex} -> ${result ? (result.kind === 'stop' ? 'stop' : `row ${result.sceneIndex}`) : 'nothing'}`,
+            `at=${deadline.toFixed(4)} now=${nowSec.toFixed(4)} lead=${(deadline - nowSec).toFixed(4)}`,
+          );
+        }
+        if (!result) continue;
+        if (result.kind === 'stop') {
+          queueLaunch({ mixIndex, sceneIndex: armed.sceneIndex, entry: null, origin: 'follow', at: deadline });
+          continue;
+        }
+        const entry = sceneClips(result.sceneIndex).find((c) => c.mixIndex === mixIndex) ?? null;
+        // Decoding starts now rather than at the line, exactly as a press does.
+        if (entry) void getClipBuffer(entry.clip).catch(() => { /* logged on use */ });
+        queueLaunch({ mixIndex, sceneIndex: result.sceneIndex, entry, origin: 'follow', at: deadline });
+      }
+    };
+  }, [columnScenes, getClipBuffer, queueLaunch, sceneClips]);
+
+  // The pump: arm-and-queue any follow that has come due, take everything the
+  // queue has due and fire it, then stand down once BOTH are empty. Follows are
+  // evaluated first so one noticed this tick still fires on this tick, with its
+  // whole lead left to schedule in. Kept in a ref so the interval never has to
+  // be torn down and rebuilt as the callbacks above re-create.
   React.useEffect(() => {
     pumpRef.current = () => {
       const context = getEngineCtx();
+      followTickRef.current(context);
       for (const ticket of launchQueue.advance(context.currentTime)) fireTicket(ticket, context);
-      if (launchQueue.pending().length === 0) stopPump();
+      if (launchQueue.pending().length === 0 && followRef.current.size === 0) stopPump();
     };
   }, [fireTicket, launchQueue, stopPump]);
 
@@ -1248,6 +1518,169 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
         </div>
       </div>
 
+
+      {/* --- The follow-action editor ---------------------------------------
+          Opened from a cell's right-click menu, and rendered here rather than
+          over the cell: a grid row is 28px tall, and a popover that size would
+          have to fight the scroll container for room. Every control is a native
+          one with its own <label htmlFor> — the session-quantize select above is
+          the same pattern. */}
+      {followEditor && (() => {
+        const { mixIndex, sceneIndex } = followEditor;
+        const clip = clipAt(mixIndex, sceneIndex);
+        if (!clip) return null;
+        const rule = followOf(clip) ?? DEFAULT_FOLLOW;
+        const after = rule.after;
+        const byPlays = 'plays' in after;
+        const bars = 'plays' in after ? 1 : after.bars;
+        const beats = 'plays' in after ? 0 : after.beats;
+        const plays = 'plays' in after ? after.plays : 1;
+        const write = (next: FollowAction) => setFollow(mixIndex, sceneIndex, next);
+        const num = (raw: string, fallback: number) => {
+          const value = Number(raw);
+          return Number.isFinite(value) ? value : fallback;
+        };
+        const field = 'h-6 px-2 border border-black/50 bg-[#15171b] text-zinc-300 text-[10px] font-bold outline-none';
+        return (
+          <div className="shrink-0 flex flex-wrap items-center gap-2 border-b border-black/70 bg-[#262a31] px-2 py-1 text-[10px] font-bold text-zinc-300">
+            <span className="text-zinc-400">
+              {`Follow · ${clip.name} · ${tracks[mixIndex]?.name ?? ''} row ${sceneIndex + 1}`}
+            </span>
+
+            <label htmlFor="follow-after-form">After</label>
+            <select
+              id="follow-after-form"
+              name="followAfterForm"
+              value={byPlays ? 'plays' : 'bars'}
+              onChange={(e) => write({
+                ...rule,
+                after: e.target.value === 'plays' ? { plays: 1 } : { bars: 1, beats: 0 },
+              })}
+              title="Measure the period in bars and beats on the shared clock, or in times the clip has played."
+              className={`${field} cursor-pointer`}
+              style={{ colorScheme: 'dark' }}
+            >
+              <option value="bars">Bars + beats</option>
+              <option value="plays">Plays</option>
+            </select>
+
+            {byPlays ? (
+              <>
+                <label htmlFor="follow-plays">Plays</label>
+                <input
+                  id="follow-plays"
+                  name="followPlays"
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={plays}
+                  onChange={(e) => write({ ...rule, after: { plays: Math.max(1, num(e.target.value, 1)) } })}
+                  className={`${field} w-16`}
+                  style={{ colorScheme: 'dark' }}
+                />
+              </>
+            ) : (
+              <>
+                <label htmlFor="follow-bars">Bars</label>
+                <input
+                  id="follow-bars"
+                  name="followBars"
+                  type="number"
+                  min={0}
+                  step={1}
+                  value={bars}
+                  onChange={(e) => write({ ...rule, after: { bars: Math.max(0, num(e.target.value, 0)), beats } })}
+                  className={`${field} w-16`}
+                  style={{ colorScheme: 'dark' }}
+                />
+                <label htmlFor="follow-beats">Beats</label>
+                <input
+                  id="follow-beats"
+                  name="followBeats"
+                  type="number"
+                  min={0}
+                  step={1}
+                  value={beats}
+                  onChange={(e) => write({ ...rule, after: { bars, beats: Math.max(0, num(e.target.value, 0)) } })}
+                  className={`${field} w-16`}
+                  style={{ colorScheme: 'dark' }}
+                />
+              </>
+            )}
+
+            <label htmlFor="follow-a">Action</label>
+            <select
+              id="follow-a"
+              name="followA"
+              value={rule.a}
+              onChange={(e) => { if (isFollowKind(e.target.value)) write({ ...rule, a: e.target.value }); }}
+              title="Next / Previous walk the rows of THIS column that hold a clip, and do nothing at the ends."
+              className={`${field} cursor-pointer`}
+              style={{ colorScheme: 'dark' }}
+            >
+              {FOLLOW_KINDS.map((kind) => (
+                <option key={kind} value={kind}>{FOLLOW_KIND_LABELS[kind]}</option>
+              ))}
+            </select>
+
+            <label htmlFor="follow-b">Or</label>
+            <select
+              id="follow-b"
+              name="followB"
+              value={rule.b ?? ''}
+              onChange={(e) => {
+                const next = { ...rule };
+                if (isFollowKind(e.target.value)) next.b = e.target.value;
+                else delete next.b;
+                write(next);
+              }}
+              title="A second action. With one set, the chance below decides between them each time the rule fires."
+              className={`${field} cursor-pointer`}
+              style={{ colorScheme: 'dark' }}
+            >
+              <option value="">(nothing else)</option>
+              {FOLLOW_KINDS.map((kind) => (
+                <option key={kind} value={kind}>{FOLLOW_KIND_LABELS[kind]}</option>
+              ))}
+            </select>
+
+            <label htmlFor="follow-chance">
+              {rule.b ? `Chance of ${FOLLOW_KIND_LABELS[rule.a]}` : 'Chance (needs a second action)'}
+            </label>
+            <input
+              id="follow-chance"
+              name="followChance"
+              type="range"
+              min={0}
+              max={1}
+              step={0.01}
+              value={rule.chance}
+              disabled={!rule.b}
+              onChange={(e) => write({ ...rule, chance: Math.min(1, Math.max(0, num(e.target.value, 1))) })}
+              className="w-24 disabled:opacity-40"
+            />
+            <span className="w-10 text-right font-mono text-zinc-400 tabular-nums">
+              {`${Math.round(rule.chance * 100)}%`}
+            </span>
+
+            <button
+              type="button"
+              onClick={() => { setFollow(mixIndex, sceneIndex, undefined); setFollowEditor(null); }}
+              className="h-6 px-2 border border-red-900/70 bg-[#3a1719] text-red-100 hover:bg-[#5a2024]"
+            >
+              Remove
+            </button>
+            <button
+              type="button"
+              onClick={() => setFollowEditor(null)}
+              className="h-6 px-2 border border-black/50 bg-[#15171b] text-zinc-300 hover:bg-[#3a3d45] hover:text-white"
+            >
+              Done
+            </button>
+          </div>
+        );
+      })()}
+
       <div className={`overflow-auto ${fill ? 'flex-1 min-h-0' : 'max-h-140'}`}>
         <div
           className="grid min-w-245"
@@ -1328,23 +1761,51 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
                       ].filter(Boolean).join(' ')}
                     >
                       {clip ? (
-                        <button
-                          type="button"
-                          onClick={() => void launchClip(mixIndex, sceneIndex)}
-                          disabled={!isPlayableClip(clip)}
-                          aria-label={isQueued ? `${clip.name} queued on ${track.name}` : `Launch ${clip.name} on ${track.name}`}
-                          className={[
-                            'h-7 w-full px-1.5 flex items-center gap-1 border text-left',
-                            clipStyle(clip, color.clip),
-                            queuedRing,
-                            !isPlayableClip(clip) ? 'opacity-45 cursor-not-allowed' : 'hover:brightness-110',
-                          ].filter(Boolean).join(' ')}
-                          style={clip.color ? { backgroundColor: clip.color, borderColor: clip.color } : undefined}
-                          title={isQueued ? `${clip.name} — queued for the next launch line` : clipTitle(clip)}
-                        >
-                          <Play className="h-3 w-3 fill-current shrink-0" />
-                          <span className="min-w-0 truncate text-[10px] font-bold">{clip.name}</span>
-                        </button>
+                        (() => {
+                          // The rule this cell carries, and whether ITS menu is
+                          // the one currently open (the menu is one instance for
+                          // the whole grid, keyed by the cell that opened it).
+                          const follow = followOf(clip);
+                          const menuOpen =
+                            followMenu.payload?.mixIndex === mixIndex
+                            && followMenu.payload?.sceneIndex === sceneIndex;
+                          const followSuffix = follow ? ` — follow: ${describeFollow(follow)}` : '';
+                          return (
+                            <button
+                              type="button"
+                              onClick={() => void launchClip(mixIndex, sceneIndex)}
+                              onContextMenu={(e) => followMenu.open(e, { mixIndex, sceneIndex })}
+                              disabled={!isPlayableClip(clip)}
+                              aria-haspopup="menu"
+                              aria-expanded={menuOpen}
+                              aria-label={
+                                (isQueued
+                                  ? `${clip.name} queued on ${track.name}`
+                                  : `Launch ${clip.name} on ${track.name}`) + followSuffix
+                              }
+                              className={[
+                                'h-7 w-full px-1.5 flex items-center gap-1 border text-left',
+                                clipStyle(clip, color.clip),
+                                queuedRing,
+                                !isPlayableClip(clip) ? 'opacity-45 cursor-not-allowed' : 'hover:brightness-110',
+                              ].filter(Boolean).join(' ')}
+                              style={clip.color ? { backgroundColor: clip.color, borderColor: clip.color } : undefined}
+                              title={
+                                (isQueued ? `${clip.name} — queued for the next launch line` : clipTitle(clip))
+                                + followSuffix
+                                + ' · right-click for follow actions'
+                              }
+                            >
+                              <Play className="h-3 w-3 fill-current shrink-0" />
+                              <span className="min-w-0 truncate text-[10px] font-bold">{clip.name}</span>
+                              {/* The name already says it; this is the at-a-glance
+                                  cue a performer reads across a whole grid. */}
+                              {follow ? (
+                                <span aria-hidden="true" className="shrink-0 font-black leading-none">&raquo;</span>
+                              ) : null}
+                            </button>
+                          );
+                        })()
                       ) : (
                         /* An empty slot is a STOP button in Live, not dead space. */
                         <button
@@ -1425,6 +1886,51 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
           {launchError}
         </div>
       )}
+
+      {/* One menu instance for the whole grid, anchored at the cell that opened
+          it. Flat items, in the shapes ui/ContextMenu already has. */}
+      {followMenu.payload && (() => {
+        const { mixIndex, sceneIndex } = followMenu.payload;
+        const clip = clipAt(mixIndex, sceneIndex);
+        if (!clip) return null;
+        const rule = followOf(clip);
+        const presetItem = (a: FollowKind, title: string): ContextMenuItem => ({
+          type: 'item',
+          label: FOLLOW_KIND_LABELS[a],
+          hint: rule?.a === a && !rule.b ? 'on' : undefined,
+          title,
+          onSelect: () => setFollow(mixIndex, sceneIndex, followPreset(rule, a)),
+        });
+        const items: ContextMenuItem[] = [
+          { type: 'header', label: 'Follow action' },
+          {
+            type: 'item',
+            label: 'None',
+            hint: rule ? undefined : 'on',
+            title: 'The clip plays and this column stays on it.',
+            onSelect: () => setFollow(mixIndex, sceneIndex, undefined),
+          },
+          presetItem('stop', 'Stop this column when the period is up.'),
+          presetItem('next', 'Launch the next row of this column that HAS a clip; at the last one, nothing.'),
+          presetItem('again', 'Relaunch this same cell.'),
+          { type: 'separator' },
+          {
+            type: 'item',
+            label: 'Follow action\u2026',
+            title: 'Set the period, both actions, and the chance between them.',
+            onSelect: () => setFollowEditor({ mixIndex, sceneIndex }),
+          },
+        ];
+        return (
+          <ContextMenu
+            position={followMenu.position}
+            onClose={followMenu.close}
+            items={items}
+            title={`${clip.name}${rule ? ` — ${describeFollow(rule)}` : ''}`}
+          />
+        );
+      })()}
+
     </div>
   );
 };

@@ -28,14 +28,14 @@ interface FxRackProps {
   onReorder: (from: number, to: number) => void;
   onToggle: (entryId: string) => void;
   onUpdateParams: (entryId: string, params: Record<string, number>) => void;
-  /** The gesture boundary of the entries whose panel reports one — the bespoke
-   *  SLIDE-slider panels (spatializer / owlpad / chop / gater). One start before
-   *  the first `onUpdateParams` of a drag / key press / wheel burst on that
-   *  entry's surface, one end after its last; the end may carry no change at all.
-   *  The boundary is per ENTRY, not per param key, because one surface writes
-   *  several keys (an OWL-Pad drag moves x and y). Absent, or for the
-   *  schema-driven panel (EffectControls) which reports nothing, a consumer
-   *  recording a gesture is on its own fallback. See lib/gestureTracker.ts. */
+  /** The gesture boundary of an entry's panel — every panel the rack renders
+   *  reports one: the bespoke ones (spatializer / owlpad / chop / gater) and the
+   *  schema-driven EffectControls alike. One start before the first
+   *  `onUpdateParams` of a drag / key press / wheel burst on that entry's
+   *  surface, one end after its last; the end may carry no change at all. The
+   *  boundary is per ENTRY, not per param key, because one surface writes
+   *  several keys (an OWL-Pad drag moves x and y). Absent, a consumer recording
+   *  a gesture falls back to its own deadline. See lib/gestureTracker.ts. */
   onParamsGestureStart?: (entryId: string) => void;
   onParamsGestureEnd?: (entryId: string) => void;
   /** Project tempo, forwarded to the Gater's tempo-sync controls. */
@@ -151,6 +151,8 @@ export function FxRack({
                     layout={layout}
                     hideHeader
                     onChange={(p) => onUpdateParams(entry.id, p)}
+                    onGestureStart={onParamsGestureStart && (() => onParamsGestureStart(entry.id))}
+                    onGestureEnd={onParamsGestureEnd && (() => onParamsGestureEnd(entry.id))}
                   />
                 </div>
               </div>
@@ -297,7 +299,9 @@ export function FxRack({
             ) : (
               /* Every other effect (and Ares while its surface is closed):
                  the schema-driven panel — grouped knobs/sliders/toggles/
-                 selects, XY pads, presets, mix, units, double-click reset. */
+                 selects, XY pads, presets, mix, units, double-click reset. It
+                 reports the same per-entry gesture boundary as the bespoke
+                 panels, so a rack knob's automation pass ends on release. */
               <div className="pl-4">
                 <EffectControls
                   schema={schemaForRackEffect(def)}
@@ -307,6 +311,8 @@ export function FxRack({
                   layout={layout}
                   hideHeader
                   onChange={(p) => onUpdateParams(entry.id, p)}
+                  onGestureStart={onParamsGestureStart && (() => onParamsGestureStart(entry.id))}
+                  onGestureEnd={onParamsGestureEnd && (() => onParamsGestureEnd(entry.id))}
                 />
               </div>
             )}

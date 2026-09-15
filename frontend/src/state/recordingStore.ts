@@ -26,6 +26,29 @@
  *     coordinates and `editorStore.addClipToTrack` is given the same field set
  *     `lib/sendToTargets.ts:sendAudioToEditor` fills in, peaks included.
  *
+ * Two recorders, one press
+ * ------------------------
+ * A press drives TWO things: this store's mic engine, and `lib/midiCapture`'s
+ * note capture (mounted in `App.tsx`, watching this store's `status`). The
+ * engine opens one recorder per armed track and `placeTakes` lands one clip per
+ * take, so an armed INSTRUMENT track once came out of a single press carrying a
+ * mic take and a MIDI take stacked on top of each other.
+ *
+ * The split is made here, at the one point armed ids reach the engine
+ * (`syncArmed`), and it reads `midiCapture`'s own `capturesMidi` predicate so
+ * the two sides can never disagree about what a MIDI track is:
+ *
+ *   - `armedTrackIds` on THIS store stays every armed track. The RECORD key
+ *     counts them and the capture picks its own tracks out of that list.
+ *   - the ENGINE is armed only for the tracks `capturesMidi` rejects.
+ *   - when it rejects none — every armed track is a MIDI track — no recorder is
+ *     opened at all (`beginPass`), because the engine refuses an empty `start()`
+ *     with `nothing-armed`. The PRESS is otherwise untouched: the transport is
+ *     still released and the status still cycles `recording` -> `stopping` ->
+ *     `idle`, which is precisely what opens and closes the capture. Nothing new
+ *     is posted to `lastNotice`: from the user's side one press still made one
+ *     take per armed track.
+ *
  * Order of the press
  * ------------------
  * `engine.start()` resolves only once every recorder's `start` event has landed
@@ -128,6 +151,7 @@ import {
   useMetronomeStore,
 } from './metronomeStore';
 import { callEditorPlay } from './editorPlaybackBridge';
+import { capturesMidi } from '../lib/midiCapture';
 import { EDITOR_TIMELINE_ID } from '../components/audio/trackMenuModel';
 
 /* -------------------------------------------------------------------------- */
@@ -488,6 +512,11 @@ let started = false;
 let countInCancel: (() => void) | null = null;
 /** True from the record press until `engine.start()` settles. */
 let startInFlight = false;
+/** Did THIS pass open mic recorders at all? False when every armed track is a
+ *  MIDI track — see `beginPass`. `finishPass` reads it so a pass that opened
+ *  nothing is not stopped, and the engine is never asked for takes it has not
+ *  got. */
+let micPassOpen = false;
 /** A stop that arrived while `start()` was still in flight. */
 let stopPending = false;
 /** Did the transport actually roll for the pass being placed? When it did not,
@@ -539,13 +568,40 @@ function getEngine(): RecordingEngine {
   return engine;
 }
 
-/** Mirror `ids` onto the engine's armed set, and onto the store. */
+/**
+ * Which of the armed ids the MIC records — every one `lib/midiCapture` does not
+ * take (see the header's "Two recorders, one press").
+ *
+ * An id with no track behind it is kept: `armedTrackIds` is a seam and a host
+ * may name a track this store cannot see, and the old behaviour for such an id
+ * was to arm a recorder for it.
+ */
+function micArmedIds(ids: readonly string[]): string[] {
+  if (ids.length === 0) return [];
+  const { tracks, clips } = useEditorStore.getState();
+  const wanted = new Set(ids);
+  const byId = new Map(tracks.filter((t) => wanted.has(t.id)).map((t) => [t.id, t]));
+  return ids.filter((id) => {
+    const track = byId.get(id);
+    return track ? !capturesMidi(track, clips) : true;
+  });
+}
+
+/**
+ * Mirror `ids` onto the store, and the MIC half of them onto the engine.
+ *
+ * The two sets are deliberately different. The STORE's `armedTrackIds` is every
+ * armed track — the RECORD key counts them and `lib/midiCapture` picks its own
+ * tracks out of that list — while the ENGINE only ever hears about the tracks
+ * whose take is a microphone's.
+ */
 function syncArmed(ids: readonly string[]): void {
   const e = getEngine();
-  const want = new Set(ids);
+  const micIds = micArmedIds(ids);
+  const want = new Set(micIds);
   for (const id of e.armed()) if (!want.has(id)) e.disarm(id);
   const have = new Set(e.armed());
-  for (const id of ids) if (!have.has(id)) e.arm(id, { kind: 'mic' });
+  for (const id of micIds) if (!have.has(id)) e.arm(id, { kind: 'mic' });
   if (!sameIds(st().armedTrackIds, ids)) setState({ armedTrackIds: [...ids] });
 }
 
@@ -555,13 +611,21 @@ async function beginPass(): Promise<void> {
   startInFlight = true;
   stopPending = false;
   transportRolled = false;
-  try {
-    await e.start();
-  } catch (err) {
-    startInFlight = false;
-    setState({ status: 'idle', lastError: asRecordingError(err), levels: {} });
-    pendingLevels = {};
-    return;
+  // Every armed track is a MIDI track: there is no recorder to open, and the
+  // engine would reject an empty `start()` with `nothing-armed`. The rest of
+  // the press is unchanged — the transport still rolls and the status still
+  // cycles, which is the whole contract `lib/midiCapture` opens and closes on.
+  micPassOpen = e.armed().length > 0;
+  if (micPassOpen) {
+    try {
+      await e.start();
+    } catch (err) {
+      startInFlight = false;
+      micPassOpen = false;
+      setState({ status: 'idle', lastError: asRecordingError(err), levels: {} });
+      pendingLevels = {};
+      return;
+    }
   }
   startInFlight = false;
   // A press that arrived while the inputs were opening: the recorders are live
@@ -583,43 +647,83 @@ async function beginPass(): Promise<void> {
 async function finishPass(): Promise<void> {
   setState({ status: 'stopping' });
   let takes: Take[] = [];
-  try {
-    takes = await getEngine().stop();
-  } catch (err) {
-    setState({ lastError: asRecordingError(err) });
+  // Nothing was opened on a MIDI-only pass, so there is nothing to stop and no
+  // take to place — but the status flip above and the one below still happen,
+  // because they are what closes the MIDI capture.
+  const hadMic = micPassOpen;
+  micPassOpen = false;
+  if (hadMic) {
+    try {
+      takes = await getEngine().stop();
+    } catch (err) {
+      setState({ lastError: asRecordingError(err) });
+    }
   }
   placeTakes(takes);
+  // The pass is over, so there is no pass window any more. Cleared HERE and not
+  // at the press, so `currentPassPunchWindow()` reads null at rest instead of
+  // the last pass's edges — a caller asking between passes must not be handed a
+  // window nothing is recording into. Safe for `lib/midiCapture`: it froze its
+  // own copy when it opened, and it closes on the `stopping` flip above.
+  passPunchWindow = null;
   pendingLevels = {};
   setState({ status: 'idle', levels: {} });
 }
 
 /**
- * The editor's loop region, or `null` when there is none to punch into. A
- * region whose end is not past its start is no region: `setLoopRegion` itself
- * refuses to enable one under 50 ms, and a degenerate one would crop every
- * take to nothing.
+ * THE punch gate, as a pure function of the mode and the editor's loop region:
+ * the transport-second window a pass may write into, or `null` when it may
+ * write anywhere (punch off, or no region to punch into). An open edge is
+ * infinite rather than clamped so the crop below is one expression for all
+ * three modes.
+ *
+ * Exported because it has THREE callers now and they must never disagree: the
+ * take crop (through `punchWindow()` below), `lib/midiCapture`'s note crop
+ * (through `currentPassPunchWindow()`), and the timeline's punch band in
+ * `WaveformEditor`. A band that promised a window this refuses would be a lie
+ * about what the next press is going to keep.
+ *
+ * The region terms are the whole of the gate, not a pre-filtered region:
+ *   - `enabled` is the user saying the region is in force. A region that is SET
+ *     but switched off punches nothing.
+ *   - a region whose end is not past its start is no region — `setLoopRegion`
+ *     itself refuses to enable one under 50 ms, and a degenerate one would crop
+ *     every take to nothing.
  */
-function loopRegion(): { start: number; end: number } | null {
-  const { loopEnabled, loopStart, loopEnd } = useEditorStore.getState();
-  if (!loopEnabled) return null;
-  if (!Number.isFinite(loopStart) || !Number.isFinite(loopEnd) || loopEnd <= loopStart) return null;
-  return { start: loopStart, end: loopEnd };
-}
-
-/**
- * The transport-second window this pass may write into, or `null` when it may
- * write anywhere (punch off, or no loop region). An open edge is infinite
- * rather than clamped so the crop below is one expression for all three modes.
- */
-function punchWindow(): { from: number; to: number } | null {
-  const punch = punchMode();
+export function punchWindowFrom(
+  punch: PunchMode,
+  loop: { enabled: boolean; start: number; end: number } | null,
+): { from: number; to: number } | null {
   if (punch === 'off') return null;
-  const loop = loopRegion();
-  if (!loop) return null;
+  if (!loop || !loop.enabled) return null;
+  if (!Number.isFinite(loop.start) || !Number.isFinite(loop.end) || loop.end <= loop.start) return null;
   return {
     from: punch === 'out' ? -Infinity : loop.start,
     to: punch === 'in' ? Infinity : loop.end,
   };
+}
+
+/**
+ * The window a press made RIGHT NOW would write into — the gate above, applied
+ * to the current mode and the editor's current loop region. Exported for the
+ * same reason the helper is: one derivation, however many surfaces read it.
+ */
+export function punchWindow(): { from: number; to: number } | null {
+  const { loopEnabled, loopStart, loopEnd } = useEditorStore.getState();
+  return punchWindowFrom(punchMode(), { enabled: loopEnabled, start: loopStart, end: loopEnd });
+}
+
+/**
+ * The window the pass IN FLIGHT was pressed with, or `null` when no pass has
+ * been pressed (or the last one punched nowhere). Read by `lib/midiCapture`,
+ * which opens its captures on the flip into `recording`: for a pass with a
+ * count-in that flip is a bar or more after the press, so reading the live
+ * window there would crop the notes to a window the take crop is not using.
+ * This is that one frozen window, so the two halves of a press can never
+ * describe different edges.
+ */
+export function currentPassPunchWindow(): { from: number; to: number } | null {
+  return passPunchWindow;
 }
 
 /**
@@ -847,6 +951,7 @@ export function resetRecording(): void {
   started = false;
   countInCancel = null;
   startInFlight = false;
+  micPassOpen = false;
   stopPending = false;
   takeSeq = 0;
   transportRolled = false;

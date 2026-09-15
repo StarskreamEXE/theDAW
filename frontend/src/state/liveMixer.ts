@@ -128,6 +128,11 @@ interface TrackNodes {
    *  from `panner` or earlier would read a track `latency + comp` early and so
    *  show tracks lighting up out of step with each other and with the master. */
   comp: DelayNode;
+  /** The strip's meter tap: a LEAF analyser hung off `comp`, i.e. exactly where
+   *  the METERING note above says a per-track meter has to sit. It is read by
+   *  `state/stripMeters`, never by the routing pass — see `makeStripMeter`.
+   *  Absent when the context cannot make one (the routing test's fakes). */
+  meter?: AnalyserNode;
   /** Per-track insert FX, spliced gain -> muteGain -> [fx] -> panner. */
   fx: ChainHandle;
   fxFullSig: string; // topology + params (skip no-op reconciles)
@@ -171,6 +176,11 @@ export interface BusNodes {
   muteGain: GainNode;
   /** What this bus feeds downstream. */
   output: GainNode;
+  /** The strip's meter tap: a LEAF analyser hung off `output`, so it reads the
+   *  bus post-rack, post-fader and post-mute — the same end-of-strip point a
+   *  track meters at. Read by `state/stripMeters`; see `makeStripMeter`.
+   *  Absent when the context cannot make one (the routing test's fakes). */
+  meter?: AnalyserNode;
   fxFullSig: string; // topology + params (skip no-op reconciles)
   fxTopoSig: string; // topology only (rebuild trigger)
 }
@@ -182,6 +192,9 @@ let busNodes = new Map<string, BusNodes>();
 /** One gain node per send, keyed `sendKey(from, to)`, so `setSendGain` reaches
  *  the exact node without a rebuild. */
 let sendGains = new Map<string, GainNode>();
+/** Reused scratch map behind `getStripMeterNodes()` — rebuilt in place once per
+ *  animation frame rather than allocated. */
+const stripMeterNodes = new Map<string, AnalyserNode>();
 let sources: AudioBufferSourceNode[] = [];
 let rafId = 0;
 let startCtxTime = 0; // ctx.currentTime at the moment playback (re)started
@@ -404,6 +417,67 @@ export interface MixBus {
   mute: boolean;
 }
 
+/* ── strip meter taps ────────────────────────────────────────────────────────
+   One analyser per strip, hung off the END of that strip — a track's `comp`, a
+   bus's `output`. Read by `state/stripMeters` once per animation frame; see that
+   file for where the tap point comes from.
+
+   A LEAF, never a node in the routing graph. `wireRoutingGraph` only ever sees
+   `outputNodeOf` (the comp / the output), so the analyser is invisible to
+   `topoOrder` and to the send taps; it has no outgoing connection of its own,
+   and it analyses anyway because its input is already being pulled toward the
+   destination — the same shape `levelsStore` uses for its two channel
+   analysers, which are likewise connected to nothing. */
+
+/** Window length for a strip analyser. 2048 for `levelsStore`'s reason: ~46 ms
+ *  at 44.1 kHz, so consecutive windows OVERLAP at 60 fps and no peak can slip
+ *  between two reads. */
+const STRIP_METER_FFT_SIZE = 2048;
+
+/**
+ * Make one strip's meter tap, or `undefined` when the context cannot.
+ *
+ * MONO, EXPLICITLY. An `AnalyserNode` analyses a mono down-mix of its input
+ * whatever its channel settings say; `channelCount = 1` with
+ * `channelCountMode = 'explicit'` and `'speakers'` interpretation does not
+ * select a channel and does not change the numbers — it PINS that fold at the
+ * node's declared input instead of leaving it implicit, so the reading a strip
+ * bar shows is stated by this file rather than inferred. What it does NOT undo
+ * is the mono sum's own cost: a hard-panned full-scale track reads 6 dB down,
+ * which is the usual trade for a single-bar strip meter and is why the master
+ * meter (`levelsStore`) stays per-channel.
+ *
+ * Guarded rather than assumed: `createBusNodes` is also driven by the fake
+ * contexts in `liveMixer.routing.test.ts`, which implement only the nodes the
+ * routing pass needs. A strip with no tap just never appears in
+ * `getStripMeterNodes()`, and its bar sits at silence.
+ */
+function makeStripMeter(ctx: BaseAudioContext, source: AudioNode): AnalyserNode | undefined {
+  if (typeof ctx.createAnalyser !== 'function') return undefined;
+  const meter = ctx.createAnalyser();
+  meter.fftSize = STRIP_METER_FFT_SIZE;
+  meter.channelCount = 1;
+  meter.channelCountMode = 'explicit';
+  meter.channelInterpretation = 'speakers';
+  source.connect(meter);
+  return meter;
+}
+
+/**
+ * Every live strip's meter tap, keyed by strip id (tracks first, then buses).
+ *
+ * The one seam `state/stripMeters` reads, so it never reaches into the private
+ * `trackNodes` / `busNodes` maps. The returned map is REUSED between calls — it
+ * is rebuilt in place on each one, because the caller asks for it once per
+ * animation frame and a fresh Map per frame would be pure garbage.
+ */
+export function getStripMeterNodes(): ReadonlyMap<string, AnalyserNode> {
+  stripMeterNodes.clear();
+  for (const [id, n] of trackNodes) if (n.meter) stripMeterNodes.set(id, n.meter);
+  for (const [id, n] of busNodes) if (n.meter) stripMeterNodes.set(id, n.meter);
+  return stripMeterNodes;
+}
+
 /** Build one bus strip: `input -> [fx] -> gain -> muteGain -> output`. The
  *  output is left UNCONNECTED — `wireRoutingGraph` places it, because where a
  *  bus goes is a property of the graph, not of the strip. */
@@ -419,12 +493,14 @@ export function createBusNodes(ctx: BaseAudioContext, bus: MixBus): BusNodes {
   const chain = bus.fxChain ?? [];
   const fx = buildEffectChain(ctx, input, gain, chain); // input -> [fx] -> gain
   gain.connect(muteGain).connect(output);
+  const meter = makeStripMeter(ctx, output); // leaf tap; not part of the routing
   return {
     input,
     fx,
     gain,
     muteGain,
     output,
+    meter,
     fxFullSig: JSON.stringify(chain),
     fxTopoSig: chainTopoSig(chain),
   };
@@ -569,6 +645,8 @@ export interface DisposableBus {
   gain: Disconnectable;
   muteGain: Disconnectable;
   output: Disconnectable;
+  /** The leaf meter tap, when the context could make one. */
+  meter?: Disconnectable;
 }
 
 /** Tear down every bus strip and every send gain. Leaving either behind on a
@@ -579,7 +657,7 @@ export function disposeBusNodes(
   sends: Iterable<Disconnectable>,
 ): void {
   for (const b of buses) {
-    try { b.fx.dispose(); b.input.disconnect(); b.gain.disconnect(); b.muteGain.disconnect(); b.output.disconnect(); } catch { /* gone */ }
+    try { b.fx.dispose(); b.input.disconnect(); b.gain.disconnect(); b.muteGain.disconnect(); b.output.disconnect(); b.meter?.disconnect(); } catch { /* gone */ }
   }
   for (const g of sends) {
     try { g.disconnect(); } catch { /* gone */ }
@@ -1039,7 +1117,7 @@ const NO_CHAIN_DELAYS: ChainAutomationDelays = { panSec: 0, prefix: {} };
  *  — the master rack is downstream of the sum, so it has no comp row and the
  *  alignment pass never hears about it. */
 let trackChainDelays = new Map<string, { sig: string; value: ChainAutomationDelays }>();
-let masterChainDelays: { sig: string; value: ChainAutomationDelays } = { sig: ' ', value: NO_CHAIN_DELAYS };
+let masterChainDelays: { sig: string; value: ChainAutomationDelays } = { sig: '\0', value: NO_CHAIN_DELAYS };
 
 /** Topology AND params: `RackLatencySpec` may be a function of an entry's params,
  *  so a knob turn can move these numbers. The same `JSON.stringify` gate the live
@@ -1274,7 +1352,7 @@ function disposeBusGraph(): void {
  *  trackNodes map for the caller to replace. */
 function disposeTrackNodes(): void {
   for (const n of trackNodes.values()) {
-    try { n.fx.dispose(); n.gain.disconnect(); n.muteGain.disconnect(); n.panner.disconnect(); n.comp.disconnect(); } catch { /* gone */ }
+    try { n.fx.dispose(); n.gain.disconnect(); n.muteGain.disconnect(); n.panner.disconnect(); n.comp.disconnect(); n.meter?.disconnect(); } catch { /* gone */ }
   }
   // Buses and sends only exist to carry tracks, and a send gain left behind
   // would keep a second path into the master alive after its source is gone.
@@ -1287,6 +1365,27 @@ function buildBusNodes(buses: MixBus[]): void {
   disposeBusGraph();
   busNodes = new Map();
   for (const b of buses) busNodes.set(b.id, createBusNodes(ctx, b));
+}
+
+/**
+ * Re-hang every strip's meter tap off the end of its strip.
+ *
+ * `wireRouting` clears the OUTPUT side of every strip with a bare
+ * `disconnect()`, which takes down ALL of that node's edges — the meter tap
+ * included, because it hangs off the very node the rewire is clearing. The tap
+ * is not part of the routing and must not be rebuilt by it, so it is simply
+ * re-attached here, after the sweep and before the graph is walked. The ONLY
+ * ordering requirement is "after the disconnects", because that is what removes
+ * the tap; re-attaching is idempotent, since connecting an edge that already
+ * exists is ignored rather than doubled.
+ */
+function reconnectLeafTaps(): void {
+  for (const n of trackNodes.values()) {
+    if (n.meter) { try { n.comp.connect(n.meter); } catch { /* gone */ } }
+  }
+  for (const n of busNodes.values()) {
+    if (n.meter) { try { n.output.connect(n.meter); } catch { /* gone */ } }
+  }
 }
 
 /**
@@ -1305,6 +1404,7 @@ function wireRouting(graph: RoutingGraph): void {
   for (const n of trackNodes.values()) { try { n.comp.disconnect(); } catch { /* gone */ } }
   for (const n of busNodes.values()) { try { n.output.disconnect(); } catch { /* gone */ } }
   for (const g of sendGains.values()) { try { g.disconnect(); } catch { /* gone */ } }
+  reconnectLeafTaps(); // the sweep above took the meters down with the routing
   sendGains = wireRoutingGraph(graph, {
     outputNodeOf: (id) => trackNodes.get(id)?.comp ?? busNodes.get(id)?.output,
     inputNodeOf: (id) => (id === MASTER_ID ? master : busNodes.get(id)?.input),
@@ -1338,11 +1438,13 @@ function buildTrackNodes(tracks: EditorTrack[]): void {
     gain.connect(muteGain);
     const fx = buildEffectChain(ctx, muteGain, panner, chain); // gain -> muteGain -> [fx] -> panner
     const comp = insertCompNode(ctx, panner); // panner -> comp; wireRouting places the rest
+    const meter = makeStripMeter(ctx, comp); // leaf tap, POST-comp; see TrackNodes.comp
     trackNodes.set(t.id, {
       gain,
       muteGain,
       panner,
       comp,
+      meter,
       fx,
       fxFullSig: JSON.stringify(chain),
       fxTopoSig: chainTopoSig(chain),

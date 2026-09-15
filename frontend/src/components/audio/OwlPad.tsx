@@ -9,7 +9,7 @@
  * so the pad and the sound stay in sync (and the offline bounce uses them too).
  */
 
-import { useRef } from 'react';
+import { useEffect, useRef } from 'react';
 import { SlideTrack } from './SlideTrack';
 import { OWLPAD_PROGRAMS } from '../../lib/rackEffects';
 
@@ -17,12 +17,13 @@ interface OwlPadProps {
   params: Record<string, number>;
   onChange: (params: Record<string, number>) => void;
   idPrefix: string;
-  /** The panel's gesture boundary, straight through to the SLIDE slider: one
-   *  start before the first `onChange` of a drag / key press / wheel burst and
-   *  one end after its last. Lets a consumer recording a gesture (automation
-   *  touch) stop guessing it from a deadline. See lib/gestureTracker.ts. The XY
-   *  surface itself is a bespoke pointer target and reports nothing, so a drag on
-   *  the pad still leaves the consumer on its fallback. */
+  /** The panel's gesture boundary: one start before the first `onChange` of a
+   *  drag / key press / wheel burst and one end after its last. Lets a consumer
+   *  recording a gesture (automation touch) stop guessing it from a deadline.
+   *  See lib/gestureTracker.ts. The SLIDE slider forwards its own; the XY
+   *  SURFACE is a bespoke pointer target with a single input, so it reports the
+   *  pair directly — the end after the release's own write (the gate-off), so
+   *  that write lands INSIDE the gesture rather than after it. */
   onGestureStart?: () => void;
   onGestureEnd?: () => void;
 }
@@ -42,6 +43,12 @@ const axisLabels = (program: number): { x: string; y: string } => {
 export function OwlPad({ params, onChange, idPrefix, onGestureStart, onGestureEnd }: OwlPadProps) {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const dragging = useRef(false);
+  // Unmounting mid-drag must still close the gesture: the pad's own pointerup
+  // will never arrive, and a begun lane with no end is the one failure the
+  // automation store cannot recover from (lib/automationGesture.ts). Read
+  // through a ref so the cleanup cannot close over a stale prop.
+  const endRef = useRef(onGestureEnd); endRef.current = onGestureEnd;
+  useEffect(() => () => { if (dragging.current) endRef.current?.(); }, []);
 
   const x = clamp(params.x ?? 0.5, 0, 1);
   const y = clamp(params.y ?? 0.3, 0, 1);
@@ -69,14 +76,19 @@ export function OwlPad({ params, onChange, idPrefix, onGestureStart, onGestureEn
     if (e.pointerType === 'mouse' && e.button !== 0) return;
     dragging.current = true;
     (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+    onGestureStart?.(); // before the press's own write, below
     fromPointer(e.clientX, e.clientY);
     e.preventDefault();
   };
   const onMove = (e: React.PointerEvent) => { if (dragging.current) fromPointer(e.clientX, e.clientY); };
   const onUp = (e: React.PointerEvent) => {
+    // pointerup and pointercancel both land here; only the one that actually
+    // ended a drag closes the gesture, so the pair stays balanced.
+    const wasDragging = dragging.current;
     dragging.current = false;
     (e.currentTarget as Element).releasePointerCapture?.(e.pointerId);
     if (!hold) onChange({ ...params, active: 0 }); // gate back to dry on release
+    if (wasDragging) onGestureEnd?.();             // AFTER that final write
   };
 
   const programId = `${idPrefix}-owlpad-program`;

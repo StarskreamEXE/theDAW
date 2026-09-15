@@ -1,5 +1,6 @@
 // Typed client for the DAW project import backend (/api/dawimport/*).
 import { getJson, postJson } from './apiJson';
+import type { FollowAction } from './followAction';
 
 export interface DawClip {
   name: string;
@@ -25,6 +26,11 @@ export interface DawClip {
   source_tempo?: number | null;
   /** Clip colour as #rrggbb, decoded from Live's palette index. */
   color?: string | null;
+  /** What this clip does to its column once it has played for a set period —
+   *  Live's follow action. Absent on every imported set (no parser reads one
+   *  yet); set in the Session grid and carried through the .tasmo round-trip as
+   *  `follow_action`. See lib/followAction.ts. */
+  followAction?: FollowAction;
 }
 
 export interface DawDevice {

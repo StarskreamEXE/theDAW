@@ -44,6 +44,17 @@ export interface LaunchSpec {
   action: LaunchAction;
   /** Seconds into the source to start at, carried through to the consumer. */
   offsetSec?: number;
+  /**
+   * The exact instant to land on, overriding `grid` when it is a finite number.
+   *
+   * Only a caller that already KNOWS the instant should pass this: a clip's
+   * follow action fires at the boundary of the clip that is finishing, and
+   * rounding that up to the next launch line would put a hole the length of the
+   * quantization into the column it was meant to hand over seamlessly. A press
+   * still leaves this out and gets the grid; a non-finite value falls back to
+   * the grid too, so a miscomputed deadline can never poison the queue.
+   */
+  at?: number;
 }
 
 /** A queued intent, frozen so a consumer cannot rewrite the queue's state. */
@@ -122,7 +133,12 @@ export const createLaunchQueue = (options: LaunchQueueOptions): LaunchQueue => {
       // a finite number, and `advance` then fires the ticket immediately.
       const reported = now();
       const from = Number.isFinite(reported) ? reported : 0;
-      const line = nextGrid(spec.grid, from);
+      // An explicit finite `at` is the caller's own deadline and is taken as
+      // given — the clock is not asked at all, so nothing rounds it up and no
+      // cold-clock anchor is set from a launch that never asked for one.
+      const line = spec.at !== undefined && Number.isFinite(spec.at)
+        ? spec.at
+        : nextGrid(spec.grid, from);
       const at = Number.isFinite(line) ? line : from;
       const ticket: LaunchTicket = Object.freeze({
         slotId,

@@ -18,9 +18,20 @@
  *     ]}
  *   />
  *
+ * A menu whose items are the settings of one thing gives each row a `checked`
+ * boolean; those rows become `menuitemradio` with `aria-checked`, and the live
+ * one is tinted. Rows without it stay plain `menuitem` commands.
+ *
  * Closing rules: clicking outside, pressing Escape, or right-clicking
  * anywhere else all close the menu. Items run `onSelect` then the menu
  * auto-closes — callers don't need to remember to call `onClose`.
+ *
+ * Keyboard: opening focuses the first enabled row, Arrow Up/Down and Home/End
+ * move between rows (wrapping), Enter/Space activate the focused one (the rows
+ * are real buttons), Escape closes, and closing hands focus back to whatever
+ * opened the menu. A caller therefore only has to set `position` — from a
+ * right-click or from Shift+F10 on its own control — to get a menu a keyboard
+ * can drive.
  */
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
@@ -51,6 +62,16 @@ export type ContextMenuItem =
        *  Note a DISABLED item is `pointer-events: none`, so a reason that the
        *  user must see belongs in `hint`, which is always visible. */
       title?: string;
+      /**
+       * Radio state, for a menu whose items are the settings of ONE thing (a
+       * mode picker). DEFINED — `true` or `false` — makes the row a
+       * `menuitemradio` carrying `aria-checked`, which is what tells a screen
+       * reader the row is a choice among several and which one is live.
+       * UNDEFINED (the default, and every existing caller) leaves it a plain
+       * `menuitem`, because a command row that claims a checked state it has
+       * not got is worse than one that claims nothing.
+       */
+      checked?: boolean;
       danger?: boolean;
       disabled?: boolean;
       onSelect: () => void;
@@ -82,6 +103,8 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({
   minWidth = '12rem',
 }) => {
   const menuRef = useRef<HTMLDivElement | null>(null);
+  /** The rendered row buttons, by item index (separators/headers leave holes). */
+  const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   // The menu portals to <body>, outside the Shell's `.edit-theme-scope`, so it
   // carries its own scope: the theme's popup surface, lines and ink tiers reach
   // it the same way they reach the rest of the app. `--et-root-bg` is left off
@@ -156,7 +179,76 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({
     };
   }, [position, onClose]);
 
+  // FOCUS. A menu opened from the keyboard (Shift+F10 / the Menu key on a
+  // focused control) is unusable if focus stays behind on the opener: nothing
+  // is reachable but Tab, which walks straight past the menu into whatever
+  // follows it in the document. So focus moves to the first enabled row on
+  // open and back to the opener on close.
+  //
+  // Deferred a frame: `useLayoutEffect` above is still clamping the menu into
+  // the viewport, and focusing an element parked at -9999 scrolls the page to
+  // it. Restoring is CONDITIONAL — an `onSelect` that opened a modal and
+  // focused it has already run by the time this cleanup does, and stealing
+  // focus back from it would be worse than not restoring at all. So the
+  // opener only gets focus back when nothing else took it (focus is on the
+  // body, lost with the removed row, or still inside the menu).
+  //
+  // `requestAnimationFrame` is asked for rather than assumed: the contrast
+  // suite renders this component under a Node DOM shim that has no frame
+  // clock, and a menu with no frames to wait for has no clamp to wait for
+  // either — the focus can just happen now.
+  useEffect(() => {
+    if (!position || typeof document === 'undefined') return;
+    const opener = document.activeElement as HTMLElement | null;
+    const menu = menuRef.current;
+    const focusFirst = () => {
+      itemRefs.current.find((el) => el && !el.disabled)?.focus();
+    };
+    const framed = typeof requestAnimationFrame === 'function';
+    const raf = framed ? requestAnimationFrame(focusFirst) : 0;
+    if (!framed) focusFirst();
+    return () => {
+      if (framed) cancelAnimationFrame(raf);
+      const active = document.activeElement;
+      const lost = !active || active === document.body || (!!menu && menu.contains(active));
+      if (!lost) return;
+      if (opener && opener !== document.body && document.contains(opener)) opener.focus();
+    };
+  }, [position]);
+
   if (!position) return null;
+
+  // A fresh row list every render, so a shortened `items` leaves no stale node
+  // behind for the arrow keys to land on.
+  itemRefs.current.length = items.length;
+
+  /**
+   * Arrow / Home / End move focus between the rows, wrapping — the menu
+   * keyboard interface from the WAI-ARIA menu pattern. Enter and Space are NOT
+   * handled here on purpose: every row is a real `<button>`, so the browser
+   * already activates the focused one with both and a handler of ours would
+   * fire the item twice. Escape is the window listener above, so it closes the
+   * menu from anywhere, inside it or not.
+   */
+  const onMenuKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp' && e.key !== 'Home' && e.key !== 'End') return;
+    const rows = itemRefs.current.filter(
+      (el): el is HTMLButtonElement => !!el && !el.disabled,
+    );
+    if (rows.length === 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const at = rows.indexOf(document.activeElement as HTMLButtonElement);
+    const next =
+      e.key === 'Home'
+        ? 0
+        : e.key === 'End'
+          ? rows.length - 1
+          : e.key === 'ArrowDown'
+            ? (at < 0 ? 0 : (at + 1) % rows.length)
+            : (at < 0 ? rows.length - 1 : (at - 1 + rows.length) % rows.length);
+    rows[next].focus();
+  };
 
   const handleItemClick = (item: Extract<ContextMenuItem, { type: 'item' }>) => {
     if (item.disabled) return;
@@ -191,6 +283,7 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({
       // keeps the edge gap above and below, so a menu taller than the window
       // scrolls inside itself.
       style={{ left: pos.x, top: pos.y, minWidth, maxWidth: 'min(22rem, 90vw)', maxHeight: 'calc(100vh - 12px)' }}
+      onKeyDown={onMenuKeyDown}
       onClick={(e) => e.stopPropagation()}
       onContextMenu={(e) => {
         // Suppress the browser's native right-click menu when the user
@@ -225,17 +318,24 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({
         const itemColor = item.danger
           ? 'text-red-300 hover:bg-red-500/20'
           : 'text-purple-200 hover:bg-purple-500/15';
+        // The live choice of a radio group is tinted as well as marked with
+        // `aria-checked`: the state has to be visible, not only announced.
+        const checkedTint = item.checked ? ' bg-purple-500/10' : '';
         // A disabled row dims its icon and label only. The hint is the row's
         // stated reason ("nothing copied"), so it stays at full ink.
         return (
           <button
             key={idx}
+            ref={(el) => {
+              itemRefs.current[idx] = el;
+            }}
             type="button"
-            role="menuitem"
+            role={item.checked === undefined ? 'menuitem' : 'menuitemradio'}
+            aria-checked={item.checked}
             disabled={item.disabled}
             title={item.title}
             onClick={() => handleItemClick(item)}
-            className={`w-full text-left px-3 py-1.5 flex items-center justify-between gap-3 disabled:pointer-events-none ${itemColor}`}
+            className={`w-full text-left px-3 py-1.5 flex items-center justify-between gap-3 disabled:pointer-events-none ${itemColor}${checkedTint}`}
           >
             <span className={`flex items-center gap-1.5 min-w-0${item.disabled ? ' opacity-40' : ''}`}>
               {item.icon ? <span className="shrink-0">{item.icon}</span> : null}

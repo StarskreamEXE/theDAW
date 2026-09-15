@@ -4,8 +4,16 @@
  * travel are log-aware through the same mapping the knobs use, so a
  * frequency axis sweeps musically. Keyboard: arrows nudge X/Y by one step
  * (Shift = 10 steps); double-click resets both to their defaults.
+ *
+ * Like SlideTrack and EffectKnob, the pad reports its GESTURE boundary —
+ * `onGestureStart` before the first `onChange` of a drag / key press and
+ * `onGestureEnd` after its last — so a consumer recording a gesture (automation
+ * touch) does not have to infer one from a deadline. One boundary covers BOTH
+ * lanes: a drag writes x and y together, and they begin and end together. Both
+ * props are optional; the rules live in `lib/gestureTracker.ts`.
  */
-import React, { useId, useRef } from 'react';
+import React, { useEffect, useId, useRef } from 'react';
+import { createGestureTracker } from '../../../lib/gestureTracker';
 import { formatParamValue, fromNorm, snapParam, toNorm, type ParamSchema } from './paramFormat';
 
 interface EffectXYPadProps {
@@ -18,14 +26,35 @@ interface EffectXYPadProps {
   size?: number;
   /** Hex accent for the dot/crosshair (defaults to the purple brand). */
   color?: string;
+  /** Fired once before the first `onChange` of a gesture. */
+  onGestureStart?: () => void;
+  /** Fired once after the last `onChange` of a gesture — including a gesture
+   *  that produced no change at all, and including an unmount mid-gesture. */
+  onGestureEnd?: () => void;
 }
 
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 
-export const EffectXYPad: React.FC<EffectXYPadProps> = ({ label, xParam, yParam, x, y, onChange, size = 120, color = '#a855f7' }) => {
+export const EffectXYPad: React.FC<EffectXYPadProps> = ({ label, xParam, yParam, x, y, onChange, size = 120, color = '#a855f7', onGestureStart, onGestureEnd }) => {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const dragging = useRef(false);
   const capId = useId();
+  // The tracker outlives every render (a gesture spans many), so it reads the
+  // callbacks through refs rather than closing over the props of the render that
+  // happened to create it. Created ON DEMAND and dropped by the unmount cleanup,
+  // because `dispose()` is terminal and StrictMode remounts the same instance.
+  const startRef = useRef(onGestureStart); startRef.current = onGestureStart;
+  const endRef = useRef(onGestureEnd); endRef.current = onGestureEnd;
+  const gestureRef = useRef<ReturnType<typeof createGestureTracker> | null>(null);
+  const getGesture = () => (gestureRef.current ??= createGestureTracker({
+    onStart: () => startRef.current?.(),
+    onEnd: () => endRef.current?.(),
+  }));
+  // Unmounting mid-gesture still closes it, exactly once.
+  useEffect(() => () => {
+    gestureRef.current?.dispose();
+    gestureRef.current = null;
+  }, []);
 
   const nx = toNorm(xParam, x);
   const ny = toNorm(yParam, y);
@@ -45,6 +74,7 @@ export const EffectXYPad: React.FC<EffectXYPadProps> = ({ label, xParam, yParam,
     if (e.pointerType === 'mouse' && e.button !== 0) return;
     dragging.current = true;
     (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+    getGesture().pointerDown(); // before the press's own write, below
     fromPointer(e.clientX, e.clientY);
     e.preventDefault();
   };
@@ -52,19 +82,24 @@ export const EffectXYPad: React.FC<EffectXYPadProps> = ({ label, xParam, yParam,
   const onUp = (e: React.PointerEvent) => {
     dragging.current = false;
     (e.currentTarget as Element).releasePointerCapture?.(e.pointerId);
+    getGesture().pointerUp();
   };
+  // The write is chosen BEFORE anything is dispatched, so the gesture can open
+  // ahead of the change it belongs to and an unhandled key stays inert.
   const onKeyDown = (e: React.KeyboardEvent) => {
     const m = e.shiftKey ? 10 : 1;
-    let handled = true;
+    let write: (() => void) | null = null;
     switch (e.key) {
-      case 'ArrowRight': onChange({ x: snapParam(xParam, x + xParam.step * m), y }); break;
-      case 'ArrowLeft': onChange({ x: snapParam(xParam, x - xParam.step * m), y }); break;
-      case 'ArrowUp': onChange({ x, y: snapParam(yParam, y + yParam.step * m) }); break;
-      case 'ArrowDown': onChange({ x, y: snapParam(yParam, y - yParam.step * m) }); break;
-      case 'Backspace': case 'Delete': onChange({ x: xParam.default, y: yParam.default }); break;
-      default: handled = false;
+      case 'ArrowRight': write = () => onChange({ x: snapParam(xParam, x + xParam.step * m), y }); break;
+      case 'ArrowLeft': write = () => onChange({ x: snapParam(xParam, x - xParam.step * m), y }); break;
+      case 'ArrowUp': write = () => onChange({ x, y: snapParam(yParam, y + yParam.step * m) }); break;
+      case 'ArrowDown': write = () => onChange({ x, y: snapParam(yParam, y - yParam.step * m) }); break;
+      case 'Backspace': case 'Delete': write = () => onChange({ x: xParam.default, y: yParam.default }); break;
     }
-    if (handled) e.preventDefault();
+    if (!write) return;
+    getGesture().key('down', e.key);
+    write();
+    e.preventDefault();
   };
 
   return (
@@ -85,8 +120,20 @@ export const EffectXYPad: React.FC<EffectXYPadProps> = ({ label, xParam, yParam,
         onPointerMove={onMove}
         onPointerUp={onUp}
         onPointerCancel={onUp}
-        onDoubleClick={() => onChange({ x: xParam.default, y: yParam.default })}
+        onDoubleClick={() => {
+          // The reset is a gesture of one change, in its own pair: the clicks
+          // that produced the double-click closed their own gestures on their
+          // pointerups.
+          const g = getGesture();
+          g.pointerDown();
+          onChange({ x: xParam.default, y: yParam.default });
+          g.pointerUp();
+        }}
         onKeyDown={onKeyDown}
+        // The keyup closes the key gesture; blur is the backstop for a focus
+        // lost mid-press, whose keyup is delivered somewhere else.
+        onKeyUp={(e) => getGesture().key('up', e.key)}
+        onBlur={() => getGesture().key('up')}
       >
         {[0.25, 0.5, 0.75].map((f) => (
           <g key={f}>

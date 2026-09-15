@@ -75,6 +75,22 @@ export interface TasmoControllerMappings {
   unattached: SwayUnattached[];
 }
 
+/**
+ * A clip's follow action as the FILE carries it (backend `Clip.follow_action`).
+ *
+ * Deliberately looser than the in-app `FollowAction`: the backend model defaults
+ * every field so an older or hand-edited file still validates, and `after`
+ * carries all three keys because the in-app type is a union of two forms.
+ * `followAction.parseFollowAction` is the strict half — anything this shape can
+ * hold but the app cannot act on becomes no rule at all on load.
+ */
+export interface TasmoFollowAction {
+  after: { bars?: number | null; beats?: number | null; plays?: number | null };
+  a: string;
+  b?: string | null;
+  chance?: number;
+}
+
 // --- Save payload (built in the frontend, validated by the backend) ---
 export interface TasmoClipInput {
   id: string;
@@ -107,6 +123,9 @@ export interface TasmoClipInput {
   track_index?: number | null;
   scene_index?: number | null;
   slot_index?: number | null;
+  /** The clip's follow action (Session grid), or null when it has none. Written
+   *  explicitly rather than omitted so the key is always in the file. */
+  follow_action?: TasmoFollowAction | null;
   /** Piano-roll clips: the grid length in steps, the time signatures by bar, the
    *  steps before bar 0 and the polymeter lanes the clip was bounced with. */
   total_steps?: number | null;
@@ -212,6 +231,9 @@ export interface TasmoLoadedClip {
   track_index?: number | null;
   scene_index?: number | null;
   slot_index?: number | null;
+  /** The clip's follow action; absent in .tasmo files written before the grid
+   *  had one, and only as trustworthy as the file — see parseFollowAction. */
+  follow_action?: TasmoFollowAction | null;
   /** Piano-roll grid length and meter; absent in .tasmo files written before
    *  the roll had a meter. */
   total_steps?: number | null;
@@ -453,6 +475,10 @@ export function dawProjectToTasmo(d: DawProject): TasmoProjectInput {
         track_index: c.track_index ?? null,
         scene_index: c.scene_index ?? null,
         slot_index: c.slot_index ?? null,
+        // The other half of what a session grid is: where a clip sits, and what
+        // it does when it finishes. Placement without the rule reopened a saved
+        // set with every column playing one clip forever.
+        follow_action: c.followAction ?? null,
       })),
       // Map the track's device chain into theDAW effect nodes (VST3 -> real,
       // creative FX -> rack, EQ/comp/reverb -> preserved). Order is kept.

@@ -63,6 +63,7 @@ import {
   type PunchMode,
   type RecordingStatus,
 } from '../../state/recordingStore';
+import { ContextMenu, menuAnchorFromEvent, type ContextMenuPosition } from '../ui/ContextMenu';
 import { postStatus } from '../../state/statusNoticeStore';
 
 /**
@@ -84,16 +85,18 @@ const REPEAT_KEY_LABEL: Record<'off' | 'all' | 'one', string> = {
 /** Why the RECORD key is dead. Shown on the key and on its plate — see there. */
 const RECORD_NEEDS_ARM = 'Record: arm a track first - the red dot in its header';
 
-/** The punch window, on the key's NAME and title and in its select. `off` names
- *  itself nowhere: a key that says nothing about punch is a key that is not
- *  punching. It rides the `aria-label` as well as the title for the reason the
- *  dead key's does (see RecordKey): a title is mouse-only, and below 2xl the
- *  mode cannot be seen anywhere else. */
+/** The punch window, on the key's NAME and title and in its select — and, from
+ *  T26, the way to CHANGE it at any width. `off` names no window because a key
+ *  that says nothing about punch is a key that is not punching, but every mode
+ *  including `off` carries the right-click hint: the menu is the only way in
+ *  below 2xl, and an affordance nothing mentions is one nobody finds. It rides
+ *  the `aria-label` as well as the title for the reason the dead key's does
+ *  (see RecordKey): a title is mouse-only, and a disabled key takes no hover. */
 const PUNCH_TITLE: Record<PunchMode, string> = {
-  off: '',
-  in: ' (punch in)',
-  out: ' (punch out)',
-  'in-out': ' (punch in-out)',
+  off: ' - right-click for punch',
+  in: ' (punch in) - right-click for punch',
+  out: ' (punch out) - right-click for punch',
+  'in-out': ' (punch in-out) - right-click for punch',
 };
 
 /** The select's own option texts. Short because the footer row is 48px and this
@@ -103,6 +106,26 @@ const PUNCH_OPTION: Record<PunchMode, string> = {
   in: 'In',
   out: 'Out',
   'in-out': 'In/Out',
+};
+
+/** The right-click menu's own row texts. Each one starts with the word PUNCH
+ *  the menu is titled with, so a speech command that reads a row off the screen
+ *  finds it, and each says the whole mode rather than the select's abbreviation
+ *  — the menu has the width the footer row has not. */
+const PUNCH_MENU_LABEL: Record<PunchMode, string> = {
+  off: 'Punch off',
+  in: 'Punch in',
+  out: 'Punch out',
+  'in-out': 'Punch in-out',
+};
+
+/** What each mode actually does to a take, on the row's own tooltip. The window
+ *  is the editor's LOOP region in every one of them. */
+const PUNCH_MENU_TITLE: Record<PunchMode, string> = {
+  off: 'Record the whole pass - no window',
+  in: 'Start the take at the loop region and run on past its end',
+  out: 'Keep the take from where it started and cut it at the loop region end',
+  'in-out': 'Keep only what falls inside the loop region',
 };
 
 /**
@@ -146,6 +169,34 @@ const PUNCH_OPTION: Record<PunchMode, string> = {
  * DEAD key is dead rides in the NAME rather than only in a title, because a
  * disabled key takes no hover of its own (`transportKey` ends in
  * `disabled:pointer-events-none`) and a title on the plate is mouse-only.
+ *
+ * THE PUNCH MENU (T26). The mode is a persisted preference, and its `<select>`
+ * is `hidden 2xl:flex` — below 1536px a mode set on a wide screen could be read
+ * off the key's title but not changed. So the key's PLATE takes a right-click
+ * and opens a four-item radio menu. The listener is on the plate <div> and not
+ * on the button for the reason the dead key's title is: `transportKey` ends in
+ * `disabled:pointer-events-none`, so a dead button receives no contextmenu at
+ * all — and the dead key is exactly when a user is most likely to be setting up
+ * a punch before arming.
+ *
+ * NO `aria-haspopup` on the button. The button's action is RECORD; a menu that
+ * opens from the plate's secondary gesture is not what the primary action does,
+ * and announcing "has popup menu" on a key that records would be a lie about
+ * what pressing it will do. The affordance travels in the NAME instead — every
+ * `PUNCH_TITLE` ends in "right-click for punch", on the aria-label as well as
+ * the title, so a screen-reader user hears it and a mouse user sees it.
+ *
+ * The keyboard opener (Shift+F10 and the Menu key, the platform's own gesture
+ * for "context menu on the focused thing") sits on the plate too and catches
+ * the keydown bubbling off the focused button. From there the menu drives
+ * itself: ContextMenu focuses its first row on open, Arrow Up/Down and Home/End
+ * move between the four, Enter or Space picks one, Escape closes — and on close
+ * focus comes back to this RECORD button, so the gesture starts and ends on the
+ * same key. It works on a LIVE key only: a disabled button is not focusable, so
+ * no key event originates there. The 2xl select and a right-click are the two
+ * ways in for that case; below 2xl a dead key's punch is mouse-only. Making the
+ * plate itself focusable would put a new stop in the footer's tab order, which
+ * is not this ticket's to spend.
  */
 const RecordKey: React.FC<{
   status: RecordingStatus;
@@ -153,25 +204,46 @@ const RecordKey: React.FC<{
   /** The punch window this press would write into — named in the title so the
    *  key never records less than the user expected without saying so. */
   punch: PunchMode;
+  /** Pick a mode from the plate's right-click menu. */
+  onSetPunch: (mode: PunchMode) => void;
   onPress: () => void;
   /** No legend, 32px — the below-xl form. */
   compact?: boolean;
   className?: string;
   tourId?: string;
-}> = ({ status, armedCount, punch, onPress, compact = false, className = '', tourId }) => {
+}> = ({ status, armedCount, punch, onSetPunch, onPress, compact = false, className = '', tourId }) => {
   const dead = status === 'idle' && armedCount === 0;
   const live = status === 'counting' || status === 'recording';
-  const title = dead
+  // The menu is per-key state: the two homes are never both displayed, so
+  // neither can hold a menu the other opened.
+  const [punchMenu, setPunchMenu] = useState<ContextMenuPosition | null>(null);
+  const plateRef = useRef<HTMLDivElement | null>(null);
+  const punchSuffix = PUNCH_TITLE[punch];
+  const title = (dead
     ? RECORD_NEEDS_ARM
-    : (status === 'counting'
-        ? 'Counting in - press to cancel'
-        : status === 'idle'
-          ? `Record a take on ${armedCount} armed track${armedCount === 1 ? '' : 's'} (R)`
-          : 'Stop recording (R)') + PUNCH_TITLE[punch];
+    : status === 'counting'
+      ? 'Counting in - press to cancel'
+      : status === 'idle'
+        ? `Record a take on ${armedCount} armed track${armedCount === 1 ? '' : 's'} (R)`
+        : 'Stop recording (R)') + punchSuffix;
   return (
     <div
+      ref={plateRef}
       data-tour={tourId}
-      title={dead ? RECORD_NEEDS_ARM : undefined}
+      title={dead ? RECORD_NEEDS_ARM + punchSuffix : undefined}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        setPunchMenu(menuAnchorFromEvent(e));
+      }}
+      onKeyDown={(e) => {
+        // The platform's own "context menu here" gestures, caught as they
+        // bubble off the focused button. ContextMenu clamps the anchor into
+        // the viewport, so the plate's top-left is a safe one from a footer.
+        if (e.key !== 'ContextMenu' && !(e.key === 'F10' && e.shiftKey)) return;
+        e.preventDefault();
+        const rect = plateRef.current?.getBoundingClientRect();
+        setPunchMenu({ x: rect?.left ?? 0, y: rect?.top ?? 0 });
+      }}
       className={`shrink-0 ${compact ? 'w-8' : 'w-12'} ${transportPlate} ${className}`}
     >
       <button
@@ -179,9 +251,7 @@ const RecordKey: React.FC<{
         onClick={onPress}
         disabled={dead}
         aria-label={
-          dead
-            ? RECORD_NEEDS_ARM
-            : (status === 'idle' ? 'Record' : 'Stop recording') + PUNCH_TITLE[punch]
+          (dead ? RECORD_NEEDS_ARM : status === 'idle' ? 'Record' : 'Stop recording') + punchSuffix
         }
         aria-pressed={status !== 'idle'}
         title={title}
@@ -201,6 +271,25 @@ const RecordKey: React.FC<{
             says Record. */}
         {!compact && <span aria-hidden="true" className={keyLabel}>REC</span>}
       </button>
+      {/* Four settings of ONE thing, so every row is a `menuitemradio` carrying
+          `aria-checked` and the live one is tinted and ticked. The tick is a
+          fixed-width spacer on the other three so the labels stay on one
+          column. The menu portals to <body>, so it costs the footer no layout:
+          the plate's measured numbers at 960/1024/1280/1536 are untouched. */}
+      <ContextMenu
+        position={punchMenu}
+        onClose={() => setPunchMenu(null)}
+        title="Punch"
+        minWidth="11rem"
+        items={PUNCH_CHOICES.map((m) => ({
+          type: 'item' as const,
+          label: PUNCH_MENU_LABEL[m],
+          title: PUNCH_MENU_TITLE[m],
+          checked: m === punch,
+          icon: <Check aria-hidden="true" className={`w-3 h-3 ${m === punch ? '' : 'opacity-0'}`} />,
+          onSelect: () => onSetPunch(m),
+        }))}
+      />
     </div>
   );
 };
@@ -1062,8 +1151,10 @@ export const PlayerFooter: React.FC = () => {
                 (342.4-617.6), which is the exact failure RecordKey's comment
                 below was written about. This track has no room at any width:
                 from xl the orb bubble takes 192px of it and the title is down
-                to 8.4px before any key. So punch lives in the RIGHT track from
-                2xl — see there. */}
+                to 8.4px before any key. So the SELECT lives in the RIGHT track
+                from 2xl — see there — and every width below it changes the mode
+                through the RECORD key's own right-click menu, which costs the
+                footer no layout at all (it portals to <body>). */}
             {/* RECORD's below-xl home, glued to the plate's LEFT edge — see
                 RecordKey for the 960px measurement that put it here. Hidden
                 from xl, where the copy at the plate's right edge takes over. */}
@@ -1074,6 +1165,7 @@ export const PlayerFooter: React.FC = () => {
                 status={recStatus}
                 armedCount={recArmedCount}
                 punch={recPunch}
+                onSetPunch={setRecPunch}
                 onPress={recordPress}
               />
             )}
@@ -1197,6 +1289,7 @@ export const PlayerFooter: React.FC = () => {
               status={recStatus}
               armedCount={recArmedCount}
               punch={recPunch}
+              onSetPunch={setRecPunch}
               onPress={recordPress}
             />
           )}
@@ -1227,9 +1320,13 @@ export const PlayerFooter: React.FC = () => {
                         (921.6-969.6, still 16px off the plate). "Up Next"
                         126.4px -> 46.4px, which it can afford. Plate 0px off
                         centre, 0px footer overflow.
-              Below 2xl the mode is not editable, only persisted — but the
-              RECORD key's title names it at EVERY width, so a punch set on a
-              wide screen never records short on a narrow one in silence. */}
+              Below 2xl this select is not rendered, and until T26 that meant a
+              persisted mode could be READ off the RECORD key's title but not
+              changed. Now the key's plate takes a right-click at every width
+              and opens the same four choices (see RecordKey), so this select is
+              the WIDE-screen convenience rather than the only way in — the two
+              read and write the one `useRecordingPrefs.punch`, so whichever the
+              user reaches for, the other shows it. */}
           {inEditorMode && (
             <div className="hidden 2xl:flex shrink-0 items-center gap-1">
               <label htmlFor="record-punch" className="sr-only">Punch recording window</label>

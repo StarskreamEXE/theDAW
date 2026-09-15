@@ -302,21 +302,19 @@ export function isMidiCaptureClip(clip: CaptureClip): boolean {
  * track becomes a MIDI track the moment it has an instrument or a MIDI clip on
  * it, both of which are things the user did on purpose.
  *
- * KNOWN GAP — the mic still records these tracks too
- * --------------------------------------------------
- * `state/recordingStore.ts` arms the take engine for EVERY id in
- * `armedTrackIds` (`recordingEngine.ts` opens a recorder per armed track and
- * `placeTakes` lands one clip per take), and this module cannot change that:
- * that store belongs to another ticket. So TODAY an armed instrument track
- * comes out of one press with BOTH a mic take and a MIDI take stacked on it.
- * Excluding empty tracks above keeps that overlap to tracks the user has
- * declared as instruments rather than every armed track, but it does not solve
- * it.
- *
- * The fix is on the MIC side, not here: `recordingStore` should skip arming a
- * recorder for any track this predicate accepts. `capturesMidi` is exported for
- * exactly that — it is the hand-off to that store's owner, so both sides read
- * ONE definition of "this is a MIDI track" and the two can never disagree.
+ * ONE DEFINITION, TWO RECORDERS
+ * ----------------------------
+ * `state/recordingStore.ts` arms the take engine only for tracks this predicate
+ * REJECTS (`micArmedIds`, batch 9 T26): an armed instrument track is the MIDI
+ * capture's alone, an armed audio track is the mic engine's alone, and one
+ * press never lands two takes on one track. The store's `armedTrackIds` stays
+ * the full armed list (the RECORD key counts it and `openPass` picks its tracks
+ * out of it); only the engine's arm list is filtered. `capturesMidi` is exported
+ * for exactly that — both sides read ONE definition of "this is a MIDI track"
+ * and cannot disagree. When every armed track captures MIDI the store starts
+ * no mic engine but keeps the press contract byte-identical
+ * (`recording` → `stopping` → `idle`), which is what `onStatus` opens and
+ * closes on.
  */
 export function capturesMidi(track: CaptureTrack, clips: readonly CaptureClip[]): boolean {
   if (track.instrumentProgram !== undefined) return true;

@@ -26,11 +26,14 @@
  *   happened is not.
  * · An `arm` for a group that is still open CLOSES it first, so a dropped end can
  *   never leave two gestures on one surface.
- * · A control that reports NO boundary (the schema path: EffectKnob, SlidePad,
- *   the enum <select>, EffectXYPad) still has to end somewhere, so a group that
- *   was never armed falls back to an idle deadline: `idleMs` with no further
- *   change, pushed out by each change. This is the only guess left in the path,
- *   and it is why a control that CAN report its boundary should.
+ * · A control that reports NO boundary still has to end somewhere, so a group
+ *   that was never armed falls back to an idle deadline: `idleMs` with no further
+ *   change, pushed out by each change. Since batch 9 (T27) every rack control
+ *   on the automation path reports its boundary — EffectKnob, EffectXYPad, the
+ *   SlidePad toggle and the enum <select> through EffectControls, and the two
+ *   bespoke XY surfaces — so the deadline is reached only by a host that passes
+ *   no gesture props (MixView renders EffectControls that way, outside the
+ *   automation consumer). It stays as the last guard, not as a live path.
  * · `dispose()` (unmount) ends everything open, exactly once, and a widget's own
  *   end arriving afterwards is inert. It is NOT terminal: React StrictMode runs
  *   mount → cleanup → mount on the same instance, so a machine that went inert

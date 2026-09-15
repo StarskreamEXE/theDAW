@@ -32,8 +32,12 @@ import { useEditorStore } from './editorStore.ts';
 import { usePlayerStore } from './playerStore.ts';
 import {
   LEVEL_WRITE_MS,
+  PUNCH_CHOICES,
+  currentPassPunchWindow,
   initRecording,
   musicalConstraints,
+  punchWindow,
+  punchWindowFrom,
   resetRecording,
   setRecordingDeps,
   mergeRecordingPrefs,
@@ -1002,6 +1006,227 @@ function setLoop(start: number, end: number): void {
   await flush();
   assert.equal(rs().lastError?.code, 'nothing-armed');
   assert.equal(rs().lastNotice, null, 'and the stale notice went with it');
+}
+
+/* ------------------------- the window, on its own -------------------------- */
+
+// `punchWindowFrom` is the ONE gate: the take crop reads it through
+// `punchWindow()` and the timeline's punch band reads it directly, so a band
+// that promises a crop the store would refuse cannot exist. Four modes against
+// a loop that is enabled, disabled, degenerate or absent.
+{
+  const loop = { enabled: true, start: 4, end: 10 };
+
+  assert.equal(punchWindowFrom('off', loop), null, 'punch off is no window, loop region or not');
+  assert.deepEqual(punchWindowFrom('in', loop), { from: 4, to: Infinity }, 'in opens at loopStart and never closes');
+  assert.deepEqual(punchWindowFrom('out', loop), { from: -Infinity, to: 10 }, 'out closes at loopEnd and never opens');
+  assert.deepEqual(punchWindowFrom('in-out', loop), { from: 4, to: 10 }, 'in-out is both edges');
+
+  for (const mode of PUNCH_CHOICES) {
+    // A region that is SET but switched off is no window — `loopEnabled` is the
+    // user saying the region is not in force, and the crop honours that.
+    assert.equal(punchWindowFrom(mode, { enabled: false, start: 4, end: 10 }), null, `${mode}: a disabled loop is no window`);
+    assert.equal(punchWindowFrom(mode, null), null, `${mode}: no loop region at all is no window`);
+    assert.equal(punchWindowFrom(mode, { enabled: true, start: 4, end: 4 }), null, `${mode}: a zero-length region is no region`);
+    assert.equal(punchWindowFrom(mode, { enabled: true, start: 10, end: 4 }), null, `${mode}: an inverted region is no region`);
+    assert.equal(punchWindowFrom(mode, { enabled: true, start: NaN, end: 10 }), null, `${mode}: a non-finite start is no region`);
+    assert.equal(punchWindowFrom(mode, { enabled: true, start: 0, end: Infinity }), null, `${mode}: a non-finite end is no region`);
+  }
+}
+
+// And the store's own reader IS that helper applied to the editor's region.
+{
+  const h = harness(['trk-a']);
+  void h;
+  rp().setPunch('in-out');
+  es().clearLoop();
+  assert.equal(punchWindow(), null, 'no region, no window');
+
+  setLoop(4, 10);
+  assert.deepEqual(punchWindow(), { from: 4, to: 10 });
+  assert.deepEqual(
+    punchWindow(),
+    punchWindowFrom('in-out', { enabled: es().loopEnabled, start: es().loopStart, end: es().loopEnd }),
+    'one derivation, two callers',
+  );
+
+  es().setLoopEnabled(false);
+  assert.equal(punchWindow(), null, 'a region switched off is no window');
+  rp().setPunch('off');
+}
+
+// The PASS window is readable from outside, so `lib/midiCapture` crops with the
+// very window the take crop uses instead of restating the derivation and
+// reading it a count-in later.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  setLoop(4, 10);
+  rp().setPunch('in-out');
+  assert.equal(currentPassPunchWindow(), null, 'nothing is frozen before a press');
+
+  rs().recordPress();
+  await flush();
+  assert.deepEqual(currentPassPunchWindow(), { from: 4, to: 10 }, 'the press froze it');
+
+  setLoop(20, 30);
+  rp().setPunch('off');
+  assert.deepEqual(currentPassPunchWindow(), { from: 4, to: 10 }, 'and a mid-pass change cannot reach it');
+
+  h.engine.resolveStart();
+  await flush();
+  h.engine.setTakes([]);
+  rs().stopRecording();
+  await flush();
+  await flush();
+
+  assert.equal(
+    currentPassPunchWindow(),
+    null,
+    'and the pass over, there is no pass window — not the last one, still standing',
+  );
+  rp().setPunch('off');
+}
+
+/* -------------------- the MIDI hand-off: one press, one take --------------- */
+
+// `lib/midiCapture` records every armed track its `capturesMidi` accepts, and
+// the engine opens a recorder per armed track — so an armed instrument track
+// used to come out of ONE press with a mic take AND a MIDI take stacked on it.
+// The arm mirror is where that is settled: the STORE still reports every armed
+// track (the capture reads that list, and the key still counts them), and only
+// the tracks that do NOT capture MIDI reach the engine.
+{
+  const h = harness(['trk-audio', 'trk-inst']);
+  es().updateTrack('trk-inst', { instrumentProgram: 0 });
+  es().updateTrack('trk-audio', { armed: true });
+  es().updateTrack('trk-inst', { armed: true });
+
+  assert.deepEqual(rs().armedTrackIds, ['trk-audio', 'trk-inst'], 'both are armed, and the store says both');
+  assert.deepEqual(h.engine.armed(), ['trk-audio'], 'one mic recorder — the instrument track is the capture\'s');
+
+  rs().recordPress();
+  await flush();
+  assert.equal(rs().status, 'recording');
+  assert.deepEqual(h.events, ['engine.start'], 'the mic pass still runs, for the audio track');
+
+  h.engine.resolveStart();
+  await flush();
+  h.engine.setTakes([fakeTake('trk-audio', 0, 4)]);
+  rs().stopRecording();
+  await flush();
+  await flush();
+
+  assert.equal(rs().status, 'idle');
+  assert.deepEqual(es().clips.map((c) => c.trackId), ['trk-audio'], 'and only the audio track gets a mic take');
+}
+
+// EVERY armed track captures MIDI: no recorder is opened at all — the real
+// engine rejects an empty `start()` with `nothing-armed` — but the PRESS
+// contract is untouched. `midiCapture` opens its captures on the flip INTO
+// `recording` and closes them on the flip out, so the pass still has to run:
+// status cycles, the transport still rolls, and nothing is said about it.
+{
+  const h = harness(['trk-inst']);
+  es().updateTrack('trk-inst', { instrumentProgram: 24, armed: true });
+
+  assert.deepEqual(rs().armedTrackIds, ['trk-inst'], 'armed, and visible as armed');
+  assert.deepEqual(h.engine.armed(), [], 'and with no mic recorder behind it');
+
+  const seen: string[] = [];
+  const off = useRecordingStore.subscribe((s, prev) => {
+    if (s.status !== prev.status) seen.push(s.status);
+  });
+
+  rs().recordPress();
+  await flush();
+  assert.equal(rs().status, 'recording', 'the press still starts a pass');
+  assert.equal(h.engine.calls.includes('start'), false, 'with no input opened');
+  assert.deepEqual(h.events, ['transport'], 'and the transport still rolls, so the clock the capture stamps with moves');
+  assert.equal(rs().lastError, null, 'nothing failed');
+  assert.equal(rs().lastNotice, null, 'and there is nothing new to say');
+
+  rs().stopRecording();
+  await flush();
+  await flush();
+  off();
+
+  assert.equal(rs().status, 'idle');
+  assert.equal(h.engine.calls.includes('stop'), false, 'nothing was opened, so there is nothing to stop');
+  assert.equal(es().clips.length, 0, 'the mic side lands nothing — the take is the capture\'s');
+  assert.deepEqual(seen, ['recording', 'stopping', 'idle'], 'the exact flips the capture opens and closes on');
+}
+
+// A track becomes the capture's the moment its LATEST clip is a MIDI clip, and
+// the mirror follows without a re-arm.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  assert.deepEqual(h.engine.armed(), ['trk-a'], 'a bare armed track is the mic\'s');
+
+  es().addClipToTrack({
+    trackId: 'trk-a',
+    label: 'Roll',
+    audioBlob: new Blob(['x'], { type: 'audio/wav' }),
+    mimeType: 'audio/wav',
+    sourceDuration: 1,
+    offsetIntoSource: 0,
+    durationSec: 1,
+    startSec: 0,
+    color: '#fff',
+    sourceKind: 'piano-roll',
+    sourcePianoRoll: [{ id: 'n1', note: 60, velocity: 100, step: 0, length: 4 }],
+  });
+  // The clip alone does not re-run the mirror (only `tracks` identity does), so
+  // the next arm-flag write is what re-reads it — as a real re-arm would.
+  es().updateTrack('trk-a', { armed: false });
+  es().updateTrack('trk-a', { armed: true });
+  assert.deepEqual(rs().armedTrackIds, ['trk-a'], 'still armed');
+  assert.deepEqual(h.engine.armed(), [], 'and now the capture\'s, not the mic\'s');
+}
+
+// An armed id with no track behind it — `armedTrackIds` is a seam, and a host
+// may name a track this store cannot see. There is nothing to judge, so the
+// recorder is armed for it exactly as it was before the hand-off existed.
+{
+  const h = harness([]);
+  setRecordingDeps({ armedTrackIds: () => ['ghost'] });
+  resetRecording();
+  initRecording();
+
+  assert.deepEqual(rs().armedTrackIds, ['ghost'], 'the store reports what the seam gave it');
+  assert.deepEqual(h.engine.armed(), ['ghost'], 'an id nothing can judge keeps its recorder');
+  // Back to the real reach, or every block after this one presses with nothing.
+  setRecordingDeps({
+    armedTrackIds: () => es().tracks.filter((t) => t.armed === true).map((t) => t.id),
+  });
+}
+
+// A pass that DID open recorders and was then disarmed mid-pass still stops the
+// engine it opened: the decision is frozen at `beginPass`, not re-read at the
+// stop, so the recorders can never be left rolling with nothing able to close
+// them.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+
+  rs().recordPress();
+  await flush();
+  h.engine.resolveStart();
+  await flush();
+  assert.equal(h.engine.calls.includes('start'), true, 'the recorders opened');
+
+  es().updateTrack('trk-a', { armed: false });
+  assert.deepEqual(h.engine.armed(), [], 'the mirror dropped it mid-pass');
+
+  h.engine.setTakes([fakeTake('trk-a', 0, 3)]);
+  rs().stopRecording();
+  await flush();
+  await flush();
+
+  assert.equal(h.engine.calls.includes('stop'), true, 'and the pass it opened is still stopped');
+  assert.equal(rs().status, 'idle');
+  assert.equal(es().clips.length, 1, 'the take it was already holding still lands');
 }
 
 /* ---------------- the preference is NOT on the hot store ------------------- */

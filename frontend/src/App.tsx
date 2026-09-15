@@ -46,7 +46,7 @@ import { publishMidi, subscribeToMidi } from './state/midiBus';
 // file's eager import graph via Shell/pianoTrigger EXCEPT `recordingStore`,
 // which has to be loaded anyway for anything to record.
 import { startMidiCapture } from './lib/midiCapture';
-import { punchMode, useRecordingStore } from './state/recordingStore';
+import { currentPassPunchWindow, useRecordingStore } from './state/recordingStore';
 import { beginUndoStep, computePeaks, useEditorStore } from './state/editorStore';
 import { currentTransportSec } from './state/liveMixer';
 import { renderStepNotesToBlob } from './lib/midiSynth';
@@ -392,28 +392,13 @@ export default function App() {
         clips: () => useEditorStore.getState().clips,
         transportSec: currentTransportSec,
         bpm: () => useEditorStore.getState().bpm,
-        // `recordingStore`'s own `punchWindow()` is module-private, so the SAME
-        // derivation is restated here from its two exported inputs — the punch
-        // mode and the editor's loop region — rather than editing that store to
-        // export it. An open edge is infinite, exactly as it is there.
-        //
-        // One divergence to close: that store FREEZES its window at the press,
-        // so a punch mode (or loop region) changed mid-pass cannot desync what
-        // lands; this block reads at the `recording` flip instead, which is the
-        // same instant for a pass with no count-in but NOT for one with one.
-        // When that store exports its frozen pass window, this whole block is
-        // replaced by reading it — the correct fix, and not ours to make here.
-        punchWindow: () => {
-          const punch = punchMode();
-          if (punch === 'off') return null;
-          const { loopEnabled, loopStart, loopEnd } = useEditorStore.getState();
-          if (!loopEnabled) return null;
-          if (!Number.isFinite(loopStart) || !Number.isFinite(loopEnd) || loopEnd <= loopStart) return null;
-          return {
-            from: punch === 'out' ? -Infinity : loopStart,
-            to: punch === 'in' ? Infinity : loopEnd,
-          };
-        },
+        // THE window this pass was pressed with, straight off `recordingStore`
+        // — not a restatement of its derivation. That store freezes the window
+        // at the PRESS, and the capture opens on the flip into `recording`,
+        // which for a pass with a count-in is a bar or more later: deriving it
+        // again here would crop the notes to a window the take crop is not
+        // using the moment the user touched the loop region during the count.
+        punchWindow: currentPassPunchWindow,
         // The last term of WaveformEditor's `effectiveProgramFor`, resolved the
         // same way its MIDI-insert path does: the picker's program only while
         // soundfonts are on.

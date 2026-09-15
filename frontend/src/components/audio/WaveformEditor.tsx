@@ -93,7 +93,7 @@ import { browserPopoverEnv, popoverMaxHeight, sameLayout, watchPopover, type Pop
 import { useTrackFxRackStore, type TrackFxRackAnchor } from '../../state/trackFxRackStore';
 import { ensureStems } from '../../lib/djStems';
 import { useFeatureToggleStore } from '../../state/featureToggleStore';
-import { useRecordingStore, type RecordingStatus } from '../../state/recordingStore';
+import { punchWindowFrom, useRecordingPrefs, useRecordingStore, type RecordingStatus } from '../../state/recordingStore';
 import type { LevelFrame } from '../../lib/recordingEngine';
 import { SurfaceAudio } from './IoDeviceSelect';
 
@@ -1554,6 +1554,12 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const loopEnabled = useEditorStore((s) => s.loopEnabled);
   const loopStart = useEditorStore((s) => s.loopStart);
   const loopEnd = useEditorStore((s) => s.loopEnd);
+  // The punch mode, for the band down the lanes that shows which edges of the
+  // loop region the next record pass may write across. Persisted, so it is set
+  // long before any track is armed — which is why the band is always on rather
+  // than only while recording: a window nothing draws is one the user finds out
+  // about by losing a take to it.
+  const recPunch = useRecordingPrefs((s) => s.punch);
   const markers = useEditorStore((s) => s.markers);
   const setLoopEnabled = useEditorStore((s) => s.setLoopEnabled);
   const setLoopRegion = useEditorStore((s) => s.setLoopRegion);
@@ -1595,13 +1601,16 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   // writes several keys — so the arm is on the entry and each key begins on its
   // own first change; the one end closes every key of that entry.
   //
-  // What is LEFT on a deadline is the schema-driven panel (EffectControls) and
-  // only it: EffectKnob (the default for every rack param, including each
-  // effect's wet/dry MIX), SlidePad toggles, the enum <select>, and EffectXYPad —
-  // plus the two bespoke XY SURFACES (the OWL-Pad pad and the Spatializer pad),
-  // which are hand-rolled pointer targets, not SlideTracks. None of those reports
-  // a boundary, so for those and only those the gesture ends after
-  // RACK_GESTURE_IDLE_MS of silence: one timer per entry, no listeners anywhere.
+  // Since batch 9 (T27) the schema-driven panel reports its boundary too:
+  // EffectControls threads gestureStart/gestureEnd to EffectKnob (the default
+  // for every rack param, including each effect's wet/dry MIX) and EffectXYPad,
+  // which own a gesture tracker each, and wraps the SlidePad toggle, the enum
+  // <select>, the preset select and the reset button as one-change pairs; the
+  // two bespoke XY SURFACES (the OWL-Pad pad and the Spatializer pad) call the
+  // pair around their drag. The RACK_GESTURE_IDLE_MS deadline is reached only
+  // by a host that passes no gesture props (MixView, outside this consumer)
+  // and by the two pads' own program/motion selects and preset buttons, which
+  // still write without a boundary.
   //
   // The bookkeeping itself is lib/automationGesture.ts, tested there.
   const gestureRef = useRef<AutomationGesture<AutomationTarget> | null>(null);
@@ -5481,6 +5490,39 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                 style={{ left: loopStart * zoom, width: (loopEnd - loopStart) * zoom }}
               />
             )}
+
+            {/* The PUNCH window: which edges of that region the next record
+                pass may write across, in the record light's red so it reads as
+                a recording thing and not a second loop. Drawn from
+                `punchWindowFrom` — the SAME gate `recordingStore` crops takes
+                with — so it can only appear when a press would really punch: a
+                loop that is set but switched off gets no band, because a band
+                promising a crop the store will refuse is a lie. An open edge
+                runs to the end of the timeline and carries no border, so which
+                side is open is visible without reading anything. `aria-hidden`
+                and `pointer-events-none`: it is a picture of state named on the
+                RECORD key, and the loop band and ruler beneath it stay
+                clickable. No z of its own, so it paints over the loop band it
+                follows and under the z-30 playhead. */}
+            {(() => {
+              const win = punchWindowFrom(recPunch, { enabled: loopEnabled, start: loopStart, end: loopEnd });
+              if (!win) return null;
+              const openStart = !Number.isFinite(win.from); // `out`: no lower edge
+              const openEnd = !Number.isFinite(win.to); // `in`: no upper edge
+              return (
+                <div
+                  aria-hidden="true"
+                  className={`absolute top-0 bottom-0 pointer-events-none bg-red-500/10 border-red-500/50 ${openStart ? 'border-r' : openEnd ? 'border-l' : 'border-x'}`}
+                  style={
+                    openStart
+                      ? { left: 0, width: win.to * zoom }
+                      : openEnd
+                        ? { left: win.from * zoom, right: 0 }
+                        : { left: win.from * zoom, width: (win.to - win.from) * zoom }
+                  }
+                />
+              );
+            })()}
 
             {/* Playhead line in track lanes (position driven imperatively) */}
             <div

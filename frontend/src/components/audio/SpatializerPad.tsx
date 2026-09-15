@@ -11,7 +11,7 @@
  * factory reads, so the pad and the sound stay in sync.
  */
 
-import { useRef } from 'react';
+import { useEffect, useRef } from 'react';
 import { SlideTrack } from './SlideTrack';
 import { getRackEffect, SPATIAL_MOTIONS, SPATIAL_PRESETS } from '../../lib/rackEffects';
 
@@ -19,12 +19,12 @@ interface SpatializerPadProps {
   params: Record<string, number>;
   onChange: (params: Record<string, number>) => void;
   idPrefix: string;
-  /** The panel's gesture boundary, straight through to the SLIDE sliders: one
-   *  start before the first `onChange` of a drag / key press / wheel burst and
-   *  one end after its last. Lets a consumer recording a gesture (automation
-   *  touch) stop guessing it from a deadline. See lib/gestureTracker.ts. The
-   *  top-down pad itself is a bespoke pointer target and reports nothing, so a
-   *  drag on the pad still leaves the consumer on its fallback. */
+  /** The panel's gesture boundary: one start before the first `onChange` of a
+   *  drag / key press / wheel burst and one end after its last. Lets a consumer
+   *  recording a gesture (automation touch) stop guessing it from a deadline.
+   *  See lib/gestureTracker.ts. The SLIDE sliders forward their own; the
+   *  top-down pad is a bespoke pointer target with a single input, so it
+   *  reports the pair directly from its pointerdown / pointerup. */
   onGestureStart?: () => void;
   onGestureEnd?: () => void;
 }
@@ -45,6 +45,12 @@ const sourceXY = (azDeg: number, dist: number) => {
 export function SpatializerPad({ params, onChange, idPrefix, onGestureStart, onGestureEnd }: SpatializerPadProps) {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const dragging = useRef(false);
+  // Unmounting mid-drag must still close the gesture: the pad's own pointerup
+  // will never arrive, and a begun lane with no end is the one failure the
+  // automation store cannot recover from (lib/automationGesture.ts). Read
+  // through a ref so the cleanup cannot close over a stale prop.
+  const endRef = useRef(onGestureEnd); endRef.current = onGestureEnd;
+  useEffect(() => () => { if (dragging.current) endRef.current?.(); }, []);
   const def = getRackEffect('spatializer');
 
   const azimuth = params.azimuth ?? 0;
@@ -78,13 +84,18 @@ export function SpatializerPad({ params, onChange, idPrefix, onGestureStart, onG
     if (e.pointerType === 'mouse' && e.button !== 0) return;
     dragging.current = true;
     (e.currentTarget as Element).setPointerCapture?.(e.pointerId);
+    onGestureStart?.(); // before the press's own write, below
     fromPointer(e.clientX, e.clientY);
     e.preventDefault();
   };
   const onMove = (e: React.PointerEvent) => { if (dragging.current) fromPointer(e.clientX, e.clientY); };
   const onUp = (e: React.PointerEvent) => {
+    // pointerup and pointercancel both land here; only the one that actually
+    // ended a drag closes the gesture, so the pair stays balanced.
+    const wasDragging = dragging.current;
     dragging.current = false;
     (e.currentTarget as Element).releasePointerCapture?.(e.pointerId);
+    if (wasDragging) onGestureEnd?.();
   };
 
   // Path overlay describing the motion around the source point. The pad is a
