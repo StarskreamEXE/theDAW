@@ -432,8 +432,10 @@ export const Shell: React.FC = () => {
           The visible wordmark IS the accessible name — no aria-label, which
           would override what the button plainly says. `title` carries the
           direction and the shortcut instead. */}
+      {/* data-edge-tab: the MIDI dock measures this tab and pads its strip and body clear of it. */}
       <button
         type="button"
+        data-edge-tab="library"
         onClick={() => setIsRightPanelOpen(!isRightPanelOpen)}
         title={`${isRightPanelOpen ? 'Collapse' : 'Expand'} library (Ctrl+K opens it)`}
         aria-expanded={isRightPanelOpen}

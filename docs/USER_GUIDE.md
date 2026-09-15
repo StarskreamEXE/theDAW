@@ -184,13 +184,13 @@ cd frontend && npm run dev
 
 The application window has five regions:
 
-- **Full-width header** (top): the theDAW logo, the center workspace tabs, and four actions on the right — mobile access QR/link, the **?** help search, **IMPORT**, and the app menu (§37).
+- **Full-width header** (top): the theDAW logo, the center workspace tabs, and five actions on the right: **Fullscreen**, mobile access QR/link, the **?** help search, **IMPORT**, and the app menu (§37).
 - **Center workspace**: the center tab bar at the top and the active workspace below it, including that tab's own controls and run action.
 - **Library rail** (right, collapsible): browse and route library material without leaving the active workspace.
 - **Global bottom dock**: the bottom multi-tab panel and the processing log, side by side.
 - **Player footer** (bottom): a fixed transport bar.
 
-**Full-width header:** a fixed bar spanning the entire window width. It holds the theDAW logo dot, the center tab bar, and the four right-hand actions above, in that order. Settings opens only from the app menu — the header gear was retired; Docs opens from inside the **?** help popover; the global search moved to the player footer; and the AI Assistant orb is a free-floating draggable element over the app rather than a header button. There is no left panel and no left-panel toggle; the only collapsible side panel is the Library rail on the right.
+**Full-width header:** a fixed bar spanning the entire window width. It holds the theDAW logo dot, the center tab bar, and the five right-hand actions above, in that order. **Fullscreen** is the first of them, immediately left of mobile access: it toggles browser fullscreen on `document.documentElement`, and its icon flips back when Esc leaves fullscreen. Settings opens only from the app menu — the header gear was retired; Docs opens from inside the **?** help popover; the global search moved to the player footer; and the AI Assistant orb is a free-floating draggable element over the app rather than a header button. There is no left panel and no left-panel toggle; the only collapsible side panel is the Library rail on the right.
 
 **The ? help search:** the **?** button opens a search over the feature registry — the same entries the Feature Tour and the pinned Feature Notes read, so the three can never drift apart. Type what you are after and each hit says what the thing is, how to use it, and which tab it lives in; **LOCATE** hands the id to the solo spotlight, which switches workspace, opens the panel the control lives in, and rings the real control on the real screen. The field takes focus on open, Down steps into the results, Up comes back out of the top of them, Enter locates the best hit, and Escape closes and hands focus back to the button. **Docs** sits beside the input and still opens this manual untouched.
 
@@ -1252,7 +1252,7 @@ The transport is a single matte plate of five labelled keys on a hairline grid, 
 | **END** | Calls `playerStore.seekByFraction(1)`. |
 | **RAND** | Random order: any other library track plays next instead of the following one. |
 
-Fullscreen is no longer on the plate — it is a window utility and sits with Mute, Volume and Download on the right (§17.3).
+Fullscreen is not on the plate. It is in the header, immediately left of mobile access (§5).
 
 **Scrub strip:** the footer's first row is a scrub strip, centred at three-fifths of the footer width with the elapsed and total times either side of it. The rail is a flat hairline that thickens under the pointer or keyboard focus; the filled part draws in the theme accent, and the playhead is a small cursor bar that widens under the hand. Click or drag anywhere to seek, and a time bubble follows the pointer. It is a real slider for assistive technology (`role="slider"` with `aria-valuetext`): Left/Right and Up/Down step by 5 s, Shift multiplies the step by six, and Home and End jump to the ends. The footer synchronizes its playhead with the Waveform Editor; scrubbing updates the editor timeline position when the editor timeline is the active audio source.
 
@@ -1262,7 +1262,6 @@ Fullscreen is no longer on the plate — it is a window utility and sits with Mu
 - **Master FX indicator** is a chip that appears whenever the global master insert has effects on it. It says how many, and its tooltip says whether any of them take level; clicking it opens MIX, and the chevron beside it expands a list of what is on the insert. It draws in the theme accent and is hidden when the insert is empty.
 - **Mute toggle** switches the `playbackStore` mute flag. The volume icon changes to a red `VolumeX` when muted.
 - **Volume**: a `SlideTrack` (a custom `role="slider"`, keyboard-operable) drives `playbackStore.volume` (0 to 100). The combined `volume × !muted` value is forwarded to `playerStore.setMasterGain`, which drives the shared Web Audio master gain node.
-- **Fullscreen** toggles browser fullscreen on `document.documentElement`. It moved here from the transport plate.
 - **Download** retrieves the library entry whose `id` matches `playerStore.currentEntryId` and triggers a browser file download.
 - **More** is decorative.
 

@@ -1531,7 +1531,7 @@ export const MixView: React.FC = () => {
   const reportPickFailed = (e: unknown) => {
     const msg = e instanceof Error ? e.message : String(e);
     logError('mix', msg);
-    useStatusBarStore.getState().setText(`OPEN FAILED: ${msg}`);
+    useStatusBarStore.getState().setText(`OPEN FAILED: ${msg}`, { source: 'mix' });
   };
   const handleOpenGan = async () => {
     let r: Awaited<ReturnType<typeof pickFile>>;

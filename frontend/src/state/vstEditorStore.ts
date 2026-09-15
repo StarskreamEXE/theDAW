@@ -183,7 +183,7 @@ export const useVstEditorStore = create<VstEditorState>()((set, get) => ({
               if (res.status === 'error') {
                 if (uncaptured?.gen === gen) uncaptured = null;
                 const msg = res.error || 'editor unavailable';
-                status.setText(`VST GUI: ${msg}`);
+                status.setText(`VST GUI FAILED: ${msg}`);
                 // Keep the host visible (Electron) so the failure is on-screen,
                 // not just in the status bar; otherwise there is nothing to clear.
                 if (get().entryId === entry.id) set({ error: msg });

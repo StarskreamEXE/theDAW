@@ -375,7 +375,7 @@ export const AssetLibraryModal: React.FC<{ open: boolean; onClose: () => void }>
     } catch (e) {
       const msg = errText(e);
       logError('assets', `Could not show ${path} in its folder: ${msg}`);
-      useStatusBarStore.getState().setText(`SHOW IN FOLDER FAILED: ${msg}`);
+      useStatusBarStore.getState().setText(`SHOW IN FOLDER FAILED: ${msg}`, { source: 'assets' });
     }
   }, []);
 

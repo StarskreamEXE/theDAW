@@ -57,6 +57,11 @@ interface PickerLayout {
    * device that is gone shows as an amber warning icon beside it.
    */
   quietStatus?: boolean;
+  /** Replaces the dropdown's look for a surface with its own type (the MIDI
+   *  dock's flyout). Unset, the picker takes the Settings dropdown, dense or not. */
+  selectClassName?: string;
+  /** Size and family of the status notes beside the select; their colours stay. */
+  hintClassName?: string;
 }
 
 
@@ -97,6 +102,8 @@ const DeviceSelect: React.FC<{
   className = '',
   dense,
   quietStatus,
+  selectClassName,
+  hintClassName = 'font-sans font-bold text-xs leading-4',
 }) => {
   // The status, in the words the chips print.
   const status = unsupported
@@ -119,7 +126,7 @@ const DeviceSelect: React.FC<{
         aria-describedby={quietStatus && status ? statusId : undefined}
         title={[unsupported || title || label, quietStatus && !unsupported ? status : ''].filter(Boolean).join(': ')}
         disabled={disabled || !!unsupported}
-        className={`${dense ? DEVICE_SELECT_DENSE : DEVICE_SELECT} ${className}`}
+        className={`${selectClassName ?? (dense ? DEVICE_SELECT_DENSE : DEVICE_SELECT)} ${className}`}
         style={{ colorScheme: 'dark' }}
       >
         {options.map((o) => (
@@ -135,16 +142,16 @@ const DeviceSelect: React.FC<{
         </>
       ) : (
         <>
-          {/* The status chips: the bold sans at 12px, on every surface that shows a picker. */}
-          {unsupported && <span className="font-sans font-bold text-xs leading-4 text-amber-300/80">{unsupported}</span>}
+          {/* The status chips: the bold sans at 12px unless the surface sets its own. */}
+          {unsupported && <span className={`${hintClassName} text-amber-300/80`}>{unsupported}</span>}
           {!unsupported && missing && (
-            <span className="inline-flex items-center gap-1 font-sans font-bold text-xs leading-4 text-amber-300">
-              <AlertTriangle className="w-3 h-3 shrink-0" />
-              not connected — using the system default
+            <span className={`inline-flex items-center gap-1 ${hintClassName} text-amber-300`}>
+              <AlertTriangle aria-hidden="true" className="w-3 h-3 shrink-0" />
+              <span>not connected — using the system default</span>
             </span>
           )}
           {!unsupported && !labelsKnown && (
-            <span className="font-sans font-bold text-xs leading-4 text-zinc-500">
+            <span className={`${hintClassName} text-zinc-500`}>
               device names appear once something opens the mic
             </span>
           )}
@@ -189,7 +196,19 @@ export const IoSurfaceSelect: React.FC<{
   legend?: string;
   labelClassName?: string;
   className?: string;
-} & PickerLayout> = ({ surface, id, label, showLabel, legend, labelClassName, className, dense, quietStatus }) => {
+} & PickerLayout> = ({
+  surface,
+  id,
+  label,
+  showLabel,
+  legend,
+  labelClassName,
+  className,
+  dense,
+  quietStatus,
+  selectClassName,
+  hintClassName,
+}) => {
   const def = surfaceById(surface);
   const kind = def?.kind ?? 'audioIn';
   const resolved: Resolved = useResolvedSurface(surface);
@@ -227,6 +246,8 @@ export const IoSurfaceSelect: React.FC<{
       className={className}
       dense={dense}
       quietStatus={quietStatus}
+      selectClassName={selectClassName}
+      hintClassName={hintClassName}
     />
   );
 };
@@ -242,7 +263,19 @@ export const IoGlobalSelect: React.FC<{
   className?: string;
   /** Set when the runtime cannot route this slot at all; disables the list. */
   unsupported?: string;
-} & PickerLayout> = ({ slot, id, label, showLabel, labelClassName, className, unsupported, dense, quietStatus }) => {
+} & PickerLayout> = ({
+  slot,
+  id,
+  label,
+  showLabel,
+  labelClassName,
+  className,
+  unsupported,
+  dense,
+  quietStatus,
+  selectClassName,
+  hintClassName,
+}) => {
   const resolved = useResolvedGlobal(slot);
   const kind = slot === 'audio_input' ? 'audioIn' : slot === 'midi_output' ? 'midiOut' : slot === 'visual_display' ? 'display' : 'audioOut';
   const live = useIoDevicesStore((s) =>
@@ -285,6 +318,8 @@ export const IoGlobalSelect: React.FC<{
       className={className}
       dense={dense}
       quietStatus={quietStatus}
+      selectClassName={selectClassName}
+      hintClassName={hintClassName}
     />
   );
 };

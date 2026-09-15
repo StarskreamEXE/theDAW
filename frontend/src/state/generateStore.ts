@@ -751,7 +751,7 @@ const runHealPass = async (
       return null;
     }
     logError('generate', `Heal pass failed — keeping the first result: ${msg}`);
-    useStatusBarStore.getState().setText('HEAL PASS FAILED — first result kept');
+    useStatusBarStore.getState().setText('HEAL PASS FAILED — first result kept', { logged: true });
     return null;
   } finally {
     _stopPacerFor(runId);
@@ -1286,7 +1286,7 @@ export const useGenerateStore = create<GenerateStoreState>()((set, get) => ({
             // Retries exhausted: surface it instead of leaving the user to
             // wonder why a track they just generated is missing.
             logError('generate', `Could not find freshly-saved entry for job ${resultJobId} after retries — try reloading the library panel.`);
-            useStatusBarStore.getState().setText('Saved to disk, but the library list did not refresh — reload the Library panel.');
+            useStatusBarStore.getState().setText('Saved to disk, but the library list did not refresh — reload the Library panel.', { logged: true });
           }
 
           useStatusBarStore.getState().setText('GENERATION COMPLETE');
@@ -1406,7 +1406,7 @@ export const useGenerateStore = create<GenerateStoreState>()((set, get) => ({
       void confirmCancel(currentJobId, nextRunId, runJobsBase);
       return;
     }
-    useStatusBarStore.getState().setText('GENERATION STOPPED');
+    useStatusBarStore.getState().setText('GENERATION STOPPED', { logged: true });
     logInfo('generate', 'STOP pressed before the backend returned a job id: a job already submitted is cancelled when its id comes back');
   },
 

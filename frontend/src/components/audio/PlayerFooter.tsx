@@ -43,6 +43,7 @@ import {
   transportPlayRest,
 } from './transportKeys';
 import { Glyph, GLYPH_PAUSE, GLYPH_PLAY, GLYPH_TO_END, GLYPH_TO_START } from './transportGlyphs';
+import { useBottomPanelStore } from '../../state/bottomPanelStore';
 import { entryAudioFileName, entryFileName } from '../../convert/convertClient';
 import { saveFile } from '../../lib/saveFile';
 import { TrackMenu } from './TrackMenu';
@@ -691,11 +692,17 @@ export const PlayerFooter: React.FC = () => {
             sticks to the bottom-left corner and overlaps the footer, so pad left
             past it: 16px margin + the 112px orb = 128, plus clearance. */}
         <div className="flex items-center gap-3 min-w-0 pl-36">
-          {/* The orb's speech bubble, in the slot G-Search used to hold, from xl
-              up. 192px below 2xl and 224px from 2xl: beside the 276px transport
+          {/* The orb's speech bubble, in the slot G-Search held, from xl up.
+              Status notices show in it, and a click on one opens the LOG; below
+              xl it is hidden and OrbStatusFloat (App.tsx) shows notices by the
+              orb. 192px below 2xl and 224px from 2xl: beside the 276px transport
               plate, 192px at 1280px still leaves the now-playing block room for
               its title and a LIBRARY chip row. */}
-          <OrbTipBubble className="hidden xl:block" widthClass="w-48 2xl:w-56" />
+          <OrbTipBubble
+            className="hidden xl:block"
+            widthClass="w-48 2xl:w-56"
+            onOpenLog={() => useBottomPanelStore.getState().setLogOpen(true)}
+          />
           <div className="flex flex-col min-w-0 flex-1 gap-0.5">
             <h4 className="text-[13px] font-bold text-zinc-100 truncate tracking-tight leading-tight">
               {displayLabel ?? 'No output loaded'}
