@@ -63,6 +63,21 @@ def test_get_missing_entry_returns_404(client_with_root):
     assert r.status_code == 404
 
 
+def test_entry_path_endpoint_returns_the_audio_file(client_with_root, tmp_path):
+    _seed_generate_entry(tmp_path, "job_path", 0)
+
+    r = client_with_root.get("/api/library/entries/job_path_00/path")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["id"] == "job_path_00"
+    assert Path(body["path"]) == (tmp_path / "job_path" / "00" / "output.wav").resolve()
+
+
+def test_entry_path_endpoint_404_for_unknown_entry(client_with_root):
+    r = client_with_root.get("/api/library/entries/no-such-entry/path")
+    assert r.status_code == 404
+
+
 def test_stream_audio_endpoint_returns_file_bytes(client_with_root, tmp_path):
     audio = b"RIFF\x00\x00\x00\x00WAVEdata fake"
     _seed_generate_entry(tmp_path, "job_audio", 0, audio_bytes=audio)

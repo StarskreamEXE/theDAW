@@ -13,6 +13,7 @@ import {
   type ScoreClock,
   type ScoreTimeMap,
 } from './scoreTimeMap';
+import { readSoundingTempi } from './soundingTempo';
 import {
   convertMidiToMusicXml,
   exportArtifact,
@@ -1321,7 +1322,7 @@ const MusicXmlPreview: React.FC<{ artifact: NotationArtifact; entry: LibraryEntr
         // load() resolves, whereas osmd.cursor does not exist until the first
         // render(). Build it here and never again: it describes notated time,
         // which zoom and page width cannot change.
-        mapRef.current = buildTimeMap(osmd);
+        mapRef.current = buildTimeMap(osmd, { soundingTempi: readSoundingTempi(xml) });
         driverRef.current?.cancel();
         driverRef.current = createCursorDriver(() =>
           (osmdGenRef.current === generation ? osmdRef.current?.cursor ?? null : null),

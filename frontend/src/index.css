@@ -361,6 +361,19 @@ select optgroup {
 .edit-theme-scope .bg-zinc-500\/20 { background-color: rgb(var(--et-tint) / 0.20); }
 .edit-theme-scope .bg-slate-500\/30 { background-color: rgb(var(--et-tint) / 0.14); }
 
+/* Surfaces drawn over other content (a dialog across a pane, a sticky head
+   over a scrolling list, a menu) carry `et-opaque`. Brushed Steel, the
+   gradient themes and the custom image give the canvas, popup and panel tiers
+   translucent values so the backdrop shows through the panes; on an overlay
+   that shows the content underneath. These take the tier's own colour at full
+   alpha, which leaves every theme with an opaque tier unchanged.
+   Pinned by components/layout/sing/opaqueOverlays.test.ts. */
+.edit-theme-scope .et-opaque:is(.bg-\[\#07050a\], .bg-\[\#07080c\]) { background-color: rgb(from var(--et-canvas) r g b / 1); }
+.edit-theme-scope .et-opaque:is(.bg-\[\#0a080f\], .bg-\[\#0a0c14\], .bg-\[\#0d0b16\], .bg-\[\#0f0f12\],
+  .bg-\[\#101215\], .bg-\[\#111114\], .bg-zinc-950, .bg-zinc-900) { background-color: rgb(from var(--et-popup) r g b / 1); }
+.edit-theme-scope .et-opaque:is(.bg-\[\#0c0a12\], .bg-\[\#0c0a14\], .bg-\[\#15171b\], .bg-\[\#150f22\],
+  .bg-\[\#140e20\], .bg-zinc-800, .bg-zinc-700) { background-color: rgb(from var(--et-panel) r g b / 1); }
+
 /* White-opacity subtle fills → themed tint. */
 .edit-theme-scope .bg-white\/2 { background-color: rgb(var(--et-tint) / 0.02); }
 .edit-theme-scope .bg-white\/5 { background-color: rgb(var(--et-tint) / 0.05); }

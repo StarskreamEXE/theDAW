@@ -509,3 +509,147 @@ def test_band_score_real_entry_fits_clef_windows(tmp_path: Path):
         assert midis, name
         assert all(low <= m <= high for m in midis), name
         assert all(len(g) <= 4 for g in _chord_groups(part)), name
+
+
+# --------------------------------------------------------------------------
+# Band-score beat grid: stem MIDIs of one song written at different tempos
+# --------------------------------------------------------------------------
+
+# The tempo the drum transcriber wrote for "Everything is Chrome in the Future"
+# (464399 microseconds per quarter), the analysed tempo it came from, and the
+# tempo basic-pitch writes every pitched stem at.
+SONG_BPM = 60_000_000 / 464_399
+ANALYSED_BPM = 129.19921875
+BASIC_PITCH_BPM = 120.0
+# Beats of the song where every part plays. Read at 120 BPM, beats 4, 16, 37
+# and 47 land a bar early.
+SONG_BEATS = (0, 4, 9, 16, 26, 37, 47)
+
+
+def write_timed_midi(
+    path: Path, bpm: float, pitch: int, *, drums: bool = False
+) -> list[float]:
+    """An eighth note of ``pitch`` on each of :data:`SONG_BEATS`, in a file that
+    declares ``bpm``. Returns the onsets in seconds, which do not depend on
+    ``bpm``."""
+    beat = 60.0 / SONG_BPM
+    onsets = [k * beat for k in SONG_BEATS]
+    pm = pretty_midi.PrettyMIDI(initial_tempo=bpm)
+    inst = pretty_midi.Instrument(program=0, is_drum=drums, name=path.stem)
+    for start in onsets:
+        inst.notes.append(pretty_midi.Note(100, pitch, start, start + beat / 2))
+    pm.instruments.append(inst)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pm.write(str(path))
+    return onsets
+
+
+def _sounding_bpms(sheet: Path) -> set[float]:
+    """The ``<sound tempo>`` of every metronome direction in a MusicXML sheet."""
+    tempi: set[float] = set()
+    for direction in ET.parse(sheet).getroot().iter("direction"):
+        sound = direction.find("sound")
+        if direction.find("direction-type/metronome") is None or sound is None:
+            continue
+        if sound.get("tempo"):
+            tempi.add(float(sound.get("tempo", "")))
+    return tempi
+
+
+def _onset_bars(sheet: Path) -> dict[str, tuple[set[float], list[tuple[int, float]]]]:
+    """Part name -> (bar lengths in quarters, sorted ``(bar number, quarters
+    into the bar)`` of every onset)."""
+    from music21 import converter, stream  # type: ignore[import]
+
+    out: dict[str, tuple[set[float], list[tuple[int, float]]]] = {}
+    for part in converter.parse(str(sheet), forceSource=True).parts:
+        lengths: set[float] = set()
+        onsets: set[tuple[int, float]] = set()
+        for measure in part.getElementsByClass(stream.Measure):
+            lengths.add(float(measure.barDuration.quarterLength))
+            for element in measure.recurse().notes:
+                offset = float(element.getOffsetInHierarchy(measure))
+                onsets.add((int(measure.number), offset))
+        out[str(part.partName)] = (lengths, sorted(onsets))
+    return out
+
+
+def assert_one_grid(sheet: Path, onsets: list[float], bpm: float) -> None:
+    """Every part of ``sheet`` sounds at ``bpm``, has the same seconds per bar,
+    and puts each onset in the same bar at the same place, at its own second."""
+    tempi = _sounding_bpms(sheet)
+    assert len(tempi) == 1, f"expected one sounding tempo, got {sorted(tempi)}"
+    (sounding,) = tempi
+    assert sounding == pytest.approx(bpm, abs=1e-9)
+
+    parts = _onset_bars(sheet)
+    assert len(parts) >= 2, parts
+    seconds_per_bar = {
+        length * 60.0 / sounding
+        for lengths, _bars in parts.values()
+        for length in lengths
+    }
+    assert len(seconds_per_bar) == 1, seconds_per_bar
+    bar_quarters = seconds_per_bar.pop() * sounding / 60.0
+
+    placed = {name: bars for name, (_lengths, bars) in parts.items()}
+    first = next(iter(placed.values()))
+    for name, bars in placed.items():
+        assert bars == first, (name, bars, first)
+    for (number, quarters), second in zip(first, onsets, strict=True):
+        at = ((number - 1) * bar_quarters + quarters) * 60.0 / sounding
+        assert at == pytest.approx(second, abs=0.005), (number, quarters, second)
+
+
+@pytest.mark.parametrize("kit", [True, False], ids=["drum-kit", "pitched"])
+def test_band_score_puts_stems_of_different_file_tempos_on_one_grid(
+    tmp_path: Path, kit: bool
+):
+    """A part written at the song's tempo and a basic-pitch part written at 120
+    BPM hold the same onsets in seconds. The band score puts both on one beat
+    grid: the same seconds per bar and the same bar for the same onset."""
+    db = LibraryDB(tmp_path / "library.db")
+    db.upsert_entry({"id": "track"})
+    song = tmp_path / "midi" / ("drums.mid" if kit else "keys.mid")
+    basic = tmp_path / "midi" / "bass.mid"
+    onsets = write_timed_midi(song, SONG_BPM, 36 if kit else 64, drums=kit)
+    assert write_timed_midi(basic, BASIC_PITCH_BPM, 40) == onsets
+
+    result = midi_to_arrangement(
+        db,
+        entry_id="track",
+        sources=[song, basic],
+        style="band-score",
+        output_path=tmp_path / "notation" / "band.musicxml",
+    )
+    assert result["ok"] is True, result
+    assert result["stats"]["parts"] == 2
+    # The file stores the tempo as whole microseconds per quarter.
+    _times, declared = pretty_midi.PrettyMIDI(str(song)).get_tempo_changes()
+    assert float(declared[0]) == pytest.approx(SONG_BPM, abs=1e-3)
+    assert_one_grid(Path(result["path"]), onsets, float(declared[0]))
+
+
+def test_band_score_lays_every_stem_out_at_the_analysed_tempo(tmp_path: Path):
+    """Given the song's analysed tempo, the drum staff (its MIDI declares the
+    tempo rounded to whole microseconds) and the 120 BPM stems all sound at it."""
+    db = LibraryDB(tmp_path / "library.db")
+    db.upsert_entry({"id": "track"})
+    bass = tmp_path / "midi" / "bass.mid"
+    drums = tmp_path / "midi" / "drums.mid"
+    guitar = tmp_path / "midi" / "guitar.mid"
+    onsets = write_timed_midi(drums, SONG_BPM, 36, drums=True)
+    write_timed_midi(bass, BASIC_PITCH_BPM, 40)
+    write_timed_midi(guitar, BASIC_PITCH_BPM, 67)
+
+    result = midi_to_arrangement(
+        db,
+        entry_id="track",
+        sources=[bass, drums, guitar],
+        style="band-score",
+        output_path=tmp_path / "notation" / "band.musicxml",
+        reference_bpm=ANALYSED_BPM,
+    )
+    assert result["ok"] is True, result
+    assert result["stats"]["parts"] == 3
+    assert_one_grid(Path(result["path"]), onsets, ANALYSED_BPM)

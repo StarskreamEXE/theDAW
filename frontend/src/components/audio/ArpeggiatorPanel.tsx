@@ -19,6 +19,7 @@ import {
 import { COLUMN_CUE_PX, arpCompact, panelStep, rowPage, wholeRows, type PanelBox } from '../../lib/arpLayout';
 import { getEngineCtx } from '../../state/playerStore';
 import { usePianoRollStore, type PianoNote } from '../../state/pianoRollStore';
+import { playedRollBends } from '../../lib/pitchBend';
 import { InstrumentPicker } from './InstrumentPicker';
 import { CueKey, FIELD_LEGEND, KEY_ON, KEY_REST, MINI_GLYPH, STRIP_GLYPH, StripKey } from './midiDockKit';
 
@@ -335,6 +336,14 @@ export const ArpeggiatorPanel: React.FC<{ playing: boolean }> = ({ playing }) =>
   useEffect(() => {
     engine.setMeter({ meterMap, pickupSteps });
   }, [engine, meterMap, pickupSteps]);
+
+  // The arpeggiator bends with the roll's lane A, its curve looping at the roll's length.
+  const bends = usePianoRollStore((s) => s.bends);
+  const lanes = usePianoRollStore((s) => s.lanes);
+  const rollSteps = usePianoRollStore((s) => s.totalSteps);
+  useEffect(() => {
+    engine.setBend(playedRollBends(bends, lanes, rollSteps).get(0) ?? null, rollSteps);
+  }, [engine, bends, lanes, rollSteps]);
   const [activeChord, setActiveChord] = useState<number>(-1);
   const [activeMidi, setActiveMidi] = useState<Set<number>>(new Set());
   const timeoutsRef = useRef<number[]>([]);

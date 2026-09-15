@@ -65,6 +65,8 @@ from ..arrangers.percussion import (
     gm_pitch_for_display,
     is_drum_midi,
 )
+from ..midi_read import read_midi
+from ..tempo_marks import restore_sounding_tempi
 from . import beatsaber_map
 
 log = logging.getLogger(__name__)
@@ -879,6 +881,7 @@ def _emit_element(
     counters: _Counters,
 ) -> list[dict[str, Any]]:
     """One music21 element as one event (a chord becomes one event per pitch)."""
+    from music21 import chord as m21chord  # type: ignore[import]
     from music21 import note as m21note  # type: ignore[import]
 
     dur = element.duration
@@ -957,6 +960,16 @@ def _emit_element(
     is_chord = len(pitches) > 1
     if is_chord:
         counters.chords += 1
+    # MusicXML ties each head of a chord on its own, and Chord.tie reports only
+    # the first tied head: a head struck beside a held one would read as held.
+    head_ties = (
+        {
+            _i(getattr(n.pitch, "midi", 0)): _s(getattr(n.tie, "type", ""))
+            for n in element.notes
+        }
+        if isinstance(element, m21chord.Chord)
+        else {}
+    )
 
     events: list[dict[str, Any]] = []
     for index, (pitch, midi, notehead, drum_voice) in enumerate(heads):
@@ -968,11 +981,13 @@ def _emit_element(
             accidental, cautionary, acc_glyph, acc_code = _accidental_fields(pitch)
         staff_step = steps[index]
         ledger, below = _ledger_lines(staff_step)
+        head_tie = head_ties.get(midi, tie) if head_ties else tie
         event = _blank_event()
         event.update(common)
         event.update(
             {
                 "isRest": False,
+                "tie": head_tie,
                 "midi": midi,
                 "drumVoice": drum_voice,
                 "velocity": velocity,
@@ -1007,7 +1022,7 @@ def _emit_element(
             counters.graces += 1
         if is_tuplet:
             counters.tuplets += 1
-        if tie:
+        if head_tie:
             counters.tied += 1
         events.append(event)
     return events
@@ -1380,10 +1395,15 @@ def build_notechart(
         # Engrave it the way MAKE SHEET does: one percussion staff, already
         # quantised to 1/16 by the arranger, so no second quantize pass.
         score = build_percussion_score(source_path, title=title)
+    elif source_format == "midi":
+        score = read_midi(source_path)
     else:
         score = converter.parse(str(source_path))
     if score is None:
         raise ValueError(f"music21 could not parse {source_path}")
+    # An engraved sheet prints a whole-number tempo; the tempo map needs the
+    # <sound tempo> its notes were placed at, which music21 does not read back.
+    restore_sounding_tempi(score, source_path)
 
     if source_format == "midi" and not drum_source:
         # Match what MAKE SHEET engraves, so the chart and the sheet agree.
@@ -1393,6 +1413,8 @@ def build_notechart(
                 score = quantized
         except Exception as exc:  # noqa: BLE001 - quantize is best-effort
             log.debug("notechart: quantize skipped for %s: %s", source_path, exc)
+        # A MIDI reads as unbarred parts; bar them as the sheet writer does.
+        score.makeNotation(inPlace=True)
 
     score = _expand_repeats(score)
 

@@ -874,6 +874,12 @@ interface DockFlyoutProps {
   id?: string;
   /** `menu` gets arrow-key movement between its `menuitem`s, and Tab leaves it. */
   role?: string;
+  /** The element the card portals into, in place of the anchor's nearest
+   *  `.edit-theme-scope`. For an anchor whose scope is a containing block for
+   *  fixed descendants (the footer's backdrop blur) the card would be placed
+   *  against that box. The element must cover the viewport: the card clamps
+   *  itself to its box. */
+  portalInto?: HTMLElement | null;
   'aria-label'?: string;
   className?: string;
   children: React.ReactNode;
@@ -910,6 +916,7 @@ export const DockFlyout: React.FC<DockFlyoutProps> = ({
   asideSelector,
   id,
   role,
+  portalInto,
   'aria-label': ariaLabel,
   className = '',
   children,
@@ -937,8 +944,8 @@ export const DockFlyout: React.FC<DockFlyoutProps> = ({
       return;
     }
     const anchor = anchorRef.current;
-    setHost((anchor?.closest('.edit-theme-scope') as HTMLElement | null) ?? document.body);
-  }, [open, anchorRef]);
+    setHost(portalInto ?? (anchor?.closest('.edit-theme-scope') as HTMLElement | null) ?? document.body);
+  }, [open, anchorRef, portalInto]);
 
   const place = useCallback(() => {
     const anchor = anchorRef.current;

@@ -86,6 +86,37 @@ def test_cannot_escape_the_build_directory(
 
 
 @pytest.mark.parametrize("mount,sidecar", CASES)
+def test_a_restaged_build_reaches_a_browser_that_loaded_the_old_one(
+    client, monkeypatch, tmp_path: Path, mount, sidecar
+) -> None:
+    """The builds keep fixed file names, so a browser that loaded the old
+    bundle must revalidate it, or it runs the old cockpit after a restage."""
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<title>old</title>", encoding="utf-8")
+    (dist / "embed.bundle.js").write_text("const build = 'old'\n", encoding="utf-8")
+    monkeypatch.setattr(sidecar, "resolve_dist_dir", lambda: dist)
+
+    first = client.get(f"{mount}/embed.bundle.js")
+    assert first.status_code == 200
+    assert first.headers["cache-control"] == "no-cache"
+    assert client.get(f"{mount}/").headers["cache-control"] == "no-cache"
+    etag = first.headers["etag"]
+
+    # Unchanged: the revalidation is a cheap 304.
+    same = client.get(f"{mount}/embed.bundle.js", headers={"If-None-Match": etag})
+    assert same.status_code == 304
+
+    # Restaged under the same name: the same revalidation now gets the new file.
+    (dist / "embed.bundle.js").write_text(
+        "const build = 'new, and longer'\n", encoding="utf-8"
+    )
+    fresh = client.get(f"{mount}/embed.bundle.js", headers={"If-None-Match": etag})
+    assert fresh.status_code == 200
+    assert "new, and longer" in fresh.text
+
+
+@pytest.mark.parametrize("mount,sidecar", CASES)
 def test_status_is_false_while_nothing_is_staged(monkeypatch, mount, sidecar) -> None:
     """The route exists from boot, so 'mounted' alone must not read as ready —
     that is what let /api/vj/status report ok while the iframe 404'd."""
