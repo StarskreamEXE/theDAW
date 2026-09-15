@@ -33,7 +33,7 @@ import type { ChainEntry } from '../../state/effectChainStore';
 import type { Vst3PluginInfo } from '../../lib/vstClient';
 import { getEngineCtx, getMasterGain, usePlayerStore } from '../../state/playerStore';
 import { usePianoRollStore } from '../../state/pianoRollStore';
-import { clipRollLoad } from '../../lib/rollClip';
+import { clipRenderInput, clipRollLoad } from '../../lib/rollClip';
 import { midiEventsToMeterMap, roundUpToBar } from '../../lib/meterMap';
 import { GM_NAMES, gmShortName } from '../../lib/gmInstruments';
 import { useSoundfontStore, ensureSoundfontReady, isSoundfontActive, getActiveProgram } from '../../lib/soundfontEngine';
@@ -1201,7 +1201,9 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
           Math.max(1, ...clip.sourcePianoRoll.map((n) => n.step + n.length)),
           clip.sourcePickupSteps ?? 0,
         );
-      const rendered = await renderStepNotesToBlob(clip.sourcePianoRoll, bpm, totalSteps, { program });
+      // A clip whose lanes bend renders each note in its lane, so the bend survives the re-render.
+      const input = clipRenderInput(clip, totalSteps);
+      const rendered = await renderStepNotesToBlob(input.notes, bpm, totalSteps, { program, bends: input.bends });
       const { peaks } = await computePeaks(rendered.blob, 240);
       // Re-read: the user may have deleted or re-assigned the clip mid-render.
       const live = useEditorStore.getState().clips.find((c) => c.id === clipId);

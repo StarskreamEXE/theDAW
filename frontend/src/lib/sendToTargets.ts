@@ -18,10 +18,10 @@
 import { useEditorStore, computePeaks } from '../state/editorStore';
 import { useGenerateParamsStore } from '../state/generateParamsStore';
 import { useBottomPanelStore } from '../state/bottomPanelStore';
-import { DEFAULT_LANES, usePianoRollStore } from '../state/pianoRollStore';
+import { usePianoRollStore } from '../state/pianoRollStore';
 import { addBlobsToChimera } from './chimeraClient';
 import { parseMidi } from './midi';
-import { midiEventsToMeterMap } from './meterMap';
+import { midiFileToRoll } from './rollMidi';
 import { renderMidiBufferToBlob } from './midiSynth';
 import { fetchMidiBytesWithRetry, fetchBlobWithRetry } from './fetchRetry';
 import { logError, logInfo } from '../state/logStore';
@@ -167,26 +167,16 @@ export function loadMidiIntoPianoRoll(
 ): boolean {
   try {
     const midi = parseMidi(buf);
-    const ppq = midi.ppq || 480;
-    const stepTicks = ppq / 4;
-    const notes = midi.tracks.flatMap((t) =>
-      t.notes.map((n) => ({
-        id: `pn-${Math.random().toString(36).slice(2)}`,
-        note: n.note,
-        step: Math.round(n.tick / stepTicks),
-        length: Math.max(1, Math.round(n.durationTicks / stepTicks)),
-        velocity: n.velocity,
-      })),
-    );
+    // Every track's notes, and the file's time signatures set the roll's meter (a file with no FF 58 is
+    // 4/4 by the MIDI spec). A channel whose pitch wheel moves gets its own lane and curve; every other
+    // note is in lane A (lib/rollMidi).
+    const { notes, bpm, meter, bends } = midiFileToRoll(midi, 'pn');
     if (notes.length === 0) {
       logError('send-to', `MIDI ${labelForLog} parsed empty — no note-on events`);
       return false;
     }
-    // The file's time signatures set the roll's meter; a file with no FF 58 is 4/4 by the MIDI spec.
-    // Its notes carry no lanes, so the roll's lanes reset to lane A alone.
-    const { map: meterMap, pickupSteps } = midiEventsToMeterMap(midi.timeSignatures ?? [], ppq);
     const piano = usePianoRollStore.getState();
-    piano.importNotes(notes, midi.bpm, { meterMap, pickupSteps, lanes: [...DEFAULT_LANES] }); // auto-fits length + pitch range to the import
+    piano.importNotes(notes, bpm, meter, bends); // auto-fits length + pitch range to the import
     useBottomPanelStore.getState().showTab(target === 'piano-roll' ? 'midi' : 'step-seq');
     const totalSteps = usePianoRollStore.getState().totalSteps;
     logInfo(
