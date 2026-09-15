@@ -57,6 +57,8 @@ import {
   resetMidiRouting,
   useSoundfontStore,
 } from '../lib/soundfontEngine';
+import { applyFadeAutomation, type FadeClip } from '../lib/clipFade';
+import { warpSegments, type WarpMarker, type WarpSegment } from '../lib/audioWarp';
 import { buildEffectChain, teleportXYZ, SPATIAL_TELEPORT, type ChainHandle } from '../lib/rackEffects';
 import { sliceChunks, type AudioChunk } from '../lib/audioAnalysis';
 import { decodeClipBlob, peekDecoded } from '../lib/decodeCache';
@@ -327,6 +329,259 @@ function isMidiClip(clip: AudioClip): boolean {
   return clip.sourceKind === 'piano-roll' && !!clip.sourcePianoRoll && clip.sourcePianoRoll.length > 0;
 }
 
+/* ── Per-clip schedule math ───────────────────────────────────────────────────
+   One clip becomes one or more buffer-source plays. With none of T07a's fields
+   that is a single play of the clip's length at unit rate, exactly as it always
+   was. `timeStretchRate` rides the source's `playbackRate` instead of a
+   destructive re-render; `warpMarkers` split the clip into one play per warp
+   segment, each with its own rate. The computation is PURE — no audio context,
+   no store — so the live scheduler here and the three offline bounces in
+   WaveformEditor schedule from the same arithmetic, and so it is testable on
+   its own (state/liveMixer.schedule.test.ts). */
+
+/** The clip fields the schedule math reads. `AudioClip` satisfies it. */
+export interface ScheduleClip {
+  offsetIntoSource: number;
+  durationSec: number;
+  timeStretchRate?: number;
+  stretchMode?: 'repitch' | 'offline';
+  warpMarkers?: WarpMarker[];
+}
+
+/** One `AudioBufferSourceNode` worth of playback. All times are seconds. */
+export interface ScheduledSegment {
+  /** Offset from the clip's HEAD at which this piece starts on the timeline —
+   *  add the clip's own start (live: its context time) to place it. */
+  targetStart: number;
+  /** Offset from the clip's head at which it ends. */
+  targetEnd: number;
+  /** Where in the decoded buffer this piece starts reading. */
+  sourceOffset: number;
+  /** How much of the buffer it reads: timeline length x `playbackRate`. */
+  sourceDuration: number;
+  /** `AudioBufferSourceNode.playbackRate` for this piece. */
+  playbackRate: number;
+}
+
+export interface ClipSchedule {
+  /** The clip's EFFECTIVE length on the timeline, once the decoded buffer's real
+   *  length, the stretch rate and the warp map are known. Every fade site passes
+   *  it to `applyFadeAutomation` as `effectiveDurationSec`, so a fade-out lands
+   *  on the end of the audio that actually plays rather than fading past audio
+   *  that is not there. (`lib/clipFade` caps it at `clip.durationSec`, so a warp
+   *  map that runs the clip PAST its box still fades over the box.) Unaffected
+   *  by a mid-clip start: the envelope describes the whole clip either way. */
+  durationSec: number;
+  /** In timeline order, and already trimmed to the requested start point. */
+  segments: ScheduledSegment[];
+}
+
+/** How close to the end of a decoded buffer a clip's offset may land. Keeps a
+ *  clip whose offset runs past its (re-decoded, slightly shorter) buffer
+ *  audible instead of silent — the app's behaviour since before this module. */
+const SOURCE_END_GUARD = 0.01;
+
+/** The rate `playbackRate` must ride. An 'offline' stretch is already baked into
+ *  the clip's blob, so it schedules like an unstretched clip; anything that is
+ *  not a usable positive rate falls back to unity rather than silencing a clip. */
+const stretchRateOf = (clip: ScheduleClip): number => {
+  if (clip.stretchMode === 'offline') return 1;
+  const rate = clip.timeStretchRate;
+  return typeof rate === 'number' && Number.isFinite(rate) && rate > 0 ? rate : 1;
+};
+
+/**
+ * Does this segment list actually bend time?
+ *
+ * `warpSegments` discards markers it cannot use — not finite, before the head of
+ * the source, past its end — and a clip whose markers ALL go that way is handed
+ * back the identity map: the whole source, once, at rate 1. So is a clip whose
+ * only marker restates where the source already ends. Neither is a warp, and
+ * treating them as one would silently drop the clip's `timeStretchRate`, so they
+ * fall through to the ordinary stretch path instead.
+ */
+const isWarp = (segments: readonly WarpSegment[], sourceSpan: number): boolean => {
+  if (segments.length === 0) return false;
+  if (segments.length > 1) return true;
+  const only = segments[0];
+  return !(
+    only.sourceStart === 0 && only.targetStart === 0
+    && only.sourceEnd === sourceSpan && only.targetEnd === sourceSpan
+  );
+};
+
+/**
+ * How to play one clip out of `bufferDurationSec` seconds of decoded audio,
+ * starting `fromClipSec` seconds into the clip (0 for an offline bounce, the
+ * seek position for a mid-clip start). Returns `null` when there is nothing
+ * left to play — no buffer, a zero-length clip, or a start past its end.
+ */
+export function computeClipSchedule(
+  clip: ScheduleClip,
+  bufferDurationSec: number,
+  fromClipSec = 0,
+): ClipSchedule | null {
+  if (!Number.isFinite(bufferDurationSec) || bufferDurationSec <= 0) return null;
+  const baseOffset = Math.min(clip.offsetIntoSource, Math.max(0, bufferDurationSec - SOURCE_END_GUARD));
+  const available = bufferDurationSec - baseOffset;
+  if (!(available > 0)) return null;
+
+  // Markers are anchored against the clip's own stretch of source, so the map is
+  // closed over the source the clip actually owns — a buffer shorter than the
+  // clip shortens the map with it.
+  const sourceSpan = Math.min(clip.durationSec, available);
+  const markers = clip.warpMarkers;
+  const warped = markers && markers.length > 0 ? warpSegments(markers, sourceSpan) : [];
+
+  let segments: ScheduledSegment[];
+  if (isWarp(warped, sourceSpan)) {
+    // The markers already say where every moment lands, so `timeStretchRate` is
+    // NOT applied on top of them. The map can re-time audio PAST the clip's own
+    // box (`warpSegments` closes it by continuing at rate 1 from the last
+    // marker), and the box is what the timeline draws, what the offline renders
+    // are sized from, and what the fade envelope spans — so the schedule is
+    // clamped to it. Without that, preview would play a tail that export cuts.
+    segments = [];
+    for (const seg of warped) {
+      // A pathological map can place a later segment earlier, so this is a skip
+      // and not a break.
+      if (!(seg.targetStart < clip.durationSec)) continue;
+      const targetEnd = Math.min(seg.targetEnd, clip.durationSec);
+      segments.push({
+        targetStart: seg.targetStart,
+        targetEnd,
+        sourceOffset: baseOffset + seg.sourceStart,
+        // Untrimmed, the source span is the map's own — recomputing it from the
+        // rate would only add float noise.
+        sourceDuration: targetEnd === seg.targetEnd
+          ? seg.sourceEnd - seg.sourceStart
+          : (targetEnd - seg.targetStart) * seg.playbackRate,
+        playbackRate: seg.playbackRate,
+      });
+    }
+  } else {
+    const playbackRate = stretchRateOf(clip);
+    // At rate r, one timeline second eats r source seconds, so the buffer runs
+    // out after `available / r` seconds of timeline.
+    const targetEnd = Math.min(clip.durationSec, available / playbackRate);
+    segments = targetEnd > 0
+      ? [{
+          targetStart: 0,
+          targetEnd,
+          sourceOffset: baseOffset,
+          sourceDuration: targetEnd * playbackRate,
+          playbackRate,
+        }]
+      : [];
+  }
+  if (segments.length === 0) return null;
+  // The max, not the last: see the skip above.
+  const durationSec = segments.reduce((end, seg) => Math.max(end, seg.targetEnd), 0);
+
+  const from = Number.isFinite(fromClipSec) && fromClipSec > 0 ? fromClipSec : 0;
+  const playable: ScheduledSegment[] = [];
+  for (const seg of segments) {
+    if (seg.targetEnd <= from) continue;                        // already finished
+    if (seg.targetStart >= from) { playable.push(seg); continue; } // still ahead
+    // The playhead is inside this one: skip into it at ITS playback rate.
+    const skipped = (from - seg.targetStart) * seg.playbackRate;
+    playable.push({
+      targetStart: from,
+      targetEnd: seg.targetEnd,
+      sourceOffset: seg.sourceOffset + skipped,
+      sourceDuration: seg.sourceDuration - skipped,
+      playbackRate: seg.playbackRate,
+    });
+  }
+  if (playable.length === 0) return null;
+  return { durationSec, segments: playable };
+}
+
+/** Everything `scheduleClipSources` reads off a clip. `AudioClip` satisfies it
+ *  structurally, and building one in a test needs no Blob. */
+export type SchedulableClip = ScheduleClip & FadeClip & { id: string; startSec: number; gain?: number };
+
+/** The audio-context surface the per-clip wiring needs — the two factories, and
+ *  nothing else. `AudioContext` satisfies it; so does a stand-in. The real one
+ *  is built by `playerStore.ensureEngine()` off `window.AudioContext`, which a
+ *  test cannot supply, so the seam that makes this testable lives here. */
+export interface ClipNodeFactory {
+  createGain(): GainNode;
+  createBufferSource(): AudioBufferSourceNode;
+}
+
+export interface ScheduledClipNodes {
+  /** The clip's live mute gate, for the caller to key by clip id. */
+  muteGate: GainNode;
+  /** One source per played segment, in the schedule's order. */
+  sources: AudioBufferSourceNode[];
+}
+
+/**
+ * Wire one clip up for playback and start it:
+ *
+ *     source(s) ─▶ clipGain (fade envelope) ─▶ muteGate ─▶ destination
+ *
+ * `nowSec` is the context's current time (captured once for the whole pass, so
+ * every clip is placed against the same instant) and `fromSec` is the timeline
+ * position playback starts at. A warped clip gets one source per warp segment;
+ * they share the one envelope and the one gate, which are therefore torn down
+ * only once the LAST source has ended. Returns `null` — having built nothing —
+ * when the clip has nothing left to play.
+ */
+export function scheduleClipSources(
+  ctx: ClipNodeFactory,
+  clip: SchedulableClip,
+  buf: AudioBuffer,
+  destination: AudioNode,
+  nowSec: number,
+  fromSec: number,
+): ScheduledClipNodes | null {
+  // How far into this clip the playhead already is (0 if clip is in the future).
+  const into = Math.max(0, fromSec - clip.startSec);
+  // One entry per buffer play: one for an ordinary clip, one per warp segment
+  // for a warped one, already trimmed to `into`. Null = nothing left to play.
+  const schedule = computeClipSchedule(clip, buf.duration, into);
+  if (!schedule) return null;
+
+  const clipStartCtx = nowSec + (clip.startSec - fromSec); // may be < now when straddling
+
+  // Per-clip fade envelope on a dedicated gain (track volume lives on trackGain).
+  // `peak` is the clip's own gain — the envelope rises to it instead of to unity,
+  // so clip gain lands before the track fader and its insert FX, matching the
+  // three offline bounce paths in WaveformEditor. The envelope is applied ONCE,
+  // over the whole clip, however many segments the clip plays as.
+  const clipGain = ctx.createGain();
+  applyFadeAutomation(clipGain.gain, clip, clipStartCtx, into, {
+    peak: clipPeakGain(clip),
+    effectiveDurationSec: schedule.durationSec,
+  });
+
+  // Live mute gate, kept separate from clipGain so a mid-playback mute toggle
+  // never clobbers the fade envelope's scheduled ramps.
+  const muteGate = ctx.createGain();
+  muteGate.gain.value = 1;
+  clipGain.connect(muteGate).connect(destination);
+
+  const clipSources: AudioBufferSourceNode[] = [];
+  let pending = schedule.segments.length;
+  for (const seg of schedule.segments) {
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.playbackRate.value = seg.playbackRate;
+    src.connect(clipGain);
+    src.start(Math.max(nowSec, clipStartCtx + seg.targetStart), seg.sourceOffset, seg.sourceDuration);
+    src.onended = () => {
+      pending -= 1;
+      try { src.disconnect(); } catch { /* already gone */ }
+      if (pending > 0) return;
+      try { clipGain.disconnect(); muteGate.disconnect(); } catch { /* already gone */ }
+    };
+    clipSources.push(src);
+  }
+  return { muteGate, sources: clipSources };
+}
+
 /** Schedule every clip that is at or after `fromSec` (or straddling it). */
 function scheduleClips(clips: AudioClip[], fromSec: number): void {
   const ctx = getEngineCtx();
@@ -345,60 +600,10 @@ function scheduleClips(clips: AudioClip[], fromSec: number): void {
     const buf = peekDecoded(ctx, clip.audioBlob);
     if (!buf) continue;
 
-    const safeOffset = Math.min(clip.offsetIntoSource, Math.max(0, buf.duration - 0.01));
-    const safeDur = Math.min(clip.durationSec, buf.duration - safeOffset);
-    if (safeDur <= 0) continue;
-
-    const clipEndSec = clip.startSec + safeDur;
-    if (clipEndSec <= fromSec) continue; // already finished before the start point
-
-    // How far into this clip the playhead already is (0 if clip is in the future).
-    const into = Math.max(0, fromSec - clip.startSec);
-    const remaining = safeDur - into;
-    if (remaining <= 0) continue;
-
-    const clipStartCtx = now + (clip.startSec - fromSec); // may be < now when straddling
-    const when = Math.max(now, clipStartCtx);
-
-    // Per-clip fade envelope on a dedicated gain (track volume lives on trackGain).
-    // `peak` is the clip's own gain — the envelope rises to it instead of to unity,
-    // so clip gain lands before the track fader and its insert FX, matching the
-    // three offline bounce paths in WaveformEditor.
-    const clipGain = ctx.createGain();
-    const fadeIn = clip.fadeInSec ?? 0;
-    const fadeOut = clip.fadeOutSec ?? 0;
-    const peak = clipPeakGain(clip);
-    const g = clipGain.gain;
-    if (clipStartCtx >= now) {
-      // Clip begins in the future — full envelope.
-      g.setValueAtTime(fadeIn > 0 ? 0 : peak, when);
-      if (fadeIn > 0) g.linearRampToValueAtTime(peak, when + Math.min(fadeIn, safeDur));
-    } else {
-      // Starting mid-clip — set the current envelope value now.
-      const cur = fadeIn > 0 && into < fadeIn ? (into / fadeIn) * peak : peak;
-      g.setValueAtTime(cur, now);
-      if (fadeIn > 0 && into < fadeIn) g.linearRampToValueAtTime(peak, clipStartCtx + fadeIn);
-    }
-    if (fadeOut > 0) {
-      const foStartCtx = clipStartCtx + safeDur - Math.min(fadeOut, safeDur);
-      if (foStartCtx > now) g.setValueAtTime(peak, foStartCtx);
-      g.linearRampToValueAtTime(0, clipStartCtx + safeDur);
-    }
-
-    // Live mute gate, kept separate from clipGain so a mid-playback mute toggle
-    // never clobbers the fade envelope's scheduled ramps.
-    const muteGate = ctx.createGain();
-    muteGate.gain.value = 1;
-    clipMuteGains.set(clip.id, muteGate);
-
-    const src = ctx.createBufferSource();
-    src.buffer = buf;
-    src.connect(clipGain).connect(muteGate).connect(nodes.gain);
-    src.start(when, safeOffset + into, remaining);
-    src.onended = () => {
-      try { src.disconnect(); clipGain.disconnect(); muteGate.disconnect(); } catch { /* already gone */ }
-    };
-    sources.push(src);
+    const scheduled = scheduleClipSources(ctx, clip, buf, nodes.gain, now, fromSec);
+    if (!scheduled) continue;
+    clipMuteGains.set(clip.id, scheduled.muteGate);
+    for (const src of scheduled.sources) sources.push(src);
   }
 }
 

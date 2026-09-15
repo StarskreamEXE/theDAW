@@ -5,7 +5,7 @@ import {
   Magnet, Trash2, Move, Plus, Volume2, Upload, Save, Piano, Paintbrush, X, Wand2, Layers,
   SlidersHorizontal, Undo2, Redo2, Gauge, Repeat, Flag, Circle, Copy, Music,
   Plug, Snowflake, Loader2, ChevronUp, ChevronDown, RefreshCw, Blocks,
-  Maximize2, Rows3, Keyboard, AudioLines, Spline, FolderOpen,
+  Maximize2, Rows3, Keyboard, AudioLines, Spline, FolderOpen, Check,
 } from 'lucide-react';
 import { deriveStyle, deriveLyrics } from '../../catalog/catalogSearch';
 import { addBlobsToChimera } from '../../lib/chimeraClient';
@@ -20,12 +20,23 @@ import { AutomationLane } from './AutomationLane';
 import { RACK_EFFECTS, getRackEffect, buildEffectChain, ensureChopModule, teleportXYZ, SPATIAL_TELEPORT, type ChainHandle } from '../../lib/rackEffects';
 import { sliceChunks } from '../../lib/audioAnalysis';
 import { decodeClipBlob, peekDecoded } from '../../lib/decodeCache';
+import { applyFadeAutomation, type FadeCurve } from '../../lib/clipFade';
+import { crossfadeRegions } from '../../lib/crossfade';
+import {
+  MIN_CLIP_SEC,
+  resizeLeft as resizeClipLeft,
+  resizeRight as resizeClipRight,
+  slip as slipClipAudio,
+  toTimelineView,
+  fromTimelineOffset,
+} from '../../lib/clipDragMath';
+import { computeClipSchedule } from '../../state/liveMixer';
 import { effectiveZoom } from '../../lib/canvasScale';
 import { ownsKey } from '../../lib/keyScope';
 import { encodeWav } from '../../lib/wavEncode';
 import type { AudioDragItem } from '../../lib/audioDnD';
 import { useExternalDragStore } from '../../state/externalDragStore';
-import { useEditorStore, computePeaks, sampleLane, clipPeakGain, snapStepSec, SNAP_DIVISIONS, TRACK_HEIGHT_MIN, TRACK_HEIGHT_MAX, type AudioClip, type EditorTrack, type SnapDivision, type AutomationTarget, type AutomationLane as AutomationLaneT, type TimelineMarker } from '../../state/editorStore';
+import { useEditorStore, beginUndoStep, computePeaks, freezeSignature, sampleLane, clipPeakGain, clipSourceSpanSec, clipStretchRate, snapStepSec, SNAP_DIVISIONS, TRACK_HEIGHT_MIN, TRACK_HEIGHT_MAX, type AudioClip, type EditorTrack, type SnapDivision, type AutomationTarget, type AutomationLane as AutomationLaneT, type TimelineMarker } from '../../state/editorStore';
 import { useLibraryStore, type LibraryEntry } from '../../state/libraryStore';
 import { LIBRARY_ID_MIME, dropHasLibraryOrFiles, entriesFromDrop } from '../../lib/libraryDrop';
 import { useVstStore } from '../../state/vstStore';
@@ -227,7 +238,10 @@ const ClipWave: React.FC<{ clip: AudioClip; height: number; selected: boolean }>
   }, [clip.audioBlob]);
   const dur = clip.sourceDuration > 0 ? clip.sourceDuration : clip.durationSec || 1;
   const viewportStart = clampFrac((clip.offsetIntoSource ?? 0) / dur);
-  const viewportEnd = clampFrac(((clip.offsetIntoSource ?? 0) + clip.durationSec) / dur);
+  // The slice the clip plays is measured in SOURCE seconds, and a stretched
+  // clip covers `rate` of them per second of timeline — `durationSec` alone
+  // would draw the wrong span of the file under a stretched clip.
+  const viewportEnd = clampFrac(((clip.offsetIntoSource ?? 0) + clipSourceSpanSec(clip)) / dur);
   return (
     <div className="h-full w-full" style={{ opacity: selected ? 1 : 0.85 }}>
       {url && (
@@ -238,6 +252,17 @@ const ClipWave: React.FC<{ clip: AudioClip; height: number; selected: boolean }>
 };
 
 const clampFrac = (n: number) => (Number.isFinite(n) ? (n < 0 ? 0 : n > 1 ? 1 : n) : 0);
+
+/** Push a context-menu separator only where one is worth drawing: not as the
+ *  first row, and never straight after another separator. Whole groups in the
+ *  clip menu are conditional (no clip under the pointer, no crossfade pair, no
+ *  fade to shape, no stretch to reset), so the separators around them can
+ *  otherwise end up stacked with nothing between them. */
+const pushSeparator = (items: ContextMenuItem[]): void => {
+  const last = items[items.length - 1];
+  if (!last || last.type === 'separator') return;
+  items.push({ type: 'separator' });
+};
 
 const MidiClipNotes: React.FC<{ clip: AudioClip; zoom: number; selected: boolean }> = ({ clip, zoom, selected }) => {
   const notes = clip.sourcePianoRoll;
@@ -444,7 +469,9 @@ const ClipInstrumentSelect: React.FC<{ clip: AudioClip }> = ({ clip }) => {
 };
 
 interface PointerOp {
-  kind: 'move' | 'resize-left' | 'resize-right' | 'ctrl-drag-pending';
+  /** `slip` moves the audio inside a clip that stays put; `stretch-*` drags an
+   *  edge without trimming, re-fitting the same audio into the new length. */
+  kind: 'move' | 'resize-left' | 'resize-right' | 'slip' | 'stretch-left' | 'stretch-right' | 'ctrl-drag-pending';
   clipId: string;
   startPxX: number;
   startPxY: number;
@@ -489,6 +516,16 @@ const TimePitchControls: React.FC<{ busy: boolean; onApply: (tempo: number, semi
   );
 };
 
+/** The three fade shapes, in the order the clip menu offers them: the app's
+ *  historical default first, then the two that need a reason. The hint says
+ *  what each one is FOR, because "exponential" alone does not tell a user which
+ *  of their two fades wants it. Evaluated by lib/clipFade. */
+const FADE_CURVE_CHOICES: Array<{ id: FadeCurve; label: string; hint: string }> = [
+  { id: 'linear', label: 'Linear', hint: 'straight' },
+  { id: 'exponential', label: 'Exponential', hint: 'even in dB' },
+  { id: 'equal-power', label: 'Equal power', hint: 'steady loudness' },
+];
+
 /** The EDIT tab's keyboard map, rendered by the "?" overlay. Kept next to the
  *  hotkey handler's own comment block so the two stay in step — if you add a
  *  binding there, add its row here. */
@@ -514,6 +551,15 @@ const EDIT_SHORTCUTS: Array<{ group: string; keys: Array<[string, string]> }> = 
       ['Ctrl+C / X / V', 'Copy / cut / paste at playhead'],
       ['Ctrl+A', 'Select all clips'],
       ['Ctrl+Z / Ctrl+Shift+Z', 'Undo / redo'],
+    ],
+  },
+  {
+    group: 'Clip gestures',
+    keys: [
+      ['Drag a clip edge', 'Trim'],
+      ['Alt + drag a clip', 'Slip the audio inside it'],
+      ['Shift + drag a clip edge', 'Stretch to fit — no re-render'],
+      ['Ctrl + drag a clip', 'Drag it out to another surface'],
     ],
   },
   {
@@ -744,6 +790,10 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const updateClip = useEditorStore((s) => s.updateClip);
   const removeClip = useEditorStore((s) => s.removeClip);
   const splitClipAt = useEditorStore((s) => s.splitClipAt);
+  const setClipFadeCurve = useEditorStore((s) => s.setClipFadeCurve);
+  const createCrossfade = useEditorStore((s) => s.createCrossfade);
+  const stretchClipToFit = useEditorStore((s) => s.stretchClipToFit);
+  const resetClipStretch = useEditorStore((s) => s.resetClipStretch);
   const cachePeaks = useEditorStore((s) => s.cachePeaks);
   const applyClipRender = useEditorStore((s) => s.applyClipRender);
   const addClipToTrack = useEditorStore((s) => s.addClipToTrack);
@@ -1772,6 +1822,28 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     return e - s > 0.05 ? { startSec: s, endSec: e } : null;
   };
 
+  /** The selection as a crossfade, or null. A crossfade needs exactly two
+   *  clips, on ONE track, that actually overlap — anything else is two clips
+   *  that happen to be selected together. */
+  const crossfadePair = useMemo(() => {
+    if (selectedClipIds.length !== 2) return null;
+    const a = clips.find((c) => c.id === selectedClipIds[0]);
+    const b = clips.find((c) => c.id === selectedClipIds[1]);
+    if (!a || !b || a.trackId !== b.trackId) return null;
+    const [region] = crossfadeRegions([a, b]);
+    return region ? { a, b, region } : null;
+  }, [clips, selectedClipIds]);
+
+  /** Every overlap on every track, in lane coordinates, for the X drawn over
+   *  it. A crossfade is not stored anywhere — it IS the overlap — so this is
+   *  derived on each render from where the clips currently sit. */
+  const crossfadeOverlaps = useMemo(() => (
+    tracks.flatMap((track, trackIdx) => (
+      crossfadeRegions(clips.filter((c) => c.trackId === track.id))
+        .map((region) => ({ key: `${region.outId}:${region.inId}`, trackIdx, region }))
+    ))
+  ), [clips, tracks]);
+
   const bleedClips = useCallback(async (hostId: string, mode: 'render' | 'live') => {
     const host = clips.find((c) => c.id === hostId);
     const donor = bleedPartnerFor(hostId);
@@ -1855,29 +1927,29 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         if (!track || track.mute) continue;
         const buf = peekDecoded(decodeCtx, clip.audioBlob);
         if (!buf) continue;
-        const src = offline.createBufferSource();
-        src.buffer = buf;
+        // Same per-clip schedule the live mixer plays: one entry, or one per warp
+        // segment, each with its own source span and playback rate.
+        const schedule = computeClipSchedule(clip, buf.duration);
+        if (!schedule) continue;
         const gain = offline.createGain();
         const panner = offline.createStereoPanner();
         panner.pan.value = Math.max(-1, Math.min(1, track.pan));
-        src.connect(gain).connect(panner).connect(offline.destination);
+        gain.connect(panner).connect(offline.destination);
 
         // This path folds track volume into the clip gain node, so the envelope
-        // peak is track volume * clip gain.
-        const vol = track.volume * clipPeakGain(clip);
-        const fadeIn = clip.fadeInSec ?? 0;
-        const fadeOut = clip.fadeOutSec ?? 0;
-        const safeOffset = Math.min(clip.offsetIntoSource, Math.max(0, buf.duration - 0.01));
-        const safeDur = Math.min(clip.durationSec, buf.duration - safeOffset);
-        if (safeDur <= 0) continue;
-        gain.gain.setValueAtTime(fadeIn > 0 ? 0 : vol, clip.startSec);
-        if (fadeIn > 0) gain.gain.linearRampToValueAtTime(vol, clip.startSec + Math.min(fadeIn, safeDur));
-        if (fadeOut > 0) {
-          const foStart = clip.startSec + safeDur - Math.min(fadeOut, safeDur);
-          gain.gain.setValueAtTime(vol, foStart);
-          gain.gain.linearRampToValueAtTime(0, clip.startSec + safeDur);
+        // peak is track volume * clip gain. One envelope for the whole clip,
+        // from lib/clipFade — the same one the live preview hears.
+        applyFadeAutomation(gain.gain, clip, clip.startSec, 0, {
+          peak: track.volume * clipPeakGain(clip),
+          effectiveDurationSec: schedule.durationSec,
+        });
+        for (const seg of schedule.segments) {
+          const src = offline.createBufferSource();
+          src.buffer = buf;
+          src.playbackRate.value = seg.playbackRate;
+          src.connect(gain);
+          src.start(clip.startSec + seg.targetStart, seg.sourceOffset, seg.sourceDuration);
         }
-        src.start(clip.startSec, safeOffset, safeDur);
       }
 
       const rendered = await offline.startRendering();
@@ -2473,30 +2545,28 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         if (!tn) continue; // track muted or hidden by an active solo
         const buf = peekDecoded(decodeCtx, c.audioBlob);
         if (!buf) continue;
-        const safeOffset = Math.min(c.offsetIntoSource, Math.max(0, buf.duration - 0.01));
-        const safeDur = Math.min(c.durationSec, buf.duration - safeOffset);
-        if (safeDur <= 0) continue;
+        // Same per-clip schedule the live mixer plays: one entry, or one per warp
+        // segment, each with its own source span and playback rate.
+        const schedule = computeClipSchedule(c, buf.duration);
+        if (!schedule) continue;
 
         // Per-clip gain carries the fade envelope scaled to the clip's own gain
         // (peak = clip gain, unity by default). Track volume lives on the track
         // gain so per-track FX process the post-fade signal exactly as they do live.
-        const src = offline.createBufferSource();
-        src.buffer = buf;
+        // The envelope comes from lib/clipFade, applied once over the whole clip.
         const clipGain = offline.createGain();
-        const fadeIn = c.fadeInSec ?? 0;
-        const fadeOut = c.fadeOutSec ?? 0;
-        const peak = clipPeakGain(c);
-        clipGain.gain.setValueAtTime(fadeIn > 0 ? 0 : peak, c.startSec);
-        if (fadeIn > 0) {
-          clipGain.gain.linearRampToValueAtTime(peak, c.startSec + Math.min(fadeIn, safeDur));
+        applyFadeAutomation(clipGain.gain, c, c.startSec, 0, {
+          peak: clipPeakGain(c),
+          effectiveDurationSec: schedule.durationSec,
+        });
+        clipGain.connect(tn.gain);
+        for (const seg of schedule.segments) {
+          const src = offline.createBufferSource();
+          src.buffer = buf;
+          src.playbackRate.value = seg.playbackRate;
+          src.connect(clipGain);
+          src.start(c.startSec + seg.targetStart, seg.sourceOffset, seg.sourceDuration);
         }
-        if (fadeOut > 0) {
-          const foStart = c.startSec + safeDur - Math.min(fadeOut, safeDur);
-          clipGain.gain.setValueAtTime(peak, foStart);
-          clipGain.gain.linearRampToValueAtTime(0, c.startSec + safeDur);
-        }
-        src.connect(clipGain).connect(tn.gain);
-        src.start(c.startSec, safeOffset, safeDur);
       }
 
       // Spatializer Teleport: schedule the same onset-driven panner jumps the live
@@ -2642,17 +2712,12 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
 
   // Signature of everything that affects the rendered master, so a frozen render
   // can be flagged stale after edits (and re-renders are skipped when unchanged).
-  const freezeSig = useMemo(() => {
-    // A clip's muted flag is part of the shape because commitEdit drops muted
-    // clips from the bounce, so toggling mute changes the rendered master.
-    const clipPart = clips
-      .map((c) => `${c.id}:${c.trackId}:${c.startSec}:${c.durationSec}:${c.offsetIntoSource}:${c.fadeInSec ?? 0}:${c.fadeOutSec ?? 0}:${c.muted ? 1 : 0}:${c.audioBlob.size}`)
-      .join('|');
-    const trackPart = tracks
-      .map((t) => `${t.id}:${t.volume}:${t.pan}:${t.mute}:${t.solo}:${JSON.stringify(t.fxChain ?? [])}`)
-      .join('|');
-    return [clipPart, trackPart, JSON.stringify(masterFxChain), JSON.stringify(masterVstChain), editorBpm].join('::');
-  }, [clips, tracks, masterFxChain, masterVstChain, editorBpm]);
+  // The rule lives in editorStore.freezeSignature, with the test that holds it
+  // to every field a renderer reads.
+  const freezeSig = useMemo(
+    () => freezeSignature({ clips, tracks, masterFxChain, masterVstChain, bpm: editorBpm }),
+    [clips, tracks, masterFxChain, masterVstChain, editorBpm],
+  );
 
   const frozenStale = !frozenMaster || frozenMaster.sig !== freezeSig;
 
@@ -2781,24 +2846,24 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         if (c.muted) continue; // muted clips stay out of the printed stem, matching live playback
         const buf = peekDecoded(decodeCtx, c.audioBlob);
         if (!buf) continue;
-        const safeOffset = Math.min(c.offsetIntoSource, Math.max(0, buf.duration - 0.01));
-        const safeDur = Math.min(c.durationSec, buf.duration - safeOffset);
-        if (safeDur <= 0) continue;
-        const src = offline.createBufferSource();
-        src.buffer = buf;
+        // Same per-clip schedule the live mixer plays: one entry, or one per warp
+        // segment, each with its own source span and playback rate. One fade
+        // envelope from lib/clipFade covers the clip however it is segmented.
+        const schedule = computeClipSchedule(c, buf.duration);
+        if (!schedule) continue;
         const clipGain = offline.createGain();
-        const fadeIn = c.fadeInSec ?? 0;
-        const fadeOut = c.fadeOutSec ?? 0;
-        const peak = clipPeakGain(c);
-        clipGain.gain.setValueAtTime(fadeIn > 0 ? 0 : peak, c.startSec);
-        if (fadeIn > 0) clipGain.gain.linearRampToValueAtTime(peak, c.startSec + Math.min(fadeIn, safeDur));
-        if (fadeOut > 0) {
-          const fo = c.startSec + safeDur - Math.min(fadeOut, safeDur);
-          clipGain.gain.setValueAtTime(peak, fo);
-          clipGain.gain.linearRampToValueAtTime(0, c.startSec + safeDur);
+        applyFadeAutomation(clipGain.gain, c, c.startSec, 0, {
+          peak: clipPeakGain(c),
+          effectiveDurationSec: schedule.durationSec,
+        });
+        clipGain.connect(trackInput);
+        for (const seg of schedule.segments) {
+          const src = offline.createBufferSource();
+          src.buffer = buf;
+          src.playbackRate.value = seg.playbackRate;
+          src.connect(clipGain);
+          src.start(c.startSec + seg.targetStart, seg.sourceOffset, seg.sourceDuration);
         }
-        src.connect(clipGain).connect(trackInput);
-        src.start(c.startSec, safeOffset, safeDur);
       }
 
       let rendered: AudioBuffer;
@@ -2910,6 +2975,9 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   // --- Inpaint drag handlers ---
   const handleInpaintDragStart = (e: React.PointerEvent, clip: AudioClip) => {
     if (tool === 'cut') return;
+    // Alt belongs to the slip gesture. This overlay covers the whole waveform
+    // body, so without this the clip's own pointerdown never sees the drag.
+    if (e.altKey) return;
     e.stopPropagation();
     e.currentTarget.setPointerCapture(e.pointerId);
     const anchorSec = timelineClientXToSec(e.clientX);
@@ -2966,13 +3034,30 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       return;
     }
 
+    // Which gesture the drag is. Alt on the BODY slips the audio under a clip
+    // that stays where it is; Shift on an EDGE stretches instead of trimming.
+    // Neither modifier had a meaning on a clip before: Ctrl/Cmd drags a clip
+    // out to another surface (above), Shift on the body extends the selection,
+    // and the edges took no modifier at all.
+    const kind: PointerOp['kind'] = edge === 'move'
+      ? (e.altKey ? 'slip' : 'move')
+      : e.shiftKey
+        ? (edge === 'left' ? 'stretch-left' : 'stretch-right')
+        : (edge === 'left' ? 'resize-left' : 'resize-right');
+
     if (edge === 'move') {
-      selectClipWithModifiers(clipId, e);
+      // A slip is a single-clip gesture, so Alt must not also extend or toggle
+      // the selection on its way in.
+      if (kind === 'slip') selectClipSingle(clipId);
+      else selectClipWithModifiers(clipId, e);
     } else if (!selectedClipIds.includes(clipId)) {
       selectClipSingle(clipId);
     }
+    // The recorder folds a whole drag into one undo step; this keeps it from
+    // folding the drag into whatever edit happened in the 300 ms before it.
+    beginUndoStep();
     const trackIndex = tracks.findIndex((t) => t.id === clip.trackId);
-    const moveIds = edge === 'move' && selectedClipIds.includes(clipId) && !(e.ctrlKey || e.metaKey || e.shiftKey)
+    const moveIds = kind === 'move' && selectedClipIds.includes(clipId) && !(e.ctrlKey || e.metaKey || e.shiftKey)
       ? selectedClipIds
       : [clipId];
     const initialClips = moveIds
@@ -2987,7 +3072,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       })
       .filter((item): item is { id: string; startSec: number; trackIndex: number } => item !== null);
     opRef.current = {
-      kind: edge === 'move' ? 'move' : edge === 'left' ? 'resize-left' : 'resize-right',
+      kind,
       clipId,
       startPxX: e.clientX,
       startPxY: e.clientY,
@@ -3030,22 +3115,65 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         const newTrackId = tracks[targetIdx].id;
         updateClip(target.id, { startSec: newStart, trackId: newTrackId });
       });
-    } else if (op.kind === 'resize-right') {
-      const newDur = Math.max(0.05, op.initialDurationSec + dxSec);
-      // Don't exceed source.
-      const maxDur = Math.max(0.05, clip.sourceDuration - clip.offsetIntoSource);
-      updateClip(op.clipId, { durationSec: Math.min(newDur, maxDur) });
+      return;
+    }
+
+    // Every gesture below measures from where the clip was when the drag began,
+    // so a drag is absolute rather than a sum of frames. lib/clipDragMath owns
+    // the arithmetic (and the minimum-length and end-of-source rules); the grid
+    // is ours, so `snapSec` goes in as the quantiser.
+    //
+    // A stretched clip covers `rate` seconds of source per second of timeline,
+    // so whatever is measured against the source converts through it. Rather
+    // than let each gesture convert for itself — which is how a left-trim came
+    // to add a timeline delta onto a source offset — the drag is handed ONE
+    // view in which every length is timeline seconds, and the single offset
+    // that comes back out converts once, through `fromTimelineOffset`. An
+    // unstretched clip is at rate 1, where both are the identity and the
+    // arithmetic is exactly what the trims did inline.
+    const rate = clipStretchRate(clip);
+    const atDragStart = toTimelineView({
+      startSec: op.initialStartSec,
+      durationSec: op.initialDurationSec,
+      offsetIntoSource: op.initialOffsetIntoSource,
+      sourceDuration: clip.sourceDuration,
+    }, rate);
+
+    if (op.kind === 'resize-right') {
+      const next = resizeClipRight(atDragStart, dxSec, snapSec);
+      updateClip(op.clipId, { durationSec: next.durationSec });
     } else if (op.kind === 'resize-left') {
-      const delta = dxSec;
-      const newStart = op.initialStartSec + delta;
-      const newOffset = op.initialOffsetIntoSource + delta;
-      const newDur = op.initialDurationSec - delta;
-      if (newDur <= 0.05 || newOffset < 0) return;
+      // null = the drag would leave nothing of the clip, or read from before
+      // the head of the source: refused, and the clip is left exactly as it was.
+      const next = resizeClipLeft(atDragStart, dxSec, snapSec);
+      if (!next) return;
       updateClip(op.clipId, {
-        startSec: Math.max(0, newStart),
-        offsetIntoSource: newOffset,
-        durationSec: newDur,
+        startSec: next.startSec,
+        offsetIntoSource: fromTimelineOffset(next.offsetIntoSource, rate),
+        durationSec: next.durationSec,
       });
+    } else if (op.kind === 'slip') {
+      // The clip window does not move and does not change length, only which
+      // part of the audio sits under it. Dragging right pushes the audio right,
+      // so the clip reads from EARLIER.
+      const next = slipClipAudio(atDragStart, -dxSec);
+      updateClip(op.clipId, { offsetIntoSource: fromTimelineOffset(next.offsetIntoSource, rate) });
+    } else if (op.kind === 'stretch-right') {
+      // Same snapped edge as a trim, but no clamp to what is left of the source
+      // — reaching past the end of the audio is the point of stretching.
+      const wanted = snapSec(op.initialStartSec + op.initialDurationSec + dxSec) - op.initialStartSec;
+      if (wanted < MIN_CLIP_SEC) return;
+      stretchClipToFit(op.clipId, wanted, undefined, { coalesce: true });
+    } else if (op.kind === 'stretch-left') {
+      // The clip's END stays put and its head moves, so the same audio lands in
+      // whatever length is left between them.
+      const endSec = op.initialStartSec + op.initialDurationSec;
+      // Held at or after zero BEFORE the length is taken from it: the clip's
+      // end is what this gesture keeps fixed, and a negative start that the
+      // store later clamped to 0 would have grown the clip past that end.
+      const newStart = Math.max(0, snapSec(op.initialStartSec + dxSec));
+      if (endSec - newStart < MIN_CLIP_SEC) return;
+      stretchClipToFit(op.clipId, endSec - newStart, newStart, { coalesce: true });
     }
   };
 
@@ -3192,6 +3320,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     e.currentTarget.setPointerCapture(e.pointerId);
     const clip = clips.find((c) => c.id === clipId);
     if (!clip) return;
+    beginUndoStep(); // the whole drag is one undo step, and only this drag
     fadeDragRef.current = {
       clipId,
       edge,
@@ -3207,9 +3336,16 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     if (!clip) return;
     const dxPx = viewportPxToLocal(e.clientX - fd.startX);
     const dxSec = fd.edge === 'in' ? pxToSec(dxPx) : pxToSec(-dxPx);
-    const maxFade = clip.durationSec / 2;
-    const newFade = Math.max(0, Math.min(maxFade, fd.initialFade + dxSec));
-    updateClip(fd.clipId, fd.edge === 'in' ? { fadeInSec: newFade } : { fadeOutSec: newFade });
+    // Each fade may run the WHOLE clip — the old durationSec / 2 cap made a
+    // 90 % in / 10 % out pair impossible to draw — and the only limit is the
+    // room the OTHER fade leaves. That other end is read, never written: a
+    // drag the user did not make on it must not shorten it, which is what
+    // writing back both ends of `clampClipFades` did. (The clamp stays the rule
+    // where both ends really are being set: the split and the crossfade.)
+    const otherFade = Math.max(0, (fd.edge === 'in' ? clip.fadeOutSec : clip.fadeInSec) ?? 0);
+    const room = Math.max(0, clip.durationSec - otherFade);
+    const wanted = Math.min(Math.max(0, fd.initialFade + dxSec), room);
+    updateClip(fd.clipId, fd.edge === 'in' ? { fadeInSec: wanted } : { fadeOutSec: wanted });
   };
 
   const onFadePointerUp = (e: React.PointerEvent) => {
@@ -4714,6 +4850,14 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                         aria-pressed={!!clip.muted}
                         className={`px-1 h-3.5 rounded-sm font-display text-xs font-bold leading-none flex items-center ${clip.muted ? 'bg-red-500/20 text-red-400 border border-red-500/50' : 'bg-black/40 text-zinc-300 border border-white/10 hover:text-white'}`}
                       >M</button>
+                      {clipStretchRate(clip) !== 1 && (
+                        <span
+                          className="text-amber-300 tabular-nums"
+                          title={`Stretched to ${clipStretchRate(clip).toFixed(2)}x — the audio is untouched. Reset it from the clip menu.`}
+                        >
+                          {clipStretchRate(clip).toFixed(2)}x
+                        </span>
+                      )}
                       <span className="text-zinc-300 tabular-nums">{clip.durationSec.toFixed(2)}s</span>
                     </span>
                   </div>
@@ -4811,6 +4955,32 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                 </div>
               );
             })}
+
+            {/* Crossfade X: where two clips on a track overlap, one is on its
+                way out and the other on its way in. The two strokes are those
+                two gains, so the crossing point is where they meet. Derived
+                from the clip positions (lib/crossfade), never stored, so it
+                follows a clip the moment it is dragged. Decoration over the
+                clips, so it takes no pointer and no name. */}
+            {crossfadeOverlaps.map(({ key, trackIdx, region }) => (
+              <svg
+                key={key}
+                aria-hidden="true"
+                className="absolute z-20 pointer-events-none"
+                style={{
+                  left: region.startSec * zoom,
+                  width: Math.max(1, region.durationSec * zoom),
+                  top: trackIdx * trackH + 6,
+                  height: Math.max(1, trackH - 12),
+                }}
+                viewBox="0 0 100 100"
+                preserveAspectRatio="none"
+              >
+                <rect x="0" y="0" width="100" height="100" fill="rgba(255,255,255,0.07)" />
+                <line x1="0" y1="100" x2="100" y2="0" stroke="rgba(255,255,255,0.55)" strokeWidth="1" vectorEffect="non-scaling-stroke" />
+                <line x1="0" y1="0" x2="100" y2="100" stroke="rgba(255,255,255,0.55)" strokeWidth="1" vectorEffect="non-scaling-stroke" />
+              </svg>
+            ))}
 
             {/* Automation lanes: read-only curve per track (volume green, pan blue, FX
                 amber), or editable when automation edit mode targets that lane. */}
@@ -4998,6 +5168,55 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             },
           });
         }
+        // A crossfade is offered only when the selection IS one: two clips on
+        // one track with something to cross over. The hint is the length, so
+        // the user can see what they are about to get before they take it.
+        if (crossfadePair) {
+          items.push({
+            type: 'item',
+            label: 'Crossfade',
+            icon: <Spline className="w-3 h-3" />,
+            hint: `${crossfadePair.region.durationSec.toFixed(2)}s`,
+            title: 'Fade the earlier clip out and the later one in across their overlap, at equal power.',
+            onSelect: () => { createCrossfade(crossfadePair.a.id, crossfadePair.b.id); },
+          });
+        }
+        // Curve rows appear for a fade that exists, because a shape is only
+        // audible once the fade has a length.
+        if (clip) {
+          for (const [edge, lengthSec, current] of [
+            ['in', clip.fadeInSec ?? 0, clip.fadeInCurve ?? 'linear'],
+            ['out', clip.fadeOutSec ?? 0, clip.fadeOutCurve ?? 'linear'],
+          ] as Array<['in' | 'out', number, FadeCurve]>) {
+            if (lengthSec <= 0) continue;
+            pushSeparator(items);
+            items.push({ type: 'header', label: `Fade ${edge} curve · ${lengthSec.toFixed(2)}s` });
+            for (const choice of FADE_CURVE_CHOICES) {
+              const active = current === choice.id;
+              items.push({
+                type: 'item',
+                label: choice.label,
+                // The check marks the shape in use; the inactive rows carry a
+                // blank of the same size so the labels stay in one column.
+                icon: active ? <Check className="w-3 h-3" /> : <span className="block w-3 h-3" />,
+                hint: active ? 'in use' : choice.hint,
+                onSelect: () => setClipFadeCurve(clip.id, edge, choice.id),
+              });
+            }
+          }
+        }
+        if (clip && clipStretchRate(clip) !== 1) {
+          pushSeparator(items);
+          items.push({
+            type: 'item',
+            label: 'Reset stretch',
+            icon: <Gauge className="w-3 h-3" />,
+            hint: `${clipStretchRate(clip).toFixed(2)}x`,
+            title: 'Play the clip at its original speed again, over the length that speed takes.',
+            onSelect: () => resetClipStretch(clip.id),
+          });
+        }
+        pushSeparator(items);
         items.push({
           type: 'item',
           label: 'Send Selection to Init',

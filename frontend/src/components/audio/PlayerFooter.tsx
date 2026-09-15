@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Volume2, Download, Share2, Heart, Repeat, Repeat1, Shuffle, VolumeX, Cast, Check, Activity, ChevronUp, Headphones, Speaker } from 'lucide-react';
+import { Volume2, Download, Share2, Heart, Repeat, Repeat1, Shuffle, VolumeX, Cast, Check, Activity, ChevronUp, Headphones, Speaker, Triangle } from 'lucide-react';
 import { useGenerateStore } from '../../state/generateStore';
 import { usePlaybackStore } from '../../state/playbackStore';
 import { usePlayerStore, getLoadedAudioUrl } from '../../state/playerStore';
@@ -48,6 +48,13 @@ import { entryAudioFileName, entryFileName } from '../../convert/convertClient';
 import { saveFile } from '../../lib/saveFile';
 import { TrackMenu } from './TrackMenu';
 import { audioExtForMime, EDITOR_TIMELINE_ID } from './trackMenuModel';
+import {
+  COUNT_IN_CHOICES,
+  initMetronome,
+  metronomeCountIn,
+  useMetronomeStore,
+  type CountInBars,
+} from '../../state/metronomeStore';
 
 /**
  * What each repeat state is called, in the tooltip and for a screen reader.
@@ -530,6 +537,20 @@ export const PlayerFooter: React.FC = () => {
     setMasterGain(isMuted ? 0 : volume / 100);
   }, [volume, isMuted, setMasterGain]);
 
+  // The transport click. `initMetronome` only subscribes (idempotent, so
+  // StrictMode's double mount is free); the scheduler runs off the audio clock
+  // and schedules nothing until EDIT plays with the metronome on.
+  const metronomeOn = useMetronomeStore((s) => s.enabled);
+  const toggleMetronome = useMetronomeStore((s) => s.toggle);
+  const countInBars = useMetronomeStore((s) => s.countInBars);
+  const setCountInBars = useMetronomeStore((s) => s.setCountInBars);
+  useEffect(() => { initMetronome(); }, []);
+  // A count-in in flight: the cancel that stops its clicks without ever having
+  // moved the playhead. Cleared the moment the transport is released.
+  const countInRef = useRef<(() => void) | null>(null);
+  const [countingIn, setCountingIn] = useState(false);
+  useEffect(() => () => { countInRef.current?.(); }, []);
+
   // Auto-load: when a new generation lands and nothing is currently loaded, load it.
   useEffect(() => {
     if (hasTrack) return;
@@ -581,6 +602,18 @@ export const PlayerFooter: React.FC = () => {
     (isDjMode && djMaster === 'playing') ||
     (centerTab === 'vj' && vjState === 'playing');
 
+  // A count-in holds a deferred "now start" that was decided for THIS surface
+  // and this transport state. If something else starts playback, or the user
+  // moves to a tab where PLAY means the DJ/VJ master instead, that release is
+  // stale — drop it (and its clicks) rather than fire it somewhere it no longer
+  // belongs. Nothing was moved during the count, so there is nothing to undo.
+  useEffect(() => {
+    if (!countingIn || !(isPlaying || isDjMode || isVjMode)) return;
+    countInRef.current?.();
+    countInRef.current = null;
+    setCountingIn(false);
+  }, [countingIn, isPlaying, isDjMode, isVjMode]);
+
   const handleToggle = () => {
     // DJ-tab mode: the footer ▶ is the Live Master — play/pause the DJ decks
     // (or start the active set from the top) and start the VJ visuals with it.
@@ -602,11 +635,36 @@ export const PlayerFooter: React.FC = () => {
     }
     // In editor mode, if editor audio isn't loaded yet, trigger the offline render+play.
     // Once loaded (entryId === 'editor-timeline'), toggle works natively.
-    if (inEditorMode && currentEntryId !== 'editor-timeline') {
-      callEditorPlay();
-    } else {
-      toggle();
+    const startTransport = () => {
+      if (inEditorMode && currentEntryId !== 'editor-timeline') {
+        callEditorPlay();
+      } else {
+        toggle();
+      }
+    };
+    // A second press during the count-in cancels it. Nothing has moved — the
+    // playhead is where it was and no pass was recorded — so there is nothing
+    // to undo, just the clicks to silence.
+    if (countInRef.current) {
+      countInRef.current();
+      countInRef.current = null;
+      setCountingIn(false);
+      return;
     }
+    // Pausing goes straight through; only STARTING counts in.
+    if (isPlaying) { startTransport(); return; }
+    setCountingIn(true);
+    // metronomeCountIn releases the transport itself when there is no count-in
+    // to play, in which case `done` is already true and there is nothing to
+    // cancel — never store that no-op, or the next press would be swallowed.
+    let done = false;
+    const cancel = metronomeCountIn(() => {
+      done = true;
+      countInRef.current = null;
+      setCountingIn(false);
+      startTransport();
+    }, { editor: inEditorMode, playing: isPlaying });
+    countInRef.current = done ? null : cancel;
   };
 
   // Save a copy of what the footer holds: the library file for an entry, the
@@ -761,6 +819,42 @@ export const PlayerFooter: React.FC = () => {
               <Share2 className="w-3.5 h-3.5" />
             </button>
           </div>
+          {/* The click track, immediately left of the transport plate. It sits
+              in THIS track rather than on the plate because the plate's key
+              count (2 + PLAY + 2) is what holds PLAY on the viewport centre —
+              a sixth key would push it off. The left track is 1fr either way,
+              and the now-playing block beside it is flex-1 min-w-0, so the pair
+              stays glued to the plate at every width without moving it. */}
+          <div className="flex shrink-0 items-center gap-1">
+            {/* A custom control, so it carries its own accessible name and its
+                state in aria-pressed — never a wrapping <label>. */}
+            <button
+              type="button"
+              onClick={toggleMetronome}
+              aria-label={`Metronome click ${metronomeOn ? 'on' : 'off'}`}
+              aria-pressed={metronomeOn}
+              title={`Metronome click ${metronomeOn ? 'on' : 'off'} - the EDIT timeline's count`}
+              className={`${iconButton} ${metronomeOn ? 'text-[rgb(var(--et-accent))] bg-white/5' : ''}`}
+            >
+              <Triangle className="w-3.5 h-3.5" strokeWidth={1.5} absoluteStrokeWidth />
+            </button>
+            {/* A native select, so it needs a real id/name and a <label htmlFor>.
+                The label is sr-only: the footer row is 48px and the three option
+                texts already say what the control is on screen. */}
+            <label htmlFor="metronome-count-in" className="sr-only">Count-in bars</label>
+            <select
+              id="metronome-count-in"
+              name="metronomeCountIn"
+              value={countInBars}
+              onChange={(e) => setCountInBars(Number(e.target.value) as CountInBars)}
+              title="Bars of clicks before the transport starts"
+              className="w-16 rounded-md bg-white/5 border border-white/10 px-1 py-0.5 text-xs text-zinc-300 hover:text-white focus:outline-hidden focus:ring-1 focus:ring-[rgb(var(--et-accent))]"
+            >
+              {COUNT_IN_CHOICES.map((n) => (
+                <option key={n} value={n}>{n === 0 ? 'Off' : `${n} bar${n === 1 ? '' : 's'}`}</option>
+              ))}
+            </select>
+          </div>
         </div>
 
         {/* 2. Transport — one matte plate (transportPlate): LOOP · START · PLAY ·
@@ -807,8 +901,8 @@ export const PlayerFooter: React.FC = () => {
             type="button"
             onClick={handleToggle}
             disabled={playDisabled}
-            aria-label={displayIsPlaying ? 'Pause' : 'Play'}
-            title={displayIsPlaying ? 'Pause' : 'Play'}
+            aria-label={countingIn ? 'Counting in - press to cancel' : displayIsPlaying ? 'Pause' : 'Play'}
+            title={countingIn ? 'Counting in - press to cancel' : displayIsPlaying ? 'Pause' : 'Play'}
             className={`${transportPlayKey} w-15 ${playDisabled ? transportPlayDead : displayIsPlaying ? transportPlayOn : transportPlayRest}`}
           >
             {displayIsPlaying

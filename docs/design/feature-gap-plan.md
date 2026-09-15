@@ -30,10 +30,17 @@ for free. It closes none of the 15 genuinely-absent features.**
 | 2026-09-15 | `919d295` | §1 caught up to `danieljtrujillo/main` (56 commits merged; one conflict, `EffectWindows.tsx`, resolved to daniel's `chainInState`) |
 | 2026-09-15 | `ab5fae5` | **D1** `pitch_shift` → rubberband pitch, **D4** split fades, **D7** master-VST undo, **D9** autosave `beforeunload`/`pagehide` flush; `editorStore.test.ts` |
 | 2026-09-15 | `4ae431c` | **D8** piano-roll undo/redo, **D3** bypass keeps the instance, **D2** inert VST entries reported via `ChainHandle.inertIds()`; `virtuosoTransform.test.ts` green (lazy `?url`); suite 103/0. Run record `docs/runs/P-20260915-batch2.md` |
-| in flight | batch 3 | §3.13 decode-cache unification (T04), §3.2 tempo+meter module (T05) |
+| 2026-09-15 | `9af4911` | **§3.13** one decode cache (`lib/decodeCache.ts`, rate-keyed — see §3.13 note), **§3.2** one tempo+meter module (`lib/tempoMap.ts`; `beatClock` bit-for-bit; closes #02 #04 #05, fixes **D12**); licence rule for the seven references (§5). Run record `docs/runs/P-20260915-batch3.md` |
+| in flight | batch 4 | **§3.4** metronome + count-in (T06, #08); **§3.3** clip editing in three waves — pure modules + clip fields (T07a), one fade envelope + non-destructive stretch/warp playback (T07b, fixes **D5**), gestures: slip / crossfade / fade curves / stretch-to-fit (T07c; #13 #16 #17 #19) |
 
 Remaining from §2: D5 (fade envelope 4×, folds into §3.3), D6 (four renderers,
 folds into §3.5), D10, D11, D12 (→ T05), D13–D19.
+
+**Regression note (found in batch 4, fixed there):** the D4 split-fade fix in
+`ab5fae5` did `Math.min(clip.fadeInSec, …)` — but `fadeInSec`/`fadeOutSec`
+are *optional* on `AudioClip`, so splitting a clip with no fades produced
+`fadeInSec: NaN`. The batch-1 test fixture always set fades and never saw it;
+T07a's builder did. Fixed with `?? 0` and a pinned no-fade split case.
 
 ---
 

@@ -3,6 +3,10 @@ import { logError, logInfo } from './logStore';
 import type { PianoNote } from './pianoRollStore';
 import type { MeterSegment, PolyLane } from '../lib/meterMap';
 import type { LaneBend } from '../lib/pitchBend';
+import { clampClipFades, type FadeCurve } from '../lib/clipFade';
+import { crossfadeRegions } from '../lib/crossfade';
+import { MIN_CLIP_SEC } from '../lib/clipDragMath';
+import type { WarpMarker } from '../lib/audioWarp';
 import type { ChainEntry, VstNode } from './effectChainStore';
 import { rackEffectDefaults } from '../lib/rackEffects';
 
@@ -116,6 +120,11 @@ export interface AudioClip {
   fadeInSec?: number;
   /** Fade-out duration in seconds (0 = no fade). */
   fadeOutSec?: number;
+  /** Shape of the fade-in; undefined = 'linear', which is what every clip
+   *  faded before curves existed. Evaluated by lib/clipFade. */
+  fadeInCurve?: FadeCurve;
+  /** Shape of the fade-out; undefined = 'linear'. */
+  fadeOutCurve?: FadeCurve;
   /** Linear clip gain (1 = unity, undefined = unity). Multiplies the fade
    *  envelope's peak, so it sits BEFORE the track fader and the per-track FX —
    *  gain-staging a loud clip changes what the track's compressor sees, exactly
@@ -126,6 +135,17 @@ export interface AudioClip {
    *  the ONE clip property liveMixer gates live mid-playback; all other clip
    *  edits are structural and take effect on the next play. */
   muted?: boolean;
+  /** Time-stretch factor; 1 (or undefined) is the original speed and >1 makes
+   *  the clip shorter. Independent of `warpMarkers`, which bend time within
+   *  the clip rather than scaling all of it. */
+  timeStretchRate?: number;
+  /** How `timeStretchRate` is realised: 'repitch' rides the source's playback
+   *  rate (pitch follows, like a tape machine), 'offline' renders a
+   *  pitch-preserving stretch. Undefined = 'repitch'. */
+  stretchMode?: 'repitch' | 'offline';
+  /** Warp anchors tying moments of the source to moments of the clip, in
+   *  clip-relative seconds. Read through lib/audioWarp. */
+  warpMarkers?: WarpMarker[];
 }
 
 export interface EditorTrack {
@@ -195,6 +215,61 @@ export interface TimelineMarker {
 export const clipPeakGain = (clip: Pick<AudioClip, 'gain'>): number => {
   const g = clip.gain;
   return typeof g === 'number' && Number.isFinite(g) && g >= 0 ? g : 1;
+};
+
+/** The rate a clip's source rides at during playback. An 'offline' stretch is
+ *  already baked into the blob, so it plays at unity; anything that is not a
+ *  usable positive rate falls back to unity rather than silencing the clip.
+ *  `liveMixer.computeClipSchedule` holds the scheduling twin of this rule. */
+export const clipStretchRate = (clip: Pick<AudioClip, 'timeStretchRate' | 'stretchMode'>): number => {
+  if (clip.stretchMode === 'offline') return 1;
+  const rate = clip.timeStretchRate;
+  return typeof rate === 'number' && Number.isFinite(rate) && rate > 0 ? rate : 1;
+};
+
+/** How many seconds of source a clip covers. At rate `r` one timeline second
+ *  eats `r` source seconds, so this is what a stretch has to preserve: the clip
+ *  plays the same audio, just over a different length of timeline. */
+export const clipSourceSpanSec = (clip: Pick<AudioClip, 'durationSec' | 'timeStretchRate' | 'stretchMode'>): number =>
+  clip.durationSec * clipStretchRate(clip);
+
+/**
+ * Signature of everything that reaches the rendered master, so a frozen render
+ * can be flagged stale after an edit (and an unchanged document re-uses it).
+ *
+ * The rule is simple and the file it is read from must keep to it: if a
+ * renderer reads the field, it belongs here. The curves, the stretch ratio and
+ * the warp markers were all invisible to this signature until the renderers
+ * learned to play them, which meant editing a fade shape left a frozen master
+ * claiming to be current. `peaks` is the counter-example — derived drawing data
+ * no renderer ever reads.
+ */
+export const freezeSignature = (doc: {
+  clips: readonly AudioClip[];
+  tracks: readonly EditorTrack[];
+  masterFxChain: readonly ChainEntry[];
+  masterVstChain: readonly ChainEntry[];
+  bpm: number;
+}): string => {
+  // A clip's muted flag is part of the shape because the bounce drops muted
+  // clips, so toggling mute changes the rendered master.
+  const clipPart = doc.clips
+    .map((c) => [
+      c.id, c.trackId, c.startSec, c.durationSec, c.offsetIntoSource,
+      c.fadeInSec ?? 0, c.fadeOutSec ?? 0, c.fadeInCurve ?? 'linear', c.fadeOutCurve ?? 'linear',
+      clipPeakGain(c), c.muted ? 1 : 0,
+      c.timeStretchRate ?? 1, c.stretchMode ?? 'repitch',
+      JSON.stringify(c.warpMarkers ?? []),
+      c.audioBlob.size,
+    ].join(':'))
+    .join('|');
+  const trackPart = doc.tracks
+    .map((t) => `${t.id}:${t.volume}:${t.pan}:${t.mute}:${t.solo}:${JSON.stringify(t.fxChain ?? [])}`)
+    .join('|');
+  return [
+    clipPart, trackPart,
+    JSON.stringify(doc.masterFxChain), JSON.stringify(doc.masterVstChain), doc.bpm,
+  ].join('::');
 };
 
 /** Stable identity for a target, so a control resolves to its one lane. */
@@ -303,6 +378,24 @@ interface EditorStoreState {
   updateClip: (id: string, updates: Partial<AudioClip>) => void;
   removeClip: (id: string) => void;
   splitClipAt: (id: string, atSec: number) => string | null;
+  /** Shape one end of a clip's fade. */
+  setClipFadeCurve: (id: string, edge: 'in' | 'out', curve: FadeCurve) => void;
+  /** Cross-fade two clips that overlap on ONE track: the earlier one fades out
+   *  across the overlap, the later one fades in across it, both equal power, as
+   *  a single undo step. Returns false and writes nothing when the pair is not
+   *  a crossfade (missing, same clip, different tracks, or no overlap). */
+  createCrossfade: (clipAId: string, clipBId: string) => boolean;
+  /** Make the clip last `newDurationSec` without re-rendering its audio: the
+   *  source it covers is unchanged and a playback ratio carries the difference.
+   *  `newStartSec` moves the head too, which is what stretching from the LEFT
+   *  edge does. */
+  /** Re-fit the source a clip covers into `newDurationSec` of timeline by
+   *  storing a ratio — the audio is never re-rendered. Pass
+   *  `{ coalesce: true }` from a continuous gesture so the whole drag stays one
+   *  undo step; any other caller gets a step of its own. */
+  stretchClipToFit: (id: string, newDurationSec: number, newStartSec?: number, opts?: { coalesce?: boolean }) => void;
+  /** Back to the original speed, and to the length that speed implies. */
+  resetClipStretch: (id: string) => void;
   /** Store peaks decoded from a clip's audio. Peaks are derived data, so the
    *  write goes through applyClipRender and stays out of undo history. */
   cachePeaks: (id: string, peaks: Float32Array) => void;
@@ -446,6 +539,19 @@ const HISTORY_LIMIT = 100;
 const HISTORY_COALESCE_MS = 300; // changes closer than this fold into one undo step
 let historyApplying = false;     // true while undo/redo writes, so it doesn't self-record
 let lastDocChangeAt = -Infinity;
+
+/**
+ * Cut the coalescing burst: the NEXT document change records an undo step of
+ * its own instead of folding into whatever happened in the last 300 ms.
+ *
+ * A gesture is one undo step because the recorder coalesces — but that same
+ * rule would swallow a gesture that starts right after another edit, so the
+ * pointer-down that begins a gesture calls this first. (undo/redo already reset
+ * the clock for the same reason.)
+ */
+export const beginUndoStep = (): void => {
+  lastDocChangeAt = -Infinity;
+};
 
 const docSnapshot = (s: EditorStoreState): EditorHistorySnapshot => ({
   tracks: s.tracks,
@@ -686,27 +792,34 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     }
     const newId = uid();
     const rightDur = clip.durationSec - relSplit;
+    // The seam is a TIMELINE point, but `offsetIntoSource` counts SOURCE
+    // seconds — and a stretched clip covers `rate` seconds of source per second
+    // of timeline. Adding `relSplit` raw put the right half's read head short of
+    // where the left half stopped, so a rate-2 split replayed half the seam.
+    const relSplitInSource = relSplit * clipStretchRate(clip);
     // Each fade belongs to one end of the original clip, so it follows that
     // end: the fade-in stays with the left half and the fade-out moves to the
     // right half. Spreading `...clip` onto both used to give the left half a
     // fade-out it never had (and the right half a fade-in), so a split inside a
-    // faded clip dipped to silence at the seam. Fades are also capped at half
-    // the half's length, the same bound the fade handles enforce.
+    // faded clip dipped to silence at the seam. What SURVIVES is then fitted by
+    // clampClipFades — the one rule that governs fades everywhere, so a fade is
+    // cut only when it no longer fits in the half it landed on. (It used to be
+    // capped at half the half, which matched a fade-handle limit that is gone.)
+    // fadeInSec / fadeOutSec are optional on AudioClip, and the clamp reads an
+    // absent fade as 0.
     const left: AudioClip = {
       ...clip,
       durationSec: relSplit,
-      fadeInSec: Math.min(clip.fadeInSec, relSplit / 2),
-      fadeOutSec: 0,
+      ...clampClipFades({ durationSec: relSplit, fadeInSec: clip.fadeInSec, fadeOutSec: 0 }),
     };
     const right: AudioClip = {
       ...clip,
       id: newId,
       startSec: clip.startSec + relSplit,
-      offsetIntoSource: clip.offsetIntoSource + relSplit,
+      offsetIntoSource: clip.offsetIntoSource + relSplitInSource,
       durationSec: rightDur,
       label: `${clip.label}_b`,
-      fadeInSec: 0,
-      fadeOutSec: Math.min(clip.fadeOutSec, rightDur / 2),
+      ...clampClipFades({ durationSec: rightDur, fadeInSec: 0, fadeOutSec: clip.fadeOutSec }),
     };
     set((s) => ({
       clips: s.clips.flatMap((c) => (c.id === id ? [left, right] : [c])),
@@ -714,6 +827,104 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     }));
     logInfo('editor', `Split clip at ${atSec.toFixed(2)}s → ${left.label} | ${right.label}`);
     return newId;
+  },
+
+  setClipFadeCurve: (id, edge, curve) => {
+    // A menu action is one edit and must be undoable on its own, however close
+    // it lands to the last one — the 300 ms coalescer exists for CONTINUOUS
+    // gestures, and would otherwise fold two quick curve choices into one step.
+    beginUndoStep();
+    set((s) => ({
+      clips: s.clips.map((c) => (
+        c.id === id ? { ...c, ...(edge === 'in' ? { fadeInCurve: curve } : { fadeOutCurve: curve }) } : c
+      )),
+    }));
+  },
+
+  createCrossfade: (clipAId, clipBId) => {
+    beginUndoStep(); // a menu action is its own undo step (see setClipFadeCurve)
+    const { clips } = get();
+    const a = clips.find((c) => c.id === clipAId);
+    const b = clips.find((c) => c.id === clipBId);
+    if (!a || !b || a.id === b.id || a.trackId !== b.trackId) return false;
+    // A crossfade IS the overlap — nothing is stored beyond the two fades, so
+    // moving either clip afterwards just changes where they cross. The region
+    // also says WHICH clip fades out: the one that starts earlier.
+    const [region] = crossfadeRegions([a, b]);
+    if (!region || !(region.durationSec > 0)) return false;
+    const out = region.outId === a.id ? a : b;
+    const into = region.inId === a.id ? a : b;
+    // Each clip's pair of fades is fitted by the same clamp as everywhere else,
+    // so a clip already faded in over most of its length gives the crossfade
+    // only the room that is left instead of overrunning its own head.
+    const outFades = clampClipFades({
+      durationSec: out.durationSec, fadeInSec: out.fadeInSec, fadeOutSec: region.durationSec,
+    });
+    const inFades = clampClipFades({
+      durationSec: into.durationSec, fadeInSec: region.durationSec, fadeOutSec: into.fadeOutSec,
+    });
+    set((s) => ({
+      clips: s.clips.map((c) => {
+        if (c.id === out.id) return { ...c, ...outFades, fadeOutCurve: 'equal-power' as FadeCurve };
+        if (c.id === into.id) return { ...c, ...inFades, fadeInCurve: 'equal-power' as FadeCurve };
+        return c;
+      }),
+    }));
+    logInfo('editor', `Crossfade ${region.durationSec.toFixed(2)}s: ${out.label} → ${into.label}`);
+    return true;
+  },
+
+  stretchClipToFit: (id, newDurationSec, newStartSec, opts) => {
+    // Same rule as the other actions, with the exception the gesture needs: a
+    // stretch DRAG calls this on every pointer move, and beginning a step each
+    // time would leave an undo entry per animation frame. The drag says
+    // `coalesce` (its pointer-down already cut the burst once, for the whole
+    // gesture); every other caller gets its own step.
+    if (!opts?.coalesce) beginUndoStep();
+    const clip = get().clips.find((c) => c.id === id);
+    if (!clip) return;
+    if (!Number.isFinite(newDurationSec) || newDurationSec < MIN_CLIP_SEC) return;
+    // Measured against the SOURCE the clip covers, not its current length, so
+    // dragging an already-stretched edge re-fits the same audio instead of
+    // compounding ratios.
+    const span = clipSourceSpanSec(clip);
+    if (!(span > 0)) return;
+    const startSec = newStartSec !== undefined && Number.isFinite(newStartSec) ? Math.max(0, newStartSec) : clip.startSec;
+    set((s) => ({
+      clips: s.clips.map((c) => (c.id === id ? {
+        ...c,
+        startSec,
+        // durationSec moves WITH the ratio: every renderer sizes its
+        // OfflineAudioContext from startSec + durationSec, so a stretch that
+        // left the old length behind would be cut off (or trail silence).
+        durationSec: newDurationSec,
+        timeStretchRate: span / newDurationSec,
+        // The gesture is the live, non-destructive path. The offline path is
+        // the Time/Pitch popover, which bakes the stretch into a new blob and
+        // leaves no ratio behind — so a clip that came through it carries its
+        // baked audio as the source this ratio now rides.
+        stretchMode: 'repitch' as const,
+      } : c)),
+    }));
+  },
+
+  resetClipStretch: (id) => {
+    beginUndoStep(); // a menu action is its own undo step (see setClipFadeCurve)
+    const clip = get().clips.find((c) => c.id === id);
+    if (!clip) return;
+    const span = clipSourceSpanSec(clip);
+    if (!(span > 0)) return;
+    // Clearing the ratio without restoring the length would leave the clip
+    // playing a DIFFERENT stretch of source at the original speed.
+    const available = clip.sourceDuration > 0
+      ? Math.max(MIN_CLIP_SEC, clip.sourceDuration - clip.offsetIntoSource)
+      : Infinity;
+    const durationSec = Math.min(Math.max(MIN_CLIP_SEC, span), available);
+    set((s) => ({
+      clips: s.clips.map((c) => (c.id === id ? {
+        ...c, durationSec, timeStretchRate: undefined, stretchMode: undefined,
+      } : c)),
+    }));
   },
 
   cachePeaks: (id, peaks) => get().applyClipRender(id, {}, peaks),

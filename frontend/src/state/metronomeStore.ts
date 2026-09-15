@@ -1,0 +1,235 @@
+/**
+ * metronomeStore — the transport click's settings, and the one service that
+ * drives `lib/metronome.ts` from the live transport.
+ *
+ * The scheduler itself is pure and knows nothing about this app: it is handed
+ * callbacks. The wiring lives HERE rather than in `lib/metronome.ts` so that
+ * module stays importable by a plain `tsx` test with no DOM, no AudioContext
+ * and no store graph behind it — `metronome.test.ts` drives it with a fake
+ * context. This file is the seam where it meets playerStore, liveMixer,
+ * editorStore and beatClock, and every one of those is READ ONLY from here.
+ *
+ * Settings are persisted like the app's other small preference stores
+ * (`drawModeStore`, `layoutPrefsStore`): `persist` + a `partialize` that saves
+ * only the four values, never the actions.
+ */
+
+import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
+import { MetronomeScheduler, METRONOME_TICK_MS, type MetronomeSettings } from '../lib/metronome';
+import { beatClock } from '../lib/beatClock';
+import type { TempoEvent } from '../lib/tempoMap';
+import type { MeterSegment } from '../lib/meterMap';
+import { getEngineCtx, getMasterGain, usePlayerStore } from './playerStore';
+import { currentTransportSec, isPlaying as liveIsPlaying } from './liveMixer';
+import { useEditorStore } from './editorStore';
+import { EDITOR_TIMELINE_ID } from '../components/audio/trackMenuModel';
+
+/** The count-in lengths the UI offers. */
+export const COUNT_IN_CHOICES = [0, 1, 2] as const;
+export type CountInBars = (typeof COUNT_IN_CHOICES)[number];
+
+interface MetronomeState extends MetronomeSettings {
+  countInBars: CountInBars;
+  setEnabled: (on: boolean) => void;
+  toggle: () => void;
+  setVolume: (v: number) => void;
+  setAccent: (on: boolean) => void;
+  setCountInBars: (bars: CountInBars) => void;
+}
+
+const asCountIn = (n: number): CountInBars =>
+  (COUNT_IN_CHOICES as readonly number[]).includes(n) ? (n as CountInBars) : 0;
+
+export const useMetronomeStore = create<MetronomeState>()(
+  persist(
+    (set) => ({
+      enabled: false,
+      volume: 0.7,
+      accent: true,
+      countInBars: 0,
+      setEnabled: (on) => set({ enabled: !!on }),
+      toggle: () => set((s) => ({ enabled: !s.enabled })),
+      setVolume: (v) => set({ volume: Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 0 }),
+      setAccent: (on) => set({ accent: !!on }),
+      setCountInBars: (bars) => set({ countInBars: asCountIn(bars) }),
+    }),
+    {
+      name: 'thedaw-metronome',
+      version: 1,
+      partialize: (s) => ({
+        enabled: s.enabled,
+        volume: s.volume,
+        accent: s.accent,
+        countInBars: s.countInBars,
+      }),
+    },
+  ),
+);
+
+/* ------------------------------- the service ------------------------------ */
+
+/**
+ * The EDIT timeline's tempo is still the scalar `editorStore.bpm`, so the map
+ * handed to `tempoMap.ts` is the degenerate one-event one. It is cached by bpm
+ * because `normalizeTempoMap` keys its cache on array IDENTITY — handing it a
+ * fresh array every tick would re-sort and re-allocate on every conversion.
+ * When EDIT grows a real tempo map, this function is what returns it.
+ */
+let tempoCache: { bpm: number; map: TempoEvent[] } = { bpm: 0, map: [] };
+export function editTempoMap(): readonly TempoEvent[] {
+  const bpm = useEditorStore.getState().bpm;
+  if (tempoCache.bpm !== bpm) tempoCache = { bpm, map: [{ beat: 0, bpm, timeSec: 0 }] };
+  return tempoCache.map;
+}
+
+/**
+ * The meter half, cached the same way and for the same reason. `beatClock`'s
+ * `meterMap` getter hands back a fresh DEEP CLONE on every access, so reading it
+ * straight through allocated a map, a segment and a groups array ten times a
+ * second for the whole of playback. The clone is unavoidable from out here
+ * (beatClock owns it), but keeping the previous array when nothing changed is
+ * not: the signature is every field that can affect a bar line.
+ */
+let meterCache: { sig: string; map: MeterSegment[] } = { sig: '', map: [] };
+export function editMeterMap(): readonly MeterSegment[] {
+  const live = beatClock.meterMap;
+  const sig = live.map((s) => `${s.bar}:${s.meter.num}/${s.meter.den}:${s.meter.groups.join('.')}`).join('|');
+  if (meterCache.sig !== sig) meterCache = { sig, map: live };
+  return meterCache.map;
+}
+
+/**
+ * The RUNNING click follows the EDIT timeline, which is the only transport
+ * whose position `currentTransportSec()` describes. While a library track plays
+ * through the <audio> element that function reports the (stationary) editor
+ * playhead, so a click there would sit on one beat forever — hence the gate.
+ *
+ * This is safe HERE and only here: by the time the click is running, liveMixer
+ * has started and has set the entry id itself. It is NOT a valid test of "is
+ * the user on EDIT" — see `shouldCountIn`.
+ */
+function onEditTransport(): boolean {
+  return usePlayerStore.getState().currentEntryId === EDITOR_TIMELINE_ID;
+}
+
+let scheduler: MetronomeScheduler | null = null;
+let timer = 0;
+let started = false;
+
+function ensureScheduler(): MetronomeScheduler {
+  scheduler ??= new MetronomeScheduler({
+    ctx: () => { try { return getEngineCtx(); } catch { return null; } },
+    destination: () => { try { return getMasterGain(); } catch { return null; } },
+    transportSec: () => currentTransportSec(),
+    tempoMap: editTempoMap,
+    // One meter owner: the shared clock's map (4/4 until something sets one).
+    meterMap: editMeterMap,
+    settings: () => useMetronomeStore.getState(),
+  });
+  return scheduler;
+}
+
+function runWindow(): void {
+  const s = ensureScheduler();
+  if (timer) return;
+  s.start();
+  // `start` no-ops when the engine context is not up yet. Arming the interval
+  // anyway would leave a timer ticking a scheduler that is not running and
+  // never will be — the next store push retries instead.
+  if (!s.isRunning) return;
+  timer = window.setInterval(() => s.tick(), METRONOME_TICK_MS);
+}
+
+function stopWindow(): void {
+  if (timer) { window.clearInterval(timer); timer = 0; }
+  scheduler?.stop();
+}
+
+/**
+ * Whether the click should be running right now. `livePlaying` is liveMixer's
+ * own flag, passed in rather than read here so the rule is testable without a
+ * running mixer — both flags are required because playerStore's `isPlaying`
+ * also covers the <audio> element, whose position `currentTransportSec()` does
+ * not describe.
+ */
+export function shouldRun(livePlaying: boolean): boolean {
+  if (!useMetronomeStore.getState().enabled) return false;
+  if (!onEditTransport()) return false;
+  return usePlayerStore.getState().isPlaying && livePlaying;
+}
+
+function sync(): void {
+  if (shouldRun(liveIsPlaying())) runWindow();
+  else stopWindow();
+}
+
+/** What the caller knows about the play press. The count-in is a function of
+ *  THIS and of `countInBars`, and of nothing it could read behind the caller's
+ *  back — see `shouldCountIn`. */
+export interface CountInPress {
+  /** The EDIT surface is what this press drives (the footer's `inEditorMode`). */
+  editor: boolean;
+  /** The transport is already running, so the press is a pause, not a start. */
+  playing: boolean;
+}
+
+/**
+ * Does this press count in? Pure, and deliberately NOT a function of
+ * `playerStore.currentEntryId`.
+ *
+ * That id only becomes `'editor-timeline'` once `liveMixer` has actually
+ * STARTED (it writes it inside `start()`, and again in `reactivate()`). EDIT is
+ * routinely the active surface while the id still names the last library track
+ * or is null — the footer's own `inEditorMode && currentEntryId !==
+ * 'editor-timeline' -> callEditorPlay()` branch exists precisely for that
+ * state. So gating the count-in on the id skipped it on the FIRST play of every
+ * session, and on any play after a library track: the user asked for two bars
+ * and got none, silently.
+ *
+ * The caller states which surface it is driving instead, because the caller is
+ * the only one that knows before the transport moves. A count-in needs nothing
+ * else: no transport position, no loaded track — only the engine context, the
+ * tempo and the meter. Contrast `shouldRun`, which gates the RUNNING click on
+ * the entry id and is right to, because by then the transport has started.
+ *
+ * `enabled` is part of the rule: a count-in is the metronome speaking, so with
+ * the metronome off a persisted `countInBars` must not sit a silent few seconds
+ * in front of every play. (The scheduler enforces this too, for any caller that
+ * reaches it directly.)
+ */
+export function shouldCountIn(press: CountInPress & { bars: number; enabled: boolean }): boolean {
+  return press.enabled && press.editor && !press.playing && press.bars > 0;
+}
+
+/**
+ * Play the configured count-in, then call `onDone` — which is where the caller
+ * starts the transport. Nothing here touches the playhead, the recorder or the
+ * player store, so a count-in that is cancelled leaves the session exactly
+ * where it was. Returns a cancel; a press that does not count in calls `onDone`
+ * at once and returns a no-op.
+ */
+export function metronomeCountIn(onDone: () => void, press: CountInPress): () => void {
+  const { countInBars: bars, enabled } = useMetronomeStore.getState();
+  if (!shouldCountIn({ ...press, bars, enabled })) { onDone(); return () => undefined; }
+  return ensureScheduler().countIn(bars, onDone);
+}
+
+/** Silence a count-in in flight (the user hit stop, or switched tab). */
+export function cancelMetronomeCountIn(): void {
+  scheduler?.cancelCountIn();
+}
+
+/**
+ * Start the click service. Idempotent — safe under StrictMode double-mount, and
+ * safe to call from more than one mount point. It only subscribes; nothing is
+ * scheduled until the transport plays with the metronome on.
+ */
+export function initMetronome(): void {
+  if (started || typeof window === 'undefined') return;
+  started = true;
+  // Subscribe, never poll: both stores push, and the scheduler derives the
+  // position from the audio clock rather than from a store tick.
+  usePlayerStore.subscribe(sync);
+  useMetronomeStore.subscribe(sync);
+}
