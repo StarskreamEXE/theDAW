@@ -53,16 +53,9 @@ createRoot(document.getElementById('root')!).render(
   </StrictMode>,
 );
 
-// Drop the instant inline cover once React has painted the boot sequence on
-// top, a frame after mount so there is no flash of blank between them.
-requestAnimationFrame(() => {
-  requestAnimationFrame(() => {
-    const splash = document.getElementById('boot-splash');
-    if (splash) {
-      splash.style.transition = 'opacity 0.4s ease';
-      splash.style.opacity = '0';
-      setTimeout(() => splash.remove(), 450);
-    }
-  });
-});
-
+// Captures (?nocinematic) skip the boot sequence outright: the node is dropped
+// before React renders, so no shot catches it and no WebGL context is spent on
+// it. Every other run keeps it until App.tsx lifts the boot layer.
+if (new URLSearchParams(window.location.search).has('nocinematic')) {
+  document.getElementById('boot-splash')?.remove();
+}

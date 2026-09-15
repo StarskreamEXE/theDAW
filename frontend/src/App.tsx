@@ -507,6 +507,19 @@ export default function App() {
   // so the HOME overlay stays down until it ends); returning users get the
   // HOME screen straight away when they've left "show at startup" on.
   const bootDone = !showLoading;
+
+  // The boot layer is the #boot-splash node in index.html (the sequence's
+  // iframe), not React's, so React lifts it here rather than by unmounting.
+  useEffect(() => {
+    if (!bootDone) return;
+    const splash = document.getElementById('boot-splash');
+    if (!splash) return;
+    splash.style.transition = 'opacity 0.4s ease';
+    splash.style.opacity = '0';
+    splash.style.pointerEvents = 'none';
+    const t = setTimeout(() => splash.remove(), 450);
+    return () => clearTimeout(t);
+  }, [bootDone]);
   const landingHandledRef = useRef(false);
   const firstRunTourRef = useRef(false);
   const tourActive = useOnboardingStore((s) => s.active);
@@ -605,6 +618,9 @@ export default function App() {
             exit={{ opacity: 0 }}
             transition={{ duration: 0.4 }}
             className="fixed inset-0 z-200"
+            // Above #boot-splash, so the setup status and the escape hatch are
+            // readable and clickable over the sequence.
+            style={{ zIndex: 2147483001 }}
           >
             <ParticleSplash
               onSkip={() => setSkipped(true)}

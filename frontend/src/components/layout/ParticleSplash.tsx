@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useBootStatusStore } from '../../state/bootStatusStore';
 
 interface ParticleSplashProps {
@@ -10,27 +10,23 @@ interface ParticleSplashProps {
 const COMPLETE_EVENT = 'thedaw:loader-complete';
 
 /**
- * The boot screen: the particle sequence in `public/splash/index.html`. A
- * field of particles forms the face, the face becomes the theDAW wordmark,
- * and once the word has formed the page shows "by" and the animated GANTASMO
- * logo under it, then spins the whole thing out.
+ * The boot screen's React half: the setup status, the setup error, and the
+ * "continue without backend" escape, drawn over the boot sequence.
  *
- * The page is a self-contained bundle (its own three.js, its own WebGL
- * context, its own CSS), so it runs in an iframe: nothing of it leaks into
- * the app's styles, and removing the frame frees its GPU context in one go.
- * The host listens on the frame's window for the page's complete event and
- * reports it upward, exactly as the previous screens reported their
- * formation. The page falls back to a static wordmark on its own when WebGL
- * is unavailable, and still fires the same event, so the host never hangs.
+ * The sequence itself (public/splash/index.html: particles form the face, the
+ * face becomes the theDAW wordmark, then "by" and the GANTASMO logo arrive and
+ * the whole thing spins out) is an iframe in index.html, so the browser runs
+ * it from the first byte instead of waiting for the app bundle and a React
+ * commit. This component only adopts that frame: it listens on it for the
+ * page's complete event and reports it upward. App.tsx fades and removes the
+ * #boot-splash node once the backend is ready too.
  *
- * Everything the boot screen carried besides the picture stays here: the
- * first-run setup status and error lines, and the "continue without backend"
- * escape after a genuine wait. `data-boot-splash` is the stable hook the
- * capture harness and the tests wait on.
+ * The page falls back to a static wordmark on its own when WebGL is
+ * unavailable, and still fires the same event, so the host never hangs.
+ * `data-boot-splash` is the stable hook the capture harness waits on.
  */
 export const ParticleSplash: React.FC<ParticleSplashProps> = ({ onSkip, onComplete }) => {
   const [elapsed, setElapsed] = useState(0);
-  const frameRef = useRef<HTMLIFrameElement | null>(null);
   const bootStatus = useBootStatusStore((s) => s.status);
   const bootLogs = useBootStatusStore((s) => s.logs);
   const bootError = useBootStatusStore((s) => s.error);
@@ -40,12 +36,16 @@ export const ParticleSplash: React.FC<ParticleSplashProps> = ({ onSkip, onComple
     return () => clearInterval(t);
   }, []);
 
-  // The event fires on the frame's window. The listener is attached once the
-  // frame has loaded its document (before that there is no window to hear),
-  // and re-attached if the frame ever reloads.
+  // The event fires on the frame's own window, which does not exist until the
+  // frame has a document — and the frame is already in the DOM before React
+  // runs, so it may have loaded already. Poll briefly for the window, then
+  // listen; if the sequence was stripped (?nocinematic) report at once.
   useEffect(() => {
-    const frame = frameRef.current;
-    if (!frame) return;
+    const frame = document.getElementById('boot-splash-frame') as HTMLIFrameElement | null;
+    if (!frame) {
+      onComplete?.();
+      return;
+    }
     let target: Window | null = null;
     const done = () => onComplete?.();
     const attach = () => {
@@ -54,10 +54,16 @@ export const ParticleSplash: React.FC<ParticleSplashProps> = ({ onSkip, onComple
       target?.removeEventListener(COMPLETE_EVENT, done);
       target = w;
       w.addEventListener(COMPLETE_EVENT, done);
+      // The page may have finished before this listener existed.
+      if ((w as { theDAWLoader?: { isComplete?: boolean } }).theDAWLoader?.isComplete) done();
     };
     frame.addEventListener('load', attach);
     attach();
+    const poll = setInterval(attach, 100);
+    const stopPolling = setTimeout(() => clearInterval(poll), 10000);
     return () => {
+      clearInterval(poll);
+      clearTimeout(stopPolling);
       frame.removeEventListener('load', attach);
       target?.removeEventListener(COMPLETE_EVENT, done);
     };
@@ -65,19 +71,12 @@ export const ParticleSplash: React.FC<ParticleSplashProps> = ({ onSkip, onComple
   }, []);
 
   return (
-    <div data-boot-splash="" className="fixed inset-0 z-200 select-none overflow-hidden bg-[#050607]">
-      <iframe
-        ref={frameRef}
-        src="/splash/index.html"
-        title="theDAW boot sequence"
-        className="absolute inset-0 block h-full w-full border-0 bg-[#050607]"
-        allow="autoplay"
-      />
-
+    <div data-boot-splash="" className="pointer-events-none fixed inset-0 z-200 select-none overflow-hidden">
       {/* First-run bootstrap status, so a slow or failed setup is visible
-          instead of a silent hang. Low-key over the picture; errors stand out. */}
+          instead of a silent hang. It sits clear of the sequence's own
+          progress bar at the foot of the frame. */}
       {(bootError || ((bootStatus || bootLogs.length > 0) && elapsed >= 3)) && (
-        <div className="pointer-events-none absolute inset-x-0 bottom-9 flex flex-col items-center gap-1 px-6 text-center">
+        <div className="absolute inset-x-0 bottom-20 flex flex-col items-center gap-1 px-6 text-center">
           {bootError ? (
             <div className="max-w-xl text-[11px] font-mono leading-relaxed text-red-300/90">
               Setup error: {bootError}
@@ -102,7 +101,7 @@ export const ParticleSplash: React.FC<ParticleSplashProps> = ({ onSkip, onComple
         <button
           type="button"
           onClick={onSkip}
-          className="absolute bottom-2 right-3 text-[9px] font-mono text-zinc-700 underline transition-colors hover:text-zinc-400"
+          className="pointer-events-auto absolute bottom-2 right-3 text-[9px] font-mono text-zinc-700 underline transition-colors hover:text-zinc-400"
         >
           Continue without backend
         </button>
