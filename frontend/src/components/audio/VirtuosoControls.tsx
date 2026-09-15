@@ -256,6 +256,7 @@ export const VirtuosoControls: React.FC<{ songEntryId?: string; onStatus?: (text
             legend="Shape"
           />
           <StripKey
+            data-tour="midi-meter"
             aria-pressed={meterFace}
             description="Time signatures, groups, lanes, syncopation and generators"
             on={meterFace}

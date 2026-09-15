@@ -135,7 +135,7 @@ const HOME_TABS: HomeTab[] = [
   {
     id: 'sway',
     label: 'Sway',
-    desc: 'Gesture control with the Audima Sway',
+    desc: 'Gesture control with Audima Labs Sway',
     icon: Waves,
     accent: { borderL: 'border-l-fuchsia-500/50', hoverBorderL: 'hover:border-l-fuchsia-400/90', icon: 'text-fuchsia-300' },
   },

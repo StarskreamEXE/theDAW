@@ -144,7 +144,7 @@ export const DAW_LABELS: Record<string, string> = {
   resolume: 'Resolume Arena',
   cubase: 'Cubase',
   pro_tools: 'Pro Tools',
-  sway: 'Audima Sway',
+  sway: 'Audima Labs Sway',
   unknown: 'Unknown',
 };
 

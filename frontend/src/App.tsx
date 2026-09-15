@@ -576,11 +576,13 @@ export default function App() {
             // match the CSS toggle size or viewport clamping drifts.
             className="orb-2x"
             bounds={112}
-            // Welded to the bottom-left corner — including across window
-            // resizes — until the user drags it out once, which releases it
-            // permanently. defaultPosition is only the pre-release fallback.
+            // Pinned flush to the bottom-left corner (re-solved on every
+            // resize, not draggable, any saved position ignored) with its drag
+            // sign above it, until the user clicks it once: that click opens the
+            // assistant and unpins it for good. defaultPosition is only the
+            // fallback for an unpinned orb with no saved position.
             stickCorner="bottom-left"
-            cornerMargin={16}
+            cornerMargin={0}
             defaultPosition={{ x: 12, y: typeof window !== 'undefined' ? window.innerHeight - 172 : 500 }}
             persistenceKey="thedaw-orb-pos-v4"
           />

@@ -1,5 +1,5 @@
 import React, { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
-import { Smartphone, X, Copy, ExternalLink, ChevronUp, ChevronDown, GripHorizontal, ChevronRight, ChevronLeft, Library } from 'lucide-react';
+import { Smartphone, X, Copy, ExternalLink, ChevronUp, ChevronDown, GripHorizontal, ChevronRight, ChevronLeft, Library, Maximize2, Minimize2 } from 'lucide-react';
 import { LibraryView } from '../../views/LibraryView';
 import { DAWCenterPanel } from './DAWCenterPanel';
 
@@ -290,7 +290,7 @@ export const Shell: React.FC = () => {
       }}
     >
       {/* Combined header + tab bar — logo (left), workspace tabs (center),
-          Mobile / Help / Import / app-menu (right). G-Search moved to the footer.
+          Fullscreen / Mobile / Help / Import / app-menu (right). G-Search moved to the footer.
 
           z-40 is about what DROPS OUT of this row, not about the row: the app
           menu, the import menu and the help search hang below it, over the library rail (z-20)
@@ -321,7 +321,8 @@ export const Shell: React.FC = () => {
         />
 
         <div className="flex items-center gap-2.5 shrink-0">
-          {/* Order: Mobile, Help, Import, then the app menu (hamburger) on the far right. */}
+          {/* Order: Fullscreen, Mobile, Help, Import, then the app menu (hamburger) on the far right. */}
+          <FullscreenToggle />
           <TopBarButton
             onClick={() => setShareOpen(true)}
             icon={<Smartphone className="w-3.5 h-3.5" />}
@@ -919,6 +920,38 @@ const ColumnResizeHandle: React.FC<ColumnResizeHandleProps> = ({ currentHeight, 
         <GripHorizontal className="w-3.5 h-3.5 text-zinc-700 group-hover:text-purple-300 opacity-0 group-hover:opacity-100 transition-opacity" />
       </div>
     </>
+  );
+};
+
+/**
+ * Fullscreen, in the header's right cluster immediately left of Mobile. It
+ * toggles browser fullscreen on `document.documentElement`, and its icon follows
+ * `fullscreenchange`, so leaving with Esc flips it back too. A component of its
+ * own so a fullscreen change re-renders this button, not the whole shell.
+ */
+const FullscreenToggle: React.FC = () => {
+  const [isFullscreen, setIsFullscreen] = useState(
+    () => typeof document !== 'undefined' && document.fullscreenElement != null,
+  );
+  useEffect(() => {
+    const sync = () => setIsFullscreen(document.fullscreenElement != null);
+    document.addEventListener('fullscreenchange', sync);
+    return () => document.removeEventListener('fullscreenchange', sync);
+  }, []);
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement) {
+      void document.exitFullscreen().catch(() => {});
+    } else {
+      void document.documentElement.requestFullscreen?.().catch(() => {});
+    }
+  };
+  return (
+    <TopBarButton
+      onClick={toggleFullscreen}
+      icon={isFullscreen ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
+      title="Toggle fullscreen"
+      ariaPressed={isFullscreen}
+    />
   );
 };
 

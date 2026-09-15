@@ -20,9 +20,9 @@ items are in `docs/CHANGELOG.md` under this date; the open remainder was appende
 - **The Sway works in theDAW now.** Root cause: the master MIDI gate defaulted OFF and theDAW owns
   the only `requestMIDIAccess()`, so the relay to the embedded SwayCommand cockpit never started
   (`frontend/src/state/midiTriggerStore.ts`, persisted v2 migrate flips existing installs ON). The
-  cockpit's splash also lied about it (`available` ignored relay mode) — fixed in the staged bundle,
-  in `electron-ui/scripts/fetch-sway-build.mjs` (BUNDLE_PATCHES re-applies on every fetch), and
-  upstream in the SwayCommand source checkout.
+  cockpit's splash also lied about it (`available` ignored relay mode), which is fixed in the
+  SwayCommand source that the release builds at `SWAY_REF`. `electron-ui/scripts/fetch-sway-build.mjs`
+  no longer patches the staged bundle.
 - **PERFORM auto-routes Sway-designed sets.** An imported `.als` carrying MIDI-learn mappings
   creates direct CC→mix routes on load and seeds the six dim bindings; the factory CC layout from
   SwayCommand's `swaymap.js` ships as overridable defaults (authority: learned > project > factory)
