@@ -855,7 +855,7 @@ const ShellBottomDock: React.FC = () => {
               ? <ChevronDown className="w-3.5 h-3.5 text-purple-300 group-hover:text-white transition-colors shrink-0" />
               : <ChevronUp className="w-3.5 h-3.5 text-purple-300 group-hover:text-white transition-colors shrink-0" />
             }
-            <span className="text-[10px] font-black uppercase tracking-widest text-purple-200 shrink-0">LOG</span>
+            <span className="font-display font-bold text-xs leading-4 uppercase text-purple-200 shrink-0">LOG</span>
             {/* Live CPU · GPU · TEMP · VRAM · RAM — shown in full (the section sizes to fit). */}
             <span className="shrink-0"><LogStripCompactInfo /></span>
           </button>

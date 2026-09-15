@@ -276,7 +276,7 @@ export function handletheDAWAction(action: AssistantActionPayload): string {
         case 'abort':
         case 'abort_generation':
         case 'stop_generation':
-            gen.cancelPolling();
+            gen.cancelGeneration();
             return 'Generation aborted';
 
         // --- EDIT arrangement (editor_* vocabulary) ---

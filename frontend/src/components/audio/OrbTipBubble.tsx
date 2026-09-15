@@ -179,9 +179,11 @@ interface OrbTipBubbleProps {
   /** Open the LOG. A click on a status notice calls it. */
   onOpenLog?: () => void;
   className?: string;
+  /** The bubble's width utilities (default `w-56`). A fixed width, so what sits beside it never shifts. */
+  widthClass?: string;
 }
 
-export const OrbTipBubble: React.FC<OrbTipBubbleProps> = ({ onOpen, onOpenLog, className }) => {
+export const OrbTipBubble: React.FC<OrbTipBubbleProps> = ({ onOpen, onOpenLog, className, widthClass = 'w-56' }) => {
   // -1 is the greeting; 0..n index into TIPS. Every launch opens on the
   // greeting, then enters the tip rotation at a random point so it is not the
   // same three lines each session.
@@ -266,7 +268,7 @@ export const OrbTipBubble: React.FC<OrbTipBubbleProps> = ({ onOpen, onOpenLog, c
           text dragged them back and forth on every rotation. The slot is a
           two-line bubble tall; a tip centres in it, and a notice panel is
           anchored to its bottom and grows upward over the row above. */}
-      <div className={['relative shrink-0 w-56 h-10.5', className || ''].join(' ')}>
+      <div className={['relative shrink-0 h-10.5', widthClass, className || ''].join(' ')}>
         <div
           className={
             notice

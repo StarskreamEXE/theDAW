@@ -96,11 +96,25 @@ export const useStudioStore = create<StudioStoreState>()((set, get) => ({
   },
 
   triggerPendingProcess: async () => {
+    // One studio run at a time: EDIT's PROCESS and MIX's CHAIN share
+    // isProcessing, the source and the output, so neither starts while either
+    // runs. Checked synchronously, before the first await, so a double press
+    // cannot slip a second run in.
+    if (get().isProcessing || get().isChainProcessing) {
+      logInfo('studio', 'PROCESS ignored: a studio process is already running');
+      return;
+    }
     const { pendingEffect, pendingParams, processAudio } = get();
     await processAudio({ effect: pendingEffect, params: pendingParams });
   },
 
   processAudio: async ({ effect, params, skipLibrary, quiet }) => {
+    // A stage runs alone. processChain awaits each stage, so between its
+    // stages isProcessing is false and the chain passes this guard.
+    if (get().isProcessing) {
+      logInfo('studio', `Process ${effect} ignored: a studio process is already running`);
+      return;
+    }
     const source = get().sourceFile;
     if (!source) {
       const message = 'Load a source audio file before processing.';
@@ -209,6 +223,10 @@ export const useStudioStore = create<StudioStoreState>()((set, get) => ({
   },
 
   processVst: async ({ pluginPath, pluginName, params, rawState, skipLibrary, quiet }) => {
+    if (get().isProcessing) {
+      logInfo('studio', `VST ${pluginName} ignored: a studio process is already running`);
+      return;
+    }
     const source = get().sourceFile;
     if (!source) {
       const message = 'Load a source audio file before processing.';

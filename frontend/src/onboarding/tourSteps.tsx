@@ -294,9 +294,10 @@ export const TOUR_STEPS: ChapteredStep[] = [
     title: 'The button that starts the work',
     body: (
       <>
-        The bottom-right button changes with the workspace: <Em>CREATE</Em> on MAKE,{' '}
-        <Em>PROCESS</Em> on EDIT and MIX, <Em>TRAIN</Em> on UNDERFIT, <Em>SEND TO VJ</Em> on DJ. It is
-        the one button that starts a job, so it never moves.
+        The bottom-right key changes with the workspace: <Em>CREATE</Em> on MAKE,{' '}
+        <Em>PROCESS</Em> on EDIT, <Em>CHAIN</Em> on MIX, <Em>TRAIN</Em> on UNDERFIT and <Em>SEND</Em> on
+        DJ. While a CREATE or TRAIN run is live it reads <Em>STOP</Em>. It is the one key that starts a
+        job, so it never moves.
       </>
     ),
     targetSelector: '[data-tour="action-button"]',
@@ -536,7 +537,7 @@ export const TOUR_STEPS: ChapteredStep[] = [
     body: (
       <>
         <Em>VJ</Em> runs a live visuals engine that listens to whatever is playing, with sources,
-        effects and an output you can throw at a second screen. DJ's <Em>SEND TO VJ</Em> pushes the
+        effects and an output you can throw at a second screen. DJ's <Em>SEND</Em> key pushes the
         active setlist straight into it.
       </>
     ),

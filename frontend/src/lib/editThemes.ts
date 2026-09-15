@@ -671,20 +671,92 @@ const parseTriplet = (v: string | undefined): [number, number, number] | null =>
 /** A tint whose channels spread less than this is a grey, not a hue. */
 const NEUTRAL_CHROMA = 30;
 
+type Rgb = readonly [number, number, number];
+
+/**
+ * The purple steps a neutral theme's accent climbs until it reads as 12px text
+ * on the latched key tile: purple 500 · 400 · 300 on dark grounds, 700 · 800 ·
+ * 900 on light ones.
+ */
+const NEUTRAL_ACCENTS: Record<'dark' | 'light', readonly Rgb[]> = {
+  dark: [[168, 85, 247], [192, 132, 252], [216, 180, 254]],
+  light: [[126, 34, 206], [107, 33, 168], [88, 28, 135]],
+};
+
+/**
+ * The ratio a neutral accent must reach on `accentKeyTile`. WCAG asks 4.5:1 for
+ * 12px text; the estimate leaves out the 5% of whatever shows through the
+ * footer's 95% ground, and in the running app the sampled tile read up to 0.4
+ * lower than the estimate (Porcelain, Olive & Bone), so the bar sits above it.
+ */
+export const ACCENT_TEXT_TARGET = 5.2;
+
+const parseColor = (v: string | undefined): Rgb | null => {
+  if (!v) return null;
+  const s = v.trim();
+  const hex = /^#([0-9a-f]{6})$/i.exec(s);
+  if (hex) {
+    const n = parseInt(hex[1], 16);
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  }
+  const fn = /^rgba?\(\s*([\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)/i.exec(s);
+  if (fn) return [Number(fn[1]), Number(fn[2]), Number(fn[3])];
+  return parseTriplet(s);
+};
+
+const over = (under: Rgb, top: Rgb, alpha: number): Rgb => [
+  under[0] + (top[0] - under[0]) * alpha,
+  under[1] + (top[1] - under[1]) * alpha,
+  under[2] + (top[2] - under[2]) * alpha,
+];
+
+/**
+ * The tile of a latched footer key, where the accent is printed as 12px text:
+ * the footer's ground (`--et-popup`) under the plate's 40% shade (`bg-black/40`)
+ * and the key's 10% tint (`bg-white/10`). Null when a var does not parse.
+ */
+export function accentKeyTile(vars: Record<string, string>): Rgb | null {
+  const ground = parseColor(vars['--et-popup']);
+  const shade = parseTriplet(vars['--et-shade']);
+  const tint = parseTriplet(vars['--et-tint']);
+  if (!ground || !shade || !tint) return null;
+  return over(over(ground, shade, 0.4), tint, 0.1);
+}
+
+const channel = (c: number): number => {
+  const s = c / 255;
+  return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+};
+const relativeLuminance = (c: Rgb): number => 0.2126 * channel(c[0]) + 0.7152 * channel(c[1]) + 0.0722 * channel(c[2]);
+
+/** The WCAG 2.x contrast ratio of two sRGB colours. */
+export function contrastRatio(a: Rgb, b: Rgb): number {
+  const [hi, lo] = [relativeLuminance(a), relativeLuminance(b)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
 /**
  * `--et-accent` / `--et-accent-ink`: the hue the footer's latched transport
- * keys, the scrub fill and the action button use, and the ink that reads on
- * a solid fill of it. A hued theme's accent is its own tint (Navy & Gold's
- * gold, Sage & Terracotta's clay) so the chrome stops fighting the theme; a
- * neutral theme keeps the app's purple, darkened on light grounds. A theme
- * that sets `--et-accent` itself is left alone.
+ * keys, the scrub fill and the action key use, and the ink that reads on a
+ * solid fill of it. A hued theme's accent is its own tint (Navy & Gold's gold,
+ * Sage & Terracotta's clay) so the chrome stops fighting the theme; a neutral
+ * theme takes the first purple step (NEUTRAL_ACCENTS) that reaches
+ * ACCENT_TEXT_TARGET on its key tile, so a latched key's legend reads at 4.5:1
+ * on every neutral ground. A theme that sets `--et-accent` itself is left alone.
  */
 export function withAccent(vars: Record<string, string>, light: boolean): Record<string, string> {
   const out = { ...vars };
   if (!out['--et-accent']) {
     const tint = parseTriplet(out['--et-tint']);
     const chroma = tint ? Math.max(...tint) - Math.min(...tint) : 0;
-    out['--et-accent'] = tint && chroma >= NEUTRAL_CHROMA ? tint.join(' ') : light ? '126 34 206' : '168 85 247';
+    if (tint && chroma >= NEUTRAL_CHROMA) {
+      out['--et-accent'] = tint.join(' ');
+    } else {
+      const steps = NEUTRAL_ACCENTS[light ? 'light' : 'dark'];
+      const tile = accentKeyTile(out);
+      const pick = steps.find((c) => !tile || contrastRatio(c, tile) >= ACCENT_TEXT_TARGET) ?? steps[steps.length - 1];
+      out['--et-accent'] = pick.join(' ');
+    }
   }
   if (!out['--et-accent-ink']) {
     const a = parseTriplet(out['--et-accent']) ?? [168, 85, 247];
