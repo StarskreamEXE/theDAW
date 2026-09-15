@@ -23,12 +23,14 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import importlib.metadata
 import io
 import logging
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Literal, Optional
 from backend.lib.launch_token import child_env
@@ -332,6 +334,11 @@ def _load_basic_pitch_model():
     global _basic_pitch_model, _basic_pitch_providers
     if _basic_pitch_model is not None:
         return _basic_pitch_model
+    # The first load imports basic-pitch's note-creation stack (mir_eval, which
+    # pulls scipy.stats): 20 s on an idle machine, over a minute while the app
+    # is busy. The opening line keeps the LOG showing a live conversion.
+    log.info("midi.engine: loading basic-pitch for the first conversion")
+    started = time.perf_counter()
     from basic_pitch import ICASSP_2022_MODEL_PATH  # type: ignore[import]
     from basic_pitch.inference import Model  # type: ignore[import]
 
@@ -353,7 +360,14 @@ def _load_basic_pitch_model():
             providers = ["CPUExecutionProvider"]
     _basic_pitch_model = model
     _basic_pitch_providers = providers
-    log.info("midi.engine: basic-pitch on %s", providers[0])
+    # basic-pitch's import logs a WARNING for each backend it probes and does
+    # not find (CoreML, TFLite, TensorFlow); theDAW runs its ONNX model.
+    log.info(
+        "midi.engine: basic-pitch ONNX model on %s, loaded in %.0f s; the "
+        "CoreML/TFLite/TensorFlow notices above name backends theDAW does not use",
+        providers[0],
+        time.perf_counter() - started,
+    )
     return model
 
 
@@ -361,9 +375,10 @@ def _run_basic_pitch(audio_path: Path, output_path: Path) -> dict:
     """Use basic-pitch's predict_and_save in a temp dir, then move
     its output to the caller's path. basic-pitch writes files named
     ``<input_stem>_basic_pitch.mid`` so we rename to honour our path."""
-    from basic_pitch.inference import predict_and_save  # type: ignore[import]
-
+    # The model load logs before it imports basic_pitch.inference (the slow
+    # import), so it runs first.
     model = _load_basic_pitch_model()
+    from basic_pitch.inference import predict_and_save  # type: ignore[import]
 
     # Use a tempdir adjacent to the output path so the final move is
     # always on the same volume (Path.replace() fails cross-drive on
@@ -577,6 +592,13 @@ def _count_midi_notes(midi_path: Path) -> int:
 
 
 def _module_version(name: str) -> str:
+    """The installed version of an engine: its distribution's metadata first
+    (basic-pitch defines no ``__version__``), then the module's
+    ``__version__``."""
+    try:
+        return importlib.metadata.version(PACKAGE_FOR_ENGINE.get(name, name))
+    except importlib.metadata.PackageNotFoundError:
+        pass
     try:
         mod = importlib.import_module(name)
         return str(getattr(mod, "__version__", "unknown"))
