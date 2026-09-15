@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import io
 import json
 import logging
@@ -257,19 +258,51 @@ async def _bring_up_sidecar(
                     )
                 await loop.run_in_executor(None, sidecar.stop_engine)
                 await loop.run_in_executor(None, sidecar.start_engine)
-            # Model load can take a while on a cold start; poll until ready.
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline:
-                await asyncio.sleep(2.0)
-                h = await sidecar.health()
-                if h.get("available"):
-                    if on_state:
-                        on_state("running", "generating")
-                    return
-                if on_state and h.get("status"):
-                    on_state("starting", str(h.get("status")))
-                if sidecar.engine_state(h, None) == "error":
-                    hint = _classify_engine_error(h).get("fix") or (
+            # A load that dies of RESOURCE_EXHAUSTED gets ONE more go with the
+            # growing allocator. JAX sizes its arena once, at import, from the
+            # VRAM free at that instant; anything holding the card for that
+            # instant leaves the engine short for the life of the process, and
+            # it then dies on an allocation as small as 96 MiB with the card
+            # almost empty. Restarting under THEDAW_MAGENTA_GROW takes memory
+            # as it is needed instead, so the same card loads the same model.
+            for attempt in ("preallocate", "grow"):
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    await asyncio.sleep(2.0)
+                    h = await sidecar.health()
+                    if h.get("available"):
+                        if on_state:
+                            on_state("running", "generating")
+                        return
+                    if on_state and h.get("status"):
+                        on_state("starting", str(h.get("status")))
+                    if sidecar.engine_state(h, None) != "error":
+                        continue
+                    free_gb = await loop.run_in_executor(None, sidecar.gpu_free_gb)
+                    kind = _classify_engine_error(h, free_gb)
+                    retry = (
+                        attempt == "preallocate"
+                        and kind.get("error_kind") == "gpu_oom"
+                        and str(h.get("allocator") or "preallocate") != "grow"
+                    )
+                    if retry:
+                        log.warning(
+                            "magenta: engine load ran out of GPU memory with "
+                            "%s GiB free; restarting it with the growing "
+                            "allocator",
+                            "unknown" if free_gb is None else f"{free_gb:.1f}",
+                        )
+                        if on_state:
+                            on_state(
+                                "starting",
+                                "restarting the engine with the growing allocator",
+                            )
+                        await loop.run_in_executor(None, sidecar.stop_engine)
+                        await loop.run_in_executor(
+                            None, functools.partial(sidecar.start_engine, grow=True)
+                        )
+                        break
+                    hint = kind.get("fix") or (
                         "Pick another model in Settings → Models or check "
                         "logs/magenta-sidecar.log."
                     )
@@ -277,6 +310,10 @@ async def _bring_up_sidecar(
                         "The Magenta RT2 engine failed to load its model: "
                         f"{h.get('error') or h.get('status')}. {hint}"
                     )
+                else:
+                    # The inner loop ran its deadline out rather than breaking
+                    # to retry, so there is nothing left to wait for.
+                    break
         raise RuntimeError(
             "The Magenta RT2 engine started but did not become ready in time. "
             "Check the WSL sidecar, then try again."
@@ -378,19 +415,52 @@ async def _start_engine_on_gpu_lane() -> None:
     _start_note = ""
 
 
-def _classify_engine_error(h: dict) -> dict:
+#: A card with at least this much free is not the reason a load ran out, in GiB.
+_ROOMY_VRAM_GB = 4.0
+
+
+def _oom_fix(free_gb: float | None, allocator: str) -> str:
+    """What to do about a load that ran out of GPU memory, given what the card
+    actually had free when it happened.
+
+    The old message asserted that something else was on the card. It said that
+    whatever the card held, so a user watching 1.3 of 11 GiB in use was told to
+    wait for a job that was not running. Measure first, then say.
+    """
+    if allocator == "grow":
+        # It already took memory as it needed it, so the card is the limit.
+        room = "" if free_gb is None else f" Only {free_gb:.1f} GiB was free."
+        return (
+            "The GPU does not have room for this checkpoint." + room + " Pick a "
+            "smaller model in Settings → Models, or close what else is using the "
+            "card and press Restart engine."
+        )
+    if free_gb is not None and free_gb >= _ROOMY_VRAM_GB:
+        return (
+            f"The card had {free_gb:.1f} GiB free, so this is not a shortage: JAX "
+            "sizes its memory arena once, when it starts, from whatever was free "
+            "at that instant — something held the card for that moment and the "
+            "engine stayed short of memory afterwards. Press Restart engine; the "
+            "retry takes memory as it needs it instead."
+        )
+    held = "" if free_gb is None else f" {free_gb:.1f} GiB was free."
+    return (
+        "The GPU ran out of memory while the engine loaded its checkpoint."
+        + held
+        + " Something else is on the card (a stem separation, whisper, MIDI "
+        "transcription or the SA3 model). Wait for it to finish, then press "
+        "Restart engine — the load waits its turn for the GPU."
+    )
+
+
+def _classify_engine_error(h: dict, free_gb: float | None = None) -> dict:
     """Turn the engine's raw error into something a user can act on."""
     err = str(h.get("error") or h.get("status") or "")
     low = err.lower()
     if "resource_exhausted" in low or "out of memory" in low or "oom" in low:
         return {
             "error_kind": "gpu_oom",
-            "fix": (
-                "The GPU ran out of memory while the engine loaded its checkpoint. "
-                "Something else was on the card (a stem separation, whisper, MIDI "
-                "transcription or the SA3 model). Wait for it to finish, then press "
-                "Restart engine — the load now waits its turn for the GPU."
-            ),
+            "fix": _oom_fix(free_gb, str(h.get("allocator") or "preallocate")),
         }
     if "checkpoint" in low or "no such file" in low or "not found" in low:
         return {
@@ -500,7 +570,14 @@ async def engine_status(refresh: bool = False):
         out["state"] = "starting"
         out["message"] = _start_note
     if out["state"] == "error":
-        out.update(_classify_engine_error(h))
+        # Measure the card before saying anything about it: an OOM message that
+        # blames another process while 10 GiB sit free sends the user looking
+        # for a job that is not running.
+        free_gb = await asyncio.get_running_loop().run_in_executor(
+            None, sidecar.gpu_free_gb
+        )
+        out["gpu_free_gb"] = free_gb
+        out.update(_classify_engine_error(h, free_gb))
         if out.get("fix"):
             out["message"] = out["fix"]
     return out

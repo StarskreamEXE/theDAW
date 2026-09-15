@@ -45,13 +45,31 @@ import threading
 import time
 import traceback
 
-# GPU allocator (must be set before jax is imported). Default to the FAST path
-# (BFC + preallocation): the engine has the card to itself while it runs (the
-# backend parks Stable Audio to CPU before bringing this up), and JAX's
-# "platform" allocator — the previous default — is documented as "very slow, not
-# recommended for general use" because it allocates/frees per op, which taxes the
-# per-frame streaming loop heavily. Set THEDAW_MAGENTA_LOWMEM=1 to fall back to
-# the low-memory platform allocator.
+# GPU allocator (must be set before jax is imported). Three modes, because
+# JAX's default sizes its arena ONCE, from what is free at import:
+#
+#   default            BFC + preallocation. The fast path, and the one the
+#                      engine has the card to itself for (the backend parks
+#                      Stable Audio to CPU before bringing this up). Its cost is
+#                      that the arena is whatever share of free VRAM existed at
+#                      import — if anything held the card for that instant the
+#                      arena stays small for the life of the process, and the
+#                      load then dies on a 96 MiB allocation with the card
+#                      almost empty. That is what THEDAW_MAGENTA_GROW is for.
+#   THEDAW_MAGENTA_GROW=1
+#                      BFC that grows on demand (preallocation off). Still the
+#                      BFC allocator, so the streaming loop is not paying the
+#                      per-op cost of "platform"; it just takes what it needs
+#                      when it needs it. The backend retries a load that died of
+#                      RESOURCE_EXHAUSTED in this mode.
+#   THEDAW_MAGENTA_LOWMEM=1
+#                      preallocation off AND the "platform" allocator, which
+#                      JAX documents as "very slow, not recommended for general
+#                      use" because it allocates and frees per op. Last resort
+#                      on a card that cannot hold the arena at all.
+# Read inline, with no helper and no name bound out here: a `def` or a
+# module-level assignment above the imports puts every one of them past the top
+# of the file. A conditional does not.
 if os.environ.get("THEDAW_MAGENTA_LOWMEM", "").strip().lower() in (
     "1",
     "true",
@@ -60,8 +78,18 @@ if os.environ.get("THEDAW_MAGENTA_LOWMEM", "").strip().lower() in (
 ):
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
     os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
+    ALLOCATOR_MODE = "lowmem"
+elif os.environ.get("THEDAW_MAGENTA_GROW", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+):
+    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    ALLOCATOR_MODE = "grow"
 else:
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "true")
+    ALLOCATOR_MODE = "preallocate"
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
 import numpy as np
@@ -262,6 +290,11 @@ async def health():
         "model": MODEL,
         "device": ENGINE.device,
         "sample_rate": ENGINE.sample_rate,
+        # Which allocator this process started with. A load that dies of
+        # RESOURCE_EXHAUSTED under "preallocate" is worth one retry under
+        # "grow"; one that dies under "grow" is a card that is genuinely too
+        # small or genuinely full, and the backend says so instead of retrying.
+        "allocator": ALLOCATOR_MODE,
     }
 
 

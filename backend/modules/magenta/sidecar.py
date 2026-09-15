@@ -709,9 +709,51 @@ def _resolve_start_model() -> tuple[str, str | None]:
     return wanted, None
 
 
-def start_engine() -> dict:
+def gpu_free_gb() -> float | None:
+    """Free VRAM on the largest card right now, in GiB, or None if unknown.
+
+    NOT cached, unlike ``gpu_info``: this is the number that changes, and every
+    caller wants it as it is at the moment they ask. nvidia-smi rather than
+    torch, because torch reports what torch has, and the question here is what
+    the whole machine has left for a child process.
+    """
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=6,
+            creationflags=_no_window_flags(),
+            env=child_env(),
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    free = []
+    for line in out.strip().splitlines():
+        try:
+            free.append(float(line.strip()) / 1024)
+        except ValueError:
+            continue
+    return round(max(free), 1) if free else None
+
+
+def start_engine(grow: bool = False) -> dict:
     """Spawn the extended sidecar in WSL2 (blocking call, returns immediately
-    after the spawn; readiness is observed via ``health()``)."""
+    after the spawn; readiness is observed via ``health()``).
+
+    ``grow`` starts it with the allocator that takes VRAM as it needs it rather
+    than sizing an arena once at import. The bring-up path uses it to retry a
+    load that died of RESOURCE_EXHAUSTED: JAX fixes its arena from whatever was
+    free the instant it imported, so a card that was busy for that instant
+    leaves the engine short for the life of the process even after the card
+    empties.
+    """
     global _engine_proc
     with _engine_lock:
         if engine_process_alive():
@@ -732,8 +774,9 @@ def start_engine() -> dict:
             # in the bash command — it does not cross the wsl.exe boundary via
             # the Windows process environment).
             distro = _wsl_distro()
+            grow_env = "THEDAW_MAGENTA_GROW=1 " if grow else ""
             bash_cmd = (
-                f"MRT2_PORT={port} MRT2_MODEL={model} "
+                f"MRT2_PORT={port} MRT2_MODEL={model} {grow_env}"
                 f"exec {_WSL_PYTHON} '{_wsl_path(_ENGINE_SCRIPT)}'"
             )
             cmd = ["wsl.exe", "-d", distro, "--", "bash", "-lc", bash_cmd]
@@ -752,6 +795,8 @@ def start_engine() -> dict:
                 )
             popen_env["MRT2_PORT"] = port
             popen_env["MRT2_MODEL"] = model
+            if grow:
+                popen_env["THEDAW_MAGENTA_GROW"] = "1"
             cmd = [str(native_py), str(_ENGINE_SCRIPT)]
             descriptor = {"native": True, "python": str(native_py)}
 
