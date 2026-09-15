@@ -291,6 +291,19 @@ function scheduleSave(): void {
   }, SAVE_DEBOUNCE_MS);
 }
 
+/** Fire a pending debounced save now. Wired to beforeunload and pagehide: the
+ *  2 s debounce otherwise drops the last edits on a clean close, and the
+ *  Ctrl+S / unload guard only prompts, it never writes. The save is async and
+ *  cannot be awaited during unload; starting it synchronously gives OPFS the
+ *  best chance to land it before the document goes away. A save that is not
+ *  pending (no timer) has nothing to flush. */
+export function flushPendingAutosave(): void {
+  if (saveTimer === null) return;
+  window.clearTimeout(saveTimer);
+  saveTimer = null;
+  void performSave();
+}
+
 // ── Recovery ─────────────────────────────────────────────────────────────────
 
 async function restoreFromAutosave(): Promise<void> {
@@ -379,6 +392,11 @@ export function initEditorAutosave(): void {
     disabled = true;
     return;
   }
+
+  // pagehide is the reliable one (bfcache, mobile, Electron close); beforeunload
+  // covers the browsers that still fire only it. Idempotent, so both may run.
+  window.addEventListener('beforeunload', flushPendingAutosave);
+  window.addEventListener('pagehide', flushPendingAutosave);
 
   void (async () => {
     const manifest = await readManifest();

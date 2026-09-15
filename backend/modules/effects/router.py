@@ -285,8 +285,24 @@ def _build_filter(
         return ["-af", f"lowpass=f={freq}"]
 
     elif effect == "pitch_shift":
-        shift = params["shift"]
-        return ["-af", f"afreqshift=shift={shift}"]
+        # `shift` is in cents and the effect must keep tempo. afreqshift was the
+        # wrong filter twice over: it is a linear frequency shifter (every
+        # partial moves by the same Hz, so harmonics stop being harmonic) and it
+        # takes Hz, so the cents value was being fed in as a Hz offset.
+        cents = params["shift"]
+        pitch_scale = 2.0 ** (cents / 1200.0)
+        if _has_librubberband():
+            return ["-af", f"rubberband=tempo=1.0:pitch={pitch_scale:.6f}"]
+        # Same built-in fallback as time_pitch with tempo held at 1.0:
+        # asetrate shifts pitch and tempo together, atempo undoes the tempo.
+        base = 44100
+        af = (
+            f"aresample={base},"
+            f"asetrate={int(round(base * pitch_scale))},"
+            f"{_atempo_chain(1.0 / pitch_scale)},"
+            f"aresample={base}"
+        )
+        return ["-af", af]
 
     elif effect == "time_pitch":
         tempo = params["tempo"]

@@ -419,6 +419,11 @@ interface EditorHistorySnapshot {
   tracks: EditorTrack[];
   clips: AudioClip[];
   masterFxChain: ChainEntry[];
+  /** The master VST rack is document state like the master FX rack: a track's
+   *  VST inserts already ride along inside `tracks`, so leaving the master's
+   *  out made master-rack edits the one kind of rack edit undo could not
+   *  reach. */
+  masterVstChain: ChainEntry[];
   automationLanes: AutomationLane[];
   markers: TimelineMarker[];
   bpm: number;
@@ -446,6 +451,7 @@ const docSnapshot = (s: EditorStoreState): EditorHistorySnapshot => ({
   tracks: s.tracks,
   clips: s.clips,
   masterFxChain: s.masterFxChain,
+  masterVstChain: s.masterVstChain,
   automationLanes: s.automationLanes,
   markers: s.markers,
   bpm: s.bpm,
@@ -679,14 +685,28 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       return null;
     }
     const newId = uid();
-    const left: AudioClip = { ...clip, durationSec: relSplit };
+    const rightDur = clip.durationSec - relSplit;
+    // Each fade belongs to one end of the original clip, so it follows that
+    // end: the fade-in stays with the left half and the fade-out moves to the
+    // right half. Spreading `...clip` onto both used to give the left half a
+    // fade-out it never had (and the right half a fade-in), so a split inside a
+    // faded clip dipped to silence at the seam. Fades are also capped at half
+    // the half's length, the same bound the fade handles enforce.
+    const left: AudioClip = {
+      ...clip,
+      durationSec: relSplit,
+      fadeInSec: Math.min(clip.fadeInSec, relSplit / 2),
+      fadeOutSec: 0,
+    };
     const right: AudioClip = {
       ...clip,
       id: newId,
       startSec: clip.startSec + relSplit,
       offsetIntoSource: clip.offsetIntoSource + relSplit,
-      durationSec: clip.durationSec - relSplit,
+      durationSec: rightDur,
       label: `${clip.label}_b`,
+      fadeInSec: 0,
+      fadeOutSec: Math.min(clip.fadeOutSec, rightDur / 2),
     };
     set((s) => ({
       clips: s.clips.flatMap((c) => (c.id === id ? [left, right] : [c])),
@@ -981,6 +1001,7 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       tracks: prev.tracks,
       clips: prev.clips,
       masterFxChain: prev.masterFxChain,
+      masterVstChain: prev.masterVstChain,
       automationLanes: prev.automationLanes,
       markers: prev.markers,
       bpm: prev.bpm,
@@ -1005,6 +1026,7 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       tracks: next.tracks,
       clips: next.clips,
       masterFxChain: next.masterFxChain,
+      masterVstChain: next.masterVstChain,
       automationLanes: next.automationLanes,
       markers: next.markers,
       bpm: next.bpm,
@@ -1043,6 +1065,7 @@ useEditorStore.subscribe((state, prev) => {
     state.tracks === prev.tracks &&
     state.clips === prev.clips &&
     state.masterFxChain === prev.masterFxChain &&
+    state.masterVstChain === prev.masterVstChain &&
     state.automationLanes === prev.automationLanes &&
     state.markers === prev.markers &&
     state.bpm === prev.bpm
