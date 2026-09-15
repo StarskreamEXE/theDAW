@@ -69,7 +69,7 @@ Detection reports a warnings list for every parsed project. Parsers never abort 
 | Adobe Audition | `.sesx` | Tracks with names, volume, and pan, and audio clips referenced by relative or absolute path from the session XML. |
 | Bitwig Studio | `.bwproject` | Tracks with content type, color, channel role, volume, pan, and mute, plus the device chain (VST3, VST2, CLAP, AU, and built-in devices) and arrangement lanes, read through the open DAWproject schema. |
 | Resolume Arena | `.avc` | Tempo, layers as tracks, audio and video clips with source file paths and best-effort timing, and native or VST effects. MIDI is emitted only when a clip carries note data. |
-| Audima Sway | `.swayproj` | The controller layout, not a session: presets and zones with their rectangles, CC slots and notes. It imports with **zero tracks by design** and reports that honestly. Its value is the Perform routing — preset names seed the six motion-dimension bindings automatically. |
+| Audima Labs Sway | `.swayproj` | The controller layout, not a session: presets and zones with their rectangles, CC slots and notes. It imports with **zero tracks by design** and reports that honestly. Its value is the Perform routing — preset names seed the six motion-dimension bindings automatically. |
 
 ### Formats with export guidance only
 

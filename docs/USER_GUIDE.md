@@ -1210,7 +1210,7 @@ The result records to the library or appends to the EDIT timeline. Sound modes c
 
 ### 16.10 SWAY
 
-The SWAY tab hosts the **SwayCommand cockpit** — the Audima Sway's own performance app, embedded in theDAW. The tab boots the cockpit straight into a project rather than its splash screen: it opens the most recent project saved from the cockpit, or the bundled `will-i-dream` template on a fresh install, and theDAW registers that project's media so its clips are allowed to load.
+The SWAY tab hosts the **SwayCommand cockpit** — the Audima Labs Sway's own performance app, embedded in theDAW. The tab boots the cockpit straight into a project rather than its splash screen: it opens the most recent project saved from the cockpit, or the bundled `will-i-dream` template on a fresh install, and theDAW registers that project's media so its clips are allowed to load.
 
 Saving inside the cockpit is durable: a save writes a `.sway` file into `data/sway-projects/` through theDAW's backend (`POST /api/sway/project-save`) and its media paths are allowlisted at the same time, so the project reopens intact.
 

@@ -52,7 +52,7 @@
 | **DJ** | Two decks with beat sync, key lock, hotcues, loops, live stems, an FX rack, a sampler, and Automix that plays prepared performance sets and takes instructions from the assistant mid-show. |
 | **VJ** | The [VJ-9000](https://github.com/gantasmo/VJ-9000) visual engine: audio-reactive terrain, cameras, GLSL shaders, cymatics, a GPU effect chain, and recording. |
 | **LOOM** | A living colony of loops cut from your own library. Cells divide, envelop and wither on the beat clock while it plays. |
-| **SWAY** | The SwayCommand gesture cockpit: scenes, a timeline and gesture axes bound to macros, driven by a camera or the Audima Sway. |
+| **SWAY** | The SwayCommand gesture cockpit: scenes, a timeline and gesture axes bound to macros, driven by a camera or the Audima Labs Sway. |
 | **PERFORM** | Launch scenes and clips from a grid. Opens Ableton sets and `.tasmo` projects. Pad effects and controller routing. |
 | **FOUNDRY** | Design a plugin interface on a canvas and export it as a `.gan` web-plugin. |
 | **NODEFI** | Connect generation, effects and library nodes into a graph. Run it as a pipeline or play it live. |
@@ -62,7 +62,7 @@
 
 **Included at no cost.** Stem separation up to 12 stems, a mastering suite, VST3 hosting, the HRTF spatializer The Owl, DJ decks with sync and Automix, audio-to-MIDI with engraving, LoRA training, forced-aligned lyrics with a whisper review, a rhyme and literary reading of any lyric, and export to WAV, MP3, FLAC, OGG, AIFF, Opus, M4A, MIDI, MusicXML and LRC. Every model in that list runs on the GPU when there is one, one at a time, and never twice for the same song.
 
-**Only in theDAW.** [theDAW-XR](https://github.com/gantasmo/theDAW-XR) hand-tracked control on Meta Quest 3, Chimera clip fusion, DRAW (draw on a canvas to play generative music), native Audima Sway motion-controller support, The Foundry plugin designer, import of Ableton, Reaper, FL Studio, Audacity, Audition, Bitwig and Resolume projects, the first non-Mac port of Magenta RealTime 2, and 28 themes plus a custom theme built from any image.
+**Only in theDAW.** [theDAW-XR](https://github.com/gantasmo/theDAW-XR) hand-tracked control on Meta Quest 3, Chimera clip fusion, DRAW (draw on a canvas to play generative music), native Audima Labs Sway motion-controller support, The Foundry plugin designer, import of Ableton, Reaper, FL Studio, Audacity, Audition, Bitwig and Resolume projects, the first non-Mac port of Magenta RealTime 2, and 28 themes plus a custom theme built from any image.
 
 ---
 
@@ -187,7 +187,7 @@ Every song in the library is torn into bar- and beat-aligned fragments of each s
 
 <p align="center"><img src="docs/readme/sway.png" alt="The SwayCommand cockpit: the scene list, the timeline, and gesture axes bound to macro knobs and named pads" width="900"></p>
 
-SWAY embeds the [SwayCommand](https://github.com/danieljtrujillo/SwayCommand) cockpit whole: scenes down the left, a timeline underneath, and gesture axes (X, Y, PULSE, PRESS, SWAY) bound to macro knobs and named pads. Move in front of a camera, or move the Audima Sway motion controller, and you are playing those controls. theDAW owns the only `requestMIDIAccess()` in the app and relays hardware into the cockpit over `postMessage`, so a controller you plug in reaches it with no extra setup. Reference: [Sway Perform](docs/guides/sway-perform-live.md).
+SWAY embeds the [SwayCommand](https://github.com/danieljtrujillo/SwayCommand) cockpit whole: scenes down the left, a timeline underneath, and gesture axes (X, Y, PULSE, PRESS, SWAY) bound to macro knobs and named pads. Move in front of a camera, or move the Audima Labs Sway motion controller, and you are playing those controls. theDAW owns the only `requestMIDIAccess()` in the app and relays hardware into the cockpit over `postMessage`, so a controller you plug in reaches it with no extra setup. Reference: [Sway Perform](docs/guides/sway-perform-live.md).
 
 ### Connect nodes: NODEFI
 
@@ -219,6 +219,18 @@ LEARN draws every track and the links between them as a 3D graph, a 2D graph, or
 
 The library is on disk, with its metadata in `data/library.db`. Every generated track is saved with its prompt, model and settings. Imported tracks keep their lyrics and tags. Sub-tabs list a track's STEMS, MIDI, VIDEO and SCORE files. SUGGEST orders tracks into a playlist by Camelot key and BPM. The Catalogue is the full-width view of the same library with an inspector, spectrograms on demand and a lineage panel. Reference: [User Guide §13](docs/USER_GUIDE.md#13-library) and [§29](docs/USER_GUIDE.md#29-catalogue).
 
+theDAW remembers every path it writes. A file it installs, saves, downloads or exports is registered, so pickers open in the folder you last used for that kind of file, a Recent list hands the file straight back, and Show in Folder opens it in the file manager. Saving goes through the native Save As dialog.
+
+### Write and shape MIDI: the piano roll
+
+Right-click a track and choose **Convert to MIDI**, or draw notes in by hand. The roll plays what you write and sends it to the EDIT timeline.
+
+The roll carries a meter map, so the time signature can change across one piece, with additive groupings like 7/8 as 2+2+3 and a pickup bar before the first full bar. Polymeter lanes each run their own meter and loop length against the same clock. A pitch bend lane sits under the keys with a semitone range and LINE, HOLD and CURVE point shapes.
+
+The SHAPE row under the roll transforms what is there: harmony, ragtime, runs, polyrhythm and humanize, each with syncopation and accent amounts. **MATCH** pulls a song's meter map, tempo and lanes from its rhythm analysis. **GEN** writes LOOM generator rules into the active lane. **ARP** writes a chord-progression arpeggio. CAPTURE, SONG and FORM assemble a multi-section arrangement from intro to outro. A microphone turns a sung line into notes, and an AI compose flyout writes a piano part from a key and mode.
+
+It reads MusicXML, ABC, Humdrum and MIDI, taking time signatures and tempo maps from MIDI files, and writes MIDI back out with the roll's own tempo and meters. Reference: [User Guide §16](docs/USER_GUIDE.md#16-bottom-panel-tabs).
+
 ### The bottom panel
 
 <p align="center">
@@ -231,7 +243,7 @@ The library is on disk, with its metadata in `data/library.db`. Every generated 
 
 - **LEVELS** meters loudness, true peak, dynamics and stereo image against a delivery target.
 - **VISUALIZE** shows an oscilloscope, a spectrum or a radial view.
-- **MIDI** is a piano roll. It imports and exports MIDI and sends notes to the EDIT timeline.
+- **MIDI** is the piano roll described above: meter maps, polymeter lanes, a pitch bend lane and the SHAPE transforms.
 - **SEQUENCE** is a step sequencer with 16 steps per voice.
 - **DRAW** plays generative music from strokes on a canvas.
 - **SCORE**, **SING** and **DETAILS** show the selected song's notation, lyrics and metadata.
@@ -249,11 +261,13 @@ Search a city and TOUR returns the venues in it — 513 for Austin above — eac
 
 ### Controllers, XR and phone
 
-Controller recognition knows about 110 device profiles, detects a connected controller, learns one by capture, and **Controller Vision** identifies a controller from a photo. The Audima Sway motion controller works natively. [theDAW-XR](https://github.com/gantasmo/theDAW-XR) turns a Meta Quest 3 into a hands-only controller with hand-tracked MIDI, passthrough video into VJ and co-located multiplayer. A phone web app pairs with the desktop for remote MAKE, transport, DJ and library control. The TOUR tab plans live dates on a map with venue, promoter and festival search, booking-contact lookup and a route. Reference: [User Guide §31](docs/USER_GUIDE.md#31-controller-vision), [§34](docs/USER_GUIDE.md#34-quest-and-xr-integrations), [§41](docs/USER_GUIDE.md#41-tour-tab) and [§42](docs/USER_GUIDE.md#42-mobile-companion-app).
+Controller recognition knows about 110 device profiles, detects a connected controller, learns one by capture, and **Controller Vision** identifies a controller from a photo. The Audima Labs Sway motion controller works natively. [theDAW-XR](https://github.com/gantasmo/theDAW-XR) turns a Meta Quest 3 into a hands-only controller with hand-tracked MIDI, passthrough video into VJ and co-located multiplayer. A phone web app pairs with the desktop for remote MAKE, transport, DJ and library control. The TOUR tab plans live dates on a map with venue, promoter and festival search, booking-contact lookup and a route. Reference: [User Guide §31](docs/USER_GUIDE.md#31-controller-vision), [§34](docs/USER_GUIDE.md#34-quest-and-xr-integrations), [§41](docs/USER_GUIDE.md#41-tour-tab) and [§42](docs/USER_GUIDE.md#42-mobile-companion-app).
 
 ### Footer, log and assistant
 
-The footer is on every tab with transport, a seek bar, volume and download. The processing log keeps the last 500 entries. The assistant orb streams chat from any configured provider (Claude Code over the CLI, Gemini, Anthropic, OpenAI, Grok, Groq, OpenRouter, Ollama, LM Studio, llama.cpp, vLLM), accepts attachments, and answers questions from these docs. Reference: [User Guide §17](docs/USER_GUIDE.md#17-player-footer), [§18](docs/USER_GUIDE.md#18-processing-log) and [§32](docs/USER_GUIDE.md#32-admin-module-and-assistant-key-apis).
+The footer is on every tab with transport, a seek bar, volume and download. A track menu key opens every audio action for the loaded track, grouped, with a row per stem that sends that stem to EDIT, the init slot, the inpaint slot or the Chimera stack. The action key beside it changes with the tab — CREATE, EDIT, TRAIN, MIX, DJ — showing a progress fill while the job runs and cancelling it on a second press. Repeat is off, all or one; an output picker chooses the audio device; a Master FX chip is reachable from any tab; Ctrl+S saves the project.
+
+Status notices go to the processing log and to the assistant orb's speech bubble. The log keeps the last 500 entries, filters to errors only, and carries a live GPU, VRAM, CPU and RAM readout. The assistant orb streams chat from any configured provider (Claude Code over the CLI, Gemini, Anthropic, OpenAI, Grok, Groq, OpenRouter, Ollama, LM Studio, llama.cpp, vLLM), accepts attachments, and answers questions from these docs. Reference: [User Guide §17](docs/USER_GUIDE.md#17-player-footer), [§18](docs/USER_GUIDE.md#18-processing-log) and [§32](docs/USER_GUIDE.md#32-admin-module-and-assistant-key-apis).
 
 ---
 

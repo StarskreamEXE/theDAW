@@ -6,6 +6,187 @@ by build, test, or observed behaviour.
 
 Newest first.
 
+## 2026-09-15
+
+### Magenta RealTime 2 loads on one card (verified by build + tests; measured on a 2080 Ti)
+
+- **bf16 parameters.** `mrt2_base` was loading its parameters in fp32 and
+  asking JAX for 75% of the card up front, which put it out of reach of an
+  11 GB card whatever else was running. The loader now converts to bf16 and
+  takes no arena up front: 4.68 GiB resident, about 0.8x realtime on one
+  2080 Ti.
+- **A load that runs out of memory retries** with a growing arena instead of
+  dying, and the failure message measures the card rather than repeating the
+  allocator's error.
+- **A model one card cannot hold splits across every GPU in the machine.**
+  Two cards hold it at 2.38 GiB each, at 0.33x realtime.
+
+### The boot screen (verified by build; live check pending)
+
+- The particle sequence *is* the boot screen. Particles gather into the
+  wordmark, and the GANTASMO credit lands once the word has formed.
+
+### Footer and status
+
+- **TRAIN starts a run from the last run's settings**, so the footer action
+  key does something when nothing is in flight.
+- **A pitch bend lane** under the piano roll, with a semitone range and LINE,
+  HOLD and CURVE point shapes: a bend can be drawn as well as played.
+- **The action keys are their word and the transport is its icons.** IMPORT
+  and Recent keep their own.
+- A status notice sits against the orb and never covers the scrub strip.
+  ArrowUp on the track menu key lands on the last row.
+- MASTER FX, METAMORPH and the automation lanes open under their own keys.
+- ffprobe output is read as UTF-8, so a song with an accent in its tags
+  analyses instead of failing on the decode.
+
+## 2026-09-14
+
+### Every status message reaches the LOG and the orb (verified by tests)
+
+- Status notices go to the processing log **and** the assistant orb's speech
+  bubble, so nothing that happens is only visible for a second.
+- Backend `WARNING` lines count as warnings, not errors, in the log's
+  errors-only filter. A MIDI conversion reports progress instead of sitting
+  silent for the 94 seconds basic-pitch takes to load.
+
+### The MIDI dock (verified by tests; live check pending)
+
+- An icon rail with `DockTip` hover labels, 12px text, a 34px settings strip
+  and a 36px SHAPE row.
+- Pitch bend in the roll model, in MIDI import and export, in playback, in
+  the arpeggiator and in Vocal2MIDI.
+- The three-dots footer key opens every audio action for the loaded track,
+  grouped, with a row per stem.
+- The song box lists library songs, so MATCH can pick one.
+
+### Notation
+
+- Notes read from a MIDI file stay at the second they sound.
+- A band score lays every stem out on the song's beat grid.
+- Sheets print the tempo as a whole number and still play the measured tempo.
+- opus, mp3, flac, m4a and float WAV reach aubio and read the tempo a PCM WAV
+  reads.
+
+### Contrast
+
+- Context-menu titles, headers and hints read on every theme.
+- The rhyme web, section heads and SING export menu are opaque on every theme.
+- The `?` search finds METER MAP, METER, STUDY, WEB, the Asset Library,
+  Inputs & outputs and the EXPORT menu.
+- A lane with no FX chain keeps one stable empty chain, so the EDIT rack
+  opens on MIDI lanes.
+
+## 2026-09-13
+
+### The piano roll grows a meter map (verified by build + tests)
+
+- **A meter map per roll**: a time signature that changes across one piece,
+  additive groupings (`7/8 = 2+2+3`), bar arithmetic, MIDI signature events,
+  and a pickup bar before the first full bar.
+- **Polymeter lanes**, each with its own meter, denominator and loop length
+  against the same clock.
+- **MATCH** pulls a song's meter map, tempo and lanes out of its rhythm
+  analysis. **GEN** writes LOOM's generators, gates, swing and accel as
+  piano-roll notes. The METER face on the SHAPE row edits a meter per song
+  section.
+- Virtuoso transforms follow the meter map, with SYNC and ACCENT alongside
+  them. The rhythm engine's metrical weights and syncopation scores draw on
+  the grid.
+- Meters and lanes survive a bounce to EDIT, a reopen in the roll, and a
+  project save. Meter writes and length edits end the roll on a bar line, and
+  a short import or a clip load never leaves it mid-bar.
+- One settings strip, a left action rail, and the SHAPE row under the roll.
+
+### theDAW remembers the paths it writes (verified by build + tests)
+
+- Every path the app installs, saves, downloads or opens is registered.
+  Pickers open where that kind of file last went, a Recent list hands the
+  file back, and Show in Folder opens the file manager. Saving goes through
+  the native Save As dialog.
+- **Serving is vouched for**: only files theDAW registered are served, saves
+  are granted by nonce, the launch token stays out of child processes, and
+  theDAW's own folders stay out of the user's pickers. Model folders open
+  without the token and `uv sync` stays off it.
+
+### SWAY
+
+- Custom scenes first, no icon before the wordmark, and one header when the
+  cockpit is carrying theDAW's controls.
+- Gantasmo songs first, the **Audima Labs Sway** by name, Orbitron and bold
+  sans, and no bundle patches.
+- The Will I Dream template plays theDAW's own shipped copy of its song.
+- The VJ and SWAY embed builds revalidate on every load, so a restaged
+  cockpit reaches a browser that cached the old one.
+
+### One play key
+
+- A single play key leads EDIT, PERFORM, LOOM, NODEFI, MIX, MAKE, the effect
+  bar, SEQUENCE, SCORE, SING and DETAILS, always first at the left.
+- Download and more sit before the volume, Fullscreen moved to the top bar,
+  and the assistant stays pinned bottom-left until its first click.
+- The assistant's sign is Orbitron at 12px.
+
+## 2026-09-12
+
+### An asset library (verified by build + tests)
+
+- A searchable library of downloadable projects, plugins, volumetric captures
+  and cockpit scenes, each with one button that installs it and opens it.
+- The lineage graphs fill the LEARN panel at every window scale.
+
+### One global input and output menu
+
+- Six global slots for audio, MIDI and visuals, with per-surface overrides.
+- A key icon on every field that takes a key. A Sponsor row in the app menu,
+  and GitHub's own funding button.
+
+### Files reach every surface
+
+- Audio dropped from the desktop lands wherever a library track can be
+  dropped. Right-click a lane in EDIT to add audio or MIDI from the library
+  or from a file. Import a folder from the toolbar.
+- The DETAILS right column is the full library and takes desktop drops.
+  METER MAP runs the rhythm engine on a song on demand and exports the result.
+- One shared sort order across the library, a drop intent for library lists,
+  and three repeat modes.
+- SCORE exports any part to any format, from either engraver.
+
+### Diagnosis instead of a status code
+
+- The failing hop is named for model status, SWAY, VJ, the Hugging Face hub
+  and the microphone, in place of `HTTP 502` and bare errnos. Port preflight
+  says which program holds port 8600.
+- The backend is reached at `127.0.0.1`, never `localhost`.
+- The Foundry pads stay out of an isolated renderer in every runtime.
+  Plugin runtimes publish atomically and the bundled plugins build on first
+  start; the Owl ships its artwork.
+- The desktop app installs to Program Files and still starts, and relocating
+  the writable data tree moves all of it, not just the library.
+- The frontend test runner discovers every suite instead of chaining them by
+  hand. Nine suites had been orphaned by the hand-maintained chain.
+- **v0.1.8 and v0.1.9** released.
+
+## 2026-09-11
+
+### Meter maps for metamorphic meter (verified by 26 tests)
+
+- The rhythm engine reads a time signature per segment, tempo curves with
+  change points, per-bar syncopation and swing, polymeter per layer and
+  cross-rhythms, at the tatum rather than the beat.
+
+### The footer redesign
+
+- The scrub strip along the top edge, a smaller play disc, one uncramped row,
+  a matte transport plate and an uncovered PANELS strip.
+- The orb loses its disc; footer keys and CREATE take the theme's accent.
+- One global IMPORT button in the header, on every tab.
+- One EXPORT menu in SCORE replaces the toolbar's row of export buttons. PDF
+  is OSMD-only, Space activates the links, the hint is live, and focus
+  returns where it came from.
+- `.gan` artwork reopens from the archive, and bundles are written
+  atomically.
+
 ## 2026-09-07
 
 ### LOOM v3 — colony mode (verified by build + tests; live check pending)
