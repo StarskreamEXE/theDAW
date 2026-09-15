@@ -89,6 +89,8 @@ def _probe_packages(python_exe: Path) -> dict:
             [str(python_exe), "-c", script],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
             env=child_env(),
         )
@@ -195,6 +197,8 @@ def _bootstrap_sidecar_venv(cfg: SidecarConfig) -> dict:
             ["uv", "venv", str(venv_dir), "--python", sys.executable, "--seed"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=180,
             env=child_env(),
         )
@@ -208,6 +212,8 @@ def _bootstrap_sidecar_venv(cfg: SidecarConfig) -> dict:
             [sys.executable, "-m", "venv", str(venv_dir)],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=180,
             env=child_env(),
         )
@@ -667,6 +673,8 @@ def _stems_install_cmd(python_exe: Path, req: Path) -> tuple[list[str], str]:
             ["uv", "--version"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             env=child_env(),
         )
@@ -683,6 +691,8 @@ def _stems_install_cmd(python_exe: Path, req: Path) -> tuple[list[str], str]:
         [str(python_exe), "-c", "import pip"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=15,
         env=child_env(),
     )
@@ -692,6 +702,8 @@ def _stems_install_cmd(python_exe: Path, req: Path) -> tuple[list[str], str]:
         [str(python_exe), "-m", "ensurepip", "--upgrade", "--default-pip"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=120,
         env=child_env(),
     )
@@ -903,6 +915,8 @@ def install_dependencies(cfg: Optional[SidecarConfig] = None) -> dict:
             argv,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=15 * 60,
             env=child_env(),
         )

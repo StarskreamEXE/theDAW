@@ -3,6 +3,12 @@
 Returns the parsed JSON dict on success, or ``{}`` if ffprobe is missing
 or the file can't be probed. Never raises — callers treat ffprobe data
 as best-effort enrichment.
+
+ffprobe writes its JSON as UTF-8, so the run names that encoding. Without it
+CPython decodes the child's bytes with the Windows ANSI codepage and one byte
+outside cp1252 — a title tag, an artist name, a path — raises UnicodeDecodeError
+inside ``subprocess.run``, which is a ValueError and so escaped the except below
+and reached the request as a 500.
 """
 
 from __future__ import annotations
@@ -64,11 +70,13 @@ def probe_file(path: Path, timeout_sec: float = 20.0) -> dict[str, Any]:
             check=False,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout_sec,
             stdin=subprocess.DEVNULL,
             env=child_env(),
         )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, ValueError) as e:
         log.info("analysis.ffprobe: probe failed for %s: %s", p.name, e)
         return {}
     if result.returncode != 0:
@@ -76,12 +84,21 @@ def probe_file(path: Path, timeout_sec: float = 20.0) -> dict[str, Any]:
             "analysis.ffprobe: ffprobe returned %d for %s: %s",
             result.returncode,
             p.name,
-            result.stderr.strip()[:200],
+            (result.stderr or "").strip()[:200],
         )
+        return {}
+    # A zero exit with nothing on stdout is a probe that produced no metadata.
+    # json.loads on that raised TypeError, which no caller expects from a
+    # function documented never to raise.
+    if not result.stdout:
+        log.info("analysis.ffprobe: ffprobe printed no metadata for %s", p.name)
         return {}
     try:
         payload = json.loads(result.stdout)
-    except json.JSONDecodeError:
+    except (ValueError, TypeError):
+        log.info("analysis.ffprobe: ffprobe printed unreadable metadata for %s", p.name)
+        return {}
+    if not isinstance(payload, dict):
         return {}
 
     payload["_summary"] = _summarize(payload)

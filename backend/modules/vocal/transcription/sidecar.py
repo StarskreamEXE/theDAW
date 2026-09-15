@@ -144,6 +144,8 @@ def _probe_packages(
             [str(python_exe), "-c", script],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
             env=child_env(),
         )
@@ -220,6 +222,8 @@ def _bootstrap_venv(cfg: WhisperConfig) -> dict:
             ["uv", "venv", str(venv_dir), "--python", sys.executable, "--seed"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=180,
             env=child_env(),
         )
@@ -232,6 +236,8 @@ def _bootstrap_venv(cfg: WhisperConfig) -> dict:
             [sys.executable, "-m", "venv", str(venv_dir)],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=180,
             env=child_env(),
         )
@@ -253,6 +259,8 @@ def _install_cmd(python_exe: Path, req: Path) -> tuple[list[str], str]:
             ["uv", "--version"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             env=child_env(),
         )
@@ -289,6 +297,8 @@ def install_dependencies(cfg: Optional[WhisperConfig] = None) -> dict:
             argv,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=_INSTALL_TIMEOUT_SEC,
             env=child_env(),
         )
@@ -319,6 +329,8 @@ def install_cuda_libs(cfg: Optional[WhisperConfig] = None) -> dict:
             argv,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=_INSTALL_TIMEOUT_SEC,
             env=child_env(),
         )
@@ -365,6 +377,8 @@ def cuda_lib_dirs(python_exe: Path) -> list[str]:
             [str(python_exe), "-c", script],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
             env=child_env(),
         )
