@@ -25,6 +25,7 @@ import {
   createRecordingEngine,
   levelFrame,
   mergeChunks,
+  micConstraints,
   takeClipPlacement,
   type LevelFrame,
   type MediaRecorderLike,
@@ -75,6 +76,38 @@ const near = (a: number, b: number, msg: string): void => {
     micList,
     'the engine\'s mime preference order must equal MicRecorder\'s, in order',
   );
+}
+
+// micConstraints: the memo profile by default (MicRecorder's), the MUSICAL one
+// on request. A host recording a performance has to be able to turn the three
+// speech processors OFF — AGC alone rides a crescendo flat — and the device id
+// stays a SOFT constraint in both profiles.
+{
+  const audioOf = (c: MediaStreamConstraints): Record<string, unknown> =>
+    c.audio as unknown as Record<string, unknown>;
+
+  const memo = audioOf(micConstraints());
+  assert.equal(memo.echoCancellation, true);
+  assert.equal(memo.noiseSuppression, true);
+  assert.equal(memo.autoGainControl, true);
+  assert.equal('deviceId' in memo, false, 'no device id asked for is no deviceId key');
+
+  // The bare-string form is the device id, which is what openGroup passes.
+  const memoDev = audioOf(micConstraints('mic-7'));
+  assert.equal(memoDev.deviceId, 'mic-7');
+  assert.equal(memoDev.autoGainControl, true, 'the default profile is unchanged by the options form');
+
+  const musical = audioOf(micConstraints({ musical: true }));
+  assert.equal(musical.echoCancellation, false);
+  assert.equal(musical.noiseSuppression, false);
+  assert.equal(musical.autoGainControl, false);
+
+  const musicalDev = audioOf(micConstraints({ deviceId: 'mic-7', musical: true }));
+  assert.equal(musicalDev.deviceId, 'mic-7', 'the device id survives the musical profile');
+  assert.equal(musicalDev.noiseSuppression, false);
+
+  // `{ musical: false }` is the memo profile spelled out, not a third thing.
+  assert.deepEqual(audioOf(micConstraints({ musical: false })), memo);
 }
 
 // mergeChunks is the blob assembly MicRecorder does in its own onstop.

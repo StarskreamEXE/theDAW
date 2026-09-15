@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { createPortal, flushSync } from 'react-dom';
 import {
   Scissors, Play, Square, ZoomIn, ZoomOut,
@@ -22,7 +22,7 @@ import { decodeClipBlob } from '../../lib/decodeCache';
 import { type FadeCurve } from '../../lib/clipFade';
 import {
   BOUNCE_SAMPLE_RATE, encodeBounce, renderBounce, renderExtentSec,
-  type BounceRequest, type BounceScope, type RenderDeps,
+  type BounceRequest, type RenderDeps,
 } from '../../lib/renderCore';
 import { crossfadeRegions } from '../../lib/crossfade';
 import {
@@ -38,13 +38,19 @@ import { ownsKey } from '../../lib/keyScope';
 import { encodeWav } from '../../lib/wavEncode';
 import type { AudioDragItem } from '../../lib/audioDnD';
 import { useExternalDragStore } from '../../state/externalDragStore';
-import { useEditorStore, beginUndoStep, computePeaks, freezeSignature, sampleLane, automationTargetKey, clipPeakGain, clipSourceSpanSec, clipStretchRate, snapStepSec, SNAP_DIVISIONS, TRACK_HEIGHT_MIN, TRACK_HEIGHT_MAX, type AudioClip, type EditorTrack, type SnapDivision, type AutomationTarget, type AutomationLane as AutomationLaneT, type TimelineMarker } from '../../state/editorStore';
+import { useEditorStore, automationLaneFeed, beginUndoStep, computePeaks, freezeSignature, sampleLane, automationTargetKey, clipPeakGain, clipSourceSpanSec, clipStretchRate, snapStepSec, SNAP_DIVISIONS, TRACK_HEIGHT_MIN, TRACK_HEIGHT_MAX, type AudioClip, type EditorTrack, type SnapDivision, type AutomationTarget, type AutomationLane as AutomationLaneT, type TimelineMarker } from '../../state/editorStore';
 import { AUTOMATION_MODES, holdsAfterRelease, type AutomationMode } from '../../lib/automationModes';
+import { createAutomationGesture, type AutomationGesture } from '../../lib/automationGesture';
 import { useLibraryStore, type LibraryEntry } from '../../state/libraryStore';
 import { LIBRARY_ID_MIME, dropHasLibraryOrFiles, entriesFromDrop } from '../../lib/libraryDrop';
 import { useVstStore } from '../../state/vstStore';
+import {
+  bounceIsChunkSafe, useRenderJobs,
+  type RenderJob, type RenderJobKind, type RenderJobResult, type RenderJobSeed,
+} from '../../state/renderJobs';
+import { useAppUiStore } from '../../state/appUiStore';
 import { useVstEditorStore } from '../../state/vstEditorStore';
-import type { ChainEntry } from '../../state/effectChainStore';
+import type { ChainEntry, VstNode } from '../../state/effectChainStore';
 import type { Vst3PluginInfo } from '../../lib/vstClient';
 import { getEngineCtx, getMasterGain, usePlayerStore } from '../../state/playerStore';
 import { usePianoRollStore } from '../../state/pianoRollStore';
@@ -87,6 +93,8 @@ import { browserPopoverEnv, popoverMaxHeight, sameLayout, watchPopover, type Pop
 import { useTrackFxRackStore, type TrackFxRackAnchor } from '../../state/trackFxRackStore';
 import { ensureStems } from '../../lib/djStems';
 import { useFeatureToggleStore } from '../../state/featureToggleStore';
+import { useRecordingStore, type RecordingStatus } from '../../state/recordingStore';
+import type { LevelFrame } from '../../lib/recordingEngine';
 import { SurfaceAudio } from './IoDeviceSelect';
 
 const TRACK_HEADER_PX = 180;
@@ -208,6 +216,663 @@ const cropAudioBlob = async (
   } finally {
     tmpCtx.close().catch(() => {});
   }
+};
+
+/* ────────────────────────────────────────────────────────────────────────────
+   THE RENDER QUEUE BRIDGE (T11c-b)
+
+   Every offline render the timeline starts is a JOB on `state/renderJobs` now,
+   not an inline `await` behind a local boolean. What lives here is the half of
+   that the queue cannot own:
+
+     - the three REQUEST BUILDERS, one per renderer, each still carrying exactly
+       the fidelity flags `lib/renderCore`'s header assigns it. They are exported
+       so `state/renderJobs.test.ts` can pin them: moving a render behind a queue
+       must not move a single flag;
+     - `runRenderJob`, the switch the app's one runner is started with. It
+       performs the render AND the consumer work that used to sit after the
+       `await` in each callback — the library import, the Save As, the Init
+       hand-off, `freezeTrack`, `setFrozenMaster`.
+
+   ONE PATTERN, ALL THREE: the consumer work lives in `run`, never in the caller.
+   The callbacks in the component build a request, enqueue, and return, so a
+   render survives EDIT unmounting and a second press queues instead of racing.
+   The two places that must hold the rendered audio to carry on — the master VST
+   freeze, and `enterFrozenMode` behind it — `enqueueAndWait` and read the
+   settled job. The alternative the plan offered, an `onDone` closure carried on
+   the job, was not taken: a job holding a callback cannot be inspected, logged
+   or replayed, and the store would then own a field it can neither type nor
+   bound.
+
+   WHY THIS IS MODULE-LEVEL. The runner is started once for the app's life (see
+   `App.tsx`) and EDIT unmounts on every tab switch, so anything `run` reaches
+   for has to be reachable with this component unmounted: the stores through
+   `getState()`, and nothing at all through props or hooks.
+
+   WHAT IS NOT ON THE QUEUE, and why:
+     - the step sequencer's pattern print — it keeps its own `isBouncing`; the
+       `pattern` kind exists in the store but nothing enqueues one yet;
+     - the Metamorph granular bleed (`isBleeding`) — it is a `morphEngine`
+       render, not a `renderCore` bounce, so it has no `BounceRequest` to put on
+       a job and no kind to put it under;
+     - `cropAudioBlob` above — a one-clip crop for an inpaint upload, not a
+       timeline bounce: no scope, no fidelity flags, nothing to report progress
+       against.
+──────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * The seven fields `lib/renderCore` reads for a bounce: the document, and the
+ * three real implementations it will not reach for itself (the shared decode
+ * cache, the rack builder, the live mixer's per-clip scheduler — the same one
+ * playback uses, which is what keeps a bounce and a preview the same audio).
+ *
+ * Read from the store when the JOB RUNS, not when it was enqueued: a job that
+ * waited behind another renders the document it actually starts against.
+ */
+const currentRenderDeps = (): RenderDeps => {
+  const st = useEditorStore.getState();
+  return {
+    clips: st.clips,
+    tracks: st.tracks,
+    masterFxChain: st.masterFxChain,
+    automationLanes: st.automationLanes,
+    decode: decodeClipBlob,
+    buildChain: buildEffectChain,
+    scheduleSources: liveMixer.scheduleClipSources,
+  };
+};
+
+/** COMMIT EDIT's bounce, and the master half of a VST freeze. Everything: the
+ *  master rack and every track's rack, the automation lanes, mute AND solo. */
+export const mixdownRequest = (): BounceRequest => ({
+  scope: { kind: 'master' },
+  sampleRate: BOUNCE_SAMPLE_RATE,
+  includeFx: true,
+  includeAutomation: true,
+  includeTrackMix: true,
+  float32: false,
+});
+
+/** Send Selection to Init. No inserts and no automation, but the track mix DOES
+ *  apply — a mashup sent to Init should sound like what the user balanced on the
+ *  timeline. Solo is ignored: this bounces exactly what was selected. */
+export const selectionRequest = (clipIds: string[]): BounceRequest => ({
+  scope: { kind: 'selection', clipIds },
+  sampleRate: BOUNCE_SAMPLE_RATE,
+  includeFx: false,
+  includeAutomation: false,
+  includeTrackMix: true,
+  float32: false,
+});
+
+/**
+ * A track stem: the track's RAW audio through its own rack — no automation, and
+ * no track volume / pan / mute / solo, because the timeline plays the printed
+ * stem back through the fader it was already going through. Hosted VST3 entries
+ * are stripped by the core and applied on the backend after.
+ *
+ * `/api/vst/process-file` answers in float precisely so a chain does not
+ * requantize between stages; encoding the input at 16 bits would put the loss
+ * back at every hop. With no plugins the stem goes straight to the timeline,
+ * where 16-bit at half the size is the right answer.
+ */
+export const stemRequest = (trackId: string, hasHostedVsts: boolean): BounceRequest => ({
+  scope: { kind: 'track', trackId },
+  sampleRate: BOUNCE_SAMPLE_RATE,
+  includeFx: true,
+  includeAutomation: false,
+  includeTrackMix: false,
+  float32: hasHostedVsts,
+});
+
+/** The filename a mixdown lands under. A `mixdown` job's `label` IS this name —
+ *  the runner reads it back to import and save — so the jobs pill says exactly
+ *  what is being written. */
+const mixdownTitle = (typed: string): string => {
+  const trimmed = typed.trim();
+  if (trimmed) return trimmed.endsWith('.wav') ? trimmed : `${trimmed}.wav`;
+  return `mixdown_${String(Date.now()).slice(-6)}.wav`;
+};
+
+/** Attach the chunk-safety verdict for THIS request against the document it will
+ *  render. The runner does not chunk (that is T11d, gated on this), but the jobs
+ *  pill has to know whether a progress number is even possible before it shows
+ *  an empty bar and calls it "0%". */
+const bounceSeed = (
+  seed: Omit<RenderJobSeed, 'chunkable' | 'chunkReasons'>,
+): RenderJobSeed => {
+  const st = useEditorStore.getState();
+  const { safe, reasons } = bounceIsChunkSafe(seed.request, st.tracks, st.masterFxChain);
+  return { ...seed, chunkable: safe, chunkReasons: reasons };
+};
+
+const enqueueBounce = (seed: Omit<RenderJobSeed, 'chunkable' | 'chunkReasons'>): string =>
+  useRenderJobs.getState().enqueue(bounceSeed(seed));
+
+const enqueueBounceAndWait = (
+  seed: Omit<RenderJobSeed, 'chunkable' | 'chunkReasons'>,
+): Promise<RenderJob> => useRenderJobs.getState().enqueueAndWait(bounceSeed(seed));
+
+/** What each kind is called, for the pill and for a failure notice. */
+const JOB_NOUN: Record<RenderJobKind, string> = {
+  mixdown: 'Mixdown',
+  selection: 'Selection bounce',
+  stem: 'Track stem',
+  freeze: 'Freeze',
+  pattern: 'Pattern print',
+};
+
+/**
+ * Which kinds have stages a cancel can be noticed BETWEEN. A single
+ * `OfflineAudioContext.startRendering()` exposes no checkpoint and no abort, so
+ * a running mixdown or selection bounce cannot be stopped — only a queued one.
+ * The freeze/stem flows hop through the backend one plugin at a time and check
+ * between hops, so cancelling one of those really does stop it.
+ */
+const STAGED_KINDS: readonly RenderJobKind[] = ['stem', 'freeze'];
+
+/** One `/api/vst/process-file` hop. The stem and the frozen master both print
+ *  their plugin chain this way, in signal-chain order, one call per node. */
+const processThroughVst = async (file: File, vst: VstNode, name: string): Promise<File> => {
+  const form = new FormData();
+  form.append('audio', file);
+  form.append('plugin_path', vst.plugin_path);
+  form.append('params', '{}');
+  // The captured plugin state. Without it every plugin rendered at its factory
+  // defaults, silently discarding whatever the user dialled in through the
+  // plugin's native GUI.
+  if (vst.raw_state) form.append('raw_state', vst.raw_state);
+  const res = await fetch('/api/vst/process-file', { method: 'POST', body: form });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const j = (await res.json()) as { detail?: string };
+      if (j.detail) detail = j.detail;
+    } catch { /* non-JSON */ }
+    throw new Error(detail);
+  }
+  return new File([await res.blob()], name, { type: 'audio/wav' });
+};
+
+/** COMMIT EDIT, end to end: the full-fidelity master bounce, then the library
+ *  entry and the Save As that used to follow the `await` in `commitEdit`. */
+const runMixdownJob = async (
+  job: RenderJob,
+  isCancelled: () => boolean,
+): Promise<RenderJobResult> => {
+  const st = useEditorStore.getState();
+  const start = performance.now();
+  logInfo('editor', `Mixing ${st.clips.length} clips on ${st.tracks.length} tracks…`);
+  const rendered = await renderBounce(job.request, currentRenderDeps());
+  const blob = encodeBounce(rendered, job.request);
+  // Called off while the context was rendering. Nothing has been written yet,
+  // so stopping here really does stop it — the buffer is simply dropped.
+  if (isCancelled()) return {};
+  const title = job.label;
+  await useLibraryStore.getState().importEntry({
+    blob,
+    filename: title,
+    mimeType: 'audio/wav',
+    metadata: {
+      title,
+      prompt: `Editor mixdown of ${st.clips.length} clips`,
+      model: 'editor-mixdown',
+      duration: rendered.duration,
+      source: 'studio',
+      tags: ['mixdown'],
+    },
+  });
+  // Also put the file on disk. Save As opens in the folder last used for audio;
+  // not awaited, so the queue moves on to the next job while the dialog is up.
+  void saveFile({ blob, suggestedName: title.replace(/[<>:"/\\|?*]/g, '_'), kind: 'audio' });
+  const ms = (performance.now() - start).toFixed(0);
+  logInfo('editor', `Mixdown complete: ${rendered.duration.toFixed(2)}s rendered in ${ms}ms → library + save`);
+  return { blob, durationSec: rendered.duration };
+};
+
+/** Send Selection to Init: bounce the picked clips, hand the file to MAKE's
+ *  params store, and show MAKE. */
+const runSelectionJob = async (
+  job: RenderJob,
+  isCancelled: () => boolean,
+): Promise<RenderJobResult> => {
+  const { scope } = job.request;
+  const ids = scope.kind === 'selection' ? scope.clipIds : [];
+  const rendered = await renderBounce(job.request, currentRenderDeps());
+  const blob = encodeBounce(rendered, job.request);
+  if (isCancelled()) return {};
+  // Resolved AFTER the render, from the same document `renderBounce` just read,
+  // so the labels describe what was actually bounced rather than what was
+  // selected when the button was pressed.
+  const clips = useEditorStore.getState().clips;
+  const selected = ids
+    .map((id) => clips.find((c) => c.id === id))
+    .filter((c): c is AudioClip => !!c);
+  const count = selected.length;
+  const mixDur = rendered.duration;
+  const fileName = count === 1
+    ? `editor-clip-${Date.now()}.wav`
+    : `editor-mashup-${count}clips-${Date.now()}.wav`;
+  const summary = count === 1
+    ? `Editor clip · ${mixDur.toFixed(2)}s`
+    : `Editor mashup · ${count} clips · ${mixDur.toFixed(2)}s`;
+  useGenerateParamsStore.getState().patch({
+    initAudioFile: new File([blob], fileName, { type: 'audio/wav' }),
+    initAudioEnabled: true,
+    initAudioSourceLabel: summary,
+    initAudioSourceClipLabels: selected.map((c) => c.label),
+  });
+  logInfo('editor', `Selection mashup sent to Init (${count} clip${count === 1 ? '' : 's'}, ${mixDur.toFixed(2)}s).`);
+  // The same store action the `onSwitchTab` prop resolves to (Shell hands
+  // DAWCenterPanel `navigateTo`); reached directly because a module-level run
+  // function has no props.
+  useAppUiStore.getState().navigateTo('create');
+  return { blob, durationSec: mixDur };
+};
+
+/**
+ * A freeze, master or per-track — structurally one thing: bounce offline, print
+ * the hosted VST3 chain on the backend one plugin at a time, then apply.
+ *
+ * `job.trackId` is what tells them apart. With one, this is a track freeze: the
+ * stem's own rack, a peaks pass, and `freezeTrack`. Without one, it is the
+ * master VST freeze: the full-fidelity master bounce through the master VST
+ * chain into `frozenMaster`.
+ *
+ * `apply` is false for a bare `stem` job — the render and the print happen, the
+ * timeline is not touched — which is the only difference between the two kinds.
+ *
+ * STAGES: 1 (the offline bounce) + one per plugin + 1 for the peaks pass a
+ * printed stem needs. Those are the checkpoints a cancel is noticed at, and the
+ * only real progress any render in this app can report (see `renderJobs`).
+ */
+const runStemJob = async (
+  job: RenderJob,
+  onProgress: (stage: number, total: number) => void,
+  isCancelled: () => boolean,
+  apply: boolean,
+): Promise<RenderJobResult> => {
+  const st = useEditorStore.getState();
+  const { trackId } = job;
+  const isTrack = trackId !== undefined;
+  const chain = isTrack
+    ? (st.tracks.find((t) => t.id === trackId)?.fxChain ?? [])
+      .filter((e) => e.enabled && e.effect === 'vst3' && e.vst)
+    : st.masterVstChain.filter((e) => e.enabled && e.vst);
+  // The request is REBUILT from the chain resolved just now, not taken as it
+  // was enqueued. `float32` is the one field that depends on the plugin chain,
+  // and a queued job can sit through the user adding a VST3 to the track —
+  // encoding that stem at 16 bits ahead of a backend hop would quantize it once
+  // for nothing. Rebuilt through the same tested builder the caller used, so
+  // the rule lives in exactly one place. The master branch is untouched: its
+  // bounce was always 16-bit and changing that would change fidelity.
+  const request = isTrack ? stemRequest(trackId, chain.length > 0) : job.request;
+  const total = 1 + chain.length + (isTrack ? 1 : 0);
+  let stage = 0;
+  const step = (): void => { stage += 1; onProgress(stage, total); };
+
+  // The freeze signature is taken HERE rather than at enqueue: the queue may
+  // have held this job, and what the frozen master is a render OF is the
+  // document the bounce below is about to read.
+  const sig = isTrack ? '' : freezeSignature({
+    clips: st.clips,
+    tracks: st.tracks,
+    masterFxChain: st.masterFxChain,
+    masterVstChain: st.masterVstChain,
+    bpm: st.bpm,
+  });
+  // Measured from the SAME snapshot the bounce below reads, as the stem
+  // renderer always did. The master branch reports the rendered buffer's own
+  // duration instead and never looks at this.
+  const durationSec = isTrack ? renderExtentSec(st.clips, request.scope) : 0;
+
+  // A track freeze replaces what the transport is playing, so it stops first.
+  // The master freeze does not: re-rendering a stale frozen master while the
+  // live mix plays is a normal thing to do, and it never did stop it.
+  if (isTrack) usePlayerStore.getState().stop();
+
+  const rendered = await renderBounce(request, currentRenderDeps());
+  const fileName = isTrack ? 'track-stem.wav' : 'edit-master.wav';
+  let file = new File([encodeBounce(rendered, request)], fileName, { type: 'audio/wav' });
+  step();
+
+  for (const node of chain) {
+    if (isCancelled()) return {};
+    file = await processThroughVst(file, node.vst as VstNode, fileName);
+    step();
+  }
+
+  if (!isTrack) {
+    if (isCancelled()) return {};
+    if (apply) {
+      useEditorStore.getState().setFrozenMaster({ blob: file, sig });
+      logInfo('editor', `VST freeze rendered through ${chain.length} plugin(s).`);
+    }
+    return { blob: file, durationSec: rendered.duration };
+  }
+
+  const { peaks } = await computePeaks(file, 240);
+  step();
+  if (isCancelled()) return {};
+  if (apply) {
+    useEditorStore.getState().freezeTrack(trackId, { audioBlob: file, durationSec, peaks });
+    liveMixer.reactivate();
+    logInfo('editor', 'Track frozen — VST FX printed into the stem.');
+  }
+  return { blob: file, durationSec, peaks };
+};
+
+/**
+ * The app's one render runner runs THIS. Started in `App.tsx`, which reaches it
+ * through a dynamic import so mounting the runner does not drag the whole EDIT
+ * chunk into the first-paint bundle.
+ *
+ * A failure is toasted from here rather than from a subscription in the
+ * component, because EDIT unmounts on every tab switch and a render started
+ * from EDIT outlives it. The throw is re-raised either way, so the store still
+ * records the message on the job.
+ */
+export async function runRenderJob(
+  job: RenderJob,
+  onProgress: (stage: number, total: number) => void,
+  isCancelled: () => boolean,
+): Promise<RenderJobResult> {
+  try {
+    if (job.kind === 'mixdown') return await runMixdownJob(job, isCancelled);
+    if (job.kind === 'selection') return await runSelectionJob(job, isCancelled);
+    if (job.kind === 'stem' || job.kind === 'freeze') {
+      return await runStemJob(job, onProgress, isCancelled, job.kind === 'freeze');
+    }
+    throw new Error('the step sequencer prints its own patterns; they are not on the render queue');
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    if (!isCancelled()) {
+      logError('editor', `${job.label} failed: ${message}`);
+      requireFeature({
+        id: `render:failed:${job.kind}`,
+        kind: 'error',
+        title: `${JOB_NOUN[job.kind]} failed`,
+        message,
+        autoDismissMs: 10000,
+      });
+    }
+    throw e;
+  }
+}
+
+/**
+ * The jobs pill: what is rendering, how far in, how many are waiting, and the
+ * one honest cancel. Its own component so a progress tick re-renders 40px of
+ * toolbar rather than the whole timeline.
+ *
+ * The bar is INDETERMINATE unless a stage has actually reported — a single
+ * offline context has no progress to read, and drawing an empty bar labelled 0%
+ * would be an invention. When the store also knows the render could not have
+ * been chunked (`chunkable === false`), the bar says so on hover instead of
+ * leaving the user to wonder why it never moves.
+ */
+const RenderJobsPill: React.FC = () => {
+  const jobs = useRenderJobs((s) => s.jobs);
+  const cancel = useRenderJobs((s) => s.cancel);
+  const clearFinished = useRenderJobs((s) => s.clearFinished);
+
+  const active = jobs.find((j) => j.status === 'running');
+  const queued = jobs.filter((j) => j.status === 'queued');
+  const live = active ?? queued[0];
+  const finishedCount = jobs.length - queued.length - (active ? 1 : 0);
+  if (!live && finishedCount === 0) return null;
+
+  if (!live) {
+    return (
+      <div className="flex items-center gap-1.5 rounded border border-white/10 bg-black/40 px-2 py-0.5">
+        <span className="font-mono text-[9px] text-zinc-500 tabular-nums">
+          {finishedCount} render{finishedCount === 1 ? '' : 's'} finished
+        </span>
+        <button
+          type="button"
+          onClick={clearFinished}
+          aria-label="Clear finished renders"
+          title="Clear finished renders"
+          className="p-0.5 rounded text-zinc-500 hover:text-white hover:bg-white/10"
+        >
+          <X className="w-3 h-3" />
+        </button>
+      </div>
+    );
+  }
+
+  const determinate = live.progress > 0;
+  const unknowable = !determinate && live.chunkable === false;
+  const pending = active ? queued.length : queued.length - 1;
+  const cancellable = live.status === 'queued' || STAGED_KINDS.includes(live.kind);
+
+  return (
+    <div
+      aria-busy
+      className="flex items-center gap-1.5 rounded border border-purple-500/30 bg-purple-500/10 px-2 py-0.5"
+    >
+      <Loader2 className={`w-3 h-3 text-purple-300 ${active ? 'animate-spin' : 'opacity-50'}`} />
+      <span className="font-mono text-[9px] text-purple-100 max-w-32 truncate" title={live.label}>
+        {live.label}
+      </span>
+      <progress
+        id="render-progress"
+        aria-label={`${JOB_NOUN[live.kind]} progress`}
+        max={1}
+        {...(determinate ? { value: live.progress } : {})}
+        title={unknowable ? 'no progress available for this render' : undefined}
+        className="w-16 h-1 align-middle accent-purple-400"
+      />
+      {pending > 0 && (
+        // The active job is usually a single offline context and cannot be
+        // interrupted, so the queue needs its own way out: this takes the job
+        // off the BACK, which is what a double-pressed COMMIT EDIT put there.
+        <button
+          type="button"
+          onClick={() => cancel(queued[queued.length - 1].id)}
+          aria-label="Cancel the last queued render"
+          title="Cancel the render at the back of the queue"
+          className="font-mono text-[9px] text-purple-300/70 tabular-nums rounded px-1 hover:text-white hover:bg-white/10"
+        >
+          +{pending} queued
+        </button>
+      )}
+      <button
+        type="button"
+        onClick={() => cancel(live.id)}
+        disabled={!cancellable}
+        aria-label="Cancel render"
+        title={cancellable
+          ? 'Cancel this render'
+          : 'This render is one offline context — it cannot be interrupted once it has started'}
+        className="p-0.5 rounded text-purple-200 hover:text-white hover:bg-white/10 disabled:opacity-30"
+      >
+        <X className="w-3 h-3" />
+      </button>
+    </div>
+  );
+};
+
+/**
+ * A track's freeze button. Its own component because it reads only THIS track's
+ * job: a freeze on another track queues behind this one rather than blocking it,
+ * so the button has to stay live while an unrelated freeze runs — which the one
+ * shared `isFreezing` boolean could not express.
+ */
+const TrackFreezeButton: React.FC<{
+  trackId: string;
+  trackName: string;
+  frozen: boolean;
+  onFreeze: (trackId: string) => void;
+  onUnfreeze: (trackId: string) => void;
+}> = ({ trackId, trackName, frozen, onFreeze, onUnfreeze }) => {
+  const job = useRenderJobs((s) => s.jobs.find(
+    (j) => j.kind === 'freeze'
+      && j.trackId === trackId
+      && (j.status === 'queued' || j.status === 'running'),
+  ));
+  const running = job?.status === 'running';
+  const queued = job?.status === 'queued';
+  const label = frozen
+    ? `Unfreeze track ${trackName}`
+    : queued
+      ? `Freeze track ${trackName} — queued`
+      : `Freeze track ${trackName} to print VST FX`;
+  return (
+    <button
+      type="button"
+      onClick={() => (frozen ? onUnfreeze(trackId) : onFreeze(trackId))}
+      // One freeze per track at a time: a second would print the same stem.
+      disabled={!!job}
+      aria-label={label}
+      aria-pressed={frozen}
+      aria-busy={running || queued}
+      title={running
+        ? 'Freezing — printing the plugin chain'
+        : queued
+          ? 'Queued — waiting for the render ahead of it'
+          : frozen
+            ? 'Unfreeze (restore live clips + FX)'
+            : 'Freeze: print VST3/effects into audio so the plugin is audible'}
+      className={`w-4 h-4 rounded flex items-center justify-center border disabled:opacity-40 ${frozen ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/50' : 'bg-black/40 text-zinc-500 border-white/5 hover:text-white'}`}
+    >
+      {running ? (
+        <Loader2 className="w-2 h-2 animate-spin" />
+      ) : queued ? (
+        <Snowflake className="w-2 h-2 animate-pulse" />
+      ) : (
+        <Snowflake className="w-2 h-2" />
+      )}
+    </button>
+  );
+};
+
+/* -------------------------------------------------------------------------- */
+/*                      the track header's record controls                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The two narrow reads the record controls make of `recordingStore`, exported
+ * so `WaveformEditorRecordArm.test.ts` can pin their equality (the whole reason
+ * the meter is its own component — see there).
+ */
+export const selectRecordingStatus = (s: { status: RecordingStatus }): RecordingStatus => s.status;
+export const selectTrackLevel =
+  (trackId: string) =>
+  (s: { levels: Record<string, LevelFrame> }): LevelFrame | undefined =>
+    s.levels[trackId];
+
+/** Arming is the engine's between-passes business; locked for every live state. */
+export const armingLocked = (status: RecordingStatus): boolean => status !== 'idle';
+
+/** Why the arm dot is dead mid-pass. One string, so the title and the reason agree. */
+const ARMING_LOCKED_TITLE = 'Stop recording to change arming';
+
+/**
+ * The count-in announcement for the PASS. One region for the whole header
+ * column, mounted next to the track list rather than inside it.
+ *
+ * Per-track would mean N regions announcing N times for one count, none of them
+ * saying which track — and a count-in counts the pass in, not a track. The node
+ * is always in the accessibility tree and only its TEXT changes: a live region
+ * has to exist before the change for the change to be announced, and `sr-only`
+ * (clipped, not `display:none`) is what keeps it there while it is empty. The
+ * status moves to `counting` once per press, so that is one announcement per
+ * pass.
+ */
+const CountInAnnouncement: React.FC = () => {
+  const status = useRecordingStore(selectRecordingStatus);
+  return (
+    <span aria-live="polite" className="sr-only">
+      {status === 'counting' ? 'Count-in' : ''}
+    </span>
+  );
+};
+
+/**
+ * A track's record-arm dot, and the count-in chip beside it.
+ *
+ * Its own component for the same reason `TrackFreezeButton` is: it reads the
+ * recording status, and the editor must not. Arming is disabled while a pass is
+ * live because `recordingStore` mirrors the `armed` flags onto the engine as
+ * they flip, and the engine only opens and closes inputs BETWEEN passes — a
+ * track armed mid-take would have no recorder and would silently record
+ * nothing. The dot pulses while the take rolls, which is the one place in the
+ * header that says "this track is being recorded right now".
+ *
+ * The chip is `aria-hidden`: it is the eyes' copy of what
+ * `CountInAnnouncement` already said once for the pass. The locked reason is
+ * folded into the button's NAME as well as its `title`, the way the footer's
+ * RECORD key carries `RECORD_NEEDS_ARM` — a disabled control's tooltip never
+ * reaches a screen reader.
+ */
+const TrackArmButton: React.FC<{
+  trackName: string;
+  armed: boolean;
+  onToggle: () => void;
+}> = ({ trackName, armed, onToggle }) => {
+  const status = useRecordingStore(selectRecordingStatus);
+  const locked = armingLocked(status);
+  const counting = armed && status === 'counting';
+  return (
+    <>
+      <button
+        type="button"
+        onClick={onToggle}
+        disabled={locked}
+        aria-label={locked ? `${trackName} record arm — ${ARMING_LOCKED_TITLE}` : `${trackName} record arm`}
+        aria-pressed={armed}
+        title={locked ? ARMING_LOCKED_TITLE : 'Arm for recording'}
+        className={`w-4 h-4 rounded-full flex items-center justify-center border disabled:opacity-40 ${armed ? 'bg-red-500/30 text-red-400 border-red-500/60' : 'bg-black/40 text-zinc-500 border-white/10 hover:text-white'}`}
+      >
+        <Circle
+          className={`w-2 h-2 ${armed ? 'fill-red-500' : ''} ${armed && status === 'recording' ? 'animate-pulse' : ''}`}
+        />
+      </button>
+      {counting && (
+        <span
+          aria-hidden="true"
+          className="font-mono text-[8px] uppercase tracking-wider text-red-400 shrink-0"
+        >
+          count-in
+        </span>
+      )}
+    </>
+  );
+};
+
+/**
+ * The take meter for ONE armed track, live for the length of a pass.
+ *
+ * Shape borrowed from the confidence meter in `sing/LyricAnalysisPane.tsx` (a
+ * `role="meter"` strip over a `bg-white/10` groove) and the colours from the arm
+ * dot right above it: an RMS fill for the body of the signal and a thin peak
+ * tick, so a take that is clipping reads before the fill catches up.
+ *
+ * `levels[trackId]` is the only thing it subscribes to, so the twenty writes a
+ * second `recordingStore` makes during a pass re-render this strip and nothing
+ * else — not the other tracks' strips, not the header, not the timeline.
+ */
+const TrackInputMeter: React.FC<{ trackId: string; trackName: string }> = ({ trackId, trackName }) => {
+  const status = useRecordingStore(selectRecordingStatus);
+  const frame = useRecordingStore(selectTrackLevel(trackId));
+  if (status === 'idle') return null;
+  const peak = clampFrac(frame?.peak ?? 0);
+  const rms = clampFrac(frame?.rms ?? 0);
+  return (
+    <div
+      role="meter"
+      aria-label={`${trackName} input level`}
+      aria-valuemin={0}
+      aria-valuemax={1}
+      aria-valuenow={peak}
+      aria-valuetext={`${Math.round(peak * 100)} percent`}
+      className="relative h-1 w-full overflow-hidden rounded-xs bg-white/10"
+    >
+      <i className="absolute inset-y-0 left-0 block bg-red-500/60" style={{ width: `${rms * 100}%` }} />
+      <i className="absolute inset-y-0 w-0.5 bg-red-400" style={{ left: `calc(${peak * 100}% - 1px)` }} />
+    </div>
+  );
 };
 
 /**
@@ -537,6 +1202,9 @@ const EDIT_SHORTCUTS: Array<{ group: string; keys: Array<[string, string]> }> = 
     group: 'Transport',
     keys: [
       ['Space', 'Play / pause'],
+      // Bound in PlayerFooter (the app-wide transport), not in this file;
+      // the sheet documents the key, the footer owns the handler.
+      ['R', 'Record / stop'],
       ['Home', 'Playhead to start'],
       ['End', 'Playhead to end'],
       ['L', 'Toggle loop'],
@@ -666,59 +1334,20 @@ const MarkerFlag: React.FC<{
   );
 };
 
-/* How long a recording gesture may sit still before it is treated as released.
-   Only the wheel actually needs it — it has no release event of any kind — so the
-   deadline is gated on `pointerHeld` below and never fires while a button is
-   down. A quarter second is short enough that a wheel flick punches out promptly. */
-const GESTURE_IDLE_MS = 250;
+/** The two scopes a rack param can live in (the shape `EffectWindowsHost` and
+ *  `FxRack` hand back). `FxScope`'s third kind, masterVst, has no live params. */
+type FxParamScope = { kind: 'master' } | { kind: 'track'; trackId: string };
 
-/* Is a pointer button down anywhere right now?
+/* Which SURFACE a lane's gesture boundary comes from.
  *
- * A fader held motionless mid-ride is ordinary playing, not the end of a gesture:
- * you stop on a value to hear it before moving again. Without this the idle
- * deadline would punch out under your finger — an unwanted punch-out/punch-in in
- * touch, and an early hold in latch/write. So the deadline only ENDS a gesture
- * when no pointer is down; while one is, it re-arms and waits for the real
- * pointerup. Keyboard and wheel gestures are unaffected: no button is down for
- * them, so they still close on the deadline (or on keyup).
- *
- * `blur` clears the flag too. The flag latching ON is the dangerous failure: the
- * idle callback would re-arm for ever, the hold would keep overwriting the lane
- * ahead of the playhead, and the listeners and timer would live until unmount. A
- * window that loses focus mid-drag does not always deliver the pointerup (nor a
- * pointercancel), so `blur` is the backstop that guarantees the flag falls.
- *
- * The watch is REFCOUNTED, not tied to one editor instance: the flag and the
- * listeners are module state, so a second mounted editor closing its last gesture
- * must not tear the watch out from under the first one's live drag.
- *
- * The listeners are BUBBLE phase on `window` deliberately: the pointerdown that
- * opens a drag is still propagating when SlideTrack's React handler runs (React
- * attaches at its root container, below window), and a listener added to a node
- * the event has not reached yet is still invoked when it gets there — so the very
- * pointerdown that started the gesture sets the flag. */
-let pointerHeld = false;
-let pointerWatchRefs = 0;
-const markPointerDown = () => { pointerHeld = true; };
-const markPointerUp = () => { pointerHeld = false; };
-const acquirePointerWatch = () => {
-  pointerWatchRefs += 1;
-  if (pointerWatchRefs > 1) return;
-  window.addEventListener('pointerdown', markPointerDown);
-  window.addEventListener('pointerup', markPointerUp);
-  window.addEventListener('pointercancel', markPointerUp);
-  window.addEventListener('blur', markPointerUp);
-};
-const releasePointerWatch = () => {
-  if (pointerWatchRefs === 0) return;
-  pointerWatchRefs -= 1;
-  if (pointerWatchRefs > 0) return;
-  pointerHeld = false;
-  window.removeEventListener('pointerdown', markPointerDown);
-  window.removeEventListener('pointerup', markPointerUp);
-  window.removeEventListener('pointercancel', markPointerUp);
-  window.removeEventListener('blur', markPointerUp);
-};
+ * A track fader is one SlideTrack writing one lane, so it is its own surface. A
+ * rack panel is one surface writing SEVERAL lanes — an OWL-Pad drag moves x and
+ * y, a preset writes the lot — and it reports one boundary for all of them, so
+ * every param of an entry shares the entry's group. */
+const gestureGroup = (t: AutomationTarget): string =>
+  t.kind === 'trackFx' || t.kind === 'masterFx'
+    ? `${t.kind}|${t.trackId ?? ''}|${t.entryId ?? ''}`
+    : automationTargetKey(t);
 
 /* A native (volume / pan) track fader, plus the badge that admits when the
    fader is NOT what drives the sound. An enabled automation lane owns its
@@ -733,12 +1362,20 @@ const NativeFader: React.FC<{
   value: number;
   automated: boolean;
   onChange: (v: number) => void;
-}> = ({ label, min, max, step, defaultValue, value, automated, onChange }) => (
+  /** The widget's gesture boundary, straight through to SlideTrack: one start
+   *  before the first `onChange` of a drag / key press / wheel burst, one end
+   *  after its last (including a gesture that changed nothing, and an unmount
+   *  mid-drag). See lib/gestureTracker.ts. */
+  onGestureStart?: () => void;
+  onGestureEnd?: () => void;
+}> = ({ label, min, max, step, defaultValue, value, automated, onChange, onGestureStart, onGestureEnd }) => (
   <>
     <SlideTrack
       min={min} max={max} step={step} defaultValue={defaultValue}
       value={value}
       onChange={onChange}
+      onGestureStart={onGestureStart}
+      onGestureEnd={onGestureEnd}
       className="flex-1"
       ariaLabel={automated ? `${label} (an automation lane drives this)` : label}
     />
@@ -876,21 +1513,24 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const previewMode = useEditorStore((s) => s.previewMode);
   const setPreviewMode = useEditorStore((s) => s.setPreviewMode);
   const frozenMaster = useEditorStore((s) => s.frozenMaster);
-  const setFrozenMaster = useEditorStore((s) => s.setFrozenMaster);
   const vstPlugins = useVstStore((s) => s.plugins);
   const vstScanning = useVstStore((s) => s.scanning);
   const scanVst = useVstStore((s) => s.scan);
   const automationMode = useEditorStore((s) => s.automationMode);
   const setAutomationMode = useEditorStore((s) => s.setAutomationMode);
   // The one derived read the rest of this component uses: "is anything armed to
-  // record?". Everything that used to ask the old `automationWrite` boolean asks
-  // this instead — the boolean cannot tell touch from latch from write, and three
-  // of the four modes are not "write".
+  // record?". This is all the store keeps now — the `automationWrite` boolean that
+  // used to shadow the mode is gone, because it could not tell touch from latch
+  // from write and three of the four modes are not "write".
   const automationArmed = automationMode !== 'read';
-  const beginAutomationTouch = useEditorStore((s) => s.beginAutomationTouch);
-  const moveAutomationTouch = useEditorStore((s) => s.moveAutomationTouch);
-  const endAutomationTouch = useEditorStore((s) => s.endAutomationTouch);
-  const automationLanes = useEditorStore((s) => s.automationLanes);
+  // Lanes come through the store's repaint feed, not a raw selector. A latch or
+  // write pass rewrites `automationLanes` on EVERY transport frame (the document
+  // needs that — undo and autosave read the slice), and this component renders the
+  // whole timeline: subscribing directly meant ~40 full re-renders a second for a
+  // curve a few pixels wide. The feed republishes at most every
+  // AUTOMATION_LANE_REPAINT_MS while holds exist and immediately otherwise, so an
+  // ordinary edit still lands on the very next paint. See editorStore.ts.
+  const automationLanes = useSyncExternalStore(automationLaneFeed.subscribe, automationLaneFeed.getSnapshot);
   const addAutomationPoint = useEditorStore((s) => s.addAutomationPoint);
   const updateAutomationPoint = useEditorStore((s) => s.updateAutomationPoint);
   const removeAutomationPoint = useEditorStore((s) => s.removeAutomationPoint);
@@ -923,96 +1563,81 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   // go, latch holds what you let go of — so the store needs begin / move / end,
   // not a stream of anonymous values.
   //
-  // Neither control the editor automates gives us that boundary: SlideTrack (the
-  // track faders) and the rack's knobs both report a bare `onChange` and nothing
-  // else. So the gesture BEGINS on the first change for a target and ENDS on the
-  // first of three things: a pointerup/pointercancel, a keyup, or GESTURE_IDLE_MS
-  // of silence WITH no pointer down (see `pointerHeld` — a paused drag is still a
-  // drag, and the deadline re-arms under a held button rather than punching out).
+  // The track faders are SlideTrack, and SlideTrack REPORTS that boundary
+  // (`onGestureStart` / `onGestureEnd`, rules in lib/gestureTracker.ts): one start
+  // before the first `onChange` of a drag / key press / wheel burst and one end
+  // after its last, with the pointer dominant so a Shift let go mid-ride or a
+  // paused drag cannot split a gesture, and an unmount closing whatever is open.
+  // The editor no longer guesses any of that from window listeners: there is no
+  // pointer watch, no keyup listener and no pointerup listener in this path.
   //
-  // All three are needed, because SlideTrack changes its value from THREE inputs:
-  // a pointer drag, the arrow/Home/End keys, and a non-passive wheel handler. A
-  // keyboard or wheel move has no pointer sequence at all, so with only the
-  // pointer listeners a single ArrowUp in TOUCH would open a hold that never
-  // closes — and a hold that never closes keeps deleting every breakpoint ahead
-  // of the playhead for the rest of the pass, with the param never handed back.
-  // The idle timer is the backstop for the wheel, which has no "up" event of any
-  // kind — and it is gated on `pointerHeld`, so a drag that pauses mid-ride keeps
-  // its gesture and only the input that cannot report a release is timed out.
+  // Per the widget's own scope note, `onGestureStart` carries no value and does
+  // not promise a change — so a start only ARMS the target, the first `onChange`
+  // is the real begin, and an end for a target that never began just disarms.
   //
-  // One listener set per live target, all removed the instant the gesture ends, so
-  // nothing accumulates; a multi-key drag (an OWL-Pad moves x and y at once) opens
-  // one gesture per key and the single release closes them all.
-  type Gesture = { end: () => void; off: () => void; touch: () => void };
-  const gesturesRef = useRef<Map<string, Gesture> | null>(null);
-  const liveGestures = () => (gesturesRef.current ??= new Map<string, Gesture>());
-  useEffect(() => () => {
-    // Unmounting mid-gesture must not leave the target held in the store: end each
-    // one properly rather than just dropping its listeners. `end` removes itself
-    // from the map, so iterate a snapshot.
-    const live = gesturesRef.current;
-    if (!live) return;
-    for (const g of [...live.values()]) g.end();
-    live.clear();
-  }, []);
-
-  /** First value of a gesture on `target` begins it; every later value moves it.
-   *  The release is wired here, fires exactly once, and punches out only in the
-   *  modes that punch out. */
-  const touchAutomation = (target: AutomationTarget, v: number) => {
-    const key = automationTargetKey(target);
-    const live = liveGestures();
-    const open = live.get(key);
-    if (open) {
-      open.touch(); // still moving — push the idle deadline out
-      moveAutomationTouch(target, liveMixer.currentTransportSec(), v);
-      return;
-    }
-    beginAutomationTouch(target, liveMixer.currentTransportSec(), v);
-    let idle = 0;
-    const end = () => {
-      const entry = live.get(key);
-      if (!entry) return; // already ended (pointerup then pointercancel, say)
-      live.delete(key); // gone from the map before anything else runs, so a
-      entry.off();      // re-entrant end() takes the guard above and stops
-      // Balanced even if the transport stopped mid-drag: the store drops an end
-      // for a target it is not holding, and the release below is a no-op when
+  // The rack's BESPOKE panels are SlideTrack too, so they report it as well:
+  // spatializer / owlpad / chop / gater thread the same two props out through
+  // FxRack (`onParamsGestureStart` / `onParamsGestureEnd`) and EffectWindowsHost.
+  // Their boundary is per ENTRY rather than per param key, because one surface
+  // writes several keys — so the arm is on the entry and each key begins on its
+  // own first change; the one end closes every key of that entry.
+  //
+  // What is LEFT on a deadline is the schema-driven panel (EffectControls) and
+  // only it: EffectKnob (the default for every rack param, including each
+  // effect's wet/dry MIX), SlidePad toggles, the enum <select>, and EffectXYPad —
+  // plus the two bespoke XY SURFACES (the OWL-Pad pad and the Spatializer pad),
+  // which are hand-rolled pointer targets, not SlideTracks. None of those reports
+  // a boundary, so for those and only those the gesture ends after
+  // RACK_GESTURE_IDLE_MS of silence: one timer per entry, no listeners anywhere.
+  //
+  // The bookkeeping itself is lib/automationGesture.ts, tested there.
+  const gestureRef = useRef<AutomationGesture<AutomationTarget> | null>(null);
+  const automationGesture = () => (gestureRef.current ??= createAutomationGesture<AutomationTarget>({
+    keyOf: automationTargetKey,
+    groupOf: gestureGroup,
+    // Read through getState() rather than a captured selector: the machine is
+    // built once, on demand, and outlives the render that happened to build it.
+    onBegin: (target, v) => useEditorStore.getState().beginAutomationTouch(target, liveMixer.currentTransportSec(), v),
+    onMove: (target, v) => useEditorStore.getState().moveAutomationTouch(target, liveMixer.currentTransportSec(), v),
+    onEnd: (target) => {
+      // Balanced even if the transport stopped mid-gesture: the store drops an
+      // end for a target it is not holding, and the release below is a no-op when
       // nothing is playing.
-      endAutomationTouch(target, liveMixer.currentTransportSec());
+      useEditorStore.getState().endAutomationTouch(target, liveMixer.currentTransportSec());
       // Touch punches out here — the lane takes its AudioParam back from the
-      // hand. Latch and write keep the released value; not re-arming the lane IS
-      // the hold.
+      // hand. Latch and write keep the released value; not re-arming IS the hold.
       if (!holdsAfterRelease(useEditorStore.getState().automationMode)) {
         liveMixer.automationReleaseNative(target);
       }
-    };
-    const touch = () => {
-      window.clearTimeout(idle);
-      idle = window.setTimeout(() => {
-        // A button is still down: the ride is paused, not over. Wait again.
-        if (pointerHeld) { touch(); return; }
-        end();
-      }, GESTURE_IDLE_MS);
-    };
-    // A key release only ends a KEYBOARD gesture. Bare `end` here meant any key
-    // let go during a held-button ride — Space for the transport, a modifier, any
-    // shortcut — punched the gesture out, and the next move opened a fresh one
-    // with its own undo step.
-    const endOnKey = () => { if (!pointerHeld) end(); };
-    const off = () => {
-      window.clearTimeout(idle);
-      window.removeEventListener('pointerup', end);
-      window.removeEventListener('pointercancel', end);
-      window.removeEventListener('keyup', endOnKey);
-      releasePointerWatch();
-    };
-    window.addEventListener('pointerup', end);
-    window.addEventListener('pointercancel', end);
-    window.addEventListener('keyup', endOnKey);
-    acquirePointerWatch();
-    live.set(key, { end, off, touch });
-    touch(); // arm the idle deadline for the inputs that have no release event
-  };
+    },
+  }));
+
+  /** A widget opened a gesture. Nothing is recorded yet, and it is armed whatever
+   *  the transport is doing, so the pairs stay balanced when stopped and a gesture
+   *  that outlives a play/stop still uses the right mechanism. */
+  const armAutomation = (target: AutomationTarget) => automationGesture().arm(gestureGroup(target));
+  /** The widget let go. Ends every lane of the surface that began; one that never
+   *  did just disarms. */
+  const endAutomation = (target: AutomationTarget) => automationGesture().end(gestureGroup(target));
+  /** First value on a lane begins it; every later value moves it. */
+  const touchAutomation = (target: AutomationTarget, v: number) => automationGesture().change(target, v);
+
+  // Unmounting mid-gesture must not leave a target held in the store: end each
+  // open lane properly rather than just dropping the map. `dispose` is not
+  // terminal, so StrictMode's mount → cleanup → mount on the same instance leaves
+  // a working machine behind.
+  useEffect(() => () => gestureRef.current?.dispose(), []);
+
+  /** The lane a native fader records onto. */
+  const faderTarget = (kind: 'trackVolume' | 'trackPan', trackId: string): AutomationTarget => ({ kind, trackId });
+  /** The lane one rack param records onto. */
+  const fxTarget = (scope: FxParamScope, entryId: string, paramKey: string): AutomationTarget =>
+    scope.kind === 'master'
+      ? { kind: 'masterFx', entryId, paramKey }
+      : { kind: 'trackFx', trackId: scope.trackId, entryId, paramKey };
+  /** The surface a rack panel's gesture belongs to — built from a target so it
+   *  cannot drift from `gestureGroup`. */
+  const fxGroup = (scope: FxParamScope, entryId: string): string => gestureGroup(fxTarget(scope, entryId, ''));
 
   // Move a track fader. While a record mode is armed and the transport is rolling,
   // the move is a gesture on the lane (timestamped off the audio clock) and is
@@ -1020,17 +1645,19 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const writeFader = (kind: 'trackVolume' | 'trackPan', trackId: string, v: number) => {
     updateTrack(trackId, kind === 'trackVolume' ? { volume: v } : { pan: v });
     if (!automationArmed || !liveMixer.isPlaying()) return;
-    const target: AutomationTarget = { kind, trackId };
+    const target = faderTarget(kind, trackId);
     touchAutomation(target, v);
     liveMixer.automationTouchNative(target, v);
   };
 
-  // Apply an FX param change, and while armed + playing, drive each param key that
-  // actually changed as its own gesture on its own lane (an OWL-Pad drag moves x
-  // and y at once, so both are captured). Playback is driven by the FX lookahead
-  // writer, which is also what advances a held key between frames.
+  // Apply an FX param change, and while armed + playing, record each param key
+  // that actually changed onto its own lane (an OWL-Pad drag moves x and y at
+  // once, so both are captured). Every key of an entry shares that entry's gesture
+  // group, so a panel that reports a boundary opens and closes all of them
+  // together and one that does not shares one deadline. Playback is driven by the
+  // FX lookahead writer, which is also what advances a held key between frames.
   const writeFxParams = (
-    scope: { kind: 'master' } | { kind: 'track'; trackId: string },
+    scope: FxParamScope,
     entryId: string,
     p: Record<string, number>,
   ) => {
@@ -1043,13 +1670,15 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     if (!automationArmed || !liveMixer.isPlaying() || !prev) return;
     for (const key of Object.keys(p)) {
       if (prev[key] === p[key]) continue;
-      const target: AutomationTarget =
-        scope.kind === 'master'
-          ? { kind: 'masterFx', entryId, paramKey: key }
-          : { kind: 'trackFx', trackId: scope.trackId, entryId, paramKey: key };
-      touchAutomation(target, p[key]);
+      touchAutomation(fxTarget(scope, entryId, key), p[key]);
     }
   };
+
+  /** A rack panel that reports its boundary opened / closed a gesture on one
+   *  entry. Armed on the ENTRY: the panel writes several param keys and each
+   *  begins on its own first change. */
+  const armFxPanel = (scope: FxParamScope, entryId: string) => automationGesture().arm(fxGroup(scope, entryId));
+  const endFxPanel = (scope: FxParamScope, entryId: string) => automationGesture().end(fxGroup(scope, entryId));
   const addMasterEffect = useEditorStore((s) => s.addMasterEffect);
   const removeMasterEffect = useEditorStore((s) => s.removeMasterEffect);
   const reorderMasterEffect = useEditorStore((s) => s.reorderMasterEffect);
@@ -1171,15 +1800,27 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const playheadDragRef = useRef<{ startX: number; startSec: number; wasPlaying: boolean } | null>(null);
   // Fade handle drag
   const fadeDragRef = useRef<{ clipId: string; edge: 'in' | 'out'; startX: number; initialFade: number } | null>(null);
-  const [isCommitting, setIsCommitting] = useState(false);
-  const [isRendering, setIsRendering] = useState(false);
-  // Granular bleed rendering from the clip menu (Metamorph offline pass).
+  // The three render flags are the queue's to answer now (T11c-b): "busy" is
+  // one job of that kind unfinished, and a second press queues rather than
+  // racing. `isBusy` reads the live store, so these flip on the same commit the
+  // job's status does.
+  const isCommitting = useRenderJobs((s) => s.isBusy('mixdown'));
+  const isSelectionRendering = useRenderJobs((s) => s.isBusy('selection'));
+  // Arming the live transport: liveMixer decodes + schedules every clip before
+  // `playAsync` resolves. This was called `isRendering` and shared that name
+  // with the selection bounce, so a bounce greyed out PLAY and arming the
+  // transport greyed out the bounce. Two different things; two names.
+  const [isArmingPlayback, setIsArmingPlayback] = useState(false);
+  // Granular bleed rendering from the clip menu (Metamorph offline pass). NOT a
+  // render job: it is a `morphEngine` render with no `BounceRequest`, so it has
+  // nothing to put on the queue and keeps its own flag.
   const [isBleeding, setIsBleeding] = useState(false);
   const [mixdownName, setMixdownName] = useState('');
   // ONE master FX panel — built-in rack effects, VST3s and .gan surfaces are
   // the same concept (chain entries) and share a single list + add menu.
   const [showMasterFx, setShowMasterFx] = useState(false);
-  const [isFreezing, setIsFreezing] = useState(false);
+  // Any freeze, master or per-track — the one flag both shared before.
+  const isFreezing = useRenderJobs((s) => s.isBusy('freeze'));
   // Magenta RT2 generative tool open in the floating panel (Collider/Jam/MRT2), or null.
   const [magentaToolId, setMagentaToolId] = useState<string | null>(null);
   const magentaTool: MagentaTool | null = magentaToolId ? magentaToolById[magentaToolId] ?? null : null;
@@ -2057,73 +2698,22 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     }
   }, [bleedPartnerFor, clips, tracks]);
 
-  /**
-   * The seven fields `lib/renderCore` reads for a bounce: the document, and the
-   * three real implementations it will not reach for itself (the shared decode
-   * cache, the rack builder, the live mixer's per-clip scheduler — the same one
-   * playback uses, which is what keeps a bounce and a preview the same audio).
-   *
-   * Read from the store at CALL time rather than closed over, so all three
-   * bounces below see the document as it is when the user presses the button
-   * and this callback never has to be rebuilt.
-   */
-  const renderDeps = useCallback((): RenderDeps => {
-    const st = useEditorStore.getState();
-    return {
-      clips: st.clips,
-      tracks: st.tracks,
-      masterFxChain: st.masterFxChain,
-      automationLanes: st.automationLanes,
-      decode: decodeClipBlob,
-      buildChain: buildEffectChain,
-      scheduleSources: liveMixer.scheduleClipSources,
-    };
-  }, []);
-
-  const sendSelectionToInit = useCallback(async () => {
+  /** Queue the selection bounce. The render, the hand-off to MAKE's params
+   *  store and the tab switch all happen in `runSelectionJob`. */
+  const sendSelectionToInit = useCallback(() => {
     const selection = getSelectionForInit();
     if (selection.length === 0) {
       logError('editor', 'Select at least one clip or track first.');
       return;
     }
-    setIsRendering(true);
-    try {
-      // No inserts and no automation, but the track mix DOES apply — a mashup
-      // sent to Init should sound like what the user has balanced on the
-      // timeline. Solo is ignored: this bounces exactly what was selected.
-      const req: BounceRequest = {
-        scope: { kind: 'selection', clipIds: selection.map((c) => c.id) },
-        sampleRate: BOUNCE_SAMPLE_RATE,
-        includeFx: false,
-        includeAutomation: false,
-        includeTrackMix: true,
-        float32: false,
-      };
-      const rendered = await renderBounce(req, renderDeps());
-      const blob = encodeBounce(rendered, req);
-      const clipLabels = selection.map((c) => c.label);
-      const mixDur = rendered.duration;
-      const fileName = selection.length === 1
-        ? `editor-clip-${Date.now()}.wav`
-        : `editor-mashup-${selection.length}clips-${Date.now()}.wav`;
-      const file = new File([blob], fileName, { type: 'audio/wav' });
-      const summary = selection.length === 1
-        ? `Editor clip · ${mixDur.toFixed(2)}s`
-        : `Editor mashup · ${selection.length} clips · ${mixDur.toFixed(2)}s`;
-      useGenerateParamsStore.getState().patch({
-        initAudioFile: file,
-        initAudioEnabled: true,
-        initAudioSourceLabel: summary,
-        initAudioSourceClipLabels: clipLabels,
-      });
-      logInfo('editor', `Selection mashup sent to Init (${selection.length} clip${selection.length === 1 ? '' : 's'}, ${mixDur.toFixed(2)}s).`);
-      onSwitchTab?.('create');
-    } catch (e) {
-      logError('editor', `Send to Init failed: ${e instanceof Error ? e.message : e}`);
-    } finally {
-      setIsRendering(false);
-    }
-  }, [getSelectionForInit, onSwitchTab, renderDeps]);
+    enqueueBounce({
+      kind: 'selection',
+      label: selection.length === 1
+        ? 'Selection → Init'
+        : `Selection → Init · ${selection.length} clips`,
+      request: selectionRequest(selection.map((c) => c.id)),
+    });
+  }, [getSelectionForInit]);
 
   const handleTrackHeaderPointerDown = useCallback((e: React.PointerEvent, trackId: string) => {
     const target = e.target as HTMLElement;
@@ -2186,7 +2776,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     // it has no writer anywhere; see swaySurface.)
     followPlayheadRef.current = true;
     stopPreview();
-    setIsRendering(true);
+    setIsArmingPlayback(true);
     try {
       // Live multi-track playback — per-track volume / pan / mute / solo are
       // audible MID-playback (see state/liveMixer). The offline bounce is kept
@@ -2195,7 +2785,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     } catch (e) {
       logError('editor', `Live playback failed: ${e instanceof Error ? e.message : e}`);
     } finally {
-      setIsRendering(false);
+      setIsArmingPlayback(false);
     }
   }, [stopPreview]);
 
@@ -2615,68 +3205,22 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     clipMenu.open(e, { clipId, atSec });
   };
 
-  // OfflineAudioContext mixdown. With { silent: true } it renders and RETURNS the
-  // master WAV without saving to the library or downloading — the VST freeze path
-  // reuses this so the frozen master matches the export exactly.
-  const commitEdit = useCallback(async (opts?: { silent?: boolean }): Promise<Blob | null> => {
-    if (clips.length === 0) {
+  // Queue the master mixdown. The render, the library entry and the Save As all
+  // happen in `runMixdownJob`; pressing COMMIT EDIT twice queues two mixdowns
+  // instead of running two OfflineAudioContexts against each other.
+  const commitEdit = useCallback(() => {
+    if (useEditorStore.getState().clips.length === 0) {
       logError('editor', 'No clips to commit');
-      return null;
+      return;
     }
-    setIsCommitting(true);
-    const start = performance.now();
-    logInfo('editor', `Mixing ${clips.length} clips on ${tracks.length} tracks…`);
-    try {
-      // Everything: the master rack and every track's rack, the automation
-      // lanes, mute AND solo. The one full-fidelity bounce — the freeze path
-      // below reuses it so a frozen master matches the export exactly.
-      const req: BounceRequest = {
-        scope: { kind: 'master' },
-        sampleRate: BOUNCE_SAMPLE_RATE,
-        includeFx: true,
-        includeAutomation: true,
-        includeTrackMix: true,
-        float32: false,
-      };
-      const rendered = await renderBounce(req, renderDeps());
-      const wavBlob = encodeBounce(rendered, req);
-      // Freeze path: hand the rendered master back to the caller (it post-processes
-      // through the VST chain and caches it) without saving/downloading.
-      if (opts?.silent) {
-        return wavBlob;
-      }
-      const id = `mix-${Date.now()}`;
-      const trimmedName = mixdownName.trim();
-      const title = trimmedName
-        ? (trimmedName.endsWith('.wav') ? trimmedName : `${trimmedName}.wav`)
-        : `mixdown_${id.slice(-6)}.wav`;
-      await useLibraryStore.getState().importEntry({
-        blob: wavBlob,
-        filename: title,
-        mimeType: 'audio/wav',
-        metadata: {
-          title,
-          prompt: `Editor mixdown of ${clips.length} clips`,
-          model: 'editor-mixdown',
-          duration: rendered.duration,
-          source: 'studio',
-          tags: ['mixdown'],
-        },
-      });
-      // Also put the file on disk. Save As opens in the folder last used for
-      // audio; not awaited, so COMMIT EDIT is free again while the dialog is up.
-      void saveFile({ blob: wavBlob, suggestedName: title.replace(/[<>:"/\\|?*]/g, '_'), kind: 'audio' });
-
-      const ms = (performance.now() - start).toFixed(0);
-      logInfo('editor', `Mixdown complete: ${rendered.duration.toFixed(2)}s rendered in ${ms}ms → library + save`);
-      return wavBlob;
-    } catch (e) {
-      logError('editor', `Mixdown failed: ${e instanceof Error ? e.message : e}`);
-      return null;
-    } finally {
-      setIsCommitting(false);
-    }
-  }, [clips, tracks, mixdownName, renderDeps]);
+    // The label IS the filename the runner writes under, so the jobs pill names
+    // the file rather than the verb.
+    enqueueBounce({
+      kind: 'mixdown',
+      label: mixdownTitle(mixdownName),
+      request: mixdownRequest(),
+    });
+  }, [mixdownName]);
 
   // --- Master VST freeze (render-on-change) ----------------------------------
   const editorBpm = useEditorStore((s) => s.bpm);
@@ -2694,54 +3238,31 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
 
   const frozenStale = !frozenMaster || frozenMaster.sig !== freezeSig;
 
-  // Render the master mix (silent commit), then post-process it through each
-  // enabled master VST on the backend (one /process-file call per node, in series).
+  // Queue the master VST freeze — the full-fidelity master bounce, then one
+  // /api/vst/process-file hop per enabled master VST, in series — and wait for
+  // the printed blob. Both halves run in `runStemJob`.
   const renderFrozenMaster = useCallback(async (): Promise<Blob | null> => {
-    const vsts = useEditorStore.getState().masterVstChain.filter((e) => e.enabled && e.vst);
+    const st = useEditorStore.getState();
+    const vsts = st.masterVstChain.filter((e) => e.enabled && e.vst);
     if (vsts.length === 0) {
       logError('editor', 'Add a master VST before rendering.');
       return null;
     }
-    if (clips.length === 0) {
+    if (st.clips.length === 0) {
       logError('editor', 'No clips to render.');
       return null;
     }
-    setIsFreezing(true);
-    try {
-      const base = await commitEdit({ silent: true });
-      if (!base) return null;
-      let current = new File([base], 'edit-master.wav', { type: 'audio/wav' });
-      for (const node of vsts) {
-        const form = new FormData();
-        form.append('audio', current);
-        form.append('plugin_path', node.vst!.plugin_path);
-        form.append('params', '{}');
-        // Send the captured plugin state, exactly as renderTrackStem does. Without
-        // it every master VST rendered at its factory defaults, silently discarding
-        // whatever the user dialled in through the plugin's native GUI.
-        if (node.vst!.raw_state) form.append('raw_state', node.vst!.raw_state);
-        const res = await fetch('/api/vst/process-file', { method: 'POST', body: form });
-        if (!res.ok) {
-          let detail = `HTTP ${res.status}`;
-          try {
-            const j = (await res.json()) as { detail?: string };
-            if (j.detail) detail = j.detail;
-          } catch { /* non-JSON */ }
-          throw new Error(detail);
-        }
-        const blob = await res.blob();
-        current = new File([blob], 'edit-master.wav', { type: 'audio/wav' });
-      }
-      setFrozenMaster({ blob: current, sig: freezeSig });
-      logInfo('editor', `VST freeze rendered through ${vsts.length} plugin(s).`);
-      return current;
-    } catch (e) {
-      logError('editor', `VST freeze failed: ${e instanceof Error ? e.message : String(e)}`);
-      return null;
-    } finally {
-      setIsFreezing(false);
-    }
-  }, [clips.length, commitEdit, setFrozenMaster, freezeSig]);
+    // The one render the caller cannot walk away from: `enterFrozenMode` has to
+    // load the returned blob into the player, so this awaits the settled job
+    // rather than firing and forgetting. A failure or a cancel both come back
+    // as a job that is not `done` — null, and the caller stays where it is.
+    const job = await enqueueBounceAndWait({
+      kind: 'freeze',
+      label: `Master VST freeze · ${vsts.length} plugin${vsts.length === 1 ? '' : 's'}`,
+      request: mixdownRequest(),
+    });
+    return job.status === 'done' ? job.result?.blob ?? null : null;
+  }, []);
 
   // Play the live multitrack mix again (re-arm liveMixer as the transport).
   const enterLiveMode = useCallback(() => {
@@ -2776,90 +3297,29 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   // Browser audio can't host VST3 live (the plugins run in pedalboard on the
   // backend), so "freezing" a track renders it offline — its clips + live rack
   // FX baked locally, then its VST3 chain applied in series on the backend — into
-  // one printed stem the normal clip path plays back. Mirrors the master freeze.
-  const renderTrackStem = useCallback(
-    async (
-      trackId: string,
-    ): Promise<{ audioBlob: Blob; durationSec: number; peaks: Float32Array } | null> => {
-      const st = useEditorStore.getState();
-      const track = st.tracks.find((t) => t.id === trackId);
-      if (!track) return null;
-      const trackClips = st.clips.filter((c) => c.trackId === trackId);
-      if (trackClips.length === 0) {
-        logError('editor', 'Track has no clips to freeze.');
-        return null;
-      }
-      const vsts = (track.fxChain ?? []).filter((e) => e.enabled && e.effect === 'vst3' && e.vst);
-      // A stem is the track's RAW audio through its own rack: no automation,
-      // and no track volume / pan / mute / solo — the timeline plays the
-      // printed stem back through the fader it was already going through.
-      // Hosted VST3 entries are stripped by the core and applied on the backend
-      // below, which is also why the encode is float when any of them exist.
-      const scope: BounceScope = { kind: 'track', trackId };
-      const dur = renderExtentSec(st.clips, scope);
-      const req: BounceRequest = {
-        scope,
-        sampleRate: BOUNCE_SAMPLE_RATE,
-        includeFx: true,
-        includeAutomation: false,
-        includeTrackMix: false,
-        // /api/vst/process-file answers in float precisely so a chain does not
-        // requantize between stages; encoding the input at 16 bits would put
-        // the loss back at every hop. With no plugins the stem goes straight to
-        // the timeline, where 16-bit at half the size is the right answer.
-        float32: vsts.length > 0,
-      };
-      const rendered = await renderBounce(req, renderDeps());
-      let blob: Blob = encodeBounce(rendered, req);
+  // one printed stem the normal clip path plays back. Mirrors the master freeze,
+  // and shares its runner: both are `freeze` jobs, told apart by `job.trackId`
+  // (see `runStemJob` at the top of this file).
 
-      // VST3 chain on the backend, in signal-chain order.
-      let current = new File([blob], 'track-stem.wav', { type: 'audio/wav' });
-      for (const node of vsts) {
-        const form = new FormData();
-        form.append('audio', current);
-        form.append('plugin_path', node.vst!.plugin_path);
-        form.append('params', '{}');
-        if (node.vst!.raw_state) form.append('raw_state', node.vst!.raw_state);
-        const res = await fetch('/api/vst/process-file', { method: 'POST', body: form });
-        if (!res.ok) {
-          let detail = `HTTP ${res.status}`;
-          try {
-            const j = (await res.json()) as { detail?: string };
-            if (j.detail) detail = j.detail;
-          } catch {
-            /* non-JSON */
-          }
-          throw new Error(detail);
-        }
-        const out = await res.blob();
-        current = new File([out], 'track-stem.wav', { type: 'audio/wav' });
-        blob = out;
-      }
-
-      const { peaks } = await computePeaks(blob, 240);
-      return { audioBlob: blob, durationSec: dur, peaks };
-    },
-    [renderDeps],
-  );
-
-  const freezeTrackAction = useCallback(
-    async (trackId: string) => {
-      setIsFreezing(true);
-      try {
-        usePlayerStore.getState().stop();
-        const stem = await renderTrackStem(trackId);
-        if (!stem) return;
-        useEditorStore.getState().freezeTrack(trackId, stem);
-        liveMixer.reactivate();
-        logInfo('editor', 'Track frozen — VST FX printed into the stem.');
-      } catch (e) {
-        logError('editor', `Track freeze failed: ${e instanceof Error ? e.message : String(e)}`);
-      } finally {
-        setIsFreezing(false);
-      }
-    },
-    [renderTrackStem],
-  );
+  /** Queue a track freeze. The stem render, the backend plugin hops and
+   *  `freezeTrack` itself all happen in `runStemJob`; a freeze on another track
+   *  queues behind this one instead of being refused. */
+  const freezeTrackAction = useCallback((trackId: string) => {
+    const st = useEditorStore.getState();
+    const track = st.tracks.find((t) => t.id === trackId);
+    if (!track) return;
+    if (!st.clips.some((c) => c.trackId === trackId)) {
+      logError('editor', 'Track has no clips to freeze.');
+      return;
+    }
+    const hasVsts = (track.fxChain ?? []).some((e) => e.enabled && e.effect === 'vst3' && e.vst);
+    enqueueBounce({
+      kind: 'freeze',
+      trackId,
+      label: `Freeze ${track.name}`,
+      request: stemRequest(trackId, hasVsts),
+    });
+  }, []);
 
   const unfreezeTrackAction = useCallback((trackId: string) => {
     usePlayerStore.getState().stop();
@@ -3730,12 +4190,12 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             <SurfacePlayKey
               size="bar"
               pauses
-              busy={isRendering}
+              busy={isArmingPlayback || isSelectionRendering}
               playing={isEditorPlaying}
               onToggle={() => isEditorPlaying ? pauseEditorPlayback() : void playEditorTimeline()}
               what="the arrangement"
-              disabled={clips.length === 0 || isRendering}
-              title={isRendering ? 'Rendering…' : isEditorPlaying ? 'Pause (Space)' : 'Play from playhead (Space)'}
+              disabled={clips.length === 0 || isArmingPlayback || isSelectionRendering}
+              title={isArmingPlayback || isSelectionRendering ? 'Rendering…' : isEditorPlaying ? 'Pause (Space)' : 'Play from playhead (Space)'}
             />
             <button
               onClick={stopEditorPlayback}
@@ -4013,11 +4473,26 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             className="bg-black/40 border border-white/10 rounded px-2 py-0.5 text-[9px] font-mono text-zinc-300 placeholder:text-zinc-600 outline-none focus:border-purple-500/50 transition-colors w-28"
             title="Optional filename for the committed mixdown"
           />
+          {/* What the queue is doing right now: the active job, its progress
+              when it has any, how many are waiting behind it, and the one
+              cancel that can honestly be offered. */}
+          <RenderJobsPill />
           <button
-            onClick={() => void commitEdit()}
-            disabled={isCommitting || clips.length === 0}
+            onClick={commitEdit}
+            // Reads `isBusy('mixdown')`, so a MASTER VST FREEZE deliberately does
+            // not light it: the freeze is its own `freeze` job now, not the
+            // `commitEdit({ silent: true })` it used to borrow, and lighting
+            // COMMITTING for a render that writes no mixdown was always a lie.
+            // Pressing this during a freeze queues a real mixdown behind it.
+            // NOT disabled while one is committing any more: a second press
+            // queues a second mixdown behind the first (and the pill offers to
+            // cancel it) instead of being swallowed. Only an empty timeline has
+            // nothing to render.
+            disabled={clips.length === 0}
             className="btn-primary py-1! px-2! text-[9px] flex items-center gap-1.5 disabled:opacity-40"
-            title="Render all clips to a single audio file and save it to the library"
+            title={isCommitting
+              ? 'A mixdown is already rendering — pressing this queues another behind it'
+              : 'Render all clips to a single audio file and save it to the library'}
           >
             {isCommitting ? <Upload className="w-3 h-3 animate-pulse" /> : <Save className="w-3 h-3" />}
             {isCommitting ? 'COMMITTING…' : 'COMMIT EDIT'}
@@ -4232,6 +4707,8 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
           the FX lists. Owns the Ares bridge while an EDIT entry drives it. */}
       <EffectWindowsHost
         writeParams={writeFxParams}
+        gestureStart={armFxPanel}
+        gestureEnd={endFxPanel}
         displayParams={fxDisplayParams}
         openVst={openVstFor}
         projectBpm={projectBpm}
@@ -4484,6 +4961,9 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         <div ref={trackHeaderColRef} className="shrink-0 bg-[#0c0a12] border-r border-[#1a1528] overflow-hidden flex flex-col" style={{ width: TRACK_HEADER_PX }}>
           {/* Ruler row spacer */}
           <div className="h-6 border-b border-white/5 bg-black/30 flex items-center justify-center text-[8px] font-mono text-zinc-700 uppercase">tracks</div>
+          {/* One live region for the whole column — the count-in belongs to the
+              pass, not to a track. See CountInAnnouncement. */}
+          <CountInAnnouncement />
           <div ref={trackHeaderScrollRef} className="flex-1 overflow-hidden">
             {tracks.map((t) => (
               <div
@@ -4508,15 +4988,11 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                     style={{ color: t.color }}
                   />
                   <div className="flex gap-1 shrink-0">
-                    <button
-                      onClick={() => updateTrack(t.id, { armed: !t.armed })}
-                      aria-label={`Arm track ${t.name} for recording`}
-                      aria-pressed={!!t.armed}
-                      title="Arm for recording"
-                      className={`w-4 h-4 rounded-full flex items-center justify-center border ${t.armed ? 'bg-red-500/30 text-red-400 border-red-500/60' : 'bg-black/40 text-zinc-500 border-white/10 hover:text-white'}`}
-                    >
-                      <Circle className={`w-2 h-2 ${t.armed ? 'fill-red-500' : ''}`} />
-                    </button>
+                    <TrackArmButton
+                      trackName={t.name}
+                      armed={!!t.armed}
+                      onToggle={() => updateTrack(t.id, { armed: !t.armed })}
+                    />
                     <button
                       onClick={() => updateTrack(t.id, { mute: !t.mute })}
                       aria-label={`Mute track ${t.name}`}
@@ -4546,30 +5022,13 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                       }`}
                     >F</button>
                     {(t.frozenOriginal || (t.fxChain ?? []).some((e) => e.effect === 'vst3' && e.vst)) && (
-                      <button
-                        onClick={() =>
-                          t.frozenOriginal ? unfreezeTrackAction(t.id) : void freezeTrackAction(t.id)
-                        }
-                        disabled={isFreezing}
-                        aria-label={
-                          t.frozenOriginal
-                            ? `Unfreeze track ${t.name}`
-                            : `Freeze track ${t.name} to print VST FX`
-                        }
-                        aria-pressed={!!t.frozenOriginal}
-                        title={
-                          t.frozenOriginal
-                            ? 'Unfreeze (restore live clips + FX)'
-                            : 'Freeze: print VST3/effects into audio so the plugin is audible'
-                        }
-                        className={`w-4 h-4 rounded flex items-center justify-center border disabled:opacity-40 ${t.frozenOriginal ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/50' : 'bg-black/40 text-zinc-500 border-white/5 hover:text-white'}`}
-                      >
-                        {isFreezing ? (
-                          <Loader2 className="w-2 h-2 animate-spin" />
-                        ) : (
-                          <Snowflake className="w-2 h-2" />
-                        )}
-                      </button>
+                      <TrackFreezeButton
+                        trackId={t.id}
+                        trackName={t.name}
+                        frozen={!!t.frozenOriginal}
+                        onFreeze={freezeTrackAction}
+                        onUnfreeze={unfreezeTrackAction}
+                      />
                     )}
                     <button
                       onClick={() => removeTrack(t.id)}
@@ -4579,6 +5038,10 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                     >×</button>
                   </div>
                 </div>
+                {/* The take meter, under the arm dot. Renders nothing unless a
+                    pass is live, so an armed track costs an idle project one
+                    mounted component and no DOM. */}
+                {t.armed && <TrackInputMeter trackId={t.id} trackName={t.name} />}
                 <div className="flex items-center gap-1.5">
                   <Volume2 className="w-2.5 h-2.5 text-zinc-600 shrink-0" />
                   {/* defaultValue is what double-click resets to; SlideTrack falls
@@ -4588,13 +5051,17 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                       so the faders are distinguishable to a screen reader. */}
                   <NativeFader label={`${t.name} volume`} min={0} max={1} step={0.01} defaultValue={0.8}
                     {...faderDisplay('trackVolume', t.id, t.volume)}
-                    onChange={(v) => writeFader('trackVolume', t.id, v)} />
+                    onChange={(v) => writeFader('trackVolume', t.id, v)}
+                    onGestureStart={() => armAutomation(faderTarget('trackVolume', t.id))}
+                    onGestureEnd={() => endAutomation(faderTarget('trackVolume', t.id))} />
                 </div>
                 <div className="flex items-center gap-1.5">
                   <span className="font-sans text-xs font-bold text-zinc-500 uppercase w-3">P</span>
                   <NativeFader label={`${t.name} pan`} min={-1} max={1} step={0.01} defaultValue={0}
                     {...faderDisplay('trackPan', t.id, t.pan)}
-                    onChange={(v) => writeFader('trackPan', t.id, v)} />
+                    onChange={(v) => writeFader('trackPan', t.id, v)}
+                    onGestureStart={() => armAutomation(faderTarget('trackPan', t.id))}
+                    onGestureEnd={() => endAutomation(faderTarget('trackPan', t.id))} />
                   <span className="font-sans text-xs font-bold text-zinc-500 text-right w-8 shrink-0 tabular-nums">
                     {t.pan > 0 ? `R${Math.round(t.pan * 100)}` : t.pan < 0 ? `L${Math.round(-t.pan * 100)}` : 'C'}
                   </span>
@@ -5176,8 +5643,8 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
           label: 'Send Selection to Init',
           icon: <Wand2 className="w-3 h-3" />,
           hint: 'mix',
-          disabled: isRendering,
-          onSelect: () => { void sendSelectionToInit(); },
+          disabled: isSelectionRendering,
+          onSelect: () => { sendSelectionToInit(); },
         });
         items.push({
           type: 'item',

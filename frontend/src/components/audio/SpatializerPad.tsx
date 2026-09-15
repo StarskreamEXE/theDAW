@@ -19,6 +19,14 @@ interface SpatializerPadProps {
   params: Record<string, number>;
   onChange: (params: Record<string, number>) => void;
   idPrefix: string;
+  /** The panel's gesture boundary, straight through to the SLIDE sliders: one
+   *  start before the first `onChange` of a drag / key press / wheel burst and
+   *  one end after its last. Lets a consumer recording a gesture (automation
+   *  touch) stop guessing it from a deadline. See lib/gestureTracker.ts. The
+   *  top-down pad itself is a bespoke pointer target and reports nothing, so a
+   *  drag on the pad still leaves the consumer on its fallback. */
+  onGestureStart?: () => void;
+  onGestureEnd?: () => void;
 }
 
 const PAD = 140;              // svg viewport (square)
@@ -34,7 +42,7 @@ const sourceXY = (azDeg: number, dist: number) => {
   return { x: C + Math.sin(az) * r, y: C - Math.cos(az) * r };
 };
 
-export function SpatializerPad({ params, onChange, idPrefix }: SpatializerPadProps) {
+export function SpatializerPad({ params, onChange, idPrefix, onGestureStart, onGestureEnd }: SpatializerPadProps) {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const dragging = useRef(false);
   const def = getRackEffect('spatializer');
@@ -277,6 +285,8 @@ export function SpatializerPad({ params, onChange, idPrefix }: SpatializerPadPro
                 ariaLabelledBy={labelId}
                 className="flex-1"
                 onChange={(v) => set(p.key, v)}
+                onGestureStart={onGestureStart}
+                onGestureEnd={onGestureEnd}
               />
               <span className="font-sans text-xs font-bold text-zinc-300 w-16 shrink-0 text-right tabular-nums">
                 {p.value.toFixed(decimals)}{p.unit ? ` ${p.unit}` : ''}

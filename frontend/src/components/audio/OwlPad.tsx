@@ -17,6 +17,14 @@ interface OwlPadProps {
   params: Record<string, number>;
   onChange: (params: Record<string, number>) => void;
   idPrefix: string;
+  /** The panel's gesture boundary, straight through to the SLIDE slider: one
+   *  start before the first `onChange` of a drag / key press / wheel burst and
+   *  one end after its last. Lets a consumer recording a gesture (automation
+   *  touch) stop guessing it from a deadline. See lib/gestureTracker.ts. The XY
+   *  surface itself is a bespoke pointer target and reports nothing, so a drag on
+   *  the pad still leaves the consumer on its fallback. */
+  onGestureStart?: () => void;
+  onGestureEnd?: () => void;
 }
 
 const PAD = 150; // svg viewport (square)
@@ -31,7 +39,7 @@ const axisLabels = (program: number): { x: string; y: string } => {
   }
 };
 
-export function OwlPad({ params, onChange, idPrefix }: OwlPadProps) {
+export function OwlPad({ params, onChange, idPrefix, onGestureStart, onGestureEnd }: OwlPadProps) {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const dragging = useRef(false);
 
@@ -141,6 +149,8 @@ export function OwlPad({ params, onChange, idPrefix }: OwlPadProps) {
               ariaLabelledBy={mixId}
               className="flex-1"
               onChange={(v) => set('mix', v)}
+              onGestureStart={onGestureStart}
+              onGestureEnd={onGestureEnd}
             />
             <span className="font-sans text-xs font-bold text-zinc-300 w-8 shrink-0 text-right tabular-nums">{mix.toFixed(2)}</span>
           </div>

@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Volume2, Download, Share2, Heart, Repeat, Repeat1, Shuffle, VolumeX, Cast, Check, Activity, ChevronUp, Headphones, Speaker, Triangle } from 'lucide-react';
+import { Volume2, Download, Share2, Heart, Repeat, Repeat1, Shuffle, VolumeX, Cast, Check, Activity, ChevronUp, Circle, Headphones, Speaker, Triangle } from 'lucide-react';
 import { useGenerateStore } from '../../state/generateStore';
 import { usePlaybackStore } from '../../state/playbackStore';
 import { usePlayerStore, getLoadedAudioUrl } from '../../state/playerStore';
@@ -55,6 +55,8 @@ import {
   useMetronomeStore,
   type CountInBars,
 } from '../../state/metronomeStore';
+import { initRecording, useRecordingStore, type RecordingStatus } from '../../state/recordingStore';
+import { postStatus } from '../../state/statusNoticeStore';
 
 /**
  * What each repeat state is called, in the tooltip and for a screen reader.
@@ -70,6 +72,102 @@ const REPEAT_KEY_LABEL: Record<'off' | 'all' | 'one', string> = {
   off: 'LOOP',
   all: 'ALL',
   one: 'ONE',
+};
+
+/** Why the RECORD key is dead. Shown on the key and on its plate — see there. */
+const RECORD_NEEDS_ARM = 'Record: arm a track first - the red dot in its header';
+
+/**
+ * The RECORD key, on a matte plate of its own — PLAY's grammar, the way the
+ * workspace action key has one.
+ *
+ * It is rendered at TWO homes and is never in the tree at both: `hidden` is
+ * display:none, so exactly one is in the accessibility tree at any width. Why
+ * two, measured at the widths the footer actually has to survive (Chrome, the
+ * EDIT tab, the numbers are getBoundingClientRect):
+ *
+ *   - 960px, the desktop app's minimum. The grid is 318.4 · 275.1 · 318.4 and
+ *     the right track's utilities are 312px of that 318.4 — 6.4px spare. A
+ *     48px key plus the track's 16px gap overflowed it by 57.6px and, with
+ *     `justify-end` pinning the right edge, landed the key at 568–616px: ON the
+ *     transport plate (342.4–617.6), covering RAND. Icon-only at 32px only
+ *     brings that back to 33.6px of overlap — there is no width of key that
+ *     fits. So below xl the key goes in the LEFT track instead, beside the
+ *     click controls, where the now-playing block is `flex-1 min-w-0` and gives
+ *     the room. Measured there: the key sits at 302.4–334.4, 8px clear of the
+ *     plate, with 0px of row and footer overflow, and the cost is the
+ *     now-playing title, 68.4px -> 32.4px. That is the trade, and it is the
+ *     cheap side of it: the title truncates, where the right-track key was
+ *     unreachable under RAND.
+ *   - 1024px, the same home: key at 334.4–366.4, title 64.4px, no overflow.
+ *   - 1280px (xl) and up, the right track has room once the utilities are
+ *     placed (measured: key at 793.6–841.6, 16px — the track's own gap — off
+ *     the plate, "Up Next" still 70.4px), so the key sits at the plate's right
+ *     edge with its legend. The left track cannot host it there: the orb bubble
+ *     takes 192px of it from xl and the now-playing title is already down to
+ *     8.4px without any key. That is why the two homes are the two sides of xl
+ *     and not one side with a narrower key.
+ *
+ * PLAY is unmoved by either: both tracks are `minmax(0,1fr)`, so the middle
+ * `auto` column — and the plate centred in it — never shifts. Measured
+ * plate-centre offset from the viewport centre: 0px at 960, 1024, 1280 and
+ * 1536, and 0px of footer overflow at all four.
+ *
+ * A custom control (CLAUDE.md rule 3): the name and the state ride on the
+ * BUTTON (aria-label + aria-pressed), never a wrapping <label>. The reason a
+ * DEAD key is dead rides in the NAME rather than only in a title, because a
+ * disabled key takes no hover of its own (`transportKey` ends in
+ * `disabled:pointer-events-none`) and a title on the plate is mouse-only.
+ */
+const RecordKey: React.FC<{
+  status: RecordingStatus;
+  armedCount: number;
+  onPress: () => void;
+  /** No legend, 32px — the below-xl form. */
+  compact?: boolean;
+  className?: string;
+  tourId?: string;
+}> = ({ status, armedCount, onPress, compact = false, className = '', tourId }) => {
+  const dead = status === 'idle' && armedCount === 0;
+  const live = status === 'counting' || status === 'recording';
+  const title = dead
+    ? RECORD_NEEDS_ARM
+    : status === 'counting'
+      ? 'Counting in - press to cancel'
+      : status === 'idle'
+        ? `Record a take on ${armedCount} armed track${armedCount === 1 ? '' : 's'} (R)`
+        : 'Stop recording (R)';
+  return (
+    <div
+      data-tour={tourId}
+      title={dead ? RECORD_NEEDS_ARM : undefined}
+      className={`shrink-0 ${compact ? 'w-8' : 'w-12'} ${transportPlate} ${className}`}
+    >
+      <button
+        type="button"
+        onClick={onPress}
+        disabled={dead}
+        aria-label={dead ? RECORD_NEEDS_ARM : status === 'idle' ? 'Record' : 'Stop recording'}
+        aria-pressed={status !== 'idle'}
+        title={title}
+        className={`${transportKey} w-full ${
+          status === 'idle' ? (dead ? transportKeyDead : transportKeyOff) : transportKeyOn
+        }`}
+      >
+        {/* The dot is red in every state and every theme — a record light is not
+            the accent's to take. It pulses while the key is counting in or
+            rolling, and the dead key's *:opacity-40 dims it with the legend. */}
+        <Circle
+          className={`w-3.5 h-3.5 fill-current text-red-500 ${live ? 'animate-pulse' : ''}`}
+          strokeWidth={1.5}
+          absoluteStrokeWidth
+        />
+        {/* Dropped in the compact form: the key is the dot, and its name still
+            says Record. */}
+        {!compact && <span aria-hidden="true" className={keyLabel}>REC</span>}
+      </button>
+    </div>
+  );
 };
 
 const formatDuration = (sec: number | null | undefined): string => {
@@ -551,6 +649,54 @@ export const PlayerFooter: React.FC = () => {
   const [countingIn, setCountingIn] = useState(false);
   useEffect(() => () => { countInRef.current?.(); }, []);
 
+  /* ── RECORD ──────────────────────────────────────────────────────────────
+     state/recordingStore.ts owns the press, the count-in, the arming mirror
+     and where a take lands; this key and the R shortcut are its only UI here
+     (the arm button and the take meter live in the track header — T12b-b).
+     `initRecording` only subscribes, so StrictMode's double mount is free and
+     no input is opened until a press. */
+  const recStatus = useRecordingStore((s) => s.status);
+  const recArmedCount = useRecordingStore((s) => s.armedTrackIds.length);
+  const recError = useRecordingStore((s) => s.lastError);
+  const recordPress = useRecordingStore((s) => s.recordPress);
+  useEffect(() => { initRecording(); }, []);
+  // A failure surfaces through the app's ONE status channel — the orb bubble
+  // this footer already draws (statusNoticeStore -> OrbTipBubble), which also
+  // files it in the LOG. "RECORD FAILED" reads as an error level from its
+  // label, so the bubble draws it in the failure colours.
+  useEffect(() => {
+    if (!recError) return;
+    postStatus(`RECORD FAILED: ${recError.message}`, { source: 'recording' });
+  }, [recError]);
+  /**
+   * R toggles record, on EDIT only. The EDIT timeline's own bare-letter keys
+   * are v / c / s / m / l and Shift+F (WaveformEditor's EDIT_SHORTCUTS list);
+   * r is free there and everywhere else — the only other footer binding is
+   * Ctrl/Cmd+K. Bound HERE rather than on the timeline because `inEditorMode`
+   * is what gates the key, and because the press belongs to the transport.
+   * The field exclusions are the timeline handler's, SELECT included, so a
+   * bare letter never steals type-to-jump inside a dropdown.
+   */
+  useEffect(() => {
+    if (!inEditorMode) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+      // Shift is rejected above, so the uppercase arm is reached only with CAPS
+      // LOCK on — where `key` is 'R' and `shiftKey` is false. It is not dead
+      // code; dropping it would silently lose the shortcut for those users.
+      if (e.key !== 'r' && e.key !== 'R') return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+      e.preventDefault();
+      // Unconditional, unlike the key itself: with nothing armed the store
+      // raises `nothing-armed` and the bubble says so, which beats a shortcut
+      // that silently does nothing.
+      useRecordingStore.getState().recordPress();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [inEditorMode]);
+
   // Auto-load: when a new generation lands and nothing is currently loaded, load it.
   useEffect(() => {
     if (hasTrack) return;
@@ -824,7 +970,9 @@ export const PlayerFooter: React.FC = () => {
               count (2 + PLAY + 2) is what holds PLAY on the viewport centre —
               a sixth key would push it off. The left track is 1fr either way,
               and the now-playing block beside it is flex-1 min-w-0, so the pair
-              stays glued to the plate at every width without moving it. */}
+              stays glued to the plate at every width without moving it. RECORD
+              is in the RIGHT track for the same reason; see the plate comment
+              below for why no sixth key can balance. */}
           <div className="flex shrink-0 items-center gap-1">
             {/* A custom control, so it carries its own accessible name and its
                 state in aria-pressed — never a wrapping <label>. */}
@@ -854,6 +1002,18 @@ export const PlayerFooter: React.FC = () => {
                 <option key={n} value={n}>{n === 0 ? 'Off' : `${n} bar${n === 1 ? '' : 's'}`}</option>
               ))}
             </select>
+            {/* RECORD's below-xl home, glued to the plate's LEFT edge — see
+                RecordKey for the 960px measurement that put it here. Hidden
+                from xl, where the copy at the plate's right edge takes over. */}
+            {inEditorMode && (
+              <RecordKey
+                compact
+                className="xl:hidden"
+                status={recStatus}
+                armedCount={recArmedCount}
+                onPress={recordPress}
+              />
+            )}
           </div>
         </div>
 
@@ -866,7 +1026,27 @@ export const PlayerFooter: React.FC = () => {
             is its widest legend at 12px Orbitron bold plus about 4px a side:
             RAND 39.9px, START 48.1px, PAUSE 48.6px. The playhead is in the
             strip above. Fullscreen lives in the top bar beside Mobile — an even
-            key count is what keeps PLAY dead centre. */}
+            key count is what keeps PLAY dead centre.
+
+            RECORD is NOT on this plate, for the same reason, and no spacer key
+            was added to make room for it: PLAY is centred only while the keys
+            either side of it pair up in width, and 12·12·14·14 (the four keys
+            that are not PLAY) cannot be split into two equal halves once a
+            fifth width joins them — 26 units a side is the only split, which
+            leaves RECORD exactly 0 units. (Algebraically: with RECORD at r the
+            half is 26 + r/2, so its own side must carry 26 - r/2 of
+            {12,12,14,14}; the reachable subset sums are 0/12/14/24/26/28/…, so
+            r is 0, or 4 — a 16px key. No key fits.) A blank sixth slot would
+            balance it at the price of a dead tile on the plate AND 98px of
+            plate width, which the 960px desktop minimum has not got: the side
+            tracks are 318px there against 312px of utilities. So RECORD sits
+            on a plate of its OWN, outside this one — at this plate's right
+            edge from xl, and beside the click controls on its left below xl
+            (the 960px right track has 6.4px spare against 312px of utilities;
+            see RecordKey for the measurement). The middle grid column is
+            untouched either way, both side columns are minmax(0,1fr), so this
+            plate — and PLAY on its centre — stays on the viewport centre:
+            measured 0px off centre at 960, 1280 and 1536. */}
         <div data-tour="transport" className={`shrink-0 ${transportPlate}`}>
           {/* Three states, one key: off -> the list plays through and stops,
               all -> the list wraps, one -> this track repeats. aria-pressed is
@@ -939,6 +1119,23 @@ export const PlayerFooter: React.FC = () => {
         {/* 3. Up Next (mirrors Now Playing) + Utilities, right-aligned in the
             right track. */}
         <div className="flex items-center gap-4 min-w-0 justify-end">
+          {/* RECORD's xl-and-up home: at the transport plate's right edge and
+              outside its centred group — see the plate comment above for why it
+              cannot be a sixth key, and RecordKey for why this copy starts at
+              xl. `mr-auto` is what glues it to the plate: "Up Next" is
+              `flex-1`, so from xl it has already absorbed the track's free
+              space and the margin resolves to 0. EDIT only (`inEditorMode`) —
+              off EDIT there is no timeline to record onto, so neither copy is
+              rendered and this row is byte-for-byte what it was. */}
+          {inEditorMode && (
+            <RecordKey
+              tourId="record"
+              className="hidden xl:flex mr-auto"
+              status={recStatus}
+              armedCount={recArmedCount}
+              onPress={recordPress}
+            />
+          )}
           {/* Up Next — mirror of the Now Playing block, right-aligned. Click loads
               the next track (no formal queue yet, so it's the next library entry —
               or a random other one while RAND is on, which the title says).

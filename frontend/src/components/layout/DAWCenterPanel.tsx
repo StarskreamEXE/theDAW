@@ -1,4 +1,5 @@
-import React, { Suspense, lazy, useEffect, useState } from 'react';
+import React, { Suspense, lazy, useEffect, useRef, useState } from 'react';
+import { ChevronDown, ChevronUp } from 'lucide-react';
 import { useAppUiStore } from '../../state/appUiStore';
 import { TabErrorBoundary } from './TabErrorBoundary';
 // Session tab is eager (not code-split): keeps it robust against lazy-chunk
@@ -41,6 +42,14 @@ const UnderfitView = lazy(() => import('../../views/UnderfitView').then((m) => (
 const NodefiView = lazy(() => import('../../views/NodefiView').then((m) => ({ default: m.NodefiView })));
 const LoomView = lazy(() => import('../../views/LoomView').then((m) => ({ default: m.LoomView })));
 const TourView = lazy(() => import('../../views/TourView').then((m) => ({ default: m.TourView })));
+// The mixer drawer — one strip per track and per bus, plus the master: output
+// pickers, sends and faders over `editorStore.routing`. Lazy like the views, so
+// its chunk only downloads the first time the drawer is opened.
+const MixerStrips = lazy(() => import('../audio/MixerStrips').then((m) => ({ default: m.MixerStrips })));
+
+const MIXER_MIN_PX = 120;
+const MIXER_MAX_PX = 520;
+const clampMixer = (px: number): number => Math.max(MIXER_MIN_PX, Math.min(MIXER_MAX_PX, px));
 
 const TabFallback: React.FC = () => (
   <div className="absolute inset-0 grid place-items-center">
@@ -67,6 +76,30 @@ export const DAWCenterPanel: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       });
     }
   }, [centerTab]);
+
+  // Mixer drawer — collapsed by default, and its height is LOCAL UI state: it
+  // is a view preference, not part of the document, so it never reaches
+  // editorStore / the project file. It hosts the only strips a BUS can have, so
+  // it sits under the timeline rather than inside the EDIT track-header column.
+  const [mixerOpen, setMixerOpen] = useState(false);
+  const [mixerHeight, setMixerHeight] = useState(220);
+  const mixerDragRef = useRef<{ startY: number; startH: number } | null>(null);
+  const onMixerResizeDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    mixerDragRef.current = { startY: e.clientY, startH: mixerHeight };
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+    e.preventDefault();
+  };
+  const onMixerResizeMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const d = mixerDragRef.current;
+    if (!d) return;
+    // Dragging the handle UP grows the drawer, so the delta is inverted.
+    setMixerHeight(clampMixer(d.startH + (d.startY - e.clientY)));
+  };
+  const onMixerResizeUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    mixerDragRef.current = null;
+    e.currentTarget.releasePointerCapture?.(e.pointerId);
+  };
 
   return (
     <div className="flex-1 h-full flex flex-col pt-1 px-0 pb-0 gap-2 bg-[#0a080f]/40 relative z-0 min-h-0">
@@ -188,6 +221,68 @@ export const DAWCenterPanel: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             </div>
           )}
         </div>
+
+        {/* Mixer drawer, under the timeline. Mounted on the EDIT tab only: its
+            strips are the editor document's tracks and buses, and the tab bar's
+            other workspaces (DJ, VJ, FOUNDRY …) carry their own mixers. Being a
+            sibling of the tab area — which keeps its `flex-1 min-h-0` — means
+            opening the drawer costs no layout change anywhere else. */}
+        {centerTab === 'edit' && (
+          <div className="shrink-0 flex flex-col border-t border-white/5">
+            {mixerOpen && (
+              <div
+                role="separator"
+                aria-orientation="horizontal"
+                aria-label="Resize the mixer drawer"
+                // A focusable separator is a window splitter, and a splitter
+                // reports its position: without these three a screen reader
+                // announces a handle that can be moved but never says where it
+                // is or how far it can go.
+                aria-valuenow={mixerHeight}
+                aria-valuemin={MIXER_MIN_PX}
+                aria-valuemax={MIXER_MAX_PX}
+                tabIndex={0}
+                onPointerDown={onMixerResizeDown}
+                onPointerMove={onMixerResizeMove}
+                onPointerUp={onMixerResizeUp}
+                onPointerCancel={onMixerResizeUp}
+                onKeyDown={(e) => {
+                  if (e.key === 'ArrowUp') setMixerHeight((h) => clampMixer(h + 16));
+                  else if (e.key === 'ArrowDown') setMixerHeight((h) => clampMixer(h - 16));
+                  else return;
+                  e.preventDefault();
+                }}
+                className="h-1.5 cursor-row-resize bg-white/5 hover:bg-white/15 focus:outline-hidden focus:bg-[rgb(var(--et-accent))]/40"
+                style={{ touchAction: 'none' }}
+              />
+            )}
+            <div className="flex items-center gap-2 px-2 py-1">
+              <button
+                type="button"
+                onClick={() => setMixerOpen((v) => !v)}
+                aria-label="Mixer"
+                aria-expanded={mixerOpen}
+                aria-controls="mixer-strips"
+                title="Mixer strips: outputs, buses and sends"
+                className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-mono uppercase tracking-widest text-zinc-500 hover:text-white hover:bg-white/5 focus:outline-hidden focus:ring-1 focus:ring-[rgb(var(--et-accent))]"
+              >
+                {mixerOpen ? <ChevronDown className="w-3 h-3" /> : <ChevronUp className="w-3 h-3" />}
+                mixer
+              </button>
+            </div>
+            {/* Always rendered so `aria-controls` resolves; `hidden` while
+                collapsed, which also keeps the lazy chunk unfetched. */}
+            <div id="mixer-strips" hidden={!mixerOpen} style={{ height: mixerOpen ? mixerHeight : undefined }} className="min-h-0 px-2 pb-2">
+              {mixerOpen && (
+                // Not `TabFallback`: that one is `absolute inset-0`, which in
+                // this un-positioned drawer would paint over the timeline.
+                <Suspense fallback={<span className="text-[10px] font-mono uppercase tracking-widest text-zinc-600 animate-pulse">loading…</span>}>
+                  <MixerStrips />
+                </Suspense>
+              )}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

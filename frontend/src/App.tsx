@@ -68,6 +68,8 @@ import { useFeatureToggleStore } from './state/featureToggleStore';
 import { useGanStore } from './state/ganStore';
 import { useProjectStore } from './state/projectStore';
 import { useAppUiStore } from './state/appUiStore';
+import { startRenderRunner } from './state/renderJobs';
+import { requireFeature } from './notices/featureGateStore';
 import { notifyPlacesChanged } from './lib/placesClient';
 
 import './orb-kit/styles/gantasmo-orb.css';
@@ -445,6 +447,42 @@ export default function App() {
     const stop = startPoseRouting();
     return stop;
   }, []);
+
+  // ONE render runner for the whole app. The timeline's offline renders — the
+  // master mixdown, the selection bounce, the master and per-track VST freezes —
+  // are jobs on `state/renderJobs` now, and something has to drain that queue.
+  // It cannot be EDIT: DAWCenterPanel unmounts the tab on every switch, and a
+  // mixdown the user started must keep going while they go and look at MIX.
+  // Starting it here also means a job left `running` by a reload is failed on
+  // the next boot instead of wedging the queue forever (see startRenderRunner).
+  //
+  // `runRenderJob` is reached through a DYNAMIC import: a static one would pull
+  // the whole EDIT chunk — wavesurfer, the effect stacks, the whole timeline —
+  // into the first-paint bundle that the lazy() in DAWCenterPanel exists to keep
+  // it out of. Nothing can enqueue a job without EDIT having been opened first,
+  // so by the time this resolves the chunk is already in memory.
+  useEffect(() => startRenderRunner({
+    run: async (job, onProgress, isCancelled) => {
+      let runRenderJob;
+      try {
+        ({ runRenderJob } = await import('./components/audio/WaveformEditor'));
+      } catch (e) {
+        // The chunk fetch itself failed — a stale build after a deploy, or the
+        // dev server gone. `runRenderJob` never gets to raise its own notice, so
+        // without this the job would land `failed` with a message nobody renders.
+        const message = e instanceof Error ? e.message : String(e);
+        requireFeature({
+          id: 'render:runner-unavailable',
+          kind: 'error',
+          title: 'Render engine could not be loaded',
+          message,
+          autoDismissMs: 10000,
+        });
+        throw e;
+      }
+      return runRenderJob(job, onProgress, isCancelled);
+    },
+  }), []);
 
   // OS file associations (desktop): a double-clicked .tasmo / .gan is delivered
   // by the Electron main process; route it to the right opener and show MIX.

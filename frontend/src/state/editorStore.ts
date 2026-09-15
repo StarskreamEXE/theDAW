@@ -447,13 +447,6 @@ interface EditorStoreState {
   /** How a control move is recorded: read / touch / latch / write. See
    *  lib/automationModes for what each one promises. */
   automationMode: AutomationMode;
-  /**
-   * @deprecated Derived mirror of `automationMode !== 'read'`, kept in sync in the
-   * same `set` as the mode so the consumers written against the old boolean keep
-   * working. Read `automationMode` instead — the boolean cannot tell touch from
-   * latch from write.
-   */
-  automationWrite: boolean;
   /** Targets currently held (or held-after-release) by the running record pass,
    *  keyed by `automationTargetKey`. Transient: NOT in the undo snapshot and NOT
    *  in the autosave manifest. */
@@ -611,8 +604,6 @@ interface EditorStoreState {
 
   // Automation (Phase E)
   setAutomationMode: (mode: AutomationMode) => void;
-  /** @deprecated Reaches `setAutomationMode(on ? 'latch' : 'read')`. */
-  setAutomationWrite: (on: boolean) => void;
   /** Begin a gesture on `target`: create the lane if it has none, write the first
    *  point, and hold the target. No-op in `read`. Starts a fresh undo step, so
    *  the whole gesture that follows folds into one. */
@@ -845,7 +836,6 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   frozenMaster: null,
   automationLanes: [],
   automationMode: 'read',
-  automationWrite: false,
   automationHolds: {},
   loopEnabled: false,
   loopStart: 0,
@@ -1494,9 +1484,6 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     })),
 
   setAutomationMode: (mode) =>
-    // The derived boolean is written in the SAME set as the mode, so no consumer
-    // can ever observe the two disagreeing.
-    //
     // Switching to a mode that does not record ALSO ends the pass. Neither
     // moveAutomationTouch nor advanceAutomationHolds re-checks the mode (they
     // are driven by the pointer and the frame timer and must stay cheap), so a
@@ -1504,11 +1491,8 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     // the lane until the transport stopped — the exact opposite of hands off.
     set({
       automationMode: mode,
-      automationWrite: mode !== 'read',
       ...(recordsWhileHeld(mode) ? {} : { automationHolds: {} }),
     }),
-
-  setAutomationWrite: (on) => get().setAutomationMode(on ? 'latch' : 'read'),
 
   beginAutomationTouch: (target, t, v) => {
     if (!recordsWhileHeld(get().automationMode)) return;
@@ -1634,8 +1618,7 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
 
   endAutomationPass: () =>
     set((s) => {
-      const mode = modeAfterStop(s.automationMode);
-      return { automationHolds: {}, automationMode: mode, automationWrite: mode !== 'read' };
+      return { automationHolds: {}, automationMode: modeAfterStop(s.automationMode) };
     }),
 
   setAutomationPointCurve: (laneId, index, curve, opts) => {
@@ -1815,6 +1798,115 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     return Math.max(0, Math.round(s / step) * step);
   },
 }));
+
+/* ── The lane repaint throttle ────────────────────────────────────────────────
+ *
+ * `advanceAutomationHolds` runs on the transport's frame timer and, while a
+ * latch/write pass holds anything, rewrites `automationLanes` EVERY frame. The
+ * document has to be written every frame — undo and autosave read that slice and
+ * a pass that skipped frames would record a staircase — but nothing on screen
+ * needs 40 repaints a second of a curve that is a few pixels wide, and a
+ * component subscribed to the slice re-renders on each one.
+ *
+ * So the throttle lives between the store and the VIEW rather than in the writer:
+ * the store is untouched and stays the single source of truth, and this feed
+ * republishes the same array at most once per `AUTOMATION_LANE_REPAINT_MS` WHILE
+ * holds exist. With no hold — every ordinary edit, every undo, loading a project
+ * — it publishes at once, so outside a record pass nothing ever waits on a timer.
+ * The gate is the HOLDS, not who wrote: an edit made during a pass shares the
+ * same 10 Hz window, which is the price of one rule instead of two and is
+ * invisible next to the pass repainting the lane under it anyway.
+ *
+ * `getSnapshot` is reference-stable between publishes, which is what actually
+ * stops the re-render: React (and zustand) compare with Object.is.
+ *
+ * The clock is injected so the whole thing is testable without a DOM
+ * (editorStore.automationLaneFeed.test.ts), the same way lib/gestureTracker does.
+ */
+export const AUTOMATION_LANE_REPAINT_MS = 100;
+
+export interface AutomationLaneFeedOptions {
+  getState: () => { automationLanes: AutomationLane[]; automationHolds: Record<string, AutomationHold> };
+  /** Subscribe to "something in the store changed". */
+  subscribe: (onChange: () => void) => () => void;
+  now?: () => number;
+  setTimer?: (fn: () => void, ms: number) => number;
+  clearTimer?: (handle: number) => void;
+  /** Repaint window while holds exist. Defaults to `AUTOMATION_LANE_REPAINT_MS`. */
+  repaintMs?: number;
+}
+
+export interface AutomationLaneFeed {
+  /** `useSyncExternalStore`'s subscribe: the callback fires once per publish. */
+  subscribe: (onPublish: () => void) => () => void;
+  /** The published lanes. Stable by reference until the next publish. */
+  getSnapshot: () => AutomationLane[];
+}
+
+export function createAutomationLaneFeed(opts: AutomationLaneFeedOptions): AutomationLaneFeed {
+  const now = opts.now ?? (() => performance.now());
+  const setTimer = opts.setTimer ?? ((fn: () => void, ms: number) => setTimeout(fn, ms) as unknown as number);
+  const clearTimer = opts.clearTimer ?? ((handle: number) => clearTimeout(handle));
+  const repaintMs = opts.repaintMs ?? AUTOMATION_LANE_REPAINT_MS;
+
+  let published: AutomationLane[] | null = null;
+  let publishedAt = -Infinity;
+  let timer = 0;
+  let offStore: (() => void) | null = null;
+  const listeners = new Set<() => void>();
+
+  const disarm = () => {
+    if (timer === 0) return;
+    clearTimer(timer);
+    timer = 0;
+  };
+
+  const publish = () => {
+    disarm();
+    const next = opts.getState().automationLanes;
+    if (next === published) return; // caught up already — wake nobody
+    published = next;
+    publishedAt = now();
+    for (const l of [...listeners]) l();
+  };
+
+  const onStoreChanged = () => {
+    const s = opts.getState();
+    if (s.automationLanes === published) return; // the write missed this slice
+    if (Object.keys(s.automationHolds).length === 0) { publish(); return; }
+    if (timer !== 0) return; // a repaint is already due; it will take the latest
+    const due = publishedAt + repaintMs - now();
+    if (due <= 0) { publish(); return; }
+    timer = setTimer(publish, due);
+  };
+
+  return {
+    subscribe: (onPublish) => {
+      if (listeners.size === 0) {
+        // Re-sync on the first subscriber: the lanes may have moved on while
+        // nothing was mounted, and a stale snapshot would paint the old document.
+        published = opts.getState().automationLanes;
+        publishedAt = now();
+        offStore = opts.subscribe(onStoreChanged);
+      }
+      listeners.add(onPublish);
+      return () => {
+        listeners.delete(onPublish);
+        if (listeners.size > 0) return;
+        offStore?.();
+        offStore = null;
+        disarm();
+      };
+    },
+    getSnapshot: () => (published ??= opts.getState().automationLanes),
+  };
+}
+
+/** The app-wide feed over `useEditorStore.automationLanes`. */
+export const automationLaneFeed = createAutomationLaneFeed({
+  getState: () => useEditorStore.getState(),
+  subscribe: (onChange) => useEditorStore.subscribe(() => onChange()),
+});
 
 // Record undo history whenever a tracked document slice changes. Only the FIRST
 // change of a burst captures the pre-change snapshot, so a continuous gesture (clip

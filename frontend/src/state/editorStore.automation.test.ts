@@ -53,7 +53,6 @@ const reset = (over: Partial<Parameters<typeof useEditorStore.setState>[0]> = {}
     automationLanes: [],
     automationHolds: {},
     automationMode: 'read',
-    automationWrite: false,
     ...over,
   } as never);
   useEditorStore.setState({ _undo: [], _redo: [] });
@@ -104,27 +103,18 @@ const undoSteps = (): number => st()._undo.length;
   assert.ok(Math.abs((sampleLane(down, 1) as number) - 0.9) < 1e-9, 'curve -1 leaves the start late');
 }
 
-// ── Mode ↔ the derived `automationWrite` flag ────────────────────────────────
+// ── The mode is the only record state ────────────────────────────────────────
 
-// `automationWrite` is a derived mirror of "the mode is not read", kept in sync in
-// the SAME set as the mode. The old consumers read it and must never see it lag.
+// `automationMode` is what every consumer reads. The derived `automationWrite`
+// boolean that shadowed it is gone: it could not tell touch from latch from
+// write, and "is anything armed?" is `automationMode !== 'read'`.
 {
   reset();
   assert.equal(st().automationMode, 'read', 'read is the default: nothing records until asked');
-  assert.equal(st().automationWrite, false);
-  for (const [mode, expected] of [['read', false], ['touch', true], ['latch', true], ['write', true]] as const) {
+  for (const mode of ['read', 'touch', 'latch', 'write'] as const) {
     st().setAutomationMode(mode);
     assert.equal(st().automationMode, mode);
-    assert.equal(st().automationWrite, expected, `automationWrite must mirror mode=${mode}`);
   }
-  // The legacy boolean setter is now a mode setter: "on" is latch, the mode the
-  // old comment claimed the boolean already was.
-  st().setAutomationWrite(true);
-  assert.equal(st().automationMode, 'latch');
-  assert.equal(st().automationWrite, true);
-  st().setAutomationWrite(false);
-  assert.equal(st().automationMode, 'read');
-  assert.equal(st().automationWrite, false);
 }
 
 // ── touch: records while held, punches out on release ────────────────────────
@@ -361,8 +351,7 @@ const undoSteps = (): number => st()._undo.length;
   // Stop demotes write to latch, so the NEXT pass does not silently overwrite
   // the whole project again, and clears every hold.
   st().endAutomationPass();
-  assert.equal(st().automationMode, 'latch');
-  assert.equal(st().automationWrite, true, 'the derived flag follows the demotion');
+  assert.equal(st().automationMode, 'latch', 'the demotion lands on the mode');
   assert.deepEqual(st().automationHolds, {});
 }
 

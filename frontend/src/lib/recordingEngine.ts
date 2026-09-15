@@ -209,20 +209,42 @@ export const RECORDING_ANALYSER_FFT_SIZE = 2048;
  */
 export const DEFAULT_START_TIMEOUT_MS = 5000;
 
+/** What `micConstraints` is being asked for. */
+export interface MicConstraintOptions {
+  /** SOFT device id (see below). */
+  deviceId?: string;
+  /**
+   * MUSICAL profile: the three processors OFF. Echo cancellation, noise
+   * suppression and AGC are tuned for speech — they duck sustained tones,
+   * gate quiet tails and ride the level under a crescendo, and AGC alone makes
+   * a take's own dynamics unusable. A performance is recorded flat; a voice
+   * memo is not.
+   */
+  musical?: boolean;
+}
+
 /**
  * Mic constraints, mirrored from `MicRecorder.tsx`: the device id is a SOFT
  * constraint so a mic that vanished between the enumerate and the open falls
  * back to the OS default instead of throwing, and the voice-memo processing
- * chain is on. Exported so a host can see exactly what it is getting — the
- * pitch paths deliberately force all three off, because they distort f0.
+ * chain is on by default. Exported so a host can see exactly what it is
+ * getting — the pitch paths deliberately force all three off, because they
+ * distort f0, and `{ musical: true }` is that same profile named, for a host
+ * recording a performance rather than a memo.
+ *
+ * A bare string is still the device id, which is what this engine's own
+ * `openGroup` passes: the DEFAULT stays the memo profile so nothing that
+ * already calls it changes behaviour, and the profile is the caller's choice.
  */
-export function micConstraints(deviceId?: string): MediaStreamConstraints {
+export function micConstraints(opts?: string | MicConstraintOptions): MediaStreamConstraints {
+  const { deviceId, musical = false } = typeof opts === 'string' ? { deviceId: opts } : (opts ?? {});
+  const processing = !musical;
   return {
     audio: {
       ...(deviceId ? { deviceId } : {}),
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
+      echoCancellation: processing,
+      noiseSuppression: processing,
+      autoGainControl: processing,
     },
   };
 }

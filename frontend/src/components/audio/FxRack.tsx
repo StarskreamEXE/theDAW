@@ -28,6 +28,16 @@ interface FxRackProps {
   onReorder: (from: number, to: number) => void;
   onToggle: (entryId: string) => void;
   onUpdateParams: (entryId: string, params: Record<string, number>) => void;
+  /** The gesture boundary of the entries whose panel reports one — the bespoke
+   *  SLIDE-slider panels (spatializer / owlpad / chop / gater). One start before
+   *  the first `onUpdateParams` of a drag / key press / wheel burst on that
+   *  entry's surface, one end after its last; the end may carry no change at all.
+   *  The boundary is per ENTRY, not per param key, because one surface writes
+   *  several keys (an OWL-Pad drag moves x and y). Absent, or for the
+   *  schema-driven panel (EffectControls) which reports nothing, a consumer
+   *  recording a gesture is on its own fallback. See lib/gestureTracker.ts. */
+  onParamsGestureStart?: (entryId: string) => void;
+  onParamsGestureEnd?: (entryId: string) => void;
   /** Project tempo, forwarded to the Gater's tempo-sync controls. */
   projectBpm?: number;
   /** During playback, returns the automation-sampled param overrides for an entry
@@ -57,6 +67,8 @@ export function FxRack({
   onReorder,
   onToggle,
   onUpdateParams,
+  onParamsGestureStart,
+  onParamsGestureEnd,
   projectBpm,
   displayParams,
   hideAdd,
@@ -247,6 +259,8 @@ export function FxRack({
                   params={shown}
                   idPrefix={`${idPrefix}-${entry.id}`}
                   onChange={(p) => onUpdateParams(entry.id, p)}
+                  onGestureStart={onParamsGestureStart && (() => onParamsGestureStart(entry.id))}
+                  onGestureEnd={onParamsGestureEnd && (() => onParamsGestureEnd(entry.id))}
                 />
               </div>
             ) : entry.effect === 'owlpad' ? (
@@ -255,6 +269,8 @@ export function FxRack({
                   params={shown}
                   idPrefix={`${idPrefix}-${entry.id}`}
                   onChange={(p) => onUpdateParams(entry.id, p)}
+                  onGestureStart={onParamsGestureStart && (() => onParamsGestureStart(entry.id))}
+                  onGestureEnd={onParamsGestureEnd && (() => onParamsGestureEnd(entry.id))}
                 />
               </div>
             ) : entry.effect === 'chop' ? (
@@ -263,6 +279,8 @@ export function FxRack({
                   params={shown}
                   idPrefix={`${idPrefix}-${entry.id}`}
                   onChange={(p) => onUpdateParams(entry.id, p)}
+                  onGestureStart={onParamsGestureStart && (() => onParamsGestureStart(entry.id))}
+                  onGestureEnd={onParamsGestureEnd && (() => onParamsGestureEnd(entry.id))}
                 />
               </div>
             ) : entry.effect === 'gater' ? (
@@ -272,6 +290,8 @@ export function FxRack({
                   idPrefix={`${idPrefix}-${entry.id}`}
                   projectBpm={projectBpm}
                   onChange={(p) => onUpdateParams(entry.id, p)}
+                  onGestureStart={onParamsGestureStart && (() => onParamsGestureStart(entry.id))}
+                  onGestureEnd={onParamsGestureEnd && (() => onParamsGestureEnd(entry.id))}
                 />
               </div>
             ) : (

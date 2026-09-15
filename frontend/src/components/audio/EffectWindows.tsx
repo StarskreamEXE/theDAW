@@ -201,6 +201,11 @@ export function openEffectWindow(
 
 export interface EffectWindowsHostProps {
   writeParams: (scope: { kind: 'master' } | { kind: 'track'; trackId: string }, entryId: string, params: Record<string, number>) => void;
+  /** The gesture boundary around a run of `writeParams` calls, for the entries
+   *  whose panel reports one (FxRack's bespoke SLIDE-slider panels). Per ENTRY:
+   *  one surface writes several param keys. See FxRack's `onParamsGestureStart`. */
+  gestureStart: (scope: { kind: 'master' } | { kind: 'track'; trackId: string }, entryId: string) => void;
+  gestureEnd: (scope: { kind: 'master' } | { kind: 'track'; trackId: string }, entryId: string) => void;
   displayParams: (scope: { kind: 'master' } | { kind: 'track'; trackId: string }, entryId: string) => Record<string, number> | undefined;
   openVst: (scope: FxScope, entry: ChainEntry) => void;
   projectBpm: number;
@@ -461,6 +466,8 @@ const EffectWindowCard: React.FC<{
             onReorder={() => undefined}
             onToggle={(id) => toggleEntry(win.scope, id)}
             onUpdateParams={(id, p) => host.writeParams(paramScope, id, p)}
+            onParamsGestureStart={(id) => host.gestureStart(paramScope, id)}
+            onParamsGestureEnd={(id) => host.gestureEnd(paramScope, id)}
             projectBpm={host.projectBpm}
             displayParams={(id) => host.displayParams(paramScope, id)}
           />

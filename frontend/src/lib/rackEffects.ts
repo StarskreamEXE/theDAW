@@ -134,6 +134,31 @@ export interface RackEffectDef {
    *  fixed by the spec, so there is no honest constant to put here.
    *  See `chainLatencySec`. */
   latencySec?: RackLatencySpec;
+  /**
+   * True when rendering this effect in separate `OfflineAudioContext` chunks
+   * would change the audio AUDIBLY at the seam. Each chunk is a fresh context:
+   * every node starts from silence and every clock restarts at t = 0. Three
+   * families qualify, and each declaration below names which one it is:
+   *
+   *  a. AUDIO MEMORY longer than a render quantum — a reverb tail, a feedback
+   *     delay line, a history ring the effect replays from.
+   *  b. ADAPTIVE STATE that takes time to settle — an envelope follower, a
+   *     zero-crossing/pitch tracker. It would re-converge at every seam.
+   *  c. A FREE-RUNNING GENERATOR whose phase IS the effect — a gate LFO's
+   *     rhythm, a ring modulator's carrier. Started at context time 0, it
+   *     re-phases at every seam: the pattern jumps, or the product steps.
+   *
+   * ABSENT MEANS FALSE, and two things are deliberately absent: biquad filters
+   * (two samples of memory) and `crossfeed`'s 300 us inter-aural delay (13
+   * samples at 44.1 kHz). Both carry state, but less than one 128-sample render
+   * quantum of it, so no seam can produce an artefact a listener could hear.
+   *
+   * Read by `state/renderJobs.chainIsChunkSafe`, which gates chunked rendering;
+   * a bypassed entry is routed around, so its declaration never counts.
+   * `renderJobs.test.ts` asserts the EXACT set of ids that declare this, so a
+   * new factory carrying state across a seam cannot be added without deciding.
+   */
+  chunkUnsafe?: boolean;
 }
 
 /* ── small helpers ─────────────────────────────────────────────────────────── */
@@ -1782,6 +1807,12 @@ export const RACK_EFFECTS: readonly RackEffectDef[] = [
       { label: 'Sygyt Whistle', values: { subLevel: 0.6, growlDepth: 0.4, whistleAmt: 1, whistleHz: 1900, vowel: 3.5 } },
       { label: 'Talking Bass', values: { vowel: 2, motionRate: 2.5, motionDepth: 0.9, growlDepth: 0.5, drive: 20 } },
     ],
+    // (b) ADAPTIVE STATE + (c) FREE-RUNNING GENERATOR: the subharmonic worklet
+    // holds a Schmitt-trigger sign, an envelope follower and DC-blocker memories
+    // (`public/subharmonic.worklet.js`), so the octave divider has to re-lock to
+    // the fundamental at every seam; the growl and vowel-motion oscillators
+    // re-phase on top of that.
+    chunkUnsafe: true,
     make: makeKargyraa,
   },
   {
@@ -1834,6 +1865,11 @@ export const RACK_EFFECTS: readonly RackEffectDef[] = [
       { key: 'motionDepth', label: 'Depth', min: 0, max: 8, step: 0.1, default: 1.5, unit: 'm', group: 'Motion' },
     ],
     presets: SPATIAL_PRESETS,
+    // (a) AUDIO MEMORY + (c) FREE-RUNNING GENERATOR: the HRTF `PannerNode`
+    // convolves against an impulse response, so it carries a tail; three motion
+    // LFOs run free from context time 0; and `scheduleTeleport` writes its jumps
+    // at ABSOLUTE context times, which a per-chunk context would not share.
+    chunkUnsafe: true,
     make: makeSpatializer,
   },
   {
@@ -1873,6 +1909,10 @@ export const RACK_EFFECTS: readonly RackEffectDef[] = [
       { label: 'Delay Throw', values: { program: 3, x: 0.4, y: 0.55, active: 1 } },
       { label: 'Filter + Delay', values: { program: 4, x: 0.5, y: 0.5, active: 1 } },
     ],
+    // FEEDBACK LOOP: two of its five programs (Delay Throw, Filter + Delay) are
+    // feedback delays, and the program is a param the user can move — so the pad
+    // is unsafe whichever one is selected right now, rather than conditionally.
+    chunkUnsafe: true,
     make: makeOwlPad,
   },
   {
@@ -1894,6 +1934,12 @@ export const RACK_EFFECTS: readonly RackEffectDef[] = [
       { label: 'Tremolo', values: { sync: 0, rate: 5, shape: 0, depth: 0.5 } },
       { label: 'Helicopter', values: { sync: 0, rate: 14, shape: 2, depth: 1 } },
     ],
+    // (c) FREE-RUNNING GENERATOR: the gate is an oscillator + constant-source
+    // started with `lfo.start()`, i.e. at context time 0. Its PHASE is the
+    // effect — a square gate re-phasing at a seam lands its openings somewhere
+    // else, which is the rhythm changing, not a subtlety. It carries no audio
+    // across the seam, but the re-phasing alone is plainly audible.
+    chunkUnsafe: true,
     make: makeGater,
   },
   {
@@ -1929,6 +1975,11 @@ export const RACK_EFFECTS: readonly RackEffectDef[] = [
       { label: 'Bell', values: { frequency: 1200, mix: 0.7 } },
       { label: 'Sub Tremor', values: { frequency: 30, mix: 1 } },
     ],
+    // (c) FREE-RUNNING GENERATOR: the output is the input multiplied by a
+    // carrier started at context time 0. Restarting that carrier mid-signal
+    // steps the product discontinuously — a click at every seam, and the
+    // sidebands shift phase either side of it.
+    chunkUnsafe: true,
     make: makeRingMod,
   },
   {
@@ -1950,6 +2001,11 @@ export const RACK_EFFECTS: readonly RackEffectDef[] = [
       { label: 'Beat Repeat', values: { program: 1, rate: 4, slice: 0.5 } },
       { label: 'Shuffle', values: { program: 2, rate: 2, slice: 1 } },
     ],
+    // (a) AUDIO MEMORY: the worklet keeps a 2 s ring of recent input and
+    // replays slices of it on every trigger (`public/chop.worklet.js`), so its
+    // output is literally audio from before the seam. A fresh context starts
+    // with a silent ring — the first triggers of every chunk would play nothing.
+    chunkUnsafe: true,
     make: makeChop,
   },
   {
@@ -2000,6 +2056,11 @@ export const RACK_EFFECTS: readonly RackEffectDef[] = [
     // Source: W3C Web Audio API, §1.19.4 DynamicsCompressorNode "Processing"
     // (https://webaudio.github.io/web-audio-api/), read 2026-09-15.
     latencySec: 0.006,
+    // The envelope follower's gain reduction is a function of everything that
+    // came before it, over attack/release times up to a second. A chunk boundary
+    // would restart it un-compressed at full gain, so the first moments of every
+    // chunk would pump. (Its 6 ms look-ahead pre-delay would also re-prime.)
+    chunkUnsafe: true,
     make: makeCompressor,
   },
   {
@@ -2021,6 +2082,10 @@ export const RACK_EFFECTS: readonly RackEffectDef[] = [
       { label: 'Hall', values: { decay: 3, predelay: 30, tone: 8000, wet: 0.35 } },
       { label: 'Cathedral', values: { decay: 6, predelay: 60, tone: 5000, wet: 0.45 } },
     ],
+    // TAIL: the convolver keeps ringing for `decay` seconds (up to 8) after its
+    // input stops, so audio from one chunk belongs in the next. A boundary would
+    // truncate every tail that crossed it and start the next chunk dry.
+    chunkUnsafe: true,
     make: makeReverb,
   },
   {
@@ -2042,6 +2107,10 @@ export const RACK_EFFECTS: readonly RackEffectDef[] = [
       { label: 'Dotted 1/8 @ 120', values: { time: 375, feedback: 0.45, tone: 5000, wet: 0.3 } },
       { label: 'Dub', values: { time: 450, feedback: 0.7, tone: 2000, wet: 0.4 } },
     ],
+    // FEEDBACK STATE: the delay line holds up to 2 s of audio and feeds it back
+    // at up to 0.95, so repeats outlive their source by many seconds. A fresh
+    // context starts with an empty line — every repeat crossing a seam is lost.
+    chunkUnsafe: true,
     make: makeDelay,
   },
   {
@@ -2122,6 +2191,11 @@ export const RACK_EFFECTS: readonly RackEffectDef[] = [
       { label: 'Shimmer Cloud', values: { filterOn: 0, delayOn: 0, reverbOn: 1, reverbSize: 0.9, reverbMix: 0.6, grainsOn: 1, grainsDensity: 0.7, grainsSize: 0.6, grainsSpread: 0.8, grainsMix: 0.7, gateOn: 0, freeze: 0, wetDry: 0.9 } },
       { label: 'Trance Gate', values: { filterOn: 1, filterType: 0, filterCutoff: 0.6, filterReso: 0.5, delayOn: 1, delayTime: 0.25, delayFeedback: 0.3, delayMix: 0.3, reverbOn: 0, grainsOn: 0, gateOn: 1, gateRate: 0.4, gateDepth: 0.9, freeze: 0, wetDry: 1 } },
     ],
+    // (a) AUDIO MEMORY + (c) FREE-RUNNING GENERATOR: ARES is a composite —
+    // `makeDelay` at up to 0.9 feedback, `makeReverb` at up to 8 s decay, a
+    // granular worklet holding its own buffer, and `makeGater`'s LFO — so it
+    // inherits every reason the four of them have, in one box.
+    chunkUnsafe: true,
     make: makeAres,
   },
 ];
