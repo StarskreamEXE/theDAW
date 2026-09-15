@@ -73,6 +73,11 @@ class Clip(BaseModel):
     meter_map: list[dict] | None = None
     pickup_steps: float | None = None
     lanes: list[dict] | None = None
+    # Piano-roll clips: each lane's pitch bend ([{lane, range, points: [{step,
+    # value, shape}]}], shape left out when linear, range in semitones).
+    # Defaulted, so .tasmo files written before the roll had pitch bend still
+    # validate and load with None.
+    roll_bends: list[dict] | None = None
     # Per-clip mute (the clip is skipped by playback and bounces). Defaulted so
     # .tasmo files written before this field existed still validate.
     muted: bool = False

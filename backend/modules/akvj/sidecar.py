@@ -143,6 +143,8 @@ class AkvjSidecar:
                 [sys.executable, "-c", probe],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=30,
                 env=child_env(),
             )
@@ -168,6 +170,8 @@ class AkvjSidecar:
                     cmd,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=BOOTSTRAP_TIMEOUT_SEC,
                     env=child_env(),
                 )
@@ -279,6 +283,8 @@ class AkvjSidecar:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     bufsize=1,
                 )
             except OSError as e:

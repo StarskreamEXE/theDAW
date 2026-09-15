@@ -52,6 +52,12 @@
 @utility et-ink-2 { color: rgb(var(--et-ink-2)); }
 @utility et-ink-3 { color: rgb(var(--et-ink-3)); }
 @utility et-ink-inv { color: rgb(var(--et-ink-inv)); }
+/* A latched key's legend and the dock's accent readouts: the theme accent as
+   ink on a key tile or a field, mixed 15% toward white so a 12px legend holds
+   4.5:1 on a dark tile (the default purple: 5.4:1); light themes take it darker
+   below. A latched key's bottom edge stays the pure accent. (--et-accent-ink is
+   a different colour: the ink that reads on a solid accent fill.) */
+@utility et-accent-legend { color: color-mix(in srgb, rgb(var(--et-accent)) 85%, white); }
 @utility et-border { border-color: rgb(var(--et-border)); }
 @utility et-outline { outline-color: rgb(var(--et-ink)); }
 @utility et-bg-tint { background-color: rgb(var(--et-tint) / 0.12); }
@@ -355,6 +361,19 @@ select optgroup {
 .edit-theme-scope .bg-zinc-500\/20 { background-color: rgb(var(--et-tint) / 0.20); }
 .edit-theme-scope .bg-slate-500\/30 { background-color: rgb(var(--et-tint) / 0.14); }
 
+/* Surfaces drawn over other content (a dialog across a pane, a sticky head
+   over a scrolling list, a menu) carry `et-opaque`. Brushed Steel, the
+   gradient themes and the custom image give the canvas, popup and panel tiers
+   translucent values so the backdrop shows through the panes; on an overlay
+   that shows the content underneath. These take the tier's own colour at full
+   alpha, which leaves every theme with an opaque tier unchanged.
+   Pinned by components/layout/sing/opaqueOverlays.test.ts. */
+.edit-theme-scope .et-opaque:is(.bg-\[\#07050a\], .bg-\[\#07080c\]) { background-color: rgb(from var(--et-canvas) r g b / 1); }
+.edit-theme-scope .et-opaque:is(.bg-\[\#0a080f\], .bg-\[\#0a0c14\], .bg-\[\#0d0b16\], .bg-\[\#0f0f12\],
+  .bg-\[\#101215\], .bg-\[\#111114\], .bg-zinc-950, .bg-zinc-900) { background-color: rgb(from var(--et-popup) r g b / 1); }
+.edit-theme-scope .et-opaque:is(.bg-\[\#0c0a12\], .bg-\[\#0c0a14\], .bg-\[\#15171b\], .bg-\[\#150f22\],
+  .bg-\[\#140e20\], .bg-zinc-800, .bg-zinc-700) { background-color: rgb(from var(--et-panel) r g b / 1); }
+
 /* White-opacity subtle fills → themed tint. */
 .edit-theme-scope .bg-white\/2 { background-color: rgb(var(--et-tint) / 0.02); }
 .edit-theme-scope .bg-white\/5 { background-color: rgb(var(--et-tint) / 0.05); }
@@ -492,6 +511,9 @@ select optgroup {
  * that read on dark panels become the deep -900 step, and -400/-500/-600 become
  * -700 (cool hues) / -800 (bright hues) — so tab labels, badges and status text keep their colour identity
  * and pass 4.5:1 on light surfaces. */
+/* A latched dock key's accent legend sits on a tinted tile, not the page: 20%
+ * toward black keeps it at 4.5:1 or better there (paper: 5.6:1). */
+.edit-theme-scope[data-et-light="1"] .et-accent-legend { color: color-mix(in srgb, rgb(var(--et-accent)) 80%, black); }
 .edit-theme-scope[data-et-light="1"] :is(.text-purple-50, .text-purple-100, .text-purple-200, .text-purple-300) { color: var(--color-purple-900, #581c87); }
 .edit-theme-scope[data-et-light="1"] :is(.text-purple-400, .text-purple-500, .text-purple-600) { color: var(--color-purple-700, #7e22ce); }
 .edit-theme-scope[data-et-light="1"] :is(.text-violet-50, .text-violet-100, .text-violet-200, .text-violet-300) { color: var(--color-violet-900, #4c1d95); }

@@ -34,10 +34,12 @@ interface StudioStoreState {
   setSourceFile: (file: File | null) => void;
   setOutputFormat: (format: string) => void;
   setPendingAction: (effect: string, params: Record<string, number>) => void;
-  processAudio: (payload: { effect: string; params: Record<string, number>; skipLibrary?: boolean }) => Promise<void>;
+  // `quiet` posts no STARTED, COMPLETE or FAILED status: processChain passes it
+  // for each stage and posts the chain's own statuses. The LOG lines stay.
+  processAudio: (payload: { effect: string; params: Record<string, number>; skipLibrary?: boolean; quiet?: boolean }) => Promise<void>;
   // VST3 chain stage: uploads the current audio + plugin path to
   // /api/vst/process-file (mirrors processAudio) and returns processed audio.
-  processVst: (payload: { pluginPath: string; pluginName: string; params: Record<string, number>; rawState?: string; skipLibrary?: boolean }) => Promise<void>;
+  processVst: (payload: { pluginPath: string; pluginName: string; params: Record<string, number>; rawState?: string; skipLibrary?: boolean; quiet?: boolean }) => Promise<void>;
   // Runs the enabled effects in useEffectChainStore in series over the
   // source in useAdvancedEditorSourceStore, then imports the final result
   // to the library, loads the player, and writes advancedEditorStore.outputUrl.
@@ -94,11 +96,25 @@ export const useStudioStore = create<StudioStoreState>()((set, get) => ({
   },
 
   triggerPendingProcess: async () => {
+    // One studio run at a time: EDIT's PROCESS and MIX's CHAIN share
+    // isProcessing, the source and the output, so neither starts while either
+    // runs. Checked synchronously, before the first await, so a double press
+    // cannot slip a second run in.
+    if (get().isProcessing || get().isChainProcessing) {
+      logInfo('studio', 'PROCESS ignored: a studio process is already running');
+      return;
+    }
     const { pendingEffect, pendingParams, processAudio } = get();
     await processAudio({ effect: pendingEffect, params: pendingParams });
   },
 
-  processAudio: async ({ effect, params, skipLibrary }) => {
+  processAudio: async ({ effect, params, skipLibrary, quiet }) => {
+    // A stage runs alone. processChain awaits each stage, so between its
+    // stages isProcessing is false and the chain passes this guard.
+    if (get().isProcessing) {
+      logInfo('studio', `Process ${effect} ignored: a studio process is already running`);
+      return;
+    }
     const source = get().sourceFile;
     if (!source) {
       const message = 'Load a source audio file before processing.';
@@ -113,7 +129,7 @@ export const useStudioStore = create<StudioStoreState>()((set, get) => ({
     }
 
     set({ isProcessing: true, error: null, outputUrl: null });
-    useStatusBarStore.getState().setText(`STUDIO PROCESS STARTED: ${effect}`);
+    if (!quiet) useStatusBarStore.getState().setText(`STUDIO PROCESS STARTED: ${effect}`);
     logInfo('studio', `Processing: effect=${effect} format=${get().outputFormat} source=${source.name} (${Math.round(source.size / 1024)}KB)`);
 
     const form = new FormData();
@@ -160,7 +176,7 @@ export const useStudioStore = create<StudioStoreState>()((set, get) => ({
         processHistory: [nextEntry, ...state.processHistory].slice(0, 8),
         error: null,
       }));
-      useStatusBarStore.getState().setText(`STUDIO PROCESS COMPLETE: ${effect}`);
+      if (!quiet) useStatusBarStore.getState().setText(`STUDIO PROCESS COMPLETE: ${effect}`);
 
       if (!skipLibrary) {
         const fmt = get().outputFormat;
@@ -201,12 +217,16 @@ export const useStudioStore = create<StudioStoreState>()((set, get) => ({
         message = error instanceof Error ? error.message : 'Studio process failed.';
       }
       set({ isProcessing: false, error: message });
-      useStatusBarStore.getState().setText(`STUDIO PROCESS FAILED: ${message}`);
+      if (!quiet) useStatusBarStore.getState().setText(`STUDIO PROCESS FAILED: ${message}`);
       logError('studio', `effect=${effect} FAILED — ${message}`);
     }
   },
 
-  processVst: async ({ pluginPath, pluginName, params, rawState, skipLibrary }) => {
+  processVst: async ({ pluginPath, pluginName, params, rawState, skipLibrary, quiet }) => {
+    if (get().isProcessing) {
+      logInfo('studio', `VST ${pluginName} ignored: a studio process is already running`);
+      return;
+    }
     const source = get().sourceFile;
     if (!source) {
       const message = 'Load a source audio file before processing.';
@@ -219,7 +239,7 @@ export const useStudioStore = create<StudioStoreState>()((set, get) => ({
     if (previous) URL.revokeObjectURL(previous);
 
     set({ isProcessing: true, error: null, outputUrl: null });
-    useStatusBarStore.getState().setText(`VST PROCESS STARTED: ${pluginName}`);
+    if (!quiet) useStatusBarStore.getState().setText(`VST PROCESS STARTED: ${pluginName}`);
     logInfo('studio', `POST /api/vst/process-file — ${pluginName} (${pluginPath})`);
 
     const form = new FormData();
@@ -257,7 +277,7 @@ export const useStudioStore = create<StudioStoreState>()((set, get) => ({
         processHistory: [nextEntry, ...state.processHistory].slice(0, 8),
         error: null,
       }));
-      useStatusBarStore.getState().setText(`VST PROCESS COMPLETE: ${pluginName}`);
+      if (!quiet) useStatusBarStore.getState().setText(`VST PROCESS COMPLETE: ${pluginName}`);
 
       if (!skipLibrary) {
         const fmt = get().outputFormat;
@@ -277,7 +297,7 @@ export const useStudioStore = create<StudioStoreState>()((set, get) => ({
     } catch (error) {
       const message = error instanceof Error ? error.message : 'VST process failed.';
       set({ isProcessing: false, error: message });
-      useStatusBarStore.getState().setText(`VST PROCESS FAILED: ${message}`);
+      if (!quiet) useStatusBarStore.getState().setText(`VST PROCESS FAILED: ${message}`);
       logError('studio', `vst=${pluginName} FAILED — ${message}`);
     }
   },
@@ -363,7 +383,10 @@ export const useStudioStore = create<StudioStoreState>()((set, get) => ({
           continue;
         }
         for (const entry of seg.entries) {
-          get().setSourceFile(currentFile);
+          // Stages run quiet: no STUDIO SOURCE LOADED, STARTED or COMPLETE status
+          // per stage, so one chain run posts MIX CHAIN STARTED and then its
+          // COMPLETE or FAILED. Each stage still writes its LOG lines.
+          set({ sourceFile: currentFile });
           if (entry.vst) {
             await get().processVst({
               pluginPath: entry.vst.plugin_path,
@@ -371,13 +394,21 @@ export const useStudioStore = create<StudioStoreState>()((set, get) => ({
               params: entry.params,
               rawState: entry.vst.raw_state,
               skipLibrary: true,
+              quiet: true,
             });
           } else {
-            await get().processAudio({ effect: entry.effect, params: entry.params, skipLibrary: true });
+            await get().processAudio({ effect: entry.effect, params: entry.params, skipLibrary: true, quiet: true });
           }
           const url = get().outputUrl;
-          // The per-stage call already set an error + status if this failed.
-          if (!url) return;
+          // The stage set its error and wrote its FAILED LOG line; the chain
+          // posts the failure to the bubble, naming the stage.
+          if (!url) {
+            const stageName = entry.vst ? entry.vst.plugin_name : entry.effect;
+            useStatusBarStore
+              .getState()
+              .setText(`MIX CHAIN FAILED at ${stageName}: ${get().error ?? 'no audio returned'}`, { logged: true });
+            return;
+          }
           const blob = await (await fetch(url)).blob();
           const stageName = entry.vst ? entry.vst.plugin_name : entry.effect;
           currentFile = new File([blob], `chain-${stageName}.${fmt}`, { type: blob.type });

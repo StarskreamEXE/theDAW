@@ -8,7 +8,9 @@ accompaniment, AND audio-style ("clone"/style-transfer) — all of which
 ``MagentaRT2System`` supports (see ``magenta_rt/jax/system.py``).
 
     GET  /health    -> {ready, status, model, device, sample_rate}
+    POST /cancel    -> form request_id: stop that take at its next chunk (409 from /generate)
     POST /generate  -> multipart form, returns audio/wav (48 kHz stereo, sync)
+        request_id    str    OPTIONAL name for /cancel
         prompt        str    text style (used when no audio style is given)
         duration      float  seconds (frames = duration * 25)
         temperature   float  (default 1.3)
@@ -34,6 +36,7 @@ override with THEDAW_MAGENTA_URL.
 from __future__ import annotations
 
 import base64
+import collections
 import hashlib
 import io
 import json
@@ -91,6 +94,21 @@ class Engine:
         self._embed_cache: dict[str, object] = {}
         # Current evolving piece for extend/morph: {state, emb, key, samples, sr}.
         self._gen: dict | None = None
+        # request_ids whose cancel arrived (POST /cancel), newest last. A cancel
+        # can reach the engine before its /generate does, so it is remembered.
+        self._cancelled: collections.deque[str] = collections.deque(maxlen=64)
+        self._cancel_lock = threading.Lock()
+
+    def cancel(self, request_id: str) -> None:
+        with self._cancel_lock:
+            if request_id not in self._cancelled:
+                self._cancelled.append(request_id)
+
+    def is_cancelled(self, request_id: str) -> bool:
+        if not request_id:
+            return False
+        with self._cancel_lock:
+            return request_id in self._cancelled
 
     def load(self) -> None:
         try:
@@ -195,6 +213,10 @@ ENGINE = Engine()
 app = FastAPI(title="theDAW MRT2 sidecar")
 
 
+class _Cancelled(Exception):
+    """The take's cancel arrived (POST /cancel)."""
+
+
 def _notes_state_for_window(
     timeline: list[dict], start_f: int, fps: int
 ) -> list[int] | None:
@@ -250,6 +272,15 @@ async def reset():
     return {"ok": True}
 
 
+@app.post("/cancel")
+async def cancel(request_id: str = Form(...)):
+    """Stop the take named ``request_id``: before it starts, or at its next
+    rendered chunk. Its /generate then answers 409 ``{"cancelled": true}`` and
+    the extend state keeps the piece as it was before that take."""
+    ENGINE.cancel(request_id)
+    return {"ok": True, "busy": ENGINE.lock.locked()}
+
+
 @app.post("/generate")
 async def generate(
     prompt: str = Form(""),
@@ -266,6 +297,7 @@ async def generate(
     extend: bool = Form(False),
     styles: str = Form(""),
     audio: UploadFile | None = None,
+    request_id: str = Form(""),
 ):
     if not ENGINE.ready:
         return JSONResponse(
@@ -293,8 +325,16 @@ async def generate(
         ]
     has_audio_style = any(s.get("type") == "audio" for s in style_list)
 
+    def _check() -> None:
+        if ENGINE.is_cancelled(request_id):
+            raise _Cancelled()
+
     def _run():
-        with ENGINE.lock:
+        # One take at a time; a take cancelled while it waits never starts.
+        while not ENGINE.lock.acquire(timeout=0.25):
+            _check()
+        try:
+            _check()
             t0 = time.time()
             prev = ENGINE._gen if extend else None
             emb, key = ENGINE.build_style(
@@ -324,6 +364,7 @@ async def generate(
                 nn_chunk = max(chunk, NO_NOTES_CHUNK)
                 done = 0
                 while done < total:
+                    _check()
                     n = min(nn_chunk, total - done)
                     wav, state = ENGINE.mrt.generate(frames=n, state=state, **common)
                     parts.append(np.asarray(wav.samples, dtype=np.float32))
@@ -331,6 +372,7 @@ async def generate(
             else:
                 # MIDI-conditioned accompaniment: per-chunk note states, threaded state.
                 for start_f in range(0, total, chunk):
+                    _check()
                     n = min(chunk, total - start_f)
                     ns = _notes_state_for_window(timeline, start_f, FPS)
                     wav, state = ENGINE.mrt.generate(
@@ -338,6 +380,9 @@ async def generate(
                     )
                     parts.append(np.asarray(wav.samples, dtype=np.float32))
 
+            # Cancelled after the last chunk: the take is dropped all the same,
+            # and the extend state keeps the piece as it was.
+            _check()
             seg = np.concatenate(parts, axis=0)
             sr = ENGINE.sample_rate
             if prev is not None and prev.get("samples") is not None:
@@ -352,6 +397,8 @@ async def generate(
                 "sr": sr,
             }
             compute = time.time() - t0
+        finally:
+            ENGINE.lock.release()
         buf = io.BytesIO()
         sf.write(buf, full, sr, format="WAV", subtype="PCM_16")
         return buf.getvalue(), compute, full.shape[0] / sr, seg.shape[0] / sr, sr
@@ -375,6 +422,8 @@ async def generate(
                 "X-Conditioning": cond,
             },
         )
+    except _Cancelled:
+        return JSONResponse({"error": "cancelled", "cancelled": True}, status_code=409)
     except Exception as e:  # noqa: BLE001 — return the real error to the client
         traceback.print_exc()
         return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)

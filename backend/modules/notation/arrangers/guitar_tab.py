@@ -81,9 +81,11 @@ def _resolve_tuning(
 
 
 def _read_events(midi_path: Path) -> list[_Event]:
-    from music21 import chord, converter, note  # type: ignore[import]
+    from music21 import chord, note  # type: ignore[import]
 
-    score = converter.parse(str(midi_path))
+    from ..midi_read import read_score
+
+    score = read_score(midi_path)
     try:
         score = score.quantize((4, 3), inPlace=False, recurse=True)
     except Exception as exc:  # noqa: BLE001 - quantize is best-effort

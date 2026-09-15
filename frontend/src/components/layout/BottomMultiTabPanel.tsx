@@ -9,8 +9,7 @@
  */
 import React, { useState, lazy, Suspense } from 'react';
 import {
-  Activity, Info, Piano, Layers, FolderOpen, SlidersVertical, ExternalLink, Maximize2, Minimize2,
-  FileMusic, Brush, Gauge, MicVocal, NotebookPen,
+  Info, FolderOpen, ExternalLink, Maximize2, Minimize2, FileMusic, MicVocal,
 } from 'lucide-react';
 import { AdvancedVisualizer } from '../audio/AdvancedVisualizer';
 import { StepSequencer } from '../audio/StepSequencer';
@@ -44,20 +43,20 @@ import { featureById } from '../../onboarding/featureRegistry';
  * `panel-<id>`, not here: the hover tooltip reads that entry's `what`, so the
  * sentence the help search returns and the sentence on the tab cannot drift
  * apart. This table keeps only what is the row's own business — order, label
- * and icon. Every tab lights the same way when selected: the theme's accent
+ * word alone — no icon. Every tab lights the same way when selected: the accent
  * (`--et-accent`), a 2px accent edge and a soft glow.
  */
-const TAB_DEFS: Array<{ id: BottomPanelTab; label: string; icon: React.ComponentType<{ className?: string }> }> = [
-  { id: 'levels',   label: 'Levels',    icon: Gauge },
-  { id: 'spectral', label: 'Visualize', icon: Activity },
-  { id: 'midi',     label: 'MIDI',      icon: Piano },
-  { id: 'step-seq', label: 'Sequence',  icon: Layers },
-  { id: 'draw',     label: 'DRAW',      icon: Brush },
-  { id: 'score',    label: 'Score',     icon: FileMusic },
-  { id: 'sing',     label: 'Sing',      icon: MicVocal },
-  { id: 'lyric',    label: 'Lyric',     icon: NotebookPen },
-  { id: 'details',  label: 'Details',   icon: Info },
-  { id: 'slide',    label: 'SLIDE',     icon: SlidersVertical },
+const TAB_DEFS: Array<{ id: BottomPanelTab; label: string }> = [
+  { id: 'levels',   label: 'Levels' },
+  { id: 'spectral', label: 'Visualize' },
+  { id: 'midi',     label: 'MIDI' },
+  { id: 'step-seq', label: 'Sequence' },
+  { id: 'draw',     label: 'DRAW' },
+  { id: 'score',    label: 'Score' },
+  { id: 'sing',     label: 'Sing' },
+  { id: 'lyric',    label: 'Lyric' },
+  { id: 'details',  label: 'Details' },
+  { id: 'slide',    label: 'SLIDE' },
 ];
 
 /** The selected tab: accent ink, accent edge, and a glow the drop-shadow draws
@@ -107,7 +106,6 @@ export const BottomMultiTabPanel: React.FC = () => {
       <div className="flex items-center justify-between border-b border-white/5 shrink-0 bg-black/30">
         <div className="flex overflow-x-auto no-scrollbar">
           {TAB_DEFS.map((t) => {
-            const Icon = t.icon;
             const active = activeTab === t.id;
             return (
               <button
@@ -116,10 +114,10 @@ export const BottomMultiTabPanel: React.FC = () => {
                 data-tour={`bottom-tab-${t.id}`}
                 onClick={() => setActiveTab(t.id)}
                 aria-pressed={active}
-                className={`px-3 py-1 flex items-center gap-1.5 border-b-2 text-[9px] uppercase tracking-widest font-black transition-colors whitespace-nowrap ${active ? TAB_ACTIVE : 'border-transparent et-ink-2 hover:et-ink'}`}
+                className={`px-3 py-1 flex items-center border-b-2 text-[12px] leading-[13.5px] font-display font-bold uppercase transition-colors whitespace-nowrap ${active ? TAB_ACTIVE : 'border-transparent et-ink-2 hover:et-ink'}`}
                 title={featureById(`panel-${t.id}`)?.what}
               >
-                <Icon className="w-3 h-3" /> {t.label}
+                {t.label}
               </button>
             );
           })}
@@ -138,7 +136,7 @@ export const BottomMultiTabPanel: React.FC = () => {
               <XrBusButton />
               <button
                 onClick={toggleSlideDetach}
-                className={`p-1 rounded border text-[9px] flex items-center gap-1 ${
+                className={`p-1 rounded border flex items-center gap-1 ${
                   slideWin
                     ? 'border-pink-500/50 bg-pink-500/15 text-pink-200'
                     : 'border-white/10 text-zinc-400 hover:text-zinc-100 hover:border-white/25'
@@ -223,12 +221,12 @@ export const BottomMultiTabPanel: React.FC = () => {
               <>
                 <div className="h-full flex flex-col items-center justify-center gap-3 text-pink-200">
                   <ExternalLink className="w-5 h-5" />
-                  <span className="text-[10px] font-mono uppercase tracking-widest">
+                  <span className="text-[12px] font-display font-bold uppercase">
                     SLIDE is in a separate window
                   </span>
                   <button
                     onClick={() => setSlideWin(null)}
-                    className="px-3 py-1.5 rounded border border-pink-500/40 bg-pink-500/15 text-pink-200 hover:bg-pink-500/25 text-[9px] font-black uppercase tracking-widest"
+                    className="px-3 py-1.5 rounded border border-pink-500/40 bg-pink-500/15 text-pink-200 hover:bg-pink-500/25 text-[12px] font-display font-bold uppercase"
                   >
                     Pop back in
                   </button>
@@ -240,7 +238,7 @@ export const BottomMultiTabPanel: React.FC = () => {
             ) : (
               <>
                 {popupBlocked && (
-                  <div className="absolute top-2 left-1/2 -translate-x-1/2 z-10 px-3 py-1.5 rounded border border-amber-500/50 bg-amber-500/15 text-amber-200 text-[9px] font-mono">
+                  <div className="absolute top-2 left-1/2 -translate-x-1/2 z-10 px-3 py-1.5 rounded border border-amber-500/50 bg-amber-500/15 text-amber-200 text-[12px] font-semibold">
                     Pop-up blocked — allow pop-ups for this site, then click the ⤢ button again.
                   </div>
                 )}
@@ -265,7 +263,7 @@ export const BottomMultiTabPanel: React.FC = () => {
 const DetailsPaneToggle: React.FC = () => {
   const pane = useBottomPanelStore((s) => s.detailsPane);
   const setPane = useBottomPanelStore((s) => s.setDetailsPane);
-  const btn = 'px-2.5 py-1 text-[9px] font-black uppercase tracking-[0.18em] transition-colors';
+  const btn = 'px-2.5 py-1 text-[12px] leading-[13.5px] font-display font-bold uppercase transition-colors';
   const on = 'bg-emerald-500/15 text-emerald-200 shadow-[inset_0_0_0_1px_rgba(16,185,129,0.5)]';
   const off = 'text-zinc-500 hover:text-zinc-200';
   return (
@@ -294,7 +292,7 @@ const DetailsPaneToggle: React.FC = () => {
 const SingPaneToggle: React.FC = () => {
   const pane = useBottomPanelStore((s) => s.singPane);
   const setPane = useBottomPanelStore((s) => s.setSingPane);
-  const btn = 'px-2.5 py-1 text-[9px] font-black uppercase tracking-[0.18em] transition-colors';
+  const btn = 'px-2.5 py-1 text-[12px] leading-[13.5px] font-display font-bold uppercase transition-colors';
   const on = 'bg-rose-500/15 text-rose-200 shadow-[inset_0_0_0_1px_rgba(244,63,94,0.5)]';
   const off = 'text-zinc-500 hover:text-zinc-200';
   return (
@@ -325,7 +323,7 @@ const SingPaneToggle: React.FC = () => {
 const SlideContentToggle: React.FC = () => {
   const content = useSlideStore((s) => s.content);
   const setContent = useSlideStore((s) => s.setContent);
-  const btn = 'px-2.5 py-1 text-[9px] font-black uppercase tracking-[0.18em] transition-colors';
+  const btn = 'px-2.5 py-1 text-[12px] leading-[13.5px] font-display font-bold uppercase transition-colors';
   return (
     <div className="flex items-center pr-2 shrink-0">
       <div className="flex rounded-md border border-white/10 overflow-hidden">

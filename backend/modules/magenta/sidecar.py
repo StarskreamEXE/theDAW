@@ -278,6 +278,8 @@ def gpu_info() -> dict:
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=12,
                 creationflags=_no_window_flags(),
                 env=child_env(),
@@ -385,6 +387,8 @@ def setup_state(refresh: bool = False) -> dict:
             _bash_cmd(script),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=_SETUP_PROBE_TIMEOUT,
             creationflags=_no_window_flags(),
             shell=False,
@@ -820,6 +824,25 @@ def stop_engine() -> dict:
         return {"terminated": terminated, "pkilled": pkilled}
 
 
+class GenerationCancelled(RuntimeError):
+    """The engine stopped a take because its cancel arrived (409 from /generate)."""
+
+
+async def cancel(request_id: str) -> bool:
+    """Ask the engine to stop the take for ``request_id`` at its next rendered
+    chunk (or before it starts, when it has not yet). True when the engine took
+    the cancel; False when it could not be reached or predates the route."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.post(
+                f"{SIDECAR_URL}/cancel", data={"request_id": request_id}
+            )
+            return r.status_code == 200
+    except Exception as e:
+        log.debug("Magenta sidecar cancel for %s failed: %s", request_id, e)
+        return False
+
+
 async def generate(
     *,
     prompt: str,
@@ -837,6 +860,7 @@ async def generate(
     styles: list[dict] | str | None = None,
     audio_bytes: bytes | None = None,
     audio_mime: str = "audio/wav",
+    request_id: str | None = None,
 ) -> tuple[bytes, dict]:
     """Generate audio. Returns ``(wav_bytes, meta_headers)``.
 
@@ -845,6 +869,9 @@ async def generate(
       - ``notes``: piano-roll events ``[{pitch, start, end}, ...]`` (or a JSON
         string) -> MIDI-conditioned accompaniment.
       - ``audio_bytes``: a clip whose style is embedded (clone / style-transfer).
+
+    ``request_id`` names the take for :func:`cancel`; a cancelled take raises
+    :class:`GenerationCancelled`.
 
     Sent as multipart to the extended sidecar (sidecars/magenta/server.py), which
     renders synchronously and replies with WAV bytes + ``X-RTF`` / ``X-Audio-Seconds``
@@ -867,11 +894,20 @@ async def generate(
         data["notes"] = notes if isinstance(notes, str) else json.dumps(notes)
     if styles:
         data["styles"] = styles if isinstance(styles, str) else json.dumps(styles)
+    if request_id:
+        data["request_id"] = request_id
     files = {"audio": ("style.wav", audio_bytes, audio_mime)} if audio_bytes else None
 
     # Generation can take a while for long durations; allow a long read timeout.
     async with httpx.AsyncClient(timeout=httpx.Timeout(30, read=600)) as client:
         r = await client.post(f"{SIDECAR_URL}/generate", data=data, files=files)
+        if r.status_code == 409:
+            try:
+                cancelled = bool(r.json().get("cancelled"))
+            except ValueError:
+                cancelled = False
+            if cancelled:
+                raise GenerationCancelled(request_id or "")
         r.raise_for_status()
         meta = {
             k: r.headers.get(k)

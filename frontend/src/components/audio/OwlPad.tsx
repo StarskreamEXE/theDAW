@@ -101,9 +101,10 @@ export function OwlPad({ params, onChange, idPrefix }: OwlPadProps) {
           <line x1={dotX} y1={0} x2={dotX} y2={PAD} stroke="#a855f7" strokeOpacity={engaged ? 0.4 : 0.12} strokeWidth={1} />
           <line x1={0} y1={dotY} x2={PAD} y2={dotY} stroke="#a855f7" strokeOpacity={engaged ? 0.4 : 0.12} strokeWidth={1} />
           <circle cx={dotX} cy={dotY} r={6} fill={engaged ? '#a855f7' : '#3f3f46'} stroke="#fff" strokeWidth={1} />
-          {/* axis captions */}
-          <text x={PAD / 2} y={PAD - 3} textAnchor="middle" fontSize={7} fill="#71717a" fontFamily="monospace">{labels.x}</text>
-          <text x={3} y={10} fontSize={7} fill="#71717a" fontFamily="monospace">{labels.y}</text>
+          {/* axis captions, drawn last with a dark halo so the crosshair and the
+              dot passing under a word never cut its letters */}
+          <text x={PAD / 2} y={PAD - 4} textAnchor="middle" fontSize={12} fill="#d4d4d8" stroke="#000" strokeOpacity={0.9} strokeWidth={3} strokeLinejoin="round" paintOrder="stroke" className="font-sans font-bold">{labels.x}</text>
+          <text x={4} y={14} fontSize={12} fill="#d4d4d8" stroke="#000" strokeOpacity={0.9} strokeWidth={3} strokeLinejoin="round" paintOrder="stroke" className="font-sans font-bold">{labels.y}</text>
         </svg>
 
         <div className="flex-1 flex flex-col gap-1.5 min-w-0">
@@ -113,23 +114,25 @@ export function OwlPad({ params, onChange, idPrefix }: OwlPadProps) {
             name={programId}
             value={program}
             onChange={(e) => set('program', Number(e.target.value))}
-            className="form-select px-2 py-1 text-[11px] font-mono"
+            className="form-select px-2 py-1 font-sans text-xs font-bold"
             style={{ colorScheme: 'dark' }}
           >
             {OWLPAD_PROGRAMS.map((label, i) => (
               <option key={label} value={i}>{label}</option>
             ))}
           </select>
+          {/* Fixed name with aria-pressed; the visible word flips with the state. */}
           <button
             onClick={() => set('hold', hold ? 0 : 1)}
             aria-pressed={hold}
+            aria-label="Hold"
             title={hold ? 'Hold on: the pad latches its last position' : 'Hold off: releasing the pad gates back to dry'}
-            className={`text-[10px] font-mono px-2 py-1 rounded border transition-colors ${hold ? 'border-purple-500/50 bg-purple-500/15 text-purple-100' : 'border-white/10 bg-black/30 text-zinc-400 hover:text-zinc-100'}`}
+            className={`font-display text-xs font-bold uppercase tracking-wider px-2 py-1 rounded border transition-colors ${hold ? 'border-purple-500/50 bg-purple-500/15 text-purple-100' : 'border-white/10 bg-black/30 text-zinc-400 hover:text-zinc-100'}`}
           >
             {hold ? 'HOLD' : 'GATE'}
           </button>
           <div className="flex items-center gap-2">
-            <span id={mixId} className="text-[9px] font-mono text-zinc-500 w-8 shrink-0">Mix</span>
+            <span id={mixId} className="font-sans text-xs font-bold text-zinc-400 w-8 shrink-0">Mix</span>
             <SlideTrack
               value={mix}
               min={0}
@@ -139,7 +142,7 @@ export function OwlPad({ params, onChange, idPrefix }: OwlPadProps) {
               className="flex-1"
               onChange={(v) => set('mix', v)}
             />
-            <span className="text-[9px] font-mono text-zinc-400 w-8 shrink-0 text-right tabular-nums">{mix.toFixed(2)}</span>
+            <span className="font-sans text-xs font-bold text-zinc-300 w-8 shrink-0 text-right tabular-nums">{mix.toFixed(2)}</span>
           </div>
         </div>
       </div>

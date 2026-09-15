@@ -4,6 +4,7 @@ Endpoints (mounted at /api/magenta):
     GET  /probe                   -> sidecar health (+ availability flag + state)
     POST /generate                -> start a generation job; returns {job:{id}}
     GET  /jobs/{job_id}           -> poll job status/result (mirrors the main JOBS shape)
+    POST /jobs/{job_id}/cancel    -> end a queued or running job as "cancelled"
     GET  /engine/status           -> health + install probe + machine-readable state
     POST /engine/start|stop|restart
     POST /engine/install          -> launch the consented one-time installer
@@ -46,6 +47,55 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 MAGENTA_JOBS: dict[str, dict] = {}
+
+
+class MagentaJobCancelled(Exception):
+    """A Magenta job whose cancel was requested (POST /jobs/{id}/cancel)."""
+
+
+# One event per Magenta job with a cancel request, set by cancel_job so a job
+# waiting on the engine bring-up or on a take ends at once. Kept out of
+# MAGENTA_JOBS, whose entries are returned as JSON.
+_CANCEL_EVENTS: dict[str, asyncio.Event] = {}
+
+# How long a cancelled job waits for the engine to stop its take and answer
+# before it drops the request. The engine checks between rendered chunks (1 s of
+# audio with notes, 10 s without), so a working engine answers well inside this.
+_ENGINE_CANCEL_WAIT_SEC = 30.0
+
+
+def _cancel_event(job_id: str) -> asyncio.Event:
+    event = _CANCEL_EVENTS.get(job_id)
+    if event is None:
+        event = _CANCEL_EVENTS[job_id] = asyncio.Event()
+    return event
+
+
+def _raise_if_cancelled(job_id: str) -> None:
+    job = MAGENTA_JOBS.get(job_id)
+    if job is not None and job.get("cancel_requested"):
+        raise MagentaJobCancelled(job_id)
+
+
+async def _finished_before_cancel(job_id: str, task: asyncio.Future) -> bool:
+    """Wait for ``task`` or the job's cancel, whichever comes first. True when
+    the task finished; False when the cancel came first (the task is left as it
+    is, for the caller to decide)."""
+    waiter = asyncio.ensure_future(_cancel_event(job_id).wait())
+    try:
+        await asyncio.wait({task, waiter}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        waiter.cancel()
+    return task.done()
+
+
+def _consume(task: asyncio.Future) -> None:
+    """Read a finished task's error so it is never reported as unretrieved."""
+    if not task.cancelled() and task.exception() is not None:
+        log.debug(
+            "magenta: step left behind by a cancelled job ended: %s", task.exception()
+        )
+
 
 # Serializes on-demand engine bring-up so concurrent CREATE presses don't each
 # park SA3 + spawn WSL; the first wins, the rest see it ready inside the lock.
@@ -580,6 +630,26 @@ async def get_job(job_id: str, summary: bool = False):
     return job
 
 
+@router.post("/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    """Cancel a Magenta generate job.
+
+    A queued or running job is flagged and ends as "cancelled": at once while
+    the engine is still being brought up (the bring-up runs on, so the engine is
+    ready for the next take), at the engine's next rendered chunk while a take
+    renders, or once the take is back, before anything is saved. A finished job
+    comes back as it is. The reply is the job summary without its result, so a
+    client can repeat the call until the status settles.
+    """
+    job = MAGENTA_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job.get("status") in ("queued", "running"):
+        job["cancel_requested"] = True
+        _cancel_event(job_id).set()
+    return {k: v for k, v in job.items() if k != "result"}
+
+
 @router.post("/generate")
 async def generate(
     prompt: str = Form(""),
@@ -766,32 +836,67 @@ async def _run_generate(
 
     def _on_state(state: str, stage: str) -> None:
         # Pollers read `engine_state` + `progress.stage` to say "starting the
-        # Magenta engine…" instead of a silent QUEUED for three minutes.
+        # Magenta engine…" instead of a silent QUEUED for three minutes. A
+        # bring-up that outlives its cancelled job no longer writes here.
+        if job.get("status") != "running":
+            return
         job["engine_state"] = state
         job["progress"] = {**job.get("progress", {}), "stage": stage}
 
     try:
+        _raise_if_cancelled(job_id)
         # Bring the engine up if it isn't already (parks SA3, spawns WSL, waits
-        # for the model to load). No-op when the sidecar is already serving.
-        await _bring_up_sidecar(on_state=_on_state)
+        # for the model to load). No-op when the sidecar is already serving. A
+        # cancel meanwhile ends the job at once, and the bring-up runs on:
+        # cutting off an SA3 park or a WSL spawn midway would leave either half
+        # done, and a finished bring-up leaves the engine ready for the next take.
+        bring_up = asyncio.ensure_future(_bring_up_sidecar(on_state=_on_state))
+        if not await _finished_before_cancel(job_id, bring_up):
+            bring_up.add_done_callback(_consume)
+            raise MagentaJobCancelled(job_id)
+        bring_up.result()
+        _raise_if_cancelled(job_id)
         _on_state("running", "generating")
-        wav_bytes, meta = await sidecar.generate(
-            prompt=prompt,
-            duration=duration,
-            temperature=temperature,
-            top_k=top_k,
-            cfg_musiccoca=cfg_musiccoca,
-            cfg_notes=cfg_notes,
-            cfg_drums=cfg_drums,
-            drums=drums,
-            chunk_frames=chunk_frames,
-            notes=notes,
-            seed=seed,
-            extend=extend,
-            styles=styles,
-            audio_bytes=audio_bytes,
-            audio_mime=audio_mime,
+        generate = asyncio.ensure_future(
+            sidecar.generate(
+                prompt=prompt,
+                duration=duration,
+                temperature=temperature,
+                top_k=top_k,
+                cfg_musiccoca=cfg_musiccoca,
+                cfg_notes=cfg_notes,
+                cfg_drums=cfg_drums,
+                drums=drums,
+                chunk_frames=chunk_frames,
+                notes=notes,
+                seed=seed,
+                extend=extend,
+                styles=styles,
+                audio_bytes=audio_bytes,
+                audio_mime=audio_mime,
+                request_id=job_id,
+            )
         )
+        try:
+            finished = await _finished_before_cancel(job_id, generate)
+        except BaseException:
+            generate.cancel()
+            raise
+        if not finished:
+            # The engine stops the take at its next rendered chunk and answers
+            # 409. An engine that predates its cancel route (or does not answer
+            # in time) cannot, so the request is dropped; whatever that engine
+            # still renders is never saved.
+            if await sidecar.cancel(job_id):
+                await asyncio.wait({generate}, timeout=_ENGINE_CANCEL_WAIT_SEC)
+            if not generate.done():
+                generate.cancel()
+                await asyncio.wait({generate})
+            _consume(generate)
+            raise MagentaJobCancelled(job_id)
+        wav_bytes, meta = generate.result()
+        # Cancelled while the take came back: none of it is saved.
+        _raise_if_cancelled(job_id)
         # Persist as a library entry ({job_id}_00) before reporting completion, so
         # the frontend's post-generation refresh finds it (mirrors the SA3 flow).
         try:
@@ -820,7 +925,15 @@ async def _run_generate(
                 **meta,
             },
         }
+    except (MagentaJobCancelled, sidecar.GenerationCancelled):
+        # Stopped by the user, not a failure; nothing was saved.
+        job["status"] = "cancelled"
+        job["saved_takes"] = 0
+        job["progress"] = {**job.get("progress", {}), "stage": "cancelled"}
+        log.info("magenta job %s cancelled", job_id)
     except Exception as e:
         log.exception("Magenta generation failed: %s", e)
         job["status"] = "failed"
         job["error"] = str(e)
+    finally:
+        _CANCEL_EVENTS.pop(job_id, None)

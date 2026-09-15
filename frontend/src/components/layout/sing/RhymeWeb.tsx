@@ -417,7 +417,7 @@ export const RhymeWeb: React.FC<RhymeWebProps> = ({
 
   return (
     <div
-      className="absolute inset-0 z-30 flex flex-col bg-[#07050a]"
+      className="et-opaque absolute inset-0 z-30 flex flex-col bg-[#07050a]"
       role="dialog"
       aria-modal="true"
       aria-label={`The rhyme web of ${title}`}

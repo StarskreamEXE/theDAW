@@ -13,6 +13,15 @@ Endpoints:
                                 alone, and training runs always survive).
   * GET  /api/underfit/update-status — is dada-bots/underfit ahead of us?
   * POST /api/underfit/update — pull upstream into the vendored subrepo.
+  * GET  /api/underfit/runs — the dashboard's training runs (id, name, status).
+  * POST /api/underfit/runs/{id}/kill — stop a run's training process.
+  * GET  /api/underfit/runs/{id}/config — that run's settings, shaped as the
+                                body /runs/new takes.
+  * POST /api/underfit/runs/new — start a run.
+
+The four run routes exist for the footer's TRAIN key, which starts a run from
+the last one's settings and stops the live one: the dashboard sends no CORS
+headers, so the app cannot read it directly.
 
 The module auto-spawns the dashboard at backend startup (unless
 ``theDAW_UNDERFIT_NO_AUTO_SPAWN`` is set) so the Underfit tab — which
@@ -25,7 +34,9 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from urllib.parse import quote
 
+import httpx
 from fastapi import APIRouter, HTTPException
 
 from . import sidecar, updater
@@ -34,6 +45,19 @@ from backend.core.startup import register_startup_hook
 log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["underfit"])
+
+#: The run fields the footer key reads; the dashboard's other fields stay there.
+#: ``gpu`` is here so TRAIN can put the next run on the card the last one used.
+_RUN_FIELDS = ("id", "display_name", "status", "created_at", "max_steps", "gpu")
+
+
+def _dashboard_client(timeout: float) -> httpx.Client:
+    # trust_env=False: a system proxy must never sit between two local processes.
+    return httpx.Client(timeout=timeout, trust_env=False)
+
+
+def _dashboard_url() -> str:
+    return f"http://127.0.0.1:{sidecar.resolve_config().port}"
 
 
 @router.get("/status")
@@ -68,6 +92,112 @@ def post_start() -> dict:
 def post_stop() -> dict:
     stopped = sidecar.stop()
     return {"ok": True, "stopped": stopped}
+
+
+@router.get("/runs")
+def get_runs() -> dict:
+    """The dashboard's training runs. ``reachable`` is false when the dashboard
+    did not answer, with an empty list."""
+    try:
+        with _dashboard_client(3.0) as client:
+            r = client.get(f"{_dashboard_url()}/api/runs")
+            r.raise_for_status()
+            payload = r.json()
+    except (httpx.HTTPError, ValueError) as e:
+        return {"reachable": False, "runs": [], "error": str(e)}
+    runs = [
+        {k: run.get(k) for k in _RUN_FIELDS}
+        for run in (payload if isinstance(payload, list) else [])
+        if isinstance(run, dict) and run.get("id")
+    ]
+    return {"reachable": True, "runs": runs}
+
+
+def _dashboard_body(r: httpx.Response) -> dict:
+    """The dashboard's JSON object, or {} for anything else it printed."""
+    try:
+        body = r.json()
+    except ValueError:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def _raise_for_dashboard(r: httpx.Response, body: dict) -> None:
+    """Pass the dashboard's own refusal through, with its own status and words."""
+    if r.status_code < 400:
+        return
+    message = body.get("error") or f"the dashboard answered HTTP {r.status_code}"
+    status = r.status_code if r.status_code in (400, 404, 409) else 502
+    raise HTTPException(status_code=status, detail=str(message))
+
+
+@router.post("/runs/{run_id}/kill")
+def post_kill_run(run_id: str) -> dict:
+    """Stop a training run: the dashboard kills its process group and marks it
+    killed. The dashboard's refusal (unknown run, a run that is not live) comes
+    back with its own status and message."""
+    url = f"{_dashboard_url()}/api/runs/{quote(run_id, safe='')}/kill"
+    try:
+        with _dashboard_client(15.0) as client:
+            r = client.post(url)
+    except httpx.HTTPError as e:
+        raise HTTPException(
+            status_code=503, detail=f"The Underfit dashboard did not answer: {e}"
+        ) from e
+    body = _dashboard_body(r)
+    _raise_for_dashboard(r, body)
+    return body
+
+
+@router.get("/runs/{run_id}/config")
+def get_run_config(run_id: str) -> dict:
+    """Everything needed to start the same training again.
+
+    The dashboard's own "clone settings" answer for a run — base model, dataset,
+    LoRA type, rank, alpha, include/exclude, learning rate, precision, demo
+    settings — which is exactly the body /runs/new takes. The footer's TRAIN key
+    reads it so one press repeats the last run instead of sending the user into
+    the dashboard's form to retype what it already knows.
+    """
+    url = f"{_dashboard_url()}/api/clone_settings?run_id={quote(run_id, safe='')}"
+    try:
+        with _dashboard_client(10.0) as client:
+            r = client.get(url)
+    except httpx.HTTPError as e:
+        raise HTTPException(
+            status_code=503, detail=f"The Underfit dashboard did not answer: {e}"
+        ) from e
+    body = _dashboard_body(r)
+    _raise_for_dashboard(r, body)
+    # The dashboard answers 200 with {"error": ...} for a run it cannot read.
+    if body.get("error"):
+        raise HTTPException(status_code=404, detail=str(body["error"]))
+    return body
+
+
+@router.post("/runs/new")
+def post_new_run(payload: dict) -> dict:
+    """Start a training run.
+
+    A straight pass-through of the dashboard's New Finetune body, so the footer
+    sends what the form sends and every refusal (a name already taken, a dataset
+    that is gone, no free GPU) arrives in the dashboard's own words. Training
+    takes hours, so this returns as soon as the dashboard has spawned the run.
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected a JSON object.")
+    try:
+        with _dashboard_client(60.0) as client:
+            r = client.post(f"{_dashboard_url()}/api/runs/new", json=payload)
+    except httpx.HTTPError as e:
+        raise HTTPException(
+            status_code=503, detail=f"The Underfit dashboard did not answer: {e}"
+        ) from e
+    body = _dashboard_body(r)
+    _raise_for_dashboard(r, body)
+    if body.get("error"):
+        raise HTTPException(status_code=400, detail=str(body["error"]))
+    return body
 
 
 @router.get("/update-status")

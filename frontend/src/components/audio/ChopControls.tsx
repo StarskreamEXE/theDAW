@@ -37,13 +37,13 @@ export function ChopControls({ params, onChange, idPrefix }: ChopControlsProps) 
   return (
     <div className="flex flex-col gap-1.5">
       <div className="flex items-center gap-2">
-        <label htmlFor={programId} className="text-[9px] font-mono text-zinc-500 w-16 shrink-0">Program</label>
+        <label htmlFor={programId} className="font-sans text-xs font-bold text-zinc-400 w-16 shrink-0">Program</label>
         <select
           id={programId}
           name={programId}
           value={program}
           onChange={(e) => set('program', Number(e.target.value))}
-          className="flex-1 form-select px-2 py-1 text-[11px] font-mono"
+          className="flex-1 form-select px-2 py-1 font-sans text-xs font-bold"
           style={{ colorScheme: 'dark' }}
         >
           {PROGRAMS.map((label, i) => (
@@ -53,12 +53,13 @@ export function ChopControls({ params, onChange, idPrefix }: ChopControlsProps) 
       </div>
 
       <div className="flex items-center gap-2">
-        <span className="text-[9px] font-mono text-zinc-500 w-16 shrink-0">Engage</span>
+        <span className="font-sans text-xs font-bold text-zinc-400 w-16 shrink-0">Engage</span>
         <button
           onClick={() => set('latch', latched ? 0 : 1)}
           aria-pressed={latched}
+          aria-label="Engage: latch"
           title={latched ? 'Latched: chops continuously' : 'Off: dry until you hold to chop'}
-          className={`text-[10px] font-mono px-2 py-1 rounded border transition-colors ${latched ? 'border-purple-500/50 bg-purple-500/15 text-purple-100' : 'border-white/10 bg-black/30 text-zinc-400 hover:text-zinc-100'}`}
+          className={`font-display text-xs font-bold uppercase tracking-wider px-2 py-1 rounded border transition-colors ${latched ? 'border-purple-500/50 bg-purple-500/15 text-purple-100' : 'border-white/10 bg-black/30 text-zinc-400 hover:text-zinc-100'}`}
         >
           LATCH
         </button>
@@ -69,7 +70,7 @@ export function ChopControls({ params, onChange, idPrefix }: ChopControlsProps) 
           aria-pressed={gating}
           aria-label="Hold to chop"
           title="Hold to chop: engages the effect only while pressed"
-          className={`flex-1 text-[10px] font-mono px-2 py-1 rounded border transition-colors select-none touch-none ${gating ? 'border-purple-400 bg-purple-500/30 text-white' : 'border-white/10 bg-black/30 text-zinc-400 hover:text-zinc-100'}`}
+          className={`flex-1 font-display text-xs font-bold uppercase tracking-wider px-2 py-1 rounded border transition-colors select-none touch-none ${gating ? 'border-purple-400 bg-purple-500/30 text-white' : 'border-white/10 bg-black/30 text-zinc-400 hover:text-zinc-100'}`}
         >
           HOLD TO CHOP
         </button>
@@ -94,10 +95,10 @@ function SliderRow({
   const decimals = step < 1 ? (step < 0.1 ? 2 : 1) : 0;
   return (
     <div className="flex items-center gap-2">
-      <span id={labelId} className="text-[9px] font-mono text-zinc-500 w-16 shrink-0">{label}</span>
+      <span id={labelId} className="font-sans text-xs font-bold text-zinc-400 w-16 shrink-0">{label}</span>
       <SlideTrack value={value} min={min} max={max} step={step} defaultValue={dflt}
         ariaLabelledBy={labelId} className="flex-1" onChange={onChange} />
-      <span className="text-[9px] font-mono text-zinc-400 w-16 shrink-0 text-right tabular-nums">
+      <span className="font-sans text-xs font-bold text-zinc-300 w-16 shrink-0 text-right tabular-nums">
         {value.toFixed(decimals)}{unit ? ` ${unit}` : ''}
       </span>
     </div>

@@ -1,5 +1,6 @@
 import { type NoteEvent, QuantizeValue, ScaleType, type SoundProfile } from './types';
 import { SCALES, SOUND_PROFILES } from './constants';
+import { bendRawToValue, sanitizeBendPoints, simplifyBend, trimLeadingCentre, type BendPoint } from '../../../lib/pitchBend';
 
 // --- Signal Processing Helpers ---
 
@@ -214,6 +215,90 @@ export interface MidiExportOptions {
   experimentalPitchBend?: boolean;
 }
 
+/** One pitch wheel message of the experimental slides: a tick at 480 PPQ, a value 0-16383 (8192 the centre), and `ramp` true on every message of a slide but its last. */
+export interface SlideBendEvent {
+  tick: number;
+  value: number;
+  ramp: boolean;
+}
+
+/**
+ * The experimental slides between consecutive notes (sorted by start): a centre
+ * at tick 0, then for each pair less than 100ms apart and at most an octave
+ * apart, nine messages ramping from 50ms before the first note ends to the next
+ * note's start, toward the interval (at most 2 semitones at the default range),
+ * and a centre 20ms after the next note starts. generateMidiFile writes these
+ * and slideBendPoints hands them to the piano roll.
+ */
+export const slideBendEvents = (sortedNotes: NoteEvent[], secToTicks: (sec: number) => number): SlideBendEvent[] => {
+  const out: SlideBendEvent[] = [];
+  if (sortedNotes.length <= 1) return out;
+  // Reset pitch bend at the start
+  out.push({ tick: 0, value: 8192, ramp: false });
+
+  for (let i = 0; i < sortedNotes.length - 1; i++) {
+    const currentNote = sortedNotes[i];
+    const nextNote = sortedNotes[i + 1];
+
+    const currentEnd = currentNote.startTime + currentNote.duration;
+    const gap = nextNote.startTime - currentEnd;
+
+    // Detect potential slide: notes are close (gap < 100ms) and different pitches
+    const isSlideCandidate = gap < 0.1 && gap >= -0.05; // Allow small overlap
+    const pitchDiff = nextNote.midiNote - currentNote.midiNote;
+
+    if (isSlideCandidate && pitchDiff !== 0 && Math.abs(pitchDiff) <= 12) {
+      // Standard pitch bend range is ±2 semitones (can be set via RPN, we assume default)
+      // pitchBendVal: 0 = -2 semitones, 8192 = center, 16383 = +2 semitones
+      // For larger intervals, we'll bend as much as we can (±2 semitones) then jump
+      const bendSemitones = Math.min(Math.abs(pitchDiff), 2) * Math.sign(pitchDiff);
+      // Convert semitones to pitch bend value: 8192 + (semitones * 4096)
+      const targetBend = 8192 + (bendSemitones * 4096);
+
+      const slideStartTick = secToTicks(currentEnd - 0.05); // Start slide 50ms before note ends
+      const slideEndTick = secToTicks(nextNote.startTime);
+
+      // Generate slide events (interpolate pitch bend)
+      const numSteps = 8; // 8 steps for smooth-ish slide
+      for (let step = 0; step <= numSteps; step++) {
+        const t = step / numSteps;
+        const tick = Math.round(slideStartTick + (slideEndTick - slideStartTick) * t);
+        const bendVal = Math.round(8192 + (targetBend - 8192) * t);
+        out.push({ tick: Math.max(0, tick), value: Math.max(0, Math.min(16383, bendVal)), ramp: step < numSteps });
+      }
+
+      // Reset pitch bend shortly after the next note starts
+      out.push({ tick: secToTicks(nextNote.startTime + 0.02), value: 8192, ramp: false });
+    }
+  }
+  return out;
+};
+
+/** The bend range the experimental slides assume (the General MIDI default). */
+export const V2M_BEND_RANGE = 2;
+
+/**
+ * The slides generateMidiFile writes for `notes` at `bpm`, as a piano-roll bend
+ * curve on the roll's step grid (a 16th is 120 ticks at 480 PPQ): each ramp one
+ * linear segment, each centre a hold, in the order the file plays them. Use it
+ * with a range of V2M_BEND_RANGE.
+ */
+export const slideBendPoints = (notes: NoteEvent[], bpm: number): BendPoint[] => {
+  const ticksPerBeat = 480;
+  const sorted = [...notes].sort((a, b) => a.startTime - b.startTime);
+  const secToTicks = (sec: number) => Math.round(sec * (bpm / 60) * ticksPerBeat);
+  // The file sorts its messages by tick and keeps their order at one tick; the later one at a tick is the one in force.
+  const ordered = slideBendEvents(sorted, secToTicks)
+    .map((e, i) => ({ e, i }))
+    .sort((a, b) => a.e.tick - b.e.tick || a.i - b.i)
+    .map(({ e }) => e);
+  const points = sanitizeBendPoints(
+    ordered.map((e) => ({ step: e.tick / (ticksPerBeat / 4), value: bendRawToValue(e.value), shape: e.ramp ? ('linear' as const) : ('hold' as const) })),
+    'v2m',
+  );
+  return simplifyBend(trimLeadingCentre(points)).map((p, i) => ({ ...p, id: `v2m-${i}` }));
+};
+
 export const generateMidiFile = (
   notes: NoteEvent[],
   bpm: number,
@@ -282,56 +367,9 @@ export const generateMidiFile = (
   });
 
   // 3. EXPERIMENTAL: Add Pitch Bend for slides between consecutive notes
-  if (experimentalPitchBend && sortedNotes.length > 1) {
-    // Reset pitch bend at the start
-    events.push({ tick: 0, type: 'pitchbend', val: 0, pitchBendVal: 8192 });
-
-    for (let i = 0; i < sortedNotes.length - 1; i++) {
-      const currentNote = sortedNotes[i];
-      const nextNote = sortedNotes[i + 1];
-
-      const currentEnd = currentNote.startTime + currentNote.duration;
-      const gap = nextNote.startTime - currentEnd;
-
-      // Detect potential slide: notes are close (gap < 100ms) and different pitches
-      const isSlideCandidate = gap < 0.1 && gap >= -0.05; // Allow small overlap
-      const pitchDiff = nextNote.midiNote - currentNote.midiNote;
-
-      if (isSlideCandidate && pitchDiff !== 0 && Math.abs(pitchDiff) <= 12) {
-        // Calculate slide parameters
-        // Standard pitch bend range is ±2 semitones (can be set via RPN, we assume default)
-        // pitchBendVal: 0 = -2 semitones, 8192 = center, 16383 = +2 semitones
-        // For larger intervals, we'll bend as much as we can (±2 semitones) then jump
-
-        const bendSemitones = Math.min(Math.abs(pitchDiff), 2) * Math.sign(pitchDiff);
-        // Convert semitones to pitch bend value: 8192 + (semitones * 4096)
-        const targetBend = 8192 + (bendSemitones * 4096);
-
-        const slideStartTick = secToTicks(currentEnd - 0.05); // Start slide 50ms before note ends
-        const slideEndTick = secToTicks(nextNote.startTime);
-
-        // Generate slide events (interpolate pitch bend)
-        const numSteps = 8; // 8 steps for smooth-ish slide
-        for (let step = 0; step <= numSteps; step++) {
-          const t = step / numSteps;
-          const tick = Math.round(slideStartTick + (slideEndTick - slideStartTick) * t);
-          const bendVal = Math.round(8192 + (targetBend - 8192) * t);
-          events.push({
-            tick: Math.max(0, tick),
-            type: 'pitchbend',
-            val: 0,
-            pitchBendVal: Math.max(0, Math.min(16383, bendVal))
-          });
-        }
-
-        // Reset pitch bend shortly after the next note starts
-        events.push({
-          tick: secToTicks(nextNote.startTime + 0.02),
-          type: 'pitchbend',
-          val: 0,
-          pitchBendVal: 8192
-        });
-      }
+  if (experimentalPitchBend) {
+    for (const e of slideBendEvents(sortedNotes, secToTicks)) {
+      events.push({ tick: e.tick, type: 'pitchbend', val: 0, pitchBendVal: e.value });
     }
   }
 

@@ -28,6 +28,7 @@ import {
 import { NOTE_NAMES, SOUND_PROFILES, GENRE_PROFILES } from './constants';
 import {
   detectPitch, frequencyToMidi, cleanupNotes, snapToScale, processNotesWithProfile, generateMidiFile,
+  slideBendPoints, V2M_BEND_RANGE,
 } from './audioProcessing';
 import { quantizeNotes, transposeNotes, snapNotesToScale, changeKey, getKeyName } from './midiEditor';
 import { detectKeyAndScale, getRelatedKeys } from './musicTheory';
@@ -46,7 +47,7 @@ import { describeMicFailure } from '../../../lib/micErrors';
 import { getEngineCtx } from '../../../state/playerStore';
 import { surfaceDeviceId, useIoDevicesStore } from '../../../state/ioDevicesStore';
 import { InstrumentPicker } from '../InstrumentPicker';
-import { KEY_ON, KEY_REST, MINI_ICON_KEY, STRIP_ICON_KEY, keyTone } from '../midiDockKit';
+import { KEY_ON, KEY_REST, MINI_ICON_KEY, STRIP_ICON_KEY, keyTone, useDockTip } from '../midiDockKit';
 
 const HISTORY_KEY = 'vocal2midi_recordings';
 
@@ -105,18 +106,18 @@ const Section: React.FC<{ title: string; defaultOpen?: boolean; children: React.
   title, defaultOpen = true, children,
 }) => (
   <details open={defaultOpen} className="rounded border border-white/10 bg-black/30">
-    <summary className="cursor-pointer select-none px-2 py-1 text-[9px] font-mono font-bold uppercase tracking-widest et-ink-2 hover:et-ink">
+    <summary className="cursor-pointer select-none px-2 py-1 text-[12px] font-display font-extrabold uppercase et-ink-2 hover:et-ink">
       {title}
     </summary>
     <div className="px-2 pb-2 pt-1 space-y-1.5">{children}</div>
   </details>
 );
 
-const labelCls = 'text-[9px] font-mono uppercase tracking-wide text-zinc-400';
-const selectCls = 'w-full bg-zinc-800 border border-zinc-600 rounded text-[10px] font-mono text-zinc-100 px-1 py-0.5';
+const labelCls = 'text-[12px] font-display font-bold uppercase text-zinc-400';
+const selectCls = 'w-full bg-zinc-800 border border-zinc-600 rounded text-[12px] font-semibold text-zinc-100 px-1 py-0.5';
 // The MIDI dock's key grammar (midiDockKit): a chip's label is always an
 // element, so a disabled chip dims its label and keeps its cap.
-const chip = 'h-5 px-1.5 inline-flex items-center gap-1 rounded-xs border-b text-[10px] font-mono transition-[color,box-shadow,border-color] cursor-pointer disabled:cursor-default disabled:*:opacity-40';
+const chip = 'h-5 px-1.5 inline-flex items-center gap-1 rounded-xs border-b text-[12px] font-display font-bold uppercase transition-[color,box-shadow,border-color] cursor-pointer disabled:cursor-default disabled:*:opacity-40';
 const chipOff = KEY_REST;
 const chipOn = KEY_ON;
 
@@ -197,9 +198,21 @@ export const Vocal2MidiPanel: React.FC = () => {
 
   const bpm = audioAnalysis?.detectedBpm || config.manualBpm || 120;
 
+  // With Pitch bend on, the slides the MIDI export writes go to the roll's lane
+  // A at the range that export assumes. A write replaces every note in the roll,
+  // so every other lane's points go and keep their range; with no slides,
+  // importNotes clears every lane's points itself.
+  const pitchBendRef = useRef(config.experimentalPitchBend);
+  useEffect(() => { pitchBendRef.current = config.experimentalPitchBend; }, [config.experimentalPitchBend]);
+
   /** Write notes into theDAW's existing piano roll. */
   const applyToRoll = useCallback((notes: NoteEvent[], atBpm: number) => {
-    usePianoRollStore.getState().importNotes(toPianoNotes(notes, atBpm), atBpm);
+    const roll = usePianoRollStore.getState();
+    const points = pitchBendRef.current ? slideBendPoints(notes, atBpm) : [];
+    const bends = points.length
+      ? [...roll.bends.filter((b) => b.lane !== 0).map((b) => ({ ...b, points: [] })), { lane: 0, range: V2M_BEND_RANGE, points }]
+      : undefined;
+    roll.importNotes(toPianoNotes(notes, atBpm), atBpm, undefined, bends);
   }, []);
 
   /* ── recorder (ported YIN capture) ─────────────────────────────────────── */
@@ -493,27 +506,43 @@ export const Vocal2MidiPanel: React.FC = () => {
   const patch = (p: Partial<ProcessingConfig>) => setConfig((prev) => ({ ...prev, ...p }));
   const relatedKeys = config.scale !== ScaleType.CHROMATIC ? getRelatedKeys(config.rootNote, config.scale).slice(0, 4) : [];
 
+  // Header keys name themselves in DockTips. Only one of the two layouts is
+  // mounted, so the record tip serves whichever record key is showing.
+  const recName = isRecording ? 'Stop recording' : 'Record';
+  const recTip = useDockTip({
+    word: isRecording ? 'Stop' : 'Record',
+    description: isRecording ? 'Stop and write the take into the piano roll' : 'Record with live pitch detection into the piano roll',
+    label: recName,
+  });
+  const expandTip = useDockTip({ word: 'Expand', description: 'Open the Voice column', label: 'Expand Vocal2MIDI' });
+  const collapseTip = useDockTip({ word: 'Collapse', description: 'Fold the Voice column to a narrow strip', label: 'Collapse Vocal2MIDI' });
+
   /* ── render ────────────────────────────────────────────────────────────── */
+  // data-dock-aside on both forms: a dock card opened from the strip above (MAP) keeps off this column.
   if (collapsed) {
     return (
-      <div className="h-full w-9 shrink-0 border-l border-white/8 bg-zinc-950 flex flex-col items-center gap-1.5 py-1">
-        <button type="button" onClick={() => setCollapsed(false)} title="Expand Voice" aria-label="Expand Vocal2MIDI"
+      <div data-dock-aside="" className="h-full w-9 shrink-0 border-l border-white/8 bg-zinc-950 flex flex-col items-center gap-1.5 py-1">
+        <button ref={expandTip.anchorRef} type="button" onClick={() => setCollapsed(false)} aria-label="Expand Vocal2MIDI"
+          aria-describedby={expandTip.describedBy}
           className={`${MINI_ICON_KEY} ${KEY_REST}`}><ChevronRight aria-hidden="true" className="w-3 h-3 rotate-180" /></button>
-        <button type="button" onClick={() => (isRecording ? void stopRecording() : void startRecording())}
-          title={isRecording ? 'Stop' : 'Record'} aria-label={isRecording ? 'Stop recording' : 'Record'}
+        {expandTip.tip}
+        <button ref={recTip.anchorRef} type="button" onClick={() => (isRecording ? void stopRecording() : void startRecording())}
+          aria-label={recName} aria-describedby={recTip.describedBy}
           className={`${STRIP_ICON_KEY} ${keyTone({ rec: isRecording })}`}>
           {isRecording ? <Square aria-hidden="true" className="w-3 h-3" /> : <Mic aria-hidden="true" className="w-3 h-3" />}
         </button>
-        <span className="text-[8px] font-mono uppercase et-ink-3 [writing-mode:vertical-rl] rotate-180 tracking-widest">Voice</span>
+        {recTip.tip}
+        <span className="text-[12px] font-display font-bold uppercase et-ink-3 [writing-mode:vertical-rl] rotate-180">Voice</span>
       </div>
     );
   }
 
   return (
-    <div className="h-full w-72 shrink-0 border-l border-white/8 bg-zinc-950 flex flex-col min-h-0">
-      {/* header — 22px, level with the piano roll's ruler */}
-      <div className="shrink-0 h-5.5 flex items-center gap-1 pl-2 pr-0.5 border-b border-white/5 bg-black/60">
-        <span className="text-[8px] font-mono font-semibold uppercase tracking-widest et-ink-3" title="Vocal2MIDI">Voice</span>
+    <div data-dock-aside="" className="h-full w-72 shrink-0 border-l border-white/8 bg-zinc-950 flex flex-col min-h-0">
+      {/* header — 22px, level with the piano roll's ruler; data-dock-ceiling: the
+          SHAPE row's above cards keep their tops below it */}
+      <div data-dock-ceiling="" className="shrink-0 h-5.5 flex items-center gap-1 pl-2 pr-0.5 border-b border-white/5 bg-black/60">
+        <span className="text-[12px] font-display font-bold uppercase et-ink-3" title="Vocal2MIDI">Voice</span>
         <div className="flex-1" />
         {/* AI assistant: a key here, its chat opens over the page — drives
             config + the piano-roll notes */}
@@ -534,15 +563,19 @@ export const Vocal2MidiPanel: React.FC = () => {
             onInstrumentChange: (inst) => { void getMidiSynth().setInstrument(inst as Parameters<ReturnType<typeof getMidiSynth>['setInstrument']>[0]); },
           }}
         />
-        <button type="button" onClick={() => (isRecording ? void stopRecording() : void startRecording())}
-          disabled={isProcessing}
-          aria-label={isRecording ? 'Stop recording' : 'Record'}
-          title={isRecording ? 'Stop recording' : 'Record (live pitch detection to the piano roll)'}
+        {/* aria-disabled while a take converts, so the key keeps keyboard focus; a press waits for it. */}
+        <button ref={recTip.anchorRef} type="button" onClick={() => { if (!isProcessing) { if (isRecording) void stopRecording(); else void startRecording(); } }}
+          aria-disabled={isProcessing || undefined}
+          aria-label={recName}
+          aria-describedby={recTip.describedBy}
           className={`${MINI_ICON_KEY} ${keyTone({ rec: isRecording })}`}>
           {isProcessing ? <Loader2 aria-hidden="true" className="w-3 h-3 animate-spin" /> : isRecording ? <Square aria-hidden="true" className="w-2.5 h-2.5" /> : <Mic aria-hidden="true" className="w-3 h-3" />}
         </button>
-        <button type="button" onClick={() => setCollapsed(true)} title="Collapse" aria-label="Collapse Vocal2MIDI"
+        {recTip.tip}
+        <button ref={collapseTip.anchorRef} type="button" onClick={() => setCollapsed(true)} aria-label="Collapse Vocal2MIDI"
+          aria-describedby={collapseTip.describedBy}
           className={`${MINI_ICON_KEY} ${KEY_REST}`}><ChevronRight aria-hidden="true" className="w-3 h-3" /></button>
+        {collapseTip.tip}
       </div>
 
       <div className="flex-1 min-h-0 overflow-y-auto p-2 space-y-2">
@@ -552,31 +585,31 @@ export const Vocal2MidiPanel: React.FC = () => {
             <label htmlFor="v2m-sens" className={labelCls}>Sensitivity</label>
             <input id="v2m-sens" name="v2m-sens" type="range" min={0} max={100} value={config.sensitivity}
               onChange={(e) => patch({ sensitivity: parseInt(e.target.value, 10) })} className="flex-1 accent-[rgb(var(--et-accent))]" />
-            <span className="w-8 text-right text-[9px] font-mono et-ink">{config.sensitivity}%</span>
+            <span className="w-8 text-right text-[12px] font-bold et-ink tabular-nums">{config.sensitivity}%</span>
           </div>
-          <label htmlFor="v2m-cleanup" className="flex items-center gap-1.5 text-[10px] text-zinc-300">
+          <label htmlFor="v2m-cleanup" className="flex items-center gap-1.5 text-[12px] font-semibold text-zinc-300">
             <input type="checkbox" id="v2m-cleanup" name="v2m-cleanup" checked={config.enableCleanup} onChange={(e) => patch({ enableCleanup: e.target.checked })} className="accent-[rgb(var(--et-accent))]" />
             Note cleanup
           </label>
-          <label htmlFor="v2m-pitchbend" className="flex items-center gap-1.5 text-[10px] text-zinc-300">
+          <label htmlFor="v2m-pitchbend" className="flex items-center gap-1.5 text-[12px] font-semibold text-zinc-300">
             <input type="checkbox" id="v2m-pitchbend" name="v2m-pitchbend" checked={config.experimentalPitchBend} onChange={(e) => patch({ experimentalPitchBend: e.target.checked })} className="accent-[rgb(var(--et-accent))]" />
             Pitch bend (experimental)
           </label>
-          <span className="block text-[9px] font-mono text-zinc-500 truncate" title={status}>{status}</span>
+          <span className="block text-[12px] font-semibold text-zinc-500 truncate" title={status}>{status}</span>
         </Section>
 
         <Section title="Musical">
           <div className="flex items-center gap-2">
-            <label htmlFor="v2m-autokey" className="flex items-center gap-1.5 text-[10px] text-zinc-300 flex-1">
+            <label htmlFor="v2m-autokey" className="flex items-center gap-1.5 text-[12px] font-semibold text-zinc-300 flex-1">
               <input type="checkbox" id="v2m-autokey" name="v2m-autokey" checked={config.autoKeyDetection} onChange={(e) => patch({ autoKeyDetection: e.target.checked })} className="accent-[rgb(var(--et-accent))]" />
               Auto key
             </label>
-            <label htmlFor="v2m-autobpm" className="flex items-center gap-1.5 text-[10px] text-zinc-300 flex-1">
+            <label htmlFor="v2m-autobpm" className="flex items-center gap-1.5 text-[12px] font-semibold text-zinc-300 flex-1">
               <input type="checkbox" id="v2m-autobpm" name="v2m-autobpm" checked={config.useGeminiForBpm} onChange={(e) => patch({ useGeminiForBpm: e.target.checked })} className="accent-[rgb(var(--et-accent))]" />
               Auto BPM (AI)
             </label>
           </div>
-          {detectedKeyString && <span className="block text-[9px] font-mono text-[rgb(var(--et-accent))]">key: {detectedKeyString}</span>}
+          {detectedKeyString && <span className="block text-[12px] font-semibold text-[rgb(var(--et-accent))]">key: {detectedKeyString}</span>}
           <div className="grid grid-cols-2 gap-1.5">
             <div>
               <label htmlFor="v2m-root" className={labelCls}>Root</label>
@@ -606,7 +639,7 @@ export const Vocal2MidiPanel: React.FC = () => {
           </div>
           <div>
             <span className={labelCls}>Quantize</span>
-            <div className="flex gap-1 mt-0.5">
+            <div className="flex flex-wrap gap-1 mt-0.5">
               <button type="button" onClick={() => patch({ quantizeMode: 'AUTO' })} className={`${chip} ${config.quantizeMode === 'AUTO' ? chipOn : chipOff}`}><span>Auto</span></button>
               <button type="button" onClick={() => patch({ quantizeMode: 'MANUAL' })} className={`${chip} ${config.quantizeMode === 'MANUAL' ? chipOn : chipOff}`}><span>Manual</span></button>
               {config.quantizeMode === 'MANUAL' && (
@@ -652,19 +685,20 @@ export const Vocal2MidiPanel: React.FC = () => {
               ))}
             </div>
           )}
-          <div className="text-[9px] font-mono text-zinc-500">current: {getKeyName(config.rootNote, config.scale)} · {processedNotes.length} notes</div>
+          <div className="text-[12px] font-semibold text-zinc-500">current: {getKeyName(config.rootNote, config.scale)} · {processedNotes.length} notes</div>
         </Section>
 
         <Section title="AI">
+          <label htmlFor="v2m-prompt" className="sr-only">AI prompt</label>
           <input id="v2m-prompt" name="v2m-prompt" type="text" value={config.prompt} onChange={(e) => patch({ prompt: e.target.value })}
-            placeholder="AI context / instruction (optional)" aria-label="AI prompt"
-            className="w-full bg-zinc-800 border border-zinc-600 rounded text-[10px] text-zinc-100 px-1.5 py-1" />
+            placeholder="AI context / instruction (optional)"
+            className="w-full bg-zinc-800 border border-zinc-600 rounded text-[12px] font-semibold text-zinc-100 px-1.5 py-1" />
           <button type="button" onClick={() => void handleSmartCleanup()} disabled={isSmartCleaning || !lastBlobRef.current || processedNotes.length === 0}
-            className={`${chip} ${chipOff} w-full justify-center uppercase tracking-wide`}>
+            className={`${chip} ${chipOff} w-full justify-center`}>
             {isSmartCleaning ? <Loader2 aria-hidden="true" className="w-3 h-3 animate-spin" /> : <Wand2 aria-hidden="true" className="w-3 h-3" />} <span>Smart cleanup (AI)</span>
           </button>
-          {lastCleanupSummary && <span className="block text-[9px] text-zinc-400 wrap-break-word">{lastCleanupSummary}</span>}
-          <span className="block text-[8px] font-mono text-zinc-600">AI uses theDAW's Gemini (gemini-3.5-flash). Needs GEMINI_API_KEY set on the server.</span>
+          {lastCleanupSummary && <span className="block text-[12px] font-semibold text-zinc-400 wrap-break-word">{lastCleanupSummary}</span>}
+          <span className="block text-[12px] font-semibold text-zinc-600">AI uses theDAW's Gemini (gemini-3.5-flash). Needs GEMINI_API_KEY set on the server.</span>
         </Section>
 
         <Section title="Play & export" defaultOpen={false}>

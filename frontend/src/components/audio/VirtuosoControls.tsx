@@ -13,7 +13,7 @@
  * orb clearance and its single line on both faces.
  */
 import React from 'react';
-import { Camera, ChevronLeft, ChevronRight, Columns3, ListMusic, Plus, RotateCcw, Ruler, Section as SectionGlyph, X } from 'lucide-react';
+import { Camera, ChevronLeft, ChevronRight, LayoutTemplate, ListMusic, Plus, RotateCcw, Ruler, Section as SectionGlyph, X } from 'lucide-react';
 import { useVirtuosoStore } from '../../state/virtuosoStore';
 import { LibraryPicker, MIDI_ONLY_TABS } from './LibraryPicker';
 import { MeterFace } from './MeterFace';
@@ -34,16 +34,18 @@ import {
   DockFlyout,
   FIELD,
   FIELD_LEGEND,
+  FIELD_SELECT,
+  FIELD_SHRINK,
   FIELD_VALUE,
   FLYOUT_CARD,
+  FLYOUT_KEY,
   KEY_REST,
+  MINI_GLYPH,
   MINI_ICON_KEY,
-  MINI_KEY,
-  RANGE,
-  STRIP_KEY,
+  RANGE_FILL,
+  STRIP_GLYPH,
   Sep,
   StripKey,
-  keyTone,
   useOrbClearance,
   useStoredToggle,
 } from './midiDockKit';
@@ -68,7 +70,7 @@ const SLIDERS: Array<{ k: keyof VirtuosoAmounts; legend: string; label: string }
 ];
 
 const sectionField =
-  'h-4 bg-black/50 border border-white/10 rounded-xs px-1 text-[9px] font-mono text-zinc-200 outline-none';
+  'h-5 bg-black/50 border border-white/10 rounded-xs px-1 text-[12px] font-semibold tabular-nums text-zinc-200 outline-none';
 
 const SongStructure: React.FC = () => {
   // Select raw state and derive the effective list with useMemo — calling
@@ -91,16 +93,16 @@ const SongStructure: React.FC = () => {
   return (
     <div className="flex flex-col gap-1.5 p-2">
       <div className="flex items-center gap-2">
-        <span className="text-[9px] font-black uppercase tracking-[0.18em] et-ink">Form</span>
+        <span className="text-[12px] font-display font-extrabold uppercase et-ink">Form</span>
         <span
-          className="inline-flex items-center gap-0.5 text-[10px] font-mono et-ink-2 tabular-nums"
+          className="inline-flex items-center gap-0.5 text-[12px] font-bold et-ink-2 tabular-nums"
           title={custom ? `Sections: ${sections.length}` : `Sections: ${sections.length}, the style's default`}
         >
           <SectionGlyph aria-hidden="true" className="w-3 h-3 et-ink-3" />
           <span>{sections.length}</span>
           <span className="sr-only">sections</span>
         </span>
-        <span className="inline-flex items-center gap-0.5 text-[10px] font-mono et-ink-2 tabular-nums" title={`Bars: ${totalBars}`}>
+        <span className="inline-flex items-center gap-0.5 text-[12px] font-bold et-ink-2 tabular-nums" title={`Bars: ${totalBars}`}>
           <Ruler aria-hidden="true" className="w-3 h-3 et-ink-3" />
           <span>{totalBars}</span>
           <span className="sr-only">bars</span>
@@ -111,7 +113,7 @@ const SongStructure: React.FC = () => {
           onClick={addSection}
           aria-label="Add a section"
           title="Add a section"
-          className={`${MINI_KEY} ${KEY_REST}`}
+          className={`${FLYOUT_KEY} ${KEY_REST}`}
         >
           <Plus aria-hidden="true" className="w-3 h-3" />
           <span>Add</span>
@@ -121,7 +123,7 @@ const SongStructure: React.FC = () => {
           onClick={resetSections}
           aria-label="Reset the form"
           title="Discard the custom layout and follow the style's default structure."
-          className={`${MINI_KEY} ${KEY_REST}`}
+          className={`${FLYOUT_KEY} ${KEY_REST}`}
         >
           <RotateCcw aria-hidden="true" className="w-3 h-3" />
           <span>Reset</span>
@@ -130,7 +132,7 @@ const SongStructure: React.FC = () => {
       <div className="flex flex-wrap gap-1">
         {sections.map((sec, i) => (
           <div key={i} className="flex items-center gap-0.5 rounded-xs border border-white/10 bg-white/3 px-1 py-0.5">
-            <span className="text-[8px] font-mono et-ink-3 w-3 text-right">{i + 1}</span>
+            <span className="text-[12px] font-bold et-ink-3 w-4 text-right tabular-nums">{i + 1}</span>
             <button
               type="button"
               className={`${MINI_ICON_KEY} ${KEY_REST}`}
@@ -232,35 +234,35 @@ export const VirtuosoControls: React.FC<{ songEntryId?: string; onStatus?: (text
 
   return (
     <>
-      {/* data-note-obstacle: the bottom strip's feature notes keep their cards off this row's keys. */}
+      {/* data-note-obstacle: the bottom strip's feature notes keep their cards off this row's keys.
+          data-dock-floor: every dock card (MAP below the strip, FORM and GEN above this
+          row's keys, the rail's cards beside their keys) ends 4px above this row.
+          @container: the groove name reads the row's content width (orb padding excluded). */}
       <div
         ref={rowRef}
         data-note-obstacle
+        data-dock-floor=""
         style={orb.left || orb.right ? { paddingLeft: orb.left || undefined, paddingRight: orb.right || undefined } : undefined}
-        className="shrink-0 h-7.5 flex flex-nowrap items-center gap-1 px-1.5 border-t border-white/8 bg-black/40"
+        className="@container shrink-0 h-9 flex flex-nowrap items-center gap-1 px-1.5 border-t border-white/8 bg-black/40"
         role="group"
         aria-label={meterFace ? 'Meter: time signatures, lanes and generators' : 'Shape: virtuoso transforms'}
       >
         <div role="group" aria-label="Row" className="shrink-0 inline-flex gap-px">
-          <button
-            type="button"
+          <StripKey
             aria-pressed={!meterFace}
-            title="Shape: the virtuoso transforms"
-            className={`${STRIP_KEY} ${keyTone({ on: !meterFace })}`}
+            description="Morph the piano roll into virtuoso lines. Dial each amount; the roll re-renders live from the captured source."
+            on={!meterFace}
             onClick={() => setMeterFace(false)}
-          >
-            <span>Shape</span>
-          </button>
-          <button
-            type="button"
+            legend="Shape"
+          />
+          <StripKey
             data-tour="midi-meter"
             aria-pressed={meterFace}
-            title="Meter: time signatures, groups, lanes, syncopation and generators"
-            className={`${STRIP_KEY} ${keyTone({ on: meterFace })}`}
+            description="Time signatures, groups, lanes, syncopation and generators"
+            on={meterFace}
             onClick={() => setMeterFace(true)}
-          >
-            <span>Meter</span>
-          </button>
+            legend="Meter"
+          />
         </div>
 
         <Sep />
@@ -268,12 +270,12 @@ export const VirtuosoControls: React.FC<{ songEntryId?: string; onStatus?: (text
         {meterFace ? (
           <MeterFace songEntryId={songEntryId} onStatus={onStatus} />
         ) : (
-        <div
-          className="contents"
-          title="Morph the piano roll into virtuoso lines. Dial each amount; the roll re-renders live from the captured source."
-        >
+        <div className="contents">
+        {/* A short row gives up width in order: the groove name first (96px to 48px,
+            by the row's container width), then the five ranges (48px to 32px).
+            1366x768 with a groove loaded lands at a 48px name and ranges of 40px. */}
         {SLIDERS.map(({ k, legend, label }) => (
-          <div key={k} className={FIELD} title={`${label} amount`}>
+          <div key={k} className={FIELD_SHRINK} title={`${label} amount`}>
             <label htmlFor={`vt-${k}`} className={FIELD_LEGEND}>{legend}</label>
             <input
               id={`vt-${k}`}
@@ -283,9 +285,9 @@ export const VirtuosoControls: React.FC<{ songEntryId?: string; onStatus?: (text
               max={100}
               value={Math.round(amounts[k] * 100)}
               onChange={(e) => setAmount(k, (parseInt(e.target.value, 10) || 0) / 100)}
-              className={RANGE}
+              className={RANGE_FILL}
             />
-            <span className={`${FIELD_VALUE} w-5`}>{Math.round(amounts[k] * 100)}</span>
+            <span className={`${FIELD_VALUE} w-5.5`}>{Math.round(amounts[k] * 100)}</span>
           </div>
         ))}
 
@@ -303,7 +305,7 @@ export const VirtuosoControls: React.FC<{ songEntryId?: string; onStatus?: (text
         <select
           id="vt-mode" name="vt-mode" value={modeV} onChange={(e) => setMode(e.target.value)}
           title="Scale the transforms use"
-          className={`${DOCK_SELECT} w-24 capitalize`}
+          className={`${DOCK_SELECT} w-23.5 capitalize`}
         >
           {MODES.map((m) => <option key={m} value={m}>{m}</option>)}
         </select>
@@ -312,76 +314,94 @@ export const VirtuosoControls: React.FC<{ songEntryId?: string; onStatus?: (text
           <label htmlFor="vt-style" className={FIELD_LEGEND}>Style</label>
           <select
             id="vt-style" name="vt-style" value={style} onChange={(e) => setStyle(e.target.value as StyleName)}
-            className="h-4.5 max-w-28 bg-transparent border-none outline-none text-[10px] font-mono et-ink cursor-pointer"
+            className={`${FIELD_SELECT} max-w-28`}
           >
             {STYLE_NAMES.map((s) => <option key={s} value={s}>{STYLES[s].label}</option>)}
           </select>
         </div>
 
-        <div
-          className={FIELD}
-          title="Drive the Humanize timing/feel from a reference song's groove (a Library track's transcribed MIDI). Timing pocket + rhythmic emphasis are learned; transcription does not recover dynamics."
-        >
-          <span className={FIELD_LEGEND}>Groove</span>
+        {/* The field keeps its width; only its name gives, and only below 1530px of
+            row, where the ranges would otherwise be the first to narrow. The keys
+            carry DockTips, so the long explanation sits on the legend alone. */}
+        <div className={FIELD}>
+          <span
+            className={FIELD_LEGEND}
+            title="Drive the Humanize timing/feel from a reference song's groove (a Library track's transcribed MIDI). Timing pocket + rhythmic emphasis are learned; transcription does not recover dynamics."
+          >
+            Groove
+          </span>
           {groove ? (
             <>
-              <span className="max-w-24 truncate text-[10px] font-mono et-ink" title={groove.name}>{groove.name}</span>
-              <button
-                type="button"
-                className={`${MINI_ICON_KEY} ${KEY_REST}`}
-                aria-label="Clear groove reference"
-                title="Clear groove reference"
-                onClick={clearGroove}
+              <span
+                data-groove-name=""
+                className="min-w-12 max-w-24 @max-[1530px]:max-w-12 truncate text-[12px] font-semibold et-ink"
+                title={groove.name}
               >
-                <X aria-hidden="true" className="w-3 h-3" />
-              </button>
+                {groove.name}
+              </span>
+              <StripKey
+                mini
+                iconOnly
+                onClick={clearGroove}
+                aria-label="Clear groove reference"
+                description={`Stop driving Humanize from ${groove.name}`}
+                icon={<X className={MINI_GLYPH} />}
+                legend="Clear groove"
+              />
             </>
           ) : (
-            <button
-              type="button"
+            <StripKey
+              mini
               onClick={() => setPickGroove(true)}
               aria-label="Pick a groove reference"
-              title="Pick a groove reference"
-              className={`${MINI_KEY} ${KEY_REST}`}
-            >
-              <span>Pick</span>
-            </button>
+              description="Choose a Library track or MIDI file whose timing pocket and rhythmic emphasis drive Humanize"
+              legend="Pick"
+            />
           )}
         </div>
 
-        <span className="flex-1 min-w-1" />
-
-        <StripKey
-          onClick={captureSource}
-          title="Snapshot the current piano roll as the morph source (re-grab after changing the arp or notes)."
-          icon={<Camera className="w-3 h-3" />}
-          legend="Capture"
-        />
-        <StripKey
-          onClick={resetToSource}
-          title="Reset amounts to zero and restore the captured source to the roll."
-          icon={<RotateCcw className="w-3 h-3" />}
-          legend="Reset"
-        />
-        <StripKey
-          ref={formKeyRef}
-          onClick={() => setShowStructure((v) => !v)}
-          aria-haspopup="dialog"
-          aria-expanded={showStructure}
-          aria-controls="vt-structure"
-          title="Open the song-structure configurator: lay out the sections (intro, theme, build, chorus, solo, climax, outro) and their length that SONG uses."
-          on={showStructure}
-          icon={<Columns3 className="w-3 h-3" />}
-          legend="Form"
-        />
-        <StripKey
-          onClick={buildSong}
-          aria-pressed={songMode}
-          title="Build a full, developing arrangement from the source in the chosen style/structure, with voice-leading, a melody, a crescendo, and rubato. While built, the sliders reshape the whole song; Reset returns to the phrase."
-          on={songMode}
-          icon={<ListMusic className="w-3 h-3" />}
-          legend="Song"
-        />
+        {/* The row's four actions at its end, 1px apart like the row's other key groups. */}
+        <div data-shape-actions="" className="ml-auto shrink-0 inline-flex items-center gap-px">
+          <StripKey
+            iconOnly
+            onClick={captureSource}
+            aria-label="Capture the roll as the morph source"
+            description="Snapshot the current piano roll as the morph source (re-grab after changing the arp or notes)."
+            icon={<Camera className={STRIP_GLYPH} />}
+            legend="Capture"
+          />
+          <StripKey
+            iconOnly
+            onClick={resetToSource}
+            aria-label="Reset to the captured source"
+            description="Reset amounts to zero and restore the captured source to the roll."
+            icon={<RotateCcw className={STRIP_GLYPH} />}
+            legend="Reset"
+          />
+          <StripKey
+            ref={formKeyRef}
+            iconOnly
+            onClick={() => setShowStructure((v) => !v)}
+            aria-haspopup="dialog"
+            aria-expanded={showStructure}
+            aria-controls="vt-structure"
+            aria-label="Form: the song structure"
+            description="Open the song-structure configurator: lay out the sections (intro, theme, build, chorus, solo, climax, outro) and their length that SONG uses."
+            on={showStructure}
+            icon={<LayoutTemplate className={STRIP_GLYPH} />}
+            legend="Form"
+          />
+          <StripKey
+            iconOnly
+            onClick={buildSong}
+            aria-pressed={songMode}
+            aria-label="Song: build a full arrangement"
+            description="Build a full, developing arrangement from the source in the chosen style/structure, with voice-leading, a melody, a crescendo, and rubato. While built, the sliders reshape the whole song; Reset returns to the phrase."
+            on={songMode}
+            icon={<ListMusic className={STRIP_GLYPH} />}
+            legend="Song"
+          />
+        </div>
         </div>
         )}
       </div>
@@ -392,6 +412,8 @@ export const VirtuosoControls: React.FC<{ songEntryId?: string; onStatus?: (text
         onClose={() => setShowStructure(false)}
         placement="above"
         align="end"
+        ceilingSelector="[data-dock-ceiling]"
+        floorSelector="[data-dock-floor]"
         id="vt-structure"
         role="dialog"
         aria-label="Song form"

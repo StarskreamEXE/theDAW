@@ -212,6 +212,8 @@ def _spawn_renderer(
             cwd=str(frontend),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=_TIMEOUT_SEC,
             stdin=subprocess.DEVNULL,
             creationflags=creationflags,

@@ -135,6 +135,8 @@ class QuestCastSidecar:
                 cwd=str(PACKAGE_DIR),
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=BOOTSTRAP_TIMEOUT_SEC,
                 env=child_env(),
             )
@@ -159,6 +161,8 @@ class QuestCastSidecar:
                 [adb, "devices"],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=15,
                 env=child_env(),
             )
@@ -286,6 +290,8 @@ class QuestCastSidecar:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     bufsize=1,
                 )
             except OSError as e:

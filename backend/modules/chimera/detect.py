@@ -3,12 +3,14 @@
 Public API:
     detect_tempo_and_beats(path) -> DetectionResult
 
-Uses aubio when it can open the file (fast, accurate on WAV), and falls back
-to librosa's beat tracker otherwise. The aubio pip wheel on Windows only ships
-the ``wavread`` backend, so it raises on MP3/M4A/etc. ("could not find RIFF
-header"); librosa decodes those formats directly (via soundfile/audioread), so
-the fallback is what makes BPM work for compressed library tracks. No ffmpeg
-transcode step required.
+aubio is the detector for every container. Its own source reader opens PCM
+WAV only (the vendored wheels carry just ``wavread``), so the file is decoded
+through ``backend/lib/audio_io.py`` — libsndfile, then the ffmpeg CLI — and
+aubio is fed the samples at the file's native rate. FLAC, Opus, MP3, M4A and
+float WAV therefore read the same tempo as the PCM WAV of the same audio.
+librosa's beat tracker stays as the fallback for a real aubio failure (a file
+nothing can decode, or an aubio error). ``engine`` in the result names the
+path that ran.
 
 Returns None for `bpm` when the file is too short or no tempo can be locked
 (silence, very sparse onsets). The caller decides how to handle that: the
@@ -36,6 +38,7 @@ class DetectionResult(TypedDict):
     confidence: float
     samplerate: int
     duration_sec: float
+    engine: str  # "aubio", "librosa", or "none" when both failed
 
 
 def _empty_result(sr: int = 0, duration_sec: float = 0.0) -> DetectionResult:
@@ -45,13 +48,14 @@ def _empty_result(sr: int = 0, duration_sec: float = 0.0) -> DetectionResult:
         "confidence": 0.0,
         "samplerate": int(sr),
         "duration_sec": duration_sec,
+        "engine": "none",
     }
 
 
 def detect_tempo_and_beats(
     path: str | Path,
     *,
-    # y_sr carries a pre-decoded librosa.load(path, sr=22050, mono=True) result; only the librosa fallback consumes it (aubio streams the file at native SR).
+    # y_sr carries a pre-decoded librosa.load(path, sr=22050, mono=True) result; only the librosa fallback consumes it (aubio decodes the file at its native rate through audio_io).
     y_sr: Optional[tuple] = None,
 ) -> DetectionResult:
     """Detect tempo + beat times (seconds). aubio first, librosa fallback."""
@@ -59,7 +63,7 @@ def detect_tempo_and_beats(
         return _detect_aubio(path)
     except Exception as e:
         log.info(
-            "chimera detect: aubio could not handle %s (%s) — falling back to librosa",
+            "chimera detect: aubio failed on %s (%s); falling back to librosa",
             Path(path).name,
             e,
         )
@@ -79,7 +83,7 @@ def _detect_librosa(
     *,
     y_sr: Optional[tuple] = None,
 ) -> DetectionResult:
-    """Tempo + beats via librosa — decodes MP3/M4A/etc. that aubio can't open."""
+    """Tempo + beats via librosa, for a file aubio could not take."""
     import librosa
     import numpy as np
 
@@ -90,7 +94,7 @@ def _detect_librosa(
     sr = int(sr)
     duration_sec = (len(y) / float(sr)) if sr else 0.0
     if y.size == 0 or duration_sec < _MIN_DURATION_SEC:
-        return _empty_result(sr, duration_sec)
+        return {**_empty_result(sr, duration_sec), "engine": "librosa"}
 
     tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
     beats = [float(t) for t in librosa.frames_to_time(beat_frames, sr=sr)]
@@ -106,8 +110,8 @@ def _detect_librosa(
             cv = float(intervals.std()) / mean_i
             confidence = max(0.0, min(1.0, 1.0 - cv))
 
-    log.debug(
-        "chimera detect (librosa): path=%s sr=%d dur=%.2f bpm=%s beats=%d conf=%.3f",
+    log.info(
+        "chimera detect: %s via librosa: sr=%d dur=%.2f bpm=%s beats=%d conf=%.3f",
         Path(path).name,
         sr,
         duration_sec,
@@ -121,25 +125,39 @@ def _detect_librosa(
         "confidence": confidence,
         "samplerate": int(sr),
         "duration_sec": duration_sec,
+        "engine": "librosa",
     }
 
 
 def _detect_aubio(path: str | Path) -> DetectionResult:
     import aubio
+    import numpy as np
+
+    from backend.lib.audio_io import load_audio_array
+
+    # Decode here and feed aubio the samples: aubio.source would refuse every
+    # container but PCM WAV. The channel mean is aubio.source's own downmix.
+    data, sr = load_audio_array(path)
+    mono = np.ascontiguousarray(data.mean(axis=0), dtype=np.float32)
 
     # aubio is a C extension without type stubs — treat as Any so the analyzer
-    # doesn't flag .source/.tempo (which it can't resolve).
+    # doesn't flag .tempo (which it can't resolve).
     a = cast(Any, aubio)
-    src = a.source(str(path), samplerate=0, hop_size=_HOP_S)
-    sr = src.samplerate
     tempo_o = a.tempo("default", _WIN_S, _HOP_S, sr)
 
     beats: list[float] = []
     confidences: list[float] = []
     total_frames = 0
+    pos = 0
 
+    # Hop by hop, the way aubio.source hands them out: the last hop is padded
+    # with zeros and ends the loop.
     while True:
-        samples, read = src()
+        samples = mono[pos : pos + _HOP_S]
+        read = int(samples.size)
+        if read < _HOP_S:
+            samples = np.pad(samples, (0, _HOP_S - read))
+        pos += _HOP_S
         is_beat = tempo_o(samples)
         total_frames += read
         if is_beat:
@@ -147,11 +165,6 @@ def _detect_aubio(path: str | Path) -> DetectionResult:
             confidences.append(float(tempo_o.get_confidence()))
         if read < _HOP_S:
             break
-
-    try:
-        src.close()
-    except Exception:
-        pass
 
     duration_sec = total_frames / float(sr) if sr > 0 else 0.0
     bpm_raw = float(tempo_o.get_bpm())
@@ -164,9 +177,9 @@ def _detect_aubio(path: str | Path) -> DetectionResult:
 
     confidence = sum(confidences) / len(confidences) if confidences else 0.0
 
-    log.debug(
-        "chimera detect: path=%s sr=%d dur=%.2f bpm=%s beats=%d conf=%.3f",
-        path,
+    log.info(
+        "chimera detect: %s via aubio: sr=%d dur=%.2f bpm=%s beats=%d conf=%.3f",
+        Path(path).name,
         sr,
         duration_sec,
         bpm,
@@ -180,4 +193,5 @@ def _detect_aubio(path: str | Path) -> DetectionResult:
         "confidence": confidence,
         "samplerate": int(sr),
         "duration_sec": duration_sec,
+        "engine": "aubio",
     }

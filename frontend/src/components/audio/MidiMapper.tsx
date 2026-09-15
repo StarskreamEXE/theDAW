@@ -11,11 +11,16 @@
  * for a toolbar strip (the MIDI dock's MAP key), whose panel opens below it
  * in a flyout the dock cannot clip.
  */
-import React, { useCallback, useEffect, useId, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { Cable, Music2, Plug, X, RotateCcw, Crosshair, Zap } from 'lucide-react';
+import { rowPage } from '../../lib/arpLayout';
+import { listRowsFit } from '../../lib/dockTip';
 import { subscribeToMidi } from '../../state/midiBus';
 import { enableMidi } from '../../state/midiTriggerStore';
-import { DockFlyout, FLYOUT_CARD, StripKey } from './midiDockKit';
+import { CueKey, DockFlyout, FLYOUT_CARD, STRIP_GLYPH, StripKey } from './midiDockKit';
+
+/** The MAP card's cue line under its binding list: a 12px line and the 2px gap above it. */
+const MAP_CUE_LINE_PX = 14;
 
 export interface MidiParamDef<K extends string = string> {
   key: K;
@@ -288,12 +293,98 @@ export function MidiMapper<K extends string = string>({
   const cls = ACCENTS[accent];
   const controllerTitle = `MIDI mapper for ${title} — ${connected ? 'controller seen' : 'waiting for controller'}`;
 
+  // The dock's MAP card is dense, and when the card is capped above the SHAPE
+  // row its binding list shows whole rows only (lib/dockTip `listRowsFit`), with
+  // a cue line whose up and down keys keep their places. The room is read from
+  // the card's cap and the card's other parts, never from the list, so the
+  // list's own height cannot feed back.
+  const dense = variant === 'key';
+  const lead = dense ? 'leading-4' : '';
+  const [listEl, setListEl] = useState<HTMLDivElement | null>(null);
+  const [listFit, setListFit] = useState<{ rows: number; height: number | null; step: number }>({ rows: 0, height: null, step: 0 });
+  const [listCues, setListCues] = useState({ up: false, down: false });
+
+  useLayoutEffect(() => {
+    const list = listEl;
+    const wrap = list?.parentElement;
+    const card = list?.closest<HTMLElement>('[role="dialog"]');
+    if (!dense || !list || !wrap || !card) return;
+    const measure = () => {
+      const z = parseFloat(card.closest('[data-layout-zoom]')?.getAttribute('data-layout-zoom') ?? '') || 1;
+      const rows = Array.from(list.children) as HTMLElement[];
+      const heights = rows.map((r) => r.getBoundingClientRect().height / z);
+      const gap = parseFloat(getComputedStyle(list).rowGap) || 0;
+      const cap = parseFloat(card.style.maxHeight);
+      let next: { rows: number; height: number | null; step: number } = { rows: rows.length, height: null, step: (heights[0] ?? 0) + gap };
+      if (cap > 0) {
+        const border = card.offsetHeight - card.clientHeight;
+        const others = Array.from(card.children)
+          .filter((c) => c !== wrap)
+          .reduce((sum, c) => sum + c.getBoundingClientRect().height / z, 0);
+        const ws = getComputedStyle(wrap);
+        const room = cap - border - others - parseFloat(ws.paddingTop) - parseFloat(ws.paddingBottom);
+        const fit = listRowsFit(room, heights, gap, MAP_CUE_LINE_PX);
+        next = { ...next, rows: fit.rows, height: fit.height };
+      }
+      setListFit((p) =>
+        p.rows === next.rows && Math.abs(p.step - next.step) < 0.25 && (p.height === next.height || (p.height != null && next.height != null && Math.abs(p.height - next.height) < 0.25))
+          ? p
+          : next,
+      );
+    };
+    measure();
+    // DockFlyout writes the cap into the card's style; a controller line or LEARN changes the other parts.
+    const mo = new MutationObserver(measure);
+    mo.observe(card, { attributes: true, attributeFilter: ['style'] });
+    const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
+    for (const c of Array.from(card.children)) if (c !== wrap) ro?.observe(c);
+    for (const r of Array.from(list.children)) ro?.observe(r);
+    return () => {
+      mo.disconnect();
+      ro?.disconnect();
+    };
+  }, [dense, listEl, params.length]);
+
+  useEffect(() => {
+    const list = listEl;
+    if (!list) return;
+    // Rows against the list's own box, never scrollTop against scrollHeight: at a
+    // layout zoom the list's height is fractional and scrollHeight whole, so the
+    // last row can sit whole at the foot with a pixel of scroll range left.
+    const update = () => {
+      const box = list.getBoundingClientRect();
+      const first = list.firstElementChild?.getBoundingClientRect();
+      const last = list.lastElementChild?.getBoundingClientRect();
+      const up = !!first && first.top < box.top - 1;
+      const down = !!last && last.bottom > box.bottom + 1;
+      setListCues((p) => (p.up === up && p.down === down ? p : { up, down }));
+    };
+    update();
+    list.addEventListener('scroll', update, { passive: true });
+    const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(update);
+    ro?.observe(list);
+    return () => {
+      list.removeEventListener('scroll', update);
+      ro?.disconnect();
+    };
+  }, [listEl, listFit.height]);
+
+  /** A cue press pages by all but one of the rows in view, landing on a row's own top. */
+  const pageList = (dir: 1 | -1) => {
+    const list = listEl;
+    if (!list || !listFit.step || !listFit.rows) return;
+    const total = list.children.length;
+    const row = rowPage(list.scrollTop, listFit.step, listFit.rows, total, dir);
+    const top = row >= Math.max(0, total - listFit.rows) ? list.scrollHeight - list.clientHeight : ((list.children[row] as HTMLElement | undefined)?.offsetTop ?? 0);
+    list.scrollTo({ top, behavior: 'smooth' });
+  };
+
   const panel = (
     <>
-      <div className={`flex items-center justify-between gap-2 px-3 py-2 border-b shrink-0 ${cls.headerBorder}`}>
+      <div className={`flex items-center justify-between gap-2 px-3 ${dense ? 'py-1' : 'py-2'} border-b shrink-0 ${cls.headerBorder}`}>
         <div className="flex items-center gap-1.5">
           <Music2 aria-hidden="true" className={`w-3.5 h-3.5 ${cls.icon}`} />
-          <span className={`font-black uppercase tracking-widest ${cls.headerText}`}>{title} · MIDI</span>
+          <span className={`text-[12px] font-display font-extrabold uppercase ${cls.headerText}`}>{title} · MIDI</span>
         </div>
         <button
           type="button"
@@ -306,32 +397,42 @@ export function MidiMapper<K extends string = string>({
         </button>
       </div>
 
-      <div className="px-3 py-2 border-b border-white/5 shrink-0 flex flex-col gap-1">
+      <div className={`px-3 ${dense ? 'py-1' : 'py-2'} border-b border-white/5 shrink-0 flex flex-col gap-1 ${lead}`}>
         <div className="flex items-center gap-1.5">
           <Plug aria-hidden="true" className={`w-3 h-3 ${connected ? cls.icon : cls.idleText}`} />
           <span className="text-zinc-400">{connected ? 'Receiving controller input' : 'Waiting for controller'}</span>
         </div>
         {lastSeenCc && (
-          <div className="text-[9px] text-zinc-600 mt-0.5">
+          <div className="text-zinc-600 mt-0.5">
             last seen: CC <span className={cls.icon}>{lastSeenCc.cc}</span> = <span className={cls.icon}>{lastSeenCc.value}</span> (ch <span className={cls.icon}>{lastSeenCc.channel + 1}</span>)
           </div>
         )}
         {learning && (
-          <div className={`text-[9px] animate-pulse mt-0.5 flex items-center gap-1 ${cls.learningText}`}>
+          <div className={`animate-pulse mt-0.5 flex items-center gap-1 ${cls.learningText}`}>
             <Crosshair aria-hidden="true" className="w-2.5 h-2.5" /> LEARN: move a knob to bind {String(learning)}
           </div>
         )}
       </div>
 
-      <div className="flex-1 min-h-0 overflow-y-auto px-2 py-2 space-y-1">
+      <div className={`flex-1 min-h-0 flex flex-col px-2 ${dense ? 'py-1 gap-0.5' : 'py-2'}`}>
+      {/* relative: each row's offsetTop, the cue's page target, is measured from this scroller. */}
+      <div
+        ref={setListEl}
+        data-map-list=""
+        className={`relative min-h-0 overflow-y-auto flex flex-col gap-1 ${dense ? 'no-scrollbar snap-y snap-mandatory' : 'flex-1'}`}
+        style={dense && listFit.height != null ? { height: listFit.height } : undefined}
+      >
         {params.map((param) => {
           const m = mappings[param.key];
           const isLearning = learning === param.key;
           return (
-            <div key={param.key} className="flex items-center gap-2 px-2 py-1 rounded border border-white/5 bg-white/3 hover:bg-white/5">
+            <div
+              key={param.key}
+              className={`shrink-0 flex items-center gap-2 px-2 py-1 rounded border border-white/5 bg-white/3 hover:bg-white/5 ${dense ? 'snap-start last:snap-end' : ''} ${lead}`}
+            >
               <div className="flex flex-col flex-1 min-w-0">
-                <span className="text-[10px] text-zinc-200 truncate">{param.label}</span>
-                <span className="text-[8px] font-mono text-zinc-600 uppercase tracking-wider">
+                <span className="text-zinc-200 truncate">{param.label}</span>
+                <span className="text-zinc-600 uppercase tabular-nums">
                   {m
                     ? `${m.kind === 'cc' ? 'CC' : 'NOTE'} ${m.number}${m.channel !== null ? ` · ch ${m.channel + 1}` : ''}${m.inverted ? ' · INV' : ''}`
                     : 'unmapped'}
@@ -374,17 +475,24 @@ export function MidiMapper<K extends string = string>({
           );
         })}
       </div>
+      {dense && listFit.height != null && (
+        <div className="h-3 shrink-0 flex items-center justify-center gap-1">
+          <CueKey dir={-1} name="Scroll up to more mappings" word="More mappings" onGo={() => pageList(-1)} idle={!listCues.up} />
+          <CueKey dir={1} name="Scroll down to more mappings" word="More mappings" onGo={() => pageList(1)} idle={!listCues.down} />
+        </div>
+      )}
+      </div>
 
-      <div className="flex items-center justify-between px-3 py-2 border-t border-white/5 shrink-0">
+      <div className={`flex flex-wrap items-center justify-between gap-x-2 px-3 border-t border-white/5 shrink-0 ${dense ? 'gap-y-0.5 py-1' : 'gap-y-1 py-2'}`}>
         <button
           type="button"
           onClick={resetMappings}
-          className="flex items-center gap-1.5 px-2 py-1 rounded border border-white/10 text-[9px] uppercase tracking-widest text-zinc-400 hover:text-zinc-100 hover:bg-white/5"
+          className="flex items-center gap-1.5 px-2 py-1 rounded border border-white/10 text-[12px] font-display font-bold uppercase text-zinc-400 hover:text-zinc-100 hover:bg-white/5"
           title="Restore auto-map defaults"
         >
           <RotateCcw aria-hidden="true" className="w-3 h-3" /> Defaults
         </button>
-        <span className="text-[8px] text-zinc-700">global MIDI bus · audio runs in parallel</span>
+        <span className={`text-zinc-700 whitespace-nowrap ${lead}`}>global MIDI bus · audio runs in parallel</span>
       </div>
     </>
   );
@@ -399,14 +507,14 @@ export function MidiMapper<K extends string = string>({
           aria-expanded={open}
           aria-controls={panelId}
           aria-label={`Map MIDI controls for ${title.toLowerCase()}`}
-          title={controllerTitle}
+          description={controllerTitle}
           on={open}
           icon={
             <>
               <span
                 className={`self-center w-1 h-1 mr-0.5 rounded-full ${connected ? 'bg-[rgb(var(--et-accent))] animate-pulse' : 'bg-white/20'}`}
               />
-              <Cable className="w-3 h-3" />
+              <Cable className={STRIP_GLYPH} />
             </>
           }
           legend="Map"
@@ -418,10 +526,14 @@ export function MidiMapper<K extends string = string>({
           placement="below"
           align="end"
           closeOnOutside={false}
+          // The card stays open while the user works in the dock (LEARN waits on a knob),
+          // so it keeps above the SHAPE row and left of the Voice column and the artifact rail.
+          floorSelector="[data-dock-floor]"
+          asideSelector="[data-dock-aside]"
           id={panelId}
           role="dialog"
           aria-label={`${title} MIDI mapper`}
-          className={`w-72 max-h-[70vh] flex flex-col text-[10px] font-mono text-zinc-200 ${FLYOUT_CARD}`}
+          className={`w-72 max-h-[70vh] flex flex-col text-[12px] font-semibold text-zinc-200 ${FLYOUT_CARD}`}
         >
           {panel}
         </DockFlyout>
@@ -434,7 +546,7 @@ export function MidiMapper<K extends string = string>({
       <button
         type="button"
         onClick={() => setOpen(true)}
-        className={`absolute top-1.5 right-1.5 z-30 flex items-center gap-1.5 px-2 py-0.5 rounded border text-[9px] font-mono uppercase tracking-widest ${cls.pillBorder} ${cls.pillBg} ${cls.pillText}`}
+        className={`absolute top-1.5 right-1.5 z-30 flex items-center gap-1.5 px-2 py-0.5 rounded border text-[9px] font-display font-bold uppercase ${cls.pillBorder} ${cls.pillBg} ${cls.pillText}`}
         title={controllerTitle}
       >
         <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${connected ? `${cls.pillDot} animate-pulse` : 'bg-zinc-700'}`} />
@@ -445,7 +557,7 @@ export function MidiMapper<K extends string = string>({
   }
 
   return (
-    <div className={`absolute top-1.5 right-1.5 z-40 w-72 max-h-[70vh] flex flex-col bg-black/90 backdrop-blur-md border rounded text-[10px] font-mono text-zinc-200 shadow-[0_8px_24px_rgba(0,0,0,0.6)] ${cls.panelBorder}`}>
+    <div className={`absolute top-1.5 right-1.5 z-40 w-72 max-h-[70vh] flex flex-col bg-black/90 backdrop-blur-md border rounded text-[12px] font-semibold text-zinc-200 shadow-[0_8px_24px_rgba(0,0,0,0.6)] ${cls.panelBorder}`}>
       {panel}
     </div>
   );

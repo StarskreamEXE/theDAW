@@ -29,9 +29,9 @@ const SONG: MeterSegment[] = [{ bar: 0, meter: M78 }, { bar: 4, meter: M54 }, { 
 {
   assert.equal(segmentLabel(SONG, 0, 160), '1-4');
   assert.equal(segmentLabel(SONG, 1, 160), '5-6');
-  assert.equal(segmentLabel(SONG, 2, 160), '7-');
+  assert.equal(segmentLabel(SONG, 2, 160), '7+');
   assert.equal(segmentLabel([{ bar: 0, meter: M44 }, { bar: 6, meter: M78 }, { bar: 7, meter: M44 }], 1, 160), '7');
-  assert.equal(segmentLabel(SONG, 9, 160), '7-', 'an index past the end reads the last segment');
+  assert.equal(segmentLabel(SONG, 9, 160), '7+', 'an index past the end reads the last segment');
   assert.equal(segmentAtStep(SONG, 0), 0);
   assert.equal(segmentAtStep(SONG, 56), 1);
   assert.equal(segmentAtStep(SONG, 95), 1);
@@ -245,7 +245,7 @@ const SONG: MeterSegment[] = [{ bar: 0, meter: M78 }, { bar: 4, meter: M54 }, { 
   sel = edit.selected;
   assert.deepEqual(st().meterMap, [{ bar: 0, meter: M44 }, { bar: 4, meter: M44 }]);
   assert.equal(sel, 1);
-  assert.equal(segmentLabel(st().meterMap, sel, st().totalSteps), '5-');
+  assert.equal(segmentLabel(st().meterMap, sel, st().totalSteps), '5+');
 
   // BEATS + three times: 4 -> 7.
   for (let k = 0; k < 3; k += 1) {
@@ -299,7 +299,7 @@ const SONG: MeterSegment[] = [{ bar: 0, meter: M78 }, { bar: 4, meter: M54 }, { 
   assert.deepEqual(st().meterMap, [{ bar: 0, meter: M44 }]);
   assert.equal(roundUpToBar(st().meterMap, st().totalSteps, st().pickupSteps), st().totalSteps, 'every face write leaves the roll on a bar line');
   assert.equal(sel, 0);
-  assert.equal(segmentLabel(st().meterMap, sel, st().totalSteps), '1-');
+  assert.equal(segmentLabel(st().meterMap, sel, st().totalSteps), '1+');
   assert.deepEqual(st().lanes, [LANE_A, { id: 1, name: 'B', cycleSteps: 12 }]);
   assert.equal(st().notes.length, 6);
 }

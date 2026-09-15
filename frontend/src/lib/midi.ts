@@ -1,11 +1,12 @@
 /**
  * Tiny Standard MIDI File (SMF) encoder + parser.
  *
- * Just enough to round-trip note-on / note-off events with tempo changes and
- * time signatures, which is what the sequencer's drum-pattern export and the
- * piano roll's note grid both need. A signature's additive grouping (3+2+2)
- * has no field in FF 58, so it travels in a text event `theDAW:groups=3+2+2`
- * at the signature's tick, which only this parser reads back.
+ * Just enough to round-trip note-on / note-off events with tempo changes, time
+ * signatures, pitch wheel messages and the pitch bend range (RPN 0/0), which is
+ * what the sequencer's drum-pattern export and the piano roll's note grid both
+ * need. A signature's additive grouping (3+2+2) has no field in FF 58, so it
+ * travels in a text event `theDAW:groups=3+2+2` at the signature's tick, which
+ * only this parser reads back.
  */
 import type { MeterEvent } from './meterMap';
 import { saveFile, type SaveFileResult } from './saveFile';
@@ -23,9 +24,29 @@ export interface MidiNote {
   channel: number;
 }
 
+/** A pitch wheel message (E0). */
+export interface MidiBend {
+  tick: number;
+  /** Channel 0-15; the wheel bends every note on it. */
+  channel: number;
+  /** 0-16383; 8192 is the centre. */
+  value: number;
+}
+
+/** A pitch bend range set through RPN 0/0: CC 101 0, CC 100 0, CC 6 semitones, CC 38 cents. */
+export interface MidiBendRange {
+  tick: number;
+  channel: number;
+  semitones: number;
+}
+
 export interface MidiTrack {
   name: string;
   notes: MidiNote[];
+  /** Pitch wheel messages, sorted by tick. Parsed: absent when the track has none. */
+  bends?: MidiBend[];
+  /** Bend ranges the track sets, sorted by tick. Parsed: absent when the track sets none. */
+  bendRanges?: MidiBendRange[];
 }
 
 export interface MidiTempo {
@@ -75,15 +96,74 @@ interface RawEvent {
   bytes: number[];
 }
 
-const notesToEvents = (notes: MidiNote[]): RawEvent[] => {
-  const evs: RawEvent[] = [];
+/** A track event with its place among the events at its tick. */
+type RankedEvent = RawEvent & { rank: number };
+
+/** At one tick: note-offs, then bend ranges, then wheel messages, then note-ons, so a note that ends there is not bent and one that starts there starts bent. */
+const RANK_NOTE_OFF = 0;
+const RANK_RANGE = 1;
+const RANK_WHEEL = 2;
+const RANK_NOTE_ON = 3;
+
+const byTickAndRank = (a: RankedEvent, b: RankedEvent): number => a.tick - b.tick || a.rank - b.rank;
+
+const notesToEvents = (notes: MidiNote[]): RankedEvent[] => {
+  const evs: RankedEvent[] = [];
   for (const n of notes) {
     const ch = (n.channel ?? 0) & 0x0f;
-    evs.push({ tick: n.tick, bytes: [0x90 | ch, n.note & 0x7f, Math.max(1, Math.min(127, n.velocity))] });
-    evs.push({ tick: n.tick + Math.max(1, n.durationTicks), bytes: [0x80 | ch, n.note & 0x7f, 0] });
+    evs.push({ tick: n.tick, rank: RANK_NOTE_ON, bytes: [0x90 | ch, n.note & 0x7f, Math.max(1, Math.min(127, n.velocity))] });
+    evs.push({ tick: n.tick + Math.max(1, n.durationTicks), rank: RANK_NOTE_OFF, bytes: [0x80 | ch, n.note & 0x7f, 0] });
   }
-  evs.sort((a, b) => a.tick - b.tick);
+  evs.sort(byTickAndRank);
   return evs;
+};
+
+/** CC 38 of a bend range in cents, as the MIDI spec has it: what a .mid file carries. */
+export const RANGE_LSB_CENTS = 100;
+/** CC 38 of a bend range in 1/128 semitones, as SpessaSynth reads it ((CC 6 << 7 | CC 38) / 128): what the soundfont synth gets. */
+export const RANGE_LSB_SPESSA = 128;
+
+/**
+ * The messages that set a channel's pitch bend range: RPN 0/0 selected, the
+ * semitones (CC 6) and the fraction of a semitone (CC 38, `lsbPerSemitone` to
+ * a semitone), then the RPN deselected (127/127) so a later data entry changes
+ * nothing. midiWrite's writer uses the same bytes.
+ */
+export const bendRangeMessages = (channel: number, semitones: number, lsbPerSemitone = RANGE_LSB_CENTS): number[][] => {
+  const status = 0xb0 | (channel & 0x0f);
+  const units = Math.max(0, Math.min(128 * lsbPerSemitone - 1, Math.round((Number.isFinite(semitones) ? semitones : 2) * lsbPerSemitone)));
+  return [
+    [status, 101, 0],
+    [status, 100, 0],
+    [status, 6, Math.floor(units / lsbPerSemitone)],
+    [status, 38, units % lsbPerSemitone],
+    [status, 101, 127],
+    [status, 100, 127],
+  ];
+};
+
+/** A pitch wheel message: E0, the low 7 bits, the high 7 bits. */
+export const pitchWheelMessage = (channel: number, value: number): number[] => {
+  const v = Math.max(0, Math.min(16383, Math.round(value)));
+  return [0xe0 | (channel & 0x0f), v & 0x7f, (v >> 7) & 0x7f];
+};
+
+/**
+ * A track's events: its notes, and when it has any, its ranges and wheel
+ * messages. At one tick the note-offs come first, then the ranges, then the
+ * wheel, then the note-ons, so a note that ends there is not bent and a note
+ * that starts there starts bent. A track with neither writes the notes' bytes alone.
+ */
+const trackEvents = (t: MidiTrack): RawEvent[] => {
+  const notes = notesToEvents(t.notes);
+  const wheel: RankedEvent[] = [];
+  for (const r of t.bendRanges ?? []) {
+    const tick = tickOf(r.tick);
+    for (const bytes of bendRangeMessages(r.channel, r.semitones)) wheel.push({ tick, rank: RANK_RANGE, bytes });
+  }
+  for (const b of t.bends ?? []) wheel.push({ tick: tickOf(b.tick), rank: RANK_WHEEL, bytes: pitchWheelMessage(b.channel, b.value) });
+  if (!wheel.length) return notes;
+  return [...wheel, ...notes].sort(byTickAndRank);
 };
 
 const serializeTrackChunk = (events: RawEvent[], name: string): number[] => {
@@ -156,7 +236,7 @@ const buildConductor = (file: MidiFileData): number[] => {
 };
 
 export const encodeMidi = (file: MidiFileData): Uint8Array => {
-  const tracks = file.tracks.map((t) => serializeTrackChunk(notesToEvents(t.notes), t.name));
+  const tracks = file.tracks.map((t) => serializeTrackChunk(trackEvents(t), t.name));
   const ntrks = 1 + tracks.length;
   const header = [
     ...ascii('MThd'),
@@ -224,6 +304,8 @@ interface DecodedTrack {
   groups: Array<{ tick: number; groups: number[] }>;
   /** `theDAW:pickup=` text events, attached the same way. */
   pickups: Array<{ tick: number; steps: number }>;
+  bends: MidiBend[];
+  ranges: MidiBendRange[];
 }
 
 const decodeTrack = (chunk: Uint8Array, ppq: number): DecodedTrack => {
@@ -237,16 +319,23 @@ const decodeTrack = (chunk: Uint8Array, ppq: number): DecodedTrack => {
   const pickups: DecodedTrack['pickups'] = [];
   const open = new Map<string, NotePartial>(); // key = `${ch}:${note}`
   const finished: MidiNote[] = [];
+  const bends: MidiBend[] = [];
+  const ranges: MidiBendRange[] = [];
+  // Per channel: the RPN selected by CC 101 / 100 (127/127 is none), and the range its last CC 6 wrote, which a CC 38 refines.
+  const rpn = new Map<number, { msb: number; lsb: number; range: MidiBendRange | null }>();
 
   while (r.remaining() > 0) {
     const delta = r.vlq();
     tick += delta;
     let status = r.byte();
     if (status < 0x80) {
-      // running status — back up one byte
+      // Running status: the data byte belongs to the last channel message's status. Back up one byte.
       r.pos -= 1;
       status = runningStatus;
-    } else {
+    } else if (status < 0xf0) {
+      // Only a channel message sets the running status. A meta or sysex event leaves it as it was:
+      // SMF 1.0 cancels it there, but some writers carry it across a meta event, and a file that
+      // follows the spec never puts a data byte after one.
       runningStatus = status;
     }
     if (status === 0xff) {
@@ -305,8 +394,31 @@ const decodeTrack = (chunk: Uint8Array, ppq: number): DecodedTrack => {
           });
           open.delete(key);
         }
+      } else if (type === 0xe0) {
+        bends.push({ tick, channel: ch, value: d1 | (d2 << 7) });
+      } else if (type === 0xb0) {
+        const sel = rpn.get(ch) ?? { msb: 127, lsb: 127, range: null };
+        if (d1 === 101) {
+          sel.msb = d2;
+          sel.range = null;
+        } else if (d1 === 100) {
+          sel.lsb = d2;
+          sel.range = null;
+        } else if (d1 === 99 || d1 === 98 || d1 === 121) {
+          // An NRPN selection, or Reset All Controllers (RP-015 leaves no parameter selected):
+          // a data entry no longer sets the bend range.
+          sel.msb = 127;
+          sel.lsb = 127;
+          sel.range = null;
+        } else if (d1 === 6 && sel.msb === 0 && sel.lsb === 0) {
+          sel.range = { tick, channel: ch, semitones: d2 };
+          ranges.push(sel.range);
+        } else if (d1 === 38 && sel.msb === 0 && sel.lsb === 0 && sel.range) {
+          sel.range.semitones = Math.floor(sel.range.semitones) + Math.min(99, d2) / 100;
+        }
+        rpn.set(ch, sel);
       }
-      // Other channel events (CC, PB, etc.) ignored
+      // Other channel events (aftertouch, program, other CCs) ignored
     }
   }
 
@@ -322,7 +434,7 @@ const decodeTrack = (chunk: Uint8Array, ppq: number): DecodedTrack => {
   }
 
   finished.sort((a, b) => a.tick - b.tick);
-  return { name, notes: finished, tempos, signatures, groups, pickups };
+  return { name, notes: finished, tempos, signatures, groups, pickups, bends, ranges };
 };
 
 export const parseMidi = (buf: ArrayBuffer | Uint8Array): MidiFileData => {
@@ -353,8 +465,14 @@ export const parseMidi = (buf: ArrayBuffer | Uint8Array): MidiFileData => {
     signatures.push(...t.signatures);
     groups.push(...t.groups);
     pickups.push(...t.pickups);
-    if (t.notes.length > 0) {
-      tracks.push({ name: t.name || `Track ${i}`, notes: t.notes });
+    // A track that only bends is kept: its channel's wheel bends notes another track holds.
+    if (t.notes.length > 0 || t.bends.length > 0) {
+      tracks.push({
+        name: t.name || `Track ${i}`,
+        notes: t.notes,
+        ...(t.bends.length ? { bends: t.bends } : {}),
+        ...(t.ranges.length ? { bendRanges: t.ranges } : {}),
+      });
     }
   }
   // Stable sorts: at one tick, events keep track order, so the last one written is the one in force.

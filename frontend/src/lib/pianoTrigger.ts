@@ -11,7 +11,15 @@
  */
 import { getEngineCtx, getMasterGain } from '../state/playerStore';
 import { triggerActiveVoice } from './midiSynth';
+import type { VoiceBend } from './pitchBendVoice';
 import { isSoundfontActive, previewNoteSF } from './soundfontEngine';
+
+/** Where a scheduled roll note plays: its soundfont channel (a lane with a pitch
+ *  bend has its own) and the bend a built-in voice follows. */
+export interface PianoNoteVoice {
+  channel?: number;
+  bend?: VoiceBend;
+}
 
 /** Live preview convenience: route the shared synth voice through the engine
  *  master/analyser. The voice itself lives in `lib/midiSynth` so previews,
@@ -22,17 +30,17 @@ export const triggerPianoNote = (
   when: number,
   duration: number,
   master: number,
+  voice?: PianoNoteVoice,
 ) => {
   const ctx = getEngineCtx();
   if (ctx.state === 'suspended') void ctx.resume();
   if (isSoundfontActive()) {
-    // The soundfont voice plays immediately, so approximate the scheduled
-    // `when` with a timer relative to now (fine for preview + playback).
-    const delayMs = Math.max(0, (when - ctx.currentTime) * 1000);
-    window.setTimeout(() => void previewNoteSF(midi, velocity, duration), delayMs);
+    // The soundfont note is timed at `when` on the synth. Its bend is the
+    // channel's pitch wheel, which the roll's scheduler sends for the same times.
+    void previewNoteSF(midi, velocity, duration, voice?.channel ?? 0, when);
     return;
   }
-  triggerActiveVoice(ctx, getMasterGain(), midi, velocity, when, duration, master);
+  triggerActiveVoice(ctx, getMasterGain(), midi, velocity, when, duration, master, voice?.bend);
 };
 
 /**

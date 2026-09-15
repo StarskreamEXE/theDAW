@@ -45,12 +45,12 @@ export function segmentAtStep(map: readonly MeterSegment[], step: number, pickup
   return segmentIndexAt(map, Math.max(0, barAt(map, step, pickupSteps).bar));
 }
 
-/** Segment `index`'s bars, 1-based: "5-6", "7" for one bar, "7-" for the last segment, which runs to the end. */
+/** Segment `index`'s bars, 1-based: "5-6", "7" for one bar, "7+" for the last segment, which runs on to the end. */
 export function segmentLabel(map: readonly MeterSegment[], index: number, totalSteps: number, pickupSteps = 0): string {
   const segs = normalizeMeterMap(map, false);
   const i = clampSelection(segs, index);
   const { first, last } = segmentBars(segs, i, totalSteps, pickupSteps);
-  if (i === segs.length - 1) return `${first + 1}-`;
+  if (i === segs.length - 1) return `${first + 1}+`;
   return first === last ? `${first + 1}` : `${first + 1}-${last + 1}`;
 }
 
