@@ -163,7 +163,9 @@ const ScrubStrip: React.FC = () => {
   };
 
   return (
-    <div className="flex items-center gap-2.5 w-3/5 mx-auto h-4 shrink-0">
+    // data-scrub-strip: the orb's status panel measures this row so a long
+    // notice rises clear of it instead of covering the playhead (noticeLift).
+    <div data-scrub-strip className="flex items-center gap-2.5 w-3/5 mx-auto h-4 shrink-0">
       {/* The times: the bold sans at 12px in tabular figures, so the digits
           hold still as they tick. */}
       <span className="w-10 shrink-0 text-right font-sans font-bold text-xs leading-4 tabular-nums text-zinc-400">

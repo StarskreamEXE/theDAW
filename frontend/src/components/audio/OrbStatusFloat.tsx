@@ -1,8 +1,9 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useStatusNoticeStore } from '../../state/statusNoticeStore';
 import { useEditThemeStore } from '../../state/editThemeStore';
 import { resolveEditThemeVars } from '../../lib/editThemes';
 import { BUBBLE_TONE, bubbleText, noticeLabel, noticeSurface, useShownNotice } from './OrbTipBubble';
+import { noticeLift } from './noticeLift';
 
 /**
  * The orb's status bubble below the xl breakpoint.
@@ -16,8 +17,9 @@ import { BUBBLE_TONE, bubbleText, noticeLabel, noticeSurface, useShownNotice } f
  * Where it sits (floatPlacement):
  * - With the orb in the footer's bottom-left corner (where it is pinned until
  *   its first click), the bubble sits in the footer row right of the orb, over
- *   the now-playing title, and grows upward. The page's controls above the
- *   footer stay clickable.
+ *   the now-playing title, and grows upward. One too tall for that row rises
+ *   clear of the scrub strip rather than over it (noticeLift), so the playhead
+ *   stays on screen. The page's controls above the footer stay clickable.
  * - With the orb anywhere else, it sits above the orb, clear of the sign a
  *   pinned orb wears above itself, or below the orb when the orb is near the
  *   top of the window. It stays inside the viewport.
@@ -82,6 +84,12 @@ export function floatPlacement(
 export const OrbStatusFloat: React.FC<OrbStatusFloatProps> = ({ position, orbBox, onOpenLog }) => {
   const [hovered, setHovered] = useState(false);
   const [notice, release] = useShownNotice(hovered);
+  const boxRef = useRef<HTMLDivElement | null>(null);
+  // In the footer row the bubble grows up from the window's bottom edge, so a
+  // long one would cover the scrub strip the same way the footer bubble did.
+  // Same rule, same helper: too tall for the row, and it rises clear of the
+  // strip (noticeLift).
+  const [lift, setLift] = useState(0);
   const themeId = useEditThemeStore((s) => s.themeId);
   const themeImage = useEditThemeStore((s) => s.customImage);
   const theme = useMemo(() => resolveEditThemeVars(themeId, themeImage), [themeId, themeImage]);
@@ -91,6 +99,32 @@ export const OrbStatusFloat: React.FC<OrbStatusFloatProps> = ({ position, orbBox
   // hold every later notice on screen past its time.
   useEffect(() => {
     if (!notice) setHovered(false);
+  }, [notice]);
+
+  useLayoutEffect(() => {
+    if (!notice) {
+      setLift(0);
+      return;
+    }
+    const measure = () => {
+      const box = boxRef.current;
+      if (!box || box.dataset.placement !== 'footer') {
+        setLift(0);
+        return;
+      }
+      const strip = document.querySelector('[data-scrub-strip]')?.getBoundingClientRect() ?? null;
+      const bottom = window.innerHeight;
+      setLift(noticeLift({ top: bottom, bottom }, box.getBoundingClientRect().height, strip));
+    };
+    measure();
+    // jsdom, and any runtime without it, simply measures once.
+    const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
+    if (ro && boxRef.current) ro.observe(boxRef.current);
+    window.addEventListener('resize', measure);
+    return () => {
+      ro?.disconnect();
+      window.removeEventListener('resize', measure);
+    };
   }, [notice]);
 
   if (!notice || typeof window === 'undefined') return null;
@@ -108,7 +142,7 @@ export const OrbStatusFloat: React.FC<OrbStatusFloatProps> = ({ position, orbBox
   let tail: string;
   let tailStyle: React.CSSProperties | undefined;
   if (place.kind === 'footer') {
-    style.bottom = 0;
+    style.bottom = lift;
     style.width = place.width;
     frame = 'min-h-12 flex flex-col justify-center';
     tail = '-left-1 top-1/2 -translate-y-1/2 border-b border-l';
@@ -126,6 +160,7 @@ export const OrbStatusFloat: React.FC<OrbStatusFloatProps> = ({ position, orbBox
 
   return (
     <div
+      ref={boxRef}
       className={`edit-theme-scope fixed z-60 xl:hidden ${frame}`}
       data-et-light={theme.light ? '1' : undefined}
       data-placement={place.kind}
