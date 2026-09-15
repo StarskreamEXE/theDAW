@@ -56,6 +56,7 @@ import {
 import { IoSurfaceSelect } from '../audio/IoDeviceSelect';
 import { useIoDevicesStore, useResolvedSurface } from '../../state/ioDevicesStore';
 import { useLibraryStore } from '../../state/libraryStore';
+import { isAudioEntry } from '../../state/libraryEntry';
 import { logInfo, logWarn } from '../../state/logStore';
 import { describeMicFailure, shouldAnnounceMicFailure } from '../../lib/micErrors';
 import { usePianoRollStore, type PianoNote } from '../../state/pianoRollStore';
@@ -291,7 +292,7 @@ export const MidiPanel: React.FC = () => {
   // Library entries whose title matches the current search text (cap the list).
   const assetMatches = (() => {
     const q = assetQuery.trim().toLowerCase();
-    const audio = entries.filter((e) => e.kind === 'audio');
+    const audio = entries.filter(isAudioEntry);
     const list = q ? audio.filter((e) => e.title.toLowerCase().includes(q)) : audio;
     return list.slice(0, 12);
   })();
@@ -546,7 +547,7 @@ export const MidiPanel: React.FC = () => {
   const listOpen = assetOpen && assetMatches.length > 0;
   // MATCH reads a library song's rhythm analysis, so it gets the field's id only
   // when that id names an audio entry; typed text that matches none leaves it off.
-  const songEntryId = entries.some((e) => e.kind === 'audio' && e.id === assetId) ? assetId : undefined;
+  const songEntryId = entries.some((e) => isAudioEntry(e) && e.id === assetId) ? assetId : undefined;
 
   return (
     // data-keyscope: this tab and the EDIT timeline both bind Delete; see

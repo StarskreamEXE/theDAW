@@ -43,6 +43,9 @@ interface ServerRecord {
   play_count?: number;
   last_played_at?: number | null;
   cover_url?: string | null;
+  // The record's media kind. /entries lists audio unless asked for ?kind=media
+  // or ?kind=all, and older backends omit the field.
+  kind?: 'audio' | 'video' | 'image';
   // Enrichment attached by the backend's `_attach_analysis` (only present once
   // the entry has been analyzed). Flat scalar analysis dict + parsed embedded
   // file tags — see LibraryEntry.analysis / .embeddedTags.
@@ -79,6 +82,9 @@ const toEntry = (r: ServerRecord): LibraryEntry => ({
   // Cover art the backend found embedded in the file. Null (not undefined)
   // when there is none, so the UI knows the answer without a probe request.
   coverUrl: r.cover_url ?? null,
+  // Carry the kind through, so a list that keeps audio sees what the backend
+  // said. A record without one is audio, as LibraryEntry.kind documents.
+  kind: r.kind ?? 'audio',
   // Pass the backend analysis enrichment straight through (snake_case →
   // camelCase only). Left undefined when the entry hasn't been analyzed, which
   // the inspector + search treat as "no extra data" rather than empty objects.
