@@ -34,12 +34,21 @@ function reviveMessages(msgs: unknown): Message[] {
     if (!Array.isArray(msgs)) return [];
     return msgs
         .filter((m): m is Record<string, unknown> => !!m && typeof m === 'object')
-        .map((m) => ({
-            ...(m as unknown as Message),
+        .map((m) => {
             // timestamp round-trips through JSON as a string; revive to Date so
-            // the Message contract (timestamp: Date) holds for consumers.
-            timestamp: m.timestamp ? new Date(m.timestamp as string) : new Date(),
-        }));
+            // the Message contract (timestamp: Date) holds for consumers. A
+            // corrupt value would yield an Invalid Date, which blows up every
+            // downstream toLocaleTimeString() — fall back to now instead.
+            const d = m.timestamp ? new Date(m.timestamp as string) : new Date();
+            return {
+                ...(m as unknown as Message),
+                // content is typed string; storage could hold anything.
+                ...(m.content !== undefined && typeof m.content !== 'string'
+                    ? { content: String(m.content) }
+                    : {}),
+                timestamp: Number.isNaN(d.getTime()) ? new Date() : d,
+            };
+        });
 }
 
 /** All stored conversations, newest-updated first. Never throws. */
@@ -66,11 +75,32 @@ function writeAll(list: StoredConversation[]): StoredConversation[] {
     let capped = [...list]
         .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
         .slice(0, MAX_CONVERSATIONS);
+    if (capped.length === 0) {
+        // An empty list is a real state (the last conversation was deleted).
+        // setItem('[]') would work too, but removing the key is cleaner and —
+        // unlike falling through the loop below — it actually persists.
+        try {
+            localStorage.removeItem(CONV_KEY);
+        } catch {
+            /* localStorage unavailable — nothing to do */
+        }
+        return [];
+    }
     while (capped.length > 0) {
         try {
             localStorage.setItem(CONV_KEY, JSON.stringify(capped));
             return capped;
-        } catch {
+        } catch (e) {
+            // Only a quota failure is worth retrying with less data; anything
+            // else (SecurityError, storage disabled) repeats forever.
+            const quota =
+                e instanceof DOMException &&
+                (e.name === 'QuotaExceededError' ||
+                    (e as DOMException & { code?: number }).code === 22);
+            if (!quota) {
+                console.warn('chatHistory: write failed', e);
+                break;
+            }
             if (capped.length === 1) break; // one convo still won't fit → give up
             capped = capped.slice(0, capped.length - 1); // drop the oldest, retry
         }

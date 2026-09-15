@@ -508,8 +508,49 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
 
 
 
+    // Follow the tail of the transcript. Kept apart from the persist effect
+    // below so switching provider/model/mode doesn't yank the view to the
+    // bottom — only new messages scroll.
     useEffect(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }, [messages]);
+
+    // The single write path for a conversation record. Shared by the debounced
+    // timer below and the synchronous flushes in "New chat" / resume, so the
+    // last <500ms of a reply survives an active-id swap.
+    const flushConversation = useCallback((convId: string, sessionId: string | null, snapshot: Message[]) => {
+        if (snapshot.length === 0) return;
+        const existing = getConversation(convId);
+        const last = snapshot[snapshot.length - 1];
+        const prev = existing?.messages[existing.messages.length - 1];
+        // skip a no-op write (e.g. the mount effect for a restored chat) — it would only
+        // rebrand provider/model and bump updatedAt, silently reshuffling history.
+        // Content (and the pendingAction/isError flags) must be compared too: while a
+        // reply streams, the last message's id and the array length hold still and only
+        // its content grows, so an id+length check would treat the finished reply as
+        // identical to an already-persisted mid-stream partial and truncate it forever.
+        if (existing && existing.messages.length === snapshot.length
+            && prev?.id === last?.id
+            && prev?.content === last?.content
+            && !!prev?.pendingAction === !!last?.pendingAction
+            && !!prev?.isError === !!last?.isError) return;
+        const now = Date.now();
+        const record: StoredConversation = {
+            id: convId,
+            title: existing?.title || deriveTitle(snapshot),
+            messages: snapshot,
+            provider: selectedProvider,
+            model: selectedModel,
+            claudeMode,
+            sessionId,
+            createdAt: existing?.createdAt ?? now,
+            updatedAt: now,
+        };
+        setActiveId(convId);
+        setConversations(upsertConversation(record));
+    }, [selectedProvider, selectedModel, claudeMode]);
+
+    useEffect(() => {
         // Debounced persist of the active conversation. Streaming mutates
         // `messages` per token, so writes are coalesced to ~half a second.
         // Any pending timer is cleared first so a stale write can't fire after
@@ -522,30 +563,11 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
         const sessionId = conversationIdRef.current;
         const snapshot = messages;
         persistTimerRef.current = window.setTimeout(() => {
-            const existing = getConversation(convId);
-            const last = snapshot[snapshot.length - 1];
-            // skip a no-op write (e.g. the mount effect for a restored chat) — it would only
-            // rebrand provider/model and bump updatedAt, silently reshuffling history.
-            if (existing && existing.messages.length === snapshot.length
-                && existing.messages[existing.messages.length - 1]?.id === last?.id) return;
-            const now = Date.now();
-            const record: StoredConversation = {
-                id: convId,
-                title: existing?.title || deriveTitle(snapshot),
-                messages: snapshot,
-                provider: selectedProvider,
-                model: selectedModel,
-                claudeMode,
-                sessionId,
-                createdAt: existing?.createdAt ?? now,
-                updatedAt: now,
-            };
-            setActiveId(convId);
-            setConversations(upsertConversation(record));
+            flushConversation(convId, sessionId, snapshot);
             persistTimerRef.current = null;
         }, 500);
         return () => { if (persistTimerRef.current) window.clearTimeout(persistTimerRef.current); };
-    }, [messages, selectedProvider, selectedModel, claudeMode]);
+    }, [messages, selectedProvider, selectedModel, claudeMode, flushConversation]);
 
     const sendMessage = async (text: string) => {
         const pendingAttachments = attachments;
@@ -787,9 +809,15 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
         handleQuickCommand(suggestion);
     };
 
-    // "New chat": the current transcript is already saved by the persist
-    // effect, so this just starts a fresh conversation id with an empty view.
+    // "New chat": flush any pending debounced write first — the persist timer
+    // is up to 500ms behind the stream, and the id swap below would leave that
+    // tail unwritten — then start a fresh conversation id with an empty view.
     const handleClearHistory = () => {
+        if (persistTimerRef.current) {
+            window.clearTimeout(persistTimerRef.current);
+            persistTimerRef.current = null;
+            flushConversation(activeConvIdRef.current, conversationIdRef.current, messages);
+        }
         setMessages([]);
         activeConvIdRef.current = uuid();
         setActiveId(activeConvIdRef.current);
@@ -802,12 +830,25 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
     // a fresh empty conversation so the panel doesn't show a deleted chat.
     const handleClearAll = () => {
         if (!window.confirm('Delete ALL saved chats from this browser?')) return;
+        // Drop the pending persist write before wiping, or the flush in
+        // handleClearHistory would write the just-deleted chat straight back.
+        if (persistTimerRef.current) {
+            window.clearTimeout(persistTimerRef.current);
+            persistTimerRef.current = null;
+        }
         clearAllConversations();
         setConversations([]);
         handleClearHistory();
     };
 
     const resumeConversation = (conv: StoredConversation) => {
+        // Same tail problem as "New chat": write out whatever the debounce is
+        // still holding for the conversation we're leaving, under its own id.
+        if (persistTimerRef.current) {
+            window.clearTimeout(persistTimerRef.current);
+            persistTimerRef.current = null;
+            flushConversation(activeConvIdRef.current, conversationIdRef.current, messages);
+        }
         activeConvIdRef.current = conv.id;
         setActiveId(conv.id);
         setMessages(conv.messages);
@@ -823,6 +864,12 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
     };
 
     const removeConversation = (id: string) => {
+        // Deleting the active chat: drop its pending write, otherwise the flush
+        // in handleClearHistory below would resurrect it.
+        if (id === activeConvIdRef.current && persistTimerRef.current) {
+            window.clearTimeout(persistTimerRef.current);
+            persistTimerRef.current = null;
+        }
         setConversations(deleteConversation(id));
         if (id === activeConvIdRef.current) handleClearHistory();
     };
@@ -949,6 +996,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                         <span className="text-[10px] font-semibold text-muted uppercase tracking-wide">History</span>
                         <div className="flex items-center gap-3">
                             <button
+                                type="button"
                                 onClick={handleClearHistory}
                                 className="inline-flex items-center gap-1 text-[10px] text-primary hover:text-white transition-colors"
                                 title="Start a new chat"
@@ -1234,6 +1282,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                                                                     onClick={() => copyToClipboard(text)}
                                                                     className="absolute right-2 top-2 p-1.5 bg-white/10 hover:bg-white/20 rounded opacity-0 group-hover:opacity-100 transition-opacity"
                                                                     title="Copy code"
+                                                                    aria-label="Copy code"
                                                                 >
                                                                     <Copy size={12} />
                                                                 </button>

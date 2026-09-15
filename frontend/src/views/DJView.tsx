@@ -907,7 +907,9 @@ export const DJView: React.FC = () => {
   useEffect(() => {
     if (!automixPendingStart) return;
     useDjAutomix.getState().consumeStart();
+    useDjAutomix.getState().consumeTransition(); // drop a stale "transition now" so the restart doesn't blend off track 1
     ejectDeck('A'); ejectDeck('B');            // clear decks so the sequencer seeds from track 1
+    applyCrossfade(-1);                        // full Deck A — the seed loads track 1 there; a parked +1 would mute it
     setAutomixOn(true);
     setAutomixRestart((n) => n + 1);           // re-run the automix effect for a fresh seed even if already on
   }, [automixPendingStart]);
@@ -2361,6 +2363,10 @@ const SourceTree: React.FC<{ source: Source; setSource: (s: Source) => void; lib
           <div className="pl-4 pr-1.5 py-0.5 text-[9px] font-mono text-zinc-700">No sets — click +</div>
         ) : sets.map((s) => {
           const isActive = source.kind === 'set' && source.id === s.id;
+          // Auto-DJ needs ≥2 real entries. Not `disabled` — browsers suppress
+          // the tooltip on a disabled control and drop it from tab order, so
+          // the "Add at least 2 tracks" hint would never reach the user.
+          const playable = s.entries.filter((e) => e.entryId).length >= 2;
           // Row is a div (not the Item <button>) so the green ▶ Auto-DJ action
           // can sit as a sibling button — nesting a button inside a button is
           // invalid DOM. Clicking the name opens/activates the set; the ▶
@@ -2383,11 +2389,11 @@ const SourceTree: React.FC<{ source: Source; setSource: (s: Source) => void; lib
               <span className="text-[8px] text-zinc-600 shrink-0" title={`${s.entries.length} tracks`}>{s.entries.length}</span>
               <button
                 type="button"
-                onClick={() => { setActive(s.id); setSource({ kind: 'set', id: s.id }); useDjAutomix.getState().requestStart(); }}
-                disabled={s.entries.filter((e) => e.entryId).length < 2}
-                title={s.entries.filter((e) => e.entryId).length < 2 ? 'Add at least 2 tracks to Auto-DJ this set' : `Auto-DJ "${s.name}" — load, beatmatch & crossfade the whole set hands-free`}
+                onClick={() => { if (!playable) return; setActive(s.id); setSource({ kind: 'set', id: s.id }); useDjAutomix.getState().requestStart(); }}
+                aria-disabled={!playable}
+                title={!playable ? 'Add at least 2 tracks to Auto-DJ this set' : `Auto-DJ "${s.name}" — load, beatmatch & crossfade the whole set hands-free`}
                 aria-label={`Play set ${s.name} with Auto-DJ`}
-                className="shrink-0 p-0.5 rounded text-emerald-400 hover:text-emerald-200 hover:bg-emerald-500/15 disabled:opacity-25 disabled:hover:bg-transparent"
+                className={`shrink-0 p-0.5 rounded text-emerald-400 disabled:opacity-25 disabled:hover:bg-transparent ${playable ? 'hover:text-emerald-200 hover:bg-emerald-500/15' : 'opacity-25'}`}
               >
                 <Play className="w-3 h-3" />
               </button>
