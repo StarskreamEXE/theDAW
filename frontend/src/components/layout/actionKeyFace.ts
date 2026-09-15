@@ -32,6 +32,13 @@ export interface ActionKeyInput {
   trainingRun: TrainingRunFace | null;
   /** How the key reaches the dashboard's runs (underfitRunsStore.link). */
   trainingLink: TrainingLink;
+  /**
+   * The most recent run of any status, whose settings a press repeats, or null
+   * when the dashboard has no runs and the first one has to come from its form.
+   */
+  lastRunName: string | null;
+  /** A start request is out (underfitRunsStore.starting). */
+  startingRun: boolean;
   /** A mounted VJ tab will take the set now (read on the DJ tab only). */
   vjTargetActive: boolean;
 }
@@ -113,11 +120,11 @@ export function generationCaption(statusLabel: string, isGenerating: boolean): A
   return { text: statusLabel, tone: 'stopped' };
 }
 
-/** UNDERFIT's key with no live run: where runs start, and why the key cannot stop one yet. */
+/** UNDERFIT's key with nothing to repeat: where the first run comes from, and why. */
 export const TRAIN_REST: Record<TrainingLink, string> = {
-  ok: 'Train: start a run in the Underfit dashboard above; this key stops it while it trains',
+  ok: 'Train: set up the first run in the Underfit dashboard above; this key then repeats it and stops it while it trains',
   'dashboard-down': 'Train: the Underfit dashboard is not answering; start it from the tab above',
-  'backend-old': 'Train: start a run in the Underfit dashboard above; restart the backend so this key can stop it',
+  'backend-old': 'Train: restart the backend so this key can start and stop runs',
 };
 
 const clampPct = (pct: number): number => (Number.isFinite(pct) ? Math.max(0, Math.min(100, Math.round(pct))) : 0);
@@ -156,11 +163,13 @@ export function actionKeyFace(s: ActionKeyInput): ActionKeyFace {
       return { ...face, label: 'Process audio' };
     }
     case 'train': {
-      // UNDERFIT's runs are the Underfit dashboard's (the tab embeds it). They
-      // start in the dashboard, which has the dataset and model forms; the key
-      // follows the newest live run and a press kills its process
-      // (underfitRunsStore.stopRun). With no live run there is nothing for the
-      // key to do, so it rests dimmed and says where runs start.
+      // UNDERFIT's runs are the Underfit dashboard's (the tab embeds it). While
+      // one is live the key is STOP and kills its process
+      // (underfitRunsStore.stopRun). With none live it is TRAIN and repeats the
+      // most recent run's settings under a fresh name
+      // (underfitRunsStore.trainAgain) — the first run of all still comes from
+      // the dashboard's form, which is where a dataset and a base model are
+      // chosen, so with no run to repeat the key rests dimmed and says so.
       const run = s.trainingRun;
       if (run) {
         const others = run.others > 0 ? `; ${run.others} other ${run.others === 1 ? 'run keeps' : 'runs keep'} training` : '';
@@ -176,13 +185,14 @@ export function actionKeyFace(s: ActionKeyInput): ActionKeyFace {
           progress: PENDING,
         };
       }
-      return {
-        ...rest,
-        glyph: 'train',
-        legend: 'TRAIN',
-        label: TRAIN_REST[s.trainingLink],
-        disabled: true,
-      };
+      const face = { ...rest, glyph: 'train' as const, legend: 'TRAIN' };
+      if (s.startingRun) {
+        return { ...face, label: 'Train: starting a run…', on: true, disabled: true, progress: PENDING };
+      }
+      if (s.trainingLink !== 'ok' || !s.lastRunName) {
+        return { ...face, label: TRAIN_REST[s.trainingLink], disabled: true };
+      }
+      return { ...face, label: `Train again with the settings of "${s.lastRunName}"` };
     }
     default: {
       const caption = generationCaption(s.statusLabel, s.isGenerating);
