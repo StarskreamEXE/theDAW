@@ -486,7 +486,7 @@ export interface FxChainListProps {
 // zustand selector below makes useSyncExternalStore see a new snapshot every
 // render (reference equality) → "getSnapshot should be cached" → infinite
 // re-render loop. One shared empty array keeps the snapshot stable.
-const EMPTY_CHAIN: ChainEntry[] = [];
+const EMPTY_CHAIN: readonly ChainEntry[] = Object.freeze([]);
 
 export const FxChainList: React.FC<FxChainListProps> = ({
   scope,
