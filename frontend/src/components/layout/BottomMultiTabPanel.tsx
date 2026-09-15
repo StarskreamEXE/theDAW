@@ -309,7 +309,7 @@ const SingPaneToggle: React.FC = () => {
         <button onClick={() => setPane('score')} className={`${btn} ${pane === 'score' ? on : off}`} title="Only the score" aria-pressed={pane === 'score'}>
           <span className="inline-flex items-center gap-1"><FileMusic className="w-3 h-3" /> Score</span>
         </button>
-        <button onClick={() => setPane('analysis')} className={`${btn} ${pane === 'analysis' ? on : off}`} title="Lyrics and the rhyme / literary analysis side by side" aria-pressed={pane === 'analysis'}>
+        <button data-tour="sing-study" onClick={() => setPane('analysis')} className={`${btn} ${pane === 'analysis' ? on : off}`} title="Lyrics and the rhyme / literary analysis side by side" aria-pressed={pane === 'analysis'}>
           Study
         </button>
       </div>

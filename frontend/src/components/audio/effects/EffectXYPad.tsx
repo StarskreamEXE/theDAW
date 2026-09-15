@@ -69,7 +69,7 @@ export const EffectXYPad: React.FC<EffectXYPadProps> = ({ label, xParam, yParam,
 
   return (
     <div className="flex flex-col items-center gap-1 min-w-0">
-      <span id={capId} className="text-[8px] font-bold uppercase tracking-wider text-zinc-400 leading-none truncate max-w-full">{label}</span>
+      <span id={capId} className="font-sans text-xs font-bold text-zinc-400 leading-none truncate max-w-full">{label}</span>
       <svg
         ref={svgRef}
         width={size}
@@ -98,10 +98,12 @@ export const EffectXYPad: React.FC<EffectXYPadProps> = ({ label, xParam, yParam,
         <line x1={0} y1={dotY} x2={size} y2={dotY} stroke={color} strokeOpacity={0.35} strokeWidth={1} />
         <circle cx={dotX} cy={dotY} r={9} fill={color} fillOpacity={0.18} />
         <circle cx={dotX} cy={dotY} r={5} fill={color} stroke="#fff" strokeWidth={1} />
-        <text x={size / 2} y={size - 3} textAnchor="middle" fontSize={7} fill="#71717a" fontFamily="monospace">{xParam.label}</text>
-        <text x={3} y={9} fontSize={7} fill="#71717a" fontFamily="monospace">{yParam.label}</text>
+        {/* Axis names drawn last with a dark halo, so the crosshair and the dot
+            passing under a word never cut its letters. */}
+        <text x={size / 2} y={size - 4} textAnchor="middle" fontSize={12} fill="#d4d4d8" stroke="#000" strokeOpacity={0.9} strokeWidth={3} strokeLinejoin="round" paintOrder="stroke" className="font-sans font-bold">{xParam.label}</text>
+        <text x={4} y={14} fontSize={12} fill="#d4d4d8" stroke="#000" strokeOpacity={0.9} strokeWidth={3} strokeLinejoin="round" paintOrder="stroke" className="font-sans font-bold">{yParam.label}</text>
       </svg>
-      <span className="text-[8px] font-mono text-zinc-400 tabular-nums leading-none whitespace-nowrap">
+      <span className="font-sans text-xs font-bold text-zinc-400 tabular-nums leading-none whitespace-nowrap">
         {formatParamValue(xParam, x)} · {formatParamValue(yParam, y)}
       </span>
     </div>

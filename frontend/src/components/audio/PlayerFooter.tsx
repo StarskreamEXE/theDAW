@@ -1,8 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Volume2, Download, Share2, Heart, Repeat, Repeat1, Shuffle, VolumeX, MoreHorizontal, Cast, Check, Activity, ChevronUp, Headphones, Speaker } from 'lucide-react';
+import { Volume2, Download, Share2, Heart, Repeat, Repeat1, Shuffle, VolumeX, Cast, Check, Activity, ChevronUp, Headphones, Speaker } from 'lucide-react';
 import { useGenerateStore } from '../../state/generateStore';
 import { usePlaybackStore } from '../../state/playbackStore';
-import { usePlayerStore } from '../../state/playerStore';
+import { usePlayerStore, getLoadedAudioUrl } from '../../state/playerStore';
 import { useLibraryStore } from '../../state/libraryStore';
 import type { LibraryEntry } from '../../state/libraryStore';
 import { useAppUiStore } from '../../state/appUiStore';
@@ -43,8 +43,10 @@ import {
   transportPlayRest,
 } from './transportKeys';
 import { Glyph, GLYPH_PAUSE, GLYPH_PLAY, GLYPH_TO_END, GLYPH_TO_START } from './transportGlyphs';
-import { entryAudioFileName } from '../../convert/convertClient';
+import { entryAudioFileName, entryFileName } from '../../convert/convertClient';
 import { saveFile } from '../../lib/saveFile';
+import { TrackMenu } from './TrackMenu';
+import { audioExtForMime, EDITOR_TIMELINE_ID } from './trackMenuModel';
 
 /**
  * What each repeat state is called, in the tooltip and for a screen reader.
@@ -604,12 +606,32 @@ export const PlayerFooter: React.FC = () => {
     }
   };
 
+  // Save a copy of what the footer holds: the library file for an entry, the
+  // loaded bytes for anything else (a stem, a MIX render, the MIDI beat). It
+  // used to fall back to the first library entry, which saved an unrelated file
+  // for every track that was not an entry.
+  const currentEntry = React.useMemo(
+    () => (currentEntryId ? libraryEntries.find((e) => e.id === currentEntryId) ?? null : null),
+    [libraryEntries, currentEntryId],
+  );
+  const canSaveCopy = hasTrack && (!!currentEntry || !!getLoadedAudioUrl());
+  const saveCopyTitle = canSaveCopy
+    ? 'Save a copy of the current track'
+    : currentEntryId === EDITOR_TIMELINE_ID
+      ? 'The EDIT timeline plays live. Mix it down in EDIT to save it'
+      : 'Load a track to save a copy';
   const handleDownload = () => {
-    const entries = useLibraryStore.getState().entries;
-    const target = entries.find((e) => e.id === currentEntryId) ?? entries[0];
-    if (!target) return;
-    const url = useLibraryStore.getState().getAudioUrl(target);
-    void saveFile({ url, suggestedName: entryAudioFileName(target), kind: 'audio' });
+    if (currentEntry) {
+      const url = useLibraryStore.getState().getAudioUrl(currentEntry);
+      void saveFile({ url, suggestedName: entryAudioFileName(currentEntry), kind: 'audio' });
+      return;
+    }
+    const loaded = getLoadedAudioUrl();
+    if (!loaded) return;
+    const name = engineLabel || 'track';
+    void fetch(loaded)
+      .then((res) => res.blob())
+      .then((blob) => saveFile({ blob, suggestedName: entryFileName(name, audioExtForMime(blob.type), 'track'), kind: 'audio' }));
   };
 
   // "Up next" — no formal play queue yet, so derive the next track from the
@@ -854,16 +876,14 @@ export const PlayerFooter: React.FC = () => {
               <button
                 type="button"
                 onClick={handleDownload}
-                disabled={!hasTrack}
+                disabled={!canSaveCopy}
                 aria-label="Save a copy of the current track"
-                title="Save a copy of the current track"
+                title={saveCopyTitle}
                 className={iconButton}
               >
                 <Download className="w-4 h-4" />
               </button>
-              <button type="button" aria-label="More options" title="More options" className={iconButton}>
-                <MoreHorizontal className="w-4 h-4" />
-              </button>
+              <TrackMenu buttonClassName={iconButton} />
             </div>
 
             <div className="h-6 w-px bg-white/5" />

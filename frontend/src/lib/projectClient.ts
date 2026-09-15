@@ -7,6 +7,7 @@ import type { PerformRoutingSnapshot } from '../state/performRouting';
 import type { AudioClip } from '../state/editorStore';
 import type { PianoNote } from '../state/pianoRollStore';
 import { normalizeMeterMap } from './meterMap';
+import { sanitizeBends, type BendShape } from './pitchBend';
 
 // --- Piano-roll meter (mirrors lib/meterMap in the .tasmo JSON shape) ---
 /** A time-signature change: the meter from `bar` until the next change. */
@@ -29,6 +30,20 @@ export interface TasmoStepNote {
   length: number;
   velocity: number;
   lane?: number;
+}
+
+/** A pitch bend point as a piano-roll clip stores it; `shape` only when it is not `linear`. */
+export interface TasmoBendPoint {
+  step: number;
+  value: number;
+  shape?: BendShape;
+}
+
+/** A lane's pitch bend: the lane id, its range in semitones and its points. */
+export interface TasmoLaneBend {
+  lane: number;
+  range: number;
+  points: TasmoBendPoint[];
 }
 
 // --- Effect chain (mirrors backend tasmo_project.py EffectChainNode/VstPluginState) ---
@@ -98,6 +113,8 @@ export interface TasmoClipInput {
   meter_map?: TasmoMeterSegment[] | null;
   pickup_steps?: number | null;
   lanes?: TasmoPolyLane[] | null;
+  /** Piano-roll clips: each lane's pitch bend. */
+  roll_bends?: TasmoLaneBend[] | null;
 }
 
 export interface TasmoTrackInput {
@@ -171,6 +188,8 @@ export interface TasmoLoadedClip {
   meter_map?: TasmoMeterSegment[] | null;
   pickup_steps?: number | null;
   lanes?: TasmoPolyLane[] | null;
+  /** Each lane's pitch bend; absent in .tasmo files written before the roll had pitch bend. */
+  roll_bends?: TasmoLaneBend[] | null;
 }
 
 export interface TasmoLoadedTrack {
@@ -221,8 +240,8 @@ export interface RecentItem {
 }
 
 // --- Piano-roll clip fields <-> .tasmo JSON (pure; tested in projectImport.test.ts) ---
-type ClipMeterFields = Pick<AudioClip, 'sourceRollNotes' | 'sourceTotalSteps' | 'sourceMeterMap' | 'sourcePickupSteps' | 'sourceLanes'>;
-type TasmoMeterFields = Pick<TasmoClipInput, 'roll_notes' | 'total_steps' | 'meter_map' | 'pickup_steps' | 'lanes'>;
+type ClipMeterFields = Pick<AudioClip, 'sourceRollNotes' | 'sourceTotalSteps' | 'sourceMeterMap' | 'sourcePickupSteps' | 'sourceLanes' | 'sourceBends'>;
+type TasmoMeterFields = Pick<TasmoClipInput, 'roll_notes' | 'total_steps' | 'meter_map' | 'pickup_steps' | 'lanes' | 'roll_bends'>;
 
 /** A piano-roll note in the .tasmo shape, carrying `lane` when the note has one. */
 export const pianoNoteToTasmo = (n: PianoNote): TasmoStepNote => ({
@@ -242,6 +261,15 @@ export const clipMeterToTasmo = (c: ClipMeterFields): TasmoMeterFields => ({
     : {}),
   ...(c.sourcePickupSteps !== undefined ? { pickup_steps: c.sourcePickupSteps } : {}),
   ...(c.sourceLanes ? { lanes: c.sourceLanes.map((l) => ({ id: l.id, name: l.name, cycle_steps: l.cycleSteps })) } : {}),
+  ...(c.sourceBends?.length
+    ? {
+        roll_bends: c.sourceBends.map((b) => ({
+          lane: b.lane,
+          range: b.range,
+          points: b.points.map((p) => ({ step: p.step, value: p.value, ...(p.shape !== 'linear' ? { shape: p.shape } : {}) })),
+        })),
+      }
+    : {}),
 });
 
 const numberAtLeast = (v: unknown, min: number): number | undefined =>
@@ -291,6 +319,21 @@ export const tasmoMeterToClip = (c: TasmoMeterFields): ClipMeterFields => {
     out.sourceLanes = c.lanes
       .filter((l) => l && Number.isInteger(l.id) && l.id >= 0)
       .map((l) => ({ id: l.id, name: String(l.name ?? ''), cycleSteps: numberAtLeast(l.cycle_steps, 1) ?? null }));
+  }
+  if (Array.isArray(c.roll_bends) && c.roll_bends.length) {
+    // The file stores no point ids, so loaded points get `rb<lane>-<index>`.
+    const bends = sanitizeBends(
+      c.roll_bends
+        .filter((b): b is TasmoLaneBend => !!b && typeof b === 'object')
+        .map((b) => ({
+          lane: b.lane,
+          range: b.range,
+          points: Array.isArray(b.points)
+            ? b.points.map((p, i) => (p && typeof p === 'object' ? { ...p, id: `rb${b.lane}-${i}` } : { step: Number.NaN, value: 0 }))
+            : [],
+        })),
+    );
+    if (bends.length) out.sourceBends = bends;
   }
   return out;
 };

@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import numpy as np
 from fastapi import Body, FastAPI, Form, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
 from backend.admin_routes import router as admin_router
 from backend.lib.audio_io import load_audio, load_audio_array, save_audio, save_subtype
@@ -2456,7 +2456,9 @@ app.include_router(admin_router)
 # /vj-app (matching the VJ build's vite base) BEFORE the SPA catch-all below so
 # it isn't shadowed. In dev the frontend's Vite config proxies /vj-app -> :8600,
 # so the iframe loads it same-origin; in packaged/Docker it's already one origin.
-def _serve_static_build(dist: Path | None, rel: str, label: str) -> FileResponse:
+def _serve_static_build(
+    dist: Path | None, rel: str, label: str, request: Request
+) -> Response:
     """Serve one file out of an embedded app build, resolved PER REQUEST.
 
     These builds are produced by a step that can run after the backend is
@@ -2490,7 +2492,24 @@ def _serve_static_build(dist: Path | None, rel: str, label: str) -> FileResponse
         raise HTTPException(
             status_code=404, detail=f"the staged {label} build has no index.html"
         )
-    return FileResponse(target)
+    # The builds keep fixed file names (embed.bundle.js, styles.css), so a
+    # response without Cache-Control lets the browser reuse an old copy on its
+    # own heuristic for hours after a new build is staged. no-cache makes every
+    # load revalidate, and a matching ETag answers 304 without the body.
+    response = FileResponse(
+        target, stat_result=target.stat(), headers={"Cache-Control": "no-cache"}
+    )
+    etag = response.headers["etag"]
+    sent = request.headers.get("if-none-match", "")
+    if any(
+        tag.strip() == "*" or tag.strip().removeprefix("W/") == etag
+        for tag in sent.split(",")
+        if tag.strip()
+    ):
+        return Response(
+            status_code=304, headers={"ETag": etag, "Cache-Control": "no-cache"}
+        )
+    return response
 
 
 try:
@@ -2498,8 +2517,8 @@ try:
 
     @app.get(f"{_vj_sidecar.STATIC_MOUNT_PATH}/", include_in_schema=False)
     @app.get(_vj_sidecar.STATIC_MOUNT_PATH + "/{rel:path}", include_in_schema=False)
-    def _serve_vj_app(rel: str = "") -> FileResponse:
-        return _serve_static_build(_vj_sidecar.resolve_dist_dir(), rel, "VJ")
+    def _serve_vj_app(request: Request, rel: str = "") -> Response:
+        return _serve_static_build(_vj_sidecar.resolve_dist_dir(), rel, "VJ", request)
 
     # The route exists from here on, so static_mount_active() only has to ask
     # whether a build is resolvable right now.
@@ -2525,8 +2544,10 @@ try:
 
     @app.get(f"{_sway_sidecar.STATIC_MOUNT_PATH}/", include_in_schema=False)
     @app.get(_sway_sidecar.STATIC_MOUNT_PATH + "/{rel:path}", include_in_schema=False)
-    def _serve_sway_app(rel: str = "") -> FileResponse:
-        return _serve_static_build(_sway_sidecar.resolve_dist_dir(), rel, "SwayCommand")
+    def _serve_sway_app(request: Request, rel: str = "") -> Response:
+        return _serve_static_build(
+            _sway_sidecar.resolve_dist_dir(), rel, "SwayCommand", request
+        )
 
     _sway_sidecar.STATIC_MOUNTED = True
     logger.info(

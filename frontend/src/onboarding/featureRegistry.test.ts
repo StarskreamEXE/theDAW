@@ -8,6 +8,8 @@
  * caught instead.
  */
 import assert from 'node:assert/strict';
+import { readdirSync, readFileSync } from 'node:fs';
+import path from 'node:path';
 import { CENTER_TABS } from '../state/appUiStore';
 import { FEATURES, featureById } from './featureRegistry';
 import { FEATURE_NOTES } from './featureNoteList';
@@ -77,5 +79,37 @@ assert.ok(
   'a labelled control does not get a pinned note',
 );
 assert.ok(featureById('library')?.locate, 'the library is still findable from the help search');
+
+// Every LOCATE hook exists in a component. The whole source tree is read back,
+// this folder included, because the "?" button's own hook is in
+// HelpSearchPopover.tsx. Only JSX attributes count: a selector string such as
+// '[data-tour="library"]' in the registry or the tour has a "[" before it.
+const SRC = path.resolve(import.meta.dirname, '..');
+const hooks = new Set<string>();
+const notes = new Set<string>();
+(function walk(dir: string): void {
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) {
+      if (e.name !== 'node_modules') walk(full);
+      continue;
+    }
+    if (!e.name.endsWith('.tsx') && !e.name.endsWith('.ts')) continue;
+    const src = readFileSync(full, 'utf8');
+    for (const m of src.matchAll(/(?<!\[)data-tour="([^"]+)"/g)) hooks.add(m[1]);
+    for (const m of src.matchAll(/(?<!\[)data-feature-note="([^"]+)"/g)) notes.add(m[1]);
+    if (/data-tour=\{`tab-\$\{/.test(src)) for (const t of CENTER_TABS) hooks.add(`tab-${t}`);
+    if (/data-tour=\{`bottom-tab-\$\{/.test(src)) for (const t of DOCK_TABS) hooks.add(`bottom-tab-${t}`);
+  }
+})(SRC);
+assert.ok(hooks.size > 10, 'the source scan found hooks');
+for (const f of FEATURES) {
+  const sel = f.locate?.selector;
+  if (!sel) continue;
+  const tour = /^\[data-tour="([^"]+)"\]$/.exec(sel);
+  if (tour) assert.ok(hooks.has(tour[1]), `${f.id}: no component carries data-tour="${tour[1]}"`);
+  const note = /^\[data-feature-note="([^"]+)"\]$/.exec(sel);
+  if (note) assert.ok(notes.has(note[1]), `${f.id}: no component carries data-feature-note="${note[1]}"`);
+}
 
 console.log('featureRegistry tests passed');

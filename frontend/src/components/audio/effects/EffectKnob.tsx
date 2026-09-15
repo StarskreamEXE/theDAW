@@ -125,10 +125,12 @@ const EffectKnobImpl: React.FC<EffectKnobProps> = ({ param, value, onChange, lab
   return (
     <div
       className={`flex flex-col items-center gap-1 select-none min-w-0 ${disabled ? 'opacity-40' : ''}`}
-      style={{ width: size + 14, ...accentVars(colorT) }}
+      style={{ width: size + 22, ...accentVars(colorT) }}
       title={param.tip}
     >
-      <span id={labelId} className="text-[8px] font-bold uppercase tracking-wider text-zinc-400 truncate max-w-full text-center leading-none">
+      {/* 12px labels: a long name ("Motion Depth") wraps to a second line and
+          the row's bottom alignment keeps the dials level. */}
+      <span id={labelId} className="font-sans text-xs font-bold text-zinc-400 max-w-full text-center leading-tight line-clamp-2 wrap-break-word">
         {shownLabel}
       </span>
       <div
@@ -157,9 +159,9 @@ const EffectKnobImpl: React.FC<EffectKnobProps> = ({ param, value, onChange, lab
         <div className="tk-point" style={{ transform: `rotate(${225 + sweep}deg)` }}><span /></div>
       </div>
       <span
-        className="font-mono tabular-nums leading-none whitespace-nowrap"
+        className="font-sans tabular-nums leading-none whitespace-nowrap"
         style={{
-          fontSize: active ? '11px' : '9px',
+          fontSize: active ? '13px' : '12px',
           fontWeight: active ? 800 : 700,
           color: 'var(--accent)',
           textShadow: active ? `0 0 10px ${rgba(base, 0.55)}` : 'none',

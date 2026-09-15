@@ -1,5 +1,6 @@
 import type { Cursor, OpenSheetMusicDisplay } from 'opensheetmusicdisplay';
 import { ensureEngine } from '../../state/playerStore';
+import { soundingBpm, type SoundingTempo } from './soundingTempo';
 
 /** Follow-along timing for the SCORE tab, kept out of the view so it can be
  *  reasoned about on its own: the notated time map the cursor steps through,
@@ -62,6 +63,10 @@ export interface BuildTimeMapOptions {
   /** Must match the cursor's own setting, or map indices address the wrong
    *  positions. Both OSMD constructors default it to true. */
   skipInvisibleNotes?: boolean;
+  /** The document's metronome marks with the tempo each one sounds at
+   *  (`readSoundingTempi`). OSMD reports the printed `<per-minute>`, a whole
+   *  number on an engraved sheet, so without these the map runs at that. */
+  soundingTempi?: readonly SoundingTempo[];
 }
 
 /**
@@ -99,9 +104,14 @@ export function buildTimeMap(
   if (!manager || measures.length === 0) return empty;
 
   const statedTempo = sheet.HasBPMInfo === true && sheet.DefaultStartTempoInBpm > 0;
+  const tempi = opts.soundingTempi ?? [];
+  // OSMD's start tempo comes from the document's first metronome mark.
+  const firstMarkMeasure = tempi.reduce((first, t) => Math.min(first, t.measureIndex), 0);
   // The document's own start tempo, which is what OSMD's iterator reports only
   // after it has activated the first tempo instruction.
-  const docBpm = statedTempo ? sheet.DefaultStartTempoInBpm : fallbackBpm;
+  const docBpm = statedTempo
+    ? soundingBpm(tempi, firstMarkMeasure, sheet.DefaultStartTempoInBpm)
+    : fallbackBpm;
 
   // End of the last measure in whole notes, for the closing segment: once the
   // iterator runs off the end it parks its timestamp at the sentinel
@@ -125,14 +135,16 @@ export function buildTimeMap(
     guard += 1;
     const enrolledBefore = it.CurrentEnrolledTimestamp.RealValue;
     const sourceBefore = it.CurrentSourceTimestamp.RealValue;
+    const measureIndex = it.CurrentMeasureIndex;
     const reported = it.CurrentBpm;
     if (reported > 0 && Math.abs(reported - OSMD_UNSET_BPM) > 1e-6) iteratorHasTempo = true;
-    const bpm = iteratorHasTempo && reported > 0 ? reported : docBpm;
+    const bpm =
+      iteratorHasTempo && reported > 0 ? soundingBpm(tempi, measureIndex, reported) : docBpm;
 
     steps.push({
       seconds,
       wholeNotes: enrolledBefore,
-      measureIndex: it.CurrentMeasureIndex,
+      measureIndex,
     });
 
     it.moveToNextVisibleVoiceEntry(false);

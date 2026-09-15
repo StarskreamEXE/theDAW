@@ -332,7 +332,7 @@ const stepSize = (size: number, direction: 1 | -1): number => {
 };
 
 const SectionHead: React.FC<{ title: string; hint?: string }> = ({ title, hint }) => (
-  <div className="sticky top-0 z-10 flex items-baseline gap-2 border-b border-white/5 bg-[#07050a] px-2 py-1 text-[9px] font-mono uppercase tracking-widest text-zinc-500">
+  <div className="et-opaque sticky top-0 z-10 flex items-baseline gap-2 border-b border-white/5 bg-[#07050a] px-2 py-1 text-[9px] font-mono uppercase tracking-widest text-zinc-500">
     <span className="text-zinc-300">{title}</span>
     {hint && <span className="normal-case tracking-normal text-zinc-600">{hint}</span>}
   </div>
