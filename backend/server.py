@@ -1083,6 +1083,8 @@ def _gpu_snapshot() -> list[dict]:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=2,
             stdin=subprocess.DEVNULL,
             env=child_env(),

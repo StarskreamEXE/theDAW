@@ -42,6 +42,8 @@ def _run(cmd: list[str], timeout: float = 5.0) -> tuple[int, str]:
             cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             stdin=subprocess.DEVNULL,
             env=child_env(),

@@ -17,7 +17,7 @@ import { useLibraryStore } from '../../state/libraryStore';
 import { buildGenerateParamsFromState, useGenerateStore } from '../../state/generateStore';
 import { useGenerateParamsStore } from '../../state/generateParamsStore';
 import { useStudioStore } from '../../state/studioStore';
-import { liveUnderfitRun, runName, useUnderfitRunsStore } from '../../state/underfitRunsStore';
+import { lastUnderfitRun, liveUnderfitRun, runName, useUnderfitRunsStore } from '../../state/underfitRunsStore';
 import { useSetlistStore } from '../../state/setlistStore';
 import { sendSetToVj, isVjSetTargetActive, type VjSetItem } from '../../state/vjSetBus';
 import { useAppUiStore } from '../../state/appUiStore';
@@ -367,6 +367,7 @@ export const LogActionButton: React.FC = () => {
   const underfitRuns  = useUnderfitRunsStore((s) => s.runs);
   const trainingLink  = useUnderfitRunsStore((s) => s.link);
   const stoppingRunId = useUnderfitRunsStore((s) => s.stoppingId);
+  const startingRun   = useUnderfitRunsStore((s) => s.starting);
   const progressId    = useId();
 
   // UNDERFIT's key follows the dashboard's runs while that tab is open.
@@ -378,6 +379,8 @@ export const LogActionButton: React.FC = () => {
     return () => window.clearInterval(t);
   }, [centerTab]);
   const liveRun = liveUnderfitRun(underfitRuns);
+  // With no run live, TRAIN repeats the newest run's settings, so the key names it.
+  const lastRun = lastUnderfitRun(underfitRuns);
 
   // The WORKSPACE decides the action (actionKind): DJ sends, MIX runs the chain,
   // EDIT processes the arrangement, UNDERFIT trains, everything else CREATEs.
@@ -397,6 +400,8 @@ export const LogActionButton: React.FC = () => {
       ? { name: runName(liveRun.run), others: liveRun.others, stopping: stoppingRunId === liveRun.run.id }
       : null,
     trainingLink,
+    lastRunName: lastRun ? runName(lastRun) : null,
+    startingRun,
     // Read at render, on the DJ tab only: whether a mounted VJ tab takes the set now.
     vjTargetActive: centerTab === 'dj' && isVjSetTargetActive(),
   });
@@ -442,8 +447,10 @@ export const LogActionButton: React.FC = () => {
         void useStudioStore.getState().triggerPendingProcess();
         return;
       case 'train':
-        // A live dashboard run is on the key as STOP; at rest the key is busy.
+        // A live dashboard run is on the key as STOP; with none live the key
+        // trains again from the newest run's settings under a fresh name.
         if (liveRun) void useUnderfitRunsStore.getState().stopRun(liveRun.run.id);
+        else void useUnderfitRunsStore.getState().trainAgain();
         return;
     }
   };

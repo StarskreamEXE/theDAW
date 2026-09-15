@@ -1,10 +1,11 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   useStatusNotice,
   useStatusNoticeStore,
   type StatusLevel,
   type StatusNotice,
 } from '../../state/statusNoticeStore';
+import { noticeLift } from './noticeLift';
 
 /**
  * The assistant orb's speech bubble.
@@ -196,6 +197,36 @@ export const OrbTipBubble: React.FC<OrbTipBubbleProps> = ({ onOpen, onOpenLog, c
   const live = useStatusNotice();
   const [notice, release] = useShownNotice(hovered);
   const noticeUp = notice !== null;
+  const slotRef = useRef<HTMLDivElement | null>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  // A notice taller than the room above the slot rises clear of the scrub
+  // strip; see noticeLift. Measured on every layout the panel can change in.
+  const [lift, setLift] = useState(0);
+  useLayoutEffect(() => {
+    if (!noticeUp) {
+      setLift(0);
+      return;
+    }
+    const measure = () => {
+      const slot = slotRef.current?.getBoundingClientRect();
+      const panel = panelRef.current?.getBoundingClientRect();
+      if (!slot || !panel) return;
+      const strip = document.querySelector('[data-scrub-strip]')?.getBoundingClientRect() ?? null;
+      // The lift moves the panel's box and never reflows its text, so the
+      // height measured in place is the height it keeps once lifted.
+      setLift(noticeLift(slot, panel.height, strip));
+    };
+    measure();
+    // jsdom, and any runtime without it, simply measures once.
+    const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
+    if (ro && panelRef.current) ro.observe(panelRef.current);
+    window.addEventListener('resize', measure);
+    return () => {
+      ro?.disconnect();
+      window.removeEventListener('resize', measure);
+    };
+    // notice, not noticeUp: a new notice of another length re-measures.
+  }, [noticeUp, notice]);
 
   const tip = index < 0 ? GREETING : TIPS[index];
 
@@ -267,12 +298,20 @@ export const OrbTipBubble: React.FC<OrbTipBubbleProps> = ({ onOpen, onOpenLog, c
           rate sit immediately to the right, and a slot that resized with its
           text dragged them back and forth on every rotation. The slot is a
           two-line bubble tall; a tip centres in it, and a notice panel is
-          anchored to its bottom and grows upward over the row above. */}
-      <div className={['relative shrink-0 h-10.5', widthClass, className || ''].join(' ')}>
+          anchored to its bottom and grows upward. A notice too tall to grow
+          inside the footer's own row rises clear of the scrub strip instead of
+          over it (noticeLift), so the playhead is never covered. */}
+      <div ref={slotRef} className={['relative shrink-0 h-10.5', widthClass, className || ''].join(' ')}>
         <div
+          ref={panelRef}
+          style={notice && lift > 0 ? { bottom: lift } : undefined}
           className={
             notice
-              ? 'absolute left-0 bottom-0 z-10 w-72 min-h-full flex flex-col justify-center'
+              // -left-8: a notice leaves the slot's indent and sits against the
+              // orb, which is what it is speaking for. The slot is inset 168px
+              // (the grid's px-6 plus pl-36) to clear the 112px orb, so -32px
+              // puts the panel's edge 8px off the orb's.
+              ? 'absolute -left-8 bottom-0 z-10 w-72 min-h-full flex flex-col justify-center'
               : 'absolute inset-0 flex flex-col justify-center'
           }
         >

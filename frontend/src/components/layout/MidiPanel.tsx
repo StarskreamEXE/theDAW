@@ -68,6 +68,7 @@ import {
   PianoRollEditKey,
   PianoRollFeel,
   PianoRollMapKey,
+  PianoRollBendKey,
   PianoRollNoteCount,
   PianoRollTransport,
   PianoRollZoom,
@@ -233,6 +234,8 @@ export const MidiPanel: React.FC = () => {
   const [voiceOn, setVoiceOn] = useStoredToggle(VOICE_COLUMN_KEY, true);
   // Step width is shared by the strip's zoom keys and the grid's ctrl+wheel.
   const [stepPx, setStepPx] = useState(16);
+  /** The pitch bend lane under the grid; the strip's BEND key opens it. */
+  const [showBend, setShowBend] = useState(false);
   const [monitorOpen, setMonitorOpen] = useState(false);
   const [inputMenuOpen, setInputMenuOpen] = useState(false);
   const [songMenuOpen, setSongMenuOpen] = useState(false);
@@ -626,6 +629,7 @@ export const MidiPanel: React.FC = () => {
         <InstrumentPicker compact />
         <Sep />
         <PianoRollZoom stepPx={stepPx} onStepPxChange={setStepPx} />
+        <PianoRollBendKey on={showBend} onChange={setShowBend} />
         <Sep />
         <PianoRollFeel />
         <Sep />
@@ -950,7 +954,7 @@ export const MidiPanel: React.FC = () => {
             running when toggling back to the roll. */}
         <div className="flex-1 min-w-0 relative">
           <div className={arpOn ? 'hidden' : 'absolute inset-0'}>
-            <PianoRoll stepPx={stepPx} onStepPxChange={setStepPx} />
+            <PianoRoll stepPx={stepPx} onStepPxChange={setStepPx} showBend={showBend} />
           </div>
           <div className={arpOn ? 'absolute inset-0' : 'hidden'}>
             <ArpeggiatorPanel playing={arpPlaying} />

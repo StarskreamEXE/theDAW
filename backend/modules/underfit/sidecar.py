@@ -276,6 +276,8 @@ def _setup_worker(cfg: UnderfitConfig, uv: str) -> None:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
         )
     except OSError as e:
@@ -348,6 +350,8 @@ def _install_sa3_backend(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
         )
     except OSError as e:

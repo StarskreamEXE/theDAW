@@ -138,6 +138,8 @@ def _has_librubberband() -> bool:
                 ["ffmpeg", "-hide_banner", "-filters"],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=10,
                 stdin=subprocess.DEVNULL,
                 env=child_env(),
