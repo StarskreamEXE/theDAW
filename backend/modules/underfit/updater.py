@@ -52,6 +52,8 @@ def _run_git(args: list[str], timeout: int = 25, cwd: Optional[Path] = None):
         cwd=str(cwd or _REPO_ROOT),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
         env=child_env(),
     )
@@ -192,6 +194,8 @@ def apply() -> dict:
                 [bash, "-c", cmd],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=300,
                 env=child_env(),
             )

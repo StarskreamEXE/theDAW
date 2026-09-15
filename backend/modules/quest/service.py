@@ -164,6 +164,8 @@ def _run(adb: str, args: list[str], timeout: float) -> subprocess.CompletedProce
         [adb, *args],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         env=child_env(),

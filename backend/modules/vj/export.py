@@ -251,6 +251,8 @@ def _run_ffmpeg(cmd: list[str]) -> None:
             cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             stdin=subprocess.DEVNULL,
             timeout=600.0,
             env=child_env(),
