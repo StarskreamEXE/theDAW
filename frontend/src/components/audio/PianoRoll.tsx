@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Check, Info, Minus, Plus, Save, Scissors, Trash2, Unlink } from 'lucide-react';
+import { Check, Info, Minus, Plus, Save, Scissors, Trash2, Unlink, Waves } from 'lucide-react';
 import { DEFAULT_LANES, usePianoRollStore, type PianoNote } from '../../state/pianoRollStore';
 import { usePlaybackStore } from '../../state/playbackStore';
 import { getEngineCtx } from '../../state/playerStore';
@@ -34,6 +34,7 @@ import { BEND_TAIL_SEC, type VoiceBend } from '../../lib/pitchBendVoice';
 import { midiFileToRoll, rollToMidiFile } from '../../lib/rollMidi';
 import { playedRollNotes, rollClipFields } from '../../lib/rollClip';
 import { syncopationByBar } from '../../lib/syncopation';
+import { BendLane } from './BendLane';
 import { MidiMapper } from './MidiMapper';
 import { ContextMenu, useContextMenu, type ContextMenuItem } from '../ui/ContextMenu';
 import { renderStepNotesToBlob } from '../../lib/midiSynth';
@@ -400,6 +401,30 @@ export const PianoRollTransport: React.FC<{
         />
       </div>
     </>
+  );
+};
+
+/**
+ * BEND: opens the pitch bend lane under the grid (BendLane.tsx). It latches, so
+ * the key says whether the lane is there, and it counts the lanes that bend so
+ * a roll carrying bends says so with the lane closed.
+ */
+export const PianoRollBendKey: React.FC<{ on: boolean; onChange: (on: boolean) => void }> = ({ on, onChange }) => {
+  const bends = usePianoRollStore((s) => s.bends);
+  const bent = bends.filter((b) => b.points.length > 0).length;
+  return (
+    <StripKey
+      on={on}
+      aria-pressed={on}
+      onClick={() => onChange(!on)}
+      legend="Bend"
+      icon={<Waves className={STRIP_GLYPH} />}
+      description={
+        bent > 0
+          ? `Pitch bend: the lane under the grid. ${bent} lane${bent === 1 ? '' : 's'} bend${bent === 1 ? 's' : ''} in this roll.`
+          : 'Pitch bend: open the lane under the grid and click to add a point'
+      }
+    />
   );
 };
 
@@ -1047,9 +1072,15 @@ const RollPlayhead: React.FC<{ stepPx: number }> = ({ stepPx }) => {
   );
 };
 
-export const PianoRoll: React.FC<{ stepPx: number; onStepPxChange: (px: number) => void }> = ({
+export const PianoRoll: React.FC<{
+  stepPx: number;
+  onStepPxChange: (px: number) => void;
+  /** The bend lane is open under the grid (the strip's BEND key). */
+  showBend?: boolean;
+}> = ({
   stepPx,
   onStepPxChange,
+  showBend = false,
 }) => {
   const notes = usePianoRollStore((s) => s.notes);
   const totalSteps = usePianoRollStore((s) => s.totalSteps);
@@ -1440,6 +1471,11 @@ export const PianoRoll: React.FC<{ stepPx: number; onStepPxChange: (px: number) 
               );
             })}
           </div>
+
+          {/* The bend lane, inside the grid's scroll box so it keeps the
+              grid's x scale and scrolls with it: a point stays under the note
+              it bends at every zoom and every scroll position. */}
+          {showBend && <BendLane stepPx={stepPx} totalSteps={totalSteps} />}
         </div>
       </div>
 
