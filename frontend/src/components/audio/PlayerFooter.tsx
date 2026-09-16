@@ -685,18 +685,22 @@ export const PlayerFooter: React.FC = () => {
           144px wider and pushed PLAY 72px right of the window centre. */}
       <div className="flex-1 min-h-0 grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 xl:gap-4 px-4 xl:px-6 pb-0.5">
         {/* 1. Orb speech bubble + Now Playing, in the left track. The orb
-            sticks to the bottom-left corner and overlaps the footer, so pad left
-            past it: 16px margin + the 112px orb = 128, plus clearance. */}
-        <div className="flex items-center gap-3 min-w-0 pl-36">
-          {/* The orb's speech bubble, in the slot G-Search held, from xl up.
-              Status notices show in it, and a click on one opens the LOG; below
-              xl it is hidden and OrbStatusFloat (App.tsx) shows notices by the
-              orb. 192px below 2xl and 224px from 2xl: beside the 276px transport
-              plate, 192px at 1280px still leaves the now-playing block room for
-              its title and a LIBRARY chip row. */}
+            is pinned flush to the bottom-left corner (0 to 112px) and overlaps
+            the footer, so pad left past it: from 2xl the grid's 24px plus pl-24
+            puts the bubble 8px off the orb. Below 2xl the bubble is hidden and
+            pl-28 keeps the now-playing block clear of the orb. */}
+        <div className="flex items-center gap-3 min-w-0 pl-28 2xl:pl-24">
+          {/* The orb's speech bubble, from 2xl up, left of the scrub strip.
+              The strip is w-3/5 mx-auto, so it starts at 20% of the window
+              (307px at 1536, 360px at 1800, 384px at 1920) and the bubble,
+              starting at 120px, has to end before that: 176px wide ends at
+              296px, 224px from 1800px wide ends at 344px. Below 2xl there is
+              no room beside the orb, so the bubble is hidden and
+              OrbStatusFloat (App.tsx) shows notices by the orb. Status notices
+              show in the bubble, and a click on one opens the LOG. */}
           <OrbTipBubble
-            className="hidden xl:block"
-            widthClass="w-48 2xl:w-56"
+            className="hidden 2xl:block"
+            widthClass="w-44 min-[1800px]:w-56"
             onOpenLog={() => useBottomPanelStore.getState().setLogOpen(true)}
           />
           <div className="flex flex-col min-w-0 flex-1 gap-0.5">
