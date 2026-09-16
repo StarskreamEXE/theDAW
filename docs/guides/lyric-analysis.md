@@ -23,7 +23,8 @@ typing and stores them beside the draft.
 
 ## Running it
 
-Press **ANALYSE** (it reads **RE-ANALYSE** once a document exists). The pass
+Press **ANALYSE** at the right end of the pane's bar (it reads **RE-ANALYSE**
+once a document exists; on a narrow pane it is the refresh icon alone). The pass
 runs as a job with a progress bar, because it is real CPU work — every word is
 turned into phones and compared with its neighbours — and it is never run per
 keystroke. A song with no words yet says so and offers nothing to press.
@@ -32,7 +33,7 @@ The result is saved next to the song as `lyric_analysis.json` and registered as
 a notation artifact of kind `lyricanalysis`, so it survives a restart and two
 tabs never analyse the same song twice.
 
-Edit a song's lyrics afterwards and the pane header shows an amber **STALE**
+Edit a song's lyrics afterwards and the bar shows an amber **STALE**
 badge: the findings are anchored to line and word positions, so once the words
 move they point at the wrong places. Re-analyse and it clears. Staleness is
 decided by a hash of the lines the analysis actually read, so it also catches
@@ -130,32 +131,37 @@ with no model and no key:
   whether or not it was meant.
 
 Metaphor, simile, irony, imagery and symbolism are readings, not measurements,
-so those are not computed — they are asked for. Tick **READ THE MEANING TOO**
-and pick a provider before you analyse.
+so those are not computed — they are asked for. Open **AI** in the bar, tick
+**Read meaning**, and pick a provider and model before you analyse.
 
-The pass uses whatever LLM key the assistant already has (Gemini, OpenAI,
-Anthropic, Grok, Groq, OpenRouter, in that probe order); nothing extra to set
-up, and the checkbox is disabled with an explanation when no provider has a
-key. It reads the first 200 lines of the lyric, returns at most 80 findings,
+The pass uses a key the backend holds: one added in the assistant (click the
+orb, open its settings, **Keys**, then **Ingest Keys**) or an environment
+variable. Providers are probed in the order Gemini, OpenAI, Anthropic, Grok,
+Groq, OpenRouter. With no key, the **AI** panel says so and where to add one,
+and it asks the backend again each time it opens. It reads the first 200 lines of the lyric, returns at most 80 findings,
 and every one of them is re-validated against the real line and word indices
 before it is kept — a model cannot point at a word that is not there. Findings
 from the pass carry an `llm` badge and the model's own confidence, never a
 rule's.
 
-The checkbox starts off every session, because the pass spends your key. If it
-fails, the deterministic analysis is still saved and the reason is shown as
-"meaning pass: …" rather than being silently reported as "this song has no
+**Read meaning** starts off every session, because the pass spends your key.
+If it fails, the deterministic analysis is still saved and the reason is shown
+as "AI: …" rather than being silently reported as "this song has no
 metaphors".
 
 ## Reading the pane
 
-The pane is a stack of sections, read top to bottom:
+Under the bar, the pane reads top to bottom:
 
-- **Shape** — one bar per line: its syllable count, how many findings it
-  carries and its rhyme class. Click a bar to jump the sheet to that line.
-- **The lyric** — the words themselves with every visible device painted on
-  them, the scheme letter down the left, and a **CLASSES** row above. Click a
-  class to isolate it; click it again to show everything.
+- **One summary line** — the whole-lyric rhyme scheme, a chip per rhyme class
+  (click one to isolate it on the sheet, click it again or **All** to show
+  everything), and the line and syllable totals.
+- **The shape strip** — one bar per line: its syllable count, how many findings
+  it carries and its rhyme class. Click a bar to jump the sheet to that line.
+- **The long-range map** — see [The long-range shapes](#the-long-range-shapes).
+- **The sheet** — the words themselves with every visible device painted on
+  them and the scheme letter down the left. A lyric with several sections heads
+  each one with its name, scheme and counts.
 - **Findings** — the list, grouped by family and kind, each row with its
   confidence as a bar and a percentage. Click one to open the inspector at the
   bottom and light that finding up on the words.
@@ -166,20 +172,19 @@ A rhyme class is never distinguished by hue alone: the scheme letter carries
 the information, and each class also has its own node shape, so the sheet
 survives colour blindness and a monochrome screenshot.
 
-The row of controls above the sheet is both the legend and the filter:
+The bar across the top of the pane is one row, and it is both the legend and
+the filter. On a pane narrower than 1024px the chips, **Sheet**, **Mark** and
+**ANALYSE** drop their words and keep their marks and counts.
 
 | Control | What it does |
 |---|---|
-| The five family checkboxes | Show or hide a whole family, with its shape and its count beside it. **Sound is off by default** — alliteration, assonance and consonance fire on most of a lyric by their nature (78% of words carry a mark with every family on, against 48% without), and a highlighter over everything says nothing. |
-| **FLOOR** | Hide findings the detector is less sure of than this. Starts at 50%. |
-| **OFF / NEAR / ALL** (wires) | How much of the wiring is drawn over the sheet — internal, leonine and cross-line rhymes as arcs, which are invisible in a flat list and are the interesting part of a rap lyric. **NEAR** is the default: connections within two lines. **ALL** draws every one, with a live count beside it. **OFF** still wires the finding you currently have open, in full. |
-| **WEB** | Open the whole lyric as one chart — see [The web](#the-web) below. |
-| **A- / A+ / B** | Lyric text size and weight. Shared with the writing surface, so both panes read the same. |
-| **STRESS** | One dot per syllable beside each line, filled where the stress falls. Off by default, and hidden when the pane is narrow. |
-| **TIE** | Tie the two panes together: select a word while writing and it lights here; pick a word here and the caret lands on it over there. |
-| **FOLLOW** | Scroll this sheet with the song, the way the karaoke does. Needs a song playing in the SING tab. |
-| **ON KARAOKE** | Underline the same devices on the karaoke words while the song plays. On by default. |
-| **MARK** | Mark the lyric yourself — see [Your own marks](#your-own-marks) below. Offered only on a LYRIC-notebook draft; a song opened straight from the library shows **MARK IN THE LYRIC TAB** instead. |
+| The family chips | Show or hide a whole family; each chip wears the family's shape and its count. **MEANING** appears once **AI** is on or the lyric has meaning findings. **Sound is off by default** — alliteration, assonance and consonance fire on most of a lyric by their nature (78% of words carry a mark with every family on, against 48% without), and a highlighter over everything says nothing. |
+| **Floor** | The key reads the current floor, e.g. **Floor 50%**. Its panel holds the slider (hide findings the detector is less sure of than this; starts at 50%), how many findings are shown of those found, and the certain/loose key. |
+| **Wires** | The key reads the mode or the count, e.g. **Wires near** or **Wires 365**. Its panel sets how much of the wiring is drawn over the sheet — internal, leonine and cross-line rhymes as arcs, which are invisible in a flat list and are the interesting part of a rap lyric. **Near** is the default: connections within two lines. **All** draws every one. **Off** still wires the finding you currently have open, in full. **Web** opens the whole lyric as one chart — see [The web](#the-web) below. |
+| **Sheet** | A panel with **A- / A+ / B** (lyric text size and weight, shared with the writing surface) and four switches: **Stress** (one dot per syllable beside each line, filled where the stress falls; off by default, hidden when the pane is narrow), **Tie** (select a word while writing and it lights here; pick one here and the caret lands on it there), **Follow** (scroll this sheet with the song, the way the karaoke does; needs a song playing in SING) and **Karaoke** (underline the same devices on the karaoke words while the song plays; on by default). |
+| **Mark** | Mark the lyric yourself — see [Your own marks](#your-own-marks) below. Offered only on a LYRIC-notebook draft. |
+| **AI** | The meaning pass: on/off, provider and model — see above. |
+| **ANALYSE** | Run the analysis. |
 
 ### The long-range shapes
 
@@ -225,9 +230,9 @@ click the words that rhyme — two, three, as many as you like — and name them
 one mark, with a verdict of your own. Your marks are drawn as boxes, never as
 another underline, so they never read as something the engine claimed.
 
-Marks are saved against a lyric **document**, which is why the toggle only
+Marks are saved against a lyric **document**, which is why the key only
 appears on a LYRIC-notebook draft; a song opened from the library has nowhere to
-keep them and shows **MARK IN THE LYRIC TAB** instead. The engine never writes
+keep them. The engine never writes
 to them, so a mark survives a re-analysis unchanged. Spans that name no word in
 the document are dropped on save, and the response says how many.
 
@@ -280,8 +285,8 @@ from one of two places:
   dictionary does not have. Lyrics are full of slang, names, coinages and
   ad-libs, so this path runs constantly even with the dictionary installed.
 
-The badge in the pane header says which one actually backed this analysis:
-`cmudict`, `rules`, or `mixed`.
+The tooltip on **ANALYSE** / **RE-ANALYSE** says which one actually backed this
+analysis: `cmudict`, `rules`, or `mixed`.
 
 **Be aware of what this costs when it says `rules`.** The guessed
 pronunciations are the weaker half, and they go wrong in both directions: the
@@ -289,7 +294,7 @@ rules miss rhymes the dictionary would have found, and they also pair words the
 dictionary would have kept apart. Ordinary English is the good case; names,
 slang, coinages and anything spelled the way it is sung are the bad ones. So a
 lyric analysed mostly by rule should be read as a sketch of its scheme rather
-than as a measurement of it — which is why the badge and the **GUESSED** tile
+than as a measurement of it — which is why the pronunciation source and the **GUESSED** tile
 are on the page at all, and why the discount below exists.
 
 The **GUESSED** metric tile counts the distinct words that had no dictionary
@@ -300,7 +305,7 @@ was guessed and 25% when both were — but only when a dictionary is actually
 installed, because when everything is a guess, discounting everything equally
 just slides the whole lyric under your confidence floor and tells you nothing.
 
-If the badge says `rules` and you expected `cmudict`, the dictionary is not
+If the tooltip says `rules` and you expected `cmudict`, the dictionary is not
 importable in the backend's environment: run `uv sync` and restart the backend.
 
 ## Troubleshooting
@@ -310,12 +315,12 @@ importable in the backend's environment: run `uv sync` and restart the backend.
 - **"No lyrics here yet."** The song has no words at all. Paste or transcribe
   them in SING first.
 - **STALE badge.** The words changed after the analysis ran. Re-analyse.
-- **A scheme that looks wrong.** Check the pronunciation badge and the GUESSED
+- **A scheme that looks wrong.** Check the pronunciation source and the GUESSED
   tile first; a lyric full of invented words is being sounded out by rule.
 - **Nothing in the findings list.** Either every family is switched off, or the
   floor is above everything found. The list says so and tells you which to
   change.
-- **"meaning pass: …"** in amber. The interpretive pass could not run (no key,
+- **"AI: …"** in amber. The interpretive pass could not run (no key,
   a provider error, an unparseable reply). Everything else on the page is still
   correct.
 - **The findings list stops partway.** Each kind lists at most 50 rows and says

@@ -74,7 +74,7 @@ assert.equal(liveRegion(html), 'SAVED: D:\\Exports\\riff.mid');
 assert.ok(!html.includes(GREETING), 'the notice takes the bubble over');
 assert.ok(html.includes('from-[rgb(var(--et-accent)/0.14)]'), 'a success wears the theme accent');
 assert.ok(html.includes('et-ink'), 'in the theme ink, which no light-theme rule re-points');
-assert.ok(html.includes('w-72') && html.includes('line-clamp-4'), 'in the panel that grows upward');
+assert.ok(html.includes('inset-x-0 bottom-0') && html.includes('line-clamp-4'), 'in the slot-wide panel that grows upward');
 
 // ── 2. A second later, a failure: an error LOG line, failure colours ─────────
 mock.timers.tick(1000);

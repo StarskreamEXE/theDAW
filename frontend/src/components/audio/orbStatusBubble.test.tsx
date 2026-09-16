@@ -155,7 +155,7 @@ await tick(1000);
 await step(() => postStatus('SAVE FAILED: footer probe one'));
 assert.ok(label().startsWith('Status: SAVE FAILED: footer probe one'));
 assert.equal(liveText(), 'SAVE FAILED: footer probe one');
-assert.ok(footerButton().parentElement?.className.includes('w-72'), 'the notice panel is wider than the slot');
+assert.ok(footerButton().parentElement?.className.includes('inset-x-0'), 'the notice panel keeps the slot width, left of the scrub strip');
 await enter(footerButton());
 await click(footerButton());
 assert.equal(label(), GREETING_LABEL, 'the click returns the bubble to its tip');

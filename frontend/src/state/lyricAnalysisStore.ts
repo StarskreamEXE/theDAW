@@ -1274,7 +1274,8 @@ export interface LyricAnalysisState {
   load: (entryId: string) => Promise<void>;
   run: (opts?: RunOptions) => Promise<void>;
   remove: () => Promise<void>;
-  probe: () => Promise<void>;
+  /** Ask the backend what it can do. `force` asks again after an answer. */
+  probe: (force?: boolean) => Promise<void>;
   clear: () => void;
   setFamily: (family: DeviceFamily, on: boolean) => void;
   setMinConfidence: (v: number) => void;
@@ -1518,8 +1519,8 @@ export const useLyricAnalysisStore = create<LyricAnalysisState>()((set, get) => 
       }
     },
 
-    probe: async () => {
-      if (get().probed) return;
+    probe: async (force = false) => {
+      if (get().probed && !force) return;
       try {
         const cap = await fetchLyricAnalysisCapability();
         // The capability payload is written by another module; keep only what

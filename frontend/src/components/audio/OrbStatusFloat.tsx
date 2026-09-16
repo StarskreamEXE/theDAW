@@ -6,10 +6,10 @@ import { BUBBLE_TONE, bubbleText, noticeLabel, noticeSurface, useShownNotice } f
 import { noticeLift } from './noticeLift';
 
 /**
- * The orb's status bubble below the xl breakpoint.
+ * The orb's status bubble below the 2xl breakpoint.
  *
- * The footer speech bubble (OrbTipBubble) is hidden under 1280px wide, and the
- * orb is on screen at every width. Below xl this bubble floats by the orb while
+ * The footer speech bubble (OrbTipBubble) is hidden under 1536px wide, and the
+ * orb is on screen at every width. Below 2xl this bubble floats by the orb while
  * a status notice is up, so a status shows on screen as well as in the LOG. It
  * renders nothing while no notice is up. The live region that announces
  * notices is OrbTipBubble's, which stays mounted at every width.
@@ -161,7 +161,7 @@ export const OrbStatusFloat: React.FC<OrbStatusFloatProps> = ({ position, orbBox
   return (
     <div
       ref={boxRef}
-      className={`edit-theme-scope fixed z-60 xl:hidden ${frame}`}
+      className={`edit-theme-scope fixed z-60 2xl:hidden ${frame}`}
       data-et-light={theme.light ? '1' : undefined}
       data-placement={place.kind}
       style={style}
