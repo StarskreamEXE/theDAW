@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Volume2, Download, Share2, Heart, Repeat, Repeat1, Shuffle, VolumeX, Cast, Check, Activity, ChevronUp, Headphones, Speaker } from 'lucide-react';
+import { Volume, Volume2, Download, Share2, Heart, Repeat, Repeat1, Shuffle, VolumeX, Cast, Check, Activity, Headphones, Speaker } from 'lucide-react';
 import { useGenerateStore } from '../../state/generateStore';
 import { usePlaybackStore } from '../../state/playbackStore';
 import { usePlayerStore, getLoadedAudioUrl } from '../../state/playerStore';
@@ -275,7 +275,7 @@ const AudioOutIndicator: React.FC = () => {
         aria-haspopup="dialog"
         aria-controls="footer-audio-out"
         title={missing ? `${name} is not connected — playing on the system default` : `Output: ${name}`}
-        className={`${iconButton} ${missing ? 'text-amber-400 hover:text-amber-300' : ''}`}
+        className={missing ? `${iconButtonBase} text-amber-400 hover:text-amber-300 hover:bg-white/5` : iconButton}
       >
         <Speaker className="w-4 h-4" />
       </button>
@@ -360,31 +360,27 @@ const MasterFxIndicator: React.FC = () => {
 
   return (
     <div ref={wrapRef} className="relative flex items-center shrink-0">
-      {/* The printed words lead the name (label-in-name): "Master FX", then the count. */}
-      <button
-        type="button"
-        onClick={openMix}
-        aria-label={`Master FX: ${count} effect${plural} live on the output. Open MIX`}
-        title={`${count} effect${plural} on the master insert${takers > 0 ? ', some of which take level' : ''}. Open MIX.`}
-        className="flex items-center gap-1.5 pl-2 pr-1.5 py-1 rounded-l border border-r-0 border-[rgb(var(--et-accent)/0.4)] bg-[rgb(var(--et-accent)/0.1)] text-[rgb(var(--et-accent))] hover:bg-[rgb(var(--et-accent)/0.2)] hover:border-[rgb(var(--et-accent)/0.7)] transition-colors shadow-[0_0_12px_rgb(var(--et-accent)/0.18)]"
-      >
-        <Activity className="w-3.5 h-3.5 shrink-0" />
-        <span className="font-display font-bold text-xs leading-4 uppercase whitespace-nowrap">Master FX</span>
-        <span className="font-sans font-bold text-xs leading-4 tabular-nums">{count}</span>
-      </button>
+      {/* One quiet icon key the size of its neighbours: the pulse icon and the
+          effect count in the accent. It opens the panel, which lists what is
+          on the insert and holds Show in MIX and Bypass all. */}
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        aria-label={open ? 'Hide what is on the master insert' : 'Show what is on the master insert'}
+        aria-label={`Master FX: ${count} effect${plural} live on the output`}
+        aria-haspopup="dialog"
         aria-expanded={open}
         aria-controls="master-fx-detail"
-        className="px-1 py-1 rounded-r border border-[rgb(var(--et-accent)/0.4)] bg-[rgb(var(--et-accent)/0.1)] text-[rgb(var(--et-accent))] hover:bg-[rgb(var(--et-accent)/0.2)] hover:border-[rgb(var(--et-accent)/0.7)] transition-colors"
+        title={`${count} effect${plural} on the master insert${takers > 0 ? ', some of which take level' : ''}`}
+        className="p-1.5 rounded-md flex items-center gap-0.5 text-[rgb(var(--et-accent))] hover:bg-white/5 transition-colors"
       >
-        <ChevronUp className={`w-3 h-3 transition-transform ${open ? 'rotate-180' : ''}`} />
+        <Activity className="w-4 h-4 shrink-0" aria-hidden="true" />
+        <span className="font-sans font-bold text-xs leading-4 tabular-nums" aria-hidden="true">{count}</span>
       </button>
       {open && (
         <div
           id="master-fx-detail"
+          role="dialog"
+          aria-label="Master FX"
           className="absolute bottom-full right-0 mb-2 w-72 flex flex-col gap-2 p-2.5 rounded-lg border border-[rgb(var(--et-accent)/0.3)] bg-[#0a080f] shadow-[0_0_24px_rgb(var(--et-accent)/0.2)]"
         >
           {/* Orbitron bold for the heading, the tags and the buttons; the bold
@@ -427,14 +423,33 @@ const MasterFxIndicator: React.FC = () => {
 };
 
 /** A quiet icon button in the footer's secondary row. */
-const iconButton = 'p-1.5 rounded-md text-zinc-500 hover:text-white hover:bg-white/5 transition-colors disabled:opacity-30 disabled:pointer-events-none';
+const iconButtonBase = 'p-1.5 rounded-md transition-colors';
+const iconButton = `${iconButtonBase} text-zinc-500 hover:text-white hover:bg-white/5`;
+/** The same key while it cannot act: greyed, and carrying no hover utilities
+ *  at all, because the theme scope re-points hover:text-* with unlayered rules
+ *  that a disabled: variant cannot beat. */
+const iconButtonOff = `${iconButtonBase} text-zinc-500 opacity-30 cursor-default`;
+/** The Like key while liked: pink, with no zinc text utilities to fight. */
+const iconButtonLiked = `${iconButtonBase} text-pink-500 hover:text-pink-400 hover:bg-white/5`;
+const iconButtonLikedOff = `${iconButtonBase} text-pink-500 opacity-30 cursor-default`;
 
 /** The visible legend beside each picker in the audio-output panel: Orbitron bold at 12px. */
 const AUDIO_OUT_LEGEND = 'font-display font-bold text-xs leading-4 uppercase text-zinc-400 shrink-0';
 
+/** The two info blocks either side of the transport share one width (192px,
+ *  256px from 2xl), so the row is symmetric about PLAY and a long title never
+ *  moves anything. It is a basis, not a fixed width: when a narrow window or
+ *  the Master FX pill leaves less room, the block gives way and its title
+ *  truncates, where a fixed width pushed CREATE off the screen and the
+ *  now-playing block onto LOOP. */
+const INFO_BLOCK = 'basis-48 2xl:basis-64 shrink min-w-0 overflow-hidden flex-col gap-0.5';
+
+/** The word under the title: what the transport is doing, in a fixed-width
+ *  box so PLAYING, PAUSED and IDLE all take the same room. */
+const STATE_WORD = 'w-20 shrink-0 text-center font-display font-bold text-xs leading-4 uppercase rounded-xs border px-1';
+
 export const PlayerFooter: React.FC = () => {
   const [isLiked, setIsLiked] = useState(false);
-
   // The footer sits OUTSIDE Shell (to escape the layout zoom), so it must
   // carry its own edit-theme scope for the theme's utility-class remaps to
   // reach it — that's what makes the action button "derivative of the theme".
@@ -482,6 +497,11 @@ export const PlayerFooter: React.FC = () => {
   const load = usePlayerStore((s) => s.load);
   const currentEntryId = usePlayerStore((s) => s.currentEntryId);
   const libraryEntries = useLibraryStore((s) => s.entries);
+  // The heart belongs to the track it was pressed on; a new track starts
+  // unliked. A stem or a render has no entry id, so its label counts too.
+  useEffect(() => {
+    setIsLiked(false);
+  }, [currentEntryId, engineLabel]);
 
   // Shuffle (the RAND key) — local to the footer: playerStore carries no shuffle
   // state and transportControlSource mirrors play/loop only, so this resets on
@@ -508,7 +528,6 @@ export const PlayerFooter: React.FC = () => {
   // Last-generation metadata (used when nothing's been explicitly loaded yet).
   const lastFilename = useGenerateStore((s) => s.lastFilename);
   const lastDurationSec = useGenerateStore((s) => s.lastDurationSec);
-  const lastModelName = useGenerateStore((s) => s.lastModelName);
 
   // Editor mode — when the EDIT tab is active and editor bridge is registered,
   // the first play click triggers an offline render into playerStore.
@@ -662,9 +681,12 @@ export const PlayerFooter: React.FC = () => {
   const startDisabled = !inEditorMode && !hasTrack;
   const playDisabled = !isVjMode && !inEditorMode && !hasTrack;
 
-  // The now-playing chip: the model that made the last output, LIBRARY for a
-  // loaded entry, IDLE for nothing.
-  const nowChip = lastModelName ? lastModelName.toUpperCase() : (displayLabel ? 'LIBRARY' : 'IDLE');
+  // What the transport is doing, under the title: PLAYING while anything
+  // plays, PAUSED with a track or a live surface held, IDLE with nothing.
+  const stateWord = displayIsPlaying ? 'Playing' : hasTrack || isVjMode ? 'Paused' : 'Idle';
+  // Like and Share are greyed out while nothing is playing. Share has no
+  // action yet.
+  const likeShareOff = !displayIsPlaying;
 
   return (
     <footer
@@ -684,11 +706,11 @@ export const PlayerFooter: React.FC = () => {
           inside them: as a flex-1 pair, section 1's 144px orb clearance made it
           144px wider and pushed PLAY 72px right of the window centre. */}
       <div className="flex-1 min-h-0 grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 xl:gap-4 px-4 xl:px-6 pb-0.5">
-        {/* 1. Orb speech bubble + Now Playing, in the left track. The orb
-            is pinned flush to the bottom-left corner (0 to 112px) and overlaps
-            the footer, so pad left past it: from 2xl the grid's 24px plus pl-24
-            puts the bubble 8px off the orb. Below 2xl the bubble is hidden and
-            pl-28 keeps the now-playing block clear of the orb. */}
+        {/* 1. The left track: the orb's speech bubble at the outer edge, the
+            now-playing block against the transport. The orb is pinned flush
+            to the bottom-left corner (0 to 112px) and overlaps the footer, so
+            the track pads past it: the grid's 24px plus pl-24 puts the bubble
+            8px off the orb. */}
         <div className="flex items-center gap-3 min-w-0 pl-28 2xl:pl-24">
           {/* The orb's speech bubble, from 2xl up, left of the scrub strip.
               The strip is w-3/5 mx-auto, so it starts at 20% of the window
@@ -703,27 +725,50 @@ export const PlayerFooter: React.FC = () => {
             widthClass="w-44 min-[1800px]:w-56"
             onOpenLog={() => useBottomPanelStore.getState().setLogOpen(true)}
           />
-          <div className="flex flex-col min-w-0 flex-1 gap-0.5">
-            <h4 className="text-[13px] font-bold text-zinc-100 truncate tracking-tight leading-tight">
+          <div className="flex-1" />
+          {/* Like and Share, always on screen beside the now-playing block,
+              greyed out while nothing is playing. aria-disabled, not disabled:
+              a key that greys under the keyboard focus (a track ending) keeps
+              the focus instead of dropping it to the page. Like keeps one name
+              and reports its state in aria-pressed. */}
+          <div className="flex shrink-0 items-center gap-0.5">
+            <button
+              type="button"
+              onClick={() => {
+                if (!likeShareOff) setIsLiked(!isLiked);
+              }}
+              aria-disabled={likeShareOff}
+              aria-label="Like"
+              aria-pressed={isLiked}
+              title={likeShareOff ? 'Like: play a track first' : 'Like'}
+              className={isLiked ? (likeShareOff ? iconButtonLikedOff : iconButtonLiked) : (likeShareOff ? iconButtonOff : iconButton)}
+            >
+              <Heart className={`w-3.5 h-3.5 ${isLiked ? 'fill-current' : ''}`} />
+            </button>
+            <button
+              type="button"
+              aria-disabled={likeShareOff}
+              aria-label="Share"
+              title={likeShareOff ? 'Share: play a track first' : 'Share'}
+              className={likeShareOff ? iconButtonOff : iconButton}
+            >
+              <Share2 className="w-3.5 h-3.5" />
+            </button>
+          </div>
+          {/* Now playing, right-aligned against the transport: the mirror of
+              Next on the other side. A label, not a heading: it heads no
+              section. */}
+          <div className={`flex ${INFO_BLOCK} items-end text-right`}>
+            <span
+              className="block w-full text-[13px] font-bold text-zinc-100 truncate tracking-tight leading-tight"
+              title={displayLabel ?? undefined}
+            >
               {displayLabel ?? 'No output loaded'}
-            </h4>
-            {/* One line at every width: the chip gives way first and ends in an
-                ellipsis (its whole name is its title); the duration and the VJ
-                chip keep their width. No sample rate: the engine plays whatever
-                rate the file carries. */}
-            <div className="flex items-center gap-2 min-w-0 whitespace-nowrap">
-              <span
-                title={nowChip}
-                className="min-w-0 truncate font-display font-bold text-xs leading-4 uppercase text-[rgb(var(--et-accent))] border border-[rgb(var(--et-accent)/0.25)] px-1 rounded-xs bg-[rgb(var(--et-accent)/0.06)]"
-              >
-                {nowChip}
-              </span>
-              <span className="shrink-0 font-sans font-bold text-xs leading-4 tabular-nums text-zinc-400">
-                {displayDuration > 0 ? formatDuration(displayDuration) : '--:--'}
-              </span>
+            </span>
+            <div className="flex min-w-0 max-w-full items-center gap-2 whitespace-nowrap">
               {isVjMode && vjSetCount > 0 && (
                 <span
-                  className={`flex items-center gap-1 px-1.5 rounded border font-display font-bold text-xs leading-4 uppercase shrink-0 ${
+                  className={`flex min-w-0 overflow-hidden items-center gap-1 px-1.5 rounded border font-display font-bold text-xs leading-4 uppercase ${
                     vjSetAcked
                       ? 'border-emerald-500/40 bg-emerald-500/5 text-emerald-300'
                       : 'border-amber-500/40 bg-amber-500/5 text-amber-300'
@@ -734,30 +779,23 @@ export const PlayerFooter: React.FC = () => {
                       : `Sending set "${vjSetName ?? ''}" to the VJ…`
                   }
                 >
-                  {vjSetAcked ? <Check className="w-3 h-3" /> : <Cast className="w-3 h-3" />}
-                  VJ {vjSetCount}
+                  {vjSetAcked ? <Check className="w-3 h-3 shrink-0" /> : <Cast className="w-3 h-3 shrink-0" />}
+                  <span className="truncate">VJ {vjSetCount}</span>
                 </span>
               )}
+              <span className="shrink-0 font-sans font-bold text-xs leading-4 tabular-nums text-zinc-400">
+                {displayDuration > 0 ? formatDuration(displayDuration) : '--:--'}
+              </span>
+              <span
+                className={`${STATE_WORD} ${
+                  displayIsPlaying
+                    ? 'text-[rgb(var(--et-accent))] border-[rgb(var(--et-accent)/0.4)] bg-[rgb(var(--et-accent)/0.1)]'
+                    : 'text-zinc-400 border-white/10'
+                }`}
+              >
+                {stateWord}
+              </span>
             </div>
-          </div>
-          {/* Like and Share, on footer hover or keyboard focus, at every width.
-              At rest the pair is 0px wide and its -ml-3 cancels the row gap, so
-              the now-playing block keeps that room; hover or focus opens it,
-              and its overflow turns visible with it so a focused key's outline
-              is never clipped. Both keys stay in the tab order throughout. */}
-          <div className="flex shrink-0 items-center gap-0.5 w-0 -ml-3 overflow-hidden opacity-0 transition-opacity group-hover:w-auto group-hover:ml-1 group-hover:overflow-visible group-hover:opacity-100 focus-within:w-auto focus-within:ml-1 focus-within:overflow-visible focus-within:opacity-100">
-            <button
-              type="button"
-              onClick={() => setIsLiked(!isLiked)}
-              aria-label={isLiked ? 'Unlike' : 'Like'}
-              aria-pressed={isLiked}
-              className={`${iconButton} ${isLiked ? 'text-pink-500 hover:text-pink-400' : ''}`}
-            >
-              <Heart className={`w-3.5 h-3.5 ${isLiked ? 'fill-current' : ''}`} />
-            </button>
-            <button type="button" aria-label="Share" className={iconButton}>
-              <Share2 className="w-3.5 h-3.5" />
-            </button>
           </div>
         </div>
 
@@ -833,45 +871,41 @@ export const PlayerFooter: React.FC = () => {
           </button>
         </div>
 
-        {/* 3. Next (mirrors Now Playing) + Utilities, right-aligned in the
-            right track. */}
-        <div className="flex items-center gap-4 min-w-0 justify-end">
-          {/* Next — mirror of the Now Playing block, right-aligned. Click loads
-              the next track (no formal queue yet, so it's the next library entry —
-              or a random other one while RAND is on, which the title says).
-              Hidden below xl: there the right track is all the utilities' (at
-              the desktop app's 960px minimum it is 318px, the utilities 312px),
-              and at lg it once collapsed to 0px and its second row spilled over
-              the plate. */}
+        {/* 3. The right track, mirroring the left: Next against the transport,
+            the utilities and the action key at the outer edge. justify-end:
+            if the utilities ever outgrow the track, they overflow toward the
+            transport, never off the right edge of the window. */}
+        <div className="flex items-center justify-end gap-3 min-w-0">
+          {/* Next, left-aligned against the transport: the mirror of now
+              playing. Click loads it (no formal queue yet, so it is the next
+              library entry, or a random other one while RAND is on, which the
+              title says). From xl. Phrasing content only inside the button. */}
           <button
             type="button"
             onClick={loadNext}
             disabled={!nextEntry}
             title={nextEntry ? `Play next${isShuffle ? ' (random)' : ''}: ${nextEntry.title}` : 'Nothing queued'}
-            className="group/next hidden xl:flex flex-col min-w-0 flex-1 items-end text-right gap-0.5 disabled:cursor-default"
+            className={`group/next hidden xl:flex mr-auto ${INFO_BLOCK} items-start text-left disabled:cursor-default`}
           >
-            <h4 className="text-[13px] font-bold text-zinc-300 group-hover/next:text-white transition-colors truncate tracking-tight leading-tight w-full">
+            <span className="block w-full text-[13px] font-bold text-zinc-300 group-hover/next:text-white transition-colors truncate tracking-tight leading-tight">
               {nextEntry?.title ?? 'Nothing queued'}
-            </h4>
-            <div className="flex items-center gap-2 whitespace-nowrap">
+            </span>
+            <span className="flex items-center gap-2 whitespace-nowrap">
+              <span className={`${STATE_WORD} text-zinc-400 border-white/10`}>Next</span>
               <span className="shrink-0 font-sans font-bold text-xs leading-4 tabular-nums text-zinc-400">
                 {nextEntry ? formatDuration(nextEntry.duration) : '--:--'}
               </span>
-              <span className="shrink-0 font-display font-bold text-xs leading-4 uppercase text-emerald-400 border border-emerald-500/20 px-1 rounded-xs bg-emerald-500/5">
-                Next
-              </span>
-            </div>
+            </span>
           </button>
-          {/* Left to right: download and more options, then the output (the
-              master FX pill, the output device, mute + volume), then the action
-              key. The two indicators stay beside the volume control because
-              that is where the symptom they account for shows. Fullscreen is in
-              the top bar, beside Mobile. Below 2xl the gaps close to 8px and the
-              volume track to 64px (312px of utilities, 384px at 2xl): that keeps
-              them inside the right track beside the 276px transport plate from
-              the desktop app's 960px minimum, and leaves Next room for its
-              title and chip row from xl. */}
-          <div className="flex items-center gap-2 2xl:gap-4 shrink-0">
+          {/* The utilities, right-aligned at the outer edge: save and more,
+              then the output (the Master FX pill, the output device, mute and
+              volume), then the action key. The pill sits beside the volume
+              because that is where the level it takes shows. Without the pill
+              the set is 286px below xl (6px gaps, a 48px volume track), 296px
+              at xl and 354px from 2xl (10px gaps, 96px), which leaves Next its
+              192px at 1280 and its 256px at 1536; the pill, when a rack is
+              live, takes its width out of Next. */}
+          <div className="flex items-center gap-1.5 xl:gap-2 2xl:gap-2.5 shrink-0">
             <div className="flex items-center gap-1">
               <button
                 type="button"
@@ -879,7 +913,7 @@ export const PlayerFooter: React.FC = () => {
                 disabled={!canSaveCopy}
                 aria-label="Save a copy of the current track"
                 title={saveCopyTitle}
-                className={iconButton}
+                className={canSaveCopy ? iconButton : iconButtonOff}
               >
                 <Download className="w-4 h-4" />
               </button>
@@ -894,15 +928,22 @@ export const PlayerFooter: React.FC = () => {
               <button
                 type="button"
                 onClick={toggleMute}
-                aria-label={isMuted ? 'Unmute' : 'Mute'}
+                aria-label="Mute"
                 aria-pressed={isMuted}
-                title={isMuted ? 'Unmute' : 'Mute'}
+                title="Mute"
                 className={iconButton}
               >
-                {isMuted || volume === 0 ? <VolumeX className="w-4 h-4 text-red-400" /> : <Volume2 className="w-4 h-4" />}
+                {/* The crossed speaker means muted, and only that; a volume of
+                    zero shows the bare speaker, so the icon and aria-pressed
+                    never disagree. */}
+                {isMuted
+                  ? <VolumeX className="w-4 h-4 text-red-400" />
+                  : volume === 0
+                    ? <Volume className="w-4 h-4" />
+                    : <Volume2 className="w-4 h-4" />}
               </button>
               <SlideTrack min={0} max={100} step={1} value={volume}
-                onChange={(v) => setVolume(v)} className="w-16 2xl:w-24" ariaLabel="Volume" />
+                onChange={(v) => setVolume(v)} className="w-12 2xl:w-24" ariaLabel="Volume" />
             </div>
 
             <div className="h-6 w-px bg-white/5" />
