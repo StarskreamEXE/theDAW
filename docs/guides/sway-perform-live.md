@@ -1,7 +1,7 @@
 # Playing Live: PERFORM, the Sway, and Performance Templates
 
 This is the live-performance path through theDAW: load a set into the **PERFORM**
-grid, drive it from an **Audima Sway** (or any MIDI controller), and punch effects
+grid, drive it from an **Audima Labs Sway** (or any MIDI controller), and punch effects
 in and out with the pads while the clips keep running.
 
 It covers the grid, the SwayCommand deck, the routing model that travels inside a
@@ -27,7 +27,7 @@ Open a set from the PERFORM header's Open icon. Three formats land here:
 |---|---|---|
 | `.tasmo` | theDAW's own project format | Full fidelity: clips, scenes, FX chains, routing |
 | `.als` | Ableton Live set | Clips, devices and the set's own MIDI-learn mappings |
-| `.swayproj` | Audima Sway project | Preset/zone map; seeds gesture bindings by preset name |
+| `.swayproj` | Audima Labs Sway project | Preset/zone map; seeds gesture bindings by preset name |
 
 ---
 
