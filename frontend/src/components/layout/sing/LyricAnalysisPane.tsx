@@ -81,6 +81,7 @@ import {
   type RowBox,
 } from './wires';
 import './sing.css';
+import { SheetSaveMenu } from './SheetSaveMenu';
 
 // The web is a whole second picture of the lyric and nobody opens it by
 // accident, so it is not in the pane's own chunk.
@@ -2399,6 +2400,7 @@ export const LyricAnalysisPane: React.FC<LyricAnalysisPaneProps> = ({
                   <Share2 className="h-3 w-3" /> WEB
                 </span>
               </button>
+              <SheetSaveMenu sheetRef={sheetRef} title={title || 'lyric'} disabled={!sheet.rows.length} />
             </Cluster>
 
             <Cluster name="type">
