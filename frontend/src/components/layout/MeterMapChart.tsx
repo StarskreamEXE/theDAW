@@ -56,6 +56,73 @@ const SANS = '"IBM Plex Sans", "Segoe UI", system-ui, sans-serif';
 /** Width an SVG string takes at a font size, close enough to lay chips out. */
 const textWidth = (s: string, size: number): number => s.length * size * 0.58;
 
+/** How far a tempo label steps up when the one beside it is in the way. */
+export const TIER_H = 13;
+
+export interface TempoFlag {
+  /** Where the change is. The flag always sits here; only the label moves. */
+  x: number;
+  label: string;
+  bpm: number;
+  at: number;
+  anchor: 'start' | 'end';
+  lx: number;
+  tier: number;
+}
+
+/**
+ * Lay out the tempo labels so none is drawn over another.
+ *
+ * A song that changes tempo eight times puts eight labels on one ruler, and two
+ * changes eight seconds apart are four pixels apart in a lane a thousand wide.
+ * The flag itself never moves, because it is the datum. The label takes
+ * whichever side has room, and where neither side has room it steps up a tier
+ * and grows a leader line back to its own flag. A number a reader cannot tell
+ * apart from the one beside it says less than no number at all.
+ */
+export const placeTempoFlags = (
+  d: MeterMapData,
+  width: number,
+  x: (t: number) => number,
+): TempoFlag[] => {
+  const out: TempoFlag[] = [];
+  // The right-hand end of the last label placed on each tier, and the left-hand
+  // end of the last one that was pushed leftwards there.
+  const used: number[][] = [];
+  const GAP = 6;
+  for (const s of d.tempo.slice(1)) {
+    const tx = x(s.start_sec);
+    const label = `${Math.round(s.bpm)}`;
+    const w = textWidth(label, 12);
+    let tier = 0;
+    let anchor: 'start' | 'end' = 'start';
+    let lx = tx + 7;
+    for (; tier < 3; tier += 1) {
+      const end = used[tier]?.[0] ?? -Infinity;
+      if (tx + 7 + w <= width && tx + 7 >= end + GAP) {
+        anchor = 'start';
+        lx = tx + 7;
+        break;
+      }
+      if (tx - 7 - w >= 0 && tx - 7 - w >= end + GAP) {
+        anchor = 'end';
+        lx = tx - 7;
+        break;
+      }
+    }
+    if (tier >= 3) {
+      // Three tiers is already a lot of ruler. Past that the label is dropped
+      // rather than stacked further: the flag still marks the change and the
+      // tooltip still carries the number.
+      out.push({ x: tx, label: '', bpm: s.bpm, at: s.start_sec, anchor: 'start', lx: tx + 7, tier: 0 });
+      continue;
+    }
+    used[tier] = [anchor === 'start' ? lx + w : lx];
+    out.push({ x: tx, label, bpm: s.bpm, at: s.start_sec, anchor, lx, tier });
+  }
+  return out;
+};
+
 export interface DrawOptions {
   width: number;
   /** Prefix for element ids, so two drawings in one document never share a
@@ -74,7 +141,12 @@ export const drawMeterMap = (d: MeterMapData, o: DrawOptions): { nodes: React.Re
   const W = o.width;
   const top = o.top ?? 0;
   const x = (t: number): number => (Math.min(Math.max(t, 0), d.duration) / d.duration) * W;
-  const rulerY = top;
+  // Tempo labels are placed before the rows are laid out, because a label that
+  // has to step up to a second tier needs headroom above the ruler, and the
+  // chart has to know how much before it decides where the ruler sits.
+  const flags = placeTempoFlags(d, W, x);
+  const maxTier = flags.reduce((m, f) => Math.max(m, f.tier), 0);
+  const rulerY = top + maxTier * TIER_H;
   const laneY = rulerY + ROWS.ruler + ROWS.gap;
   const syncY = laneY + ROWS.lane + ROWS.syncGap;
   const ticks = ticksFor(d.duration, W);
@@ -96,28 +168,36 @@ export const drawMeterMap = (d: MeterMapData, o: DrawOptions): { nodes: React.Re
           </g>
         );
       })}
-      {d.tempo.slice(1).map((s, i) => {
-        const tx = x(s.start_sec);
-        const label = `${Math.round(s.bpm)}`;
-        const flip = tx + 6 + textWidth(label, 12) > W;
-        return (
-          <g key={`flag-${i}`}>
-            <title>{`${s.bpm} bpm from ${mmss(s.start_sec)}`}</title>
-            <path d={`M ${tx - 5} ${rulerY + 4} L ${tx + 5} ${rulerY + 4} L ${tx} ${rulerY + 12} Z`} fill={TEMPO_COLOUR} />
-            <text
-              x={flip ? tx - 7 : tx + 7}
-              y={rulerY + 12}
-              fill={TEMPO_COLOUR}
-              fontFamily={SANS}
-              fontSize={12}
-              fontWeight={700}
-              textAnchor={flip ? 'end' : 'start'}
-            >
-              {label}
-            </text>
-          </g>
-        );
-      })}
+      {flags.map((f, i) => (
+        <g key={`flag-${i}`}>
+          <title>{`${f.bpm} bpm from ${mmss(f.at)}`}</title>
+          <path d={`M ${f.x - 5} ${rulerY + 4} L ${f.x + 5} ${rulerY + 4} L ${f.x} ${rulerY + 12} Z`} fill={TEMPO_COLOUR} />
+          {f.tier > 0 && (
+            // A leader line, so a label that stepped up still reads as belonging
+            // to its own flag rather than to the nearest one.
+            <line
+              x1={f.x}
+              y1={rulerY + 4}
+              x2={f.x}
+              y2={rulerY + 4 - f.tier * TIER_H}
+              stroke={TEMPO_COLOUR}
+              strokeWidth={1}
+              strokeOpacity={0.45}
+            />
+          )}
+          <text
+            x={f.lx}
+            y={rulerY + 12 - f.tier * TIER_H}
+            fill={TEMPO_COLOUR}
+            fontFamily={SANS}
+            fontSize={12}
+            fontWeight={700}
+            textAnchor={f.anchor}
+          >
+            {f.label}
+          </text>
+        </g>
+      ))}
 
       {/* meter lane */}
       <rect x={0} y={laneY} width={W} height={ROWS.lane} rx={3} fill={LANE_BG} />
@@ -252,7 +332,7 @@ export const drawMeterMap = (d: MeterMapData, o: DrawOptions): { nodes: React.Re
       </g>
     </g>
   );
-  return { nodes, height: chartHeight() };
+  return { nodes, height: chartHeight() + maxTier * TIER_H };
 };
 
 /** The legend as SVG rows at a width. */
