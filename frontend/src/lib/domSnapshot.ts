@@ -109,7 +109,11 @@ const inlineStyles = (source: Element, clone: Element): void => {
   const cs = getComputedStyle(source);
   const style = (clone as HTMLElement | SVGElement).style;
   if (!style) return;
-  const props = isSvg(source) ? SVG_COPIED : COPIED;
+  // An <svg> root placed by CSS (the sheet's wire layer, position: absolute
+  // over the words) needs its box properties too, or it falls into the flow
+  // and the wires are drawn above the words instead of on them.
+  const svgRoot = isSvg(source) && source.tagName.toLowerCase() === 'svg';
+  const props: readonly string[] = svgRoot ? [...COPIED, ...SVG_COPIED] : isSvg(source) ? SVG_COPIED : COPIED;
   for (const p of props) {
     const v = cs.getPropertyValue(p);
     if (v) style.setProperty(p, v);
