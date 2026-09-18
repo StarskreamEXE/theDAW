@@ -590,7 +590,7 @@ export default function App() {
             persistenceKey="thedaw-orb-pos-v4"
           />
           <OrbDripTrail position={orbPosition} orbBox={112} />
-          {/* Status notices by the orb below xl, where the footer bubble is hidden. */}
+          {/* Status notices by the orb below 2xl, where the footer bubble is hidden. */}
           <OrbStatusFloat
             position={orbPosition}
             orbBox={112}

@@ -327,7 +327,6 @@ export const Shell: React.FC = () => {
             onClick={() => setShareOpen(true)}
             icon={<Smartphone className="w-3.5 h-3.5" />}
             title="Open mobile access QR/link"
-            accent="emerald"
           />
           {/* The Docs button used to sit here on its own. It now lives one step
               in, beside the search field, because "open the manual" is the

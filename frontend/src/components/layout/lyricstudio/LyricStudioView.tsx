@@ -58,15 +58,22 @@ export const LyricStudioView: React.FC = () => {
 
   return (
     <div className="h-full min-h-0 flex flex-col bg-[#07050a]">
-      <DocumentRail />
       <div ref={rowRef} className="flex-1 min-h-0 flex">
         <div
           id={EDITOR_PANE_ID}
           className="min-w-0 min-h-0 relative"
           style={{ flexGrow: frac, flexBasis: 0 }}
         >
-          <div className="absolute inset-0">
-            <LyricEditor ref={editorRef} />
+          {/* The draft's bar sits over the writing column, level with the
+              analysis bar over the other one, so the tab has one row of
+              controls. */}
+          <div className="absolute inset-0 flex flex-col">
+            <DocumentRail />
+            <div className="relative flex-1 min-h-0">
+              <div className="absolute inset-0">
+                <LyricEditor ref={editorRef} />
+              </div>
+            </div>
           </div>
         </div>
         <PaneSplitter

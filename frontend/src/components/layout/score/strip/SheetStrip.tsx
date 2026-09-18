@@ -116,6 +116,69 @@ export function describeOsmdParts(osmd: OpenSheetMusicDisplay): PartDescriptor[]
   });
 }
 
+/** One part's name pinned to the strip's left edge, in px from the top of the
+ *  rendered staffline, spanning that part's staves. */
+export interface StaffLabel {
+  name: string;
+  top: number;
+  height: number;
+}
+
+/** OSMD draws at 10 px per unit of its own layout, times the zoom. */
+const OSMD_UNIT_PX = 10;
+
+/**
+ * CSS px per viewport px inside `el`. The app shell sets CSS `zoom` for its
+ * layout scale, so a getBoundingClientRect distance is zoomed while a `top`
+ * written in style is not; this converts the one into the other.
+ */
+function cssPxPerViewportPx(el: HTMLElement): number {
+  const rendered = el.getBoundingClientRect().height;
+  return rendered > 0 && el.offsetHeight > 0 ? el.offsetHeight / rendered : 1;
+}
+
+/**
+ * Where each visible part's staves sit on the rendered strip, grouped by part
+ * so a two-staff piano gets one name across both. Read from OSMD's graphic
+ * layout (staff tops in layout units) plus the page SVG's offset inside the
+ * host, so it matches what was drawn at this zoom.
+ */
+export function measureStaffLabels(osmd: OpenSheetMusicDisplay, host: HTMLElement): StaffLabel[] {
+  const svg = host.querySelector('svg');
+  if (!svg) return [];
+  const offsetY = (svg.getBoundingClientRect().top - host.getBoundingClientRect().top) * cssPxPerViewportPx(host);
+  const unit = OSMD_UNIT_PX * (osmd.Zoom || 1);
+  type Line = {
+    StaffHeight?: number;
+    PositionAndShape?: { AbsolutePosition?: { y: number } };
+    ParentStaff?: { ParentInstrument?: { NameLabel?: { text?: string }; Name?: string } };
+  };
+  const system = (osmd as unknown as {
+    GraphicSheet?: { MusicPages?: Array<{ MusicSystems?: Array<{ StaffLines?: Line[] }> }> };
+  }).GraphicSheet?.MusicPages?.[0]?.MusicSystems?.[0];
+  const groups = new Map<object, { name: string; top: number; bottom: number }>();
+  for (const line of system?.StaffLines ?? []) {
+    const inst = line.ParentStaff?.ParentInstrument;
+    const y = line.PositionAndShape?.AbsolutePosition?.y;
+    if (!inst || typeof y !== 'number') continue;
+    const top = y;
+    const bottom = y + (line.StaffHeight ?? 4);
+    const name = (inst.NameLabel?.text ?? inst.Name ?? '').trim();
+    const group = groups.get(inst);
+    if (group) {
+      group.top = Math.min(group.top, top);
+      group.bottom = Math.max(group.bottom, bottom);
+    } else {
+      groups.set(inst, { name, top, bottom });
+    }
+  }
+  return Array.from(groups.values()).map((g, i) => ({
+    name: g.name || `Part ${i + 1}`,
+    top: offsetY + g.top * unit,
+    height: Math.max(1, (g.bottom - g.top) * unit),
+  }));
+}
+
 /**
  * STRIP view for a MusicXML sheet: OSMD renders the whole score ONCE as a
  * single horizontal staffline (a construction-time option, which is why this
@@ -170,6 +233,19 @@ export const SheetStrip: React.FC<SheetStripProps> = ({ artifact, entry }) => {
   const [parts, setParts] = useState<PartDescriptor[]>([]);
   const [measureCount, setMeasureCount] = useState(0);
   const [ready, setReady] = useState(false);
+  // The part names pinned to the left edge, and the layer that carries them:
+  // it is moved with the staffline's vertical position on every scroll, so a
+  // name stays level with its staff while the music scrolls under it.
+  const [staffLabels, setStaffLabels] = useState<StaffLabel[]>([]);
+  const labelLayerRef = useRef<HTMLDivElement | null>(null);
+  const placeLabels = useCallback(() => {
+    const layer = labelLayerRef.current;
+    const host = hostRef.current;
+    const wrap = layer?.parentElement;
+    if (!layer || !host || !wrap) return;
+    const dy = (host.getBoundingClientRect().top - wrap.getBoundingClientRect().top) * cssPxPerViewportPx(wrap);
+    layer.style.transform = `translateY(${dy}px)`;
+  }, []);
 
   const stored = usePlayAlongStore((s) => s.partVisibility[artifact.id]);
   const nowLine = usePlayAlongStore((s) => s.nowLine);
@@ -307,6 +383,7 @@ export const SheetStrip: React.FC<SheetStripProps> = ({ artifact, entry }) => {
       }
       renderedZoomRef.current = zoomRef.current;
       xmapRef.current = buildStripXMap(osmd, mapRef.current, zoomRef.current);
+      setStaffLabels(measureStaffLabels(osmd, host));
       // render() rebuilt every SVG and replaced the Cursor: the painted
       // elements are gone and the driver's index must come from the new
       // cursor's iterator.
@@ -382,7 +459,9 @@ export const SheetStrip: React.FC<SheetStripProps> = ({ artifact, entry }) => {
           drawTitle: false,
           drawSubtitle: false,
           drawComposer: false,
-          drawPartNames: true,
+          // The names are pinned over the left edge instead (staffLabels), so
+          // they stay readable while the strip scrolls.
+          drawPartNames: false,
           pageBackgroundColor: '#FFFFFF',
         });
         // Same hairline as the page view. follow:false + FollowCursor=false
@@ -485,7 +564,12 @@ export const SheetStrip: React.FC<SheetStripProps> = ({ artifact, entry }) => {
     // collapsing to the left edge until the observer's state update lands.
     const measure = () => setPaneWidth((w) => (el.clientWidth > 0 ? el.clientWidth : w));
     measure();
+    let lastTop = el.scrollTop;
     const onScroll = () => {
+      if (el.scrollTop !== lastTop) {
+        lastTop = el.scrollTop;
+        placeLabels();
+      }
       const now = performance.now();
       if (now <= autoScrollUntilRef.current && Math.abs(el.scrollLeft - expectedLeftRef.current) < 1) return;
       manualUntilRef.current = now + MANUAL_HOLD_MS;
@@ -494,6 +578,7 @@ export const SheetStrip: React.FC<SheetStripProps> = ({ artifact, entry }) => {
     let raf = 0;
     const ro = new ResizeObserver(() => {
       measure();
+      placeLabels();
       cancelAnimationFrame(raf);
       raf = requestAnimationFrame(() => applyFrame(lastSecRef.current, true));
     });
@@ -503,7 +588,12 @@ export const SheetStrip: React.FC<SheetStripProps> = ({ artifact, entry }) => {
       ro.disconnect();
       cancelAnimationFrame(raf);
     };
-  }, [applyFrame]);
+  }, [applyFrame, placeLabels]);
+
+  // New labels (a render, a part toggled): put the layer level with the staves.
+  useLayoutEffect(() => {
+    placeLabels();
+  }, [staffLabels, placeLabels]);
 
   // The now-line moved, or the pad under it changed with the pane width:
   // re-seat the strip under the line, even mid-hold. Runs after React has
@@ -545,6 +635,23 @@ export const SheetStrip: React.FC<SheetStripProps> = ({ artifact, entry }) => {
               the opening bar needs to sit under the now-line. */}
           <div ref={hostRef} className="w-max shrink-0" style={{ paddingLeft: nowGeom.padPx }} />
         </div>
+        {/* The part names, pinned to the left edge over the paper. Hidden from
+            assistive tech: the PART filter above already names every part. */}
+        {staffLabels.length > 0 && (
+          <div aria-hidden="true" className="pointer-events-none absolute inset-0 overflow-hidden">
+            <div ref={labelLayerRef} className="relative">
+              {staffLabels.map((label, i) => (
+                <div
+                  key={`${label.name}-${i}`}
+                  className="absolute left-0 flex max-w-40 items-center border-r-2 border-zinc-300 bg-white/95 pl-2 pr-2.5 shadow-[4px_0_8px_rgba(255,255,255,0.9)]"
+                  style={{ top: label.top, height: label.height }}
+                >
+                  <span className="truncate text-xs font-bold text-zinc-800">{label.name}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
         {/* The now-line: the music sounding now sits under it. Placed from the
             measured scroller width, the same one the scroll maths uses. */}
         <div

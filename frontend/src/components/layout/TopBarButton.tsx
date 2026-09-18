@@ -3,7 +3,7 @@
  *
  * One treatment for every control in the top-bar cluster — mobile access, the
  * help search, IMPORT, the app menu — so the row reads as one set of buttons
- * instead of four lookalikes. `accent` picks the hue; `active` is the filled
+ * instead of four lookalikes, in the theme accent. `active` is the filled
  * state a popover trigger wears while its panel is open; `label` adds visible
  * text for the one control (IMPORT) that has to be found without hovering.
  *
@@ -12,8 +12,6 @@
  * leaving the button private to Shell would make that pair import each other.
  */
 import React from 'react';
-
-export type TopBarAccent = 'purple' | 'emerald' | 'sky' | 'rose' | 'neutral';
 
 export interface TopBarButtonProps {
   onClick: () => void;
@@ -29,7 +27,6 @@ export interface TopBarButtonProps {
    * `title` then carries the longer hint.
    */
   label?: string;
-  accent?: TopBarAccent;
   /** Filled treatment. A popover trigger wears it while its panel is open. */
   active?: boolean;
   /** Popover wiring, for a trigger that owns a panel. */
@@ -47,40 +44,24 @@ export interface TopBarButtonProps {
   buttonRef?: React.Ref<HTMLButtonElement>;
 }
 
-const ACCENT_CLS: Record<TopBarAccent, { idle: string; idleText: string; active: string }> = {
-  purple: {
-    idle: 'border-purple-500/30 hover:bg-purple-500/15 shadow-[0_0_10px_rgba(168,85,247,0.3)]',
-    idleText: 'text-purple-300 group-hover:text-purple-200',
-    active: 'border-purple-500/50 bg-purple-500/15 text-purple-200 shadow-[0_0_12px_rgba(168,85,247,0.45)]',
-  },
-  emerald: {
-    idle: 'border-emerald-500/30 hover:bg-emerald-500/15 shadow-[0_0_10px_rgba(16,185,129,0.3)]',
-    idleText: 'text-emerald-300 group-hover:text-emerald-200',
-    active: 'border-emerald-500/50 bg-emerald-500/15 text-emerald-200 shadow-[0_0_12px_rgba(16,185,129,0.45)]',
-  },
-  sky: {
-    idle: 'border-sky-500/30 hover:bg-sky-500/15 shadow-[0_0_10px_rgba(14,165,233,0.3)]',
-    idleText: 'text-sky-300 group-hover:text-sky-200',
-    active: 'border-sky-500/50 bg-sky-500/15 text-sky-200 shadow-[0_0_12px_rgba(14,165,233,0.45)]',
-  },
-  rose: {
-    idle: 'border-rose-500/30 hover:bg-rose-500/15 shadow-[0_0_10px_rgba(244,63,94,0.3)]',
-    idleText: 'text-rose-300 group-hover:text-rose-200',
-    active: 'border-rose-500/50 bg-rose-500/15 text-rose-200 shadow-[0_0_12px_rgba(244,63,94,0.45)]',
-  },
-  neutral: {
-    idle: 'border-white/5 hover:bg-white/5',
-    idleText: 'text-zinc-500 group-hover:text-zinc-200',
-    active: 'border-white/20 bg-white/10 text-zinc-100',
-  },
-};
+/**
+ * The one treatment every header control wears: the theme accent
+ * (--et-accent, re-pointed per theme) on a hairline border, filled while
+ * active. No glow. The app menu and the recent-files clock take the same
+ * classes, so the cluster is one colour.
+ */
+export function topBarButtonClass(active = false): string {
+  const state = active
+    ? 'border-[rgb(var(--et-accent)/0.55)] bg-[rgb(var(--et-accent)/0.15)] text-[rgb(var(--et-accent))]'
+    : 'border-[rgb(var(--et-accent)/0.3)] text-[rgb(var(--et-accent))] hover:bg-[rgb(var(--et-accent)/0.12)]';
+  return `p-1.5 rounded border transition-colors group flex items-center gap-1.5 outline-none focus-visible:ring-1 focus-visible:ring-[rgb(var(--et-accent)/0.6)] ${state}`;
+}
 
 export const TopBarButton: React.FC<TopBarButtonProps> = ({
   onClick,
   icon,
   title,
   label,
-  accent = 'neutral',
   active = false,
   ariaHasPopup,
   ariaExpanded,
@@ -88,8 +69,6 @@ export const TopBarButton: React.FC<TopBarButtonProps> = ({
   ariaPressed,
   buttonRef,
 }) => {
-  const cls = ACCENT_CLS[accent];
-  const stateCls = active ? cls.active : `${cls.idle} ${cls.idleText}`;
   return (
     <button
       type="button"
@@ -101,7 +80,7 @@ export const TopBarButton: React.FC<TopBarButtonProps> = ({
       aria-expanded={ariaExpanded}
       aria-controls={ariaControls}
       aria-pressed={ariaPressed}
-      className={`p-1.5 rounded border transition-colors group flex items-center gap-1.5 outline-none focus-visible:ring-1 focus-visible:ring-purple-400/60 ${stateCls}`}
+      className={topBarButtonClass(active)}
     >
       {icon}
       {label && (
