@@ -20,6 +20,7 @@ import {
   StickyNote,
 } from 'lucide-react';
 import { useFeatureNoteStore } from '../../onboarding/featureNoteStore';
+import { topBarButtonClass } from '../layout/TopBarButton';
 import { FEATURE_NOTES } from '../../onboarding/featureNoteList';
 import { AssetLibraryModal } from '../assets/AssetLibraryModal';
 import { BackupModal } from './BackupModal';
@@ -61,18 +62,12 @@ interface MenuSection {
   items: MenuAction[];
 }
 
-/* Trigger styling mirrors the header icon cluster's TopBarButton (purple accent). */
-const TRIGGER_IDLE =
-  'border-purple-500/30 hover:bg-purple-500/15 shadow-[0_0_10px_rgba(168,85,247,0.3)] text-purple-300 hover:text-purple-200';
-const TRIGGER_ACTIVE =
-  'border-purple-500/50 bg-purple-500/15 text-purple-200 shadow-[0_0_12px_rgba(168,85,247,0.45)]';
-
 const ITEM_CLS =
-  'w-full flex items-center gap-2 px-2 py-1 rounded text-left text-[10px] text-zinc-300 hover:bg-purple-500/15 hover:text-zinc-100 transition-colors outline-none focus-visible:bg-purple-500/15 focus-visible:text-zinc-100 focus-visible:ring-1 focus-visible:ring-purple-400/60';
+  'w-full flex items-center gap-2 px-2 py-1 rounded text-left text-[10px] text-zinc-300 hover:bg-[rgb(var(--et-accent)/0.15)] hover:text-zinc-100 transition-colors outline-none focus-visible:bg-[rgb(var(--et-accent)/0.15)] focus-visible:text-zinc-100 focus-visible:ring-1 focus-visible:ring-[rgb(var(--et-accent)/0.6)]';
 /* The sponsor row: no icon, label centred in the row rather than left-aligned
    with the rest of the menu. */
 const ITEM_ACCENT_CLS =
-  'justify-center border border-purple-400/50 bg-purple-500/20 text-purple-100 font-black uppercase tracking-wider hover:bg-purple-500/30 hover:text-white';
+  'justify-center border border-[rgb(var(--et-accent)/0.5)] bg-[rgb(var(--et-accent)/0.2)] et-accent-legend font-black uppercase tracking-wider hover:bg-[rgb(var(--et-accent)/0.3)] hover:text-white';
 
 /** Where every Sponsor entry points: the hamburger row here, the pinned row in
  *  Settings, the README badge, .github/FUNDING.yml and the Pinokio menu. */
@@ -118,10 +113,10 @@ export const HamburgerMenu: React.FC<HamburgerMenuProps> = ({
     {
       label: 'Project',
       items: [
-        { id: 'new-project', label: 'New Project', icon: FilePlus2, iconCls: 'text-sky-300', onSelect: onNewProject },
-        { id: 'open-project', label: 'Open Project', icon: FolderOpen, iconCls: 'text-sky-300', onSelect: onOpenProject },
-        { id: 'save-project', label: 'Save Project', icon: Save, iconCls: 'text-sky-300', onSelect: onSaveProject },
-        { id: 'import-daw', label: 'Import DAW Project', icon: FolderInput, iconCls: 'text-sky-300', onSelect: onImportDawProject },
+        { id: 'new-project', label: 'New Project', icon: FilePlus2, iconCls: '', onSelect: onNewProject },
+        { id: 'open-project', label: 'Open Project', icon: FolderOpen, iconCls: '', onSelect: onOpenProject },
+        { id: 'save-project', label: 'Save Project', icon: Save, iconCls: '', onSelect: onSaveProject },
+        { id: 'import-daw', label: 'Import DAW Project', icon: FolderInput, iconCls: '', onSelect: onImportDawProject },
       ],
     },
     {
@@ -131,21 +126,21 @@ export const HamburgerMenu: React.FC<HamburgerMenuProps> = ({
           id: 'asset-library',
           label: 'Asset Library',
           icon: Layers,
-          iconCls: 'text-emerald-300',
+          iconCls: '',
           onSelect: () => setAssetsOpen(true),
         },
         {
           id: 'backup-migrate',
           label: 'Backup / Migrate',
           icon: Archive,
-          iconCls: 'text-emerald-300',
+          iconCls: '',
           onSelect: () => setBackupOpen(true),
         },
         {
           id: 'check-updates',
           label: 'Check for Updates',
           icon: RefreshCw,
-          iconCls: 'text-emerald-300',
+          iconCls: '',
           onSelect: () => {
             setUpdateShowsReleases(false);
             setUpdateOpen(true);
@@ -155,7 +150,7 @@ export const HamburgerMenu: React.FC<HamburgerMenuProps> = ({
           id: 'restore-version',
           label: 'Restore Previous Version',
           icon: History,
-          iconCls: 'text-emerald-300',
+          iconCls: '',
           onSelect: () => {
             setUpdateShowsReleases(true);
             setUpdateOpen(true);
@@ -170,7 +165,7 @@ export const HamburgerMenu: React.FC<HamburgerMenuProps> = ({
           id: 'deploy-quest',
           label: 'Deploy to Quest',
           icon: Headset,
-          iconCls: 'text-sky-300',
+          iconCls: '',
           onSelect: () => setQuestOpen(true),
         },
       ],
@@ -182,24 +177,24 @@ export const HamburgerMenu: React.FC<HamburgerMenuProps> = ({
           id: 'edit-layout',
           label: 'Edit Layout',
           icon: LayoutGrid,
-          iconCls: 'text-purple-300',
+          iconCls: 'text-[rgb(var(--et-accent))]',
           onSelect: onToggleEditLayout,
           active: editLayoutActive,
         },
-        { id: 'change-theme', label: 'Change Theme', icon: Palette, iconCls: 'text-teal-300', onSelect: () => setThemeOpen(true) },
-        { id: 'settings', label: 'Settings', icon: Settings, iconCls: 'text-rose-300', onSelect: onOpenSettings },
-        { id: 'docs', label: 'Docs', icon: BookOpen, iconCls: 'text-purple-300', onSelect: onOpenDocs },
+        { id: 'change-theme', label: 'Change Theme', icon: Palette, iconCls: '', onSelect: () => setThemeOpen(true) },
+        { id: 'settings', label: 'Settings', icon: Settings, iconCls: '', onSelect: onOpenSettings },
+        { id: 'docs', label: 'Docs', icon: BookOpen, iconCls: 'text-[rgb(var(--et-accent))]', onSelect: onOpenDocs },
       ],
     },
     {
       label: 'Help',
       items: [
-        { id: 'feature-tour', label: 'Feature Tour', icon: Compass, iconCls: 'text-amber-300', onSelect: onStartTour },
+        { id: 'feature-tour', label: 'Feature Tour', icon: Compass, iconCls: '', onSelect: onStartTour },
         {
           id: 'feature-notes',
           label: notesShown ? 'Hide Feature Notes' : 'Show Feature Notes',
           icon: StickyNote,
-          iconCls: 'text-amber-300',
+          iconCls: '',
           // Showing brings back every note, dismissed ones included: the point
           // of the entry is to re-find a control you have since forgotten.
           onSelect: () =>
@@ -207,7 +202,7 @@ export const HamburgerMenu: React.FC<HamburgerMenuProps> = ({
               ? useFeatureNoteStore.getState().setEnabled(false)
               : useFeatureNoteStore.getState().resetAll(),
         },
-        { id: 'home-screen', label: 'Home Screen', icon: Home, iconCls: 'text-amber-300', onSelect: onOpenHome },
+        { id: 'home-screen', label: 'Home Screen', icon: Home, iconCls: '', onSelect: onOpenHome },
       ],
     },
     {
@@ -304,9 +299,8 @@ export const HamburgerMenu: React.FC<HamburgerMenuProps> = ({
         // Only while the menu is actually rendered: aria-controls naming an
         // element that does not exist is worse than no aria-controls at all.
         aria-controls={open ? 'app-hamburger-menu' : undefined}
-        className={`p-1.5 rounded border transition-colors group flex items-center gap-1.5 outline-none focus-visible:ring-1 focus-visible:ring-purple-400/60 ${
-          open ? TRIGGER_ACTIVE : TRIGGER_IDLE
-        }`}
+        // The header cluster's one treatment (TopBarButton).
+        className={topBarButtonClass(open)}
       >
         <Menu className="w-3.5 h-3.5" />
       </button>
@@ -346,10 +340,10 @@ export const HamburgerMenu: React.FC<HamburgerMenuProps> = ({
                     onClick={() => selectItem(item)}
                     title={item.title}
                     className={`${ITEM_CLS} ${item.accent ? ITEM_ACCENT_CLS : ''} ${
-                      item.active ? 'bg-purple-500/10 text-purple-200' : ''
+                      item.active ? 'bg-[rgb(var(--et-accent)/0.1)] et-accent-legend' : ''
                     }`}
                   >
-                    {Icon && <Icon className={`w-3.5 h-3.5 shrink-0 ${item.iconCls}`} />}
+                    {Icon && <Icon className={`w-3.5 h-3.5 shrink-0 ${item.iconCls || 'text-[rgb(var(--et-accent))]'}`} />}
                     <span
                       className={
                         item.accent ? 'min-w-0 truncate' : 'flex-1 min-w-0 truncate'
@@ -358,7 +352,7 @@ export const HamburgerMenu: React.FC<HamburgerMenuProps> = ({
                       {item.label}
                     </span>
                     {item.external && <ExternalLink className="w-3 h-3 opacity-70 shrink-0" />}
-                    {item.active && <span className="w-1.5 h-1.5 rounded-full bg-purple-400 shrink-0" />}
+                    {item.active && <span className="w-1.5 h-1.5 rounded-full bg-[rgb(var(--et-accent))] shrink-0" />}
                   </button>
                 );
               })}

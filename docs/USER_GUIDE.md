@@ -1210,7 +1210,7 @@ The result records to the library or appends to the EDIT timeline. Sound modes c
 
 ### 16.10 SWAY
 
-The SWAY tab hosts the **SwayCommand cockpit** — the Audima Sway's own performance app, embedded in theDAW. The tab boots the cockpit straight into a project rather than its splash screen: it opens the most recent project saved from the cockpit, or the bundled `will-i-dream` template on a fresh install, and theDAW registers that project's media so its clips are allowed to load.
+The SWAY tab hosts the **SwayCommand cockpit** — the Audima Labs Sway's own performance app, embedded in theDAW. The tab boots the cockpit straight into a project rather than its splash screen: it opens the most recent project saved from the cockpit, or the bundled `will-i-dream` template on a fresh install, and theDAW registers that project's media so its clips are allowed to load.
 
 Saving inside the cockpit is durable: a save writes a `.sway` file into `data/sway-projects/` through theDAW's backend (`POST /api/sway/project-save`) and its media paths are allowlisted at the same time, so the project reopens intact.
 
@@ -2275,7 +2275,7 @@ The assistant streams chat from any configured provider: Claude Code over the CL
 
 theDAW turns audio into symbolic music and back: audio → MIDI → sheet music, guitar and bass tabs, and playable arrangements, plus an inferred Stable Audio prompt for any track. The symbolic side lives in the **Score** tab of the bottom panel (§16.7) and the **Details** panel (§16.4), backed by the `notation` module (`/api/notation`) and the `analysis` module. The standalone guide is [guides/notation-and-score.md](guides/notation-and-score.md).
 
-A track needs a MIDI first. Convert one from the Library (right-click → Convert to MIDI, §13.7); once a MIDI artifact exists, the Score buttons activate.
+A track needs a MIDI first. Convert one from the Library (right-click → Convert to MIDI, §13.7); once a MIDI artifact exists, every way of writing it activates.
 
 ![Guitar tablature rendered from a track's MIDI in the Score panel](screenshots/score.png)
 
@@ -2283,24 +2283,24 @@ A track needs a MIDI first. Convert one from the Library (right-click → Conver
 
 Every symbolic file a track produces is a notation artifact with a kind: `midi`, `musicxml`, `abc`, `alphatex` (tabs), `pdf`, or `svg`. The Score panel's left rail lists them; selecting one previews it (MusicXML as sheet music through OpenSheetMusicDisplay, alphaTex as tablature through alphaTab), and DOWNLOAD saves it. Artifacts are stored under `data/generations/<entry_id>/notation/` and tracked in the library database with lineage back to their source MIDI or score.
 
-### 33.2 Sheet music (MAKE SHEET)
+### 33.2 Making notation (the maker)
 
-MAKE SHEET converts the first MIDI artifact to MusicXML with music21, quantizing rhythm, splitting parts, and inferring a time signature. MusicXML is the canonical interchange format and also feeds tabs, arrangements, and exports.
+The top of the Score panel's left rail is one maker: pick an Instrument (Piano, Voice, Guitar, Bass, Ukulele, Drums, Band), pick how to Write as, and press MAKE. Piano offers Grand, Lead, Exact and Chords; Voice offers Melody, Lead and Exact; Guitar offers Tab, Chords, Melody and Exact; Bass offers Tab and Exact; Ukulele offers Tab and Chords; Drums offers Exact (a drum-kit MIDI becomes a percussion staff); Band offers Score. From picks the MIDI to read and starts on the instrument's own stem, falling back to the full-mix MIDI. Exact converts that MIDI to MusicXML with music21, quantizing rhythm, splitting parts, and inferring a time signature; MusicXML is the canonical interchange format and also feeds exports. Chords builds the chord track from the lead sheet when one exists, else from the audio, and needs no MIDI. When MAKE cannot run, the reason is printed under it. The « key in the rail's header collapses the rail to a thin strip and » opens it again.
 
 ### 33.3 Tabs
 
-The Tabs section turns a MIDI into tablature. Choose the instrument (Guitar or Bass), a tuning (standard, drop D, 7-string, 4- or 5-string bass), a capo fret, and a difficulty (Easy / Medium / Hard, which caps fret height and reach), then press MAKE TABS. Because the same pitch can be played at several string and fret positions, a dynamic-programming pass chooses positions that minimize hand travel, prefer open strings and low frets, and keep simultaneous notes on distinct strings. The output is alphaTex, rendered as interactive tablature by alphaTab. Notes outside the instrument's range are reported as unplayable rather than forced.
+Pick Guitar, Bass or Ukulele and Tab, then a Tuning (only that instrument's: standard, drop D or 7-string guitar; 4- or 5-string bass; standard ukulele), a Level (Easy / Medium / Hard, which caps fret height and reach) and a Capo fret, and press MAKE. Because the same pitch can be played at several string and fret positions, a dynamic-programming pass chooses positions that minimize hand travel, prefer open strings and low frets, and keep simultaneous notes on distinct strings. The output is alphaTex, rendered as interactive tablature by alphaTab. Notes outside the instrument's range are reported as unplayable rather than forced.
 
 ### 33.4 Arrangements
 
-The Arrange section produces a playable MusicXML arrangement from a track's MIDIs. The styles are:
+Four of the maker's ways are rule-based arrangements:
 
-- **lead-sheet**: the melody (skyline) with chord symbols above it.
-- **piano-reduction**: a two-staff grand staff split at middle C.
-- **simplified**: a single-staff quantized melody.
-- **band-score**: one staff per separated stem, combined into a full score.
+- **Lead** (`lead-sheet`): the melody (skyline) with chord symbols above it.
+- **Grand** (`piano-reduction`): a two-staff grand staff split at middle C.
+- **Melody** (`simplified`): a single-staff quantized melody.
+- **Score** on Band (`band-score`): one staff per separated stem, combined into a full score.
 
-Arrangements render in the same in-browser sheet-music viewer as MAKE SHEET and are saved as MusicXML artifacts.
+Arrangements render in the same in-browser sheet-music viewer and are saved as MusicXML artifacts. In the STRIP view every part's name is pinned to the left edge, level with its staves, while the score scrolls.
 
 ### 33.5 Exporting scores (the EXPORT menu)
 

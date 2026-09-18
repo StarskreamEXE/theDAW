@@ -129,7 +129,6 @@ export const HelpSearchPopover: React.FC<HelpSearchPopoverProps> = ({ onOpenDocs
         onClick={() => (open ? close(true) : setOpen(true))}
         icon={<HelpCircle className="w-3.5 h-3.5" />}
         title="Find a feature, or open the docs"
-        accent="purple"
         active={open}
         ariaHasPopup="dialog"
         ariaExpanded={open}
@@ -149,7 +148,7 @@ export const HelpSearchPopover: React.FC<HelpSearchPopoverProps> = ({ onOpenDocs
             e.stopPropagation();
             close(true);
           }}
-          className="absolute right-0 top-full mt-1 z-50 w-96 max-w-[92vw] flex flex-col gap-2 rounded-lg border border-purple-500/30 bg-[#0a080f] p-2 shadow-[0_8px_32px_rgba(0,0,0,0.75)]"
+          className="absolute right-0 top-full mt-1 z-50 w-96 max-w-[92vw] flex flex-col gap-2 rounded-lg border border-[rgb(var(--et-accent)/0.3)] bg-[#0a080f] p-2 shadow-[0_8px_32px_rgba(0,0,0,0.75)]"
         >
           <div className="flex items-center gap-1.5">
             <label htmlFor={INPUT_ID} className="sr-only">
@@ -180,7 +179,6 @@ export const HelpSearchPopover: React.FC<HelpSearchPopoverProps> = ({ onOpenDocs
               }}
               icon={<BookOpen className="w-3.5 h-3.5" />}
               title="Open the full documentation"
-              accent="purple"
             />
           </div>
 
@@ -213,7 +211,7 @@ export const HelpSearchPopover: React.FC<HelpSearchPopoverProps> = ({ onOpenDocs
                 >
                   <div className="min-w-0 flex-1 flex flex-col gap-1">
                     <div className="flex items-baseline gap-2 min-w-0">
-                      <span className="truncate text-[11px] font-black uppercase tracking-widest text-purple-100">
+                      <span className="truncate text-[11px] font-black uppercase tracking-widest et-accent-legend">
                         {f.name}
                       </span>
                       <span className="shrink-0 text-[8px] font-mono uppercase tracking-widest text-zinc-500">
@@ -234,7 +232,7 @@ export const HelpSearchPopover: React.FC<HelpSearchPopoverProps> = ({ onOpenDocs
                       onClick={() => locate(f)}
                       title={`Show me where ${f.name} is`}
                       aria-label={`Show me where ${f.name} is`}
-                      className="shrink-0 rounded border border-purple-500/30 p-1 text-purple-300 transition-colors hover:bg-purple-500/15 hover:text-purple-200 outline-none focus-visible:ring-1 focus-visible:ring-purple-400/60"
+                      className="shrink-0 rounded border border-[rgb(var(--et-accent)/0.3)] p-1 text-[rgb(var(--et-accent))] transition-colors hover:bg-[rgb(var(--et-accent)/0.15)] hover:et-accent-legend outline-none focus-visible:ring-1 focus-visible:ring-[rgb(var(--et-accent)/0.6)]"
                     >
                       <ScanSearch className="w-3.5 h-3.5" aria-hidden="true" />
                     </button>

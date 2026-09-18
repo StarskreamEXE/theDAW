@@ -21,8 +21,8 @@ import { noticeLift } from './noticeLift';
  * Status notices (state/statusNoticeStore.ts: every useStatusBarStore.setText
  * line) take the bubble over for a few seconds, in failure colours when they
  * report a failure, and the bubble then returns to the tip it showed. A notice
- * draws in a wider panel on the theme's opaque popup surface, anchored to the
- * bottom of the slot and growing upward to four lines, so the footer row and
+ * draws in a panel on the theme's opaque popup surface, as wide as the slot,
+ * anchored to the bottom of the slot and growing upward to four lines, so the footer row and
  * the now-playing title keep their places and a failure keeps its ending.
  * Hovering holds a notice as it holds a tip; clicking a notice lets it go and
  * opens the LOG (onOpenLog). The notice text is also written to a polite live
@@ -47,7 +47,7 @@ const TIPS: string[] = [
   'stack 2+ clips in CHIMERA to blend them',
   'drag a clip to the EDIT timeline to arrange it',
   'use the cut tool to split a clip, then drag its edge to fade',
-  'hit COMMIT EDIT to bounce the arrangement to one file',
+  'hit MIXDOWN to bounce the arrangement to one file',
   'drag effects into the MIX chain to reorder them',
   'load a deck, press SYNC, then move the crossfader',
   'pull a stem fader to drop the vocal mid-track',
@@ -307,11 +307,11 @@ export const OrbTipBubble: React.FC<OrbTipBubbleProps> = ({ onOpen, onOpenLog, c
           style={notice && lift > 0 ? { bottom: lift } : undefined}
           className={
             notice
-              // -left-8: a notice leaves the slot's indent and sits against the
-              // orb, which is what it is speaking for. The slot is inset 168px
-              // (the grid's px-6 plus pl-36) to clear the 112px orb, so -32px
-              // puts the panel's edge 8px off the orb's.
-              ? 'absolute -left-8 bottom-0 z-10 w-72 min-h-full flex flex-col justify-center'
+              // The slot's own width: the slot sits 8px off the orb and ends
+              // before the scrub strip starts, so a notice stays beside the orb
+              // and out from under the strip. One too tall for the slot rises
+              // clear of the strip (noticeLift).
+              ? 'absolute inset-x-0 bottom-0 z-10 min-h-full flex flex-col justify-center'
               : 'absolute inset-0 flex flex-col justify-center'
           }
         >

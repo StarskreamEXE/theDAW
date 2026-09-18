@@ -1847,6 +1847,22 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const [magentaToolId, setMagentaToolId] = useState<string | null>(null);
   const magentaTool: MagentaTool | null = magentaToolId ? magentaToolById[magentaToolId] ?? null : null;
   const [showMetamorph, setShowMetamorph] = useState(false);
+  /**
+   * Where the toolbar's floating panels (MASTER FX, METAMORPH) open: under the
+   * key that asked for them, the way TOOLS opens its menu. They used to be
+   * pinned to `top-28 left-4`, which put MASTER FX in the far corner of the
+   * timeline with no relation to the FX key on the toolbar. null falls back to
+   * that corner, for the code paths that open METAMORPH with no key to hang
+   * under (a clip action, the assistant).
+   */
+  const [toolbarPanelAt, setToolbarPanelAt] = useState<{ x: number; y: number } | null>(null);
+  /** The same, for the automation lanes panel behind the AUTO key. */
+  const [automationAt, setAutomationAt] = useState<{ x: number; y: number } | null>(null);
+  /** The anchor under `el`: its left edge, 4px below it. */
+  const underKey = (el: HTMLElement) => {
+    const r = el.getBoundingClientRect();
+    return { x: Math.round(r.left), y: Math.round(r.bottom) + 4 };
+  };
   // The TOOLS dropdown (Magenta / Metamorph) — anchored under its button.
   const [toolsMenu, setToolsMenu] = useState<{ x: number; y: number } | null>(null);
   // Per-track FX rack popover. x/y anchor it at the opening click (clip FX
@@ -1860,13 +1876,22 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const closeFxRack = useTrackFxRackStore((s) => s.close);
   // Leaving EDIT closes the rack.
   useEffect(() => () => useTrackFxRackStore.getState().close(), []);
-  /** The rack's anchor for a click at (x, y): at the click, moved right of the
-   *  track header column so every lane's header controls, its F button among
-   *  them, stay clickable while the rack is open. */
+  /** The rack's anchor for a click at (x, y), for a caller with no element of
+   *  its own to hang under (the lane's context menu). */
   const fxRackAnchor = (trackId: string, x?: number, y?: number): TrackFxRackAnchor => {
     if (x == null || y == null) return { trackId };
-    const headerRight = trackHeaderColRef.current?.getBoundingClientRect().right ?? 0;
-    return { trackId, x: Math.max(x, Math.round(headerRight) + 8), y };
+    return { trackId, x, y };
+  };
+  /**
+   * The rack's anchor under the key that opened it: its left edge, 4px below
+   * it — the placement TOOLS uses for its menu, so the two open the same way.
+   * The rack used to open at the pointer, pushed out past the track header
+   * column, which put it nowhere near the key that asked for it.
+   * popoverPlacement keeps it on screen and above the transport from there.
+   */
+  const fxRackUnder = (trackId: string, el: HTMLElement): TrackFxRackAnchor => {
+    const r = el.getBoundingClientRect();
+    return { trackId, x: Math.round(r.left), y: Math.round(r.bottom) + 4 };
   };
   // Open a VST entry's REAL native GUI; the sink stores the captured raw_state
   // on the right chain (a track's fxChain or the master VST chain).
@@ -4384,7 +4409,10 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
           <div className="h-4 w-px bg-white/10" />
 
           <button
-            onClick={() => setShowMasterFx((v) => !v)}
+            onClick={(e) => {
+              setToolbarPanelAt(underKey(e.currentTarget));
+              setShowMasterFx((v) => !v);
+            }}
             aria-pressed={showMasterFx}
             aria-label="Master FX"
             className={`flex items-center gap-1.5 p-1 px-2 rounded border transition-colors font-display text-xs font-bold uppercase tracking-wider
@@ -4447,11 +4475,14 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
               </span>
             )}
             <button
-              onClick={() => setAutomationEdit((v) => {
-                const next = !v;
-                if (next && !activeLaneId && automationLanes.length > 0) setActiveLaneId(automationLanes[0].id);
-                return next;
-              })}
+              onClick={(e) => {
+                setAutomationAt(underKey(e.currentTarget));
+                setAutomationEdit((v) => {
+                  const next = !v;
+                  if (next && !activeLaneId && automationLanes.length > 0) setActiveLaneId(automationLanes[0].id);
+                  return next;
+                });
+              }}
               aria-pressed={automationEdit}
               aria-label="Edit automation lanes"
               title="AUTO — edit automation: draw, drag, and delete breakpoints on the selected lane"
@@ -4517,19 +4548,26 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
               : 'Render all clips to a single audio file and save it to the library'}
           >
             {isCommitting ? <Upload className="w-3 h-3 animate-pulse" /> : <Save className="w-3 h-3" />}
-            {isCommitting ? 'COMMITTING…' : 'COMMIT EDIT'}
+            {isCommitting ? 'MIXING DOWN…' : 'MIXDOWN'}
           </button>
         </div>
       </div>
 
-      {/* MASTER FX + METAMORPH float as popups (like the per-track FX rack) so they
-          never shove the timeline down; close with the X. Portaled to
-          document.body: inside the CSS-zoomed .dense-layout a `fixed` panel is
-          scaled, clipped to the shell, and anchored in a different space than
-          the (also portaled) track FX popover — outside, top-28 means the same
-          thing for both. */}
-      {(showMasterFx || showMetamorph) && createPortal(
-        <div className="fixed top-28 left-4 z-50 flex items-start gap-3 max-w-[calc(100%-2rem)]">
+      {/* MASTER FX + METAMORPH float as popups (like the per-track FX rack) so
+          they never shove the timeline down; close with the X. They open under
+          the toolbar key that asked for them (toolbarPanelAt), which is where
+          TOOLS opens its menu, and PopoverPortal keeps them inside the window
+          and above the transport from there. A path that opens METAMORPH with
+          no key to hang under falls back to the timeline's top-left corner,
+          where both panels used to be pinned. */}
+      {(showMasterFx || showMetamorph) && (
+        <PopoverPortal
+          x={toolbarPanelAt?.x}
+          y={toolbarPanelAt?.y}
+          anchorClassName="top-28 left-4"
+          maxHeight="70vh"
+          className="fixed z-50 flex items-start gap-3 max-w-[calc(100%-2rem)]"
+        >
           {showMasterFx && (
             <section aria-label="Master FX" className="w-90 max-h-[70vh] overflow-y-auto hardware-card bg-black/90 border border-purple-500/30 rounded-lg shadow-2xl shadow-purple-900/40 p-3 flex flex-col gap-2">
               <div className="flex items-center justify-between gap-2 border-b border-white/10 pb-2">
@@ -4612,8 +4650,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
               <MetamorphPanel />
             </section>
           )}
-        </div>,
-        document.body,
+        </PopoverPortal>
       )}
 
       {/* Magenta RT2 generative tools (floating; large enough for the 780×504
@@ -4719,7 +4756,12 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             label: showMetamorph ? 'Close Metamorph' : 'Metamorph',
             icon: <Wand2 className="w-3 h-3" />,
             hint: 'identity bleed',
-            onSelect: () => setShowMetamorph((v) => !v),
+            onSelect: () => {
+              // The menu's own position is already under the TOOLS key, so the
+              // panel opens where the menu it was chosen from is.
+              if (toolsMenu) setToolbarPanelAt(toolsMenu);
+              setShowMetamorph((v) => !v);
+            },
           },
         ]}
       />
@@ -4766,9 +4808,14 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       )}
 
       {/* Automation lane panel (floating; while automation edit mode is on).
-          Portaled for the same coordinate-space reason as the FX panels. */}
-      {automationEdit && createPortal(
-        <div className="fixed left-4 top-28 z-50 w-72 max-h-[70vh] overflow-y-auto hardware-card bg-black/90 border border-amber-500/30 rounded-lg shadow-2xl shadow-amber-900/30 p-3 flex flex-col gap-2">
+          Opens under the AUTO key, like every other toolbar panel. */}
+      {automationEdit && (
+        <PopoverPortal
+          x={automationAt?.x}
+          y={automationAt?.y}
+          anchorClassName="left-4 top-28"
+          maxHeight="70vh"
+          className="fixed z-50 w-72 hardware-card bg-black/90 border border-amber-500/30 rounded-lg shadow-2xl shadow-amber-900/30 p-3 flex flex-col gap-2">
           <div className="flex items-center justify-between gap-2 border-b border-white/10 pb-2">
             <span className="text-[10px] font-mono uppercase tracking-wider text-amber-300">Automation Lanes</span>
             <button
@@ -4834,8 +4881,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
               Editing the highlighted lane: click the curve to add a point, drag a point to move it, Alt-click or right-click a point to delete it.
             </p>
           )}
-        </div>,
-        document.body,
+        </PopoverPortal>
       )}
 
       {/* Per-clip instrument override (floating; MIDI clips only). Portaled to
@@ -5028,7 +5074,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                       className={`w-4 h-4 rounded font-display text-xs font-bold leading-none flex items-center justify-center ${t.solo ? 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/50' : 'bg-black/40 text-zinc-500 border border-white/5 hover:text-white'}`}
                     >S</button>
                     <button
-                      onClick={(e) => toggleFxRack(fxRackAnchor(t.id, e.clientX, e.clientY))}
+                      onClick={(e) => toggleFxRack(fxRackUnder(t.id, e.currentTarget))}
                       aria-label={`Track ${t.name} insert FX`}
                       aria-pressed={fxPanel?.trackId === t.id}
                       title="Track insert FX rack"
@@ -5276,7 +5322,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                         onDoubleClick={(e) => e.stopPropagation()}
                         onClick={(e) => {
                           e.stopPropagation();
-                          openFxRack(fxRackAnchor(clip.trackId, e.clientX, e.clientY));
+                          openFxRack(fxRackUnder(clip.trackId, e.currentTarget));
                         }}
                         aria-label={`Open track FX for clip ${clip.label}`}
                         className="px-1 h-3.5 rounded-sm font-display text-xs font-bold leading-none flex items-center bg-black/40 text-zinc-300 border border-white/10 hover:text-purple-300 hover:border-purple-500/50"

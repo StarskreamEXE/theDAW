@@ -42,6 +42,7 @@ ONE tempo and ONE fixed ``beats_per_bar``. Metamorphic music breaks both. So:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 from dataclasses import dataclass
@@ -53,7 +54,10 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
-RHYTHM_VERSION = 2
+# 3: the tempo run rule can follow a staircase, and fit_meter carries a
+#    permutation p-value. Both change what a map says, so every cached analysis
+#    from 2 is stale and is re-read rather than served.
+RHYTHM_VERSION = 3
 
 SR = 22050
 _HOP = 512
@@ -65,7 +69,11 @@ _TG_WIN = 384  # tempogram window in frames: ~8.9 s at hop 512 / 22.05 kHz
 _TEMPO_SMOOTH_SEC = 2.0
 _TEMPO_STEP = 0.04  # a sustained local-tempo step this large starts a run
 _TEMPO_STEP_MIN_SEC = 3.0
-_TEMPO_RUN_MIN_SEC = 8.0  # shorter runs fold into a neighbour
+_TEMPO_RUN_MIN_SEC = 16.0  # shorter runs fold into a neighbour
+# Two adjacent runs whose tempos agree this closely are one run. Needed because
+# a merged run is re-valued from its own span, which can land it on its
+# neighbour's tempo; without the fold the ten masters report 48 runs instead of 31.
+_TEMPO_SAME = math.log(1.02)
 L_MIN, L_MAX = 2, 16  # at the tracked beat; finer levels go to 32
 METER_WINDOW_BEATS = 48
 _METER_STRIDE_BEATS = 4
@@ -106,6 +114,27 @@ _POLY_MIN_CONF = 0.4
 _CROSS_MIN_REL = 0.6  # of the tempogram profile's peak
 _CROSS_PEAK_TOL = 0.06
 _EPS = 1e-9
+# Surrogate null: how many beat-shuffled draws a window is scored against.
+# By RANK, never by mapping a z through an erf -- at K=10 a z-score reads +6.46
+# on pure Gaussian noise, which is exactly the confident nonsense the null is
+# here to prevent. At K=199 the smallest reportable p is 1/200 = 0.005.
+_NULL_K = 199
+# Below this many beats, `template_corr` is a dimensional artefact rather than
+# evidence: `best_grouping` returns exactly 1.0 for a two-point profile, because
+# a Pearson correlation on two points is +/-1 whatever the numbers are, and
+# 0.86-0.91 for a three-point one. The credit goes to the shortest bar, which
+# already wins too often.
+#
+# NOT APPLIED YET, deliberately. Withholding it alone makes a synthetic 6/8 read
+# as 12/8, because the 2-versus-4 decision is currently leaning on the artefact:
+# with identical accents in every bar, nothing else separates one bar of 6/8
+# from half a bar of 12/8. The honest separator is measured and waiting --
+# compare the two halves of the length-4 profile, which differ by 0.020 on a
+# true 6/8 and 0.265 on a true 12/8 -- and it belongs with the selection rework
+# that replaces score-by-evidence-magnitude with score-by-lag-prominence, where
+# a bar at L that also repeats at 2L is the case being handled. Applying the
+# floor before that trades one bias for a different wrong answer.
+_TEMPLATE_MIN_LENGTH = 4
 
 # How common a bar length is; multiplies the data score. Keeps 4 ahead of 2 and
 # 8 when the evidence alone cannot tell them apart, without ever overriding a
@@ -242,6 +271,86 @@ def _effect_size(score: np.ndarray, k: int) -> float:
     return float(max(0.0, min(1.0, eps_sq)))
 
 
+def _eps_batch(m: np.ndarray, k: int) -> np.ndarray:
+    """``_effect_size`` for every row of ``m`` at period ``k``, UNCLAMPED.
+
+    Unclamped matters: ``_effect_size`` clamps at zero, and a clamped null
+    lands exactly on 0.0 in most draws at small k, which collapses the spread
+    and makes any comparison against it meaningless. The null needs the real
+    distribution, negative values and all.
+    """
+    rows, n = m.shape
+    if n < 2 * k or k < 1:
+        return np.zeros(rows, dtype=np.float64)
+    mean = m.mean(axis=1, keepdims=True)
+    total = np.sum((m - mean) ** 2, axis=1)
+    # Phase p is m[:, p::k]; doing all k at once means padding to a rectangle.
+    full = (n // k) * k
+    head = m[:, :full].reshape(rows, n // k, k)
+    between = head.shape[1] * (head.mean(axis=1) - mean) ** 2
+    if full < n:
+        # The ragged tail: phases 0..n-full-1 carry one extra beat each, so
+        # their group mean and size differ from the rectangle's.
+        tail = m[:, full:]
+        extra = tail.shape[1]
+        cnt = np.full(k, n // k, dtype=np.float64)
+        cnt[:extra] += 1.0
+        sums = head.sum(axis=1)
+        sums[:, :extra] += tail
+        between = cnt * (sums / cnt - mean) ** 2
+    between = between.sum(axis=1)
+    within = np.maximum(0.0, total - between)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out = (between - (k - 1) * within / float(n - k)) / total
+    return np.where(total > 1e-12, out, 0.0)
+
+
+def _ac_batch(m: np.ndarray, lag: int) -> np.ndarray:
+    """``_autocorr`` for every row of ``m`` at ``lag``."""
+    rows, n = m.shape
+    if lag <= 0 or lag >= n:
+        return np.zeros(rows, dtype=np.float64)
+    a, b = m[:, :-lag], m[:, lag:]
+    d = np.sqrt(np.sum(a * a, axis=1) * np.sum(b * b, axis=1))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out = np.sum(a * b, axis=1) / d
+    return np.where(d > _EPS, out, 0.0)
+
+
+def _null_pvalues(s: np.ndarray, lengths: list[int]) -> dict[int, float]:
+    """For each candidate bar length, the chance that a shuffled version of
+    this window scores as well.
+
+    One permutation pool is shared across every length: a single shuffle of the
+    accent row is a null draw for all candidates at once, which is what makes
+    the null affordable. The seed is the window's own bytes, so two runs of the
+    same audio give the same map -- a meter map that changed between runs would
+    be worse than one that is wrong.
+
+    The statistic is the length-unbiased half of the evidence (effect size and
+    autocorrelation). Similarity and template are deliberately left out: they
+    carry the length bias this null exists to expose, and ``best_grouping`` --
+    the expensive call -- never runs on a surrogate.
+    """
+    n = s.size
+    if not lengths or n < 4:
+        return {length: 1.0 for length in lengths}
+    seed = int.from_bytes(
+        hashlib.blake2b(
+            np.ascontiguousarray(s, dtype=np.float64).tobytes(), digest_size=8
+        ).digest(),
+        "little",
+    )
+    rng = np.random.default_rng(seed)
+    idx = np.argsort(rng.random((_NULL_K, n)), axis=1)
+    m = np.vstack([s[None, :], s[idx]])
+    out: dict[int, float] = {}
+    for length in lengths:
+        v = 0.55 * _eps_batch(m, length) + 0.45 * np.maximum(0.0, _ac_batch(m, length))
+        out[length] = (1.0 + float(np.count_nonzero(v[1:] >= v[0]))) / (_NULL_K + 1.0)
+    return out
+
+
 def _cos_dist(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     num = np.sum(a * b, axis=0)
     den = np.linalg.norm(a, axis=0) * np.linalg.norm(b, axis=0) + _EPS
@@ -341,6 +450,9 @@ class MeterFit:
     template_corr: float
     similarity: float
     profile: tuple[float, ...] = ()  # mean accent per phase, downbeat at ``phase``
+    # Chance that a beat-shuffled window scores this well at this bar length.
+    # 1.0 means "not computed"; nothing downstream reads it yet.
+    p: float = 1.0
 
 
 def fit_meter(
@@ -370,6 +482,13 @@ def fit_meter(
     ]
     if not lengths:
         return []
+    # Is there any bar here at all? A per-length p-value against beat-shuffled
+    # copies of this same window. It answers SIGNIFICANCE only -- every length
+    # that can see a real cycle is significant, so it cannot pick the bar --
+    # and it means the same thing on a synthetic signal as on a dense mix,
+    # which no absolute threshold in this file can claim.
+    pvals = _null_pvalues(s, lengths)
+
     sims: dict[int, float] = {}
     if features is not None and features.ndim == 2 and features.shape[1] == s.size:
         feats = _scale_rows(features)
@@ -422,6 +541,7 @@ def fit_meter(
                 tc,
                 sim,
                 tuple(float(v) for v in prof),
+                pvals.get(length, 1.0),
             )
         )
     return fits
@@ -561,32 +681,80 @@ def _fold_octaves(local: np.ndarray, reference: float) -> np.ndarray:
 
 
 def _tempo_runs(curve: np.ndarray, frame_sec: float) -> list[tuple[int, int, float]]:
-    """``(start_frame, end_frame, bpm)`` runs of the smoothed local tempo. A new
-    run starts where the curve leaves the current run's tempo by more than
-    ``_TEMPO_STEP`` for at least ``_TEMPO_STEP_MIN_SEC``; runs shorter than
-    ``_TEMPO_RUN_MIN_SEC`` then fold into the neighbour they are closer to."""
+    """``(start_frame, end_frame, bpm)`` runs of the smoothed local tempo.
+
+    A new run starts where the curve leaves the tempo the current run has
+    settled on by more than ``_TEMPO_STEP``, for at least
+    ``_TEMPO_STEP_MIN_SEC``; runs shorter than ``_TEMPO_RUN_MIN_SEC`` fold into
+    the neighbour they are closer to, and adjacent runs that end up at the same
+    tempo are folded together.
+
+    The scan this replaces could not follow a staircase, and that -- not the
+    tempo curve -- was the binding constraint on every metamorphic reading the
+    engine produced. Handed the songwriter's own eight tempos for House of the
+    Rising Sun as a perfect curve, the old rule returned THREE runs; the rule
+    below returns six, and the curve was never touched. Three defects, all in
+    the excursion scan:
+
+      * an excursion ended only when the curve came back to within a step of
+        the OLD reference, so a tempo that moved and stayed moved ran to the
+        end of the song;
+      * the new reference was the median of the whole excursion, so on a
+        150-180-210 climb the reference became 180 and neither 150 nor 210 was
+        ever a run;
+      * the scan resumed at the excursion's END, so nothing inside one was
+        examined -- which is why a 234-second run could never be subdivided.
+
+    The repair is to re-reference against the current run as it grows, to end
+    an excursion when the curve settles somewhere new rather than only when it
+    comes home, and to resume inside the new run instead of past it.
+    """
     n = int(curve.size)
     if n == 0:
         return []
     min_frames = max(1, int(round(_TEMPO_STEP_MIN_SEC / frame_sec)))
     step = math.log(1.0 + _TEMPO_STEP)
-    runs: list[tuple[int, int, float]] = []
+    logs = np.log(np.maximum(curve, _EPS))
+
+    def away(frame: int, reference: float) -> bool:
+        return abs(float(logs[frame]) - math.log(max(reference, _EPS))) > step
+
+    bounds: list[int] = [0]
     start = 0
-    ref = float(np.median(curve[: min(n, min_frames)]))
     i = 0
     while i < n:
-        if abs(math.log(max(curve[i], _EPS) / ref)) > step:
+        # The reference is what this run has settled on SO FAR, not what it
+        # looked like in its first three seconds.
+        ref = float(np.median(curve[start : max(start + 1, i)]))
+        if away(i, ref):
             j = i
-            while j < n and abs(math.log(max(curve[j], _EPS) / ref)) > step:
+            while j < n and away(j, ref):
+                # The excursion also ends when it has itself settled: once it
+                # has dwelt long enough to be a run, judge the next frame
+                # against ITS tempo rather than against the one being left.
+                if j - i >= min_frames:
+                    settled = float(np.median(curve[i:j]))
+                    if away(j, settled):
+                        break
                 j += 1
             if j - i >= min_frames:
-                runs.append((start, i, float(np.median(curve[start:i]))))
+                bounds.append(i)
                 start = i
-                ref = float(np.median(curve[i:j]))
-            i = j
+                # Resume INSIDE the new run, so a run that later steps again is
+                # still scanned rather than skipped over.
+                i = min(i + min_frames, n)
+                continue
+            i = max(j, i + 1)
             continue
         i += 1
-    runs.append((start, n, float(np.median(curve[start:n]))))
+    bounds.append(n)
+
+    # Value each run by its own span, once the spans are final.
+    runs = [
+        (a, b, float(np.median(curve[a:b])))
+        for a, b in zip(bounds[:-1], bounds[1:])
+        if b > a
+    ]
 
     min_run = int(round(_TEMPO_RUN_MIN_SEC / frame_sec))
     changed = True
@@ -595,8 +763,6 @@ def _tempo_runs(curve: np.ndarray, frame_sec: float) -> list[tuple[int, int, flo
         for k, (a, b, bpm) in enumerate(runs):
             if b - a >= min_run:
                 continue
-            # Fold into the neighbour whose tempo is closer; the neighbour's
-            # tempo stands (it is the one with enough music behind it).
             cands = []
             if k > 0:
                 cands.append((abs(math.log(bpm / runs[k - 1][2])), k - 1))
@@ -604,11 +770,32 @@ def _tempo_runs(curve: np.ndarray, frame_sec: float) -> list[tuple[int, int, flo
                 cands.append((abs(math.log(bpm / runs[k + 1][2])), k + 1))
             _, into = min(cands)
             lo, hi = min(k, into), max(k, into)
-            merged = (runs[lo][0], runs[hi][1], runs[into][2])
+            # The merged span is re-valued from the music it now covers. Taking
+            # the neighbour's bpm made a run report a tempo that was not the
+            # tempo of the span it labelled.
+            merged = (
+                runs[lo][0],
+                runs[hi][1],
+                float(np.median(curve[runs[lo][0] : runs[hi][1]])),
+            )
             runs = runs[:lo] + [merged] + runs[hi + 1 :]
             changed = True
             break
-    return runs
+
+    # Two adjacent runs at the same tempo are one run. Without this the
+    # re-valuing above splits a steady stretch into neighbours that agree.
+    folded: list[tuple[int, int, float]] = []
+    for run in runs:
+        if (
+            folded
+            and abs(math.log(max(run[2], _EPS) / max(folded[-1][2], _EPS)))
+            <= _TEMPO_SAME
+        ):
+            a, _, _ = folded[-1]
+            folded[-1] = (a, run[1], float(np.median(curve[a : run[1]])))
+        else:
+            folded.append(run)
+    return folded
 
 
 def _track_beats(

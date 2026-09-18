@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import io
 import json
 import logging
@@ -257,19 +258,51 @@ async def _bring_up_sidecar(
                     )
                 await loop.run_in_executor(None, sidecar.stop_engine)
                 await loop.run_in_executor(None, sidecar.start_engine)
-            # Model load can take a while on a cold start; poll until ready.
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline:
-                await asyncio.sleep(2.0)
-                h = await sidecar.health()
-                if h.get("available"):
-                    if on_state:
-                        on_state("running", "generating")
-                    return
-                if on_state and h.get("status"):
-                    on_state("starting", str(h.get("status")))
-                if sidecar.engine_state(h, None) == "error":
-                    hint = _classify_engine_error(h).get("fix") or (
+            # A load that runs out of GPU memory on one card gets ONE more go
+            # split across every card the machine has, when it has more than
+            # one: each parameter tensor is cut in half and each card holds its
+            # half (sidecars/magenta/weights.py). A load that runs out on one
+            # card of a one-card machine, or runs out split, is a model this
+            # machine cannot hold, and the message says which model fits.
+            for attempt in ("one-card", "split"):
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    await asyncio.sleep(2.0)
+                    h = await sidecar.health()
+                    if h.get("available"):
+                        if on_state:
+                            on_state("running", "generating")
+                        return
+                    if on_state and h.get("status"):
+                        on_state("starting", str(h.get("status")))
+                    if sidecar.engine_state(h, None) != "error":
+                        continue
+                    kind = _classify_engine_error(h)
+                    gpus = int(h.get("gpus") or 1)
+                    retry = (
+                        attempt == "one-card"
+                        and kind.get("error_kind") == "gpu_oom"
+                        and gpus > 1
+                        and not h.get("sharded")
+                    )
+                    if retry:
+                        log.warning(
+                            "magenta: engine load ran out of GPU memory on one "
+                            "card (%s); restarting it split across %d cards",
+                            _gpu_line(h),
+                            gpus,
+                        )
+                        if on_state:
+                            on_state(
+                                "starting",
+                                f"the model did not fit one card; restarting it split across {gpus} cards",
+                            )
+                        await loop.run_in_executor(None, sidecar.stop_engine)
+                        await loop.run_in_executor(
+                            None, functools.partial(sidecar.start_engine, shard=True)
+                        )
+                        break
+                    hint = kind.get("fix") or (
                         "Pick another model in Settings → Models or check "
                         "logs/magenta-sidecar.log."
                     )
@@ -277,6 +310,10 @@ async def _bring_up_sidecar(
                         "The Magenta RT2 engine failed to load its model: "
                         f"{h.get('error') or h.get('status')}. {hint}"
                     )
+                else:
+                    # The inner loop ran its deadline out rather than breaking
+                    # to retry, so there is nothing left to wait for.
+                    break
         raise RuntimeError(
             "The Magenta RT2 engine started but did not become ready in time. "
             "Check the WSL sidecar, then try again."
@@ -378,20 +415,102 @@ async def _start_engine_on_gpu_lane() -> None:
     _start_note = ""
 
 
-def _classify_engine_error(h: dict) -> dict:
+_GIB = 2**30
+
+
+def _gpu_line(h: dict) -> str:
+    """The engine's own account of its GPU memory, in one line: bytes in use of
+    the bytes JAX lets it take, at the moment it failed (or now). Empty when the
+    engine reported nothing, which is an engine older than this route."""
+    stats = h.get("gpu_at_error") or h.get("gpu") or {}
+    in_use = stats.get("bytes_in_use")
+    limit = stats.get("bytes_limit")
+    if not isinstance(in_use, int):
+        return ""
+    if isinstance(limit, int) and limit > 0:
+        return f"{in_use / _GIB:.2f} GiB in use of the {limit / _GIB:.2f} GiB JAX could take"
+    return f"{in_use / _GIB:.2f} GiB in use"
+
+
+def _oom_fix(h: dict, free_gb: float | None = None) -> str:
+    """What to do about a load that ran out of GPU memory, from the engine's own
+    numbers.
+
+    The engine runs in WSL, and nvidia-smi on the Windows side does not
+    reliably reflect it: it reported 9.3 GiB free while JAX had 8.21 GiB in use
+    of an 8.25 GiB cap. So the message is written from what the engine reports
+    about itself (/health: gpu_at_error, sharded, gpus, plan), and the Windows
+    figure appears only when the engine reported nothing, labelled as what it
+    is.
+    """
+    gpus = int(h.get("gpus") or 1)
+    sharded = bool(h.get("sharded"))
+    plan = h.get("plan") or {}
+    per_card = plan.get("per_card_bytes")
+    line = _gpu_line(h)
+    had = f"The engine had {line} when it ran out." if line else ""
+    needs = (
+        f" The model needs about {per_card / _GIB:.1f} GiB per card before the compile and the stream."
+        if isinstance(per_card, int)
+        else ""
+    )
+    if sharded:
+        return (
+            f"{had}{needs} That was split across {gpus} cards, so this machine "
+            "cannot hold this model. Pick MRT2 Small in Settings → Models."
+        ).strip()
+    if gpus > 1:
+        # Only reached when the split retry itself could not start.
+        return (
+            f"{had}{needs} This card cannot hold the model on its own. Press "
+            "Restart engine to load it split across both cards, or pick MRT2 "
+            "Small in Settings → Models."
+        ).strip()
+    if line:
+        return (
+            f"{had}{needs} This card cannot hold this model. Pick MRT2 Small in "
+            "Settings → Models."
+        ).strip()
+    # An engine that reported nothing about its memory: say what Windows saw,
+    # and say what that number cannot see.
+    seen = (
+        f" Windows saw {free_gb:.1f} GiB free on the card, which may not count what the WSL engine held."
+        if free_gb is not None
+        else ""
+    )
+    return (
+        "The GPU ran out of memory while the engine loaded its checkpoint."
+        + seen
+        + " Restart the engine; if it fails again, pick MRT2 Small in Settings → Models."
+    )
+
+
+def engine_error_fix(h: dict) -> str | None:
+    """The sentence that tells the user what to do about the engine's error,
+    written from the engine's own numbers, or None for no error. The Settings
+    card prints this in place of the raw JAX error."""
+    return _classify_engine_error(h).get("fix")
+
+
+def engine_layout_line(h: dict) -> str | None:
+    """How a running engine holds the model and how fast it runs it, for the
+    Settings card: "runs at 0.76x realtime, bf16 params on one card". None
+    until the engine has reported a timed warm-up."""
+    rtf = h.get("realtime_factor")
+    if not isinstance(rtf, (int, float)):
+        return None
+    gpus = int(h.get("gpus") or 1)
+    where = f"split across {gpus} cards" if h.get("sharded") else "on one card"
+    params = str(h.get("params_dtype") or "bf16")
+    return f"runs at {rtf:g}x realtime, {params} params {where}"
+
+
+def _classify_engine_error(h: dict, free_gb: float | None = None) -> dict:
     """Turn the engine's raw error into something a user can act on."""
     err = str(h.get("error") or h.get("status") or "")
     low = err.lower()
     if "resource_exhausted" in low or "out of memory" in low or "oom" in low:
-        return {
-            "error_kind": "gpu_oom",
-            "fix": (
-                "The GPU ran out of memory while the engine loaded its checkpoint. "
-                "Something else was on the card (a stem separation, whisper, MIDI "
-                "transcription or the SA3 model). Wait for it to finish, then press "
-                "Restart engine — the load now waits its turn for the GPU."
-            ),
-        }
+        return {"error_kind": "gpu_oom", "fix": _oom_fix(h, free_gb)}
     if "checkpoint" in low or "no such file" in low or "not found" in low:
         return {
             "error_kind": "checkpoint_missing",
@@ -500,7 +619,14 @@ async def engine_status(refresh: bool = False):
         out["state"] = "starting"
         out["message"] = _start_note
     if out["state"] == "error":
-        out.update(_classify_engine_error(h))
+        # Measure the card before saying anything about it: an OOM message that
+        # blames another process while 10 GiB sit free sends the user looking
+        # for a job that is not running.
+        free_gb = await asyncio.get_running_loop().run_in_executor(
+            None, sidecar.gpu_free_gb
+        )
+        out["gpu_free_gb"] = free_gb
+        out.update(_classify_engine_error(h, free_gb))
         if out.get("fix"):
             out["message"] = out["fix"]
     return out

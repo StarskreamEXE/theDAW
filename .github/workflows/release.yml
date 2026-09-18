@@ -172,7 +172,24 @@ jobs:
       # latest.yml + the .blockmap are the electron-updater feed: the packaged
       # app reads latest.yml from the newest published release to find and
       # download the installer in place (electron-ui/main/index.ts). Without
-      # them Settings > Update can only open the release page.
+      # them Settings > Update can only open the release page. Every release
+      # up to v0.1.9 shipped the installer alone, because the upload step
+      # below named only the .exe -- the guard is here so the feed cannot go
+      # missing again without failing the build.
+      - name: Check the update feed was written
+        shell: bash
+        run: |
+          for f in \
+            "electron-ui/release/latest.yml" \
+            "electron-ui/release/theDAW-Setup-${VERSION}.exe.blockmap"
+          do
+            if [ ! -f "$f" ]; then
+              echo "::error::electron-builder did not write $f. The packaged app reads latest.yml from the release to self-update, so the release cannot ship without it. Check the publish: key in electron-ui/electron-builder.yml."
+              exit 1
+            fi
+          done
+          echo "Update feed present:"
+          cat electron-ui/release/latest.yml
       - name: Attach the installer and the update feed to the draft release
         if: github.ref_type == 'tag'
         shell: bash
@@ -181,6 +198,8 @@ jobs:
         run: |
           gh release upload "$GITHUB_REF_NAME" \
             "electron-ui/release/theDAW-Setup-${VERSION}.exe" \
+            "electron-ui/release/theDAW-Setup-${VERSION}.exe.blockmap" \
+            "electron-ui/release/latest.yml" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
 

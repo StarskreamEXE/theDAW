@@ -2592,10 +2592,4 @@ if _serve_ui:
     elif os.environ.get("theDAW_SERVE_UI") == "1":
         logger.warning(
             "ui: theDAW_SERVE_UI=1 but %s is missing; UI mount skipped", _ui_dist
-    if target.name == "index.html":
-        # index.html names the hashed bundle, so a cached copy pins the tab to
-        # a build that no longer exists: a rebuild kept serving the old page in
-        # the browser and in Electron's persistent cache. Hashed assets stay
-        # cacheable; the entry page is revalidated on every load.
-        return FileResponse(target, headers={"Cache-Control": "no-cache"})
         )

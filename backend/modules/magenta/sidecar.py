@@ -130,24 +130,28 @@ _LOG_DIR = paths.data_path("logs")
 CHECKPOINT_REPO = "google/magenta-realtime-2"  # cli/models_commands.py _HF_REPO_NAME
 DEFAULT_ENGINE_MODEL = "mrt2_small"
 ENGINE_MODELS: dict[str, dict] = {
+    # jax_vram_gb is what the load needs on ONE card the way the sidecar loads
+    # it — the depthformer as bf16 (sidecars/magenta/weights.py), the codec
+    # fp32, plus the compile and the streaming state. The checkpoints are fp32
+    # on disk (1.05 and 9.16 GiB), which is where the old figures came from.
     "mrt2_small": {
         "label": "MRT2 Small",
         "params": "230M",
         "checkpoint": "mrt2_small.safetensors",
-        # ~1.1 GB download (install/setup_all.sh); "JAX fp32 (~4 GB)" VRAM.
+        # ~1.1 GB download (install/setup_all.sh).
         "download_bytes": 1_128_840_272,
-        "jax_vram_gb": 4.0,
-        "how_local": "JAX fp32 needs about 4 GB of VRAM",
+        "jax_vram_gb": 2.5,
+        "how_local": "loads as bf16 and needs about 2.5 GB of VRAM",
     },
     "mrt2_base": {
         "label": "MRT2 Base",
         "params": "2.4B",
         "checkpoint": "mrt2_base.safetensors",
         "download_bytes": None,
-        "jax_vram_gb": 12.0,
+        "jax_vram_gb": 6.0,
         "how_local": (
-            "JAX fp32 wants about 12 GB of VRAM; the sidecar's own docs run this "
-            "size on a cloud GPU (RunPod)"
+            "loads as bf16 and needs about 6 GB of VRAM on one card, or about "
+            "3 GB on each of two"
         ),
     },
 }
@@ -709,9 +713,51 @@ def _resolve_start_model() -> tuple[str, str | None]:
     return wanted, None
 
 
-def start_engine() -> dict:
+def gpu_free_gb() -> float | None:
+    """Free VRAM on the largest card as Windows sees it, in GiB, or None.
+
+    NOT cached, unlike ``gpu_info``: this is the number that changes. It does
+    not reliably reflect the engine: the sidecar runs in WSL, and nvidia-smi on
+    the Windows side reported 9.3 GiB free while the engine had 8.21 GiB in
+    use. The engine's own /health figures (gpu, gpu_at_error) are the truth
+    about the engine; this is what Windows sees, and the last-resort number in
+    a message when the engine reported nothing.
+    """
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=6,
+            creationflags=_no_window_flags(),
+            env=child_env(),
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    free = []
+    for line in out.strip().splitlines():
+        try:
+            free.append(float(line.strip()) / 1024)
+        except ValueError:
+            continue
+    return round(max(free), 1) if free else None
+
+
+def start_engine(shard: bool = False) -> dict:
     """Spawn the extended sidecar in WSL2 (blocking call, returns immediately
-    after the spawn; readiness is observed via ``health()``)."""
+    after the spawn; readiness is observed via ``health()``).
+
+    ``shard`` starts it with every parameter tensor cut across all the cards
+    JAX sees, each card holding its share (sidecars/magenta/weights.py). The
+    bring-up path uses it to retry a load that ran out of memory on one card
+    when the machine has more than one.
+    """
     global _engine_proc
     with _engine_lock:
         if engine_process_alive():
@@ -732,8 +778,9 @@ def start_engine() -> dict:
             # in the bash command — it does not cross the wsl.exe boundary via
             # the Windows process environment).
             distro = _wsl_distro()
+            shard_env = "THEDAW_MAGENTA_SHARD=1 " if shard else ""
             bash_cmd = (
-                f"MRT2_PORT={port} MRT2_MODEL={model} "
+                f"MRT2_PORT={port} MRT2_MODEL={model} {shard_env}"
                 f"exec {_WSL_PYTHON} '{_wsl_path(_ENGINE_SCRIPT)}'"
             )
             cmd = ["wsl.exe", "-d", distro, "--", "bash", "-lc", bash_cmd]
@@ -752,6 +799,8 @@ def start_engine() -> dict:
                 )
             popen_env["MRT2_PORT"] = port
             popen_env["MRT2_MODEL"] = model
+            if shard:
+                popen_env["THEDAW_MAGENTA_SHARD"] = "1"
             cmd = [str(native_py), str(_ENGINE_SCRIPT)]
             descriptor = {"native": True, "python": str(native_py)}
 

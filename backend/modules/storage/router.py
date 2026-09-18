@@ -552,6 +552,7 @@ async def _magenta_provider_status() -> dict:
     ``models`` is the real catalog — every checkpoint the vendored sidecar can
     load, stamped installed / active / runnable on this GPU."""
     try:
+        from backend.modules.magenta import router as magenta_router
         from backend.modules.magenta import sidecar
 
         health = await sidecar.health()
@@ -568,6 +569,11 @@ async def _magenta_provider_status() -> dict:
         if engine_state == "running":
             state = "active"
             summary = f"Engine running ({running_model or active_model})."
+            layout = magenta_router.engine_layout_line(health)
+            if layout:
+                # "runs at 0.76x realtime, bf16 params on one card": under 1x
+                # means the model generates slower than it plays on this card.
+                summary += f" It {layout}."
             if restart_required:
                 summary += f" Restart to switch to {active_model}."
         elif engine_state == "starting":
@@ -575,10 +581,13 @@ async def _magenta_provider_status() -> dict:
             summary = f"Engine starting: {health.get('status') or 'loading'}…"
         elif engine_state == "error":
             state = "unavailable"
-            summary = (
-                "Engine failed to load: "
-                f"{health.get('error') or health.get('status')}. Pick another "
-                "model or restart."
+            # The classified advice — "the engine had 8.21 GiB in use of the
+            # 8.25 GiB JAX could take … pick MRT2 Small" — where the raw JAX
+            # error used to be printed with "pick another model or restart".
+            fix = magenta_router.engine_error_fix(health)
+            summary = "Engine failed to load: " + (
+                fix
+                or f"{health.get('error') or health.get('status')}. Pick another model or restart."
             )
         elif engine_state == "not_running":
             state = "ready"
