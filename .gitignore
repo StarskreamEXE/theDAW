@@ -349,6 +349,17 @@ logs/
 *.bak
 *.bak-*
 deprecated/
+# ...except the backend's, which is a live import target:
+# tests/test_assistant_stream_lock.py imports
+# backend/deprecated/assistant_claude_spawn_20260915.py (the pre-T07 Claude
+# spawn paths, moved not deleted). The directory has to be re-included
+# BEFORE its contents - git will not descend into an excluded directory.
+!backend/deprecated/
+!backend/deprecated/**
+# ...but the re-include above also overrides the global __pycache__/ rule
+# (line 62) inside that tree, so put the bytecode back out.
+backend/deprecated/**/__pycache__/
+backend/deprecated/**/*.pyc
 
 # Local model weights (multi-GB safetensors + configs) - never commit.
 # ROOT-anchored on purpose: a bare `models/` matches at any depth and was
@@ -405,3 +416,11 @@ examples/audio/
 # ran it, which do not belong in the repository.
 /.codacy/codacy.config.json
 /.codacy/codacy.config.baseline.json
+oss-refs/
+
+# Local-only parking areas (never-delete backups, old runtime venvs, caches,
+# scratch API dumps). Kept on disk, never committed: _deprecated/ alone is 7+ GB
+# of site-packages. Same intent as the deprecated/ rule above.
+_deprecated/
+_backup/
+.scratch/
