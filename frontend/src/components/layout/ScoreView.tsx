@@ -1,5 +1,5 @@
 import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Download, Loader2, Minus, Plus, RefreshCw } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Download, Loader2, Minus, Plus, RefreshCw } from 'lucide-react';
 import { useLibraryStore, type LibraryEntry } from '../../state/libraryStore';
 import { usePlayerStore } from '../../state/playerStore';
 import { logError, logInfo } from '../../state/logStore';
@@ -115,6 +115,7 @@ import { ExportMenu } from './score/ExportMenu';
 import { PlayAlongTransportCompact } from './score/playAlong/PlayAlongTransport';
 import { usePlayAlong } from './score/playAlong/usePlayAlongClock';
 import { SurfacePlayKey } from '../ui/SurfacePlayKey';
+import { CollapsibleRail } from '../ui/CollapsibleRail';
 import { applyInstrumentPreset, discoverParts, knownParts, useKnownParts } from './score/playAlong/partRegistry';
 
 // The play-along views load on demand: OSMD and alphaTab are already dynamic
@@ -148,17 +149,6 @@ const LazyFallback: React.FC = () => (
   <div className="h-full grid place-items-center text-[10px] font-mono text-zinc-500">Loading…</div>
 );
 
-/** Where the rail's collapsed state is remembered, per viewer. */
-const RAIL_COLLAPSED_KEY = 'score.railCollapsed.v1';
-
-const readRailCollapsed = (): boolean => {
-  try {
-    return localStorage.getItem(RAIL_COLLAPSED_KEY) === '1';
-  } catch {
-    return false;
-  }
-};
-
 export const ScoreView: React.FC = () => {
   const selectedEntryId = useLibraryStore((s) => s.selectedEntryId);
   const entries = useLibraryStore((s) => s.entries);
@@ -171,19 +161,6 @@ export const ScoreView: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [caps, setCaps] = useState<NotationCapabilities | null>(null);
   const [exporting, setExporting] = useState<string | null>(null);
-  // The left rail (maker + made list) folds to a thin strip so the score can
-  // take the whole width.
-  const [railCollapsed, setRailCollapsed] = useState(readRailCollapsed);
-  const toggleRail = () => {
-    setRailCollapsed((was) => {
-      try {
-        localStorage.setItem(RAIL_COLLAPSED_KEY, was ? '0' : '1');
-      } catch {
-        /* private mode: the state still holds for this session */
-      }
-      return !was;
-    });
-  };
   // Beat Saber export popover: open flag, and the part names it offers (learnt
   // from a loaded view or fetched from the sheet's part-list; null = all).
   const [bsOpen, setBsOpen] = useState(false);
@@ -543,98 +520,80 @@ export const ScoreView: React.FC = () => {
 
   return (
     <div className="h-full min-h-0 flex bg-[#07050a] text-zinc-200">
-      {railCollapsed && (
-        <div className="w-10 shrink-0 border-r border-white/10 flex flex-col items-center gap-3 py-1.5 bg-black/30">
-          <button
-            type="button"
-            className="h-7 w-7 shrink-0 rounded border border-white/10 flex items-center justify-center text-zinc-400 transition-colors hover:border-[rgb(var(--et-accent)/0.5)] hover:text-zinc-100 outline-none focus-visible:ring-1 focus-visible:ring-[rgb(var(--et-accent)/0.6)]"
-            onClick={toggleRail}
-            aria-expanded={false}
-            aria-controls="score-notation-rail"
-            aria-label="Show the notation rail"
-            title="Show the notation rail"
-          >
-            <ChevronsRight className="size-3.5" aria-hidden="true" />
-          </button>
-          <span className="font-display text-xs font-bold uppercase text-zinc-500 [writing-mode:vertical-rl] select-none" aria-hidden="true">
-            Notation
-          </span>
-        </div>
-      )}
-      <div
+      {/* The left rail (maker + made list) folds to a thin strip so the score
+          can take the whole width. */}
+      <CollapsibleRail
         id="score-notation-rail"
-        hidden={railCollapsed}
+        side="left"
+        name="Notation"
+        label="the notation rail"
+        storageKey="score.railCollapsed.v1"
         className="w-72 shrink-0 border-r border-white/10 flex flex-col min-h-0 bg-black/30"
       >
-        <div className="h-10 shrink-0 border-b border-white/10 flex items-center gap-2 px-3">
-          <button
-            type="button"
-            className="h-7 w-7 -ml-1 shrink-0 rounded border border-white/10 flex items-center justify-center text-zinc-400 transition-colors hover:border-[rgb(var(--et-accent)/0.5)] hover:text-zinc-100 outline-none focus-visible:ring-1 focus-visible:ring-[rgb(var(--et-accent)/0.6)]"
-            onClick={toggleRail}
-            aria-expanded={!railCollapsed}
-            aria-controls="score-notation-rail"
-            aria-label="Hide the notation rail"
-            title="Hide the notation rail"
-          >
-            <ChevronsLeft className="size-3.5" aria-hidden="true" />
-          </button>
-          <span className="font-display text-xs font-bold uppercase text-zinc-300">Notation</span>
-          <span className="min-w-0 flex-1 truncate text-xs font-bold text-zinc-500" title={entry?.title}>
-            {entry?.title ?? 'Select a library track'}
-          </span>
-          <button
-            type="button"
-            className="h-7 w-7 shrink-0 rounded border border-white/10 flex items-center justify-center text-zinc-400 transition-colors hover:border-[rgb(var(--et-accent)/0.5)] hover:text-zinc-100 disabled:opacity-40 outline-none focus-visible:ring-1 focus-visible:ring-[rgb(var(--et-accent)/0.6)]"
-            onClick={() => void loadArtifacts()}
-            disabled={!selectedEntryId || loading}
-            aria-label="Refresh notation"
-            title="Refresh notation"
-          >
-            {loading ? <Loader2 className="size-3.5 animate-spin" aria-hidden="true" /> : <RefreshCw className="size-3.5" aria-hidden="true" />}
-          </button>
-        </div>
-
-        <NotationMaker
-          entryId={selectedEntryId}
-          midis={midiArtifacts}
-          caps={caps}
-          onMade={(artifact, way) => void onMade(artifact, way)}
-        />
-
-        <div className="flex-1 min-h-0 overflow-y-auto p-3 flex flex-col gap-1 text-xs font-bold">
-          {artifacts.length > 0 && <span className="pb-1 font-display uppercase text-zinc-500">Made</span>}
-          {artifacts.map((artifact) => {
-            const active = artifact.id === selectedArtifactId;
-            return (
+        {(foldKey) => (
+          <>
+            <div className="h-10 shrink-0 border-b border-white/10 flex items-center gap-2 px-3">
+              <span className="font-display text-xs font-bold uppercase text-zinc-300">Notation</span>
+              <span className="min-w-0 flex-1 truncate text-xs font-bold text-zinc-500" title={entry?.title}>
+                {entry?.title ?? 'Select a library track'}
+              </span>
               <button
-                key={artifact.id}
                 type="button"
-                onClick={() => setSelectedArtifactId(artifact.id)}
-                aria-current={active ? 'true' : undefined}
-                className={`w-full text-left rounded border px-2.5 py-1.5 transition-colors ${
-                  active
-                    ? 'border-[rgb(var(--et-accent)/0.55)] bg-[rgb(var(--et-accent)/0.15)] et-accent-legend'
-                    : 'border-white/10 text-zinc-300 hover:border-white/25 hover:text-zinc-100'
-                }`}
+                className="h-7 w-7 shrink-0 rounded border border-white/10 flex items-center justify-center text-zinc-400 transition-colors hover:border-[rgb(var(--et-accent)/0.5)] hover:text-zinc-100 disabled:opacity-40 outline-none focus-visible:ring-1 focus-visible:ring-[rgb(var(--et-accent)/0.6)]"
+                onClick={() => void loadArtifacts()}
+                disabled={!selectedEntryId || loading}
+                aria-label="Refresh notation"
+                title="Refresh notation"
               >
-                <div className="truncate">
-                  {describeArtifact(artifact)}
-                  {artifact.kind === 'midi' ? ` · ${stemOf(artifact)}` : ''}
-                </div>
-                <div className="truncate font-semibold text-zinc-500">
-                  {artifact.kind}
-                  {artifact.engine ? ` · ${artifact.engine}` : ''}
-                </div>
+                {loading ? <Loader2 className="size-3.5 animate-spin" aria-hidden="true" /> : <RefreshCw className="size-3.5" aria-hidden="true" />}
               </button>
-            );
-          })}
-          {!loading && selectedEntryId && artifacts.length === 0 && (
-            <p className="rounded border border-dashed border-white/10 p-3 leading-5 text-zinc-500">
-              Nothing made yet. Chords work from the audio alone; everything else needs the track converted to MIDI first (right-click it in the library).
-            </p>
-          )}
-        </div>
-      </div>
+              {/* At the rail's inner edge, beside the score. */}
+              <span className="-mr-1 flex">{foldKey}</span>
+            </div>
+
+            <NotationMaker
+              entryId={selectedEntryId}
+              midis={midiArtifacts}
+              caps={caps}
+              onMade={(artifact, way) => void onMade(artifact, way)}
+            />
+
+            <div className="flex-1 min-h-0 overflow-y-auto p-3 flex flex-col gap-1 text-xs font-bold">
+              {artifacts.length > 0 && <span className="pb-1 font-display uppercase text-zinc-500">Made</span>}
+              {artifacts.map((artifact) => {
+                const active = artifact.id === selectedArtifactId;
+                return (
+                  <button
+                    key={artifact.id}
+                    type="button"
+                    onClick={() => setSelectedArtifactId(artifact.id)}
+                    aria-current={active ? 'true' : undefined}
+                    className={`w-full text-left rounded border px-2.5 py-1.5 transition-colors ${
+                      active
+                        ? 'border-[rgb(var(--et-accent)/0.55)] bg-[rgb(var(--et-accent)/0.15)] et-accent-legend'
+                        : 'border-white/10 text-zinc-300 hover:border-white/25 hover:text-zinc-100'
+                    }`}
+                  >
+                    <div className="truncate">
+                      {describeArtifact(artifact)}
+                      {artifact.kind === 'midi' ? ` · ${stemOf(artifact)}` : ''}
+                    </div>
+                    <div className="truncate font-semibold text-zinc-500">
+                      {artifact.kind}
+                      {artifact.engine ? ` · ${artifact.engine}` : ''}
+                    </div>
+                  </button>
+                );
+              })}
+              {!loading && selectedEntryId && artifacts.length === 0 && (
+                <p className="rounded border border-dashed border-white/10 p-3 leading-5 text-zinc-500">
+                  Nothing made yet. Chords work from the audio alone; everything else needs the track converted to MIDI first (right-click it in the library).
+                </p>
+              )}
+            </div>
+          </>
+        )}
+      </CollapsibleRail>
 
       <div className="flex-1 min-w-0 min-h-0 flex flex-col">
         <div className="h-8 shrink-0 border-b border-white/5 bg-black/30 flex items-center gap-2 px-2">
