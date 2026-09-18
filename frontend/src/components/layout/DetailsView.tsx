@@ -11,70 +11,23 @@ import { useBottomPanelStore } from '../../state/bottomPanelStore';
 import { deriveLyrics } from '../../catalog/catalogSearch';
 import { entryAudioFileName } from '../../convert/convertClient';
 import { saveFile } from '../../lib/saveFile';
-
-interface AnalysisRow {
-  bpm: number | null;
-  key: string | null;
-  scale: string | null;
-  key_confidence: number | null;
-  pitch_mean_hz: number | null;
-  pitch_std_hz: number | null;
-  loudness_lufs: number | null;
-  rms_db: number | null;
-  bars_estimated: number | null;
-  genre: string | null;
-  genre_confidence: number | null;
-  embedded_tags_json: string | null;
-  ffprobe_json: string | null;
-  analyzed_at: number | null;
-}
+import {
+  fetchIdentity,
+  firstLyricLine,
+  fmtDate,
+  fmtDuration,
+  fmtSize,
+  safeFfprobeSummary,
+  safeJsonPretty,
+  type AnalysisRow,
+  type NotationIdentity,
+} from '../../lib/trackFacts';
 
 interface InferredPrompt {
   prompt_guess: string;
   prompt_confidence: number;
   semantic_tags: string[];
 }
-
-/** Artist / song as the notation module reads this entry: `auto_*` is what was
- * parsed out of the filename, `override_*` is what the user typed here (empty
- * when nothing has been corrected). */
-interface NotationIdentity {
-  override_artist: string;
-  override_title: string;
-  auto_artist: string;
-  auto_title: string;
-}
-
-const fmtDuration = (sec: number): string => {
-  if (!Number.isFinite(sec) || sec <= 0) return '--:--';
-  const m = Math.floor(sec / 60);
-  const s = Math.floor(sec % 60);
-  const ms = Math.floor((sec % 1) * 1000);
-  return `${m}:${s.toString().padStart(2, '0')}.${ms.toString().padStart(3, '0').slice(0, 2)}`;
-};
-
-const fmtSize = (bytes: number): string => {
-  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
-  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${bytes} B`;
-};
-
-const fmtDate = (iso: string): string => {
-  try {
-    const d = new Date(iso);
-    return d.toLocaleString();
-  } catch { return iso; }
-};
-
-/** The first sung line of a lyric (markers like [Chorus] skipped). */
-const firstLyricLine = (text: string): string => {
-  for (const raw of (text || '').split(/\r?\n/)) {
-    const t = raw.trim();
-    if (!t || /^[[(][^\])]{1,40}[\])]$/.test(t)) continue;
-    return t;
-  }
-  return '';
-};
 
 const Row: React.FC<{ icon?: React.ComponentType<{ className?: string }>; label: string; value: React.ReactNode; mono?: boolean }> = ({
   icon: Icon,
@@ -535,50 +488,3 @@ export const DetailsView: React.FC = () => {
     </div>
   );
 };
-
-
-/** Ask the notation module how it reads this entry's name. Returns null when
- * the endpoint is unavailable, which leaves the fields usable and the
- * placeholders empty rather than surfacing an error the user cannot act on. */
-async function fetchIdentity(entryId: string): Promise<NotationIdentity | null> {
-  try {
-    const res = await fetch(`/api/notation/${encodeURIComponent(entryId)}/identity`);
-    if (!res.ok) return null;
-    const payload = (await res.json()) as Partial<NotationIdentity>;
-    return {
-      override_artist: payload.override_artist ?? '',
-      override_title: payload.override_title ?? '',
-      auto_artist: payload.auto_artist ?? '',
-      auto_title: payload.auto_title ?? '',
-    };
-  } catch {
-    return null;
-  }
-}
-
-
-function safeJsonPretty(jsonText: string): string {
-  try {
-    return JSON.stringify(JSON.parse(jsonText), null, 2);
-  } catch {
-    return jsonText;
-  }
-}
-
-
-function safeFfprobeSummary(jsonText: string): string {
-  try {
-    const parsed = JSON.parse(jsonText) as {
-      _summary?: Record<string, unknown>;
-      streams?: Array<Record<string, unknown>>;
-      format?: Record<string, unknown>;
-    };
-    if (parsed._summary) {
-      return JSON.stringify(parsed._summary, null, 2);
-    }
-    return JSON.stringify(parsed, null, 2);
-  } catch {
-    return jsonText;
-  }
-}
-
