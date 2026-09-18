@@ -250,8 +250,13 @@ value: viewport/container units (`max-w-[92vw]`, `w-[min(640px,95vw)]`),
 
 **Before writing any className string, check it against this rule.**
 
-**Before finishing ANY task that touched a `.tsx`/`.ts` file, SWEEP for
-violations — never rely on having written them correctly:**
+**Before finishing ANY task that touched a `.tsx`/`.ts` file, run
+`cd frontend && npm run lint:classes`.** It asks the project's own tailwindcss
+(`canonicalizeCandidates`, the engine behind the editor's
+`suggestCanonicalClasses`) about every class in `src/`, so it catches every
+case the table and the greps below miss (`break-words` -> `wrap-break-word`,
+`translate-y-0.25` -> `translate-y-px`, ...). `npm run fix:classes` rewrites
+them; `npm run lint` and CI fail on any hit. The greps remain as a quick look:
 
 ```bash
 cd frontend/src
