@@ -29,6 +29,7 @@ import { ColonyCanvas } from '../components/loom/ColonyCanvas';
 import { findNode, GRAINS, graphAt, meterText, parseColony, partitions, serializeColony, SPACE_MODES, walkNodes, type ColonyNode, type GateNode, type LoopNode, type Meter, type ModNode, type RuleNode } from '../lib/colony';
 import { cellColor, KIND_COLOR, ROLE_COLOR, rgba } from '../lib/loomPalette';
 import { SurfacePlayKey } from '../components/ui/SurfacePlayKey';
+import { CollapsibleRail } from '../components/ui/CollapsibleRail';
 
 type Pane = 'cell' | 'code' | 'crate';
 
@@ -135,31 +136,47 @@ export function LoomView(): React.ReactElement {
           <ColonyCanvas />
         </section>
 
-        <aside className="w-96 shrink-0 border-l border-white/15 bg-black/20 flex flex-col min-h-0">
-          <div role="tablist" aria-label="Loom panes" className="flex border-b border-white/15">
-            {(['cell', 'code', 'crate'] as Pane[]).map((p) => (
-              <button
-                key={p}
-                type="button"
-                role="tab"
-                id={`loom-tab-${p}`}
-                aria-selected={pane === p}
-                aria-controls={`loom-pane-${p}`}
-                onClick={() => setPane(p)}
-                className={`flex-1 px-2 py-2 text-xs font-mono font-semibold uppercase tracking-widest transition-colors ${
-                  pane === p ? 'et-ink border-b-2 border-amber-300' : 'et-ink-2 hover:et-ink'
-                }`}
-              >
-                {p}
-              </button>
-            ))}
-          </div>
-          <div id={`loom-pane-${pane}`} role="tabpanel" aria-labelledby={`loom-tab-${pane}`} className="flex-1 min-h-0 overflow-auto">
-            {pane === 'cell' && <CellPane />}
-            {pane === 'code' && <ColonyCodePane />}
-            {pane === 'crate' && <CratePane />}
-          </div>
-        </aside>
+        <CollapsibleRail
+          as="aside"
+          id="loom-rail"
+          side="right"
+          name={pane}
+          label="the cell, code and crate panes"
+          storageKey="loom.railCollapsed.v1"
+          className="w-96 shrink-0 border-l border-white/15 bg-black/20 flex flex-col min-h-0"
+        >
+          {(foldKey) => (
+            <>
+              <div className="flex items-center border-b border-white/15">
+                {/* At the rail's inner edge, beside the dish. */}
+                <span className="flex pl-1.5">{foldKey}</span>
+                <div role="tablist" aria-label="Loom panes" className="flex flex-1 min-w-0">
+                  {(['cell', 'code', 'crate'] as Pane[]).map((p) => (
+                    <button
+                      key={p}
+                      type="button"
+                      role="tab"
+                      id={`loom-tab-${p}`}
+                      aria-selected={pane === p}
+                      aria-controls={`loom-pane-${p}`}
+                      onClick={() => setPane(p)}
+                      className={`flex-1 px-2 py-2 text-xs font-mono font-semibold uppercase tracking-widest transition-colors ${
+                        pane === p ? 'et-ink border-b-2 border-amber-300' : 'et-ink-2 hover:et-ink'
+                      }`}
+                    >
+                      {p}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div id={`loom-pane-${pane}`} role="tabpanel" aria-labelledby={`loom-tab-${pane}`} className="flex-1 min-h-0 overflow-auto">
+                {pane === 'cell' && <CellPane />}
+                {pane === 'code' && <ColonyCodePane />}
+                {pane === 'crate' && <CratePane />}
+              </div>
+            </>
+          )}
+        </CollapsibleRail>
       </div>
     </div>
   );
