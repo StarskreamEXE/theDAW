@@ -231,6 +231,57 @@ driven in the live app yet; items stay here until that happens.
 
 ---
 
+## P1 — from the user, 2026-09-17 (marked done only when the user says so)
+
+Three branches, each cut from `main`; they merge in any order. The legend goes
+on `meter-map-tempo-flags` because the on-screen meter map exists only there.
+
+- [ ] **The meter map has no legend on screen.** `drawLegend` in
+  `frontend/src/components/layout/meterMapDraw.tsx` runs only inside
+  `meterMapSvgText`, which builds the saved file. `MeterMapChart` in DETAILS
+  draws `drawMeterMap` alone, so the family colours, the guess hatch, the
+  8TH/16TH badge, the tempo flag and the syncopation lane are unexplained.
+  Plan: one list of legend items in `meterMapDraw.tsx` feeds both the file and
+  a `MeterMapLegend` in `MeterMapChart.tsx`; `RhythmBlock.tsx` shows it under
+  the map as wrapping HTML rows at 12px bold. — XS — branch
+  `meter-map-tempo-flags`
+- [ ] **The LOOM right rail folds.** The CELL / CODE / CRATE rail
+  (`frontend/src/views/LoomView.tsx:138`, `w-96`) takes Score's collapsible
+  rail. Folded, it is a 32px strip (`w-8`, thinner than Score's `w-10`) with the
+  rail's name written down it, and a click anywhere on the strip opens it. Open,
+  the fold key sits at the rail's inner edge, left of the tabs. The state is
+  remembered per viewer (`loom.railCollapsed.v1`). One shared component,
+  `frontend/src/components/ui/CollapsibleRail.tsx`, serves LOOM and Score. — S —
+  branch `rails-collapse-loom-score`
+- [ ] **The Score notation rail follows the same rules.** The folded strip
+  (`frontend/src/components/layout/ScoreView.tsx:546`) goes from `w-10` to
+  `w-8`, the whole strip opens the rail, and the fold key moves from the left
+  end of the header to the right end, beside the score. — XS — branch
+  `rails-collapse-loom-score`
+- [ ] **The library stays on the last clicked track across its tabs.** Stems,
+  MIDI and Score list every song's group from the top of the scroll region
+  (`frontend/src/views/LibraryView.tsx:1374-1405`), so after clicking song X in
+  Tracks the other tabs open somewhere else. Plan: on every tab switch the
+  selected track's group scrolls into view and wears the accent ring; a song
+  with nothing in that tab gets a line saying so, with the key that makes it
+  (Separate stems, Convert to MIDI, Open in SCORE); a group's title selects that
+  song; returning to Tracks scrolls the selected row back into view. — S —
+  branch `library-follow-track-info`
+- [ ] **An INFO tab in the library strip.** After Score, a sixth tab shows the
+  selected track in one column: everything DETAILS shows (identity, generation
+  settings, prompt, notes, tags, lyrics, analysis, embedded tags, ffprobe,
+  notation identity, the cached meter reading, chimera sources) and everything
+  the lineage inspector shows (parents and children with their relation, counts
+  by relation, ancestors and descendants, recurring prompt terms and tags), plus
+  the track's stems, MIDI and scores. Keys at the top open the full DETAILS tab
+  and the LINEAGE window. New file
+  `frontend/src/components/library/TrackInfo.tsx`; reads
+  `/api/library/entries/{id}`, `/api/analysis/{id}`, `/api/rhythm/{id}`,
+  `/api/notation/{id}/identity` and `/api/library/{id}/lineage`. — M — branch
+  `library-follow-track-info`
+
+---
+
 ## P1 — from the user, 2026-09-16 (marked done only when the user says so)
 
 - [ ] **A notation writing tool in SCORE.** Write and correct notation by hand
