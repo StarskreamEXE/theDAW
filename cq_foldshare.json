@@ -1,0 +1,196 @@
+[
+ {
+  "track": "01 - Prologue.opus",
+  "g": 129.2,
+  "n": 6848,
+  "moved_cur": 0,
+  "moved_nxt": 88,
+  "differ": 88,
+  "mixed_pct": 1.3,
+  "runs_cur": [
+   136.0,
+   129.2,
+   129.2
+  ],
+  "runs_nxt": [
+   136.0,
+   129.2,
+   129.2
+  ]
+ },
+ {
+  "track": "02 - will i dream.opus",
+  "g": 117.45,
+  "n": 9411,
+  "moved_cur": 0,
+  "moved_nxt": 311,
+  "differ": 311,
+  "mixed_pct": 3.3,
+  "runs_cur": [
+   117.5,
+   117.5
+  ],
+  "runs_nxt": [
+   117.5,
+   117.5
+  ]
+ },
+ {
+  "track": "03 - eacc.opus",
+  "g": 99.38,
+  "n": 15117,
+  "moved_cur": 122,
+  "moved_nxt": 5605,
+  "differ": 5483,
+  "mixed_pct": 36.3,
+  "runs_cur": [
+   129.2
+  ],
+  "runs_nxt": [
+   99.4
+  ]
+ },
+ {
+  "track": "04 - House of the Risi",
+  "g": 198.77,
+  "n": 11758,
+  "moved_cur": 3639,
+  "moved_nxt": 5778,
+  "differ": 2302,
+  "mixed_pct": 19.6,
+  "runs_cur": [
+   161.5,
+   198.8
+  ],
+  "runs_nxt": [
+   206.7,
+   198.8,
+   258.4,
+   258.4
+  ]
+ },
+ {
+  "track": "05 - Miracle Mile.opus",
+  "g": 99.38,
+  "n": 16237,
+  "moved_cur": 1447,
+  "moved_nxt": 1917,
+  "differ": 470,
+  "mixed_pct": 2.9,
+  "runs_cur": [
+   99.4,
+   123.0,
+   99.4,
+   99.4,
+   99.4
+  ],
+  "runs_nxt": [
+   99.4,
+   123.0,
+   99.4,
+   99.4,
+   99.4
+  ]
+ },
+ {
+  "track": "06 - Gravy.opus",
+  "g": 117.45,
+  "n": 13093,
+  "moved_cur": 10,
+  "moved_nxt": 503,
+  "differ": 493,
+  "mixed_pct": 3.8,
+  "runs_cur": [
+   117.5,
+   117.5,
+   86.1,
+   136.0,
+   117.5
+  ],
+  "runs_nxt": [
+   117.5,
+   117.5,
+   117.5
+  ]
+ },
+ {
+  "track": "07 - Hell is a Very Sm",
+  "g": 136.0,
+  "n": 11444,
+  "moved_cur": 582,
+  "moved_nxt": 1815,
+  "differ": 1233,
+  "mixed_pct": 10.8,
+  "runs_cur": [
+   136.0,
+   136.0,
+   136.0,
+   129.2,
+   136.0,
+   129.2,
+   129.2,
+   136.0
+  ],
+  "runs_nxt": [
+   136.0,
+   136.0,
+   136.0,
+   129.2,
+   136.0,
+   129.2,
+   129.2,
+   136.0
+  ]
+ },
+ {
+  "track": "08 - The Owl Grinned.o",
+  "g": 103.36,
+  "n": 12714,
+  "moved_cur": 535,
+  "moved_nxt": 1501,
+  "differ": 966,
+  "mixed_pct": 7.6,
+  "runs_cur": [
+   129.2,
+   103.4
+  ],
+  "runs_nxt": [
+   129.2,
+   103.4
+  ]
+ },
+ {
+  "track": "09 - I Do's.opus",
+  "g": 112.35,
+  "n": 11542,
+  "moved_cur": 561,
+  "moved_nxt": 1135,
+  "differ": 574,
+  "mixed_pct": 5.0,
+  "runs_cur": [
+   112.3,
+   83.4,
+   112.3
+  ],
+  "runs_nxt": [
+   112.3,
+   83.4,
+   112.3
+  ]
+ },
+ {
+  "track": "10 - Everything is Chr",
+  "g": 129.2,
+  "n": 14356,
+  "moved_cur": 113,
+  "moved_nxt": 691,
+  "differ": 578,
+  "mixed_pct": 4.0,
+  "runs_cur": [
+   129.2
+  ],
+  "runs_nxt": [
+   129.2
+  ]
+ }
+]
