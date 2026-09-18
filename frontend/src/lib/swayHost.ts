@@ -13,6 +13,9 @@ import { basenameOf, pathKey, placesApi, type PlaceItem } from './placesClient';
 
 /** The cockpit shows theDAW's controls in its own header. */
 export const CAP_HOST_HEADER = 'host-header';
+/** The cockpit posts sway/track-menu on a track's right-click and places audio
+ *  the host answers with (sway/load-audio: a URL the host serves). */
+export const CAP_TRACK_MENU = 'host-track-menu';
 /** The cockpit shows the scene list theDAW sends. */
 export const CAP_HOST_SCENES = 'host-scenes';
 
@@ -34,7 +37,8 @@ export type CockpitAction =
   | { kind: 'set-audio-source'; source: HostAudioSource }
   | { kind: 'request-scenes' }
   | { kind: 'open-scene'; name: string | null; path: string | null }
-  | { kind: 'choose-scene-file' };
+  | { kind: 'choose-scene-file' }
+  | { kind: 'track-menu'; trackId: string; name: string; empty: boolean; x: number; y: number };
 
 const nonEmpty = (v: unknown): string | null => (typeof v === 'string' && v.trim() ? v : null);
 
@@ -66,6 +70,20 @@ export function cockpitAction(data: unknown): CockpitAction | null {
     }
     case 'sway/choose-scene-file':
       return { kind: 'choose-scene-file' };
+    case 'sway/track-menu': {
+      // x, y are viewport px inside the cockpit's frame; the host adds the
+      // frame's own offset before opening its menu.
+      const trackId = nonEmpty(d.trackId);
+      if (!trackId || typeof d.x !== 'number' || typeof d.y !== 'number') return null;
+      return {
+        kind: 'track-menu',
+        trackId,
+        name: nonEmpty(d.name) ?? 'this track',
+        empty: d.empty === true,
+        x: d.x,
+        y: d.y,
+      };
+    }
     default:
       return null;
   }
