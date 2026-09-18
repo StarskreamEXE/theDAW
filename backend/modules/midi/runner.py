@@ -46,10 +46,19 @@ def convert_entry(
 
     results: list[dict] = []
 
+    # Every target gets the entry's real tempo: the drum engine quantises to
+    # it, the pitched engines have it stamped over their 120 BPM placeholder.
+    # Read once, up front, so all of them agree.
+    tempo_bpm, tempo_beats = _analysis_tempo_map(db, entry_id)
+
     # Full-track conversion.
     full_out = midi_dir / "full.mid"
     full_res = convert_to_midi(
-        audio_path, full_out, hint="generic", auto_install=auto_install
+        audio_path,
+        full_out,
+        hint="generic",
+        auto_install=auto_install,
+        bpm=tempo_bpm,
     )
     results.append({"target": "full", **full_res})
     if full_res.get("ok"):
@@ -72,7 +81,6 @@ def convert_entry(
     # Per-stem conversions (if requested + stems exist).
     if from_stems:
         stems = db.list_stems(entry_id)
-        tempo_map: Optional[tuple[Optional[float], list[float]]] = None
         for stem_row in stems:
             stem_name = stem_row.get("stem_name") or ""
             stem_audio = Path(stem_row.get("audio_path") or "")
@@ -80,13 +88,11 @@ def convert_entry(
                 continue
             hint: MidiHint = hint_for_stem(stem_name)
             stem_out = midi_dir / f"{stem_name}.mid"
-            extra: dict = {}
+            extra: dict = {"bpm": tempo_bpm}
             if hint == "drums":
-                # The drum engine writes the entry's real tempo map and snaps
-                # on-grid hits to it; read the analysis row once, lazily.
-                if tempo_map is None:
-                    tempo_map = _analysis_tempo_map(db, entry_id)
-                extra = {"bpm": tempo_map[0], "beats": tempo_map[1] or None}
+                # Only the drum engine consumes the beat list — it snaps
+                # on-grid hits to it. The pitched engines just need the tempo.
+                extra["beats"] = tempo_beats or None
             stem_res = convert_to_midi(
                 stem_audio, stem_out, hint=hint, auto_install=auto_install, **extra
             )

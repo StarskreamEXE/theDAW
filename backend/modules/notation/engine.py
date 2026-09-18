@@ -50,7 +50,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, NamedTuple, Optional, Sequence
 
-from backend.modules.library.db import LibraryDB
+from backend.modules.library.db import LibraryDB, normalize_artifact_path
 
 from . import pdf_render
 
@@ -404,12 +404,43 @@ def register_existing_midis(db: LibraryDB, entry_id: str) -> list[dict[str, Any]
     immediately for entries that already have MIDI conversions.
     """
     created: list[dict[str, Any]] = []
+    # Existing rows keyed by the FILE they point at. Mirroring is idempotent by
+    # id, but a file already represented by a different row (a create-scheme or
+    # consolidated canonical row) must not gain a second row here — that is how
+    # duplicate artifacts came back after every consolidation.
+    holder_for_path = {
+        normalize_artifact_path(str(row.get("path") or "")): (
+            str(row.get("id") or ""),
+            str(row.get("engine") or "").strip().lower(),
+        )
+        for row in db.list_notation_artifacts(entry_id)
+    }
     for midi in db.list_midis(entry_id):
         midi_id = str(midi.get("id") or "")
         midi_path = str(midi.get("midi_path") or "")
         if not midi_id or not midi_path:
             continue
         artifact_id = f"{midi_id}__artifact_midi"
+        holder = holder_for_path.get(normalize_artifact_path(midi_path))
+        # A file already represented by a REAL row must not gain a second row.
+        # A ``recovered-from-disk`` holder is different: it is the filename-derived
+        # stand-in, it carries no legacy_midi_id, and the ``/from-midi`` route
+        # cannot resolve a midi id through it. The mirror is the canonical
+        # representation of a MIDI the library owns, so it is written anyway and
+        # the recovery row is left for the consolidator to retire.
+        if (
+            holder is not None
+            and holder[0] != artifact_id
+            and holder[1] != _RECOVERED_ENGINE
+        ):
+            log.debug(
+                "notation: %s already represents %s; skipping mirror row %s",
+                holder[0],
+                midi_path,
+                artifact_id,
+            )
+            continue
+        holder_for_path[normalize_artifact_path(midi_path)] = (artifact_id, "")
         db.add_notation_artifact(
             artifact_id=artifact_id,
             entry_id=entry_id,
@@ -462,6 +493,48 @@ _LYRICS_FILENAME = "lyrics.json"
 _LYRICS_KIND = "lyrics"
 
 
+def _song_slug(title: str, fallback: str = "score") -> str:
+    """Filesystem-safe, readable slug of a song title for score filenames."""
+    cleaned = "".join(c if (c.isalnum() or c in " -_") else "_" for c in (title or ""))
+    cleaned = "_".join(cleaned.split())  # collapse whitespace runs to one "_"
+    cleaned = cleaned.strip("_-")
+    return cleaned[:60] or fallback
+
+
+def _scored_name(slug: str, base: str) -> str:
+    """Prefix ``base`` with the song slug unless it already leads with it,
+    so the file (and its download name) carries the originating song."""
+    if slug and not base.lower().startswith(slug.lower()):
+        return f"{slug}__{base}"
+    return base
+
+
+def sheet_output_path(store: Any, entry_id: str, midi_id: str) -> Optional[Path]:
+    """THE on-disk path of the MusicXML sheet engraved from ``midi_id``.
+
+    Both writers of that sheet -- the ``/from-midi`` route and the notation
+    backfill -- register the SAME artifact id, so they must agree on the
+    filename or they ping-pong the sheet between two names on alternating runs
+    and leave a rowless copy behind. They also have to read the title from the
+    SAME place: the entry record (metadata.json chain), not the entries table,
+    because the two can diverge. This function is that single agreement.
+
+    ``None`` when the entry has no directory.
+    """
+    entry_dir = store._dir_for(entry_id)  # noqa: SLF001 - module convention
+    if entry_dir is None:
+        return None
+    entry = store.get_entry(entry_id)
+    title = str(getattr(entry, "title", "") or "") if entry is not None else ""
+    return (
+        entry_dir / "notation" / _scored_name(_song_slug(title), f"{midi_id}.musicxml")
+    )
+
+
+# The engine value register_on_disk_artifacts stamps on a recovered row.
+_RECOVERED_ENGINE = "recovered-from-disk"
+
+
 def lyrics_artifact_id(entry_id: str) -> str:
     """The one notation artifact id a recovered ``<entry>/lyrics.json`` gets."""
     return f"{entry_id}__lyrics__lyrics"
@@ -475,6 +548,41 @@ def _kind_and_stem_for_file(path: Path) -> tuple[Optional[str], str]:
         if name.endswith(suffix):
             return kind, path.name[: -len(suffix)]
     return _KIND_FOR_SUFFIX.get(path.suffix.lower()), path.stem
+
+
+def drop_superseded_recovery_rows(
+    artifacts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Hide a ``recovered-from-disk`` row from a LISTING when a real row already
+    covers the same file.
+
+    Rows are never deleted -- a legacy library can hold both a filename-derived
+    recovery row and the real row (mirror or create-path) for one file until the
+    consolidator retires the former. The recovery row is the wrong one to serve:
+    it carries no ``legacy_midi_id`` and its ``source_ref`` is an absolute path,
+    so a client that reads the FIRST midi artifact of an entry (rows come back
+    oldest-first, and the recovery row is usually older) would try to resolve a
+    filesystem path as a midi id, and an "arrange from all MIDI" action would
+    arrange the same file twice.
+
+    Returns the list in its original order, minus those shadowed rows.
+    """
+    # normalize_artifact_path does a realpath syscall, so each row is normalized
+    # exactly once and both passes read the same precomputed value.
+    scanned = [
+        (
+            artifact,
+            str(artifact.get("engine") or "").strip().lower() == _RECOVERED_ENGINE,
+            normalize_artifact_path(str(artifact.get("path") or "")),
+        )
+        for artifact in artifacts
+    ]
+    covered = {path for _, is_recovered, path in scanned if not is_recovered and path}
+    return [
+        artifact
+        for artifact, is_recovered, path in scanned
+        if not (is_recovered and path in covered)
+    ]
 
 
 def register_on_disk_artifacts(
@@ -503,17 +611,51 @@ def register_on_disk_artifacts(
     if db.get_entry(entry_id) is None:
         return []
     recovered: list[dict[str, Any]] = []
+    # Recovery is idempotent by derived id, but the SAME file is also reachable
+    # under a create-scheme id, so recovering it again would duplicate the
+    # artifact on every bundle/reindex/artifacts read. Track what each file is
+    # already represented by and skip those.
+    holder_for_path = {
+        normalize_artifact_path(str(row.get("path") or "")): str(row.get("id") or "")
+        for row in db.list_notation_artifacts(entry_id)
+    }
+    # A MIDI the library OWNS (it has a ``midis`` row) is represented canonically
+    # by register_existing_midis' mirror, which carries the legacy midi id the
+    # ``/from-midi`` route resolves through. This scan runs FIRST on bundle and
+    # reindex, so recovering such a file here would plant a filename-derived row
+    # that permanently displaces that mirror. Leave owned MIDI to the mirror.
+    owned_midi_paths = {
+        normalize_artifact_path(str(row.get("midi_path") or ""))
+        for row in db.list_midis(entry_id)
+    }
+    owned_midi_paths.discard("")
 
     def _recover(artifact_id: str, kind: str, path: Path, source_dir: str) -> None:
         if db.get_notation_artifact(artifact_id) is not None:
             return
+        normalized = normalize_artifact_path(str(path))
+        if normalized in owned_midi_paths:
+            log.debug(
+                "notation: %s is an owned MIDI; leaving it to the mirror row", path
+            )
+            return
+        holder = holder_for_path.get(normalized)
+        if holder is not None:
+            log.debug(
+                "notation: %s already represents %s; not recovering as %s",
+                holder,
+                path,
+                artifact_id,
+            )
+            return
+        holder_for_path[normalized] = artifact_id
         db.add_notation_artifact(
             artifact_id=artifact_id,
             entry_id=entry_id,
             kind=kind,
             path=str(path),
             source_ref=str(path),
-            engine="recovered-from-disk",
+            engine=_RECOVERED_ENGINE,
             engine_version="1",
             metadata={"recovered": True, "source_dir": source_dir},
         )

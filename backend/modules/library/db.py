@@ -24,8 +24,10 @@ in CPython's bundled SQLite, so flexible JSON blobs work out of the box.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -301,6 +303,144 @@ _MIGRATIONS: list[tuple[int, list[str]]] = [
 
 def _now() -> float:
     return time.time()
+
+
+# Sub-folder each artifact kind is superseded into. Kept out of the live
+# listing (register_on_disk_artifacts only scans notation/ + midi/, and the
+# stems/notation routers list DB rows), so a superseded copy never reappears.
+DEPRECATED_DIRNAME = "deprecated"
+
+# Every table that points at an artifact file, and the column holding it. Used
+# to answer "is this file still referenced by some OTHER row?" before a
+# superseding move, so a shared physical file is never moved out from under a
+# row that still resolves through it.
+ARTIFACT_PATH_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("notation_artifacts", "path"),
+    ("midis", "midi_path"),
+    ("stems", "audio_path"),
+)
+
+
+def normalize_artifact_path(path: str) -> str:
+    """Canonical spelling of an artifact path for identity comparisons.
+
+    Two rows can store the same file with different spellings (case, separators,
+    ``..`` segments, a symlinked root), so every path identity check in the
+    artifact layer goes through this. Resolution is best-effort: a path that
+    cannot be realpath'd still normalizes so comparisons never raise.
+    """
+    if not path:
+        return ""
+    try:
+        return os.path.normcase(os.path.realpath(path))
+    except OSError:
+        return os.path.normcase(path)
+
+
+def _same_file_content(a: Path, b: Path) -> bool:
+    """Whether two existing files are byte-identical (cheap size check first).
+
+    Two writers can spell the SAME artifact's filename differently (the
+    ``/from-midi`` route scores the name with the song slug, the notation
+    backfill does not) while registering the same stable artifact id. Without
+    this check, alternating runs would shuttle identical copies into
+    ``deprecated/`` forever; with it, an identical payload is recognised as the
+    same artifact and nothing is moved.
+    """
+    try:
+        if a.stat().st_size != b.stat().st_size:
+            return False
+        return _sha256(a) == _sha256(b)
+    except OSError:
+        return False
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def supersede_artifact_file(
+    old_path: str, new_path: str, *, skip_identical: bool = True
+) -> Optional[str]:
+    """When an artifact row is re-pointed from ``old_path`` to a DIFFERENT
+    ``new_path`` on disk, move the now-orphaned old file into a sibling
+    ``deprecated/`` folder instead of leaving it as a duplicate copy.
+
+    This is the anti-duplication invariant for every ``add_*`` create path:
+    the row is keyed on a stable id and ``INSERT OR REPLACE``d, and the file it
+    used to point at is preserved (never deleted) but moved out of the live
+    directory so exactly one copy per key remains where the listing looks.
+
+    Returns the destination path when a move happened, else ``None``. It is
+    best-effort: any filesystem error is logged and swallowed so a housekeeping
+    move never blocks persistence of the row itself. A no-op when the paths are
+    equal, the old file is gone, or the two paths resolve to the same file
+    (in-place overwrite).
+
+    ``skip_identical`` (default True) additionally treats a byte-identical
+    ``old``/``new`` pair as the same artifact and declines to move — that is the
+    create-path behaviour, which must not shuttle identical copies around when
+    two writers spell one filename differently. The consolidation tool passes
+    False, because there an identical duplicate copy is exactly what it is
+    retiring.
+    """
+    if not old_path or not new_path or old_path == new_path:
+        return None
+    old = Path(old_path)
+    new = Path(new_path)
+    try:
+        if not old.is_file():
+            return None
+        if normalize_artifact_path(old_path) == normalize_artifact_path(new_path):
+            return None
+        # An in-place overwrite (same file, e.g. differing string form) leaves
+        # nothing to supersede.
+        if new.exists():
+            try:
+                if old.samefile(new):
+                    return None
+            except OSError:
+                pass
+            # Same artifact written under a differently-spelled filename by
+            # another writer: identical payload, so there is no stale copy to
+            # retire. Without this, two writers that disagree about the name
+            # would ping-pong identical files into deprecated/ on every run.
+            if skip_identical and _same_file_content(old, new):
+                log.debug(
+                    "library.db: %s and %s are byte-identical; not superseding",
+                    old,
+                    new,
+                )
+                return None
+        dep_dir = old.parent / DEPRECATED_DIRNAME
+        dep_dir.mkdir(parents=True, exist_ok=True)
+        dest = dep_dir / old.name
+        if dest.exists():
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            candidate = dep_dir / f"{old.stem}.superseded_{stamp}{old.suffix}"
+            counter = 1
+            while candidate.exists():
+                candidate = (
+                    dep_dir / f"{old.stem}.superseded_{stamp}_{counter}{old.suffix}"
+                )
+                counter += 1
+            dest = candidate
+        # os.rename, NOT shutil.move: deprecated/ is a sub-directory of the
+        # file's own parent, so the move never crosses a filesystem and needs no
+        # copy fallback. shutil.move WOULD fall back to copy-then-unlink when the
+        # rename is refused (a Windows handle held on the file), leaving a COPY in
+        # deprecated/ beside the still-live original -- precisely the duplicate
+        # this function exists to prevent. A failed rename simply changes nothing.
+        os.rename(old, dest)
+        log.info("library.db: superseded orphaned artifact copy %s -> %s", old, dest)
+        return str(dest)
+    except Exception as exc:  # noqa: BLE001 - housekeeping never blocks the write
+        log.warning("library.db: could not supersede %s: %s", old_path, exc)
+        return None
 
 
 class LibraryDB:
@@ -746,6 +886,73 @@ class LibraryDB:
             cur.close()
             return {row["entry_id"]: dict(row) for row in rows}
 
+    def path_referenced_elsewhere(
+        self, path: str, *, table: str, row_id: str, entry_id: str
+    ) -> Optional[str]:
+        """The id of another artifact row that still points at ``path``, or
+        ``None``.
+
+        A physical artifact file is legitimately shared by more than one row:
+        the on-disk recovery scan registers a file under a filename-derived id
+        while a real conversion registers the same file under its create-scheme
+        id. Superseding (moving) such a file would leave the other row resolving
+        to nothing, so every create path asks this first and skips the move when
+        the answer is not ``None``. Scoped to the entry plus any exact-string
+        match elsewhere, then compared on normalized paths so different
+        spellings of one file still count as a reference.
+        """
+        target = normalize_artifact_path(path)
+        if not target:
+            return None
+        with self._writelock:
+            cur = self._conn.cursor()
+            try:
+                for tbl, col in ARTIFACT_PATH_COLUMNS:
+                    rows = cur.execute(
+                        f"SELECT id, {col} AS artifact_path FROM {tbl} "
+                        f"WHERE entry_id = ? OR {col} = ?",
+                        (entry_id, path),
+                    ).fetchall()
+                    for row in rows:
+                        other_id = str(row["id"] or "")
+                        if tbl == table and other_id == row_id:
+                            continue  # the row we just wrote
+                        if (
+                            normalize_artifact_path(str(row["artifact_path"] or ""))
+                            == target
+                        ):
+                            return other_id
+            finally:
+                cur.close()
+        return None
+
+    def _supersede_unless_shared(
+        self,
+        old_path: str,
+        new_path: str,
+        *,
+        table: str,
+        row_id: str,
+        entry_id: str,
+    ) -> None:
+        """Retire ``old_path`` after a row was re-pointed to ``new_path``,
+        unless another row still references it."""
+        if not old_path or normalize_artifact_path(old_path) == normalize_artifact_path(
+            new_path
+        ):
+            return
+        holder = self.path_referenced_elsewhere(
+            old_path, table=table, row_id=row_id, entry_id=entry_id
+        )
+        if holder is not None:
+            log.info(
+                "library.db: not superseding %s — still referenced by %s",
+                old_path,
+                holder,
+            )
+            return
+        supersede_artifact_file(old_path, new_path)
+
     def add_stem(
         self,
         *,
@@ -757,6 +964,7 @@ class LibraryDB:
         model: Optional[str] = None,
         model_variant: Optional[str] = None,
     ) -> None:
+        prior = self.get_stem(stem_id)
         with self._txn() as cur:
             cur.execute(
                 """
@@ -775,6 +983,14 @@ class LibraryDB:
                     model_variant,
                     _now(),
                 ),
+            )
+        if prior is not None:
+            self._supersede_unless_shared(
+                str(prior.get("audio_path") or ""),
+                audio_path,
+                table="stems",
+                row_id=stem_id,
+                entry_id=entry_id,
             )
 
     def list_stems(self, entry_id: str) -> list[dict[str, Any]]:
@@ -828,6 +1044,7 @@ class LibraryDB:
         engine_version: str = "",
         notes_count: int = 0,
     ) -> None:
+        prior = self.get_midi(midi_id)
         with self._txn() as cur:
             cur.execute(
                 """
@@ -847,6 +1064,14 @@ class LibraryDB:
                     notes_count,
                     _now(),
                 ),
+            )
+        if prior is not None:
+            self._supersede_unless_shared(
+                str(prior.get("midi_path") or ""),
+                midi_path,
+                table="midis",
+                row_id=midi_id,
+                entry_id=entry_id,
             )
 
     def list_midis(self, entry_id: str) -> list[dict[str, Any]]:
@@ -899,6 +1124,7 @@ class LibraryDB:
         engine_version: str = "",
         metadata: Optional[dict[str, Any]] = None,
     ) -> None:
+        prior = self.get_notation_artifact(artifact_id)
         with self._txn() as cur:
             cur.execute(
                 """
@@ -918,6 +1144,14 @@ class LibraryDB:
                     json.dumps(metadata or {}),
                     _now(),
                 ),
+            )
+        if prior is not None:
+            self._supersede_unless_shared(
+                str(prior.get("path") or ""),
+                path,
+                table="notation_artifacts",
+                row_id=artifact_id,
+                entry_id=entry_id,
             )
 
     def list_notation_artifacts(
