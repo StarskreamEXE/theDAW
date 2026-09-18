@@ -1,0 +1,8 @@
+{
+  "name": "Remix: UI Builder Canvas",
+  "description": "Drag and drop UI builder over a background image canvas",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_AI_API"
+  ]
+}

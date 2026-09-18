@@ -34,10 +34,12 @@ import {
   generateViaComfyUI,
   generateViaDallE,
   generateViaGemini,
+  generateViaOpenRouter,
   saveImagesToFiles,
   GenParams,
 } from "./sd";
 import { registerExtractRoutes } from "./extract";
+import { registerOpenRouterRoutes } from "./features/openrouter/catalog";
 
 // ---------- /api/assistant/transcribe: local Whisper STT via faster-whisper ----------
 // Raw audio body (audio/*) → temp file → spawn stt/transcribe.py → return its
@@ -741,6 +743,8 @@ export function registerRoutes(app: Express, deps: { shutdown: (signal: string) 
     }
   });
 
+  registerOpenRouterRoutes(app);
+
   // Generate textures
   app.post("/api/textures/generate", async (req, res) => {
     const params: GenParams = req.body || {};
@@ -755,6 +759,7 @@ export function registerRoutes(app: Express, deps: { shutdown: (signal: string) 
         case "comfyui": images = await generateViaComfyUI(params, cfg); break;
         case "openai": case "dalle": images = await generateViaDallE(params); break;
         case "gemini": images = await generateViaGemini(params); break;
+        case "openrouter": images = await generateViaOpenRouter(params); break;
         default:
           res.status(400).json({ error: `Unsupported image generation provider: ${params.provider}` });
           return;
