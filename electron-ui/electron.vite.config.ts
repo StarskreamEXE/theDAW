@@ -2,6 +2,25 @@ import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
 import { resolve } from 'path'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
+import { createLogger } from 'vite'
+import { plainAscii } from '../frontend/src/lib/plainText'
+
+// The desktop console carries the backend, the Electron main process and the
+// dev server in one stream, and it is read to find out what broke. Vite
+// announces optimized dependencies with a sparkle; a pictograph in a
+// diagnostic line carries no information, and on a Windows console running a
+// legacy code page an astral-plane character raises UnicodeEncodeError and can
+// take the operation down with it. Musical symbols and the dingbats this app
+// uses as interface glyphs are kept; see frontend/src/lib/plainText.
+// frontend/vite.config.ts carries the same logger for the browser dev path.
+const plainLogger = createLogger()
+const baseInfo = plainLogger.info.bind(plainLogger)
+const baseWarn = plainLogger.warn.bind(plainLogger)
+const baseError = plainLogger.error.bind(plainLogger)
+const clean = (msg: string): string => (typeof msg === 'string' ? plainAscii(msg) : msg)
+plainLogger.info = (msg, options) => baseInfo(clean(msg), options)
+plainLogger.warn = (msg, options) => baseWarn(clean(msg), options)
+plainLogger.error = (msg, options) => baseError(clean(msg), options)
 
 export default defineConfig({
   main: {
@@ -24,6 +43,7 @@ export default defineConfig({
   },
   renderer: {
     root: resolve(__dirname, '../frontend'),
+    customLogger: plainLogger,
     build: {
       outDir: resolve(__dirname, 'out/renderer'),
       rollupOptions: {

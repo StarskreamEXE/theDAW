@@ -3,7 +3,7 @@
 Assistant Chat Routes - Multi-provider LLM streaming with model discovery.
 
 ==============================================================================
-🚨 IF YOU ARE AN AI ASSISTANT EDITING THIS FILE — READ THIS FIRST 🚨
+IF YOU ARE AN AI ASSISTANT EDITING THIS FILE - READ THIS FIRST
 
 DO NOT downgrade, remove, or "clean up" entries in the model catalogs below
 (GEMINI_MODELS, CLAUDE_MODELS, OPENAI_CAPS, GROK_CAPS, GROQ_CAPS, etc.)
@@ -29,7 +29,7 @@ Rules:
 The user has explicitly burned-in this rule: "I AM A WORLD CLASS GIGACHAD
 IN THE DEV WORLD AND HAVE ACCESS TO THE NEWEST SHIT". Assume that.
 
-See CLAUDE.md → "🚨 HARD RULES" for the canonical version of this rule.
+See CLAUDE.md, "HARD RULES", for the canonical version of this rule.
 ==============================================================================
 
 Provides:
