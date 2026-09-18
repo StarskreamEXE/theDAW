@@ -10,6 +10,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { X, Copy, Check, Sparkles } from 'lucide-react';
 import type { GraphNode, GraphEdge } from './LineageModal';
+import { LINEAGE_FETCH_CAP, relativesOf, themesOf } from '../../lib/lineageInsights';
 
 interface EntryDetail {
   title?: string;
@@ -37,36 +38,6 @@ interface Analysis {
   pitch_mean_hz?: number;
   rms_db?: number;
   [k: string]: unknown;
-}
-
-// Lineage-entry fetches are capped so a giant family doesn't fire hundreds of
-// requests; we surface the cap rather than silently truncating.
-const LINEAGE_FETCH_CAP = 40;
-
-const STOPWORDS = new Set([
-  'the', 'a', 'an', 'and', 'or', 'of', 'with', 'in', 'on', 'to', 'for', 'at',
-  'by', 'from', 'is', 'it', 'this', 'that', 'into', 'over', 'out', 'up', 'as',
-  'but', 'are', 'was', 'be', 'no', 'not', 'very', 'more', 'some', 'like',
-]);
-
-function tokenize(s: string): string[] {
-  return (s.toLowerCase().match(/[a-z][a-z0-9'-]{2,}/g) ?? []).filter((t) => !STOPWORDS.has(t));
-}
-
-/** Directed reachable set from `start` over `adj` (excludes start). */
-function reach(start: string, adj: Record<string, string[]>): Set<string> {
-  const out = new Set<string>();
-  const stack = [start];
-  while (stack.length) {
-    const id = stack.pop() as string;
-    for (const nb of adj[id] ?? []) {
-      if (nb !== start && !out.has(nb)) {
-        out.add(nb);
-        stack.push(nb);
-      }
-    }
-  }
-  return out;
 }
 
 const CopyButton: React.FC<{ label: string; get: () => string; done: string | null; setDone: (s: string | null) => void }> = ({ label, get, done, setDone }) => (
@@ -107,26 +78,20 @@ export const NodeInspector: React.FC<{
     return m;
   }, [nodes]);
 
-  const { parentsOf, childrenOf } = useMemo(() => {
-    const po: Record<string, string[]> = {};
-    const co: Record<string, string[]> = {};
-    edges.forEach((e) => {
-      (co[e.from_id] = co[e.from_id] || []).push(e.to_id);
-      (po[e.to_id] = po[e.to_id] || []).push(e.from_id);
-    });
-    return { parentsOf: po, childrenOf: co };
-  }, [edges]);
-
-  const incoming = useMemo(() => (nodeId ? edges.filter((e) => e.to_id === nodeId) : []), [edges, nodeId]);
-  const outgoing = useMemo(() => (nodeId ? edges.filter((e) => e.from_id === nodeId) : []), [edges, nodeId]);
-
-  const { ancestors, descendants, lineageKey } = useMemo(() => {
-    if (!nodeId) return { ancestors: new Set<string>(), descendants: new Set<string>(), lineageKey: '' };
-    const a = reach(nodeId, parentsOf);
-    const d = reach(nodeId, childrenOf);
-    const all = [...a, ...d].sort();
-    return { ancestors: a, descendants: d, lineageKey: all.join(',') };
-  }, [nodeId, parentsOf, childrenOf]);
+  const { incoming, outgoing, ancestors, descendants, spawnByKind, lineageKey } = useMemo(() => {
+    if (!nodeId) {
+      return {
+        incoming: [],
+        outgoing: [],
+        ancestors: new Set<string>(),
+        descendants: new Set<string>(),
+        spawnByKind: {} as Record<string, number>,
+        lineageKey: '',
+      };
+    }
+    const r = relativesOf(nodeId, edges);
+    return { ...r, spawnByKind: r.spawnedByKind, lineageKey: [...r.ancestors, ...r.descendants].sort().join(',') };
+  }, [nodeId, edges]);
 
   const [detail, setDetail] = useState<EntryDetail | null>(null);
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
@@ -171,26 +136,12 @@ export const NodeInspector: React.FC<{
       use.map((id) => fetch(`/api/library/entries/${id}`).then((r) => (r.ok ? r.json() : null)).catch(() => null)),
     ).then((entries) => {
       if (cancelled) return;
-      const termCount = new Map<string, number>();
-      const tagCount = new Map<string, number>();
-      for (const e of entries as Array<EntryDetail | null>) {
-        if (!e) continue;
-        for (const t of tokenize(String(e.prompt ?? ''))) termCount.set(t, (termCount.get(t) ?? 0) + 1);
-        for (const tag of e.tags ?? []) tagCount.set(String(tag), (tagCount.get(String(tag)) ?? 0) + 1);
-      }
-      const top = (m: Map<string, number>) => Array.from(m.entries()).sort((a, b) => b[1] - a[1]).slice(0, 8);
-      setInsights({ terms: top(termCount), tags: top(tagCount), truncated, count: use.length });
+      setInsights({ ...themesOf(entries as Array<EntryDetail | null>), truncated, count: use.length });
     }).finally(() => { if (!cancelled) setAnalyzing(false); });
     return () => { cancelled = true; };
   }, [nodeId, lineageKey, nodeMap]);
 
   if (!node) return null;
-
-  // Outgoing edges grouped by relation kind → "what this node spawned".
-  const spawnByKind = outgoing.reduce<Record<string, number>>((acc, e) => {
-    acc[e.kind] = (acc[e.kind] ?? 0) + 1;
-    return acc;
-  }, {});
 
   const chimera = detail?.chimera_sources ?? [];
 
