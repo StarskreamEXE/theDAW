@@ -2,7 +2,12 @@
 
 Endpoints (prefix from module.json → `/api/library`):
 
-    GET    /entries            list entries (?kind=audio|video|image|media|all)
+    GET    /summary            category counts + the DB revision they came from
+    GET    /entries            list entries (?kind=audio|video|image|media|all);
+                               with ?limit= it is paged + searchable (see below)
+    GET    /entries/ids        every matching id, for select-all / shift-range
+    GET    /entries/facets     value counts per field, for the filter dropdowns
+    POST   /entries/bulk-delete  delete many entries by id, or by filter
     GET    /entries/{id}       single entry record
     GET    /audio/{id}         stream the audio file
     GET    /audio/{id}/cover   cover art for an audio entry
@@ -13,6 +18,9 @@ Endpoints (prefix from module.json → `/api/library`):
     DELETE /entries/{id}       remove the entry (audio + metadata)
     POST   /import             accept an audio upload, return new entry
     POST   /import-media       accept a video/image upload, return new entry
+    POST   /import-folder      add a folder reference-in-place (?async=1 → a job)
+    GET    /import-jobs/{id}   progress of an async folder import
+    DELETE /import-jobs/{id}   cancel one after the batch in flight
     POST   /covers/backfill    re-read embedded art for entries with none
     POST   /reindex            re-sync the SQLite mirror from the filesystem
 
@@ -26,23 +34,74 @@ import hashlib
 import json
 import logging
 import mimetypes
+import os
 import re
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
 import httpx
-from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+)
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
+from . import suno_promote, suno_stage
 from .bundle import build_bundle_bytes
-from .store import AUDIO_EXTS, LibraryStore, _read_metadata, default_library_root
+from .db import DEFAULT_SORT, FACET_FIELDS, SORTS, EntryFilters
+from .store import (
+    AUDIO_EXTS,
+    ImportJob,
+    LibraryStore,
+    _read_metadata,
+    default_library_root,
+    get_import_jobs,
+)
 from .tags import MAX_EMBEDDED_COVER_BYTES
 from backend.lib import known_paths, paths
 from backend.lib.cross_site import refuse_cross_site
 
 log = logging.getLogger(__name__)
+
+#: Page size ceiling. 500 rows is already more than any screen shows; the cap
+#: is what stops a client from asking for the 200,000-row response this whole
+#: endpoint exists to replace.
+MAX_PAGE_LIMIT = 500
+
+#: Page size when a caller asks for a filtered/searched list without saying how
+#: many rows it wants.
+DEFAULT_PAGE_LIMIT = 200
+
+#: Ceiling on ``GET /entries/ids``. Select-all over more than this is refused
+#: (413) rather than answered with a list the client cannot hold.
+MAX_SELECTABLE_IDS = 50_000
+
+#: Ceiling on the ``ids`` form of ``POST /entries/bulk-delete``. Above this the
+#: caller has to say what it wants with a filter instead of naming every row,
+#: which is also what lets the server re-count before it deletes anything.
+MAX_BULK_DELETE_IDS = 5_000
+
+#: How many per-id failures one bulk-delete response carries. The rest are
+#: implied by ``deleted + failures == total_matched``.
+MAX_BULK_DELETE_ERRORS = 50
+
+#: A paged row carries at most this much lyric text; the rest is only on the
+#: single-entry read. A page of 500 songs with full lyrics is megabytes of
+#: text nothing on screen displays.
+LYRICS_PREVIEW_CHARS = 280
+
+#: How many created entries the SYNCHRONOUS folder import echoes back. The
+#: full count is always reported as ``created_total``.
+MAX_SYNC_IMPORT_ENTRIES = 200
 
 
 _store: Optional[LibraryStore] = None
@@ -58,16 +117,28 @@ def get_store() -> LibraryStore:
 router = APIRouter()
 
 
-def _attach_play_counts(store: LibraryStore, entries: list[dict[str, Any]]) -> None:
+def _attach_play_counts(
+    store: LibraryStore,
+    entries: list[dict[str, Any]],
+    *,
+    ids: Optional[list[str]] = None,
+) -> None:
     """Merge the persistent play_count / last_played_at from the DB into entry
     dicts. The DB column is the source for these; entries with no DB row read 0.
-    The frontend sorts on play_count, so it ships with every entry payload."""
+    The frontend sorts on play_count, so it ships with every entry payload.
+
+    ``ids`` restricts the lookup to one page. Without it the whole ``entries``
+    table is read -- fine for the unpaged list, which is already reading every
+    row, and ruinous for a page of 200 out of 200,000."""
     if store.db is None:
         for e in entries:
             e.setdefault("play_count", 0)
             e.setdefault("last_played_at", None)
         return
-    rows = {row["id"]: row for row in store.db.list_entries()}
+    if ids is None:
+        rows: dict[str, Any] = {row["id"]: row for row in store.db.list_entries()}
+    else:
+        rows = store.db.play_counts_for(ids)
     for e in entries:
         row = rows.get(e["id"]) or {}
         e["play_count"] = int(row.get("play_count") or 0)
@@ -171,16 +242,40 @@ def _apply_analysis(entry: dict[str, Any], row: Optional[dict[str, Any]]) -> Non
         entry["embedded_tags"] = embedded
 
 
-def _attach_analysis(store: LibraryStore, entries: list[dict[str, Any]]) -> None:
-    """Bulk-enrich a LIST of entries with their analysis. One ``get_all_analysis``
-    query for the whole page (no N+1), then an in-memory join by id."""
+def _attach_analysis(
+    store: LibraryStore,
+    entries: list[dict[str, Any]],
+    *,
+    ids: Optional[list[str]] = None,
+) -> None:
+    """Bulk-enrich a LIST of entries with their analysis. ONE query for the
+    whole list (no N+1), then an in-memory join by id. ``ids`` narrows that
+    query to the page, instead of loading every analyzed entry in the
+    library."""
     if store.db is None:
         return
-    rows = store.db.get_all_analysis()
+    rows = (
+        store.db.get_all_analysis() if ids is None else store.db.get_analysis_for(ids)
+    )
     if not rows:
         return
     for e in entries:
         _apply_analysis(e, rows.get(e["id"]))
+
+
+def _trim_lyrics(entry: dict[str, Any]) -> None:
+    """Replace a long ``lyrics`` field with a preview, in place.
+
+    A paged row is for a list: it needs enough text to show a snippet, not the
+    whole song. The full text stays on ``GET /entries/{id}``. Short lyrics are
+    left exactly as they are, so a row is only ever reshaped when there is
+    something to save."""
+    lyrics = entry.get("lyrics") or ""
+    if len(lyrics) <= LYRICS_PREVIEW_CHARS:
+        return
+    entry.pop("lyrics", None)
+    entry["lyrics_preview"] = lyrics[:LYRICS_PREVIEW_CHARS]
+    entry["has_lyrics"] = True
 
 
 def _attach_analysis_one(store: LibraryStore, entry: dict[str, Any]) -> None:
@@ -201,24 +296,288 @@ _KIND_FILTERS: dict[str, Optional[set[str]]] = {
 }
 
 
-@router.get("/entries")
-def list_entries(kind: str = "audio") -> dict[str, Any]:
-    # Default 'audio' preserves the historical behavior: the tracks/stems/
-    # midi library never sees video/image entries. The VIDEO tab requests
-    # ?kind=media (video + image); ?kind=all returns everything.
+def _entry_filters(
+    kind: str,
+    q: Optional[str],
+    favorite: Optional[bool],
+    source: Optional[str],
+) -> EntryFilters:
+    kinds = _KIND_FILTERS[kind]
+    return EntryFilters(
+        kinds=frozenset(kinds) if kinds is not None else None,
+        favorite=favorite,
+        source=source,
+        q=q,
+    )
+
+
+def _validate_listing(kind: str, sort: Optional[str], offset: int) -> None:
     if kind not in _KIND_FILTERS:
         raise HTTPException(
             400, f"kind must be one of {sorted(_KIND_FILTERS)}, got {kind!r}"
         )
+    if sort is not None and sort not in SORTS:
+        raise HTTPException(400, f"sort must be one of {list(SORTS)}, got {sort!r}")
+    if offset < 0:
+        raise HTTPException(400, f"offset must be >= 0, got {offset}")
+
+
+@router.get("/entries")
+def list_entries(
+    kind: str = "audio",
+    limit: Optional[int] = None,
+    offset: int = 0,
+    q: Optional[str] = None,
+    sort: Optional[str] = None,
+    favorite: Optional[bool] = None,
+    source: Optional[str] = None,
+) -> dict[str, Any]:
+    """The library list, in two shapes.
+
+    With NONE of ``limit`` / ``offset`` / ``q`` / ``sort`` / ``favorite`` /
+    ``source`` this is byte-for-byte the endpoint it has always been: every
+    entry of the requested kind, plus ``count`` / ``root`` / ``kind``. Callers
+    that predate paging keep working unchanged.
+
+    With any of them it is paged: filtering, searching and sorting happen in
+    SQL, records are built for the page only, and the response adds ``total``
+    (rows matching the filters), ``offset``, ``limit`` and ``revision`` (the
+    library revision the page was read at, so a client can drop a stale
+    response). Long ``lyrics`` are replaced by ``lyrics_preview`` +
+    ``has_lyrics``; the full text stays on ``GET /entries/{id}``.
+    """
+    # Default 'audio' preserves the historical behavior: the tracks/stems/
+    # midi library never sees video/image entries. The VIDEO tab requests
+    # ?kind=media (video + image); ?kind=all returns everything.
+    _validate_listing(kind, sort, offset)
+    if limit is not None and not (1 <= limit <= MAX_PAGE_LIMIT):
+        raise HTTPException(400, f"limit must be 1..{MAX_PAGE_LIMIT}, got {limit}")
     store = get_store()
-    entries = [r.to_dict() for r in store.list_entries_fast(kinds=_KIND_FILTERS[kind])]
-    _attach_play_counts(store, entries)
-    _attach_analysis(store, entries)
+
+    paged = any(v is not None for v in (limit, q, sort, favorite, source)) or offset > 0
+    if not paged:
+        entries = [
+            r.to_dict() for r in store.list_entries_fast(kinds=_KIND_FILTERS[kind])
+        ]
+        _attach_play_counts(store, entries)
+        _attach_analysis(store, entries)
+        return {
+            "entries": entries,
+            "count": len(entries),
+            "root": str(store.root),
+            "kind": kind,
+        }
+
+    if store.db is None:
+        raise HTTPException(503, "library DB not available")
+    page_limit = limit if limit is not None else DEFAULT_PAGE_LIMIT
+    filters = _entry_filters(kind, q, favorite, source)
+    entries = [
+        r.to_dict()
+        for r in store.list_entries_page(
+            filters, sort=sort or DEFAULT_SORT, limit=page_limit, offset=offset
+        )
+    ]
+    ids = [str(e["id"]) for e in entries]
+    _attach_play_counts(store, entries, ids=ids)
+    _attach_analysis(store, entries, ids=ids)
+    for entry in entries:
+        _trim_lyrics(entry)
     return {
         "entries": entries,
         "count": len(entries),
-        "root": str(store.root),
+        "total": store.db.count_entries_filtered(filters),
+        "offset": offset,
+        "limit": page_limit,
+        "revision": store.db.library_revision(),
         "kind": kind,
+    }
+
+
+@router.get("/entries/ids")
+def list_entry_ids(
+    kind: str = "audio",
+    q: Optional[str] = None,
+    sort: Optional[str] = None,
+    favorite: Optional[bool] = None,
+    source: Optional[str] = None,
+) -> dict[str, Any]:
+    """Every id matching the filters, in the same order the paged list uses.
+
+    This is what select-all and shift-click ranges need: the client holds the
+    ids, not the rows. Declared BEFORE ``/entries/{entry_id}`` so the literal
+    path is not swallowed by the id parameter. Refuses (413) above
+    ``MAX_SELECTABLE_IDS`` rather than streaming an unbounded list.
+    """
+    _validate_listing(kind, sort, 0)
+    store = get_store()
+    if store.db is None:
+        raise HTTPException(503, "library DB not available")
+    filters = _entry_filters(kind, q, favorite, source)
+    # One row past the cap comes back when there are more, so no second COUNT
+    # is needed to tell "at the limit" from "over it".
+    ids = store.db.list_entry_ids(
+        filters, MAX_SELECTABLE_IDS, sort=sort or DEFAULT_SORT
+    )
+    if len(ids) > MAX_SELECTABLE_IDS:
+        raise HTTPException(
+            413,
+            f"more than {MAX_SELECTABLE_IDS} entries match; narrow the filters "
+            "or the search before selecting them all",
+        )
+    return {"ids": ids, "total": len(ids)}
+
+
+@router.get("/entries/facets")
+def entry_facets(
+    fields: str,
+    kind: str = "audio",
+    q: Optional[str] = None,
+    favorite: Optional[bool] = None,
+    source: Optional[str] = None,
+) -> dict[str, Any]:
+    """Value counts for the filter dropdowns, over the WHOLE filtered library.
+
+    ``fields`` is required and comma-separated; every value must be one of
+    :data:`~backend.modules.library.db.FACET_FIELDS` (``model``, ``provider``,
+    ``source``, ``kind``). Repeats are answered once, in the order first asked
+    for. The remaining parameters are the paged list's filters and mean exactly
+    the same thing here, so a dropdown can never offer a value the list would
+    not show.
+
+    Each field comes back as ``[{"value", "count"}]`` sorted by count
+    descending then value ascending (the "unset" bucket last), capped at
+    :data:`~backend.modules.library.db.MAX_FACET_VALUES`. ``revision`` is the
+    library revision the counts were read at, so a client can drop a stale
+    response -- the same field the paged list carries.
+
+    Declared BEFORE ``/entries/{entry_id}`` so the literal path is not
+    swallowed by the id parameter.
+    """
+    _validate_listing(kind, None, 0)
+    requested = [part.strip() for part in fields.split(",") if part.strip()]
+    if not requested:
+        raise HTTPException(
+            400, f"fields must name at least one of {list(FACET_FIELDS)}"
+        )
+    unknown = [name for name in requested if name not in FACET_FIELDS]
+    if unknown:
+        raise HTTPException(
+            400, f"fields must be among {list(FACET_FIELDS)}, got {unknown}"
+        )
+    store = get_store()
+    if store.db is None:
+        raise HTTPException(503, "library DB not available")
+    filters = _entry_filters(kind, q, favorite, source)
+    return {
+        "facets": store.db.facet_counts(filters, requested),
+        "revision": store.db.library_revision(),
+    }
+
+
+class BulkDeleteFilter(BaseModel):
+    """The subset of the listing filters a bulk delete may target. ``kind``
+    absent means EVERY kind -- an absent filter field never narrows, which is
+    what makes ``{}`` mean "the whole library" and why it needs the ``all``
+    guard."""
+
+    q: Optional[str] = None
+    kind: Optional[str] = None
+    favorite: Optional[bool] = None
+    source: Optional[str] = None
+
+
+class BulkDeleteRequest(BaseModel):
+    ids: Optional[list[str]] = None
+    filter: Optional[BulkDeleteFilter] = None
+    confirm_total: Optional[int] = None
+    all: bool = False
+
+
+@router.post("/entries/bulk-delete")
+def bulk_delete_entries(req: BulkDeleteRequest) -> Any:
+    """Delete many entries in one request. Two forms, exactly one per call.
+
+    ``{"ids": [...]}`` deletes those entries, at most
+    :data:`MAX_BULK_DELETE_IDS` of them.
+
+    ``{"filter": {...}, "confirm_total": n}`` deletes everything the filter
+    matches -- but the SERVER re-counts first, and if the count is not ``n`` it
+    answers 409 with the count it saw and deletes NOTHING. That is the whole
+    point of the form: the client is confirming a number it showed the user, so
+    a library that changed underneath it must not be cleared on the strength of
+    a stale one. An empty filter would match the whole library and is refused
+    unless ``"all": true`` is sent alongside.
+
+    Answers ``{deleted, failed, total_matched, revision}``. ``failed`` carries
+    at most :data:`MAX_BULK_DELETE_ERRORS` entries, and
+    ``deleted + (every failure) == total_matched`` always, so a client can tell
+    how many failures were elided.
+
+    Declared BEFORE ``/entries/{entry_id}`` so the literal path is not swallowed
+    by the id parameter.
+    """
+    if (req.ids is None) == (req.filter is None):
+        raise HTTPException(400, "send exactly one of 'ids' or 'filter'")
+    store = get_store()
+    if store.db is None:
+        raise HTTPException(503, "library DB not available")
+
+    if req.ids is not None:
+        if len(req.ids) > MAX_BULK_DELETE_IDS:
+            raise HTTPException(
+                400,
+                f"at most {MAX_BULK_DELETE_IDS} ids per request, got {len(req.ids)}; "
+                "use the filter form to clear more than that",
+            )
+        ids = list(dict.fromkeys(str(entry_id) for entry_id in req.ids))
+        total_matched = len(ids)
+    else:
+        spec = req.filter
+        assert spec is not None  # the exactly-one check above guarantees it
+        if req.confirm_total is None:
+            raise HTTPException(400, "'confirm_total' is required with 'filter'")
+        if spec.kind is not None and spec.kind not in _KIND_FILTERS:
+            raise HTTPException(
+                400, f"kind must be one of {sorted(_KIND_FILTERS)}, got {spec.kind!r}"
+            )
+        narrows = (spec.q, spec.kind, spec.favorite, spec.source) != (
+            None,
+            None,
+            None,
+            None,
+        )
+        if not narrows and not req.all:
+            raise HTTPException(
+                400,
+                "an empty filter matches the whole library; resend with "
+                '"all": true to confirm that is what you mean',
+            )
+        filters = _entry_filters(spec.kind or "all", spec.q, spec.favorite, spec.source)
+        total_matched = store.db.count_entries_filtered(filters)
+        if total_matched != req.confirm_total:
+            # NOTHING has been deleted at this point, and nothing will be.
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": (
+                        f"the library changed: {total_matched} entries match, not "
+                        f"{req.confirm_total}. Re-read the count and try again."
+                    ),
+                    "total_matched": total_matched,
+                },
+            )
+        # ``list_entry_ids`` answers one past its cap, so a row written between
+        # the count and this read would otherwise delete one more entry than the
+        # user confirmed. The confirmed number is the contract; trim to it.
+        ids = store.db.list_entry_ids(filters, total_matched)[:total_matched]
+
+    result = store.delete_entries_bulk(ids)
+    return {
+        "deleted": result.deleted,
+        "failed": result.failed[:MAX_BULK_DELETE_ERRORS],
+        "total_matched": total_matched,
+        "revision": store.db.library_revision(),
     }
 
 
@@ -298,9 +657,14 @@ async def stream_audio(entry_id: str) -> Response:
 def stream_audio_cover(entry_id: str) -> FileResponse:
     """Serve the cover art for an audio entry (JPEG). Same shape as the media
     poster route: the store normalises everything to one file, so there is no
-    content negotiation and a missing cover is a plain 404."""
+    content negotiation and a missing cover is a plain 404.
+
+    A bulk-imported entry has no cover on disk (extraction is skipped to keep
+    a 200,000-file import from reading every file's tags). ``extract_missing``
+    makes the first request for one look, once per entry per process; a track
+    that carries no picture still answers 404."""
     store = get_store()
-    cover_path = store.get_cover_path(entry_id)
+    cover_path = store.get_cover_path(entry_id, extract_missing=True)
     if cover_path is None or not cover_path.is_file():
         raise HTTPException(404, f"Cover for entry {entry_id!r} not found")
     return FileResponse(path=str(cover_path), media_type="image/jpeg")
@@ -497,15 +861,70 @@ class ImportFolderRequest(BaseModel):
     recursive: bool = True
 
 
+def _enqueue_import_job(store: LibraryStore, job: ImportJob) -> None:
+    """Hand one import job to the project's background queue.
+
+    The queue's consumer awaits ``job.fn`` on the event loop, so the work goes
+    through ``asyncio.to_thread`` -- the same shape every other library
+    background job uses. The queue is idle-gated and single-consumer: a large
+    import waits for the app to go quiet and, while it runs, nothing else
+    heavy starts. That is the right ordering for a mass import, but it does
+    mean the job may not begin the instant it is queued.
+    """
+
+    async def _run() -> None:
+        import asyncio
+
+        await asyncio.to_thread(store.run_import_job, job)
+
+    try:
+        from backend.core.background_workers import get_background_queue
+
+        get_background_queue().enqueue(f"library-import:{job.id}", _run)
+    except Exception as e:  # noqa: BLE001 - the job must report, not raise
+        log.warning("library: failed to queue import job %s: %s", job.id, e)
+        job.finish("failed", error=f"could not start the import: {e!r}")
+
+
+@router.get("/import-jobs/{job_id}")
+def get_import_job(job_id: str) -> dict[str, Any]:
+    """Progress of one async folder import. Jobs live in this process only:
+    an unknown id is a 404, including after a restart."""
+    job = get_import_jobs().get(job_id)
+    if job is None:
+        raise HTTPException(404, f"import job {job_id!r} not found")
+    return job.snapshot()
+
+
+@router.delete("/import-jobs/{job_id}")
+def cancel_import_job(job_id: str) -> dict[str, Any]:
+    """Ask an import to stop. A running job stops after the batch in flight
+    commits, so the library is left consistent and the import is resumable --
+    re-running it skips everything already registered."""
+    job = get_import_jobs().get(job_id)
+    if job is None:
+        raise HTTPException(404, f"import job {job_id!r} not found")
+    job.cancel()
+    return job.snapshot()
+
+
 @router.post("/import-folder", dependencies=[Depends(refuse_cross_site)])
 def import_folder(
     req: ImportFolderRequest = Body(default=ImportFolderRequest()),
+    run_async: bool = Query(False, alias="async"),
 ) -> dict[str, Any]:
     """Add a local folder of audio as a playlist, REFERENCE-IN-PLACE: each file
     becomes a library entry that points at the on-disk file (no copy), so it
     plays / analyses like any track. With no ``path``, opens a native folder
     picker in the last music folder added. Returns the created entries; the
-    caller builds the setlist."""
+    caller builds the setlist.
+
+    With ``?async=1`` the folder is validated here and the scan + registration
+    move to a background job: the response is ``{job_id, status_url}`` and the
+    caller polls. That is the only form that works for a folder of ~200,000
+    songs -- the synchronous one holds a request open for the whole import and
+    is capped at ``MAX_SYNC_IMPORT_ENTRIES`` echoed entries.
+    """
     folder = req.path
     if not folder:
         from backend.core import folder_dialog
@@ -524,23 +943,231 @@ def import_folder(
         raise HTTPException(400, f"not a folder: {folder!r}")
     # Picked or typed, the folder is where the next picker opens.
     known_paths.record(root, "library-folder", source="library-folder")
+    store = get_store()
+
+    if run_async:
+        job = get_import_jobs().create(folder=str(root), recursive=req.recursive)
+        _enqueue_import_job(store, job)
+        return {
+            "job_id": job.id,
+            "status_url": f"{store.api_prefix}/import-jobs/{job.id}",
+        }
+
     paths = root.rglob("*") if req.recursive else root.iterdir()
     files = sorted(
         (p for p in paths if p.is_file() and p.suffix.lower() in AUDIO_EXTS),
         key=lambda p: str(p).lower(),
     )
-    store = get_store()
     entries: list[dict[str, Any]] = []
+    created_total = 0
     for f in files:
         rec = store.register_reference(str(f), {"source": "folder"})
-        if rec is not None:
+        if rec is None:
+            continue
+        created_total += 1
+        # Every entry is created; only the echo is bounded. A 200,000-file
+        # folder would otherwise serialize the whole library into one response.
+        if len(entries) < MAX_SYNC_IMPORT_ENTRIES:
             entries.append(rec.to_dict())
     return {
         "cancelled": False,
         "folder": str(root),
         "name": root.name,
         "entries": entries,
+        "created_total": created_total,
     }
+
+
+# ---------------------------------------------------------------------------
+# Suno full-cache import: stage, then promote
+# ---------------------------------------------------------------------------
+#
+# Two long jobs, both driven through the SAME ``/import-jobs/{id}`` routes as a
+# folder import, because from the user's side they are the same thing: a huge
+# import you start, watch, and may want to stop. Registered above the
+# ``/{entry_id}/...`` routes so ``/suno/stage-report`` is never read as an
+# entry id.
+
+
+class SunoStageRequest(BaseModel):
+    cache_path: str
+    media_root: Optional[str] = None
+    stage_root: Optional[str] = None
+    namespace: str = "suno"
+
+
+class SunoPromoteRequest(BaseModel):
+    stage_root: str
+    dry_run: bool = False
+    batch_size: int = suno_promote.DEFAULT_BATCH_SIZE
+
+
+def _outside_library(candidate: Path, label: str) -> Path:
+    """Resolve ``candidate`` and refuse it if it lives under the library root.
+
+    Staging inside the library would put a multi-gigabyte SQLite file where the
+    entry walk and every bulk delete expect entry folders.
+    """
+    store = get_store()
+    root = os.path.normcase(str(store.root.resolve()))
+    try:
+        resolved = candidate.expanduser().resolve()
+    except OSError as e:
+        raise HTTPException(400, f"unusable {label} {str(candidate)!r}: {e}") from e
+    target = os.path.normcase(str(resolved))
+    if target == root or target.startswith(root + os.sep):
+        raise HTTPException(
+            400,
+            f"{label} {resolved} is inside the library root; "
+            "choose a folder outside it (a fast drive is worth it)",
+        )
+    return resolved
+
+
+def _readable_file(raw: str, label: str) -> Path:
+    path = Path(raw).expanduser()
+    if not path.is_file():
+        raise HTTPException(400, f"no such {label}: {raw!r}")
+    try:
+        with path.open("rb"):
+            pass
+    except OSError as e:
+        raise HTTPException(400, f"{label} {raw!r} is not readable: {e}") from e
+    return _outside_library(path, label)
+
+
+def _writable_dir(path: Path, label: str) -> Path:
+    resolved = _outside_library(path, label)
+    try:
+        resolved.mkdir(parents=True, exist_ok=True)
+        probe = resolved / ".theDAW-write-probe"
+        probe.write_bytes(b"")
+        probe.unlink()
+    except OSError as e:
+        raise HTTPException(400, f"{label} {resolved} is not writable: {e}") from e
+    return resolved
+
+
+def _enqueue_suno_job(job: suno_promote.SunoJob, run: Any) -> dict[str, Any]:
+    """Hand one Suno job to the shared background queue and answer with its handle."""
+
+    async def _run() -> None:
+        import asyncio
+
+        await asyncio.to_thread(run)
+
+    try:
+        from backend.core.background_workers import get_background_queue
+
+        get_background_queue().enqueue(f"library-{job.kind}:{job.id}", _run)
+    except Exception as e:  # noqa: BLE001 - the job must report, not raise
+        log.warning("library: failed to queue %s job %s: %s", job.kind, job.id, e)
+        job.finish("failed", error=f"could not start the job: {e!r}")
+    return {
+        "job_id": job.id,
+        "status_url": f"{get_store().api_prefix}/import-jobs/{job.id}",
+    }
+
+
+@router.post("/suno/stage", dependencies=[Depends(refuse_cross_site)])
+def suno_stage_cache(req: SunoStageRequest = Body(...)) -> dict[str, Any]:
+    """Stage a Suno/Harvester cache file into its own catalog, as a job.
+
+    Loss-free and read-only over the cache: identity is the provider song id,
+    every observed version is kept, malformed rows are quarantined, and local
+    media is matched by id and REFERENCED, never copied. Nothing reaches the
+    library until ``POST /suno/promote``.
+
+    ``stage_root`` defaults to the app data directory. A fast drive is worth
+    naming explicitly: 200,000 songs staged in ~1.7 min on NVMe against ~16 min
+    on a spinning disk.
+    """
+    cache = _readable_file(req.cache_path, "cache file")
+    media_root: Optional[Path] = None
+    if req.media_root:
+        candidate = Path(req.media_root).expanduser()
+        if not candidate.is_dir():
+            raise HTTPException(400, f"no such media root: {req.media_root!r}")
+        media_root = _outside_library(candidate, "media root")
+    stage_root = _writable_dir(
+        Path(req.stage_root).expanduser()
+        if req.stage_root
+        else suno_promote.default_stage_root(),
+        "stage root",
+    )
+    known_paths.record(cache.parent, "suno-cache", source="suno-cache")
+
+    job = get_import_jobs().register(
+        suno_promote.SunoJob(
+            uuid.uuid4().hex,
+            "suno-stage",
+            {
+                "cache_path": str(cache),
+                "stage_root": str(stage_root),
+                "media_root": str(media_root) if media_root else None,
+            },
+        )
+    )
+    return _enqueue_suno_job(
+        job,
+        lambda: suno_promote.run_stage_job(
+            job,
+            cache_path=cache,
+            stage_root=stage_root,
+            media_root=media_root,
+            namespace=req.namespace or "suno",
+        ),
+    )
+
+
+@router.get("/suno/stage-report")
+def suno_stage_report(stage_root: str = Query(...)) -> dict[str, Any]:
+    """What a staging catalog holds: identities, revisions, same-title songs,
+    media availability, quarantined rows, unresolved lineage, and how many of
+    the songs a promotion could actually place (``promotable``)."""
+    root = Path(stage_root).expanduser()
+    try:
+        return suno_promote.stage_report(root)
+    except suno_promote.PromotionRefused as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@router.post("/suno/promote", dependencies=[Depends(refuse_cross_site)])
+def suno_promote_stage(req: SunoPromoteRequest = Body(...)) -> dict[str, Any]:
+    """Promote a staged catalog into the library, as a resumable job.
+
+    Reference-in-place (no audio is copied), updates rather than duplicates a
+    song that was imported before, keeps every user edit, and can be stopped
+    with ``DELETE /import-jobs/{id}`` and restarted without repeating work.
+    ``dry_run`` reports exactly what a real run would do and writes nothing.
+    """
+    stage_root = Path(req.stage_root).expanduser()
+    if not stage_root.is_dir():
+        raise HTTPException(400, f"no such stage root: {req.stage_root!r}")
+    resolved = _outside_library(stage_root, "stage root")
+    if not suno_stage.stage_db_path(resolved).is_file():
+        raise HTTPException(400, f"no Suno staging database under {resolved}")
+    store = get_store()
+    if store.db is None:
+        raise HTTPException(503, "library DB not available")
+
+    job = get_import_jobs().register(
+        suno_promote.SunoJob(
+            uuid.uuid4().hex,
+            "suno-promote",
+            {"stage_root": str(resolved), "dry_run": bool(req.dry_run)},
+        )
+    )
+    return _enqueue_suno_job(
+        job,
+        lambda: suno_promote.run_promote_job(
+            job,
+            store,
+            stage_root=resolved,
+            dry_run=bool(req.dry_run),
+            batch_size=max(1, int(req.batch_size)),
+        ),
+    )
 
 
 _PERF_SETS_DIRNAME = "performance-sets"
@@ -772,6 +1399,17 @@ def delete_entry(entry_id: str) -> dict[str, Any]:
             404, f"Entry {entry_id!r} not found or could not be deleted"
         )
     return {"deleted": entry_id}
+
+
+@router.get("/summary")
+def library_summary() -> dict[str, Any]:
+    """Category counts for the library tab strip, plus the DB revision they
+    were read at. Declared before the ``/{entry_id}/...`` routes so a literal
+    path can never be swallowed by the entry-id parameter."""
+    store = get_store()
+    if store.db is None:
+        raise HTTPException(503, "library DB not available")
+    return store.db.library_counts()
 
 
 @router.get("/{entry_id}/bundle")

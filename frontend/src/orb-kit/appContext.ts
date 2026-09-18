@@ -2,6 +2,11 @@ import { useAppUiStore } from '../state/appUiStore';
 import { useGenerateParamsStore } from '../state/generateParamsStore';
 import { useGenerateStore } from '../state/generateStore';
 import { useEditorStore } from '../state/editorStore';
+import {
+    referenceContextEntry,
+    type AssistantReference,
+    type AssistantReferenceContext,
+} from '../state/assistantReferenceStore';
 import { FEATURES } from '../onboarding/featureRegistry';
 
 type EditorSummary = {
@@ -40,12 +45,24 @@ type RuntimeContext = {
     };
     params: Record<string, unknown>;
     attachments: Array<{ name: string; mime: string; size: number }>;
+    /** The chips the user attached to THIS message, resolved against the live
+     *  document. Absent/empty when they attached none. */
+    references?: AssistantReferenceContext[];
 };
 
+/** Said once, where the references are, so the model cannot miss it. */
+const REFERENCES_INSTRUCTION =
+    'When references are present, act ONLY on these ids; never pick a clip by name. '
+    + 'A reference with status "missing" no longer exists — say so and stop; do not substitute '
+    + 'the current selection. Status "changed" means it moved or was renamed since the user '
+    + 'pointed at it: use the facts below, not the label.';
+
 export function formattheDAWAppContext(context: RuntimeContext): string {
+    const references = context.references ?? [];
     const payload = {
         assistant_is_inside_running_app: true,
         important_behavior: [
+            ...(references.length ? [REFERENCES_INSTRUCTION] : []),
             'The user is already talking to you from inside theDAW (by GANTASMO) frontend. Do not tell them to click UI manually when an action exists.',
             'If the user asks to navigate, emit a navigate action immediately.',
             'If the user asks where something is, emit locate_feature with an id from locatableFeatures below — it switches workspace, opens the panel the control lives in and rings the control itself. Do not describe a location you can point at.',
@@ -61,6 +78,9 @@ export function formattheDAWAppContext(context: RuntimeContext): string {
         generationState: context.generation,
         currentGenerationParams: context.params,
         pendingAttachments: context.attachments,
+        ...(references.length
+            ? { references_instruction: REFERENCES_INSTRUCTION, references }
+            : {}),
     };
 
     return `<current_app_context>\n${JSON.stringify(payload, null, 2)}\n</current_app_context>`;
@@ -70,6 +90,10 @@ export function buildtheDAWAppContext(options: {
     selectedProvider: string;
     selectedModel: string;
     attachments?: Array<{ name: string; mime: string; size: number }>;
+    /** Reference chips attached to this message. Resolved HERE, at send time,
+     *  so a clip deleted while the user was typing goes out flagged missing
+     *  rather than as a stale fact. */
+    references?: AssistantReference[];
 }): string {
     const ui = useAppUiStore.getState();
     const params = useGenerateParamsStore.getState();
@@ -188,6 +212,7 @@ export function buildtheDAWAppContext(options: {
             })),
         },
         attachments: options.attachments ?? [],
+        references: (options.references ?? []).map(referenceContextEntry),
     });
 }
 

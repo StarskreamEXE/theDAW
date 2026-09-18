@@ -1,11 +1,16 @@
 """Ingest songs from a SunoHarvester API-compatible cache into the DAW library.
 
-Reads the cache JSON, deduplicates by title (keeps the most recent),
-selects the N most recent entries, and writes metadata.json directories
-into the library root so the library store picks them up on reindex.
+Reads the cache JSON, deduplicates by song id (keeps the most recent record
+for each id), optionally caps the number of entries, and writes metadata.json
+directories into the library root so the library store picks them up on
+reindex.
 
 No audio is downloaded — each entry stores a cdn_audio_url that the
 library audio endpoint proxies on first play.
+
+For a loss-free staged import of the *whole* cache (every revision, lineage
+edges, quarantine, resume) use ``scripts/stage_suno_cache.py`` instead; this
+script stays the quick "give me playable CDN entries" path.
 
 Usage:
     python scripts/ingest_suno_cache.py [--cache PATH] [--limit N]
@@ -16,9 +21,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 # CHANGED: new script — bulk-imports Suno cache entries as CDN-backed
 # library entries (no audio download, proxied on demand).
@@ -28,9 +35,13 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 log = logging.getLogger(__name__)
 
+# CHANGED: Path("") is truthy, so the old `Path(os.environ.get(...)) or default`
+# never reached the default — an unset SUNO_CACHE_PATH meant Path(".").
+_CACHE_FROM_ENV = os.environ.get("SUNO_CACHE_PATH", "").strip()
 DEFAULT_CACHE = (
-    Path(os.environ.get("SUNO_CACHE_PATH", ""))
-    or Path.home()
+    Path(_CACHE_FROM_ENV)
+    if _CACHE_FROM_ENV
+    else Path.home()
     / "Documents"
     / "GitHub"
     / "SunoHarvester"
@@ -42,14 +53,18 @@ DEFAULT_CACHE = (
 
 def load_cache(path: Path) -> list[dict]:
     # CHANGED: stream-parse with ijson to avoid MemoryError on 150k+ entry files.
+    # ijson is not a project dependency and this script never installs anything:
+    # it says what to run and exits.
     try:
         import ijson
     except ImportError:
-        # Fallback: parse with json in chunks won't work — install ijson.
-        import subprocess
-
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "ijson"])
-        import ijson
+        log.error(
+            "Streaming %s needs the optional 'ijson' package, which this project "
+            "does not depend on. Run `uv add ijson` first, or use "
+            "scripts/stage_suno_cache.py with a JSONL export (no dependency).",
+            path.name,
+        )
+        sys.exit(2)
 
     songs = []
     with open(path, "r", encoding="utf-8") as f:
@@ -58,30 +73,64 @@ def load_cache(path: Path) -> list[dict]:
     return songs
 
 
-def dedupe_by_title(songs: list[dict], limit: int) -> list[dict]:
-    """Sort by created_at desc, keep first occurrence of each title."""
+def dedupe_by_id(songs: list[dict], limit: Optional[int]) -> list[dict]:
+    """Sort by created_at desc, keep the newest record for each song id.
+
+    CHANGED: keyed on the provider song id, not the title. Songs that share a
+    title are different songs and all of them survive; an untitled song is kept
+    too (``ingest`` gives it a fallback title).
+    """
     songs_sorted = sorted(
         songs,
         key=lambda s: s.get("created_at") or "",
         reverse=True,
     )
-    seen_titles: set[str] = set()
+    seen_ids: set[str] = set()
     result: list[dict] = []
     for s in songs_sorted:
-        title = (s.get("title") or "").strip().lower()
-        if not title:
+        song_id = (s.get("id") or "").strip()
+        if not song_id:
             continue
         if s.get("status") != "complete":
             continue
         if not s.get("audio_url"):
             continue
-        if title in seen_titles:
+        if song_id in seen_ids:
             continue
-        seen_titles.add(title)
+        seen_ids.add(song_id)
         result.append(s)
-        if len(result) >= limit:
+        if limit is not None and len(result) >= limit:
             break
     return result
+
+
+def song_duration(song: dict) -> Optional[float]:
+    """Seconds when the cache states a usable duration, else None.
+
+    CHANGED: the old code wrote 0.0 for every entry, which is indistinguishable
+    from a real measurement. Unknown stays unknown.
+    """
+    meta = song.get("metadata") or {}
+    candidates = (
+        meta.get("duration") if isinstance(meta, dict) else None,
+        song.get("duration"),
+        song.get("duration_seconds"),
+    )
+    for value in candidates:
+        if value is None or isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            number = float(value)
+        elif isinstance(value, str):
+            try:
+                number = float(value.strip())
+            except ValueError:
+                continue
+        else:
+            continue
+        if math.isfinite(number) and number > 0:
+            return number
+    return None
 
 
 def ingest(songs: list[dict], library_root: Path) -> int:
@@ -122,7 +171,7 @@ def ingest(songs: list[dict], library_root: Path) -> int:
             "prompt": prompt,
             "negative_prompt": "",
             "model": "suno",
-            "duration": 0.0,
+            "duration": song_duration(song),
             "steps": 0,
             "cfg": 0.0,
             "seed": 0,
@@ -150,15 +199,22 @@ def ingest(songs: list[dict], library_root: Path) -> int:
     return count
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Ingest SunoHarvester cache into DAW library"
     )
     parser.add_argument(
         "--cache", type=Path, default=DEFAULT_CACHE, help="Path to cache JSON"
     )
-    parser.add_argument("--limit", type=int, default=5000, help="Max entries to import")
-    args = parser.parse_args()
+    # CHANGED: no cap by default — the old 5000 silently discarded the rest.
+    parser.add_argument(
+        "--limit", type=int, default=None, help="Max entries to import (default: all)"
+    )
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -170,8 +226,8 @@ def main() -> None:
     songs = load_cache(args.cache)
     log.info("Loaded %d total songs", len(songs))
 
-    selected = dedupe_by_title(songs, args.limit)
-    log.info("Selected %d songs (deduped by title, most recent first)", len(selected))
+    selected = dedupe_by_id(songs, args.limit)
+    log.info("Selected %d songs (deduped by song id, most recent first)", len(selected))
 
     from backend.modules.library.store import default_library_root
 

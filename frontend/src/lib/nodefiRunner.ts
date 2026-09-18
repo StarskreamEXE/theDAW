@@ -149,11 +149,9 @@ export function runGraph(
         const id = String(node.params.libraryId || '');
         if (!id) throw new Error('no library entry selected');
         const lib = useLibraryStore.getState();
-        let entry = lib.entries.find((e) => e.id === id);
-        if (!entry) {
-          await lib.load();
-          entry = useLibraryStore.getState().entries.find((e) => e.id === id);
-        }
+        // By id, not through `entries`: that holds only the LOADED rows, and
+        // reloading the first page never reaches a row deep in a big library.
+        const entry = lib.getById(id) ?? (await lib.ensureEntry(id));
         if (!entry) throw new Error('library entry not found');
         return useLibraryStore.getState().fetchAudioBlob(entry);
       }

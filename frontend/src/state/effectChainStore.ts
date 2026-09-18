@@ -85,6 +85,22 @@ export const MIX_RACK_IDS: Set<string> = new Set(
   RACK_EFFECTS.filter((d) => !(d.id in EFFECT_DEFAULTS)).map((d) => d.id),
 );
 
+/**
+ * Which host produced a plugin's saved `raw_state`.
+ *
+ * A VST3 state blob is NOT portable between theDAW's own live host and the
+ * offline pedalboard renderer — measured, not assumed: iZotope Vinyl and Ozone
+ * reject each other's component state outright, and AIR accepts the
+ * pedalboard's blob and then ignores it. So the blob alone is not enough to
+ * reproduce a sound; the entry has to remember who wrote it, and the offline
+ * render has to go back through the SAME host.
+ *
+ * `'pedalboard'` is the old editor sidecar (and the offline renderer). Every
+ * project saved before this field existed was captured that way, which is why
+ * ABSENT reads as `'pedalboard'` — see `vstStateHost`.
+ */
+export type VstStateHost = 'thedaw' | 'pedalboard';
+
 /** Identity of a VST3 plugin node in the chain. Present only on VST entries;
  *  FFmpeg/built-in effects leave it undefined. */
 export interface VstNode {
@@ -93,7 +109,16 @@ export interface VstNode {
   /** Base64 plugin state captured from the native editor (show_editor); applied
    *  at process time so the dialed-in sound is reused. Undefined = defaults. */
   raw_state?: string;
+  /** Which host captured `raw_state`. Absent on every project written before
+   *  the live host existed, and therefore read as `'pedalboard'`. */
+  state_host?: VstStateHost;
 }
+
+/** The host that produced this node's state, with the compatibility default.
+ *  ONE definition, so no caller can decide "absent means live" by accident and
+ *  hand an old sidecar blob to a host that will reject it. */
+export const vstStateHost = (vst: VstNode | undefined): VstStateHost =>
+  vst?.state_host === 'thedaw' ? 'thedaw' : 'pedalboard';
 
 export interface ChainEntry {
   id: string;
@@ -117,7 +142,11 @@ interface EffectChainState {
    *  never seed from EFFECT_DEFAULTS. This is the only seeding path for rack ids. */
   addRackEffect: (effect: string) => void;
   addVst: (plugin: VstNode) => void;
-  setVstRawState: (id: string, rawState: string) => void;
+  /** Store a captured plugin state on a VST entry, together with the host that
+   *  produced it. `stateHost` defaults to `'pedalboard'` because the caller that
+   *  omits it is the OLD editor sidecar path — the live capture path names
+   *  `'thedaw'` explicitly. */
+  setVstRawState: (id: string, rawState: string, stateHost?: VstStateHost) => void;
   removeEffect: (id: string) => void;
   updateParams: (id: string, params: Record<string, number>) => void;
   toggleEnabled: (id: string) => void;
@@ -141,10 +170,12 @@ export const useEffectChainStore = create<EffectChainState>()(
         set((s) => ({
           chain: [...s.chain, { id: uuid(), effect: 'vst3', params: {}, enabled: true, vst: plugin }],
         })),
-      setVstRawState: (id, rawState) =>
+      setVstRawState: (id, rawState, stateHost = 'pedalboard') =>
         set((s) => ({
           chain: s.chain.map((e) =>
-            e.id === id && e.vst ? { ...e, vst: { ...e.vst, raw_state: rawState } } : e,
+            e.id === id && e.vst
+              ? { ...e, vst: { ...e.vst, raw_state: rawState, state_host: stateHost } }
+              : e,
           ),
         })),
       removeEffect: (id) => set((s) => ({ chain: s.chain.filter((e) => e.id !== id) })),

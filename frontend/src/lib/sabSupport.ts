@@ -17,6 +17,7 @@
  *
  * Nothing here allocates shared memory or touches audio — it only reports.
  */
+import { useVstLiveStore, type VstLiveHostState } from '../state/vstLiveStore';
 
 /** True only in a document the browser has marked cross-origin isolated. */
 export function isCrossOriginIsolated(): boolean {
@@ -36,23 +37,36 @@ export function sabAvailable(): boolean {
 }
 
 /**
- * What the UI says about a `vst3` chain entry that has no live node.
+ * What the UI says about live VST hosting on this machine.
  *
- * `isolated` answers "could a live host exist here at all", which is why it is
- * `sabAvailable()` and not the raw flag: a page claiming isolation with no
- * SharedArrayBuffer is no more able to run a plugin than an un-isolated one,
- * and telling the user otherwise would send them hunting the wrong fault.
- * `reason` is the sentence shown in the row's `title`.
+ * CROSS-ORIGIN ISOLATION IS NO LONGER THE QUESTION. This used to report
+ * `sabAvailable()`, because a live host was expected to hand the worklet a
+ * SharedArrayBuffer ring, and shared memory needs an isolated document. The
+ * bridge that was actually built (docs/design/vst-live-protocol.md) moves audio
+ * over a `MessagePort` and a loopback WebSocket, neither of which is gated —
+ * so an un-isolated page hosts plugins perfectly well, and telling the user to
+ * go and fix their headers would send them after a fault that is not there. A
+ * SharedArrayBuffer ring remains a possible later optimisation behind the same
+ * node contract, which is why `sabAvailable` is still exported above.
+ *
+ * The question now is whether the backend has a host BINARY, which is a fact
+ * about the machine that only `GET /api/vst/live/host` knows. That answer is
+ * cached in `vstLiveStore` by the session registry; `available === null` means
+ * nobody has asked yet, and an entry opened in that state proceeds
+ * optimistically rather than declaring the machine plugin-less.
+ *
+ * `host` defaults to the current store value. A React caller passes its own
+ * SUBSCRIBED value instead, so the row re-renders when the probe lands — a
+ * `getState()` read inside a render would show the "checking…" answer forever.
  */
-export function liveVstStatus(): { isolated: boolean; reason: string } {
-  const isolated = sabAvailable();
+export function liveVstStatus(
+  host: VstLiveHostState = useVstLiveStore.getState().host,
+): { available: boolean | null; reason: string } {
+  const { available, reason } = host;
+  if (available === true) return { available, reason: 'live plugin host available' };
+  if (available === null) return { available, reason: 'checking for the live plugin host…' };
   return {
-    isolated,
-    reason: isolated
-      ? 'isolated — live host not built yet'
-      : // Names the switch, because "not isolated" is not actionable on its
-        // own: the headers are opt-in (theDAW_ISOLATE=1 in vite.config.ts and
-        // electron-ui/main/index.ts) and the caveat is the reason they are.
-        'live VST needs cross-origin isolation (start with theDAW_ISOLATE=1; sidecar tabs are not yet proxied)',
+    available,
+    reason: reason ?? 'live plugin host unavailable — plugins render at freeze/bounce only',
   };
 }

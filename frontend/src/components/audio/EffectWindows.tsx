@@ -37,7 +37,7 @@ import { GanPluginStage } from './GanPluginStage';
 import { useEditorStore } from '../../state/editorStore';
 import { sidechainsInto, wouldCycle, type RoutingRefusal } from '../../state/routingGraph';
 import { requireFeature } from '../../notices/featureGateStore';
-import { useVstEditorStore } from '../../state/vstEditorStore';
+import { useVstEditorStore, vstEntryName } from '../../state/vstEditorStore';
 import { useGanStore } from '../../state/ganStore';
 import { EFFECT_LABELS, type ChainEntry } from '../../state/effectChainStore';
 import { getRackEffect, RACK_EFFECTS } from '../../lib/rackEffects';
@@ -83,7 +83,11 @@ export function chainForScope(scope: FxScope): readonly ChainEntry[] {
  *  with a backend effect ('delay': "Delay", the backend's "Stereo Delay") reads
  *  the same in the menu and in its row. */
 export function effectEntryLabel(entry: ChainEntry): string {
-  if (entry.vst) return entry.vst.plugin_name;
+  // A VST entry is named after the PLUGIN. vstEntryName covers a chain saved
+  // before the scanner learned real names (or written by an importer) whose
+  // stored plugin_name is empty, so a row never falls back to the blank string
+  // — nor to 'vst3', which names the hosting format, not the effect.
+  if (entry.vst) return vstEntryName(entry.vst.plugin_name, entry.vst.plugin_path);
   return getRackEffect(entry.effect)?.label || EFFECT_LABELS[entry.effect] || entry.label || entry.effect;
 }
 
@@ -814,17 +818,25 @@ export const FxChainList: React.FC<FxChainListProps> = ({
                 <div className="max-h-32 overflow-y-auto flex flex-col gap-0.5">
                   {vstPlugins.map((pl) => {
                     const inChain = chain.some((e) => e.vst?.plugin_path === pl.path);
+                    // The plugin's OWN name once the backend probe has read it;
+                    // the file stem is only the fallback. The vendor rides
+                    // alongside as a muted secondary label, so two plugins that
+                    // share a short name stay tellable apart.
+                    const name = pl.display_name || pl.name;
                     return (
                       <button
                         key={pl.path}
                         onClick={() => onAddVst(pl)}
-                        title={inChain ? `Open ${pl.name} controls` : `Insert ${pl.name}`}
+                        title={inChain ? `Open ${name} controls` : `Insert ${name}`}
                         className={`flex items-center gap-1.5 text-left px-1.5 py-1 rounded font-sans text-xs font-bold truncate transition-colors border ${
                           inChain ? 'bg-teal-500/15 text-teal-300 border-teal-500/30' : 'text-zinc-400 hover:bg-white/5 hover:text-white border-transparent'
                         }`}
                       >
                         <Plug className="w-3 h-3 text-teal-300 shrink-0" />
-                        <span className="flex-1 min-w-0 truncate">{pl.name}</span>
+                        <span className="flex-1 min-w-0 truncate">{name}</span>
+                        {pl.manufacturer && (
+                          <span className="shrink-0 max-w-20 truncate font-sans text-xs font-bold text-zinc-600">{pl.manufacturer}</span>
+                        )}
                         {!inChain && <Plus className="w-3 h-3 text-zinc-500 shrink-0" />}
                       </button>
                     );

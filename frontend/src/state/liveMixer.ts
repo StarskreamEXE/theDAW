@@ -39,6 +39,7 @@
  */
 import {
   useEditorStore,
+  freezeSignature,
   sampleLane,
   automationTargetKey,
   clipPeakGain,
@@ -80,6 +81,9 @@ import {
   type ChainLatencyReport,
   type RackEffectDef,
 } from '../lib/rackEffects';
+import { broadcastVstTransport } from '../lib/vstLive/vstLiveNode';
+import { hookVstSessionUnload, vstSessions } from '../lib/vstLive/sessionRegistry';
+import { entryLatencySamples, useVstLiveStore, type VstLiveEntryState } from './vstLiveStore';
 import { sliceChunks, type AudioChunk } from '../lib/audioAnalysis';
 import {
   configureDecodeCache,
@@ -239,6 +243,17 @@ let masterBus: GainNode | null = null;
 let masterChain: ChainHandle | null = null;
 let lastMasterSig = '';     // topology only (rebuild trigger)
 let lastMasterFullSig = ''; // topology + params (skip no-op ticks)
+// The MASTER VST rack (editorStore.masterVstChain), spliced after masterFxChain
+// — see buildMasterBus for when it is built and when the frozen render already
+// contains it.
+let masterVstNode: GainNode | null = null;
+let masterVstChainHandle: ChainHandle | null = null;
+let lastMasterVstSig = '';
+let lastMasterVstFullSig = '';
+// Live VST sessions: their reported latency drives PDC, so a `ready` or a
+// `latency` event has to re-run the same alignment a chain edit does.
+let unsubVstLive: (() => void) | null = null;
+let lastVstLatencySig = '';
 
 // Routing reconciliation signatures. Split so the store subscription can tell
 // a STRUCTURAL move (rebuild nodes / rewire) from a VALUE move (write a param),
@@ -920,13 +935,92 @@ export function disposeBusNodes(
  *  shared engine master. Safe to call repeatedly (tears down the prior one). */
 function buildMasterBus(): void {
   const ctx = getEngineCtx();
+  disposeMasterVstChain();
   if (masterChain) { masterChain.dispose(); masterChain = null; }
   if (masterBus) { try { masterBus.disconnect(); } catch { /* gone */ } masterBus = null; }
   masterBus = ctx.createGain();
   const chain = useEditorStore.getState().masterFxChain;
-  masterChain = buildEffectChain(ctx, masterBus, getMasterGain(), chain);
+  const vstChain = liveMasterVstChain();
+
+  // MASTER VST RACK — where it goes, and when it is skipped.
+  //
+  // The two master racks are ordered the way the offline master bounce orders
+  // them: `masterFxChain` (the psychoacoustic rack) first, then
+  // `masterVstChain` (hosted plugins), so the live preview and the printed
+  // master apply them in the same order.
+  //
+  // It is NOT built while a CURRENT frozen master is the preview. Freezing
+  // renders the whole master, plugins included, and auditioning that render
+  // through a live VST rack would process the plugins twice — the second pass
+  // over a signal they have already shaped. `liveMasterVstChain` returns an
+  // empty chain in exactly that case, and a stale frozen render (the signature
+  // no longer matches the document) is not that case: what is being heard is
+  // the live mix again, so the plugins belong in it.
+  if (vstChain.length > 0) {
+    masterVstNode = ctx.createGain();
+    masterChain = buildEffectChain(ctx, masterBus, masterVstNode, chain);
+    masterVstChainHandle = buildEffectChain(ctx, masterVstNode, getMasterGain(), vstChain);
+  } else {
+    masterChain = buildEffectChain(ctx, masterBus, getMasterGain(), chain);
+  }
   lastMasterSig = chainTopoSig(chain);
   lastMasterFullSig = JSON.stringify(chain);
+  lastMasterVstSig = chainTopoSig(vstChain);
+  lastMasterVstFullSig = JSON.stringify(vstChain);
+}
+
+/**
+ * The master VST entries that should SOUND right now — empty while a CURRENT
+ * frozen master is the preview, because that render already contains them.
+ *
+ * "Current" is the freeze signature the render was made from still matching the
+ * document: a stale frozen master means the user is hearing the live mix, and
+ * the live mix includes its plugins.
+ */
+function liveMasterVstChain(): ChainEntry[] {
+  const s = useEditorStore.getState();
+  if (s.masterVstChain.length === 0) return [];
+  if (s.previewMode === 'frozen' && s.frozenMaster) {
+    const sig = freezeSignature({
+      clips: s.clips,
+      tracks: s.tracks,
+      masterFxChain: s.masterFxChain,
+      masterVstChain: s.masterVstChain,
+      bpm: s.bpm,
+    });
+    if (sig === s.frozenMaster.sig) return [];
+  }
+  return [...s.masterVstChain];
+}
+
+function disposeMasterVstChain(): void {
+  if (masterVstChainHandle) { masterVstChainHandle.dispose(); masterVstChainHandle = null; }
+  if (masterVstNode) { try { masterVstNode.disconnect(); } catch { /* gone */ } masterVstNode = null; }
+  lastMasterVstSig = '';
+  lastMasterVstFullSig = '';
+}
+
+/**
+ * Reconcile the live master VST rack with the store. Adding or removing the
+ * FIRST / LAST plugin changes the master's node topology (a stage node appears
+ * or disappears between the two racks), so that case rebuilds the whole master
+ * bus rather than trying to re-thread it in place.
+ */
+function applyMasterVstChainLive(): void {
+  if (!masterBus) return;
+  const chain = liveMasterVstChain();
+  const full = JSON.stringify(chain);
+  if (full === lastMasterVstFullSig) return;
+  const had = masterVstChainHandle !== null;
+  if (had !== chain.length > 0) { buildMasterBus(); return; }
+  lastMasterVstFullSig = full;
+  const sig = chainTopoSig(chain);
+  if (sig !== lastMasterVstSig) {
+    lastMasterVstSig = sig;
+    masterVstChainHandle?.rebuild(chain);
+  } else {
+    for (const e of chain) masterVstChainHandle?.updateParams(e.id, e.params);
+  }
 }
 
 /** Reconcile the live master rack with the store: rebuild on topology change,
@@ -1507,6 +1601,80 @@ function syncTrackLatency(): void {
   if (sig === lastCompSig) return;
   lastCompSig = sig;
   applyCompDelays(rows, (id) => trackNodes.get(id)?.comp, ctx.currentTime);
+  noteCompClamp(rows, s.tracks, { graph: s.routing, buses: s.buses });
+}
+
+/**
+ * Say so when a chain declares more latency than the mixer can compensate.
+ *
+ * The comp delays are `DelayNode`s built with `maxDelayTime = COMP_MAX_DELAY`
+ * (1 s), and Web Audio clamps a `delayTime` above that SILENTLY: the other
+ * tracks simply stay early and nothing anywhere says why. A plugin is the one
+ * thing that can realistically declare that much (a mastering limiter's
+ * look-ahead plus the bridge buffer), so its own row is where the warning
+ * belongs.
+ *
+ * The flag goes on the LIVE VST entries of the PATH that declared the over-long
+ * chain — the cause — not on the tracks that are waiting for it. That path is
+ * the track's own insert chain PLUS every bus chain between it and the master,
+ * because `row.latencySec` is the sum of all of them: a mastering limiter on a
+ * bus can blow the ceiling on its own, and walking only the track chains left
+ * the one row that could explain it unmarked.
+ *
+ * A bus is shared, so its verdict is the OR over every row that flows through
+ * it: one quiet track must not clear a flag another track's path just set.
+ * Reads the store and writes a boolean; it does NOT touch the compensation
+ * math, which stays exactly as `trackCompDelays` computed it.
+ */
+function noteCompClamp(
+  rows: readonly TrackCompRow[],
+  tracks: readonly EditorTrack[],
+  routing?: LatencyRouting,
+): void {
+  const vst = useVstLiveStore.getState();
+  const byTrack = new Map(tracks.map((t) => [t.id, t.fxChain ?? []]));
+  const byBus = new Map((routing?.buses ?? []).map((b) => [b.id, b.fxChain ?? []]));
+
+  /** entry id -> is it on at least one over-long path. */
+  const verdict = new Map<string, boolean>();
+  const judge = (entries: readonly ChainEntry[], over: boolean): void => {
+    for (const e of entries) {
+      if (e.effect !== 'vst3') continue;
+      verdict.set(e.id, (verdict.get(e.id) ?? false) || over);
+    }
+  };
+  /** The blamed track that caused a flag, for the one-line explanation. */
+  let blame: TrackCompRow | null = null;
+
+  for (const row of rows) {
+    const over = row.latencySec > COMP_MAX_DELAY;
+    if (over && !blame) blame = row;
+    judge(byTrack.get(row.trackId) ?? [], over);
+    if (!routing) continue;
+    // Everything downstream of the track, up to (not including) the master —
+    // the same walk `trackCompDelays` used to build `row.latencySec`, and
+    // bounded by the node count so a cyclic graph from a project file cannot
+    // spin here either.
+    let cur = outputOf(routing.graph, row.trackId);
+    for (let hops = 0; cur !== null && cur !== MASTER_ID && hops <= routing.graph.nodes.length; hops += 1) {
+      judge(byBus.get(cur) ?? [], over);
+      cur = outputOf(routing.graph, cur);
+    }
+  }
+
+  for (const [entryId, over] of verdict) {
+    const state = vst.entries[entryId];
+    if (!state || state.status !== 'live') continue;
+    if (state.clamped === over) continue;
+    vst.setClamped(entryId, over);
+    if (over && blame) {
+      console.warn(
+        `[liveMixer] track ${blame.trackId} declares ${blame.latencySec.toFixed(3)} s of latency, ` +
+          `past the ${COMP_MAX_DELAY} s compensation ceiling — the other tracks cannot wait ` +
+          `that long and will play early against it.`,
+      );
+    }
+  }
 }
 
 /**
@@ -3082,6 +3250,15 @@ async function start(fromSec: number): Promise<void> {
       if (state.masterFxChain !== prev.masterFxChain) {
         applyMasterChainLive(); // live master rack edits (add/remove/reorder/param)
       }
+      // The master VST rack, and the two things that decide whether it should
+      // be sounding at all (see `liveMasterVstChain`).
+      if (
+        state.masterVstChain !== prev.masterVstChain ||
+        state.previewMode !== prev.previewMode ||
+        state.frozenMaster !== prev.frozenMaster
+      ) {
+        applyMasterVstChainLive();
+      }
       // Routing and the bus strips: rebuild/rewire on a structural move, push
       // values otherwise. Gated on the slice references for the same reason the
       // others are — the 60 Hz playhead tick leaves both untouched.
@@ -3114,8 +3291,51 @@ async function start(fromSec: number): Promise<void> {
       }
     });
   }
+  subscribeVstLiveLatency();
+  hookVstSessionUnload();
+
+  // Where the transport is, for every live plugin's AudioPlayHead. `start` is
+  // the ONE entry point for play, seek and every loop wrap, so a single
+  // discontinuity here is what makes a hosted plugin reset its tails instead of
+  // smearing them across the jump.
+  broadcastVstTransport({
+    playing: true,
+    positionSamples: Math.round(begin * ctx.sampleRate),
+    tempoBpm: ed.bpm,
+    discontinuity: true,
+  });
 
   rafId = requestAnimationFrame(tick);
+}
+
+/**
+ * Re-align the mixer whenever a live plugin's declared latency moves.
+ *
+ * PDC is driven by STORE state, not by the audio graph, and a hosted plugin's
+ * latency is not known until its host answers `ready` — seconds after the chain
+ * was built — and can change again at any time (`restartComponent`
+ * (kLatencyChanged)). Without this the compensation would be computed once
+ * against a latency of zero and never corrected, so every OTHER track would
+ * play early by exactly the plugin's latency.
+ *
+ * Signature-gated on the per-entry SAMPLE totals rather than on the store
+ * object: an xrun counter ticking or an editor opening must not re-write a
+ * `setTargetAtTime` on every comp delay in the project.
+ */
+function subscribeVstLiveLatency(): void {
+  if (unsubVstLive) return;
+  const sigOf = (entries: Record<string, VstLiveEntryState>): string =>
+    Object.keys(entries)
+      .sort()
+      .map((id) => `${id}=${entryLatencySamples(entries[id])}`)
+      .join('|');
+  lastVstLatencySig = sigOf(useVstLiveStore.getState().entries);
+  unsubVstLive = useVstLiveStore.subscribe((state) => {
+    const sig = sigOf(state.entries);
+    if (sig === lastVstLatencySig) return;
+    lastVstLatencySig = sig;
+    syncTrackLatency();
+  });
 }
 
 /* ------------------------------- public API ------------------------------- */
@@ -3158,6 +3378,14 @@ export function pause(): void {
   useEditorStore.getState().endAutomationPass();
   useEditorStore.getState().setPlayhead(elapsed);
   usePlayerStore.setState({ isPlaying: false, currentTime: elapsed });
+  // Pause holds position, so this is NOT a discontinuity: a plugin keeps its
+  // tail and resumes where it was.
+  broadcastVstTransport({
+    playing: false,
+    positionSamples: Math.round(elapsed * getEngineCtx().sampleRate),
+    tempoBpm: currentBpm(),
+    discontinuity: false,
+  });
 }
 
 /** Stop and rewind to 0. */
@@ -3168,6 +3396,15 @@ export function stop(): void {
   useEditorStore.getState().endAutomationPass();
   useEditorStore.getState().setPlayhead(0);
   usePlayerStore.setState({ isPlaying: false, currentTime: 0 });
+  // Rewinding to 0 is a jump, so hosted plugins reset rather than carrying a
+  // tail from the end of the song into the top of it.
+  broadcastVstTransport({ playing: false, positionSamples: 0, tempoBpm: currentBpm(), discontinuity: true });
+}
+
+/** The project tempo for the plugin play head; 0 when there is none to give. */
+function currentBpm(): number {
+  const bpm = useEditorStore.getState().bpm;
+  return Number.isFinite(bpm) && bpm > 0 ? bpm : 0;
 }
 
 /** Seek to `sec`; reschedules from there if currently playing. */
@@ -3213,12 +3450,22 @@ export function dispose(): void {
   // too: the next project's clip with the same id is a different clip.
   resetScheduleWarnings('all');
   if (unsubEditor) { unsubEditor(); unsubEditor = null; }
+  if (unsubVstLive) { unsubVstLive(); unsubVstLive = null; }
+  lastVstLatencySig = '';
   disposeTrackNodes();
   trackNodes = new Map();
+  disposeMasterVstChain();
   if (masterChain) { masterChain.dispose(); masterChain = null; }
   if (masterBus) { try { masterBus.disconnect(); } catch { /* gone */ } masterBus = null; }
   lastMasterSig = '';
   lastMasterFullSig = '';
+  // The project is going away with the editor, so the host processes go too —
+  // this is the "closing the project closes the session" half of the registry's
+  // contract, and `dispose()` is the only place that knows it happened. The
+  // instances above have already called `release()`, but that only arms a
+  // 10 s grace timer meant for a rebuild; nothing is coming back here.
+  vstSessions.closeAll();
+  broadcastVstTransport({ playing: false, positionSamples: 0, tempoBpm: 0, discontinuity: true });
   // Cleared, not re-seeded: the next start() builds a fresh graph and calls
   // resetRoutingSigs itself, and a stale signature here would let the first
   // subscription tick of that session skip a rewire it needs.

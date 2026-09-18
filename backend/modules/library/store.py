@@ -22,17 +22,24 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Iterator, Optional
 
-from .db import LibraryDB
+from .db import DEFAULT_DELETE_BATCH, DEFAULT_SORT, EntryFilters, LibraryDB
 from backend.lib import paths
 
 log = logging.getLogger(__name__)
+
+#: How many failures one bulk import reports back. The list is for a human
+#: reading a progress panel, not a log; a folder of 200,000 files with a bad
+#: drive would otherwise return 200,000 strings.
+MAX_IMPORT_ERRORS = 50
 
 
 # Fields a frontend client is allowed to modify on an entry. Everything
@@ -510,6 +517,348 @@ def _int_or_none(v: Any) -> Optional[int]:
         return None
 
 
+def _record_from_db_row(
+    row: dict[str, Any], entry_dir: Path, api_prefix: str
+) -> LibraryRecord:
+    """Build a record from ONE ``entries`` row plus its directory.
+
+    The shared core of :meth:`LibraryStore.list_entries_fast` (whole table) and
+    :meth:`LibraryStore.list_entries_page` (one page), so a paged list can
+    never disagree with the unpaged one about what an entry looks like. Only
+    the fields with no column -- tags, lyrics, mime, media dimensions -- come
+    out of ``metadata_json``.
+    """
+    entry_id = str(row["id"])
+    kind = str(row.get("kind") or "audio")
+    try:
+        meta = json.loads(row.get("metadata_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    meta = _flatten_suno_meta(meta)
+    is_media = kind in ("video", "image")
+    if is_media:
+        media_url: Optional[str] = _media_url_for(api_prefix, entry_id)
+        audio_url = media_url
+        thumb_url = (
+            _thumb_url_for(api_prefix, entry_id)
+            if (entry_dir / "thumb.jpg").is_file()
+            else None
+        )
+        cover_url: Optional[str] = None
+    else:
+        media_url = None
+        audio_url = _audio_url_for(api_prefix, entry_id)
+        thumb_url = None
+        cover_url = _cover_url_if_present(entry_dir, api_prefix, entry_id)
+    # mime_type must come from metadata, not the DB mime column:
+    # upsert_entry coerces an empty mime to 'audio/wav', which would
+    # break the walk's '' default for media and 'audio/mpeg' for audio.
+    mime_default = "" if is_media else "audio/mpeg"
+    return LibraryRecord(
+        id=entry_id,
+        title=str(row.get("title") or ""),
+        prompt=str(row.get("prompt") or ""),
+        negative_prompt=str(row.get("negative_prompt") or ""),
+        model=str(row.get("model") or ""),
+        duration=float(row.get("duration_sec") or 0.0),
+        steps=int(row.get("steps") or 0),
+        cfg=float(row.get("cfg") or 0.0),
+        seed=int(row.get("seed") or 0),
+        audio_url=audio_url,
+        audio_filename=str(row.get("audio_filename") or ""),
+        mime_type=str(meta.get("mime_type") or mime_default),
+        file_size_bytes=int(row.get("file_size_bytes") or 0),
+        timestamp=str(row.get("timestamp") or ""),
+        favorite=bool(row.get("favorite")),
+        rating=None if is_media else row.get("rating"),
+        tags=list(meta.get("tags") or []),
+        notes=str(row.get("notes") or ""),
+        source=str(row.get("source") or "generate"),
+        chimera_sources=[] if is_media else list(meta.get("chimera_sources") or []),
+        lyrics=str(meta.get("lyrics") or ""),
+        spectrogram_paths={} if is_media else dict(meta.get("spectrogram_paths") or {}),
+        kind=kind,
+        media_url=media_url,
+        thumb_url=thumb_url,
+        width=_int_or_none(meta.get("width")) if is_media else None,
+        height=_int_or_none(meta.get("height")) if is_media else None,
+        has_alpha=bool(meta.get("has_alpha", False)) if is_media else False,
+        cover_url=cover_url,
+    )
+
+
+def _db_payload(record: LibraryRecord, meta: dict[str, Any]) -> dict[str, Any]:
+    """The flattened payload ``LibraryDB.upsert_entry`` takes for one record.
+    Shared by the single-record sync and the bulk import so a row written in
+    bulk is indistinguishable from one written on its own."""
+    return {
+        "id": record.id,
+        "kind": record.kind,
+        "title": record.title,
+        "prompt": record.prompt,
+        "negative_prompt": record.negative_prompt,
+        "model": record.model,
+        "duration": record.duration,
+        "steps": record.steps,
+        "cfg": record.cfg,
+        "seed": record.seed,
+        "mime_type": record.mime_type,
+        "audio_filename": record.audio_filename,
+        "file_size_bytes": record.file_size_bytes,
+        "source": record.source,
+        "favorite": record.favorite,
+        "rating": record.rating,
+        "notes": record.notes,
+        "timestamp": record.timestamp,
+        "tags": list(record.tags),
+        "metadata_json": meta,
+    }
+
+
+def _chimera_edges(entry_id: str, meta: dict[str, Any]) -> list[tuple[str, str, str]]:
+    """``chimera_sources`` as directed lineage edges."""
+    sources = meta.get("chimera_sources") or []
+    if not isinstance(sources, list):
+        return []
+    return [(str(label), entry_id, "chimera_source_of") for label in sources if label]
+
+
+def _reference_metadata(
+    src: Path, entry_id: str, meta_in: dict[str, Any]
+) -> dict[str, Any]:
+    """The ``metadata.json`` for a reference-in-place entry. Shared by
+    :meth:`LibraryStore.register_reference` and the bulk importer."""
+    # Unreachable from folder import, which filters on AUDIO_EXTS — but this
+    # is public, so an unknown container gets the honest generic answer
+    # rather than being labelled an MP3.
+    mime = AUDIO_MIME_BY_EXT.get(src.suffix.lower(), "application/octet-stream")
+    return {
+        "id": entry_id,
+        "source_path": str(src.resolve()),
+        "filename": src.name,
+        "audio_filename": src.name,
+        "mime_type": mime,
+        "title": meta_in.get("title") or src.stem,
+        "prompt": "",
+        "negative_prompt": "",
+        "model": "reference",
+        "duration": 0.0,
+        "steps": 0,
+        "cfg": 0.0,
+        "seed": 0,
+        "favorite": False,
+        "rating": None,
+        "tags": list(meta_in.get("tags", [])),
+        "notes": meta_in.get("notes", ""),
+        "source": meta_in.get("source", "folder"),
+        "chimera_sources": [],
+        "saved_at": time.time(),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
+@dataclass
+class BulkDeleteResult:
+    """What one batched delete did.
+
+    ``deleted`` counts entries that are fully gone -- rows AND, where there was
+    one, the library folder. ``failed`` holds ``{"id", "error"}`` for every id
+    that is not, in the order they were asked for, so
+    ``deleted + len(failed) == len(requested unique ids)`` always holds and a
+    caller that truncates the list can still say how many it hid.
+    """
+
+    deleted: int = 0
+    failed: list[dict[str, str]] = field(default_factory=list)
+
+
+def _contains(root_normcase: str, candidate: Path) -> bool:
+    """Whether ``candidate`` resolves to something strictly inside the library
+    root.
+
+    The guard on every ``rmtree`` this module performs in bulk. Entry ids come
+    off the wire and :meth:`LibraryStore._dir_for` simply joins them onto the
+    root, so an id carrying ``..`` names a directory outside the library that
+    exists and holds a ``metadata.json`` -- the user's own music folder, say.
+    Resolving first (which collapses ``..`` AND follows a symlink planted in
+    the library) and comparing case-normalised prefixes is what makes the
+    answer about the real target rather than the spelling. The root itself is
+    not "inside" itself: deleting it is never what was asked for.
+    """
+    try:
+        target = os.path.normcase(str(candidate.resolve()))
+    except OSError:
+        return False
+    return target.startswith(root_normcase + os.sep)
+
+
+@dataclass
+class BulkImportResult:
+    """What one batched reference-import pass did.
+
+    ``skipped`` is files already registered (a re-run over the same folder),
+    ``failed`` files that could not be registered at all. ``errors`` is capped
+    at :data:`MAX_IMPORT_ERRORS` while ``failed`` keeps counting."""
+
+    created: list[LibraryRecord] = field(default_factory=list)
+    skipped: int = 0
+    failed: int = 0
+    errors: list[str] = field(default_factory=list)
+
+    def note_failure(self, message: str) -> None:
+        self.failed += 1
+        if len(self.errors) < MAX_IMPORT_ERRORS:
+            self.errors.append(message)
+
+
+class ImportJob:
+    """A folder import running off the request thread.
+
+    Mutated by the worker and read by whatever polls ``GET
+    /import-jobs/{id}``, so every read and write of the counters goes through
+    one lock and :meth:`snapshot` hands back a consistent picture rather than
+    a half-updated one. Cancellation is an ``Event``: the worker checks it
+    BETWEEN batches, so a cancel never tears a transaction in half -- the
+    batch in flight finishes and is kept."""
+
+    def __init__(self, job_id: str, folder: str, *, recursive: bool = True) -> None:
+        self.id = job_id
+        self.folder = folder
+        self.recursive = bool(recursive)
+        self._lock = threading.Lock()
+        self._cancel = threading.Event()
+        self.status = "queued"
+        self.seen = 0
+        self.created = 0
+        self.skipped = 0
+        self.failed = 0
+        self.errors: list[str] = []
+        self.started_at: Optional[float] = None
+        self.finished_at: Optional[float] = None
+
+    def cancel(self) -> None:
+        """Ask the job to stop.
+
+        A job still QUEUED has no worker to notice the flag -- the background
+        consumer may be minutes away from picking it up -- so it is settled
+        here and :meth:`LibraryStore.run_import_job` short-circuits when it
+        eventually runs. A RUNNING job keeps its status until the worker
+        reaches the next batch boundary, so the reported status is never ahead
+        of what actually stopped."""
+        self._cancel.set()
+        with self._lock:
+            if self.status == "queued":
+                self.status = "cancelled"
+                self.finished_at = time.time()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancel.is_set()
+
+    @property
+    def finished(self) -> bool:
+        with self._lock:
+            return self.status in ("done", "failed", "cancelled")
+
+    def begin(self) -> None:
+        with self._lock:
+            self.status = "running"
+            self.started_at = time.time()
+
+    def set_seen(self, seen: int) -> None:
+        with self._lock:
+            self.seen = int(seen)
+
+    def merge(self, result: BulkImportResult) -> None:
+        with self._lock:
+            self.created += len(result.created)
+            self.skipped += result.skipped
+            self.failed += result.failed
+            for message in result.errors:
+                if len(self.errors) < MAX_IMPORT_ERRORS:
+                    self.errors.append(message)
+
+    def finish(self, status: str, *, error: Optional[str] = None) -> None:
+        with self._lock:
+            self.status = status
+            self.finished_at = time.time()
+            if error and len(self.errors) < MAX_IMPORT_ERRORS:
+                self.errors.append(error)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "job_id": self.id,
+                "folder": self.folder,
+                "status": self.status,
+                "seen": self.seen,
+                "created": self.created,
+                "skipped": self.skipped,
+                "failed": self.failed,
+                "errors": list(self.errors),
+                "started_at": self.started_at,
+                "finished_at": self.finished_at,
+            }
+
+
+class ImportJobRegistry:
+    """In-process register of import jobs, newest last.
+
+    Deliberately not persisted: a job is a view onto work that only exists
+    while the process does, and the library itself (metadata.json + the DB) is
+    what survives a restart. Bounded so a long-lived server that imports a
+    folder a day does not accumulate handles forever."""
+
+    def __init__(self, max_jobs: int = 50) -> None:
+        self._lock = threading.Lock()
+        self._jobs: dict[str, ImportJob] = {}
+        self._max_jobs = int(max_jobs)
+
+    def create(self, *, folder: str, recursive: bool = True) -> ImportJob:
+        job = ImportJob(uuid.uuid4().hex, folder, recursive=recursive)
+        with self._lock:
+            self._jobs[job.id] = job
+            self._prune()
+        return job
+
+    def register(self, job: Any) -> Any:
+        """Adopt an already-built job so it shows up on the import-job routes.
+
+        :meth:`create` mints an :class:`ImportJob`, which is a folder import.
+        The Suno stage/promote jobs are a different shape but the same
+        lifecycle, and the user should be able to poll and cancel them at the
+        one place every other import lives. Anything with ``id``, ``finished``,
+        ``cancel()`` and ``snapshot()`` fits here -- that is the whole contract
+        the routes and :meth:`_prune` use.
+        """
+        with self._lock:
+            self._jobs[job.id] = job
+            self._prune()
+        return job
+
+    def get(self, job_id: str) -> Optional[ImportJob]:
+        with self._lock:
+            return self._jobs.get(job_id)
+
+    def _prune(self) -> None:
+        if len(self._jobs) <= self._max_jobs:
+            return
+        for job_id, job in list(self._jobs.items()):
+            if len(self._jobs) <= self._max_jobs:
+                break
+            if job.finished:
+                self._jobs.pop(job_id, None)
+
+
+_import_jobs = ImportJobRegistry()
+
+
+def get_import_jobs() -> ImportJobRegistry:
+    return _import_jobs
+
+
 class LibraryStore:
     """Filesystem-backed library with an attached SQLite query layer.
 
@@ -546,19 +895,26 @@ class LibraryStore:
             if self.db.count_entries() == 0:
                 self.reindex()
 
+        #: Entry ids whose missing cover art has already been looked for, so a
+        #: track that simply has none costs one tag read per process rather
+        #: than one per request. See :meth:`get_cover_path`.
+        self._cover_attempts: set[str] = set()
+
     # ---- Read ---------------------------------------------------------------
 
-    def list_entries(
+    def _iter_disk_entries(
         self, kinds: Optional[Iterable[str]] = None
-    ) -> list[LibraryRecord]:
-        """List entries, optionally restricted to a set of ``kind`` values
-        ('audio' | 'video' | 'image'). ``kinds=None`` returns every kind
-        (used by reindex); callers that want the historical audio-only
-        behavior pass ``kinds={'audio'}``."""
+    ) -> Iterator[tuple[LibraryRecord, dict[str, Any], Path]]:
+        """Walk the filesystem yielding ``(record, metadata, entry_dir)``.
+
+        The single place the on-disk layout is interpreted. Yielding the parsed
+        metadata alongside the record is what lets :meth:`reindex` read each
+        ``metadata.json`` ONCE -- it used to walk with ``list_entries`` and
+        then read every file a second time to get the same dict back.
+        """
         if not self.root.is_dir():
-            return []
+            return
         kind_set = set(kinds) if kinds is not None else None
-        out: list[LibraryRecord] = []
         for child in sorted(self.root.iterdir()):
             if not child.is_dir():
                 continue
@@ -569,7 +925,7 @@ class LibraryStore:
             if direct_meta is not None:
                 record = _record_from_metadata(child, direct_meta, self.api_prefix)
                 if record is not None and (kind_set is None or record.kind in kind_set):
-                    out.append(record)
+                    yield record, direct_meta, child
                 continue
             for inner in sorted(child.iterdir()):
                 if not inner.is_dir():
@@ -596,8 +952,16 @@ class LibraryStore:
                 else:
                     record.media_url = _media_url_for(self.api_prefix, entry_id)
                     record.audio_url = record.media_url
-                out.append(record)
-        return out
+                yield record, meta, inner
+
+    def list_entries(
+        self, kinds: Optional[Iterable[str]] = None
+    ) -> list[LibraryRecord]:
+        """List entries, optionally restricted to a set of ``kind`` values
+        ('audio' | 'video' | 'image'). ``kinds=None`` returns every kind
+        (used by reindex); callers that want the historical audio-only
+        behavior pass ``kinds={'audio'}``."""
+        return [record for record, _meta, _dir in self._iter_disk_entries(kinds)]
 
     def list_entries_fast(
         self, kinds: Optional[Iterable[str]] = None
@@ -624,72 +988,43 @@ class LibraryStore:
             entry_dir = self._dir_for(entry_id)
             if entry_dir is None:
                 continue
-            try:
-                meta = json.loads(row.get("metadata_json") or "{}")
-            except (TypeError, json.JSONDecodeError):
-                meta = {}
-            if not isinstance(meta, dict):
-                meta = {}
-            meta = _flatten_suno_meta(meta)
-            is_media = kind in ("video", "image")
-            if is_media:
-                media_url: Optional[str] = _media_url_for(self.api_prefix, entry_id)
-                audio_url = media_url
-                thumb_url = (
-                    _thumb_url_for(self.api_prefix, entry_id)
-                    if (entry_dir / "thumb.jpg").is_file()
-                    else None
-                )
-                cover_url: Optional[str] = None
-            else:
-                media_url = None
-                audio_url = _audio_url_for(self.api_prefix, entry_id)
-                thumb_url = None
-                cover_url = _cover_url_if_present(entry_dir, self.api_prefix, entry_id)
-            # mime_type must come from metadata, not the DB mime column:
-            # upsert_entry coerces an empty mime to 'audio/wav', which would
-            # break the walk's '' default for media and 'audio/mpeg' for audio.
-            mime_default = "" if is_media else "audio/mpeg"
-            out.append(
-                LibraryRecord(
-                    id=entry_id,
-                    title=str(row.get("title") or ""),
-                    prompt=str(row.get("prompt") or ""),
-                    negative_prompt=str(row.get("negative_prompt") or ""),
-                    model=str(row.get("model") or ""),
-                    duration=float(row.get("duration_sec") or 0.0),
-                    steps=int(row.get("steps") or 0),
-                    cfg=float(row.get("cfg") or 0.0),
-                    seed=int(row.get("seed") or 0),
-                    audio_url=audio_url,
-                    audio_filename=str(row.get("audio_filename") or ""),
-                    mime_type=str(meta.get("mime_type") or mime_default),
-                    file_size_bytes=int(row.get("file_size_bytes") or 0),
-                    timestamp=str(row.get("timestamp") or ""),
-                    favorite=bool(row.get("favorite")),
-                    rating=None if is_media else row.get("rating"),
-                    tags=list(meta.get("tags") or []),
-                    notes=str(row.get("notes") or ""),
-                    source=str(row.get("source") or "generate"),
-                    chimera_sources=[]
-                    if is_media
-                    else list(meta.get("chimera_sources") or []),
-                    lyrics=str(meta.get("lyrics") or ""),
-                    spectrogram_paths={}
-                    if is_media
-                    else dict(meta.get("spectrogram_paths") or {}),
-                    kind=kind,
-                    media_url=media_url,
-                    thumb_url=thumb_url,
-                    width=_int_or_none(meta.get("width")) if is_media else None,
-                    height=_int_or_none(meta.get("height")) if is_media else None,
-                    has_alpha=bool(meta.get("has_alpha", False)) if is_media else False,
-                    cover_url=cover_url,
-                )
-            )
+            out.append(_record_from_db_row(row, entry_dir, self.api_prefix))
         # The walk emits entries in sorted(root.iterdir()) order; sorting by
         # id mirrors that (entry ids are the directory names).
         out.sort(key=lambda r: r.id)
+        return out
+
+    def list_entries_page(
+        self,
+        filters: EntryFilters,
+        *,
+        sort: str = DEFAULT_SORT,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> list[LibraryRecord]:
+        """Records for ONE page, in the order SQL returned them.
+
+        The filtering, searching, sorting and slicing all happen in the
+        database; the only per-row work here is the directory stat that
+        resolves cover art, and it runs at most ``limit`` times instead of once
+        per entry in the library.
+
+        An entry whose folder was deleted by hand is omitted, exactly as
+        :meth:`list_entries_fast` omits it — so a page can be shorter than
+        ``limit`` while the caller's ``total`` still counts the row. Catching
+        that in the count would mean the per-row filesystem access this whole
+        path exists to avoid.
+        """
+        if self.db is None:
+            raise RuntimeError("paged listing needs the library DB")
+        out: list[LibraryRecord] = []
+        for row in self.db.list_entries_page(
+            filters, sort=sort, limit=limit, offset=offset
+        ):
+            entry_dir = self._dir_for(str(row["id"]))
+            if entry_dir is None:
+                continue
+            out.append(_record_from_db_row(row, entry_dir, self.api_prefix))
         return out
 
     def get_entry(self, entry_id: str) -> Optional[LibraryRecord]:
@@ -750,12 +1085,33 @@ class LibraryStore:
         thumb = entry_dir / "thumb.jpg"
         return thumb if thumb.is_file() else None
 
-    def get_cover_path(self, entry_id: str) -> Optional[Path]:
-        """Resolve the cover art for an entry, if the track had any."""
+    def get_cover_path(
+        self, entry_id: str, *, extract_missing: bool = False
+    ) -> Optional[Path]:
+        """Resolve the cover art for an entry, if the track had any.
+
+        A bulk folder import skips cover extraction — reading tags off 200,000
+        files up front is most of the import. With ``extract_missing`` the
+        serving route pays that cost lazily instead: the FIRST request for an
+        entry with no cover on disk reads its embedded art and writes it.
+        Guarded per process, so a track that simply has no picture costs one
+        tag read, not one per request.
+        """
         entry_dir = self._dir_for(entry_id)
         if entry_dir is None:
             return None
         cover = entry_dir / COVER_FILENAME
+        if cover.is_file():
+            return cover
+        if not extract_missing or entry_id in self._cover_attempts:
+            return None
+        self._cover_attempts.add(entry_id)
+        meta = _read_metadata(entry_dir) or {}
+        if str(meta.get("kind") or "audio") != "audio":
+            return None
+        audio_path = _resolve_audio_file(entry_dir, meta)
+        if audio_path is None or not extract_cover_for(entry_dir, audio_path):
+            return None
         return cover if cover.is_file() else None
 
     # ---- Write --------------------------------------------------------------
@@ -816,6 +1172,100 @@ class LibraryStore:
         if self.db is not None:
             self.db.delete_entry(entry_id)
         return True
+
+    def delete_entries_bulk(
+        self, entry_ids: Iterable[str], *, batch: int = DEFAULT_DELETE_BATCH
+    ) -> BulkDeleteResult:
+        """Delete many entries. One DB transaction per batch, filesystem after.
+
+        ``batch`` is how many entries share a transaction; the DB layer caps it
+        at the SQL parameter ceiling, so a larger value simply commits more
+        often rather than failing.
+
+        Removes exactly what :meth:`delete_entry` removes, per entry: the
+        entry's own folder under the library root, plus its rows. In
+        particular, for a REFERENCE-IN-PLACE entry -- one registered from the
+        user's own music folder, whose ``source_path`` points outside the
+        library -- the folder holds only ``metadata.json`` and any extracted
+        cover, so the user's audio file is never a candidate for removal. There
+        is no code path here that reads ``source_path``, by design.
+
+        Three rules make this safe to point at 200,000 rows:
+
+        * **Containment.** Every directory is resolved and proved to be inside
+          the library root before anything is removed (:func:`_contains`). An
+          id that escapes is refused outright -- its rows are left alone too,
+          so the entry stays visible instead of half-deleted.
+        * **Order.** The rows are committed first, the folder goes after. A
+          crash between the two leaves an orphan folder, which is harmless and
+          re-importable; the other order would leave a row pointing at audio
+          that no longer exists.
+        * **Isolation.** A failure is recorded against its id and the rest of
+          the request continues. Nothing aborts the batch.
+
+        A row whose folder was deleted by hand is still cleared: those rows are
+        skipped by the listing but counted in its ``total``, so leaving them
+        would mean "Clear all" never finishes. An id with neither a row nor a
+        folder is reported as a failure -- there was nothing to delete.
+        """
+        ordered = list(dict.fromkeys(str(entry_id) for entry_id in entry_ids))
+        result = BulkDeleteResult()
+        if not ordered:
+            return result
+
+        known = self.db.existing_entry_ids(ordered) if self.db is not None else set()
+        root_normcase = os.path.normcase(str(self.root.resolve()))
+
+        # Classify first, so a refused id never reaches a DELETE.
+        targets: list[tuple[str, Optional[Path]]] = []
+        for entry_id in ordered:
+            entry_dir = self._dir_for(entry_id)
+            if entry_dir is not None and not _contains(root_normcase, entry_dir):
+                log.warning(
+                    "library.store: refusing bulk delete of %r: %s is outside %s",
+                    entry_id,
+                    entry_dir,
+                    self.root,
+                )
+                result.failed.append(
+                    {
+                        "id": entry_id,
+                        "error": "resolved path is outside the library root",
+                    }
+                )
+                continue
+            if entry_dir is None and entry_id not in known:
+                result.failed.append({"id": entry_id, "error": "no such library entry"})
+                continue
+            targets.append((entry_id, entry_dir))
+
+        size = max(1, int(batch))
+        for start in range(0, len(targets), size):
+            chunk = targets[start : start + size]
+            if self.db is not None:
+                # One transaction, one revision bump, for this whole chunk.
+                self.db.delete_entries_bulk(
+                    [entry_id for entry_id, _ in chunk], batch=len(chunk)
+                )
+            for entry_id, entry_dir in chunk:
+                if entry_dir is None:
+                    result.deleted += 1
+                    continue
+                try:
+                    shutil.rmtree(entry_dir)
+                except OSError as e:
+                    log.warning(
+                        "library.store: deleted row %r but failed to remove %s: %s",
+                        entry_id,
+                        entry_dir,
+                        e,
+                    )
+                    result.failed.append(
+                        {"id": entry_id, "error": f"could not remove folder: {e}"}
+                    )
+                    continue
+                result.deleted += 1
+        return result
 
     def import_blob(
         self,
@@ -912,34 +1362,7 @@ class LibraryStore:
         entry_id = uuid.uuid4().hex
         entry_dir = self.root / entry_id
         entry_dir.mkdir(parents=True, exist_ok=True)
-        meta_in = dict(metadata or {})
-        # Unreachable from folder import, which filters on AUDIO_EXTS — but this
-        # is public, so an unknown container gets the honest generic answer
-        # rather than being labelled an MP3.
-        mime = AUDIO_MIME_BY_EXT.get(src.suffix.lower(), "application/octet-stream")
-        record_meta: dict[str, Any] = {
-            "id": entry_id,
-            "source_path": str(src.resolve()),
-            "filename": src.name,
-            "audio_filename": src.name,
-            "mime_type": mime,
-            "title": meta_in.get("title") or src.stem,
-            "prompt": "",
-            "negative_prompt": "",
-            "model": "reference",
-            "duration": 0.0,
-            "steps": 0,
-            "cfg": 0.0,
-            "seed": 0,
-            "favorite": False,
-            "rating": None,
-            "tags": list(meta_in.get("tags", [])),
-            "notes": meta_in.get("notes", ""),
-            "source": meta_in.get("source", "folder"),
-            "chimera_sources": [],
-            "saved_at": time.time(),
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
+        record_meta = _reference_metadata(src, entry_id, dict(metadata or {}))
         # The audio stays where it is, but its artwork is copied in: the cover
         # has to live under the library root for the route to serve it. A
         # folder import runs this per file — a track with no picture costs a
@@ -956,6 +1379,136 @@ class LibraryStore:
         # it reads get_audio_path, which now resolves to the external file.
         _maybe_enqueue_analysis(self, entry_id, source="import")
         return record
+
+    def register_references_bulk(
+        self,
+        paths: Iterable[Any],
+        *,
+        defer_jobs: bool = True,
+        extract_covers: bool = False,
+        source: str = "folder",
+        batch: int = 1000,
+        known_source_paths: Optional[set[str]] = None,
+    ) -> BulkImportResult:
+        """Register many on-disk files as reference-in-place entries.
+
+        The batched sibling of :meth:`register_reference`, for the folder
+        import that has to survive ~200,000 files. Three things are different,
+        and all three are why the per-file version cannot be used at that size:
+
+        * DB writes go through ``upsert_entries_bulk``, so ``batch`` files
+          share ONE transaction and one ``library_revision`` bump instead of
+          one each.
+        * ``extract_covers`` is off: reading embedded artwork means opening and
+          parsing every source file. :meth:`get_cover_path` picks it up lazily
+          when a cover is actually asked for.
+        * ``defer_jobs`` is on: 200,000 queued analysis jobs would saturate the
+          serial background queue for days. The user runs analysis when they
+          want it.
+
+        Already-registered files (matched on the resolved ``source_path``) are
+        skipped, which makes a re-run over the same folder a no-op and makes a
+        cancelled import resumable. ``known_source_paths``, when given, is both
+        read AND extended with what this call registers, so a caller looping
+        over batches pays for the lookup scan once.
+        """
+        if self.db is None:
+            raise RuntimeError("bulk import needs the library DB")
+        result = BulkImportResult()
+        known = (
+            known_source_paths
+            if known_source_paths is not None
+            else self.db.registered_source_paths()
+        )
+        buffered: list[tuple[LibraryRecord, dict[str, Any]]] = []
+
+        def flush() -> None:
+            if not buffered:
+                return
+            self.db.upsert_entries_bulk(
+                [_db_payload(record, meta) for record, meta in buffered],
+                batch=len(buffered),
+            )
+            for record, _meta in buffered:
+                result.created.append(record)
+                if not defer_jobs:
+                    _maybe_enqueue_analysis(self, record.id, source="import")
+            buffered.clear()
+
+        for raw in paths:
+            src = Path(raw)
+            try:
+                if not src.is_file():
+                    result.note_failure(f"not a file: {src}")
+                    continue
+                resolved = str(src.resolve())
+                if resolved in known:
+                    result.skipped += 1
+                    continue
+                entry_id = uuid.uuid4().hex
+                entry_dir = self.root / entry_id
+                entry_dir.mkdir(parents=True, exist_ok=True)
+                record_meta = _reference_metadata(src, entry_id, {"source": source})
+                if extract_covers:
+                    extract_cover_for(entry_dir, src)
+                _write_metadata(entry_dir, record_meta)
+                record = _record_from_metadata(entry_dir, record_meta, self.api_prefix)
+                if record is None:
+                    result.note_failure(f"unreadable after registering: {src}")
+                    continue
+                record.id = entry_id
+                record.audio_url = _audio_url_for(self.api_prefix, entry_id)
+                buffered.append((record, record_meta))
+                known.add(resolved)
+            except OSError as e:
+                result.note_failure(f"{src}: {e}")
+                continue
+            if len(buffered) >= batch:
+                flush()
+        flush()
+        return result
+
+    def run_import_job(self, job: ImportJob, *, batch: int = 1000) -> ImportJob:
+        """Run one folder import to completion, synchronously.
+
+        Called from a worker thread (see the router's ``?async=1`` path), which
+        is why it takes no event loop and never raises: every outcome is
+        recorded on ``job``. Cancellation is honoured BETWEEN batches, so the
+        transaction in flight always commits — a cancelled import leaves a
+        consistent, resumable library rather than a partial batch.
+        """
+        if job.cancelled:
+            job.finish("cancelled")
+            return job
+        job.begin()
+        try:
+            root = Path(job.folder)
+            if not root.is_dir():
+                job.finish("failed", error=f"not a folder: {job.folder}")
+                return job
+            walk = root.rglob("*") if job.recursive else root.iterdir()
+            files = sorted(
+                (p for p in walk if p.is_file() and p.suffix.lower() in AUDIO_EXTS),
+                key=lambda p: str(p).lower(),
+            )
+            job.set_seen(len(files))
+            known = self.db.registered_source_paths() if self.db is not None else set()
+            for start in range(0, len(files), batch):
+                if job.cancelled:
+                    job.finish("cancelled")
+                    return job
+                job.merge(
+                    self.register_references_bulk(
+                        [str(p) for p in files[start : start + batch]],
+                        batch=batch,
+                        known_source_paths=known,
+                    )
+                )
+            job.finish("cancelled" if job.cancelled else "done")
+        except Exception as e:  # noqa: BLE001 - a job records its failure, never raises
+            log.warning("library.store: import job %s failed: %s", job.id, e)
+            job.finish("failed", error=repr(e))
+        return job
 
     def import_media(
         self,
@@ -1097,64 +1650,51 @@ class LibraryStore:
     ) -> None:
         if self.db is None:
             return
-        payload: dict[str, Any] = {
-            "id": record.id,
-            "kind": record.kind,
-            "title": record.title,
-            "prompt": record.prompt,
-            "negative_prompt": record.negative_prompt,
-            "model": record.model,
-            "duration": record.duration,
-            "steps": record.steps,
-            "cfg": record.cfg,
-            "seed": record.seed,
-            "mime_type": record.mime_type,
-            "audio_filename": record.audio_filename,
-            "file_size_bytes": record.file_size_bytes,
-            "source": record.source,
-            "favorite": record.favorite,
-            "rating": record.rating,
-            "notes": record.notes,
-            "timestamp": record.timestamp,
-            "tags": list(record.tags),
-            "metadata_json": meta,
-        }
         try:
-            self.db.upsert_entry(payload)
+            self.db.upsert_entry(_db_payload(record, meta))
         except Exception as e:
             log.warning("library.store: db upsert failed for %s: %s", record.id, e)
 
         # Chimera sources → directed lineage edges.
-        sources = meta.get("chimera_sources") or []
-        if isinstance(sources, list) and sources:
-            for source_label in sources:
-                if not source_label:
-                    continue
-                try:
-                    self.db.add_relation(
-                        from_id=str(source_label),
-                        to_id=record.id,
-                        kind="chimera_source_of",
-                    )
-                except Exception as e:
-                    log.debug(
-                        "library.store: relation insert failed for %s→%s: %s",
-                        source_label,
-                        record.id,
-                        e,
-                    )
+        for from_id, to_id, kind in _chimera_edges(record.id, meta):
+            try:
+                self.db.add_relation(from_id=from_id, to_id=to_id, kind=kind)
+            except Exception as e:
+                log.debug(
+                    "library.store: relation insert failed for %s→%s: %s",
+                    from_id,
+                    to_id,
+                    e,
+                )
 
-    def reindex(self) -> int:
+    def reindex(self, *, batch: int = 1000) -> int:
         """Walk the filesystem and upsert every entry into the DB.
-        Returns the number of entries indexed. Idempotent."""
+        Returns the number of entries indexed. Idempotent.
+
+        One ``metadata.json`` read per entry (the walk hands its parsed dict
+        straight through) and one transaction per ``batch``. It used to read
+        every file twice and commit once per entry, which on a 200,000-entry
+        library is 400,000 reads and 200,000 fsyncs.
+        """
         if self.db is None:
             return 0
         count = 0
-        for record in self.list_entries():
-            entry_dir = self._dir_for(record.id)
-            meta = _read_metadata(entry_dir) if entry_dir else None
-            self._sync_record_to_db(record, meta or {})
+        next_log = 5000
+        payloads: list[dict[str, Any]] = []
+        edges: list[tuple[str, str, str]] = []
+        for record, meta, _entry_dir in self._iter_disk_entries():
+            payloads.append(_db_payload(record, meta))
+            edges.extend(_chimera_edges(record.id, meta))
             count += 1
+            if len(payloads) >= batch:
+                self.db.upsert_entries_bulk(payloads, batch=len(payloads))
+                payloads = []
+            if count >= next_log:
+                log.info("library.store: reindexed %d entries", count)
+                next_log += 5000
+        if payloads:
+            self.db.upsert_entries_bulk(payloads, batch=len(payloads))
+        self.db.add_relations_bulk(edges)
         return count
 
     # ---- Helpers ------------------------------------------------------------

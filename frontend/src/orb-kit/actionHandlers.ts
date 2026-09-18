@@ -14,6 +14,28 @@ export interface AssistantActionPayload {
     payload?: Record<string, unknown>;
 }
 
+/** What an action actually did. `ok:false` means the app is UNCHANGED and
+ *  `message` says why — the panel prints it verbatim instead of the old
+ *  "Executed action: X", which was printed for a miss and a hit alike. */
+export interface AssistantActionResult {
+    ok: boolean;
+    message: string;
+}
+
+/** Marks a branch that refused to act. See `runtheDAWAction`. */
+interface ActionFailure {
+    failed: true;
+    message: string;
+}
+
+/** A branch of `runtheDAWAction` returns a bare string when it DID the thing,
+ *  or `fail(...)` when it did not. Keeping success as a plain string means the
+ *  honesty of a branch is visible at its own `return` rather than buried in a
+ *  wrapper object every line has to spell out. */
+type ActionBranch = string | ActionFailure;
+
+const fail = (message: string): ActionFailure => ({ failed: true, message });
+
 function stringValue(payload: Record<string, unknown> | undefined, keys: string[], fallback = ''): string {
     for (const key of keys) {
         const value = payload?.[key];
@@ -146,7 +168,7 @@ function editorClipMiss(payload: Record<string, unknown> | undefined): string {
     return `No clip "${asked}". Clips: ${labels}`;
 }
 
-export function handletheDAWAction(action: AssistantActionPayload): string {
+function runtheDAWAction(action: AssistantActionPayload): ActionBranch {
     const { type, payload } = action;
     const params = useGenerateParamsStore.getState();
     const gen = useGenerateStore.getState();
@@ -164,7 +186,7 @@ export function handletheDAWAction(action: AssistantActionPayload): string {
             const ok = useAppUiStore.getState().navigateTo(tab);
             return ok
                 ? `Navigated to ${tab}`
-                : `Navigation failed: unknown workspace "${tab}". Valid targets: make, edit, mix, perform, dj, vj, sway, foundry, underfit, nodefi, learn, tour, library.`;
+                : fail(`Navigation failed: unknown workspace "${tab}". Valid targets: make, edit, mix, perform, dj, vj, sway, foundry, underfit, nodefi, learn, tour, library.`);
         }
 
         case 'open_docs':
@@ -189,10 +211,10 @@ export function handletheDAWAction(action: AssistantActionPayload): string {
             // in, and rings the control itself.
             const id = stringValue(payload, ['feature_id', 'featureId', 'feature', 'id']).trim();
             const entry = featureById(id);
-            if (!entry) return `No feature "${id}". Known ids: ${locatableFeatureIds()}`;
+            if (!entry) return fail(`No feature "${id}". Known ids: ${locatableFeatureIds()}`);
             // Spotlighting one of these would dim the app around a ring that
             // never appears, with no way for the user to dismiss it.
-            if (!entry.locate) return `${entry.name} has no one control to point at — it is ${entry.where}. ${entry.what}.`;
+            if (!entry.locate) return fail(`${entry.name} has no one control to point at — it is ${entry.where}. ${entry.what}.`);
             useOnboardingStore.getState().spotlightOne(entry.id);
             return `Spotlighting ${entry.name} (${entry.where})`;
         }
@@ -300,54 +322,54 @@ export function handletheDAWAction(action: AssistantActionPayload): string {
 
         case 'editor_remove_track': {
             const track = findEditorTrack(payload);
-            if (!track) return editorTrackMiss(payload);
+            if (!track) return fail(editorTrackMiss(payload));
             useEditorStore.getState().removeTrack(track.id);
             return `Removed track "${track.name}" and its clips`;
         }
 
         case 'editor_set_track': {
             const track = findEditorTrack(payload);
-            if (!track) return editorTrackMiss(payload);
+            if (!track) return fail(editorTrackMiss(payload));
             const updates: Record<string, unknown> = {};
             if (payload?.volume !== undefined) updates.volume = Number(payload.volume);
             if (payload?.pan !== undefined) updates.pan = Number(payload.pan);
             if (payload?.mute !== undefined) updates.mute = booleanValue(payload, ['mute'], track.mute);
             if (payload?.solo !== undefined) updates.solo = booleanValue(payload, ['solo'], track.solo);
             if (payload?.name !== undefined && payload?.track_id !== undefined) updates.name = String(payload.name);
-            if (!Object.keys(updates).length) return 'editor_set_track: nothing to change (pass volume/pan/mute/solo/name)';
+            if (!Object.keys(updates).length) return fail('editor_set_track: nothing to change (pass volume/pan/mute/solo/name)');
             useEditorStore.getState().updateTrack(track.id, updates);
             return `Updated track "${track.name}": ${Object.keys(updates).join(', ')}`;
         }
 
         case 'editor_move_clip': {
             const clip = findEditorClip(payload);
-            if (!clip) return editorClipMiss(payload);
+            if (!clip) return fail(editorClipMiss(payload));
             const updates: Record<string, unknown> = {};
             if (payload?.start_sec !== undefined) updates.startSec = Math.max(0, Number(payload.start_sec));
             if (payload?.track_id !== undefined) {
                 const target = findEditorTrack({ track_id: payload.track_id });
-                if (!target) return editorTrackMiss({ track_id: payload.track_id });
+                if (!target) return fail(editorTrackMiss({ track_id: payload.track_id }));
                 updates.trackId = target.id;
             }
-            if (!Object.keys(updates).length) return 'editor_move_clip: pass start_sec and/or track_id';
+            if (!Object.keys(updates).length) return fail('editor_move_clip: pass start_sec and/or track_id');
             useEditorStore.getState().updateClip(clip.id, updates);
             return `Moved clip "${clip.label}"${updates.startSec !== undefined ? ` to ${updates.startSec}s` : ''}`;
         }
 
         case 'editor_remove_clip': {
             const clip = findEditorClip(payload);
-            if (!clip) return editorClipMiss(payload);
+            if (!clip) return fail(editorClipMiss(payload));
             useEditorStore.getState().removeClip(clip.id);
             return `Removed clip "${clip.label}"`;
         }
 
         case 'editor_split_clip': {
             const clip = findEditorClip(payload);
-            if (!clip) return editorClipMiss(payload);
+            if (!clip) return fail(editorClipMiss(payload));
             const at = Number(payload?.at_sec);
-            if (!Number.isFinite(at)) return 'editor_split_clip: pass at_sec (timeline seconds)';
+            if (!Number.isFinite(at)) return fail('editor_split_clip: pass at_sec (timeline seconds)');
             if (at <= clip.startSec || at >= clip.startSec + clip.durationSec) {
-                return `editor_split_clip: ${at}s is outside "${clip.label}" (${clip.startSec}–${clip.startSec + clip.durationSec}s)`;
+                return fail(`editor_split_clip: ${at}s is outside "${clip.label}" (${clip.startSec}–${clip.startSec + clip.durationSec}s)`);
             }
             useEditorStore.getState().splitClipAt(clip.id, at);
             return `Split clip "${clip.label}" at ${at}s`;
@@ -355,21 +377,21 @@ export function handletheDAWAction(action: AssistantActionPayload): string {
 
         case 'editor_select_clip': {
             const clip = findEditorClip(payload);
-            if (!clip) return editorClipMiss(payload);
+            if (!clip) return fail(editorClipMiss(payload));
             useEditorStore.getState().setSelected(clip.id);
             return `Selected clip "${clip.label}"`;
         }
 
         case 'editor_set_playhead': {
             const sec = Number(payload?.seconds ?? payload?.sec);
-            if (!Number.isFinite(sec) || sec < 0) return 'editor_set_playhead: pass seconds >= 0';
+            if (!Number.isFinite(sec) || sec < 0) return fail('editor_set_playhead: pass seconds >= 0');
             useEditorStore.getState().setPlayhead(sec);
             return `Playhead at ${sec}s`;
         }
 
         case 'editor_set_bpm': {
             const bpm = Number(payload?.bpm);
-            if (!Number.isFinite(bpm) || bpm < 20 || bpm > 400) return 'editor_set_bpm: pass bpm in 20..400';
+            if (!Number.isFinite(bpm) || bpm < 20 || bpm > 400) return fail('editor_set_bpm: pass bpm in 20..400');
             useEditorStore.getState().setBpm(bpm);
             return `BPM set to ${bpm}`;
         }
@@ -389,7 +411,7 @@ export function handletheDAWAction(action: AssistantActionPayload): string {
 
         case 'editor_add_marker': {
             const sec = Number(payload?.seconds ?? payload?.sec);
-            if (!Number.isFinite(sec) || sec < 0) return 'editor_add_marker: pass seconds >= 0';
+            if (!Number.isFinite(sec) || sec < 0) return fail('editor_add_marker: pass seconds >= 0');
             const name = payload?.name !== undefined ? String(payload.name) : undefined;
             useEditorStore.getState().addMarker(sec, name);
             return `Marker${name ? ` "${name}"` : ''} added at ${sec}s`;
@@ -411,14 +433,14 @@ export function handletheDAWAction(action: AssistantActionPayload): string {
 
         case 'dj_load_set': {
             const name = stringValue(action.payload, ['name', 'set']).trim();
-            if (!name) return 'No set name provided. Pass a set name to switch to it.';
+            if (!name) return fail('No set name provided. Pass a set name to switch to it.');
             const sl = useSetlistStore.getState();
             const match = Object.values(sl.setlists).find(
                 (s) => s.name.toLowerCase() === name.toLowerCase(),
             ) ?? Object.values(sl.setlists).find(
                 (s) => s.name.toLowerCase().includes(name.toLowerCase()),
             );
-            if (!match) return `No setlist named "${name}". Known sets: ${Object.values(sl.setlists).map((s) => s.name).join(', ') || 'none'}`;
+            if (!match) return fail(`No setlist named "${name}". Known sets: ${Object.values(sl.setlists).map((s) => s.name).join(', ') || 'none'}`);
             sl.setActive(match.id);
             useAppUiStore.getState().setCenterTab('dj');
             return `Active set is now "${match.name}" (${match.entries.length} tracks). Say dj_automix on to run it.`;
@@ -442,17 +464,17 @@ export function handletheDAWAction(action: AssistantActionPayload): string {
 
         case 'dj_set_next': {
             const label = stringValue(action.payload, ['label', 'track', 'title']).trim();
-            if (!label) return 'No track label provided. Pass a title or track label to queue next.';
+            if (!label) return fail('No track label provided. Pass a title or track label to queue next.');
             const sl = useSetlistStore.getState();
             const active = sl.activeId ? sl.setlists[sl.activeId] : null;
-            if (!active) return 'No active setlist.';
+            if (!active) return fail('No active setlist.');
             const idx = active.entries.findIndex(
                 (e) => e.label.toLowerCase().includes(label.toLowerCase()),
             );
-            if (idx < 0) return `No track matching "${label}" in "${active.name}".`;
+            if (idx < 0) return fail(`No track matching "${label}" in "${active.name}".`);
             const now = useDjAutomix.getState().nowPlayingEntryId;
             const nowIdx = now ? active.entries.findIndex((e) => e.entryId === now) : -1;
-            if (idx === nowIdx) return `"${active.entries[idx].label}" is already playing.`;
+            if (idx === nowIdx) return fail(`"${active.entries[idx].label}" is already playing.`);
             const entries = [...active.entries];
             const [moved] = entries.splice(idx, 1);
             // After the currently-playing track; to the front when nothing plays.
@@ -481,8 +503,27 @@ export function handletheDAWAction(action: AssistantActionPayload): string {
         }
 
         default:
-            return `Unknown action: ${type}`;
+            return fail(`Unknown action: ${type}`);
     }
+}
+
+/**
+ * Run one assistant action and say truthfully what happened.
+ *
+ * Callers MUST surface `message`: it is the only place a miss ("No clip
+ * \"kick\"...") is reported, and every caller used to throw it away and print
+ * its own "Executed action: X" instead.
+ */
+export function handletheDAWAction(action: AssistantActionPayload): AssistantActionResult {
+    const branch = runtheDAWAction(action);
+    return typeof branch === 'string'
+        ? { ok: true, message: branch }
+        : { ok: false, message: branch.message };
+}
+
+/** The message alone, for callers that only log it (orb-kit/chat/useOrbChat). */
+export function handletheDAWActionMessage(action: AssistantActionPayload): string {
+    return handletheDAWAction(action).message;
 }
 
 

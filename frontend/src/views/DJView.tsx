@@ -21,7 +21,8 @@
  * engine (djEngine) is the real 2-deck AudioBuffer transport. Per-deck logic
  * lives in `useDeck`, shared by the waveform lane and the deck column.
  */
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { List, type ListImperativeAPI, type RowComponentProps } from 'react-window';
 import {
   Disc, Play, Pause, Plus, Save, Trash2, Cast, Music2, Square,
   ChevronDown, ChevronRight, Magnet, Gauge, Lock,
@@ -47,6 +48,8 @@ import { useDjAutomix } from '../state/djAutomixStore';
 import { useDjDeckLoad } from '../state/djDeckLoadStore';
 import { useLibraryStore } from '../state/libraryStore';
 import type { LibraryEntry } from '../state/libraryStore';
+import { fetchLibraryMatchCount } from '../lib/backendLocalProvider';
+import type { LibrarySortBy } from '../lib/libraryRows';
 import { useDjAnalysisStore } from '../state/djAnalysisStore';
 import { useDjCuesStore, HOTCUE_SLOTS } from '../state/djCuesStore';
 import { toCamelot, keyLabel } from '../lib/camelot';
@@ -183,14 +186,139 @@ type Source = { kind: LibSourceKind } | { kind: 'set'; id: string };
 const LIB_SOURCE_LABEL: Record<LibSourceKind, string> = {
   library: 'Library', favorites: 'Favorites', gen: 'Generated', import: 'Imports',
 };
-const libSourceFilter = (entries: LibraryEntry[], kind: LibSourceKind): LibraryEntry[] => {
+/**
+ * A source tab as the library store's own filters. The store sends them to the
+ * backend, which is what lets the browser page through 200,000 rows instead of
+ * filtering the few hundred it happens to hold.
+ */
+const libSourceQuery = (kind: LibSourceKind): { favorite: boolean; source: string | null } => {
   switch (kind) {
-    case 'favorites': return entries.filter((e) => e.favorite);
-    case 'gen': return entries.filter((e) => e.source === 'generate');
-    case 'import': return entries.filter((e) => e.source === 'import');
-    default: return entries;
+    case 'favorites': return { favorite: true, source: null };
+    case 'gen': return { favorite: false, source: 'generate' };
+    case 'import': return { favorite: false, source: 'import' };
+    default: return { favorite: false, source: null };
   }
 };
+
+/** One browser row, whether it came from the library or from a set. */
+interface DjBrowserRow {
+  entryId: string | null;
+  title: string;
+  bpm: number | null;
+  key: string | null;
+  dur: number | null;
+  date: string | null;
+  source: string;
+  order: number;
+  setIndex?: number;
+}
+
+type DjSortKey = 'order' | 'bpm' | 'title' | 'key' | 'dur' | 'date' | 'source';
+
+/**
+ * The library sort that answers this column, or null when only the loaded rows
+ * can be put in this order.
+ *
+ * BPM and KEY come from the DJ's own analysis store, and SOURCE has no server
+ * order at all, so those three — plus the two directions the library does not
+ * offer — sort what is in hand and say so in the header.
+ */
+const djServerSort = (key: DjSortKey, dir: 'asc' | 'desc'): LibrarySortBy | null => {
+  switch (key) {
+    case 'order': return dir === 'asc' ? 'newest' : 'oldest';
+    case 'date': return dir === 'asc' ? 'oldest' : 'newest';
+    case 'title': return dir === 'asc' ? 'title' : null;
+    case 'dur': return dir === 'desc' ? 'duration' : null;
+    default: return null;
+  }
+};
+
+/** The one column template the header and every row share. */
+const DJ_BROWSER_GRID = '1.8rem 4.1rem minmax(10rem,1fr) 2.7rem 2.5rem 2.9rem 3.3rem 4.2rem';
+/** Row height in px: `py-0.5` around a 9px line, plus its bottom border. */
+const DJ_BROWSER_ROW_HEIGHT = 20;
+
+const djDateLabel = (v: string | null): string => {
+  if (!v) return '—';
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? '—' : d.toLocaleDateString(undefined, { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+};
+
+interface DjBrowserRowProps {
+  /** The row at a GLOBAL index, or undefined while its page is coming. */
+  rowAt: (index: number) => DjBrowserRow | undefined;
+  /** Changes identity whenever the rows behind `rowAt` do. */
+  revision: number;
+  isSet: boolean;
+  onLoadDeck: (entryId: string, deck: djEngine.DeckId) => void;
+  onStage: (entryId: string, title: string) => void;
+  onSendVj: (row: DjBrowserRow) => void;
+  onReorder: (from: number, to: number) => void;
+  onRemove: (setIndex: number) => void;
+  onContextMenu: (e: React.MouseEvent, row: DjBrowserRow) => void;
+}
+
+/** A single virtualized browser row. Drag source and load buttons unchanged. */
+function DjBrowserRowView({
+  index,
+  style,
+  ariaAttributes,
+  rowAt,
+  isSet,
+  onLoadDeck,
+  onStage,
+  onSendVj,
+  onReorder,
+  onRemove,
+  onContextMenu,
+}: RowComponentProps<DjBrowserRowProps>) {
+  const r = rowAt(index);
+  if (!r) {
+    return (
+      <div style={style} className="px-2 py-0.5" {...ariaAttributes}>
+        <div aria-hidden="true" className="h-3 rounded bg-white/5 animate-pulse" />
+      </div>
+    );
+  }
+  return (
+    <div
+      // react-window positions the row; the grid template is the header's, so
+      // the columns below line up with the sort buttons above.
+      style={{ ...style, gridTemplateColumns: DJ_BROWSER_GRID }}
+      {...ariaAttributes}
+      draggable={!!r.entryId}
+      onContextMenu={(e) => onContextMenu(e, r)}
+      onDragStart={(ev) => {
+        if (!r.entryId) return;
+        ev.dataTransfer.effectAllowed = 'copy';
+        ev.dataTransfer.setData(DJ_TRACK_MIME, r.entryId);
+        ev.dataTransfer.setData('text/plain', r.title);
+      }}
+      className="grid items-center gap-1 px-2 overflow-hidden text-[9px] font-mono text-zinc-400 hover:bg-white/5 border-b border-white/3 group/row cursor-grab active:cursor-grabbing"
+    >
+      <span className="text-right text-zinc-600">{String(r.order).padStart(2, '0')}</span>
+      <span className="truncate text-zinc-600" title={r.date ?? undefined}>{djDateLabel(r.date)}</span>
+      <span className="truncate text-zinc-300" title={r.title}>{r.title}</span>
+      <span className="text-right tabular-nums text-zinc-500">{r.bpm != null ? r.bpm.toFixed(0) : '—'}</span>
+      <span className="text-zinc-500">{r.key ?? '—'}</span>
+      <span className="text-right tabular-nums text-zinc-600">{r.dur != null ? fmtTime(r.dur) : '—'}</span>
+      <span className="truncate text-zinc-600 capitalize">{r.source}</span>
+      <span className="flex items-center gap-0.5 justify-end pr-0.5">
+        {isSet ? (
+          <span className="hidden group-hover/row:flex items-center gap-0.5">
+            <button onClick={() => onReorder(r.setIndex!, r.setIndex! - 1)} disabled={r.setIndex === 0} className="p-0.5 text-zinc-600 hover:text-zinc-200 disabled:opacity-20" title="Move up"><ChevronDown className="w-2.5 h-2.5 rotate-180" /></button>
+            <button onClick={() => onReorder(r.setIndex!, r.setIndex! + 1)} className="p-0.5 text-zinc-600 hover:text-zinc-200" title="Move down"><ChevronDown className="w-2.5 h-2.5" /></button>
+            <button onClick={() => onRemove(r.setIndex!)} className="p-0.5 text-zinc-600 hover:text-rose-400" title="Remove from set"><Trash2 className="w-2.5 h-2.5" /></button>
+          </span>
+        ) : null}
+        {r.entryId && <button onClick={() => onStage(r.entryId!, r.title)} className="hidden group-hover/row:inline p-0.5 text-zinc-600 hover:text-purple-300" title="Stage in Next queue"><ListMusic className="w-2.5 h-2.5" /></button>}
+        <button onClick={() => r.entryId && onLoadDeck(r.entryId, 'A')} disabled={!r.entryId} className="px-1 py-0.5 rounded text-[8px] font-black text-purple-300 hover:bg-purple-500/20 disabled:opacity-30" title="Load onto Deck A">→A</button>
+        <button onClick={() => r.entryId && onLoadDeck(r.entryId, 'B')} disabled={!r.entryId} className="px-1 py-0.5 rounded text-[8px] font-black text-cyan-300 hover:bg-cyan-500/20 disabled:opacity-30" title="Load onto Deck B">→B</button>
+        {!isSet && r.entryId && <button onClick={() => onSendVj(r)} className="hidden group-hover/row:inline p-0.5 text-zinc-600 hover:text-cyan-300" title="Send to VJ"><Cast className="w-2.5 h-2.5" /></button>}
+      </span>
+    </div>
+  );
+}
 
 const isExternalAudioFile = (file: File): boolean => {
   if (file.type.startsWith('audio/')) return true;
@@ -554,7 +682,12 @@ export const DJView: React.FC = () => {
   // calls getUserMedia, so on this surface the labels could never fill in.
   const cueSupported = djEngine.isCueSupported();
 
+  // The loaded WINDOW of the library (T31), not the library: `libTotal` is how
+  // many rows the current filters match, and `lookupVersion` re-renders when a
+  // single-entry lookup for a row on no loaded page lands.
   const entries = useLibraryStore((s) => s.entries);
+  const libTotal = useLibraryStore((s) => s.total);
+  const libLookupVersion = useLibraryStore((s) => s.lookupVersion);
   const analyzeAll = useDjAnalysisStore((s) => s.analyzeAll);
   const djTabActive = useAppUiStore((s) => s.centerTab === 'dj');
   const setlists = useSetlistStore((s) => s.setlists);
@@ -564,7 +697,14 @@ export const DJView: React.FC = () => {
   const activeSet = activeId ? setlists[activeId] : null;
   useEffect(() => { void importBundledSetlists(); }, [importBundledSetlists]);
 
-  const trackById = (id: string | null): LibraryEntry | null => (id ? entries.find((e) => e.id === id) ?? null : null);
+  // A deck can hold a track whose page the library's LRU dropped an hour ago,
+  // so this goes through the store's id lookup (which fetches the one row it
+  // needs and re-renders through `lookupVersion`) rather than the loaded rows.
+  const trackById = (id: string | null): LibraryEntry | null => {
+    void libLookupVersion;
+    void entries;
+    return id ? useLibraryStore.getState().getById(id) ?? null : null;
+  };
   const deckATitle = trackById(deckATrack)?.title ?? null;
   const deckBTitle = trackById(deckBTrack)?.title ?? null;
   const deckAUrl = trackById(deckATrack)?.audioUrl ?? null;
@@ -652,6 +792,10 @@ export const DJView: React.FC = () => {
     });
   }, []);
 
+  // BPM/key analysis is a per-track backend job, so it runs over the rows the
+  // library actually has in hand — a few hundred, not 200,000. Scrolling the
+  // browser brings more into range; the analysis queue de-duplicates ids, so
+  // re-running this as pages land costs nothing.
   useEffect(() => { if (djTabActive && entries.length) void analyzeAll(entries.map((e) => e.id)); }, [djTabActive, entries, analyzeAll]);
 
   useEffect(() => {
@@ -1033,7 +1177,7 @@ export const DJView: React.FC = () => {
     onSync: syncDeck, onSyncLock: toggleSyncLock, onHeadCue: toggleCue,
     onSendVj: sendDeckToVj, onAddSet: addDeckToSet,
     deckAUrl, deckBUrl, deckATrack, deckBTrack, setDeckATrack, setDeckBTrack,
-    source, setSource, libCount: entries.length, loadDeck, loadDropOntoDeck,
+    source, setSource, libCount: libTotal, loadDeck, loadDropOntoDeck,
     gainA, gainB, eqA, eqB, filterA, filterB, volA, volB,
     stemKnobModeA, stemKnobModeB, setStemKnobModeA, setStemKnobModeB,
     pitchA: deckAPitch, pitchB: deckBPitch, bpmA: ctlA.bpm ?? null, bpmB: ctlB.bpm ?? null,
@@ -1193,31 +1337,41 @@ const SamplerRail: React.FC = () => {
   const setPad = useDjSampler((s) => s.setPad);
   const clearPad = useDjSampler((s) => s.clearPad);
   const entries = useLibraryStore((s) => s.entries);
+  const lookupVersion = useLibraryStore((s) => s.lookupVersion);
   const [over, setOver] = useState<number | null>(null);
   const loadedRef = useRef<Set<string>>(new Set());
 
   // Decode each persisted pad's sample into the engine once (after a reload).
+  // A pad persists an ENTRY ID, and the row behind it is usually on no loaded
+  // page after a restart, so the store fetches the one record it needs and the
+  // `lookupVersion` bump brings this effect back round with the answer.
   useEffect(() => {
     for (const [k, pad] of Object.entries(pads)) {
       const i = Number(k);
       const tag = `sampler:${i}:${pad.entryId}`;
       if (loadedRef.current.has(tag)) continue;
-      const entry = entries.find((e) => e.id === pad.entryId);
+      const entry = useLibraryStore.getState().getById(pad.entryId);
       if (!entry?.audioUrl) continue;
       loadedRef.current.add(tag);
       void djEngine.loadSample(`sampler:${i}`, entry.audioUrl).catch(() => loadedRef.current.delete(tag));
     }
-  }, [pads, entries]);
+  }, [pads, entries, lookupVersion]);
 
   const drop = async (i: number, e: React.DragEvent) => {
     setOver(null);
     const dt = e.dataTransfer;
     if (!dropHasLibraryOrFiles(dt, [DJ_TRACK_MIME])) return;
     e.preventDefault();
-    const fromDesktop = !dt.getData(DJ_TRACK_MIME);
-    // A desktop drop imports its first audio file to the library, then loads
-    // the pad exactly as a library drop does.
-    const [entry] = await entriesFromDrop(dt, { mimes: [DJ_TRACK_MIME], entries, max: 1 });
+    // The library id is read here, synchronously, before anything awaits:
+    // protected mode empties the DataTransfer the moment this handler yields.
+    const draggedId = dt.getData(DJ_TRACK_MIME);
+    const fromDesktop = !draggedId;
+    // A library drop resolves through the store (the dragged row may sit on a
+    // page that has since been evicted); a desktop drop imports its first audio
+    // file to the library, then loads the pad exactly as a library drop does.
+    const entry = draggedId
+      ? await useLibraryStore.getState().ensureEntry(draggedId)
+      : (await entriesFromDrop(dt, { mimes: [], entries: [], max: 1 }))[0];
     if (!entry?.audioUrl) return;
     try {
       await djEngine.loadSample(`sampler:${i}`, entry.audioUrl);
@@ -1821,7 +1975,10 @@ const SideListLane: React.FC<{ onLoadDeck: (entryId: string, deck: djEngine.Deck
   const remove = useDjSideList((s) => s.remove);
   const reorder = useDjSideList((s) => s.reorder);
   const clear = useDjSideList((s) => s.clear);
-  const entries = useLibraryStore((s) => s.entries);
+  // `entries` + `lookupVersion` are the re-render triggers for the id lookups
+  // below; neither is read directly any more.
+  useLibraryStore((s) => s.entries);
+  useLibraryStore((s) => s.lookupVersion);
   const analysisById = useDjAnalysisStore((s) => s.byId);
   const activeId = useSetlistStore((s) => s.activeId);
   const appendToSet = useSetlistStore((s) => s.append);
@@ -1833,11 +1990,20 @@ const SideListLane: React.FC<{ onLoadDeck: (entryId: string, deck: djEngine.Deck
     const dt = e.dataTransfer;
     if (!dropHasLibraryOrFiles(dt, [DJ_TRACK_MIME])) return;
     e.preventDefault();
-    const fromDesktop = !dt.getData(DJ_TRACK_MIME);
+    // Read the library id synchronously — protected mode empties the
+    // DataTransfer as soon as this handler yields.
+    const draggedId = dt.getData(DJ_TRACK_MIME);
+    if (draggedId) {
+      // Staged by ID: the row may be on an evicted page, so ask the store.
+      void useLibraryStore.getState().ensureEntry(draggedId).then((lib) => {
+        if (lib) add({ entryId: lib.id, label: lib.title });
+      });
+      return;
+    }
     // A desktop drop imports every audio file to the library, then stages each.
-    void entriesFromDrop(dt, { mimes: [DJ_TRACK_MIME], entries }).then((dropped) => {
+    void entriesFromDrop(dt, { mimes: [], entries: [] }).then((dropped) => {
       for (const lib of dropped) add({ entryId: lib.id, label: lib.title });
-      if (fromDesktop && dropped.length > 0) logInfo('dj', `Imported ${dropped.length} file(s) from the desktop into the Next queue`);
+      if (dropped.length > 0) logInfo('dj', `Imported ${dropped.length} file(s) from the desktop into the Next queue`);
     });
   };
   const pushToSet = () => {
@@ -1894,7 +2060,10 @@ const SideListLane: React.FC<{ onLoadDeck: (entryId: string, deck: djEngine.Deck
         {items.length === 0 ? (
           <div className="h-full grid place-items-center text-[9px] font-mono text-zinc-600 px-3 text-center">Drag tracks here to stage them play-next.</div>
         ) : items.map((it, i) => {
-          const lib = entries.find((e) => e.id === it.entryId) ?? null;
+          // The queue holds ids and its own labels, so a staged track stays
+          // usable while its library row is on no loaded page: the store
+          // fetches the record and `lookupVersion` brings this list back round.
+          const lib = useLibraryStore.getState().getById(it.entryId) ?? null;
           const bpm = analysisById[it.entryId]?.data?.bpm ?? null;
           return (
             <div
@@ -1928,7 +2097,16 @@ const SideListLane: React.FC<{ onLoadDeck: (entryId: string, deck: djEngine.Deck
 /* ═══════════════════════════════ TrackBrowser ═══════════════════════════════ */
 
 const TrackBrowser: React.FC<{ source: Source; setSource: (s: Source) => void; onLoadDeck: (entryId: string, deck: djEngine.DeckId) => void }> = ({ source, setSource, onLoadDeck }) => {
+  // The library store is PAGED (T31): `entries` is the loaded window and
+  // `total` is how many rows the current filters match. This browser therefore
+  // scrolls by global index and asks the store for the range it rendered.
   const entries = useLibraryStore((s) => s.entries);
+  const libTotal = useLibraryStore((s) => s.total);
+  const libLoading = useLibraryStore((s) => s.pagesLoading);
+  const entryAt = useLibraryStore((s) => s.entryAt);
+  const ensureRange = useLibraryStore((s) => s.ensureRange);
+  const libSearch = useLibraryStore((s) => s.searchQuery);
+  const lookupVersion = useLibraryStore((s) => s.lookupVersion);
   const analysisById = useDjAnalysisStore((s) => s.byId);
   const stemSettings = useFeatureToggleStore((s) => s.settings.stems);
   const setlists = useSetlistStore((s) => s.setlists);
@@ -1941,22 +2119,87 @@ const TrackBrowser: React.FC<{ source: Source; setSource: (s: Source) => void; o
   const [editing, setEditing] = useState(false);
   const [editName, setEditName] = useState('');
   const [dropOverSet, setDropOverSet] = useState(false);
-  type SortKey = 'order' | 'bpm' | 'title' | 'key' | 'dur' | 'date' | 'source';
-  const [sort, setSort] = useState<{ key: SortKey; dir: 'asc' | 'desc' }>({ key: 'order', dir: 'asc' });
+  const [sort, setSort] = useState<{ key: DjSortKey; dir: 'asc' | 'desc' }>({ key: 'order', dir: 'asc' });
   const [appliedSetSort, setAppliedSetSort] = useState<{ key: 'title' | 'bpm'; dir: 'asc' | 'desc' } | null>(null);
   type StemCache = { status: 'checking' | 'none' | 'ready' | 'running' | 'error'; count?: number; message?: string };
   const [stemCache, setStemCache] = useState<Record<string, StemCache>>({});
   const [stemRun, setStemRun] = useState<{ entryId: string; title: string; phase: string; progress: number } | null>(null);
+  const listRef = useRef<ListImperativeAPI | null>(null);
 
   const set = source.kind === 'set' ? setlists[source.id] ?? null : null;
   const isSet = source.kind === 'set' && !!set;
+  const rowMenu = useContextMenu<{ row: DjBrowserRow }>();
 
-  // Rows: either library entries or a set's entries (resolved against the library for metadata).
-  type Row = { entryId: string | null; title: string; bpm: number | null; key: string | null; dur: number | null; date: string | null; source: string; order: number; setIndex?: number };
-  const rowMenu = useContextMenu<{ row: Row }>();
-  const baseRows: Row[] = isSet
-    ? set!.entries.map((e, i) => {
-        const lib = e.entryId ? entries.find((x) => x.id === e.entryId) ?? null : null;
+  // ── The library's own query ───────────────────────────────────────────────
+  // A source tab IS a library filter, and the backend applies it. The store's
+  // setters no-op when nothing changed, so this is cheap to re-run.
+  useEffect(() => {
+    if (source.kind === 'set') return;
+    const store = useLibraryStore.getState();
+    const { favorite, source: src } = libSourceQuery(source.kind as LibSourceKind);
+    store.setOnlyFavorites(favorite);
+    store.setSourceFilter(src);
+  }, [source]);
+
+  // The search box is the LIBRARY's search while a library source is open, so
+  // the backend narrows 200,000 rows instead of this component filtering the
+  // few hundred in hand. Over a SET it stays a local filter — a set is small.
+  useEffect(() => {
+    if (source.kind === 'set') return;
+    setQ(libSearch);
+  }, [source.kind, libSearch]);
+
+  const onSearchChange = (value: string) => {
+    setQ(value);
+    if (source.kind !== 'set') useLibraryStore.getState().setSearchQuery(value);
+  };
+
+  // A server-backed order is the library's; anything else can only order the
+  // rows in hand, and the header says so.
+  const serverSort = isSet ? null : djServerSort(sort.key, sort.dir);
+  useEffect(() => {
+    if (!serverSort) return;
+    useLibraryStore.getState().setSortBy(serverSort);
+  }, [serverSort]);
+
+  // ── Rows ──────────────────────────────────────────────────────────────────
+  const libRow = useCallback((entry: LibraryEntry, order: number): DjBrowserRow => {
+    const d = analysisById[entry.id]?.data ?? null;
+    return {
+      entryId: entry.id,
+      title: entry.title,
+      bpm: d?.bpm ?? null,
+      key: d?.key ? keyLabel(d.key, d.scale) : null,
+      dur: d?.duration_sec ?? entry.duration ?? null,
+      date: entry.timestamp,
+      source: entry.source,
+      order,
+    };
+  }, [analysisById]);
+
+  /**
+   * The rows this browser MATERIALIZES: a set's entries, or — when the sort is
+   * one the library cannot do — the loaded library rows put in that order.
+   * Empty when the library is answering the order itself, in which case rows
+   * come straight off `entryAt` and never exist as an array.
+   */
+  const materialized: DjBrowserRow[] | null = useMemo(() => {
+    const compare = (a: DjBrowserRow, b: DjBrowserRow): number => {
+      const value = (r: DjBrowserRow) => (sort.key === 'date' ? (r.date ? Date.parse(r.date) : null) : r[sort.key]);
+      const av = value(a);
+      const bv = value(b);
+      if (av == null && bv == null) return a.order - b.order;
+      if (av == null) return 1;
+      if (bv == null) return -1;
+      const cmp = typeof av === 'number' && typeof bv === 'number'
+        ? av - bv
+        : String(av).localeCompare(String(bv), undefined, { numeric: true, sensitivity: 'base' });
+      return sort.dir === 'asc' ? cmp : -cmp;
+    };
+
+    if (isSet) {
+      const rows = set!.entries.map((e, i): DjBrowserRow => {
+        const lib = e.entryId ? useLibraryStore.getState().getById(e.entryId) ?? null : null;
         const d = e.entryId ? analysisById[e.entryId]?.data ?? null : null;
         return {
           entryId: e.entryId,
@@ -1969,46 +2212,46 @@ const TrackBrowser: React.FC<{ source: Source; setSource: (s: Source) => void; o
           order: i + 1,
           setIndex: i,
         };
-      })
-    : libSourceFilter(entries, source.kind as LibSourceKind).map((e, i) => {
-        const d = analysisById[e.id]?.data ?? null;
-        return {
-          entryId: e.id,
-          title: e.title,
-          bpm: d?.bpm ?? null,
-          key: d?.key ? keyLabel(d.key, d.scale) : null,
-          dur: d?.duration_sec ?? e.duration ?? null,
-          date: e.timestamp,
-          source: e.source,
-          order: i + 1,
-        };
       });
+      const needle = q.trim().toLowerCase();
+      const filtered = needle ? rows.filter((r) => r.title.toLowerCase().includes(needle)) : rows;
+      return [...filtered].sort(compare);
+    }
+
+    if (serverSort) return null;
+    // A client-only order (BPM, KEY, SOURCE, or a direction the library does
+    // not offer): the loaded rows, in that order. The header says how many.
+    return entries.map((e, i) => libRow(e, i + 1)).sort(compare);
+    // `lookupVersion` is a dependency because a set row's library record can
+    // arrive after the first render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isSet, set, q, sort, entries, serverSort, libRow, analysisById, lookupVersion]);
+
+  const rowCount = materialized ? materialized.length : libTotal;
+  const rowAt = useCallback((index: number): DjBrowserRow | undefined => {
+    if (materialized) return materialized[index];
+    const entry = entryAt(index);
+    return entry ? libRow(entry, index + 1) : undefined;
+  }, [materialized, entryAt, libRow]);
+
+  const handleRowsRendered = useCallback((
+    _visible: { startIndex: number; stopIndex: number },
+    rendered: { startIndex: number; stopIndex: number },
+  ) => {
+    if (materialized) return; // already in hand
+    void ensureRange(rendered.startIndex, rendered.stopIndex);
+  }, [materialized, ensureRange]);
+
+  // The library has moved under the list (new filter, new sort): go back to
+  // the top so the user is not left staring at row 40,000 of a new result set.
+  useEffect(() => {
+    if (materialized) return;
+    listRef.current?.scrollToRow({ index: 0, align: 'start' });
+  }, [serverSort, libSearch, source, materialized]);
+
   const sourceLabel = isSet ? set!.name : (LIB_SOURCE_LABEL[source.kind as LibSourceKind] ?? 'Library');
-  const filteredRows = q.trim() ? baseRows.filter((r) => r.title.toLowerCase().includes(q.trim().toLowerCase())) : baseRows;
-  const rows = useMemo(() => {
-    const value = (r: Row) => {
-      if (sort.key === 'date') return r.date ? Date.parse(r.date) : null;
-      return r[sort.key];
-    };
-    return [...filteredRows].sort((a, b) => {
-      const av = value(a);
-      const bv = value(b);
-      if (av == null && bv == null) return a.order - b.order;
-      if (av == null) return 1;
-      if (bv == null) return -1;
-      const cmp = typeof av === 'number' && typeof bv === 'number'
-        ? av - bv
-        : String(av).localeCompare(String(bv), undefined, { numeric: true, sensitivity: 'base' });
-      return sort.dir === 'asc' ? cmp : -cmp;
-    });
-  }, [filteredRows, sort]);
-  const setSortKey = (key: SortKey) => setSort((p) => (p.key === key ? { key, dir: p.dir === 'asc' ? 'desc' : 'asc' } : { key, dir: key === 'order' || key === 'title' ? 'asc' : 'desc' }));
-  const dateLabel = (v: string | null) => {
-    if (!v) return '—';
-    const d = new Date(v);
-    return Number.isNaN(d.getTime()) ? '—' : d.toLocaleDateString(undefined, { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
-  };
-  const SortHeader: React.FC<{ id: SortKey; children: React.ReactNode; align?: 'left' | 'right' }> = ({ id, children, align = 'left' }) => (
+  const setSortKey = (key: DjSortKey) => setSort((p) => (p.key === key ? { key, dir: p.dir === 'asc' ? 'desc' : 'asc' } : { key, dir: key === 'order' || key === 'title' ? 'asc' : 'desc' }));
+  const SortHeader: React.FC<{ id: DjSortKey; children: React.ReactNode; align?: 'left' | 'right' }> = ({ id, children, align = 'left' }) => (
     <button
       type="button"
       onClick={() => setSortKey(id)}
@@ -2053,9 +2296,12 @@ const TrackBrowser: React.FC<{ source: Source; setSource: (s: Source) => void; o
     e.stopPropagation();
 
     const entryId = e.dataTransfer.getData(DJ_TRACK_MIME);
+    const fallbackLabel = e.dataTransfer.getData('text/plain');
     if (entryId) {
-      const lib = entries.find((x) => x.id === entryId);
-      appendToSet(set.id, [{ entryId, label: lib?.title || e.dataTransfer.getData('text/plain') || 'Untitled', kind: 'audio' }]);
+      // The dragged row can sit on a page the cache dropped, so the title comes
+      // from the store's id lookup rather than from the loaded rows.
+      const lib = await useLibraryStore.getState().ensureEntry(entryId);
+      appendToSet(set.id, [{ entryId, label: lib?.title || fallbackLabel || 'Untitled', kind: 'audio' }]);
       return;
     }
 
@@ -2066,10 +2312,16 @@ const TrackBrowser: React.FC<{ source: Source; setSource: (s: Source) => void; o
     }
     if (imported.length > 0) appendToSet(set.id, imported);
   };
-  const sendEntry = (e: SetlistEntry) => { const lib = e.entryId ? entries.find((x) => x.id === e.entryId) ?? null : null; sendTrackToVj({ entryId: e.entryId, label: e.label, url: lib?.audioUrl ?? e.url, kind: e.kind ?? 'audio' }); };
+  const sendEntry = (e: SetlistEntry) => {
+    const lib = e.entryId ? useLibraryStore.getState().getById(e.entryId) ?? null : null;
+    sendTrackToVj({ entryId: e.entryId, label: e.label, url: lib?.audioUrl ?? e.url, kind: e.kind ?? 'audio' });
+  };
   const sendWholeSet = () => {
     if (!set) return;
-    const items: VjSetItem[] = set.entries.map((e) => { const lib = e.entryId ? entries.find((x) => x.id === e.entryId) ?? null : null; return { entryId: e.entryId, label: e.label, url: lib?.audioUrl ?? e.url, kind: e.kind ?? 'audio' }; });
+    const items: VjSetItem[] = set.entries.map((e) => {
+      const lib = e.entryId ? useLibraryStore.getState().getById(e.entryId) ?? null : null;
+      return { entryId: e.entryId, label: e.label, url: lib?.audioUrl ?? e.url, kind: e.kind ?? 'audio' };
+    });
     sendSetToVj({ setId: set.id, name: set.name, items });
   };
   const sortSetEntries = (key: 'title' | 'bpm') => {
@@ -2115,13 +2367,13 @@ const TrackBrowser: React.FC<{ source: Source; setSource: (s: Source) => void; o
       }));
     }
   };
-  const openSetRowMenu = (e: React.MouseEvent, row: Row) => {
+  const openSetRowMenu = (e: React.MouseEvent, row: DjBrowserRow) => {
     if (!isSet || !row.entryId) return;
     rowMenu.open(e, { row });
     const cached = stemCache[row.entryId];
     if (!cached || cached.status === 'error') void refreshStemCache(row.entryId);
   };
-  const separateSetRowStems = async (row: Row) => {
+  const separateSetRowStems = async (row: DjBrowserRow) => {
     if (!row.entryId) return;
     const entryId = row.entryId;
     setStemCache((p) => ({ ...p, [entryId]: { status: 'running', count: p[entryId]?.count } }));
@@ -2192,6 +2444,14 @@ const TrackBrowser: React.FC<{ source: Source; setSource: (s: Source) => void; o
     },
   ] : [];
 
+  // What the count in the header means, honestly: the whole result set when the
+  // library is doing the ordering, the rows in hand when it cannot.
+  const countLabel = isSet
+    ? `${rowCount} tracks`
+    : serverSort
+      ? `${libTotal.toLocaleString()} files`
+      : `${rowCount.toLocaleString()} of ${libTotal.toLocaleString()} loaded`;
+
   return (
     <div
       className={`hardware-card h-full w-full flex flex-col min-h-0 overflow-hidden ${dropOverSet ? 'ring-2 ring-inset ring-purple-300/60' : ''}`}
@@ -2208,7 +2468,15 @@ const TrackBrowser: React.FC<{ source: Source; setSource: (s: Source) => void; o
         ) : (
           <span className="text-[10px] font-black uppercase tracking-wider text-purple-300 truncate max-w-40" title={sourceLabel}>{sourceLabel}</span>
         )}
-        <span className="text-[8px] font-mono text-zinc-600">{rows.length} {isSet ? 'tracks' : 'files'}</span>
+        <span
+          className="text-[8px] font-mono text-zinc-600"
+          title={!isSet && !serverSort ? 'BPM, KEY and SOURCE can only be ordered over the tracks already loaded — scroll to bring more in, or sort by #, Date, Title or Len to order the whole library.' : undefined}
+        >
+          {countLabel}
+        </span>
+        {libLoading > 0 && !isSet && (
+          <Loader2 role="img" className="w-2.5 h-2.5 animate-spin text-purple-300/70" aria-label="Loading more of the library" />
+        )}
         {stemRun && (
           <span className="min-w-0 max-w-48 truncate text-[8px] font-mono text-emerald-300" title={`${stemRun.title}: ${stemRun.phase}`}>
             stems · {stemRun.progress > 0 ? `${Math.round(stemRun.progress)}%` : stemRun.phase}
@@ -2216,7 +2484,17 @@ const TrackBrowser: React.FC<{ source: Source; setSource: (s: Source) => void; o
         )}
         <div className="flex items-center gap-1 ml-auto bg-black/40 border border-white/10 rounded px-1.5 w-36 max-w-[40%]">
           <Search className="w-3 h-3 text-zinc-600 shrink-0" />
-          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="search…" className="flex-1 min-w-0 bg-transparent text-[10px] font-mono text-zinc-200 py-1 focus:outline-none placeholder:text-zinc-600" />
+          <label htmlFor="dj-browser-search" className="sr-only">
+            {isSet ? 'Filter this set' : 'Search the library'}
+          </label>
+          <input
+            id="dj-browser-search"
+            name="dj-browser-search"
+            value={q}
+            onChange={(e) => onSearchChange(e.target.value)}
+            placeholder="search…"
+            className="flex-1 min-w-0 bg-transparent text-[10px] font-mono text-zinc-200 py-1 focus:outline-none placeholder:text-zinc-600"
+          />
         </div>
         {isSet && set && (
           <div className="flex items-center gap-0.5 shrink-0">
@@ -2230,7 +2508,7 @@ const TrackBrowser: React.FC<{ source: Source; setSource: (s: Source) => void; o
       </div>
 
       {/* column header */}
-      <div className="shrink-0 grid items-center gap-1 px-2 py-0.5 border-b border-white/5 text-[7px] font-black uppercase tracking-wider text-zinc-600" style={{ gridTemplateColumns: '1.8rem 4.1rem minmax(10rem,1fr) 2.7rem 2.5rem 2.9rem 3.3rem 4.2rem' }}>
+      <div className="shrink-0 grid items-center gap-1 px-2 py-0.5 border-b border-white/5 text-[7px] font-black uppercase tracking-wider text-zinc-600" style={{ gridTemplateColumns: DJ_BROWSER_GRID }}>
         <SortHeader id="order" align="right">#</SortHeader>
         <SortHeader id="date">Date</SortHeader>
         <SortHeader id="title">Title</SortHeader>
@@ -2242,39 +2520,34 @@ const TrackBrowser: React.FC<{ source: Source; setSource: (s: Source) => void; o
       </div>
 
       {/* rows */}
-      <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain">
-        {rows.length === 0 ? (
+      <div className="flex-1 min-h-0">
+        {rowCount === 0 ? (
           <div className="h-full grid place-items-center text-[9px] font-mono text-zinc-600 px-3 text-center">
-            {isSet ? 'Empty set — drag tracks here, or Save a loaded deck.' : (entries.length === 0 ? 'Library empty — generate or import audio.' : 'No matches.')}
+            {isSet ? 'Empty set — drag tracks here, or Save a loaded deck.' : (libTotal === 0 && !q.trim() ? 'Library empty — generate or import audio.' : 'No matches.')}
           </div>
-        ) : rows.map((r, i) => (
-          <div key={(r.entryId ?? 'x') + i} draggable={!!r.entryId}
-            onContextMenu={(e) => openSetRowMenu(e, r)}
-            onDragStart={(ev) => { if (!r.entryId) return; ev.dataTransfer.effectAllowed = 'copy'; ev.dataTransfer.setData(DJ_TRACK_MIME, r.entryId); ev.dataTransfer.setData('text/plain', r.title); }}
-            className="grid items-center gap-1 px-2 py-0.5 text-[9px] font-mono text-zinc-400 hover:bg-white/5 border-b border-white/3 group/row cursor-grab active:cursor-grabbing"
-            style={{ gridTemplateColumns: '1.8rem 4.1rem minmax(10rem,1fr) 2.7rem 2.5rem 2.9rem 3.3rem 4.2rem' }}>
-            <span className="text-right text-zinc-600">{String(r.order).padStart(2, '0')}</span>
-            <span className="truncate text-zinc-600" title={r.date ?? undefined}>{dateLabel(r.date)}</span>
-            <span className="truncate text-zinc-300" title={r.title}>{r.title}</span>
-            <span className="text-right tabular-nums text-zinc-500">{r.bpm != null ? r.bpm.toFixed(0) : '—'}</span>
-            <span className="text-zinc-500">{r.key ?? '—'}</span>
-            <span className="text-right tabular-nums text-zinc-600">{r.dur != null ? fmtTime(r.dur) : '—'}</span>
-            <span className="truncate text-zinc-600 capitalize">{r.source}</span>
-            <span className="flex items-center gap-0.5 justify-end pr-0.5">
-              {isSet ? (
-                <span className="hidden group-hover/row:flex items-center gap-0.5">
-                  <button onClick={() => reorder(r.setIndex!, r.setIndex! - 1)} disabled={r.setIndex === 0} className="p-0.5 text-zinc-600 hover:text-zinc-200 disabled:opacity-20" title="Move up"><ChevronDown className="w-2.5 h-2.5 rotate-180" /></button>
-                  <button onClick={() => reorder(r.setIndex!, r.setIndex! + 1)} className="p-0.5 text-zinc-600 hover:text-zinc-200" title="Move down"><ChevronDown className="w-2.5 h-2.5" /></button>
-                  <button onClick={() => set && removeEntry(r.setIndex!)} className="p-0.5 text-zinc-600 hover:text-rose-400" title="Remove from set"><Trash2 className="w-2.5 h-2.5" /></button>
-                </span>
-              ) : null}
-              {r.entryId && <button onClick={() => stage({ entryId: r.entryId!, label: r.title })} className="hidden group-hover/row:inline p-0.5 text-zinc-600 hover:text-purple-300" title="Stage in Next queue"><ListMusic className="w-2.5 h-2.5" /></button>}
-              <button onClick={() => r.entryId && onLoadDeck(r.entryId, 'A')} disabled={!r.entryId} className="px-1 py-0.5 rounded text-[8px] font-black text-purple-300 hover:bg-purple-500/20 disabled:opacity-30" title="Load onto Deck A">→A</button>
-              <button onClick={() => r.entryId && onLoadDeck(r.entryId, 'B')} disabled={!r.entryId} className="px-1 py-0.5 rounded text-[8px] font-black text-cyan-300 hover:bg-cyan-500/20 disabled:opacity-30" title="Load onto Deck B">→B</button>
-              {!isSet && r.entryId && <button onClick={() => sendEntry({ entryId: r.entryId, label: r.title, kind: 'audio' })} className="hidden group-hover/row:inline p-0.5 text-zinc-600 hover:text-cyan-300" title="Send to VJ"><Cast className="w-2.5 h-2.5" /></button>}
-            </span>
-          </div>
-        ))}
+        ) : (
+          <List
+            listRef={listRef}
+            rowComponent={DjBrowserRowView}
+            rowCount={rowCount}
+            rowHeight={DJ_BROWSER_ROW_HEIGHT}
+            rowProps={{
+              rowAt,
+              revision: lookupVersion,
+              isSet,
+              onLoadDeck,
+              onStage: (entryId: string, title: string) => stage({ entryId, label: title }),
+              onSendVj: (row: DjBrowserRow) => sendEntry({ entryId: row.entryId, label: row.title, kind: 'audio' }),
+              onReorder: reorder,
+              onRemove: removeEntry,
+              onContextMenu: openSetRowMenu,
+            }}
+            overscanCount={10}
+            onRowsRendered={handleRowsRendered}
+            aria-label={isSet ? 'Set tracks' : 'Library tracks'}
+            style={{ height: '100%' }}
+          />
+        )}
       </div>
       <ContextMenu
         position={rowMenu.position}
@@ -2294,13 +2567,47 @@ const TrackBrowser: React.FC<{ source: Source; setSource: (s: Source) => void; o
  *  user's Sets. No placeholder/streaming stubs. */
 const SourceTree: React.FC<{ source: Source; setSource: (s: Source) => void; libCount: number }> = ({ source, setSource, libCount }) => {
   const entries = useLibraryStore((s) => s.entries);
+  const libRevision = useLibraryStore((s) => s.revision);
+  const libPaged = useLibraryStore((s) => s.paged);
   const setlists = useSetlistStore((s) => s.setlists);
   const createSetlist = useSetlistStore((s) => s.create);
   const setActive = useSetlistStore((s) => s.setActive);
   const sets = Object.values(setlists).sort((a, b) => b.updatedAt - a.updatedAt);
-  const favCount = entries.filter((e) => e.favorite).length;
-  const genCount = entries.filter((e) => e.source === 'generate').length;
-  const impCount = entries.filter((e) => e.source === 'import').length;
+
+  /**
+   * The numbers beside Favorites / Generated / Imports.
+   *
+   * Counting the loaded rows would print "43 favorites" for a library with
+   * four thousand, so each is one `limit=1` request read for its `total`, taken
+   * again whenever the library's revision moves. An unpaged backend has every
+   * row in hand, so there it still counts them locally — which is the truth
+   * there.
+   */
+  const [libCounts, setLibCounts] = useState<{ fav: number; gen: number; imp: number } | null>(null);
+  useEffect(() => {
+    if (!libPaged) {
+      setLibCounts(null);
+      return;
+    }
+    let live = true;
+    const base = useLibraryStore.getState().getQuery();
+    const plain = { ...base, q: '', favorite: null, source: null };
+    void Promise.all([
+      fetchLibraryMatchCount({ ...plain, favorite: true }),
+      fetchLibraryMatchCount({ ...plain, source: 'generate' }),
+      fetchLibraryMatchCount({ ...plain, source: 'import' }),
+    ])
+      .then(([fav, gen, imp]) => {
+        if (!live || fav == null || gen == null || imp == null) return;
+        setLibCounts({ fav, gen, imp });
+      })
+      .catch(() => { /* a count that did not arrive simply is not shown */ });
+    return () => { live = false; };
+  }, [libPaged, libRevision]);
+
+  const favCount = libCounts ? libCounts.fav : entries.filter((e) => e.favorite).length;
+  const genCount = libCounts ? libCounts.gen : entries.filter((e) => e.source === 'generate').length;
+  const impCount = libCounts ? libCounts.imp : entries.filter((e) => e.source === 'import').length;
 
   // Online Download — same backend as the Media tab (/api/ytimport/fetch),
   // routed straight into the library so the imported track appears below.

@@ -319,6 +319,24 @@ export const FEATURES: FeatureEntry[] = [
     locate: tourTarget('bottom-tab-midi'),
   },
   {
+    // Locates the PANEL BODY, not the tab button: the dock tab row builds its
+    // hooks from a template literal, so only a tab named in the test's restated
+    // list resolves — and this drawer is better pointed at anyway, since what it
+    // shows is the clip you opened rather than the tab you clicked.
+    id: 'panel-audio-edit',
+    name: 'CLIP',
+    what: 'Trim, slip, fade and gain one audio clip against its whole source, without changing the file',
+    how: [
+      'Double-click an audio clip on the EDIT timeline.',
+      'Drag the handles over the waveform to trim the ends, slide the audio or set the fades.',
+      'Type exact times in the fields, or press Audition to hear just that region.',
+    ],
+    where: 'Bottom dock → CLIP',
+    surface: { kind: 'dock', tab: 'audio-edit' },
+    aliases: ['clip editor', 'audio edit', 'trim', 'slip', 'crop', 'fade in', 'fade out', 'clip gain', 'sample editor'],
+    locate: tourTarget('audio-edit-panel'),
+  },
+  {
     id: 'panel-step-seq',
     name: 'SEQUENCE',
     what: 'Program drum and note patterns step by step on a grid',

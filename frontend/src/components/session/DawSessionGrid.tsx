@@ -24,7 +24,7 @@ import { enableMidi } from '../../state/midiTriggerStore';
 import { usePerformRoutingStore, ctrlMatches } from '../../state/performRouting';
 import { registerPerformChainPush } from '../../state/performRailStore';
 import { logError } from '../../state/logStore';
-import { dawDeviceToEffectNode } from '../../lib/dawEffectMap';
+import { dawDeviceToChainEntry } from '../../lib/dawEffectMap';
 import {
   buildEffectChain,
   ensureChopModule,
@@ -601,21 +601,24 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
       analyser.connect(getMasterGain());
 
       let handle: ChainHandle | null = null;
+      // Hosted VST3/AU devices are NO LONGER filtered out. They were, because
+      // `buildEffectChain` knew only the rack effects and a plugin could not run
+      // in the live Web Audio graph at all — that reason is gone: the builder
+      // has a `vst3` branch that spawns a native host process per entry. So the
+      // set's real plugins now process Perform's signal, with the same rules as
+      // everywhere else: an entry whose host cannot start (no binary, or the
+      // backend's 24-session cap) stays a PASSTHROUGH and shows the backend's
+      // own reason on its row — never silence.
+      //
+      // `dawDeviceToChainEntry` is what makes that possible: the live graph
+      // needs `effect: 'vst3'` plus a `vst` node, where the persisted
+      // interchange node keeps the device's own name. The entry id is the
+      // registry's key, and `perform-<track>-<device>` is stable across chain
+      // rebuilds (and is already what the controller mappings address), so one
+      // host process survives launches instead of respawning per rebuild.
       const entries: ChainEntry[] = (track.devices ?? [])
         .filter((d) => !d.is_instrument && !d.is_rack)
-        .map((d, i) => {
-          const node = dawDeviceToEffectNode(d);
-          return {
-            id: `perform-${mixIndex}-${i}`,
-            effect: node.effect_name,
-            params: node.parameters ?? {},
-            enabled: !node.bypass,
-          } as ChainEntry;
-        })
-        // VST3/AU cannot run in the live Web Audio graph (buildEffectChain only
-        // knows the rack effects), so they are inert here exactly as they are on
-        // the EDIT timeline.
-        .filter((e) => e.effect !== 'vst3');
+        .map((d, i) => dawDeviceToChainEntry(d, `perform-${mixIndex}-${i}`));
       try {
         handle = buildEffectChain(context, input, output, entries);
       } catch (e) {

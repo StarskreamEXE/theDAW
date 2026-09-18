@@ -258,4 +258,49 @@ assert.ok(
   'every delay is finite and non-negative — setTargetAtTime throws otherwise',
 );
 
+/* ── a LIVE hosted VST3 counts, because it really is in the path ────────────
+   The block above pins the other half: a `vst3` entry with no live session
+   contributes 0 and stays `counted: false`. Once a session is live the plugin
+   IS processing, and its latency — the plugin's own plus the bridge's fixed
+   play-out buffer — delays everything behind it. If it did not count here, the
+   mixer would compensate every other track by the wrong amount, which is
+   exactly what "inert" used to mean and no longer does.
+
+   `liveLatencySec` is the seam `vstLiveStore.vstLiveLatencySec` fills in
+   production; it answers 0 for every entry that is not live, which is why the
+   inert cases above need no store at all. */
+{
+  const live = { v1: 0.032 }; // 1024 plugin samples + 1536 bridge, at 48 kHz
+  const liveLatencySec = (id: string) => live[id as keyof typeof live] ?? 0;
+  const entries = [entry('v1', 'vst3'), entry('b', 'fixed'), entry('v2', 'vst3')];
+
+  const rep = chainLatencyReport(entries, { resolve, liveLatencySec });
+  assert.deepEqual(rep.perEntry, [
+    { id: 'v1', effect: 'vst3', latencySec: 0.032, counted: true },
+    { id: 'b', effect: 'fixed', latencySec: 0.006, counted: true },
+    { id: 'v2', effect: 'vst3', latencySec: 0, counted: false },
+  ], 'the live plugin counts; the one that never opened does not');
+  near(rep.totalSec, 0.038, 'and the total is the sum of what is actually in the path');
+  assert.equal(chainLatencySec(entries, { resolve, liveLatencySec }), rep.totalSec);
+
+  // Bypass still wins over liveness: a bypassed entry is routed AROUND, so
+  // whatever its session reports, it delays nothing.
+  const bypassed = chainLatencyReport([entry('v1', 'vst3', false)], { resolve, liveLatencySec });
+  assert.deepEqual(bypassed.perEntry, [{ id: 'v1', effect: 'vst3', latencySec: 0, counted: false }]);
+  assert.equal(bypassed.totalSec, 0, 'a bypassed plugin is not in the path, live session or not');
+
+  // Only `vst3` entries consult the seam: an imported DAW effect has no live
+  // host to ask, and must not pick up a latency because its id collided.
+  const imported = chainLatencyReport([entry('v1', 'imported-x')], {
+    resolve,
+    liveLatencySec: () => 0.5,
+  });
+  assert.deepEqual(imported.perEntry, [{ id: 'v1', effect: 'imported-x', latencySec: 0, counted: false }]);
+
+  // A negative or non-finite answer cannot reach the accumulator: these numbers
+  // end up on a DelayNode, which throws on a non-finite target.
+  const hostile = chainLatencyReport([entry('v1', 'vst3')], { resolve, liveLatencySec: () => -1 });
+  assert.deepEqual(hostile.perEntry, [{ id: 'v1', effect: 'vst3', latencySec: 0, counted: false }]);
+}
+
 console.log('rackEffects latency: chain accumulator counts only live effects, summing aligns to the slowest — passed');

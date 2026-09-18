@@ -4,7 +4,7 @@ import { logError, logInfo } from './logStore';
 import { uuid } from '../orb-kit/utils';
 import { useLibraryStore } from './libraryStore';
 import { usePlayerStore } from './playerStore';
-import { useEffectChainStore, EFFECT_LABELS, MIX_RACK_IDS } from './effectChainStore';
+import { useEffectChainStore, EFFECT_LABELS, MIX_RACK_IDS, type VstStateHost } from './effectChainStore';
 import { useAdvancedEditorSourceStore } from './advancedEditorStore';
 import { getRackEffect, buildEffectChain, ensureChopModule, ensureGranularModule } from '../lib/rackEffects';
 import { encodeWav } from '../lib/wavEncode';
@@ -39,7 +39,12 @@ interface StudioStoreState {
   processAudio: (payload: { effect: string; params: Record<string, number>; skipLibrary?: boolean; quiet?: boolean }) => Promise<void>;
   // VST3 chain stage: uploads the current audio + plugin path to
   // /api/vst/process-file (mirrors processAudio) and returns processed audio.
-  processVst: (payload: { pluginPath: string; pluginName: string; params: Record<string, number>; rawState?: string; skipLibrary?: boolean; quiet?: boolean }) => Promise<void>;
+  // `stateHost` names WHICH host captured `rawState`. A VST3 state blob is not
+  // portable between theDAW's live host and the pedalboard renderer, so the
+  // render has to go back through the one that wrote it. Omitted (or
+  // 'pedalboard') leaves the request byte-for-byte what it always was, which is
+  // what every pre-existing project and every older backend expects.
+  processVst: (payload: { pluginPath: string; pluginName: string; params: Record<string, number>; rawState?: string; stateHost?: VstStateHost; skipLibrary?: boolean; quiet?: boolean }) => Promise<void>;
   // Runs the enabled effects in useEffectChainStore in series over the
   // source in useAdvancedEditorSourceStore, then imports the final result
   // to the library, loads the player, and writes advancedEditorStore.outputUrl.
@@ -222,7 +227,7 @@ export const useStudioStore = create<StudioStoreState>()((set, get) => ({
     }
   },
 
-  processVst: async ({ pluginPath, pluginName, params, rawState, skipLibrary, quiet }) => {
+  processVst: async ({ pluginPath, pluginName, params, rawState, stateHost, skipLibrary, quiet }) => {
     if (get().isProcessing) {
       logInfo('studio', `VST ${pluginName} ignored: a studio process is already running`);
       return;
@@ -247,6 +252,12 @@ export const useStudioStore = create<StudioStoreState>()((set, get) => ({
     form.append('plugin_path', pluginPath);
     form.append('params', JSON.stringify(params || {}));
     if (rawState) form.append('raw_state', rawState);
+    // Only the 'thedaw' case is sent: absent means the backend's existing
+    // pedalboard path, which is what an old project (and an old backend) must
+    // keep getting. A failure from the 'thedaw' path is reported as the backend
+    // words it and NOT retried through pedalboard — a silent fall back would
+    // render a blob that host cannot read and call it a success.
+    if (stateHost === 'thedaw') form.append('state_host', 'thedaw');
 
     try {
       const response = await fetchWithTimeout('/api/vst/process-file', {

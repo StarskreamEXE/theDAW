@@ -58,6 +58,7 @@ import {
   type EditorTrack,
 } from '../state/editorStore';
 import type { RoutingGraph } from '../state/routingGraph';
+import { captureLiveVstStates } from '../state/vstEditorStore';
 import { logError, logInfo, logWarn } from '../state/logStore';
 
 const DIR_NAME = 'thedaw-editor-autosave';
@@ -516,7 +517,14 @@ function resumeSaving(): void {
   paused = false;
 }
 
-async function performSave(): Promise<void> {
+/**
+ * @param captureLive Ask every live plugin that is ahead of its stored state
+ *   for a fresh one before the snapshot. FALSE only on the unload flush: that
+ *   path is racing the document's death and must spend its budget on the OPFS
+ *   write, not on a 750 ms round trip to a host process that is being reaped at
+ *   the same moment (the registry's shutdown DELETE rescues that state instead).
+ */
+async function performSave(captureLive = true): Promise<void> {
   if (saveInFlight) {
     saveQueued = true;
     return;
@@ -527,6 +535,11 @@ async function performSave(): Promise<void> {
     // from the tab that lost it.
     if (ownershipReady) await ownershipReady;
     if (ownership === 'observer') return;
+    // Ahead of the manifest, and only in the tab that will actually write it:
+    // a plugin driven from the FX row with its editor closed is otherwise saved
+    // at the state it held the last time an editor happened to be open. Bounded
+    // and parallel, and it never rejects — see `captureLiveVstStates`.
+    if (captureLive) await captureLiveVstStates();
     const dir = await opfsRoot();
     if (!dir) throw new Error('OPFS unavailable');
     const assets = await dir.getDirectoryHandle(ASSETS_DIR, { create: true });
@@ -614,7 +627,7 @@ export function flushPendingAutosave(): void {
   if (saveTimer === null) return;
   window.clearTimeout(saveTimer);
   saveTimer = null;
-  void performSave();
+  void performSave(false);
 }
 
 // ── Recovery ─────────────────────────────────────────────────────────────────

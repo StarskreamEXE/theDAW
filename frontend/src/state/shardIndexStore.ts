@@ -109,7 +109,8 @@ export const useShardIndexStore = create<ShardIndexState>()((set, get) => ({
         let rows = await fetchEntry(entryId);
         if (rows.length === 0 && opts?.run !== false) {
           set((s) => ({ status: { ...s.status, [entryId]: 'sharding' } }));
-          const title = useLibraryStore.getState().entries.find((e) => e.id === entryId)?.title ?? entryId;
+          // By id: `entries` holds only the loaded rows of the library.
+          const title = useLibraryStore.getState().getById(entryId)?.title ?? entryId;
           logInfo('loom', `Sharding "${title}"…`);
           const run = await fetch(`/api/shards/${encodeURIComponent(entryId)}/run`, { method: 'POST' });
           if (!run.ok) {

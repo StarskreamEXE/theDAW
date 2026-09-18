@@ -107,6 +107,10 @@ dependencies = [
     # guards its import and falls back to its own letter-to-sound rules, so
     # the backend still boots if this is absent.
     "cmudict>=1.0.0",
+    # Suno cache staging (backend/modules/library/suno_stage.py) — streams a
+    # multi-GB `{"songs": [...]}` cache without loading it. JSONL needs nothing;
+    # only the big-JSON path imports this, and it prefers the C backend.
+    "ijson>=3.3",
 ]
 
 [project.optional-dependencies]
@@ -245,6 +249,9 @@ exclude = [
     # Vendored subrepo (dada-bots/underfit + local mods); keeps its own style,
     # not linted by the parent project — same policy as the MRT2 sidecar above.
     "underfit",
+    # Verbatim reference helpers extracted from the 2026-09-18 handoff pack; never
+    # imported or run — ported into backend/ with the project's own style.
+    "docs/design/repair-pack",
     # Runtime-created isolated venv for the faster-whisper transcription sidecar.
     "backend/modules/vocal/transcription/.whisper_venv",
     # Vendored stems-separation sidecar (Demucs/LARSNET server); runs in its own

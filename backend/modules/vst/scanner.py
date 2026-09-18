@@ -39,6 +39,14 @@ class Vst3PluginInfo:
     loadable: bool = True
     probed: bool = False
     probe_timeouts: int = 0
+    # The plugin's OWN name and VST3 identifier, read from the plugin by
+    # ``probe_plugin``. ``name`` above is only the bundle/file stem — the host
+    # library's filename, which is often not what the vendor calls the plugin
+    # ("FabFilter Pro-Q 4.vst3" vs "Pro-Q 4"), and for a multi-plugin shell is
+    # not a plugin name at all. Empty until the probe lands (and for a plugin
+    # that never loads), so every consumer falls back to ``name``.
+    display_name: str = ""
+    identifier: str = ""
 
 
 # A VST3 bundle stores its binaries under Contents/<architecture>/. Only
@@ -258,6 +266,11 @@ def probe_plugin(path: str) -> dict:
     if not category:
         category = "instrument" if getattr(plugin, "is_instrument", False) else "effect"
     return {
+        # The plugin's own name and identifier, which no filesystem scan can
+        # know. Every value is coerced to a string so a plugin that reports
+        # None (or nothing) yields "" rather than a null in the cache/API.
+        "display_name": str(getattr(plugin, "name", "") or ""),
+        "identifier": str(getattr(plugin, "identifier", "") or ""),
         "manufacturer": getattr(plugin, "manufacturer_name", "") or "",
         "version": getattr(plugin, "version", "") or "",
         "category": category,
@@ -342,6 +355,8 @@ def enrich_plugin_metadata(
         if meta is None:
             info.loadable = False
             continue
+        info.display_name = info.display_name or meta.get("display_name", "")
+        info.identifier = info.identifier or meta.get("identifier", "")
         info.manufacturer = info.manufacturer or meta.get("manufacturer", "")
         info.version = info.version or meta.get("version", "")
         if info.category in ("", "unknown"):
@@ -438,6 +453,8 @@ def carry_over_metadata(
             continue
         info.probed = True
         info.loadable = info.loadable and old.loadable
+        info.display_name = info.display_name or old.display_name
+        info.identifier = info.identifier or old.identifier
         info.manufacturer = info.manufacturer or old.manufacturer
         info.version = info.version or old.version
         if info.category in ("", "unknown"):
@@ -447,8 +464,11 @@ def carry_over_metadata(
 # --- Scan result cache ---
 _CACHE_FILENAME = "vst3_scan_cache.json"
 # Bumped whenever the scan changes shape, so an older cache is discarded rather
-# than served (v2: one entry per plugin instead of bundle + inner-binary twins).
-_CACHE_VERSION = 2
+# than served (v2: one entry per plugin instead of bundle + inner-binary twins;
+# v3: the probe also records display_name/identifier — a v2 entry carries
+# probed=True, so without the bump it would never be probed again and every
+# name would stay stuck at the filename stem).
+_CACHE_VERSION = 3
 
 
 def _cache_path() -> Path:

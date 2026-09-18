@@ -6,6 +6,7 @@ import {
   SlidersHorizontal, Undo2, Redo2, Gauge, Repeat, Flag, Circle, Copy, Music,
   Plug, Snowflake, Loader2, ChevronUp, ChevronDown, RefreshCw, Blocks,
   Maximize2, Rows3, Keyboard, AudioLines, Spline, FolderOpen, Check,
+  Settings2, ScanSearch, BoxSelect, Ellipsis, AudioWaveform, Bot,
 } from 'lucide-react';
 import { deriveStyle, deriveLyrics } from '../../catalog/catalogSearch';
 import { addBlobsToChimera } from '../../lib/chimeraClient';
@@ -86,6 +87,31 @@ import { publishSelectedTracks } from '../../state/editorSelectionBridge';
 import * as liveMixer from '../../state/liveMixer';
 import { useDjAnalysisStore } from '../../state/djAnalysisStore';
 import { laneTargetAtY } from './laneTarget';
+import {
+  cancelReorder, finishReorder, moveReorder, movingIdsFor, reorderRows, startReorder,
+  type ReorderSession,
+} from './trackReorderDrag';
+import {
+  autoscrollVelocity, cancelGesture, finishGesture, isPrimaryGestureButton, moveGesture, placementIntent,
+  refreshMarquee, startGesture, type ClickSurface, type GestureState,
+} from '../../lib/timeline/pointerGesture';
+import { combineMarquee, contextAt, marqueeModeFor, reduceSelection, type TimeRange } from '../../lib/timeline/timeSelection';
+import { layoutRows } from '../../lib/timeline/trackOrder';
+import { useTimelinePrefs } from '../../state/timelinePrefsStore';
+import { WHEEL_PROFILES, isWheelExcludedTarget } from '../../lib/timeline/viewport';
+import { useEditThemeStore } from '../../state/editThemeStore';
+import { TimelineGridLayer } from './TimelineGridLayer';
+import { TimelinePrefsPanel } from './TimelinePrefsPanel';
+import {
+  ZOOM_FOLLOW_HOLD_MS, ZOOM_STEP_FACTOR, clipChromeLayout, createZoomCoalescer, fitProjectZoom, fitRangeZoom,
+  followHoldActive, localViewportWidth, planZoom, resolveAnchorSec, rulerBarLabels, spanOfClips, viewportWindowSec,
+  wheelDispatch, type ZoomAnchor, type ZoomCoalescer,
+} from './timelineZoom';
+import {
+  buildClipHitRects, buildRangeMenu, classifyRulerPress, formatCursorTime, formatRangeReadout,
+  highlightClearDecision, hitTestClipRects,
+  inpaintFromRange, rangeSplitPlan, rulerDragRange, type RangeMenuAction,
+} from './timelineInteraction';
 import { alignedStart, beatMatchPlan, firstBeatInClip } from '../../lib/beatMatch';
 import { ContextMenu, useContextMenu, type ContextMenuItem, type ContextMenuPosition } from '../ui/ContextMenu';
 import { SurfacePlayKey } from '../ui/SurfacePlayKey';
@@ -93,7 +119,17 @@ import { StemsRunModal, type StemsRunOptions } from '../library/StemsRunModal';
 import { EffectWindowsHost, FxChainList, openEffectWindow, type EffectWindowOrigin, type FxScope } from './EffectWindows';
 import { browserPopoverEnv, popoverMaxHeight, sameLayout, watchPopover, type PopoverLayout } from '../../lib/popoverPlacement';
 import { useTrackFxRackStore, type TrackFxRackAnchor } from '../../state/trackFxRackStore';
-import { ensureStems } from '../../lib/djStems';
+import { ensureStems, listStems, type StemRef } from '../../lib/djStems';
+import { clipEditKind, isMidiClip } from '../../lib/clipEditTarget';
+import {
+  REVEAL_CLIP_EVENT, clipGesturePhase, planStemInsert, skippedAggregatesNote, stemClipPlacement,
+  type RevealClipDetail,
+} from './clipDoubleClick';
+import { useAudioEditorStore } from '../../state/audioEditorStore';
+import {
+  referenceForClip, referenceForTimeSelection, referenceForTrack, requestAssistantFocus,
+  useAssistantReferenceStore, type AssistantReference,
+} from '../../state/assistantReferenceStore';
 import { useFeatureToggleStore } from '../../state/featureToggleStore';
 import { punchWindowFrom, useRecordingPrefs, useRecordingStore, type RecordingStatus } from '../../state/recordingStore';
 import type { LevelFrame } from '../../lib/recordingEngine';
@@ -150,6 +186,14 @@ const isEditorTimelinePlaying = (): boolean => {
   const player = usePlayerStore.getState();
   return player.isPlaying && player.currentEntryId === 'editor-timeline';
 };
+
+/** macOS: a ctrl+click with a mouse is a context-menu click, never a timeline gesture. */
+const IS_MAC = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform);
+
+/** Installed on window while a ruler or lane press is in flight, so dragging
+ *  across clip labels and readouts never starts a text selection. */
+const preventSelectStart = (e: Event): void => e.preventDefault();
+
 
 // Preview routes through the shared engine context so the visualizer sees it too.
 
@@ -397,8 +441,17 @@ const processThroughVst = async (file: File, vst: VstNode, name: string): Promis
   // defaults, silently discarding whatever the user dialled in through the
   // plugin's native GUI.
   if (vst.raw_state) form.append('raw_state', vst.raw_state);
+  // ...and WHICH host captured it. A VST3 state blob does not survive the trip
+  // between theDAW's live host and the pedalboard renderer (measured), so a
+  // state our host wrote has to be rendered back through our host. Only that
+  // case is sent: absent means the pedalboard path the backend has always
+  // taken, so every old project and every older backend behaves identically.
+  if (vst.state_host === 'thedaw') form.append('state_host', 'thedaw');
   const res = await fetch('/api/vst/process-file', { method: 'POST', body: form });
   if (!res.ok) {
+    // Surfaced as the backend words it, and NOT retried through pedalboard: a
+    // silent fall back would print a state that host cannot read and report a
+    // clean render of the wrong sound.
     let detail = `HTTP ${res.status}`;
     try {
       const j = (await res.json()) as { detail?: string };
@@ -1220,8 +1273,8 @@ const EDIT_SHORTCUTS: Array<{ group: string; keys: Array<[string, string]> }> = 
       // Bound in PlayerFooter (the app-wide transport), not in this file;
       // the sheet documents the key, the footer owns the handler.
       ['R', 'Record / stop'],
-      ['Home', 'Playhead to start'],
-      ['End', 'Playhead to end'],
+      ['Home', 'Playhead and edit cursor to start'],
+      ['End', 'Playhead and edit cursor to end'],
       ['L', 'Toggle loop'],
       ['M', 'Marker at playhead'],
     ],
@@ -1234,7 +1287,7 @@ const EDIT_SHORTCUTS: Array<{ group: string; keys: Array<[string, string]> }> = 
       ['S', 'Split selection at playhead'],
       ['Del', 'Delete selected clips'],
       ['Ctrl+D', 'Duplicate'],
-      ['Ctrl+C / X / V', 'Copy / cut / paste at playhead'],
+      ['Ctrl+C / X / V', 'Copy / cut / paste at the edit cursor'],
       ['Ctrl+A', 'Select all clips'],
       ['Ctrl+Z / Ctrl+Shift+Z', 'Undo / redo'],
     ],
@@ -1320,7 +1373,7 @@ const MarkerFlag: React.FC<{
   const [draft, setDraft] = useState(marker.label);
   const commit = () => { onRename(draft.trim() || marker.label); setEditing(false); };
   return (
-    <div className="absolute top-0 bottom-0 z-30" style={{ left: marker.t * zoom }} onMouseDown={(e) => e.stopPropagation()}>
+    <div data-ruler-control="1" className="absolute top-0 bottom-0 z-30" style={{ left: marker.t * zoom }} onMouseDown={(e) => e.stopPropagation()}>
       <div className="absolute top-3.5 bottom-0 w-px bg-cyan-400/50 pointer-events-none" />
       {editing ? (
         <input
@@ -1431,11 +1484,16 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   // the next transport start, so it never fights the user for the scrollbar.
   const followPlayheadRef = useRef(true);
   const programmaticScrollRef = useRef(false);
+  /** performance.now() until which follow paging holds off: a zoom keeps the
+   *  edit cursor centred, and paging to the playhead on the next frame would
+   *  undo it. Follow stays armed and resumes once the hold lapses. */
+  const zoomFollowHoldUntilRef = useRef(0);
   useEffect(() => {
     const scrollIntoView = (sec: number) => {
       const el = timelineScrollRef.current;
       if (!el || !followPlayheadRef.current) return;
       if (!liveMixer.isPlaying()) return;
+      if (followHoldActive(performance.now(), zoomFollowHoldUntilRef.current)) return;
       const x = sec * zoomRef.current;
       const view = el.clientWidth;
       if (view <= 0) return;
@@ -1488,7 +1546,6 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const setTrackHeight = useEditorStore((s) => s.setTrackHeight);
   const setSelected = useEditorStore((s) => s.setSelected);
   const setTool = useEditorStore((s) => s.setTool);
-  const setZoom = useEditorStore((s) => s.setZoom);
   const setSnap = useEditorStore((s) => s.setSnap);
   const setBpm = useEditorStore((s) => s.setBpm);
   const setPlayhead = useEditorStore((s) => s.setPlayhead);
@@ -1496,6 +1553,10 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const insertTrack = useEditorStore((s) => s.insertTrack);
   const removeTrack = useEditorStore((s) => s.removeTrack);
   const updateTrack = useEditorStore((s) => s.updateTrack);
+  /* Reorder (F01). Both record ONE undo step and no-op on an unchanged order;
+     routing and clip trackIds are keyed by id, so neither is touched. */
+  const moveTracks = useEditorStore((s) => s.moveTracks);
+  const moveTracksByOffset = useEditorStore((s) => s.moveTracksByOffset);
   const toggleSolo = useEditorStore((s) => s.toggleSolo);
   const updateClip = useEditorStore((s) => s.updateClip);
   const removeClip = useEditorStore((s) => s.removeClip);
@@ -1828,7 +1889,9 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     laneInsertRef.current = idx;
     setLaneInsert(idx);
   };
-  const inpaintDragRef = useRef<{ clipId: string; anchorSec: number } | null>(null);
+  // originX/Y: the press in client px, so a release without travel reads as a
+  // clip-body click (edit cursor placement, F06) rather than a mask drag.
+  const inpaintDragRef = useRef<{ clipId: string; anchorSec: number; originX: number; originY: number } | null>(null);
   const previewSourceRef = useRef<AudioBufferSourceNode | null>(null);
   // Playhead drag
   const playheadDragRef = useRef<{ startX: number; startSec: number; wasPlaying: boolean } | null>(null);
@@ -1875,6 +1938,11 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     const r = el.getBoundingClientRect();
     return { x: Math.round(r.left), y: Math.round(r.bottom) + 4 };
   };
+  /** Timeline preferences popover, anchored under its toolbar key. */
+  const [prefsAnchor, setPrefsAnchor] = useState<{ x: number; y: number } | null>(null);
+  /** Whether the popover was open when the key's press began (null = no press). */
+  const prefsOpenAtPressRef = useRef<boolean | null>(null);
+  const closePrefs = useCallback(() => setPrefsAnchor(null), []);
   // The TOOLS dropdown (Magenta / Metamorph) — anchored under its button.
   const [toolsMenu, setToolsMenu] = useState<{ x: number; y: number } | null>(null);
   // Per-track FX rack popover. x/y anchor it at the opening click (clip FX
@@ -2043,11 +2111,19 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         (pct, phase) => setStemsJob({ clipId, entryId, phase, pct }),
       );
       if (!refs.length) throw new Error('separation produced no stems');
-      // 3. One new track per stem; the clip lands exactly where the source is.
+      // 3. Which stems go on the timeline. An `aggregate` row is a SUM of other
+      //    rows in the same run (`drums` over the LARSNET kit parts,
+      //    `no_vocals` over everything but the vocal), so placing it beside its
+      //    members would put that audio on the arrangement twice at double
+      //    level. A run that reports no roles at all is placed whole, as before.
+      const plan = planStemInsert(refs);
       setStemsJob({ clipId, entryId, phase: 'placing clips', pct: 100 });
-      const srcNow = useEditorStore.getState().clips.find((c) => c.id === clipId) ?? src;
-      let placed = 0;
-      for (const ref of refs) {
+      // 4. Fetch and decode EVERY stem before touching the document. The store
+      //    writes then run back to back with nothing awaited between them, so
+      //    they land inside one coalescing burst (300 ms) and the explosion is
+      //    a single undo step instead of one per stem.
+      const decoded: Array<{ ref: StemRef; blob: Blob; peaks: Float32Array; duration: number }> = [];
+      for (const ref of plan.insert) {
         const res = await fetch(ref.url);
         if (!res.ok) {
           logError('editor', `stem ${ref.name}: fetch failed (${res.status})`);
@@ -2055,31 +2131,48 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         }
         const blob = await res.blob();
         const { peaks, duration } = await computePeaks(blob, 240);
-        const store = useEditorStore.getState();
+        decoded.push({ ref, blob, peaks, duration });
+      }
+      if (!decoded.length) throw new Error('no stem audio could be fetched');
+      // 5. One new track per stem; each clip lands exactly where the source is.
+      //    Read the source AFTER the downloads — it may have been moved or
+      //    trimmed while they ran, and the stems line up with where it is now.
+      const srcNow = useEditorStore.getState().clips.find((c) => c.id === clipId) ?? src;
+      beginUndoStep();
+      const store = useEditorStore.getState();
+      for (const { ref, blob, peaks, duration } of decoded) {
+        const label = `${srcNow.label} · ${ref.name}`;
         const color = STEM_TRACK_COLORS[ref.name] ?? srcNow.color;
-        const trackId = store.addTrack({ name: `${srcNow.label} · ${ref.name}`, color });
-        const offset = Math.min(srcNow.offsetIntoSource, Math.max(0, duration - 0.05));
+        const trackId = store.addTrack({ name: label, color });
         const newClipId = store.addClipToTrack({
           trackId,
-          label: `${srcNow.label} · ${ref.name}`,
+          label,
           audioBlob: blob,
           mimeType: 'audio/wav',
           sourceDuration: duration,
-          offsetIntoSource: offset,
-          durationSec: Math.min(srcNow.durationSec, Math.max(0.05, duration - offset)),
-          startSec: srcNow.startSec,
+          ...stemClipPlacement(srcNow, duration),
           color,
           gain: srcNow.gain,
           fadeInSec: srcNow.fadeInSec,
           fadeOutSec: srcNow.fadeOutSec,
         });
         store.cachePeaks(newClipId, peaks);
-        placed += 1;
       }
-      if (!placed) throw new Error('no stem audio could be fetched');
-      // 4. Mute the source clip — kept, so the explosion is undoable/reversible.
-      useEditorStore.getState().updateClip(clipId, { muted: true });
-      logInfo('editor', `Exploded "${srcNow.label}" into ${placed} stem track(s)`);
+      // 6. Mute the source clip — kept, so the explosion is undoable/reversible.
+      //    `{ coalesce: true }` is what makes the whole explode ONE undo step:
+      //    `updateClip` keys its coalescing on the clip while `addTrack` /
+      //    `addClipToTrack` are anonymous, so without the opt-in this write
+      //    opened a SECOND step and one Ctrl-Z left the stems on the timeline
+      //    with the parent unmuted — every part of the audio playing twice.
+      //    The `beginUndoStep()` above already cut the burst for the whole
+      //    operation, which is exactly the case the opt-in exists for (same
+      //    rule as a `stretchClipToFit` drag).
+      useEditorStore.getState().updateClip(clipId, { muted: true }, { coalesce: true });
+      const note = skippedAggregatesNote(plan.skipped);
+      logInfo(
+        'editor',
+        `Exploded "${srcNow.label}" into ${decoded.length} stem track(s)${note ? ` — ${note}` : ''}`,
+      );
       setStemsJob(null);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -2346,8 +2439,64 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     logInfo('editor', `Beat match to ${Math.round(targetBpm)} bpm: ${stretched} stretched, ${aligned} moved onto the grid${skipped}`);
   }, [applyTimePitch, clipKnownBpm, setBpm, updateClip]);
 
-  const [selectedClipIds, setSelectedClipIds] = useState<string[]>([]);
-  const [selectedTrackIds, setSelectedTrackIds] = useState<string[]>([]);
+  // The clip / track multi-selection lives in editorStore (batch 11), not local
+  // state: EDIT unmounts on a tab switch and a local selection died with it.
+  // These two wrappers keep the useState setter shape every call site below
+  // already uses (value or updater), and skip the store write when nothing
+  // changed so the prune effect cannot ping-pong renders.
+  const selectedClipIds = useEditorStore((s) => s.selectedClipIds);
+  const selectedTrackIds = useEditorStore((s) => s.selectedTrackIds);
+  const setSelectedClipIds = useCallback((next: string[] | ((prev: string[]) => string[])) => {
+    const st = useEditorStore.getState();
+    const ids = typeof next === 'function' ? next(st.selectedClipIds) : next;
+    if (ids.length === st.selectedClipIds.length && ids.every((id, i) => id === st.selectedClipIds[i])) return;
+    st.setSelectedClipIds(ids);
+  }, []);
+  const setSelectedTrackIds = useCallback((next: string[] | ((prev: string[]) => string[])) => {
+    const st = useEditorStore.getState();
+    const ids = typeof next === 'function' ? next(st.selectedTrackIds) : next;
+    if (ids.length === st.selectedTrackIds.length && ids.every((id, i) => id === st.selectedTrackIds[i])) return;
+    st.setSelectedTrackIds(ids);
+  }, []);
+  // The time range (F03) and the edit cursor (F06), also workspace state in the store.
+  const timeSelection = useEditorStore((s) => s.timeSelection);
+  const editCursorSec = useEditorStore((s) => s.editCursorSec);
+  const setTimeSelection = useEditorStore((s) => s.setTimeSelection);
+  const setEditCursor = useEditorStore((s) => s.setEditCursor);
+  const clickProfile = useTimelinePrefs((s) => s.clickProfile);
+  /** Grid style (F05): tier opacities, bar width, lane-divider alpha. */
+  const gridStyle = useTimelinePrefs((s) => s.grid);
+  /** Redraw key for the canvas grid: its line colour comes from the theme. */
+  const editThemeId = useEditThemeStore((s) => s.themeId);
+
+  /** A real transport seek: moves the playhead and, when the footer player is
+   *  driving the editor timeline, the audio itself. Never starts or stops play.
+   *  While stopped the playhead and the edit cursor are one point, so a seek
+   *  then moves the edit cursor too (F06). */
+  const seekEditorTo = useCallback((sec: number) => {
+    setPlayhead(sec);
+    if (usePlayerStore.getState().currentEntryId === 'editor-timeline') {
+      usePlayerStore.getState().seek(sec);
+    }
+    if (!isEditorTimelinePlaying()) setEditCursor(sec);
+  }, [setPlayhead, setEditCursor]);
+
+  /* Timeline gesture state shared by the Escape key (window listener, declared
+     further up than the handlers) and the pointer handlers further down. */
+  /** The empty-lane press in flight: a click until it travels 4 px, then a marquee. */
+  const marqueeRef = useRef<GestureState | null>(null);
+  /** The live rubber band in lanes-content local px, for drawing; null when none. */
+  const [marqueeRect, setMarqueeRect] = useState<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
+  /** Last pointer position (client px) of the marquee, re-read after an autoscroll step. */
+  const marqueeClientRef = useRef<{ x: number; y: number } | null>(null);
+  const marqueeRafRef = useRef<number | null>(null);
+  /** A plain ruler press: seek on a click, time range on a drag. `before` is the
+   *  range at press time, restored if Escape cancels the drag. */
+  const rulerPressRef = useRef<
+    { pointerId: number; originX: number; originY: number; anchorSec: number; dragging: boolean; before: TimeRange | null } | null
+  >(null);
+  /** Set by the render below: what Escape does on the timeline (menu → gesture → clips → range → inpaint mask). */
+  const timelineEscapeRef = useRef<() => void>(() => {});
 
   // Publish the track selection for non-React consumers (the Sway control
   // surface's selection-following fader bank reads this).
@@ -3001,16 +3150,18 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     deleteSelectedClips();
   }, [copySelectedClips, deleteSelectedClips]);
 
-  /** Paste at the playhead, preserving the clips' relative timing and their track
-   *  layout. A clip whose original track is gone lands on the first track.
+  /** Paste at the edit cursor, preserving the clips' relative timing and their
+   *  track layout. A clip whose original track is gone lands on the first track.
+   *  The edit cursor, not the playhead: a click while playing places the cursor
+   *  without moving the transport (F06), and the paste goes where the user put it.
    *
    *  `opts` is what the timeline's right-click "Paste clip here" passes: the
-   *  clicked time instead of the playhead, and the clicked lane instead of each
+   *  clicked time instead of the edit cursor, and the clicked lane instead of each
    *  clip's original track (so a paste lands where the user pointed). */
   const pasteClips = useCallback((opts?: { atSec?: number; trackId?: string }) => {
     const buf = clipboardRef.current;
     if (buf.length === 0) return;
-    const anchor = snapSec(opts?.atSec ?? useEditorStore.getState().playheadSec);
+    const anchor = snapSec(opts?.atSec ?? useEditorStore.getState().editCursorSec);
     const earliest = Math.min(...buf.map((c) => c.startSec));
     const liveTracks = useEditorStore.getState().tracks;
     const fallbackTrackId = opts?.trackId ?? liveTracks[0]?.id;
@@ -3095,15 +3246,171 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     setSelected(ids[0]);
   }, [clips, setSelected]);
 
-  /** Fit the whole arrangement in the viewport, then scroll back to the top. */
+  /* --- Zoom (F07). Every zoom entry point — wheel, toolbar +/-, +/- keys, fit,
+     zoom to selection / selected clips — goes through requestZoom, which keeps
+     the EDIT CURSOR centred (not the pointer, not time 0, not the left edge).
+     The new scrollLeft cannot be written in the same tick as setZoom: the lanes
+     are still the old width, so the browser would clamp the write and the
+     anchor would drift. It is parked in pendingZoomScrollRef and applied by the
+     layout effect below once the wider content is committed. */
+  const pendingZoomScrollRef = useRef<number | null>(null);
+
+  /** The scroller's visible width in LOCAL px. Its on-screen rect is viewport
+   *  px (divide by the cumulative CSS zoom) and includes the vertical
+   *  scrollbar (local px, subtracted after). The track-header column is a
+   *  sibling outside the scroller, so there is no header width to exclude. */
+  const measureViewportWidth = useCallback((el: HTMLElement): number => {
+    const scrollbar = Math.max(0, el.offsetWidth - el.clientWidth);
+    return Math.max(0, localViewportWidth({
+      rectWidthPx: el.getBoundingClientRect().width,
+      layoutZoom: effectiveZoom(el),
+      headerColumnPx: 0,
+    }) - scrollbar);
+  }, []);
+
+  /** Claim the scroll events of this frame as ours, so the follow-playhead
+   *  listener does not read them as the user taking the scrollbar. Cleared on
+   *  the next frame, after the scroll events it covers have been dispatched. */
+  const markProgrammaticScroll = useCallback(() => {
+    programmaticScrollRef.current = true;
+    requestAnimationFrame(() => { programmaticScrollRef.current = false; });
+  }, []);
+
+  /** A scroll write that is ours. */
+  const writeProgrammaticScrollLeft = useCallback((el: HTMLElement, left: number) => {
+    markProgrammaticScroll();
+    el.scrollLeft = left;
+  }, [markProgrammaticScroll]);
+
+  /** Zoom to `nextZoom` px/s (clamped to ZOOM_MIN..ZOOM_MAX) keeping `anchor`
+   *  — the edit cursor unless told otherwise, clamped into the project — at
+   *  the centre of the viewport where the content allows it. */
+  const requestZoom = useCallback((nextZoom: number, anchor: ZoomAnchor = 'edit-cursor') => {
+    if (!Number.isFinite(nextZoom) || nextZoom <= 0) return;
+    const st = useEditorStore.getState();
+    const el = timelineScrollRef.current;
+    const viewportWidth = el ? measureViewportWidth(el) : 0;
+    if (!el || viewportWidth <= 0) {
+      st.setZoom(nextZoom);
+      return;
+    }
+    const totalDurationSec = st.getTotalDurationSec();
+    const plan = planZoom({
+      requestedZoom: nextZoom,
+      anchorSec: resolveAnchorSec(anchor, st.editCursorSec, totalDurationSec),
+      totalDurationSec,
+      viewportWidth,
+      bounds: { min: ZOOM_MIN, max: ZOOM_MAX },
+    });
+    // While the transport rolls, follow-playhead would page away from the
+    // anchor on the very next frame; hold it off briefly (it stays armed).
+    zoomFollowHoldUntilRef.current = performance.now() + ZOOM_FOLLOW_HOLD_MS;
+    if (plan.zoom === st.zoom) {
+      // Same width: nothing to wait for.
+      pendingZoomScrollRef.current = null;
+      writeProgrammaticScrollLeft(el, plan.scrollLeft);
+      return;
+    }
+    pendingZoomScrollRef.current = plan.scrollLeft;
+    // Zooming out shrinks the lanes, and the browser clamps scrollLeft as they
+    // shrink — that scroll event is a consequence of this zoom, not the user
+    // grabbing the scrollbar, so claim it before the width changes.
+    markProgrammaticScroll();
+    st.setZoom(plan.zoom);
+  }, [markProgrammaticScroll, measureViewportWidth, writeProgrammaticScrollLeft]);
+
+  useLayoutEffect(() => {
+    const left = pendingZoomScrollRef.current;
+    if (left === null) return;
+    pendingZoomScrollRef.current = null;
+    const el = timelineScrollRef.current;
+    if (el) writeProgrammaticScrollLeft(el, left);
+  }, [zoom, writeProgrammaticScrollLeft]);
+
+  /** One discrete zoom step (toolbar buttons, +/- keys). */
+  const zoomStepBy = useCallback((direction: 'in' | 'out') => {
+    const z = useEditorStore.getState().zoom;
+    requestZoom(direction === 'in' ? z * ZOOM_STEP_FACTOR : z / ZOOM_STEP_FACTOR);
+  }, [requestZoom]);
+
+  /** Wheel bursts: one zoom request per animation frame. */
+  const zoomCoalescerRef = useRef<ZoomCoalescer | null>(null);
+  const requestZoomRef = useRef(requestZoom);
+  requestZoomRef.current = requestZoom;
+  if (zoomCoalescerRef.current === null) {
+    zoomCoalescerRef.current = createZoomCoalescer({
+      schedule: (cb) => requestAnimationFrame(cb),
+      cancel: (id) => cancelAnimationFrame(id),
+      readZoom: () => useEditorStore.getState().zoom,
+      apply: (z) => requestZoomRef.current(z),
+      bounds: { min: ZOOM_MIN, max: ZOOM_MAX },
+    });
+  }
+  useEffect(() => () => zoomCoalescerRef.current?.cancel(), []);
+
+  /** Fit [startSec, endSec] with a 5 % margin on each side, centred on it. */
+  const zoomToRange = useCallback((startSec: number, endSec: number) => {
+    const el = timelineScrollRef.current;
+    if (!el) return;
+    const fit = fitRangeZoom(startSec, endSec, measureViewportWidth(el));
+    if (fit) requestZoom(fit.zoom, { sec: fit.centerSec });
+  }, [measureViewportWidth, requestZoom]);
+
+  /* ── Reveal a clip (F19) ──────────────────────────────────────────────────
+     The AUDIO EDIT drawer's "Reveal in timeline" key dispatches
+     `thedaw:reveal-clip`; this brings the clip into view here. Three things,
+     in the order a user reads them: the clip becomes the selection, the lanes
+     scroll to it, and the edit cursor parks on its start (so the next Space,
+     split or paste acts there).
+
+     BOTH scroll writes are claimed as ours FIRST. The follow-playhead listener
+     treats any unclaimed scroll as the user grabbing the scrollbar and disarms
+     itself, and revealing a clip must not cost the user follow-playhead on the
+     next transport start. Neither axis is touched when the clip is already in
+     view — scrolling to something you can see is just a jump. */
+  useEffect(() => {
+    const onReveal = (e: Event) => {
+      const clipId = (e as CustomEvent<RevealClipDetail>).detail?.clipId;
+      if (typeof clipId !== 'string' || clipId.length === 0) return;
+      const st = useEditorStore.getState();
+      const clip = st.clips.find((c) => c.id === clipId);
+      if (!clip) {
+        logError('editor', `Cannot reveal clip ${clipId.slice(0, 8)}: it is no longer in the project`);
+        return;
+      }
+      selectClipSingle(clipId);
+      setEditCursor(Math.max(0, clip.startSec));
+
+      const el = timelineScrollRef.current;
+      if (!el) return;
+      const laneH = st.trackHeight;
+      const leftPx = clip.startSec * st.zoom;
+      const rightPx = (clip.startSec + clip.durationSec) * st.zoom;
+      const viewW = measureViewportWidth(el);
+      const trackIdx = st.tracks.findIndex((t) => t.id === clip.trackId);
+      const topPx = trackIdx * laneH;
+      const viewH = el.clientHeight;
+      const needsX = viewW > 0 && (leftPx < el.scrollLeft || rightPx > el.scrollLeft + viewW);
+      const needsY = trackIdx >= 0 && viewH > 0 && (topPx < el.scrollTop || topPx + laneH > el.scrollTop + viewH);
+      if (!needsX && !needsY) return;
+      markProgrammaticScroll();
+      // A margin ahead of the clip rather than hard against the left edge, so
+      // what comes before it stays readable — the same lead follow-playhead uses.
+      if (needsX) el.scrollLeft = Math.max(0, leftPx - viewW * 0.15);
+      if (needsY) el.scrollTop = Math.max(0, topPx - Math.max(0, (viewH - laneH) / 2));
+    };
+    window.addEventListener(REVEAL_CLIP_EVENT, onReveal);
+    return () => window.removeEventListener(REVEAL_CLIP_EVENT, onReveal);
+  }, [selectClipSingle, setEditCursor, measureViewportWidth, markProgrammaticScroll]);
+
+  /** Fit the whole arrangement in the viewport ("whole project": anchored on
+   *  the project centre, so the clamp lands at the start). */
   const zoomToFit = useCallback(() => {
     const el = timelineScrollRef.current;
-    const dur = getTotalDurationSec();
-    if (!el || dur <= 0) return;
-    const usable = Math.max(200, el.clientWidth - 24);
-    setZoom(usable / dur);
-    el.scrollLeft = 0;
-  }, [getTotalDurationSec, setZoom]);
+    if (!el) return;
+    const fit = fitProjectZoom(getTotalDurationSec(), measureViewportWidth(el));
+    if (fit) requestZoom(fit.zoom, { sec: fit.centerSec });
+  }, [getTotalDurationSec, measureViewportWidth, requestZoom]);
 
   // --- Keyboard hotkeys ---
   // v          = move tool                 c            = cut tool
@@ -3112,17 +3419,32 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   // ←/→        = nudge by grid (Shift ×4)  ↑/↓          = move a track up / down
   // Home/End   = playhead to start / end   m            = marker at playhead
   // l          = toggle loop               +/-          = zoom in / out
-  // Shift+F    = zoom to fit               Escape       = clear inpaint selection
-  // Ctrl/Cmd + C/X/V = copy / cut / paste at playhead
+  // Shift+F    = zoom to fit               Escape       = clear clips, then range, then inpaint mask
+  // Ctrl/Cmd + C/X/V = copy / cut / paste at the edit cursor
   // Ctrl/Cmd + D = duplicate               Ctrl/Cmd + A = select all clips
   // Ctrl/Cmd + P = inpaint selection       (Ctrl/Cmd + Z/Y = undo/redo, own effect)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // Someone ahead of us already handled this key (an open ContextMenu takes
+      // Escape, for one). Listener order between two window handlers depends on
+      // which effect re-registered last, so the flag is what decides, not luck.
+      if (e.defaultPrevented) return;
       const t = e.target as HTMLElement | null;
       // SELECT is in the exclusion list because the bare-letter hotkeys below
       // (s / m / l / f) would otherwise steal type-to-jump inside a dropdown such
       // as the snap-division picker.
       if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+      // Alt+Shift+Arrow moves the selected TRACKS one row (F01) — the same edit
+      // the header grip's Alt+Arrow makes, reachable without focusing a grip.
+      // Alt alone belongs to the lane keys, so the Shift is what distinguishes
+      // "move the tracks" from them.
+      if (e.altKey && e.shiftKey && !e.ctrlKey && !e.metaKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+        const st = useEditorStore.getState();
+        if (st.selectedTrackIds.length === 0) return;
+        e.preventDefault();
+        st.moveTracksByOffset(st.selectedTrackIds, e.key === 'ArrowUp' ? -1 : 1);
+        return;
+      }
       // No modifier hotkeys.
       if (!e.ctrlKey && !e.metaKey && !e.altKey) {
         if (e.key === 'v' || e.key === 'V') {
@@ -3158,22 +3480,27 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         }
         if (e.key === '+' || e.key === '=') {
           e.preventDefault();
-          setZoom(useEditorStore.getState().zoom * 1.25);
+          zoomStepBy('in');
           return;
         }
         if (e.key === '-' || e.key === '_') {
           e.preventDefault();
-          setZoom(useEditorStore.getState().zoom / 1.25);
+          zoomStepBy('out');
           return;
         }
+        // Home/End move the edit cursor AND the transport (a real seek, so a
+        // rolling timeline keeps rolling from the new point).
         if (e.key === 'Home') {
           e.preventDefault();
-          setPlayhead(0);
+          setEditCursor(0);
+          seekEditorTo(0);
           return;
         }
         if (e.key === 'End') {
           e.preventDefault();
-          setPlayhead(getTotalDurationSec());
+          const end = getTotalDurationSec();
+          setEditCursor(end);
+          seekEditorTo(end);
           return;
         }
         if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
@@ -3216,13 +3543,16 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             setShowShortcuts(false);
             return;
           }
-          clearInpaintSelection();
+          // Same hidden-tab guard as the undo handler: EDIT stays mounted
+          // behind other tabs, and Escape there must not clear its selection.
+          if (!containerRef.current?.offsetParent) return;
+          timelineEscapeRef.current();
           return;
         }
       }
       if (e.ctrlKey || e.metaKey) {
         const k = e.key.toLowerCase();
-        // Ctrl/Cmd + C / X / V = copy / cut / paste-at-playhead. If the user has
+        // Ctrl/Cmd + C / X / V = copy / cut / paste-at-edit-cursor. If the user has
         // actually selected text somewhere on the page (a label, a log line), let
         // the browser's own copy win instead of hijacking it for clips.
         const hasTextSelection = !(window.getSelection()?.isCollapsed ?? true);
@@ -3266,44 +3596,97 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     return () => window.removeEventListener('keydown', onKey);
   }, [
     selectedClipCount, setTool, pauseEditorPlayback, playEditorTimeline, deleteSelectedClips,
-    duplicateSelectedClips, openInpaintPanel, clearInpaintSelection, splitSelectedAtPlayhead,
-    addMarker, setLoopEnabled, zoomToFit, setZoom, setPlayhead, getTotalDurationSec,
+    duplicateSelectedClips, openInpaintPanel, splitSelectedAtPlayhead,
+    addMarker, setLoopEnabled, zoomToFit, zoomStepBy, setEditCursor, seekEditorTo, getTotalDurationSec,
     nudgeSelectedClips, moveSelectedClipsByTrack, copySelectedClips, cutSelectedClips,
     pasteClips, selectAllClips,
   ]);
 
-  // --- Wheel: Ctrl/Cmd + wheel = zoom; plain wheel = horizontal pan ---
+  // --- Wheel (F08): the selected profile in useTimelinePrefs decides what each
+  // modifier does. theDAW default: wheel = time zoom, Ctrl/Cmd = fine time
+  // zoom, Shift = horizontal scroll, Alt = vertical scroll, Ctrl/Cmd+Shift =
+  // lane height. Zooms go through requestZoom (edit-cursor anchored), one per
+  // frame. Form fields and anything under [data-wheel-passthrough] (editable
+  // automation lanes, popovers) keep their own wheel; so does any gesture the
+  // profile does not handle — preventDefault only when the editor acts.
   const timelineScrollRef = useRef<HTMLDivElement | null>(null);
-  useEffect(() => {
+  /** The mounted scroller as state, so effects that attach listeners re-run
+   *  when it (re)mounts instead of depending on mount order. */
+  const [scrollerEl, setScrollerEl] = useState<HTMLDivElement | null>(null);
+  const setTimelineScroller = useCallback((el: HTMLDivElement | null) => {
+    timelineScrollRef.current = el;
+    setScrollerEl(el);
+  }, []);
+  const wheelHandlerRef = useRef<(e: WheelEvent) => void>(() => {});
+  wheelHandlerRef.current = (e: WheelEvent) => {
     const el = timelineScrollRef.current;
     if (!el) return;
-    const onWheel = (e: WheelEvent) => {
-      if (e.ctrlKey || e.metaKey) {
-        e.preventDefault();
-        // Zoom centered on cursor X. (clientX - rect.left) is viewport px while
-        // scrollLeft is local px, so normalise before mixing them — otherwise the
-        // anchor drifts and the content slides under the cursor as you zoom.
-        const rect = el.getBoundingClientRect();
-        const localCursorX = (e.clientX - rect.left) / effectiveZoom(el);
-        const cursorX = localCursorX + el.scrollLeft;
-        const oldZoom = useEditorStore.getState().zoom;
-        const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
-        const newZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, oldZoom * factor));
-        useEditorStore.getState().setZoom(newZoom);
-        // Keep the cursor on the same time after zoom.
-        const ratio = newZoom / oldZoom;
-        el.scrollLeft = cursorX * ratio - localCursorX;
+    const target = e.target instanceof Element ? e.target : null;
+    if (isWheelExcludedTarget(target)) return;
+    const prefs = useTimelinePrefs.getState();
+    const st = useEditorStore.getState();
+    const d = wheelDispatch(
+      e,
+      WHEEL_PROFILES[prefs.wheelProfile],
+      el.clientHeight,
+      { coarseSpeed: prefs.coarseZoomSpeed, fineSpeed: prefs.fineZoomSpeed },
+      { trackHeight: st.trackHeight, min: TRACK_HEIGHT_MIN, max: TRACK_HEIGHT_MAX },
+    );
+    switch (d.kind) {
+      case 'none':
         return;
-      }
-      // Shift + wheel — convert vertical delta to horizontal scroll. Plain wheel remains vertical.
-      if (e.shiftKey && Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+      case 'zoom':
         e.preventDefault();
-        el.scrollLeft += e.deltaY;
-      }
+        zoomCoalescerRef.current?.push(d.factor);
+        return;
+      case 'scroll-x':
+        e.preventDefault();
+        el.scrollLeft += d.px;
+        return;
+      case 'scroll-y':
+        e.preventDefault();
+        el.scrollTop += d.px;
+        return;
+      case 'lane-height':
+        e.preventDefault();
+        st.setTrackHeight(d.height);
+        return;
+    }
+  };
+  useEffect(() => {
+    if (!scrollerEl) return;
+    const onWheel = (e: WheelEvent) => wheelHandlerRef.current(e);
+    scrollerEl.addEventListener('wheel', onWheel, { passive: false });
+    return () => scrollerEl.removeEventListener('wheel', onWheel);
+  }, [scrollerEl]);
+
+  /* Visible window of the scroller (local px), for the grid window, the ruler's
+     bar numbers and the clip chrome. Updated at most once per frame on scroll
+     and on resize — never from playback frames (follow-playhead only moves it
+     when it pages). */
+  const [viewport, setViewport] = useState<{ scrollLeft: number; width: number }>({ scrollLeft: 0, width: 0 });
+  const viewportRafRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!scrollerEl) return;
+    const sync = () => {
+      viewportRafRef.current = null;
+      const next = { scrollLeft: scrollerEl.scrollLeft, width: measureViewportWidth(scrollerEl) };
+      setViewport((prev) => (prev.scrollLeft === next.scrollLeft && prev.width === next.width ? prev : next));
     };
-    el.addEventListener('wheel', onWheel, { passive: false });
-    return () => el.removeEventListener('wheel', onWheel);
-  }, []);
+    const schedule = () => {
+      if (viewportRafRef.current === null) viewportRafRef.current = requestAnimationFrame(sync);
+    };
+    scrollerEl.addEventListener('scroll', schedule, { passive: true });
+    const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(schedule);
+    ro?.observe(scrollerEl);
+    sync();
+    return () => {
+      scrollerEl.removeEventListener('scroll', schedule);
+      ro?.disconnect();
+      if (viewportRafRef.current !== null) cancelAnimationFrame(viewportRafRef.current);
+      viewportRafRef.current = null;
+    };
+  }, [scrollerEl, measureViewportWidth]);
 
   // --- Right-click context menu (uses shared ContextMenu primitive) ---
   const clipMenu = useContextMenu<{ clipId: string; atSec: number }>();
@@ -3312,16 +3695,42 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
    *  right-click resolved to; a null trackId means "below every lane", which
    *  adds to a new track exactly as dropping there does. */
   const addMenu = useContextMenu<AddToTrackTarget>();
+  /** The time-range menu (F04): a right-click INSIDE the range. A right-click
+   *  never clears a highlight (T44 rule 5) — "Clear range" in this menu is the
+   *  only way one of them removes a range.
+   *  `trackId` / `clipId` are what was under the pointer, for the rows that
+   *  need a lane or a clip. */
+  const rangeMenu = useContextMenu<{ range: TimeRange; trackId: string | null; clipId?: string; sec: number }>();
   const addInputUid = useId().replace(/[^a-zA-Z0-9_-]/g, '');
   const addAudioInputId = `editor-add-audio-${addInputUid}`;
   const addMidiInputId = `editor-add-midi-${addInputUid}`;
 
+  /** The range menu when a right-click at (`sec`, `trackId`) lands inside the
+   *  time range; true when it opened. Opening it changes no selection. */
+  const openRangeMenuIfInside = (e: React.MouseEvent, sec: number, trackId: string | null, clipId?: string): boolean => {
+    const st = useEditorStore.getState();
+    const ctx = contextAt(
+      { clipIds: st.selectedClipIds, range: st.timeSelection },
+      clipId !== undefined ? { trackId, sec, clipId } : { trackId, sec },
+    );
+    if (ctx.kind !== 'time-range') return false;
+    rangeMenu.open(e, { range: ctx.range, trackId, clipId: ctx.clipId, sec });
+    return true;
+  };
+
   const openContextMenu = (e: React.MouseEvent, clipId: string) => {
     e.stopPropagation();
+    const atSec = timelineClientXToSec(e.clientX);
+    const hitClip = clips.find((c) => c.id === clipId);
+    // Inside the time range the range menu wins (F04); "Clip actions…" in it
+    // reaches this clip's own menu.
+    if (openRangeMenuIfInside(e, Math.max(0, atSec), hitClip?.trackId ?? null, clipId)) return;
     if (!selectedClipIds.includes(clipId)) {
       selectClipSingle(clipId);
     }
-    const atSec = timelineClientXToSec(e.clientX);
+    // The "Insert stem…" group needs the entry's separated stems; a right-click
+    // is the only moment it matters, so the read starts here rather than on mount.
+    warmClipStems(hitClip?.libraryEntryId);
     clipMenu.open(e, { clipId, atSec });
   };
 
@@ -3492,9 +3901,13 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     // body, so without this the clip's own pointerdown never sees the drag.
     if (e.altKey) return;
     e.stopPropagation();
+    // Primary button only. A right-click (or a mac ctrl-click) is on its way to
+    // a context menu: it must not capture the pointer, mask anything, or later
+    // read as a clip-body click.
+    if (!isPrimaryGestureButton(e, IS_MAC)) return;
     e.currentTarget.setPointerCapture(e.pointerId);
     const anchorSec = timelineClientXToSec(e.clientX);
-    inpaintDragRef.current = { clipId: clip.id, anchorSec };
+    inpaintDragRef.current = { clipId: clip.id, anchorSec, originX: e.clientX, originY: e.clientY };
   };
 
   const handleInpaintDragMove = (e: React.PointerEvent) => {
@@ -3507,19 +3920,40 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     const clampedEnd   = Math.min(clip.startSec + clip.durationSec, Math.max(anchorSec, curSec));
     if (clampedEnd - clampedStart >= 0.1) {
       setInpaintSelection({ clipId, startSec: clampedStart, endSec: clampedEnd });
+      // The other half of T44 rule 3: only one highlight at a time, so drawing a
+      // mask puts away the time range. Guarded against a per-pointermove write.
+      if (useEditorStore.getState().timeSelection) setTimeSelection(null);
     }
   };
 
-  const handleInpaintDragEnd = () => {
+  const handleInpaintDragEnd = (e: React.PointerEvent) => {
+    const drag = inpaintDragRef.current;
     const sel = useEditorStore.getState().inpaintSelection;
     if (sel && sel.endSec - sel.startSec < 0.1) {
       clearInpaintSelection();
     }
     inpaintDragRef.current = null;
+    // A PRIMARY press released where it began is a clip-body click, which places
+    // the edit cursor (and seeks only when the click profile says so).
+    if (
+      drag && isPrimaryGestureButton(e, IS_MAC) &&
+      clipGesturePhase(e.clientX - drag.originX, e.clientY - drag.originY) === 'click'
+    ) {
+      const hitClip = clips.find((c) => c.id === drag.clipId);
+      placeClickAt(timelineClientXToSec(e.clientX), 'clip-body', {
+        trackId: hitClip?.trackId ?? null,
+        clipId: drag.clipId,
+      });
+    }
   };
 
   const onClipPointerDown = (e: React.PointerEvent, clipId: string, edge: 'move' | 'left' | 'right') => {
+    // stopPropagation first, so a press on a clip never reaches the lanes'
+    // marquee — then bail on anything that is not a primary press. A right-click
+    // must leave the selection (and the time range) exactly as it found them;
+    // the menu it opens is the contextmenu event, not this one.
     e.stopPropagation();
+    if (!isPrimaryGestureButton(e, IS_MAC)) return;
     const clip = clips.find((c) => c.id === clipId);
     if (!clip) return;
 
@@ -3615,6 +4049,24 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       return;
     }
 
+    /* F18 — the click band. Below CLIP_CLICK_SLOP_PX of pointer travel this
+       press is still a CLICK, so the op applies nothing: no move, no trim, no
+       slip, no stretch, no lane-insert marker, and so no store write and no
+       undo step. Above it the gesture is a drag and everything below runs
+       exactly as it always has, measured from where the press went down (an
+       absolute drag, so the suppressed frames cost no accuracy).
+
+       This is what makes double-click reliable. Applying from the FIRST
+       pointermove meant one wobbled pixel re-snapped the clip to the grid,
+       and — since laneTargetAtY's 10 px insert band covers a clip's top and
+       bottom few pixels — the release could also insert a track and move the
+       clip onto it. Either way the clip left the pointer, the second press
+       landed on the lanes, and the browser dispatched `dblclick` there instead
+       of on the clip. The SAME threshold decides the release in onPointerUp
+       below, so there is no travel at which the op applied yet the release
+       still counted as a click. */
+    if (clipGesturePhase(e.clientX - op.startPxX, e.clientY - op.startPxY) === 'click') return;
+
     const dxSec = pxToSec(dxPx);
     const clip = clips.find((c) => c.id === op.clipId);
     if (!clip) return;
@@ -3701,6 +4153,20 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
 
   const onPointerUp = (e: React.PointerEvent) => {
     const op = opRef.current;
+    // A plain PRIMARY clip press released without travel is a clip-body click
+    // (F06): it places the edit cursor. The move op already selected the clip on
+    // pointer-down; nothing about that gesture changes. The cut tool's click is
+    // its split, so it places nothing.
+    if (
+      op?.kind === 'move' && tool !== 'cut' && isPrimaryGestureButton(e, IS_MAC) &&
+      clipGesturePhase(e.clientX - op.startPxX, e.clientY - op.startPxY) === 'click'
+    ) {
+      const hitClip = clips.find((c) => c.id === op.clipId);
+      placeClickAt(timelineClientXToSec(e.clientX), 'clip-body', {
+        trackId: hitClip?.trackId ?? null,
+        clipId: op.clipId,
+      });
+    }
     if (op?.kind === 'ctrl-drag-pending') {
       selectClipWithModifiers(op.clipId, { ctrlKey: true });
       opRef.current = null;
@@ -3917,13 +4383,6 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     playheadDragRef.current = { startX: e.clientX, startSec: sec, wasPlaying };
   };
 
-  const seekEditorTo = useCallback((sec: number) => {
-    setPlayhead(sec);
-    if (usePlayerStore.getState().currentEntryId === 'editor-timeline') {
-      usePlayerStore.getState().seek(sec);
-    }
-  }, [setPlayhead]);
-
   const onPlayheadPointerMove = (e: React.PointerEvent) => {
     if (!playheadDragRef.current) return;
     seekEditorTo(secFromClientX(e.clientX));
@@ -3940,44 +4399,339 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     }
   };
 
-  // Ruler click sets playhead immediately (same coord math as track lanes).
+  /** Where a click resolves (F06), on pointer-up: the edit cursor and/or a real
+   *  seek, per the placement policy and the user's click profile. A seek never
+   *  starts or stops playback, so clicking while playing keeps it playing.
+   *
+   *  T44 — the same click also puts away a highlight it lands AWAY from: the
+   *  time range and the clip inpaint mask are the user's current focus, not
+   *  pinned annotations, so a click outside one clears it (a click inside keeps
+   *  it, so the edit cursor can be parked in a range). `hit` names the lane and
+   *  clip under the pointer; `highlightClearDecision` owns the rule. Only
+   *  primary-button clicks reach here — right-clicks go to the menus and never
+   *  clear anything, and controls never call this at all. */
+  const placeClickAt = useCallback((
+    sec: number,
+    surface: ClickSurface,
+    hit?: { trackId: string | null; clipId?: string },
+  ) => {
+    const at = Math.max(0, sec);
+    const intent = placementIntent({
+      surface,
+      playing: isEditorTimelinePlaying() || liveMixer.isPlaying(),
+      explicitSeek: false,
+      profile: clickProfile,
+    });
+    if (intent.moveEditCursor) setEditCursor(at);
+    if (intent.seek) seekEditorTo(at);
+    if (!hit) return;
+    const st = useEditorStore.getState();
+    const decision = highlightClearDecision({
+      surface,
+      clickSec: at,
+      clickTrackId: hit.trackId,
+      clickClipId: hit.clipId,
+      range: st.timeSelection,
+      mask: st.inpaintSelection,
+    });
+    if (decision.clearRange) setTimeSelection(null);
+    if (decision.clearMask) clearInpaintSelection();
+  }, [clearInpaintSelection, clickProfile, seekEditorTo, setEditCursor, setTimeSelection]);
+
+  // Shift-drag on the ruler draws the loop region (unchanged). A plain press is
+  // the pointer handlers below: a click seeks, a drag draws the time range.
   const onRulerMouseDown = (e: React.MouseEvent) => {
-    // Shift-drag on the ruler draws the loop region; a plain click sets the playhead.
-    if (e.shiftKey) {
-      const anchor = Math.max(0, secFromClientX(e.clientX));
-      setLoopRegion(anchor, anchor);
-      const move = (ev: MouseEvent) => {
-        const cur = Math.max(0, secFromClientX(ev.clientX));
-        setLoopRegion(Math.min(anchor, cur), Math.max(anchor, cur));
-      };
-      const up = () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); };
-      window.addEventListener('mousemove', move);
-      window.addEventListener('mouseup', up);
-      e.preventDefault();
-      return;
-    }
-    seekEditorTo(secFromClientX(e.clientX));
+    if (!e.shiftKey) return;
+    const anchor = Math.max(0, secFromClientX(e.clientX));
+    setLoopRegion(anchor, anchor);
+    const move = (ev: MouseEvent) => {
+      const cur = Math.max(0, secFromClientX(ev.clientX));
+      setLoopRegion(Math.min(anchor, cur), Math.max(anchor, cur));
+    };
+    const up = () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); };
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', up);
+    e.preventDefault();
   };
 
-  const onTimelineClick = (e: React.MouseEvent) => {
+  /** A plain primary press on the ruler. Resolved on pointer-up: under 4 px of
+   *  travel it is a click (placement, which on the ruler always seeks); past it,
+   *  a drag that sets the time range live and never seeks (F03). */
+  const onRulerPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.shiftKey) return; // the loop gesture (onRulerMouseDown)
+    if (!isPrimaryGestureButton(e, IS_MAC)) return;
+    // Marker flags own their own click (seek / rename / delete).
+    if ((e.target as HTMLElement).closest('[data-ruler-control="1"]')) return;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    window.addEventListener('selectstart', preventSelectStart);
+    rulerPressRef.current = {
+      pointerId: e.pointerId,
+      originX: e.clientX,
+      originY: e.clientY,
+      anchorSec: secFromClientX(e.clientX),
+      dragging: false,
+      before: useEditorStore.getState().timeSelection,
+    };
+  };
+
+  const onRulerPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const press = rulerPressRef.current;
+    if (!press || press.pointerId !== e.pointerId) return;
+    if (!press.dragging) {
+      if (classifyRulerPress({ x: press.originX, y: press.originY }, { x: e.clientX, y: e.clientY }) === 'click') return;
+      press.dragging = true;
+    }
+    // snapSec is the identity when snapping is off. A new drag replaces the range.
+    const drawn = rulerDragRange(press.anchorSec, secFromClientX(e.clientX), snapSec);
+    setTimeSelection(drawn);
+    // Only ONE highlight is ever on screen: drawing a time range puts away the
+    // clip inpaint mask (T44 rule 3). Guarded so a drag does not write the store
+    // once per pointermove.
+    if (drawn && useEditorStore.getState().inpaintSelection) clearInpaintSelection();
+  };
+
+  const endRulerPress = (el: Element, pointerId: number) => {
+    rulerPressRef.current = null;
+    window.removeEventListener('selectstart', preventSelectStart);
+    if (el.hasPointerCapture?.(pointerId)) el.releasePointerCapture(pointerId);
+  };
+
+  const onRulerPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    const press = rulerPressRef.current;
+    if (!press || press.pointerId !== e.pointerId) return;
+    endRulerPress(e.currentTarget, e.pointerId);
+    // No lane under a ruler click: a track-scoped range ignores the scope there
+    // (rangeContains), so only the time decides whether the click is outside it.
+    if (!press.dragging) placeClickAt(secFromClientX(e.clientX), 'ruler', { trackId: null });
+  };
+
+  const onRulerPointerCancel = (e: React.PointerEvent<HTMLDivElement>) => {
+    const press = rulerPressRef.current;
+    if (!press || press.pointerId !== e.pointerId) return;
+    endRulerPress(e.currentTarget, e.pointerId);
+    if (press.dragging) setTimeSelection(press.before);
+  };
+
+  /* --- Empty-lane press: click (placement) or marquee (F15) ----------------
+     Model space is lanes-content local px: the content rect already carries the
+     scroll offset, so only the CSS layout zoom is divided out. Hit rects come
+     from store data (buildClipHitRects), never from DOM queries, so clips
+     scrolled offscreen are selectable once the band reaches them. */
+  const lanesModelPoint = useCallback((clientX: number, clientY: number): { x: number; y: number } | null => {
+    const rect = timelineRef.current?.getBoundingClientRect();
+    if (!rect) return null;
+    const z = layoutZoom();
+    return { x: (clientX - rect.left) / z, y: (clientY - rect.top) / z };
+  }, [layoutZoom]);
+
+  /** Clip rects captured at press time; clips do not move during a marquee. */
+  const marqueeHitRectsRef = useRef<ReturnType<typeof buildClipHitRects>>([]);
+  /** What a cancelled marquee restores besides the clip ids. */
+  const marqueeBaselineRef = useRef<{ anchor: string | null; trackIds: string[] }>({ anchor: null, trackIds: [] });
+  const marqueeHitTest = useCallback(
+    (r: { x1: number; y1: number; x2: number; y2: number }) => hitTestClipRects(marqueeHitRectsRef.current, r),
+    [],
+  );
+
+  const applyMarqueeSelection = useCallback((ids: string[]) => {
+    setSelectedClipIds(ids);
+    const anchor = useEditorStore.getState().selectedClipId;
+    setSelected(anchor !== null && ids.includes(anchor) ? anchor : ids[0] ?? null);
+    setSelectedTrackIds([]);
+  }, [setSelected, setSelectedClipIds, setSelectedTrackIds]);
+
+  /** Tear down a marquee press: no gesture, no band, no autoscroll, no capture. */
+  const endMarquee = useCallback((el?: Element | null, pointerId?: number) => {
+    marqueeRef.current = null;
+    marqueeClientRef.current = null;
+    if (marqueeRafRef.current !== null) {
+      cancelAnimationFrame(marqueeRafRef.current);
+      marqueeRafRef.current = null;
+    }
+    window.removeEventListener('selectstart', preventSelectStart);
+    setMarqueeRect(null);
+    if (el && pointerId !== undefined && el.hasPointerCapture?.(pointerId)) el.releasePointerCapture(pointerId);
+  }, []);
+
+  /** Escape / pointercancel: the gesture ends and the selection captured at
+   *  pointer-down comes back. */
+  const cancelMarquee = useCallback(() => {
+    const g = marqueeRef.current;
+    if (!g) return;
+    const { restoreIds } = cancelGesture(g);
+    endMarquee(timelineRef.current, g.pointerId);
+    if (g.phase === 'marquee') {
+      setSelectedClipIds(restoreIds);
+      setSelected(marqueeBaselineRef.current.anchor);
+      setSelectedTrackIds(marqueeBaselineRef.current.trackIds);
+    }
+  }, [endMarquee, setSelected, setSelectedClipIds, setSelectedTrackIds]);
+
+  /** One autoscroll frame while the band is near a viewport edge. After each
+   *  scroll step the pointer sits over different content, so the model point is
+   *  re-read and the marquee re-evaluated (refreshMarquee). Held in a ref so the
+   *  rAF chain always runs the current render's closure. */
+  const marqueeAutoscrollRef = useRef<() => void>(() => {});
+  marqueeAutoscrollRef.current = () => {
+    marqueeRafRef.current = null;
+    const g = marqueeRef.current;
+    const el = timelineScrollRef.current;
+    const p = marqueeClientRef.current;
+    if (!g || g.phase !== 'marquee' || !el || !p) return;
+    const vp = el.getBoundingClientRect();
+    const { vx, vy } = autoscrollVelocity(p, vp);
+    if (vx !== 0 || vy !== 0) {
+      // The velocity is screen px per frame; scrollLeft/Top are local px.
+      const z = layoutZoom();
+      const beforeLeft = el.scrollLeft;
+      const beforeTop = el.scrollTop;
+      el.scrollLeft += vx / z;
+      el.scrollTop += vy / z;
+      const moved = el.scrollLeft !== beforeLeft || el.scrollTop !== beforeTop;
+      const model = moved ? lanesModelPoint(p.x, p.y) : null;
+      if (model) {
+        const next: GestureState = { ...g, currentModel: model };
+        marqueeRef.current = next;
+        const res = refreshMarquee(next, marqueeHitTest, combineMarquee);
+        if (res.selectedIds) applyMarqueeSelection(res.selectedIds);
+        if (res.rect) setMarqueeRect(res.rect);
+      }
+    }
+    marqueeRafRef.current = requestAnimationFrame(() => marqueeAutoscrollRef.current());
+  };
+
+  // A marquee never outlives EDIT: unmounting stops its frame loop and listener.
+  useEffect(() => () => {
+    if (marqueeRafRef.current !== null) cancelAnimationFrame(marqueeRafRef.current);
+    marqueeRafRef.current = null;
+    marqueeRef.current = null;
+    window.removeEventListener('selectstart', preventSelectStart);
+  }, []);
+
+  const onLanesPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (automationEdit) return; // automation edit mode owns the lanes; ruler still moves the playhead
-    if (e.button === 2) return; // right-click opens the add-to-track menu, not a playhead move
-    if (!timelineRef.current) return;
+    // Primary button only: a right-click opens a menu and never starts a marquee.
+    if (!isPrimaryGestureButton(e, IS_MAC)) return;
     if (opRef.current) return;
-    // Only react to direct clicks on the timeline gutter (not on a clip).
+    // Only presses on empty lane space (lane background, gaps, below the last
+    // lane). Clips and the playhead handle own their presses.
     const target = e.target as HTMLElement;
     if (target.closest('[data-clip="1"]')) return;
     if (target.closest('[data-playhead-handle="1"]')) return;
-    clearInpaintSelection();
-    const sec = contentClientXToSec(e.clientX);
-    setPlayhead(Math.max(0, sec));
-    // Clear the multi-selection too, not just the single-clip pointer. Clearing
-    // only `selectedClipId` left clips visibly ringed and Delete still armed on a
-    // timeline the user had just clicked away from — so the next Del destroyed
-    // clips they believed were released.
-    setSelected(null);
-    setSelectedClipIds([]);
+    const model = lanesModelPoint(e.clientX, e.clientY);
+    if (!model) return;
+    const st = useEditorStore.getState();
+    // The baseline is what the user sees selected: the multi-selection, or the
+    // single focused clip when there is no multi-selection.
+    const baseline = st.selectedClipIds.length > 0 ? st.selectedClipIds : st.selectedClipId ? [st.selectedClipId] : [];
+    marqueeBaselineRef.current = { anchor: st.selectedClipId, trackIds: st.selectedTrackIds };
+    marqueeHitRectsRef.current = buildClipHitRects(
+      st.clips,
+      layoutRows(st.tracks.map((t) => ({ id: t.id, height: st.trackHeight }))),
+      st.zoom,
+    );
+    marqueeRef.current = startGesture(e.pointerId, { x: e.clientX, y: e.clientY }, model, baseline, marqueeModeFor(e));
+    marqueeClientRef.current = { x: e.clientX, y: e.clientY };
+    e.currentTarget.setPointerCapture(e.pointerId);
+    window.addEventListener('selectstart', preventSelectStart);
+  };
+
+  const onLanesPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const g = marqueeRef.current;
+    if (!g || g.pointerId !== e.pointerId) return;
+    const model = lanesModelPoint(e.clientX, e.clientY);
+    if (!model) return;
+    marqueeClientRef.current = { x: e.clientX, y: e.clientY };
+    const res = moveGesture(g, e.pointerId, { x: e.clientX, y: e.clientY }, model, marqueeHitTest, combineMarquee);
+    marqueeRef.current = res.state;
+    if (res.selectedIds) applyMarqueeSelection(res.selectedIds);
+    if (res.rect) setMarqueeRect(res.rect);
+    if (res.state.phase === 'marquee' && marqueeRafRef.current === null) {
+      marqueeRafRef.current = requestAnimationFrame(() => marqueeAutoscrollRef.current());
+    }
+  };
+
+  const onLanesPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    const g = marqueeRef.current;
+    if (!g || g.pointerId !== e.pointerId) return;
+    const outcome = finishGesture(g, e.pointerId);
+    endMarquee(e.currentTarget, e.pointerId);
+    if (outcome !== 'click') return; // a marquee keeps the selection it drew; no click follows
+    // Which lane the click landed on, for a track-scoped range: plain lane index,
+    // not laneTargetAtY — its 10 px insert band is about where a DRAGGED clip
+    // lands, and a click in it is still visibly on that lane. Below the last lane
+    // there is no track, and the scope is then ignored (rangeContains).
+    const model = lanesModelPoint(e.clientX, e.clientY);
+    const laneIdx = model ? Math.floor(model.y / trackH) : -1;
+    placeClickAt(contentClientXToSec(e.clientX), 'empty-lane', {
+      trackId: laneIdx >= 0 ? tracks[laneIdx]?.id ?? null : null,
+    });
+    // An empty click releases what was selected — clips (reduceSelection
+    // 'empty-click'), the focused clip and the track selection, exactly as the
+    // click did before the time range existed. The highlights it lands away from
+    // go too, but that is placeClickAt's call (highlightClearDecision), not this
+    // reducer's: a click INSIDE the range keeps it. Clearing only `selectedClipId`
+    // once left clips visibly ringed and Delete still armed, so the
+    // multi-selection goes too.
+    const st = useEditorStore.getState();
+    const next = reduceSelection({ clipIds: st.selectedClipIds, range: st.timeSelection }, { type: 'empty-click' });
+    setSelectedClipIds([...next.clipIds]);
     setSelectedTrackIds([]);
+    setSelected(null);
+  };
+
+  /** pointercancel AND lostpointercapture: either way the gesture is over and
+   *  its teardown must run (rAF stopped, selectstart blocker removed, baseline
+   *  selection restored). Whichever fires second finds no gesture and no-ops. */
+  const onLanesPointerCancel = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (marqueeRef.current?.pointerId !== e.pointerId) return;
+    cancelMarquee();
+  };
+
+  /* Escape on the timeline, in order: an open menu or popover owns the key;
+     then an active gesture is cancelled (its baseline restored); then the clip
+     selection clears; then, on a later press, the time range; and only when
+     nothing else is selected, the inpaint mask. */
+  timelineEscapeRef.current = () => {
+    // Any menu, picker or panel that is open owns Escape — it is the thing the
+    // user means to dismiss, and several of them close on Escape themselves.
+    const menuOpen =
+      !!(
+        clipMenu.position || trackMenu.position || addMenu.position || rangeMenu.position || addPicker ||
+        gainPanel || timePitchPanel || instrPanel || stemsModal || inpaintPanel || prefsAnchor
+      ) ||
+      document.querySelector('[role="menu"], [role="dialog"][aria-modal="true"]') !== null;
+    // Every timeline gesture, not just the two this ticket added: a clip drag,
+    // trim, slip, stretch, fade drag, inpaint mask drag or playhead drag is just
+    // as much "a gesture in flight", and Escape must not clear a selection out
+    // from under one.
+    const gestureActive =
+      marqueeRef.current !== null || rulerPressRef.current !== null || opRef.current !== null ||
+      fadeDragRef.current !== null || inpaintDragRef.current !== null || playheadDragRef.current !== null;
+    if (menuOpen) return;
+    if (gestureActive) {
+      cancelMarquee();
+      const press = rulerPressRef.current;
+      if (press) {
+        rulerPressRef.current = null;
+        window.removeEventListener('selectstart', preventSelectStart);
+        if (press.dragging) setTimeSelection(press.before);
+      }
+      return;
+    }
+    const st = useEditorStore.getState();
+    const clipIds = st.selectedClipIds.length > 0 ? st.selectedClipIds : st.selectedClipId ? [st.selectedClipId] : [];
+    const cur = { clipIds, range: st.timeSelection };
+    const next = reduceSelection(cur, { type: 'escape', gestureActive, menuOpen });
+    if (next === cur) {
+      clearInpaintSelection();
+      return;
+    }
+    if (next.clipIds !== cur.clipIds) {
+      setSelectedClipIds([...next.clipIds]);
+      setSelected(null);
+    }
+    if (next.range !== cur.range) setTimeSelection(next.range);
   };
 
   const onClipClick = (e: React.MouseEvent, clipId: string) => {
@@ -3989,7 +4743,9 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
 
   /** Bind a MIDI clip to the Piano Roll and reveal it (FL: double-click a clip). */
   const editClipInPianoRoll = useCallback((clip: AudioClip) => {
-    if (!clip.sourcePianoRoll) return;
+    // The classifier, not `sourcePianoRoll` truthiness: a roll clip whose notes
+    // were all deleted is still a roll, and opening it is how you put notes back.
+    if (!isMidiClip(clip)) return;
     // The roll's own notes with their lanes, meter map and pickup; a clip bounced
     // before the roll had a meter opens as 4/4 on a whole number of bars.
     const args = clipRollLoad(clip);
@@ -3998,9 +4754,107 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     logInfo('editor', `Editing clip ${clip.id.slice(0, 8)} in MIDI (${args[1].length} notes)`);
   }, []);
 
+  /** Open the AUDIO EDIT drawer on a clip and bring its tab up (F19). */
+  const editClipInAudioEditor = useCallback((clip: AudioClip) => {
+    useAudioEditorStore.getState().openForClip(clip.id);
+    useBottomPanelStore.getState().showTab('audio-edit');
+    logInfo('editor', `Editing clip ${clip.id.slice(0, 8)} in the audio editor`);
+  }, []);
+
+  /**
+   * F18/F19 — double-clicking a clip opens the editor that OWNS it, and every
+   * clip has one: a roll clip opens the piano roll, everything else opens the
+   * audio drawer. `clipEditKind` is the single answer to that question, shared
+   * with the clip menu below so the two can never disagree.
+   */
   const onClipDoubleClick = (clip: AudioClip) => {
-    if (clip.sourcePianoRoll) editClipInPianoRoll(clip);
+    if (clipEditKind(clip) === 'midi') editClipInPianoRoll(clip);
+    else editClipInAudioEditor(clip);
   };
+
+  /**
+   * F17 — hand gantasmob0t an explicit "act on THIS" list, then bring the
+   * composer up. Adding a reference is NOT a request, so nothing is ever sent:
+   * the chips sit beside the composer until the user types.
+   *
+   * A builder returns null when its subject is gone (deleted between the menu
+   * opening and the row being chosen); those are dropped and the rest still
+   * land, because losing one clip should not cost the user the other four.
+   */
+  const addAssistantReferences = useCallback((refs: readonly (AssistantReference | null)[], what: string) => {
+    const add = useAssistantReferenceStore.getState().add;
+    const usable = refs.filter((r): r is AssistantReference => r !== null);
+    if (usable.length === 0) {
+      logError('editor', `Nothing left to reference in gantasmob0t: ${what} is no longer in the project`);
+      return;
+    }
+    for (const ref of usable) add(ref);
+    requestAssistantFocus();
+    logInfo('editor', `Referenced ${usable.length === 1 ? what : `${usable.length} clips`} in gantasmob0t`);
+  }, []);
+
+  /* ── Stems already separated for the clip-menu clip's library entry ────────
+     Read when the menu opens (a right-click is the only moment the list
+     matters), so the rows are there by the time the user looks. `rows: null`
+     is "still reading"; an entry id that no longer matches the open menu is
+     ignored, so a slow answer for a previous clip cannot land in this one. */
+  const [clipStems, setClipStems] = useState<{ entryId: string; rows: StemRef[] | null }>({ entryId: '', rows: [] });
+  const warmClipStems = useCallback((entryId: string | undefined) => {
+    if (!entryId) {
+      setClipStems({ entryId: '', rows: [] });
+      return;
+    }
+    setClipStems({ entryId, rows: null });
+    void listStems(entryId)
+      .then((rows) => setClipStems((prev) => (prev.entryId === entryId ? { entryId, rows } : prev)))
+      .catch(() => setClipStems((prev) => (prev.entryId === entryId ? { entryId, rows: [] } : prev)));
+  }, []);
+
+  /**
+   * Put ONE already-separated stem on a new track, framed exactly like the clip
+   * it came from (`stemClipPlacement` — the same arithmetic the explode-to-
+   * tracks path uses). The parent is left UNMUTED: adding one stem beside a mix
+   * is a layering gesture, not an explosion of it.
+   */
+  const insertStemBesideClip = useCallback(async (clipId: string, ref: StemRef) => {
+    const src = useEditorStore.getState().clips.find((c) => c.id === clipId);
+    if (!src) return;
+    try {
+      const res = await fetch(ref.url);
+      if (!res.ok) throw new Error(`fetch failed (${res.status})`);
+      const blob = await res.blob();
+      const { peaks, duration } = await computePeaks(blob, 240);
+      // Re-read: the clip may have been moved, trimmed or deleted while the
+      // stem downloaded, and the new clip has to line up with where it is NOW.
+      const live = useEditorStore.getState().clips.find((c) => c.id === clipId);
+      if (!live) {
+        logError('editor', `Stem "${ref.name}" not inserted: the clip it was aimed at is gone`);
+        return;
+      }
+      const store = useEditorStore.getState();
+      const label = `${live.label} · ${ref.name}`;
+      const color = STEM_TRACK_COLORS[ref.name] ?? live.color;
+      // The track and its clip are ONE undo step.
+      beginUndoStep();
+      const trackId = store.addTrack({ name: label, color });
+      const newClipId = store.addClipToTrack({
+        trackId,
+        label,
+        audioBlob: blob,
+        mimeType: 'audio/wav',
+        sourceDuration: duration,
+        ...stemClipPlacement(live, duration),
+        color,
+        gain: live.gain,
+        fadeInSec: live.fadeInSec,
+        fadeOutSec: live.fadeOutSec,
+      });
+      store.cachePeaks(newClipId, peaks);
+      logInfo('editor', `Inserted stem "${ref.name}" beside "${live.label}"`);
+    } catch (e) {
+      logError('editor', `Stem "${ref.name}" could not be inserted: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }, []);
 
   /** Read the two indexes the add menu counts, so it can tell "there is none of
    *  this in the library" (disable the row, say why) from "not fetched yet"
@@ -4033,6 +4887,9 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     const belowAllTracks = yPx >= tracks.length * trackH;
     const trackIdx = Math.max(0, Math.min(tracks.length - 1, Math.floor(yPx / trackH)));
     const track = belowAllTracks ? undefined : tracks[trackIdx];
+    // Inside the time range the range menu wins over the add menu (F04). Below
+    // every lane there is no track; a null track ignores the range's scope.
+    if (openRangeMenuIfInside(e, Math.max(0, contentClientXToSec(e.clientX)), track?.id ?? null)) return;
     warmAddMenuCounts();
     addMenu.open(e, {
       trackId: track?.id ?? null,
@@ -4232,11 +5089,11 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   };
 
   /** Where a file chosen from a Recent list lands: the one selected track, or
-   *  a new track when none or several are selected, at the playhead. */
+   *  a new track when none or several are selected, at the edit cursor. */
   const recentAddTarget = (): AddToTrackTarget => {
     const st = useEditorStore.getState();
     const track = selectedTrackIds.length === 1 ? st.tracks.find((t) => t.id === selectedTrackIds[0]) : undefined;
-    return { trackId: track?.id ?? null, trackName: track?.name ?? null, atSec: st.playheadSec };
+    return { trackId: track?.id ?? null, trackName: track?.name ?? null, atSec: st.editCursorSec };
   };
 
   /** Run one entry of the add-to-track menu.
@@ -4328,11 +5185,231 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
 
   const selectedClip = clips.find((c) => c.id === selectedClipId) ?? null;
 
+  /** Lanes content height (local px): every lane, the drop slot, the master strip. */
+  const lanesHeightPx = tracks.length * trackH + 34 + (automationEdit ? MASTER_STRIP_H : 0);
+  /** Seconds the grid and the ruler's bar numbers cover (null until measured). */
+  const gridWindow = viewport.width > 0 ? viewportWindowSec(viewport.scrollLeft, viewport.width, zoom, totalDuration) : null;
+  const barLabels = gridWindow
+    ? rulerBarLabels({ startSec: gridWindow.startSec, endSec: gridWindow.endSec, bpm: projectBpm, zoom })
+    : [];
+  /** Open a clip's menu under one of its header buttons (compact / handle chrome). */
+  const openClipMenuFrom = (el: HTMLElement, clipId: string) => {
+    if (!selectedClipIds.includes(clipId)) selectClipSingle(clipId);
+    const r = el.getBoundingClientRect();
+    clipMenu.open(
+      new MouseEvent('contextmenu', { clientX: r.left, clientY: r.bottom }),
+      { clipId, atSec: Math.max(0, timelineClientXToSec(r.left + r.width / 2)) },
+    );
+  };
+
+  const zoomToSelection = () => {
+    if (timeSelection) zoomToRange(timeSelection.startSec, timeSelection.endSec);
+  };
+  const selectedClipsSpan = spanOfClips(clips.filter((c) => selectedClipIdSet.has(c.id) || c.id === selectedClipId));
+  const zoomToSelectedClips = () => {
+    if (selectedClipsSpan) zoomToRange(selectedClipsSpan.startSec, selectedClipsSpan.endSec);
+  };
+
   const handleTimelineScroll = useCallback(() => {
     if (trackHeaderScrollRef.current && timelineScrollRef.current) {
       trackHeaderScrollRef.current.scrollTop = timelineScrollRef.current.scrollTop;
     }
   }, []);
+
+  /* ── Track reorder (F01) ───────────────────────────────────────────────────
+     Dragging a header's grip reorders the arrangement. The session model,
+     threshold and drop target are pure (trackReorderDrag.ts); this owns pointer
+     capture, the insertion line, autoscroll and the single store write. The
+     dragged track's clips, routing and sound are untouched — a reorder is a
+     permutation of the track array, nothing else. */
+
+  /** The live session. A ref, because pointer handlers must see the latest one
+   *  without waiting for a render. */
+  const reorderRef = useRef<ReorderSession | null>(null);
+  /** What the drag DRAWS: the rows to dim and the gap to draw the line in.
+   *  Null whenever no drag is active, which is also the effects' on/off switch. */
+  const [reorderDraw, setReorderDraw] = useState<{ movingIds: readonly string[]; insertIndex: number } | null>(null);
+  /** Last pointer position (client px), re-read by each autoscroll frame. */
+  const reorderClientRef = useRef<{ x: number; y: number } | null>(null);
+  const reorderRafRef = useRef<number | null>(null);
+
+  /** Client y -> px from the top of the track-list CONTENT (scroll applied).
+   *  The rect is viewport px, so it is divided by the cumulative CSS zoom
+   *  before it meets scrollTop, which is already local px. */
+  const headerLocalY = useCallback((clientY: number): number | null => {
+    const el = trackHeaderScrollRef.current;
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    return (clientY - rect.top) / effectiveZoom(el) + el.scrollTop;
+  }, []);
+
+  /** Move focus to a track's grip after a keyboard move, so a run of Alt+Arrow
+   *  presses keeps moving the same track. Attribute lookup rather than a
+   *  selector string: a track id never has to be CSS-escaped this way. */
+  const focusTrackGrip = useCallback((trackId: string) => {
+    const root = trackHeaderScrollRef.current;
+    if (!root) return;
+    for (const el of root.querySelectorAll<HTMLElement>('[data-track-grip]')) {
+      if (el.dataset.trackGrip === trackId) {
+        el.focus();
+        return;
+      }
+    }
+  }, []);
+
+  /** Tear down a session: no drag, no line, no autoscroll frame, no capture. */
+  const endReorder = useCallback((el?: Element | null, pointerId?: number) => {
+    reorderRef.current = null;
+    reorderClientRef.current = null;
+    if (reorderRafRef.current !== null) {
+      cancelAnimationFrame(reorderRafRef.current);
+      reorderRafRef.current = null;
+    }
+    setReorderDraw(null);
+    if (el && pointerId !== undefined && el.hasPointerCapture?.(pointerId)) el.releasePointerCapture(pointerId);
+  }, []);
+
+  /** Escape / pointercancel / lost capture: the drag ends and the order is left
+   *  exactly as it was. */
+  const cancelReorderDrag = useCallback((el?: Element | null) => {
+    const s = reorderRef.current;
+    if (!s) return;
+    reorderRef.current = cancelReorder(s);
+    endReorder(el, s.pointerId);
+  }, [endReorder]);
+
+  /** One autoscroll frame while the pointer sits near the header column's top
+   *  or bottom edge. The real scroller is the timeline; the header column
+   *  mirrors its scrollTop (handleTimelineScroll), so both are written here and
+   *  the drop target is re-read from the new scroll offset. Held in a ref so
+   *  the rAF chain always runs the current render's closure. */
+  const reorderAutoscrollRef = useRef<() => void>(() => {});
+  reorderAutoscrollRef.current = () => {
+    reorderRafRef.current = null;
+    const s = reorderRef.current;
+    const header = trackHeaderScrollRef.current;
+    const scroller = timelineScrollRef.current;
+    const p = reorderClientRef.current;
+    if (!s || s.phase !== 'active' || !header || !scroller || !p) return;
+    const vp = header.getBoundingClientRect();
+    // A reorder only ever moves rows up and down, so the horizontal velocity is
+    // read and dropped. (DOMRect's edges live on its prototype — spreading one
+    // yields an empty object — so they are named out explicitly.)
+    const { vy } = autoscrollVelocity(
+      { x: p.x, y: p.y },
+      { left: vp.left, top: vp.top, right: vp.right, bottom: vp.bottom },
+    );
+    if (vy !== 0) {
+      const z = effectiveZoom(header);
+      const before = scroller.scrollTop;
+      markProgrammaticScroll();
+      scroller.scrollTop += vy / z; // velocity is screen px per frame, scrollTop is local px
+      header.scrollTop = scroller.scrollTop;
+      if (scroller.scrollTop !== before) {
+        const localY = headerLocalY(p.y);
+        if (localY !== null) {
+          const rows = reorderRows(useEditorStore.getState().tracks.map((t) => t.id), trackH);
+          const next = moveReorder(s, s.pointerId, p.y, localY, rows);
+          if (next !== s) {
+            reorderRef.current = next;
+            if (next.insertIndex !== null) setReorderDraw({ movingIds: next.movingIds, insertIndex: next.insertIndex });
+          }
+        }
+      }
+    }
+    reorderRafRef.current = requestAnimationFrame(() => reorderAutoscrollRef.current());
+  };
+
+  const onGripPointerDown = useCallback((e: React.PointerEvent<HTMLButtonElement>, trackId: string) => {
+    if (!isPrimaryGestureButton(e, IS_MAC)) return;
+    // The header row's own pointerdown selects the track; the grip is a drag
+    // handle, not a selector, so the press stops here.
+    e.stopPropagation();
+    // preventDefault keeps the press from selecting the header's text or
+    // starting a native drag — and, with it, from focusing the button, so the
+    // focus the keyboard path needs is taken explicitly.
+    e.preventDefault();
+    e.currentTarget.focus();
+    const st = useEditorStore.getState();
+    reorderRef.current = startReorder(e.pointerId, trackId, e.clientY, st.selectedTrackIds);
+    reorderClientRef.current = { x: e.clientX, y: e.clientY };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  }, []);
+
+  const onGripPointerMove = useCallback((e: React.PointerEvent<HTMLButtonElement>) => {
+    const s = reorderRef.current;
+    if (!s || s.pointerId !== e.pointerId || s.phase === 'cancelled') return;
+    const localY = headerLocalY(e.clientY);
+    if (localY === null) return;
+    reorderClientRef.current = { x: e.clientX, y: e.clientY };
+    const rows = reorderRows(useEditorStore.getState().tracks.map((t) => t.id), trackH);
+    const next = moveReorder(s, e.pointerId, e.clientY, localY, rows);
+    if (next !== s) {
+      reorderRef.current = next;
+      if (next.insertIndex !== null) setReorderDraw({ movingIds: next.movingIds, insertIndex: next.insertIndex });
+    }
+    if (reorderRef.current?.phase === 'active' && reorderRafRef.current === null) {
+      reorderRafRef.current = requestAnimationFrame(() => reorderAutoscrollRef.current());
+    }
+  }, [headerLocalY, trackH]);
+
+  const onGripPointerUp = useCallback((e: React.PointerEvent<HTMLButtonElement>) => {
+    const s = reorderRef.current;
+    if (!s) return;
+    // The order at RELEASE time decides, not the one the drag started with.
+    const drop = finishReorder(s, e.pointerId, useEditorStore.getState().tracks.map((t) => t.id));
+    endReorder(e.currentTarget, e.pointerId);
+    // 'click' (under the threshold), 'none' (order unchanged) and 'ignore' all
+    // write nothing: no undo step for a press that moved nothing.
+    if (drop.kind === 'move') moveTracks(drop.ids, drop.beforeId);
+  }, [endReorder, moveTracks]);
+
+  const onGripPointerCancel = useCallback((e: React.PointerEvent<HTMLButtonElement>) => {
+    cancelReorderDrag(e.currentTarget);
+  }, [cancelReorderDrag]);
+
+  /** Alt+Arrow on a focused grip moves the track (or the whole selection it
+   *  belongs to) one row, and keeps the focus on it. */
+  const onGripKeyDown = useCallback((e: React.KeyboardEvent<HTMLButtonElement>, trackId: string) => {
+    if (!e.altKey || e.ctrlKey || e.metaKey) return;
+    if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+    e.preventDefault();
+    e.stopPropagation();
+    moveTracksByOffset(movingIdsFor(trackId, useEditorStore.getState().selectedTrackIds), e.key === 'ArrowUp' ? -1 : 1);
+    // React moves the same DOM node when the keyed rows reorder, so focus
+    // normally survives on its own; this makes that a guarantee.
+    requestAnimationFrame(() => focusTrackGrip(trackId));
+  }, [focusTrackGrip, moveTracksByOffset]);
+
+  /** Escape abandons a drag in flight. Registered only while one is active, so
+   *  it never shadows the editor's own Escape at any other moment — and in the
+   *  CAPTURE phase, because while a drag IS live Escape means "cancel it" and
+   *  nothing else: the editor's Escape listener was registered first, so a
+   *  bubble-phase listener here would clear the selection before this one ever
+   *  ran (it bails on `defaultPrevented`, which capture sets in time). */
+  useEffect(() => {
+    if (!reorderDraw) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      cancelReorderDrag(document.activeElement);
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [reorderDraw, cancelReorderDrag]);
+
+  // A reorder never outlives EDIT: unmounting stops its frame loop.
+  useEffect(() => () => {
+    if (reorderRafRef.current !== null) cancelAnimationFrame(reorderRafRef.current);
+    reorderRafRef.current = null;
+    reorderRef.current = null;
+  }, []);
+
+  /** Ids being dragged right now, for dimming their rows. */
+  const reorderMovingSet = useMemo(
+    () => new Set(reorderDraw?.movingIds ?? []),
+    [reorderDraw],
+  );
 
   return (
     <div data-keyscope="edit-timeline" className="hardware-card h-full flex flex-col bg-black/40 overflow-hidden" ref={containerRef}>
@@ -4478,20 +5555,53 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
           </div>
 
           <div className="flex items-center gap-1">
-            <button onClick={() => setZoom(zoom / 1.25)} className="p-1 hover:bg-white/5 rounded text-zinc-500" title="Zoom out (-)">
+            <button
+              type="button"
+              onClick={() => zoomStepBy('out')}
+              aria-label="Zoom out around the edit cursor"
+              className="p-1 hover:bg-white/5 rounded text-zinc-500"
+              title="Zoom out around the edit cursor (-)"
+            >
               <ZoomOut className="w-3 h-3" />
             </button>
             <span className="text-[9px] font-mono text-zinc-400 w-14 text-center">{zoom.toFixed(2)}px/s</span>
-            <button onClick={() => setZoom(zoom * 1.25)} className="p-1 hover:bg-white/5 rounded text-zinc-500" title="Zoom in (+)">
+            <button
+              type="button"
+              onClick={() => zoomStepBy('in')}
+              aria-label="Zoom in around the edit cursor"
+              className="p-1 hover:bg-white/5 rounded text-zinc-500"
+              title="Zoom in around the edit cursor (+)"
+            >
               <ZoomIn className="w-3 h-3" />
             </button>
             <button
+              type="button"
               onClick={zoomToFit}
               aria-label="Zoom to fit the whole arrangement"
               className="p-1 hover:bg-white/5 rounded text-zinc-500"
               title="Zoom to fit the whole arrangement (Shift+F)"
             >
               <Maximize2 className="w-3 h-3" />
+            </button>
+            <button
+              type="button"
+              onClick={zoomToSelection}
+              disabled={!timeSelection}
+              aria-label="Zoom to selection"
+              className="p-1 hover:bg-white/5 rounded text-zinc-500 disabled:opacity-30 disabled:pointer-events-none"
+              title={timeSelection ? 'Zoom to selection — fit the time range' : 'Zoom to selection — drag on the ruler to make a time range first'}
+            >
+              <ScanSearch className="w-3 h-3" />
+            </button>
+            <button
+              type="button"
+              onClick={zoomToSelectedClips}
+              disabled={!selectedClipsSpan}
+              aria-label="Zoom to selected clips"
+              className="p-1 hover:bg-white/5 rounded text-zinc-500 disabled:opacity-30 disabled:pointer-events-none"
+              title={selectedClipsSpan ? 'Zoom to selected clips' : 'Zoom to selected clips — select a clip first'}
+            >
+              <BoxSelect className="w-3 h-3" />
             </button>
             <button
               onClick={() => setShowShortcuts(true)}
@@ -4503,6 +5613,27 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             >
               <Keyboard className="w-3 h-3" />
             </button>
+            {/* Timeline preferences (wheel profile, zoom speeds, click profile,
+                grid). The panel closes itself on an outside mousedown, which
+                includes this button: open only if it was closed when the
+                press began, so the same click does not re-open it. */}
+            <button
+              type="button"
+              onPointerDown={() => { prefsOpenAtPressRef.current = prefsAnchor !== null; }}
+              onClick={(e) => {
+                const wasOpen = prefsOpenAtPressRef.current ?? prefsAnchor !== null;
+                prefsOpenAtPressRef.current = null;
+                setPrefsAnchor(wasOpen ? null : underKey(e.currentTarget));
+              }}
+              aria-label="Timeline preferences"
+              aria-haspopup="dialog"
+              aria-expanded={prefsAnchor !== null}
+              className={`p-1 rounded ${prefsAnchor ? 'bg-purple-600/20 text-purple-300' : 'hover:bg-white/5 text-zinc-500'}`}
+              title="Timeline preferences — wheel, zoom speed, clicks, grid"
+            >
+              <Settings2 className="w-3 h-3" />
+            </button>
+            <TimelinePrefsPanel anchor={prefsAnchor} onClose={closePrefs} />
           </div>
 
           {/* Vertical zoom — lane height. A native range needs a real label; it is
@@ -5162,6 +6293,9 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
               pass, not to a track. See CountInAnnouncement. */}
           <CountInAnnouncement />
           <div ref={trackHeaderScrollRef} className="flex-1 overflow-hidden">
+            {/* `relative` so the reorder insertion line can be placed in the
+                gap it would drop into; the rows themselves stay in flow. */}
+            <div className="relative">
             {tracks.map((t) => (
               <div
                 key={t.id}
@@ -5169,11 +6303,34 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                 onContextMenu={(e) => { selectTrackSingle(t.id); warmAddMenuCounts(); trackMenu.open(e, { trackId: t.id }); }}
                 /* overflow-hidden: shrinking the lane height (vertical zoom) clips the
                    header's controls rather than letting them spill into the next track. */
-                className={`border-b border-[#1a1528] p-2 flex flex-col gap-1.5 overflow-hidden transition-colors ${selectedTrackIds.includes(t.id) ? 'bg-purple-500/10 ring-1 ring-inset ring-purple-500/35' : ''}`}
+                className={`border-b border-[#1a1528] p-2 flex flex-col gap-1.5 overflow-hidden transition-colors ${selectedTrackIds.includes(t.id) ? 'bg-purple-500/10 ring-1 ring-inset ring-purple-500/35' : ''} ${reorderMovingSet.has(t.id) ? 'opacity-40' : ''}`}
                 style={{ height: trackH }}
                 title="Click to select track. Ctrl/Cmd-click to multi-select tracks. Right-click to add audio or MIDI to it, or for track FX."
               >
                 <div className="flex justify-between items-center gap-1">
+                  {/* Reorder grip (F01). A drag handle, not a selector: the press
+                      stops here so the row's select handler never runs. Alt+Arrow
+                      moves the track when it has focus, which is the whole
+                      keyboard path — no pointer needed. */}
+                  <button
+                    type="button"
+                    data-track-grip={t.id}
+                    aria-label={`Reorder track ${t.name}`}
+                    aria-roledescription="drag handle"
+                    title="Drag to reorder · Alt+↑/↓ to move"
+                    onPointerDown={(e) => onGripPointerDown(e, t.id)}
+                    onPointerMove={onGripPointerMove}
+                    onPointerUp={onGripPointerUp}
+                    onPointerCancel={onGripPointerCancel}
+                    onLostPointerCapture={onGripPointerCancel}
+                    onKeyDown={(e) => onGripKeyDown(e, t.id)}
+                    onClick={(e) => e.stopPropagation()}
+                    className={`h-4 w-1.5 shrink-0 rounded-xs border border-white/5 transition-colors focus:outline-hidden focus-visible:ring-1 focus-visible:ring-purple-400 ${
+                      reorderMovingSet.has(t.id)
+                        ? 'bg-purple-400 cursor-grabbing'
+                        : 'bg-white/15 hover:bg-purple-400/70 cursor-grab'
+                    }`}
+                  />
                   <input
                     id={`editor-track-name-${t.id}`}
                     name={`editor-track-name-${t.id}`}
@@ -5263,11 +6420,21 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                     {t.pan > 0 ? `R${Math.round(t.pan * 100)}` : t.pan < 0 ? `L${Math.round(-t.pan * 100)}` : 'C'}
                   </span>
                 </div>
-                {clips.some((c) => c.trackId === t.id && c.sourceKind === 'piano-roll' && !!c.sourcePianoRoll && c.sourcePianoRoll.length > 0) && (
+                {clips.some((c) => c.trackId === t.id && isMidiClip(c)) && (
                   <TrackInstrumentSelect track={t} />
                 )}
               </div>
             ))}
+            {/* Where the drop lands. Drawn in the gap between two header rows,
+                and mirrored across the lanes by the twin below. */}
+            {reorderDraw && (
+              <div
+                aria-hidden="true"
+                className="absolute left-0 right-0 h-0.5 bg-purple-400 shadow-[0_0_6px_rgba(168,85,247,0.9)] pointer-events-none z-30"
+                style={{ top: reorderDraw.insertIndex * trackH - 1 }}
+              />
+            )}
+            </div>
             {/* Add-track affordance sits directly below the lowest (newest) track. */}
             <button
               onClick={() => addTrack()}
@@ -5301,17 +6468,23 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
 
         {/* Scrollable timeline area */}
         <div
-          ref={timelineScrollRef}
+          ref={setTimelineScroller}
           className="flex-1 min-w-0 overflow-x-auto overflow-y-auto bg-[#07050a]"
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
           onScroll={handleTimelineScroll}
         >
-          {/* Ruler — click or drag to set playhead. Sticky so vertical scroll keeps it pinned. */}
+          {/* Ruler — click to seek, drag to select a time range, shift-drag for
+              the loop. Sticky so vertical scroll keeps it pinned. */}
           <div
             className="h-6 border-b border-white/5 bg-black/80 backdrop-blur-sm sticky top-0 z-40 select-none cursor-col-resize"
             style={{ width: timelineWidthPx }}
             onMouseDown={onRulerMouseDown}
+            onPointerDown={onRulerPointerDown}
+            onLostPointerCapture={onRulerPointerCancel}
+            onPointerMove={onRulerPointerMove}
+            onPointerUp={onRulerPointerUp}
+            onPointerCancel={onRulerPointerCancel}
           >
             {renderRuler.map((tick) => (
               <div
@@ -5324,6 +6497,17 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                 </span>
               </div>
             ))}
+            {/* Bar numbers (F05) at bar lines, once bars are >= 24 px apart. */}
+            {barLabels.map((b) => (
+              <div
+                key={`bar-${b.bar}`}
+                aria-hidden="true"
+                className="absolute top-0 h-2.5 border-l border-purple-300/40 pointer-events-none"
+                style={{ left: b.sec * zoom }}
+              >
+                <span className="absolute top-0 left-0.5 text-[8px] font-mono leading-none text-purple-300/80">{b.bar}</span>
+              </div>
+            ))}
             {/* Loop region (shift-drag the ruler to set; LOOP toggles it) */}
             {loopEnd > loopStart && (
               <div
@@ -5331,6 +6515,31 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                 style={{ left: loopStart * zoom, width: (loopEnd - loopStart) * zoom }}
               />
             )}
+            {/* Time range on the ruler (F03): the stronger band, with its
+                start – end · duration readout. A picture of state: no pointer. */}
+            {timeSelection && (
+              <div
+                aria-hidden="true"
+                className="absolute top-0 bottom-0 z-10 pointer-events-none bg-sky-400/30 border-x border-sky-300"
+                style={{ left: timeSelection.startSec * zoom, width: (timeSelection.endSec - timeSelection.startSec) * zoom }}
+              >
+                <span className="absolute top-0.5 left-1 text-[8px] font-mono text-sky-100 leading-none whitespace-nowrap">
+                  {formatRangeReadout(timeSelection)}
+                </span>
+              </div>
+            )}
+            {/* Edit cursor on the ruler (F06): an OUTLINED upward triangle,
+                where the playhead is a filled downward one. */}
+            <div
+              role="img"
+              aria-label={`Edit cursor at ${formatCursorTime(editCursorSec)}`}
+              className="absolute bottom-0 z-20 w-3 h-2 -translate-x-1/2 pointer-events-none"
+              style={{ left: editCursorSec * zoom }}
+            >
+              <svg viewBox="0 0 12 8" className="w-full h-full overflow-visible" aria-hidden="true">
+                <polygon points="6,0.75 11.25,7.25 0.75,7.25" fill="none" stroke="#7dd3fc" strokeWidth="1.5" strokeLinejoin="round" />
+              </svg>
+            </div>
             {/* Marker flags */}
             {markers.map((m) => (
               <MarkerFlag
@@ -5378,20 +6587,66 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                instead of stranding it on <body> when the dialog is cancelled. */
             tabIndex={-1}
             className={`relative outline-none ${tool === 'cut' ? 'cursor-crosshair' : 'cursor-default'}`}
-            style={{ width: timelineWidthPx, height: tracks.length * trackH + 34 + (automationEdit ? MASTER_STRIP_H : 0) }}
-            onMouseDown={onTimelineClick}
+            style={{ width: timelineWidthPx, height: lanesHeightPx }}
+            onPointerDown={onLanesPointerDown}
+            onLostPointerCapture={onLanesPointerCancel}
+            onPointerMove={onLanesPointerMove}
+            onPointerUp={onLanesPointerUp}
+            onPointerCancel={onLanesPointerCancel}
             onContextMenu={onLanesContextMenu}
             onDragOver={onTimelineDragOver}
             onDragLeave={onTimelineDragLeave}
             onDrop={onTimelineDrop}
           >
+            {/* Bar / beat / sub grid (F05), windowed to the visible range +-1
+                viewport; behind everything, never takes the pointer. */}
+            {gridWindow && (
+              <TimelineGridLayer
+                startSec={gridWindow.startSec}
+                endSec={gridWindow.endSec}
+                zoom={zoom}
+                bpm={projectBpm}
+                heightPx={lanesHeightPx}
+                style={gridStyle}
+                themeKey={editThemeId}
+              />
+            )}
             {tracks.map((track, ti) => (
               <div
                 key={track.id}
-                className="absolute left-0 right-0 border-b border-white/5"
-                style={{ top: ti * trackH, height: trackH, backgroundImage: 'linear-gradient(to right, rgba(255,255,255,0.02) 1px, transparent 1px)', backgroundSize: `${zoom * 5}px 100%` }}
+                className="absolute left-0 right-0 border-b"
+                style={{ top: ti * trackH, height: trackH, borderBottomColor: `rgb(var(--et-line, 255 255 255) / ${gridStyle.laneDividerOpacity})` }}
               />
             ))}
+
+            {/* Reorder drop target (F01), the same gap the header column draws,
+                carried across the lanes so the eye does not have to travel back
+                to the header column to see where the track will land. */}
+            {reorderDraw && (
+              <div
+                aria-hidden="true"
+                className="absolute left-0 right-0 h-0.5 bg-purple-400/80 pointer-events-none z-30"
+                style={{ top: reorderDraw.insertIndex * trackH - 1 }}
+              />
+            )}
+
+            {/* Time range down the lanes (F03): above the lane grid, under the
+                clips' interactive layers, no pointer. All-tracks by default;
+                a track-scoped range shades only its own lanes. */}
+            {timeSelection && (timeSelection.scope.kind === 'all-tracks' ? (
+              <div
+                aria-hidden="true"
+                className="absolute top-0 bottom-0 pointer-events-none bg-sky-400/10 border-x border-sky-300/50"
+                style={{ left: timeSelection.startSec * zoom, width: (timeSelection.endSec - timeSelection.startSec) * zoom }}
+              />
+            ) : tracks.map((t, ti) => (timeSelection.scope.kind === 'tracks' && timeSelection.scope.ids.includes(t.id) ? (
+              <div
+                key={`range-${t.id}`}
+                aria-hidden="true"
+                className="absolute pointer-events-none bg-sky-400/10 border-x border-sky-300/50"
+                style={{ left: timeSelection.startSec * zoom, width: (timeSelection.endSec - timeSelection.startSec) * zoom, top: ti * trackH, height: trackH }}
+              />
+            ) : null)))}
 
             {/* Clips */}
             {clips.map((clip) => {
@@ -5402,7 +6657,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
               const top = trackIdx * trackH + 6;
               const height = trackH - 12;
               const selected = selectedClipIdSet.has(clip.id) || clip.id === selectedClipId;
-              const isMidi = clip.sourceKind === 'piano-roll' && !!clip.sourcePianoRoll && clip.sourcePianoRoll.length > 0;
+              const isMidi = isMidiClip(clip);
               // Compact BPM/key readout: MIDI clips carry their render BPM; audio
               // clips resolve through the DJ analysis cache. Hidden entirely on
               // narrow clips or when neither value is known.
@@ -5419,8 +6674,16 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                 if (d?.bpm) bpmText = String(Math.round(d.bpm));
                 if (d?.key) keyText = `${d.key}${(d.scale ?? '').toLowerCase().startsWith('min') ? 'm' : ''}`;
               }
+              /* F09 — the header rides the VISIBLE part of the clip, so a long
+                 clip scrolled past its own start still shows its title and
+                 controls, and the 6-px resize zones stay clear. Before the
+                 first viewport measurement the clip is treated as fully
+                 visible, which is what it was on the previous render. */
+              const chrome = viewport.width > 0
+                ? clipChromeLayout(left, width, viewport.scrollLeft, viewport.width)
+                : clipChromeLayout(left, width, left, Math.max(1, width));
               const bpmKeyReadout =
-                width >= 120 && (bpmText || keyText) ? [bpmText, keyText].filter(Boolean).join(' . ') : null;
+                chrome && chrome.width >= 120 && (bpmText || keyText) ? [bpmText, keyText].filter(Boolean).join(' . ') : null;
               return (
                 <div
                   key={clip.id}
@@ -5436,54 +6699,97 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                     cursor: tool === 'cut' ? 'crosshair' : 'grab',
                   }}
                 >
-                  {/* Header bar */}
-                  <div className="absolute top-0 left-0 right-0 px-1 h-3.5 bg-black/50 backdrop-blur-sm border-b border-white/10 flex justify-between items-center font-sans text-xs font-bold leading-none">
-                    <span className="flex items-center gap-1 min-w-0 max-w-3/5">
-                      {clip.sourceKind === 'piano-roll' && (
-                        <Piano className="w-2.5 h-2.5 text-emerald-300 shrink-0" />
-                      )}
-                      <span className="text-white truncate">{clip.label}</span>
-                    </span>
-                    <span className="flex items-center gap-1 shrink-0">
-                      {bpmKeyReadout && (
-                        <span className="text-zinc-400 normal-case tabular-nums">{bpmKeyReadout}</span>
-                      )}
-                      {/* Header buttons stop pointerdown so they never start a
-                          clip drag, and stop click so they never re-select. */}
-                      <button
-                        type="button"
-                        onPointerDown={(e) => e.stopPropagation()}
-                        onDoubleClick={(e) => e.stopPropagation()}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          openFxRack(fxRackUnder(clip.trackId, e.currentTarget));
-                        }}
-                        aria-label={`Open track FX for clip ${clip.label}`}
-                        className="px-1 h-3.5 rounded-sm font-display text-xs font-bold leading-none flex items-center bg-black/40 text-zinc-300 border border-white/10 hover:text-purple-300 hover:border-purple-500/50"
-                      >FX</button>
-                      <button
-                        type="button"
-                        onPointerDown={(e) => e.stopPropagation()}
-                        onDoubleClick={(e) => e.stopPropagation()}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          updateClip(clip.id, { muted: !clip.muted });
-                        }}
-                        aria-label={`Mute clip ${clip.label}`}
-                        aria-pressed={!!clip.muted}
-                        className={`px-1 h-3.5 rounded-sm font-display text-xs font-bold leading-none flex items-center ${clip.muted ? 'bg-red-500/20 text-red-400 border border-red-500/50' : 'bg-black/40 text-zinc-300 border border-white/10 hover:text-white'}`}
-                      >M</button>
-                      {clipStretchRate(clip) !== 1 && (
-                        <span
-                          className="text-amber-300 tabular-nums"
-                          title={`Stretched to ${clipStretchRate(clip).toFixed(2)}x — the audio is untouched. Reset it from the clip menu.`}
-                        >
-                          {clipStretchRate(clip).toFixed(2)}x
+                  {/* Header strip: the bar itself spans the clip (decoration),
+                      its contents ride the visible part. */}
+                  <div className="absolute top-0 left-0 right-0 h-3.5 bg-black/50 backdrop-blur-sm border-b border-white/10 pointer-events-none" />
+                  {chrome && chrome.tier !== 'handle' && (
+                    <div
+                      className="absolute top-0 h-3.5 flex justify-between items-center gap-1 font-sans text-xs font-bold leading-none"
+                      style={{ left: chrome.leftInClip, width: chrome.width }}
+                    >
+                      <span className={`flex items-center gap-1 min-w-0 ${chrome.tier === 'full' ? 'max-w-3/5' : 'flex-1'}`}>
+                        {clip.sourceKind === 'piano-roll' && (
+                          <Piano className="w-2.5 h-2.5 text-emerald-300 shrink-0" />
+                        )}
+                        <span className="text-white truncate" title={clip.label}>{clip.label}</span>
+                      </span>
+                      {chrome.tier === 'full' ? (
+                        <span className="flex items-center gap-1 shrink-0">
+                          {bpmKeyReadout && (
+                            <span className="text-zinc-400 normal-case tabular-nums">{bpmKeyReadout}</span>
+                          )}
+                          {/* Header buttons stop pointerdown so they never start a
+                              clip drag, and stop click so they never re-select. */}
+                          <button
+                            type="button"
+                            onPointerDown={(e) => e.stopPropagation()}
+                            onDoubleClick={(e) => e.stopPropagation()}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              openFxRack(fxRackUnder(clip.trackId, e.currentTarget));
+                            }}
+                            aria-label={`Open track FX for clip ${clip.label}`}
+                            className="px-1 h-3.5 rounded-sm font-display text-xs font-bold leading-none flex items-center bg-black/40 text-zinc-300 border border-white/10 hover:text-purple-300 hover:border-purple-500/50"
+                          >FX</button>
+                          <button
+                            type="button"
+                            onPointerDown={(e) => e.stopPropagation()}
+                            onDoubleClick={(e) => e.stopPropagation()}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              updateClip(clip.id, { muted: !clip.muted });
+                            }}
+                            aria-label={`Mute clip ${clip.label}`}
+                            aria-pressed={!!clip.muted}
+                            className={`px-1 h-3.5 rounded-sm font-display text-xs font-bold leading-none flex items-center ${clip.muted ? 'bg-red-500/20 text-red-400 border border-red-500/50' : 'bg-black/40 text-zinc-300 border border-white/10 hover:text-white'}`}
+                          >M</button>
+                          {clipStretchRate(clip) !== 1 && (
+                            <span
+                              className="text-amber-300 tabular-nums"
+                              title={`Stretched to ${clipStretchRate(clip).toFixed(2)}x — the audio is untouched. Reset it from the clip menu.`}
+                            >
+                              {clipStretchRate(clip).toFixed(2)}x
+                            </span>
+                          )}
+                          <span className="text-zinc-300 tabular-nums">{clip.durationSec.toFixed(2)}s</span>
                         </span>
+                      ) : (
+                        /* Compact: no room for the readouts — one key to the
+                           clip's own menu, which holds all of them. */
+                        <button
+                          type="button"
+                          onPointerDown={(e) => e.stopPropagation()}
+                          onDoubleClick={(e) => e.stopPropagation()}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            openClipMenuFrom(e.currentTarget, clip.id);
+                          }}
+                          aria-label={`More actions for clip ${clip.label}`}
+                          aria-haspopup="menu"
+                          title={`${clip.label} — clip actions`}
+                          className="px-0.5 h-3.5 rounded-sm shrink-0 flex items-center bg-black/40 text-zinc-300 border border-white/10 hover:text-white"
+                        ><Ellipsis className="w-2.5 h-2.5" /></button>
                       )}
-                      <span className="text-zinc-300 tabular-nums">{clip.durationSec.toFixed(2)}s</span>
-                    </span>
-                  </div>
+                    </div>
+                  )}
+                  {/* Handle: too narrow for a title — a grip that carries the
+                      name and opens the clip menu. */}
+                  {chrome && chrome.tier === 'handle' && (
+                    <button
+                      type="button"
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onDoubleClick={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openClipMenuFrom(e.currentTarget, clip.id);
+                      }}
+                      aria-label={`${clip.label} — clip actions`}
+                      aria-haspopup="menu"
+                      title={clip.label}
+                      className="absolute top-0 h-3.5 w-1.5 rounded-sm bg-white/25 hover:bg-white/60"
+                      style={{ left: chrome.leftInClip }}
+                    />
+                  )}
                   {/* Body: MIDI clips show their notes (FL-style); audio clips show
                       peaks. A muted clip's body is dimmed (the red M is the flag). */}
                   {isMidi ? (
@@ -5617,18 +6923,21 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
               const vis = laneVisual(lane);
               if (!vis) return null;
               return (
-                <AutomationLane
-                  key={lane.id}
-                  lane={lane}
-                  zoom={zoom}
-                  width={timelineWidthPx}
-                  height={trackH}
-                  top={trackIdx * trackH}
-                  color={vis.color}
-                  toNorm={vis.toNorm}
-                  fromNorm={vis.fromNorm}
-                  editable={editable}
-                />
+                /* An editable lane owns its own wheel (curve nudges); display
+                   contents keeps the lane's own absolute layout. */
+                <div key={lane.id} className="contents" data-wheel-passthrough={editable ? '' : undefined}>
+                  <AutomationLane
+                    lane={lane}
+                    zoom={zoom}
+                    width={timelineWidthPx}
+                    height={trackH}
+                    top={trackIdx * trackH}
+                    color={vis.color}
+                    toNorm={vis.toNorm}
+                    fromNorm={vis.fromNorm}
+                    editable={editable}
+                  />
+                </div>
               );
             })}
 
@@ -5648,18 +6957,19 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
               const vis = laneVisual(lane);
               if (!vis) return null;
               return (
-                <AutomationLane
-                  key={lane.id}
-                  lane={lane}
-                  zoom={zoom}
-                  width={timelineWidthPx}
-                  height={MASTER_STRIP_H}
-                  top={tracks.length * trackH + 34}
-                  color={vis.color}
-                  toNorm={vis.toNorm}
-                  fromNorm={vis.fromNorm}
-                  editable={editable}
-                />
+                <div key={lane.id} className="contents" data-wheel-passthrough={editable ? '' : undefined}>
+                  <AutomationLane
+                    lane={lane}
+                    zoom={zoom}
+                    width={timelineWidthPx}
+                    height={MASTER_STRIP_H}
+                    top={tracks.length * trackH + 34}
+                    color={vis.color}
+                    toNorm={vis.toNorm}
+                    fromNorm={vis.fromNorm}
+                    editable={editable}
+                  />
+                </div>
               );
             })}
 
@@ -5703,6 +7013,28 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                 />
               );
             })()}
+
+            {/* Edit cursor line in the lanes (F06): thin and DASHED, where the
+                playhead line is solid red, so the two never read as one. */}
+            <div
+              aria-hidden="true"
+              className="absolute top-0 bottom-0 w-0 border-l border-dashed border-sky-300/70 z-30 pointer-events-none"
+              style={{ left: editCursorSec * zoom }}
+            />
+
+            {/* The marquee's rubber band while a drag in empty space is live (F15). */}
+            {marqueeRect && (
+              <div
+                aria-hidden="true"
+                className="absolute z-40 pointer-events-none border border-sky-300/80 bg-sky-400/10"
+                style={{
+                  left: marqueeRect.x1,
+                  top: marqueeRect.y1,
+                  width: marqueeRect.x2 - marqueeRect.x1,
+                  height: marqueeRect.y2 - marqueeRect.y1,
+                }}
+              />
+            )}
 
             {/* Playhead line in track lanes (position driven imperatively) */}
             <div
@@ -5818,7 +7150,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         });
         items.push({
           type: 'item',
-          label: 'Paste at playhead',
+          label: 'Paste at edit cursor',
           hint: 'Ctrl+V',
           disabled: clipboardRef.current.length === 0,
           onSelect: () => pasteClips(),
@@ -5914,9 +7246,9 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         });
         // Granular bleed: needs a second selected clip to act as the donor.
         // Overlapping pair → only the seam is bled; otherwise the whole host.
-        if (clip && !clip.sourcePianoRoll) {
+        if (clip && !isMidiClip(clip)) {
           const donor = bleedPartnerFor(clip.id);
-          if (donor && !donor.sourcePianoRoll) {
+          if (donor && !isMidiClip(donor)) {
             const seam = clipOverlap(clip, donor);
             const donorName = (donor.label || tracks.find((t) => t.id === donor.trackId)?.name || 'clip').slice(0, 18);
             items.push({ type: 'separator' });
@@ -5936,7 +7268,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             });
           }
         }
-        if (clip && !clip.sourcePianoRoll) {
+        if (clip && !isMidiClip(clip)) {
           const subjectIds = selectedClipIdSet.has(payload.clipId) && selectedClipIds.length > 1 ? selectedClipIds : [payload.clipId];
           const others = subjectIds.filter((id) => id !== payload.clipId);
           const anchorBpm = clipKnownBpm(clip);
@@ -5982,13 +7314,31 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             onSelect: () => setStemsModal({ clipId: payload.clipId }),
           });
         }
-        if (clip?.sourcePianoRoll) {
-          const noteCount = clip.sourcePianoRoll.length;
+        // The row that opens THIS clip's editor, chosen by the same classifier
+        // the double-click uses, so the menu and the gesture always agree —
+        // and every clip has one, which is why there is no `else` that leaves
+        // a clip with no way in from the menu.
+        if (clip) pushSeparator(items);
+        if (clip && clipEditKind(clip) === 'audio') {
+          items.push({
+            type: 'item',
+            label: 'Edit audio clip',
+            icon: <AudioWaveform className="w-3 h-3" />,
+            hint: 'double-click',
+            title: 'Open this clip in the audio editor drawer (trim, gain, fades)',
+            onSelect: () => editClipInAudioEditor(clip),
+          });
+        }
+        if (clip && clipEditKind(clip) === 'midi') {
+          // The count the roll will actually SHOW: its own notes when it has
+          // them, else the notes the clip plays. An empty roll is a valid
+          // document — the row stays, and says "0 notes" rather than vanishing.
+          const noteCount = clip.sourceRollNotes?.length || clip.sourcePianoRoll?.length || 0;
           items.push({
             type: 'item',
             label: 'Edit in Piano Roll',
             icon: <Piano className="w-3 h-3" />,
-            hint: `${noteCount} notes`,
+            hint: `${noteCount} note${noteCount === 1 ? '' : 's'}`,
             onSelect: () => editClipInPianoRoll(clip),
           });
           items.push({
@@ -6000,6 +7350,58 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
               const pos = clipMenu.position;
               setInstrPanel({ clipId: payload.clipId, x: pos?.x ?? 240, y: pos?.y ?? 200 });
             },
+          });
+        }
+        // ── Insert ONE stem beside this clip ────────────────────────────────
+        // Every stem the entry already has is listed, aggregates included: the
+        // user is naming one deliberately here, and hiding the drum sum from
+        // someone who asked for it by name would be the wrong kind of help.
+        // (The bulk paths are the ones that skip sums — see planStemInsert.)
+        if (clip?.libraryEntryId && clipStems.entryId === clip.libraryEntryId) {
+          const stemRows = clipStems.rows;
+          if (stemRows === null) {
+            pushSeparator(items);
+            items.push({ type: 'header', label: 'Insert stem…' });
+            items.push({ type: 'item', label: 'Reading stems…', disabled: true, onSelect: () => undefined });
+          } else if (stemRows.length > 0) {
+            pushSeparator(items);
+            items.push({ type: 'header', label: 'Insert stem…' });
+            for (const ref of stemRows) {
+              items.push({
+                type: 'item',
+                icon: <AudioLines className="w-3 h-3" />,
+                label: ref.name,
+                hint: ref.role === 'aggregate' ? 'sum of parts' : 'new track',
+                title: ref.role === 'aggregate'
+                  ? `Add ${ref.name} — a SUM of the other stems — on its own track, lined up with this clip`
+                  : `Add the ${ref.name} stem on its own track, lined up with this clip`,
+                onSelect: () => { void insertStemBesideClip(payload.clipId, ref); },
+              });
+            }
+          }
+        }
+        // ── Hand it to the assistant ────────────────────────────────────────
+        if (clip) {
+          // The clicked clip, or the whole selection when it contains it —
+          // the same subject rule the beat-match rows use.
+          const refIds = selectedClipIdSet.has(payload.clipId) && selectedClipIds.length > 1
+            ? selectedClipIds
+            : [payload.clipId];
+          const present = refIds.filter((id) => clips.some((c) => c.id === id));
+          pushSeparator(items);
+          items.push({
+            type: 'item',
+            icon: <Bot className="w-3 h-3" />,
+            label: refIds.length > 1 ? `Reference ${refIds.length} clips in gantasmob0t` : 'Reference in gantasmob0t',
+            // A disabled row is pointer-events:none, so the reason rides in the
+            // always-visible hint rather than the tooltip.
+            hint: present.length === 0 ? 'No longer in the project' : 'assistant',
+            disabled: present.length === 0,
+            title: 'Add these clips to the assistant’s reference list and open its composer. Nothing is sent.',
+            onSelect: () => addAssistantReferences(
+              refIds.map((id) => referenceForClip(id)),
+              refIds.length > 1 ? `${refIds.length} clips` : `"${clip.label}"`,
+            ),
           });
         }
         items.push({ type: 'separator' });
@@ -6035,11 +7437,11 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         const lyricsText = srcEntry ? deriveLyrics(srcEntry).trim() : '';
         // The header is where a user looks for "add something to THIS track",
         // so it offers the same sources as right-clicking the lane. A header
-        // click has no x, so the insert point is the playhead.
+        // click has no x, so the insert point is the edit cursor.
         const headerTarget: AddToTrackTarget = {
           trackId: t.id,
           trackName: t.name,
-          atSec: Math.max(0, snapSec(useEditorStore.getState().playheadSec)),
+          atSec: Math.max(0, snapSec(useEditorStore.getState().editCursorSec)),
         };
         const items: ContextMenuItem[] = [
           { type: 'header', label: 'Add to this track' },
@@ -6058,6 +7460,44 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             label: 'Copy lyrics',
             disabled: !lyricsText,
             onSelect: () => { if (lyricsText) void navigator.clipboard.writeText(lyricsText); },
+          },
+          { type: 'separator' },
+          // Reorder (F01). The menu moves THIS track, one row per invocation —
+          // the same store action the grip's Alt+Arrow uses. A disabled row is
+          // pointer-events:none, so the reason rides in the always-visible hint.
+          ...(() => {
+            const at = tracks.findIndex((tr) => tr.id === t.id);
+            const atTop = at <= 0;
+            const atBottom = at < 0 || at >= tracks.length - 1;
+            return [
+              {
+                type: 'item',
+                icon: <ChevronUp className="w-3 h-3" />,
+                label: 'Move track up',
+                hint: atTop ? 'Already first' : undefined,
+                disabled: atTop,
+                title: 'Move this track one row up (Alt+↑ on its grip)',
+                onSelect: () => moveTracksByOffset([t.id], -1),
+              },
+              {
+                type: 'item',
+                icon: <ChevronDown className="w-3 h-3" />,
+                label: 'Move track down',
+                hint: atBottom ? 'Already last' : undefined,
+                disabled: atBottom,
+                title: 'Move this track one row down (Alt+↓ on its grip)',
+                onSelect: () => moveTracksByOffset([t.id], 1),
+              },
+            ] satisfies ContextMenuItem[];
+          })(),
+          { type: 'separator' },
+          {
+            type: 'item',
+            icon: <Bot className="w-3 h-3" />,
+            label: 'Reference track in gantasmob0t',
+            hint: 'assistant',
+            title: 'Add this track to the assistant’s reference list and open its composer. Nothing is sent.',
+            onSelect: () => addAssistantReferences([referenceForTrack(t.id)], `"${t.name}"`),
           },
           { type: 'separator' },
           {
@@ -6099,6 +7539,101 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       {/* Add-to-track menu — right-click an empty part of the timeline. The
           group header names the lane the click resolved to, so it can never
           again claim to add to a track while quietly making a new one. */}
+      {/* The time-range menu (F04). Rows come from timelineInteraction's model
+          (tested there); this only binds each row to its action. Opening or
+          closing it changes neither the range nor the clip selection. */}
+      {rangeMenu.position && rangeMenu.payload && (() => {
+        const { range, trackId, clipId, sec } = rangeMenu.payload;
+        const menuPos = rangeMenu.position;
+        const menuClips = clips.map((c) => ({
+          id: c.id,
+          trackId: c.trackId,
+          startSec: c.startSec,
+          durationSec: c.durationSec,
+          midi: isMidiClip(c),
+        }));
+        const actions: Record<RangeMenuAction, { icon?: React.ReactNode; run: () => void }> = {
+          play: {
+            icon: <Play className="w-3 h-3" />,
+            run: () => {
+              setEditCursor(range.startSec);
+              seekEditorTo(range.startSec);
+              if (!isEditorTimelinePlaying() && !liveMixer.isPlaying()) void playEditorTimeline();
+            },
+          },
+          loop: { icon: <Repeat className="w-3 h-3" />, run: () => setLoopRegion(range.startSec, range.endSec) },
+          zoom: { icon: <ScanSearch className="w-3 h-3" />, run: () => zoomToRange(range.startSec, range.endSec) },
+          split: {
+            icon: <Scissors className="w-3 h-3" />,
+            run: () => {
+              const plan = rangeSplitPlan(menuClips, range);
+              if (plan.length === 0) return;
+              // One undo step for every cut: the recorder folds the synchronous
+              // burst after this cut into a single step.
+              beginUndoStep();
+              const anchor = useEditorStore.getState().selectedClipId;
+              for (const cut of plan) splitClipAt(cut.clipId, cut.atSec);
+              // splitClipAt focuses each new right half; a range command should
+              // leave the user's focused clip where it was.
+              setSelected(anchor);
+              logInfo('editor', `Split ${plan.length} cut${plan.length === 1 ? '' : 's'} at the range edges`);
+            },
+          },
+          'copy-to-inpaint': {
+            icon: <Paintbrush className="w-3 h-3" />,
+            run: () => {
+              const res = inpaintFromRange(menuClips, range, trackId);
+              if (res.ok) setInpaintSelection(res.selection);
+            },
+          },
+          'clip-actions': {
+            icon: <Layers className="w-3 h-3" />,
+            // The clip's own menu, at the same spot, exactly as a right-click
+            // outside the range opens it — including the selection rule: a clip
+            // that is not in the selection becomes the selection, so the rows
+            // that act on "the selected clips" act on THIS one. Choosing this
+            // row is a deliberate command, so changing the selection is allowed
+            // (unlike merely opening or closing a menu).
+            run: () => {
+              if (clipId === undefined) return;
+              if (!useEditorStore.getState().selectedClipIds.includes(clipId)) selectClipSingle(clipId);
+              clipMenu.open(new MouseEvent('contextmenu', { clientX: menuPos.x, clientY: menuPos.y }), { clipId, atSec: sec });
+            },
+          },
+          render: { run: () => undefined },
+          'send-assistant': {
+            icon: <Bot className="w-3 h-3" />,
+            // The store's time selection, not this menu's copy of it: the
+            // reference has to describe what the editor is selecting NOW.
+            run: () => addAssistantReferences([referenceForTimeSelection()], 'this range'),
+          },
+          clear: { icon: <X className="w-3 h-3" />, run: () => setTimeSelection(null) },
+        };
+        const items: ContextMenuItem[] = [];
+        for (const entry of buildRangeMenu({ range, clips: menuClips, trackId, clipId })) {
+          if (entry.action === 'render' || entry.action === 'clear') items.push({ type: 'separator' });
+          items.push({
+            type: 'item',
+            icon: actions[entry.action].icon,
+            label: entry.label,
+            disabled: !entry.enabled,
+            // A disabled row is pointer-events-none, so its reason goes in the
+            // always-visible hint rather than a tooltip.
+            hint: entry.reason,
+            onSelect: actions[entry.action].run,
+          });
+        }
+        return (
+          <ContextMenu
+            position={menuPos}
+            onClose={rangeMenu.close}
+            items={items}
+            title={`Range · ${formatRangeReadout(range)}`}
+            minWidth="16rem"
+          />
+        );
+      })()}
+
       {addMenu.position && addMenu.payload && (() => {
         const target = addMenu.payload;
         const items: ContextMenuItem[] = [

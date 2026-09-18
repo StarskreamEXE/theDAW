@@ -307,6 +307,51 @@ export const filterAndSort = (
 };
 
 // ---------------------------------------------------------------------------
+// Which knobs the SERVER can apply
+// ---------------------------------------------------------------------------
+
+/**
+ * The Catalogue drives the same paged library store the side panel does, so
+ * its query text, favourites, source and sort are sent to the backend and only
+ * the rows on screen are ever fetched.
+ *
+ * Its remaining knobs — a field-scoped target, the stricter match modes, the
+ * derived provider, an exact model, a rating, a duration window — have no
+ * server equivalent. `isServerOnly` says whether the state uses ONLY what the
+ * backend applies; when it does not, the view refines the rows it has loaded
+ * and says so, rather than pretending to have searched 200,000 entries.
+ *
+ * `fuzzy` and `contains` both count as server-equivalent: the backend's search
+ * is a prefix match per token, which is the same intent, not the same letters.
+ */
+export const isServerOnly = (state: CatalogueSearchState): boolean =>
+  state.searchTarget === 'all'
+  && (state.mode === 'fuzzy' || state.mode === 'contains')
+  && !state.providerFilter
+  && !state.modelFilter
+  && state.ratingFilter === 'all'
+  && state.durationMin == null
+  && state.durationMax == null;
+
+/** The Catalogue's sort names happen to be the library store's own names. */
+export type CatalogueServerSource = 'generate' | 'studio' | 'import' | null;
+
+/** The part of a Catalogue state the library store can carry to the backend. */
+export interface CatalogueServerQuery {
+  q: string;
+  sortBy: CatalogueSortBy;
+  onlyFavorites: boolean;
+  source: CatalogueServerSource;
+}
+
+export const catalogueServerQuery = (state: CatalogueSearchState): CatalogueServerQuery => ({
+  q: state.query,
+  sortBy: state.sortBy,
+  onlyFavorites: state.onlyFavorites,
+  source: state.sourceFilter === 'all' ? null : state.sourceFilter,
+});
+
+// ---------------------------------------------------------------------------
 // Label maps (for the filter bar UI)
 // ---------------------------------------------------------------------------
 

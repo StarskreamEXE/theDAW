@@ -3,6 +3,7 @@ import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
 import {createLogger, defineConfig, loadEnv} from 'vite';
+import {buildInfoDefines} from './buildInfo.config';
 import {plainAscii} from './src/lib/plainText';
 
 // During startup the frontend comes up before the backend binds :8600, so every
@@ -119,6 +120,8 @@ export default defineConfig(({mode}) => {
     },
     define: {
       'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),
+      // __APP_BUILD_SHA__ / __APP_BUILD_TIME__ — shown in the Update dialog.
+      ...buildInfoDefines(__dirname),
     },
     resolve: {
       alias: {

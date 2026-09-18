@@ -1,0 +1,7 @@
+# The built host binary: produced by build.ps1, never committed.
+bin/
+
+# Local build trees, in case someone configures in-source instead of on E:.
+build/
+out/
+*.user

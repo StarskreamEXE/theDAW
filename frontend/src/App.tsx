@@ -23,6 +23,7 @@ import OrbDripTrail from './components/audio/OrbDripTrail';
 import { OrbStatusFloat } from './components/audio/OrbStatusFloat';
 import { useBottomPanelStore } from './state/bottomPanelStore';
 import { useAssistantActivityStore } from './state/assistantActivityStore';
+import { ASSISTANT_FOCUS_EVENT } from './state/assistantReferenceStore';
 import { logInfo, logWarn, useLogStore, type LogLevel } from './state/logStore';
 import { handletheDAWAction } from './orb-kit/actionHandlers';
 import { useStatusBarStore } from './state/statusBarStore';
@@ -226,6 +227,16 @@ export default function App() {
   useEffect(() => {
     if (isAssistantOpen) setAssistantMounted(true);
   }, [isAssistantOpen]);
+
+  // F17 — something somewhere added a reference chip and wants the composer.
+  // Opening the panel is ALL this does: a reference is not a request, so no
+  // message is ever sent, and an already-open panel is left exactly as it is
+  // rather than being toggled shut by a second "Reference…" click.
+  useEffect(() => {
+    const onFocus = () => setIsAssistantOpen(true);
+    window.addEventListener(ASSISTANT_FOCUS_EVENT, onFocus);
+    return () => window.removeEventListener(ASSISTANT_FOCUS_EVENT, onFocus);
+  }, []);
 
   // App-wide TEXT size: publish the persisted scale as the `--text-scale` CSS
   // variable. index.css multiplies every font-size utility by it (font-size
@@ -583,9 +594,13 @@ export default function App() {
     };
   }, []);
 
+  // Returns the result so the panel can print what actually happened. It used
+  // to log the message and swallow it, leaving the panel free to claim
+  // "Executed action: X" for a miss.
   const handleAssistantAction = useCallback((action: { type: string; payload?: any }) => {
     const result = handletheDAWAction(action);
-    logInfo('assistant', `Action: ${action.type} → ${result}`);
+    logInfo('assistant', `Action: ${action.type} → ${result.ok ? 'ok' : 'FAILED'}: ${result.message}`);
+    return result;
   }, []);
 
   // The loading screen is gated purely on real backend readiness — it lifts the

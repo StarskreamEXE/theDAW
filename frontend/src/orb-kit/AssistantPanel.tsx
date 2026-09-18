@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
-import { X, Send, Sparkles, Bot, User, Loader2, Command, Play, Zap, KeyRound, RefreshCw, Trash2, Minimize2, Maximize2, Copy, Square, Paperclip, Mic, MicOff, FileText, Image as ImageIcon, Music, Film, History, Plus } from 'lucide-react';
+import { X, Send, Sparkles, Bot, User, Loader2, Command, Play, Zap, KeyRound, RefreshCw, Trash2, Minimize2, Maximize2, Copy, Square, Paperclip, Mic, MicOff, FileText, Image as ImageIcon, Music, Film, History, Plus, Clock, Library, Layers, AlertTriangle, CheckCircle2, XCircle } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { ProviderModelSelector, type ModelInfo } from './ProviderModelSelector';
@@ -21,6 +21,14 @@ import {
 } from './chatHistory';
 import { useStatusBarStore } from '../state/statusBarStore';
 import { useAssistantActivityStore } from '../state/assistantActivityStore';
+import {
+    ASSISTANT_FOCUS_EVENT,
+    referenceKey,
+    resolveAssistantReference,
+    useAssistantReferenceStore,
+    type AssistantReference,
+} from '../state/assistantReferenceStore';
+import type { AssistantActionResult } from './actionHandlers';
 
 // Inline clipboard helper (no external util available in theDAW)
 const copyToClipboard = (text: string) => navigator.clipboard.writeText(text).catch(() => {});
@@ -45,8 +53,19 @@ const fileToBase64 = (file: File): Promise<string> => new Promise((resolve, reje
 interface AssistantPanelProps {
     isOpen: boolean;
     onClose: () => void;
-    onExecuteAction: (action: { type: string; payload?: any }) => void;
+    /** Runs the action and reports what actually happened. A host that returns
+     *  nothing is treated as "dispatched, outcome unknown" — never as success. */
+    onExecuteAction: (action: { type: string; payload?: any }) =>
+        AssistantActionResult | Promise<AssistantActionResult> | void;
     orbPosition?: { x: number; y: number };
+}
+
+/** One action attempt, from dispatch to its real outcome. */
+export interface MessageActionResult {
+    id: string;
+    type: string;
+    status: 'running' | 'succeeded' | 'failed';
+    message: string;
 }
 
 export interface Message {
@@ -59,6 +78,11 @@ export interface Message {
     data?: any;
     suggestions?: string[];
     isError?: boolean;
+    /** The chips the user attached to this (user) message. */
+    references?: AssistantReference[];
+    /** What every action fired from this (assistant) message actually did.
+     *  Optional so transcripts stored before this existed still revive. */
+    actionResults?: MessageActionResult[];
 }
 
 interface AssistantAttachment {
@@ -273,6 +297,73 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
         if (mime.startsWith('image/')) return <ImageIcon size={12} />;
         if (mime.startsWith('video/')) return <Film size={12} />;
         return <FileText size={12} />;
+    };
+
+    // Reference chips — the "act on THIS" list built from the EDIT timeline and
+    // the Library. Resolved at render so a clip deleted while the composer sits
+    // open greys out instead of quietly pointing at nothing.
+    const references = useAssistantReferenceStore((s) => s.references);
+    const removeReference = useAssistantReferenceStore((s) => s.remove);
+
+    const renderReferenceIcon = (kind: AssistantReference['kind']) => {
+        if (kind === 'clip') return <Music size={12} />;
+        if (kind === 'time-range') return <Clock size={12} />;
+        if (kind === 'track') return <Layers size={12} />;
+        return <Library size={12} />;
+    };
+
+    /** Dispatch one action and record its REAL outcome on `messageId`. The
+     *  status starts at 'running' so an async tool is visibly in flight rather
+     *  than silently assumed done. */
+    const runAction = (action: { type: string; payload?: any }, messageId: string) => {
+        const resultId = uuid();
+        setMessages(prev => prev.map(msg =>
+            msg.id === messageId
+                ? {
+                    ...msg,
+                    action,
+                    actionResults: [
+                        ...(msg.actionResults ?? []),
+                        { id: resultId, type: action.type, status: 'running' as const, message: 'Running…' },
+                    ],
+                }
+                : msg
+        ));
+
+        const settle = (status: MessageActionResult['status'], message: string) => {
+            setMessages(prev => prev.map(msg =>
+                msg.id === messageId
+                    ? {
+                        ...msg,
+                        actionResults: (msg.actionResults ?? []).map(entry =>
+                            entry.id === resultId ? { ...entry, status, message } : entry
+                        ),
+                    }
+                    : msg
+            ));
+        };
+        const finish = (result: AssistantActionResult | void) => {
+            if (!result) {
+                // No host result: say exactly that rather than inventing a success.
+                settle('succeeded', `${action.type} dispatched (host reported no result)`);
+                return;
+            }
+            settle(result.ok ? 'succeeded' : 'failed', result.message);
+        };
+
+        try {
+            const outcome = onExecuteAction(action);
+            if (outcome && typeof (outcome as Promise<AssistantActionResult>).then === 'function') {
+                void (outcome as Promise<AssistantActionResult>).then(
+                    finish,
+                    (err: unknown) => settle('failed', err instanceof Error ? err.message : String(err)),
+                );
+            } else {
+                finish(outcome as AssistantActionResult | void);
+            }
+        } catch (err) {
+            settle('failed', err instanceof Error ? err.message : String(err));
+        }
     };
 
     const stopGeneration = () => {
@@ -505,6 +596,18 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
         }
     }, [isOpen, isMinimized]);
 
+    // Adding a reference must not send anything — `requestAssistantFocus()`
+    // only brings the composer forward so the user can type against the chips
+    // they just made.
+    useEffect(() => {
+        const onFocusRequest = () => {
+            setIsMinimized(false);
+            window.setTimeout(() => inputRef.current?.focus(), 0);
+        };
+        window.addEventListener(ASSISTANT_FOCUS_EVENT, onFocusRequest);
+        return () => window.removeEventListener(ASSISTANT_FOCUS_EVENT, onFocusRequest);
+    }, []);
+
 
 
 
@@ -529,11 +632,17 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
         // reply streams, the last message's id and the array length hold still and only
         // its content grows, so an id+length check would treat the finished reply as
         // identical to an already-persisted mid-stream partial and truncate it forever.
+        // An action settling from 'running' to its real status changes nothing
+        // else on the message, so the signature has to include it or the
+        // reloaded transcript would be frozen mid-flight forever.
+        const actionSig = (m?: Message) =>
+            (m?.actionResults ?? []).map(a => `${a.id}:${a.status}:${a.message}`).join('|');
         if (existing && existing.messages.length === snapshot.length
             && prev?.id === last?.id
             && prev?.content === last?.content
             && !!prev?.pendingAction === !!last?.pendingAction
-            && !!prev?.isError === !!last?.isError) return;
+            && !!prev?.isError === !!last?.isError
+            && actionSig(prev) === actionSig(last)) return;
         const now = Date.now();
         const record: StoredConversation = {
             id: convId,
@@ -571,7 +680,12 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
 
     const sendMessage = async (text: string) => {
         const pendingAttachments = attachments;
-        const promptText = text.trim() || (pendingAttachments.length ? 'Analyze the attached file(s).' : '');
+        // Snapshot the chips: they go out with THIS message and are then
+        // cleared, so a later message never silently inherits them.
+        const pendingReferences = useAssistantReferenceStore.getState().references;
+        const promptText = text.trim()
+            || (pendingAttachments.length ? 'Analyze the attached file(s).' : '')
+            || (pendingReferences.length ? 'Work on the referenced items.' : '');
         if (!promptText && pendingAttachments.length === 0) return;
 
         // If currently generating, stop it first
@@ -603,14 +717,18 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                 mime: item.mime,
                 size: item.size,
             })),
+            references: pendingReferences,
         });
 
         const userMessage: Message = {
             id: uuid(),
             role: 'user',
             content: `${promptText}${attachmentSummary}`,
-            timestamp: new Date()
+            timestamp: new Date(),
+            ...(pendingReferences.length ? { references: pendingReferences } : {}),
         };
+        // The chips are spent the moment the message is built.
+        if (pendingReferences.length) useAssistantReferenceStore.getState().clear();
 
         setMessages(prev => [...prev, userMessage]);
         setIsProcessing(true);
@@ -705,16 +823,10 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                                             : msg
                                     ));
                                 } else {
-                                    onExecuteAction(executableAction);
-                                    setMessages(prev => prev.map(msg =>
-                                        msg.id === assistantId
-                                            ? {
-                                                ...msg,
-                                                action: executableAction,
-                                                content: msg.content || `Executed action: ${executableAction.type}`,
-                                            }
-                                            : msg
-                                    ));
+                                    // No optimistic "Executed action: X" — the
+                                    // result card below the bubble says what
+                                    // the action actually did, including a miss.
+                                    runAction(executableAction, assistantId);
                                 }
                                 continue;
                             }
@@ -740,7 +852,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                                         const act = sanitizeAssistantAction(JSON.parse(match[1]));
                                         if (!act) continue;
                                         if (getToolTier(act.type) === 'T2_confirm') scrapedPending = act;
-                                        else onExecuteAction(act);
+                                        else runAction(act, assistantId);
                                     } catch {}
                                 }
                                 const cleaned = streamText.replace(actionRx, '').trim();
@@ -763,10 +875,16 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                     }
                 }
 
-                // Finalize — set final content from accumulated message
+                // Finalize — set final content from accumulated message. A reply
+                // that was pure action carries no prose, and its result card
+                // already says what happened: "No response." would contradict it.
                 setMessages(prev => prev.map(msg =>
                     msg.id === assistantId
-                        ? { ...msg, content: msg.content || 'No response.' }
+                        ? {
+                            ...msg,
+                            content: msg.content
+                                || (msg.actionResults?.length ? '' : 'No response.'),
+                        }
                         : msg
                 ));
         } catch (error) {
@@ -1307,10 +1425,50 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                                             </ReactMarkdown>
                                         </div>
                                     )}
-                                    {msg.action && (
+                                    {msg.role === 'user' && msg.references && msg.references.length > 0 && (
+                                        <div className="mt-1.5 pt-1.5 border-t border-white/20 flex flex-wrap gap-1">
+                                            {msg.references.map(ref => (
+                                                <span
+                                                    key={referenceKey(ref)}
+                                                    className="inline-flex items-center gap-1 rounded-full bg-white/15 px-1.5 py-0.5 text-[10px]"
+                                                >
+                                                    {renderReferenceIcon(ref.kind)}
+                                                    <span className="max-w-40 truncate">{ref.label}</span>
+                                                </span>
+                                            ))}
+                                        </div>
+                                    )}
+                                    {/* Transcripts stored before action results existed only have
+                                        the type; keep showing it so they don't lose the line. */}
+                                    {msg.action && !msg.actionResults?.length && (
                                         <div className="mt-1.5 pt-1.5 border-t border-white/10 flex items-center gap-1.5 text-[10px] opacity-70">
                                             <Command size={10} />
                                             <span className="font-mono">{msg.action.type}</span>
+                                        </div>
+                                    )}
+                                    {msg.actionResults && msg.actionResults.length > 0 && (
+                                        <div className="mt-1.5 pt-1.5 border-t border-white/10 flex flex-col gap-1">
+                                            {msg.actionResults.map(entry => (
+                                                <div
+                                                    key={entry.id}
+                                                    className={`flex items-start gap-1.5 text-[10px] ${entry.status === 'failed'
+                                                        ? 'text-red-300'
+                                                        : entry.status === 'running'
+                                                            ? 'text-muted'
+                                                            : 'text-emerald-300'
+                                                        }`}
+                                                >
+                                                    {entry.status === 'running' ? (
+                                                        <Loader2 size={10} className="mt-0.5 shrink-0 animate-spin" />
+                                                    ) : entry.status === 'failed' ? (
+                                                        <XCircle size={10} className="mt-0.5 shrink-0" />
+                                                    ) : (
+                                                        <CheckCircle2 size={10} className="mt-0.5 shrink-0" />
+                                                    )}
+                                                    <span className="font-mono shrink-0">{entry.type}</span>
+                                                    <span className="min-w-0 break-words opacity-80">{entry.message}</span>
+                                                </div>
+                                            ))}
                                         </div>
                                     )}
                                     {msg.pendingAction && msg.role === 'assistant' && (
@@ -1326,18 +1484,14 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                                             <div className="flex gap-2 mt-1">
                                                 <button
                                                     onClick={() => {
-                                                        onExecuteAction(msg.pendingAction!);
-                                                        setMessages(prev => {
-                                                            const updated = prev.map(m =>
-                                                                m.id === msg.id ? { ...m, pendingAction: undefined } : m
-                                                            );
-                                                            return [...updated, {
-                                                                id: uuid(),
-                                                                role: 'assistant' as const,
-                                                                content: 'Action "' + msg.pendingAction!.type + '" has been executed.',
-                                                                timestamp: new Date(),
-                                                            }];
-                                                        });
+                                                        const confirmed = msg.pendingAction!;
+                                                        setMessages(prev => prev.map(m =>
+                                                            m.id === msg.id ? { ...m, pendingAction: undefined } : m
+                                                        ));
+                                                        // The old code appended
+                                                        // 'Action "X" has been executed.'
+                                                        // before the action had even run.
+                                                        runAction(confirmed, msg.id);
                                                     }}
                                                     className="flex-1 bg-green-500/20 hover:bg-green-500/30 text-green-400 border border-green-500/30 rounded py-1.5 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5"
                                                     disabled={isProcessing}
@@ -1459,6 +1613,39 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                         event.target.value = '';
                     }}
                 />
+                {references.length > 0 && (
+                    <div className="mb-2 flex flex-wrap gap-1.5">
+                        {references.map(ref => {
+                            const key = referenceKey(ref);
+                            const resolved = resolveAssistantReference(ref);
+                            const missing = resolved.status === 'missing';
+                            return (
+                                <div
+                                    key={key}
+                                    title={resolved.detail}
+                                    className={`flex items-center gap-1.5 max-w-full rounded-full border px-2 py-1 text-[10px] ${missing
+                                        ? 'border-red-500/40 bg-red-500/10 text-red-300 line-through'
+                                        : resolved.status === 'changed'
+                                            ? 'border-amber-500/40 bg-amber-500/10 text-amber-200'
+                                            : 'border-emerald-500/25 bg-emerald-500/10 text-emerald-200'
+                                        }`}
+                                >
+                                    {missing ? <AlertTriangle size={12} /> : renderReferenceIcon(ref.kind)}
+                                    <span className="max-w-48 truncate">{ref.label}</span>
+                                    <button
+                                        type="button"
+                                        onClick={() => removeReference(key)}
+                                        className="ml-0.5 rounded-full opacity-70 hover:opacity-100 hover:text-red-300"
+                                        title={`Remove reference ${ref.label}`}
+                                        aria-label={`Remove reference ${ref.label}`}
+                                    >
+                                        <X size={10} />
+                                    </button>
+                                </div>
+                            );
+                        })}
+                    </div>
+                )}
                 {attachments.length > 0 && (
                     <div className="mb-2 flex flex-wrap gap-1.5">
                         {attachments.map(item => (
@@ -1530,7 +1717,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                     ) : (
                         <button
                             type="submit"
-                            disabled={!input.trim() && attachments.length === 0}
+                            disabled={!input.trim() && attachments.length === 0 && references.length === 0}
                             className="px-3 py-2 bg-linear-to-r from-primary to-pink-500 hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg transition-all"
                             title="Send message"
                         >

@@ -21,6 +21,10 @@ export type BottomPanelTab =
   | 'sing'
   | 'lyric'
   | 'midi'
+  // The clip-bound audio editor. Adding an id is forward-compatible with the
+  // persisted 'thedaw-bottom-panel-v5' state: nothing stores the union, only
+  // whichever member was last active.
+  | 'audio-edit'
   | 'step-seq'
   | 'draw'
   | 'slide';

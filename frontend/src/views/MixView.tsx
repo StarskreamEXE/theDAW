@@ -10,7 +10,7 @@ import {
 import { effectiveZoom } from '../lib/canvasScale';
 import { useEffectChainStore, EFFECT_LABELS, EFFECT_DEFAULTS, MIX_RACK_IDS } from '../state/effectChainStore';
 import { useVstStore } from '../state/vstStore';
-import { useVstEditorStore } from '../state/vstEditorStore';
+import { useVstEditorStore, vstEntryName } from '../state/vstEditorStore';
 import type { Vst3PluginInfo } from '../lib/vstClient';
 import { useAdvancedEditorSourceStore } from '../state/advancedEditorStore';
 import { useStudioStore } from '../state/studioStore';
@@ -801,13 +801,17 @@ function buildMixRegistry(p: MixRegArgs): WidgetRegistry {
             <div className="flex flex-wrap gap-3 content-start justify-center p-1.5">
               {p.vstPlugins.map((pl) => {
                 const inChain = p.vstInChain.has(pl.path);
+                // The plugin's OWN name once the backend probe has read it; the
+                // file stem is only the fallback. The vendor already shows below
+                // as the muted secondary line.
+                const name = pl.display_name || pl.name;
                 return (
                   <button key={pl.path} onClick={() => p.addVstToChain(pl)} title={pl.path}
                     className={`group relative flex flex-col gap-1.5 rounded-md border overflow-hidden transition-all p-2 text-left ${inChain ? 'border-teal-400/60 ring-1 ring-teal-400/40 bg-teal-500/5' : 'border-white/8 bg-black/30 hover:border-white/20 hover:brightness-110'}`}
                     style={{ width: 132 }}>
                     <div className="flex items-center gap-1.5">
                       <Plug className="w-3 h-3 text-teal-300 shrink-0" />
-                      <span className="text-[10px] font-bold text-zinc-100 truncate flex-1">{pl.name}</span>
+                      <span className="text-[10px] font-bold text-zinc-100 truncate flex-1">{name}</span>
                       {inChain && <span aria-label="In chain" className="w-1.5 h-1.5 rounded-full bg-teal-400 shrink-0" />}
                     </div>
                     <div className="relative w-full h-16 rounded bg-[#0a0c14] border border-white/5 overflow-hidden">
@@ -903,10 +907,15 @@ function buildMixRegistry(p: MixRegArgs): WidgetRegistry {
                 <div className={boxCls}>
                   {p.vstPlugins.map((pl) => {
                     const inChain = p.vstInChain.has(pl.path);
+                    // Vendor · version is the muted secondary label under the
+                    // plugin's own name (file stem only as the fallback). The
+                    // thumbnail seed stays on the FILE name so a plugin's
+                    // generated artwork does not change when a probe lands.
+                    const name = pl.display_name || pl.name;
                     const desc = [pl.manufacturer, pl.version].filter(Boolean).join(' · ') || pl.category;
                     return tile
-                      ? <ModuleTile key={pl.path} name={pl.name} color="#2dd4bf" marked={inChain} onClick={() => p.addVstToChain(pl)} preview={vstPreviewKey(pl.category)} seed={`${pl.name}|${pl.manufacturer}`} />
-                      : <ModuleRow key={pl.path} name={pl.name} desc={desc} color="#2dd4bf" marked={inChain} onClick={() => p.addVstToChain(pl)} />;
+                      ? <ModuleTile key={pl.path} name={name} color="#2dd4bf" marked={inChain} onClick={() => p.addVstToChain(pl)} preview={vstPreviewKey(pl.category)} seed={`${pl.name}|${pl.manufacturer}`} />
+                      : <ModuleRow key={pl.path} name={name} desc={desc} color="#2dd4bf" marked={inChain} onClick={() => p.addVstToChain(pl)} />;
                   })}
                 </div>
               </div>
@@ -995,7 +1004,10 @@ function buildMixRegistry(p: MixRegArgs): WidgetRegistry {
                 className={`rounded p-1.5 border transition-all cursor-pointer shrink-0 w-40 flex flex-col ${p.selectedEntry?.id === entry.id ? 'border-purple-500/60 bg-purple-500/5' : 'border-zinc-800 hover:border-white/10'} ${!entry.enabled ? 'opacity-40' : ''}`}>
                 <div className="flex items-center gap-1 shrink-0">
                   <button className="text-zinc-600 hover:text-purple-400 disabled:opacity-20 shrink-0" disabled={index === 0} title="Move earlier" onClick={(e) => { e.stopPropagation(); p.reorder(index, index - 1); }}><ChevronLeft className="w-3 h-3" /></button>
-                  <span className="text-[10px] font-mono text-purple-300 font-semibold flex-1 truncate">{entry.vst ? entry.vst.plugin_name : (EFFECT_LABELS[entry.effect] || getRackEffect(entry.effect)?.label || entry.effect)}</span>
+                  {/* A VST row is named after the PLUGIN; vstEntryName keeps an
+                      entry whose stored name is empty off the bare format id
+                      'vst3', which names the host library, not the effect. */}
+                  <span className="text-[10px] font-mono text-purple-300 font-semibold flex-1 truncate">{entry.vst ? vstEntryName(entry.vst.plugin_name, entry.vst.plugin_path) : (EFFECT_LABELS[entry.effect] || getRackEffect(entry.effect)?.label || entry.effect)}</span>
                   {entry.vst && (
                     <button
                       className={`shrink-0 ${entry.vst.raw_state ? 'text-teal-400 hover:text-teal-300' : 'text-zinc-500 hover:text-teal-300'}`}
@@ -1070,7 +1082,7 @@ function buildMixRegistry(p: MixRegArgs): WidgetRegistry {
           <div className="flex flex-col gap-2 rounded-md border border-teal-500/25 bg-black/40 px-4 py-3 min-w-56">
             <div className="flex items-center gap-1.5">
               <Plug className="w-3.5 h-3.5 text-teal-300 shrink-0" />
-              <span className="text-[11px] font-bold text-zinc-100 truncate">{selected.vst.plugin_name}</span>
+              <span className="text-[11px] font-bold text-zinc-100 truncate">{vstEntryName(selected.vst.plugin_name, selected.vst.plugin_path)}</span>
             </div>
             {selected.vst.raw_state && <span className="text-[8px] font-mono text-teal-400">settings saved</span>}
             <button
@@ -1454,7 +1466,13 @@ export const MixView: React.FC = () => {
   const activeEffects = activeCategory === 'all' ? allEffects : (EFFECT_CATALOG[activeCategory] || []);
   const chainEffectIds = new Set(chain.map((e) => e.effect));
   const vstInChain = new Set(chain.filter((e) => e.vst).map((e) => e.vst!.plugin_path));
-  const addVstToChain = (pl: Vst3PluginInfo) => addVst({ plugin_path: pl.path, plugin_name: pl.name });
+  // A new chain entry stores the plugin's OWN name where the backend probe has
+  // read one, so the chain reads the way the vendor names the plugin rather
+  // than the way its file happens to be named. Entries added before the probe
+  // landed keep the stem they were stored with — the chain is the record of
+  // what the user added, not a live view of the scan.
+  const addVstToChain = (pl: Vst3PluginInfo) =>
+    addVst({ plugin_path: pl.path, plugin_name: pl.display_name || pl.name });
   const selectedEntry = chain.find((e) => e.id === selectedChainId) ?? chain[0] ?? null;
 
   // Open a VST3 plugin's REAL native GUI (pedalboard show_editor in a sidecar

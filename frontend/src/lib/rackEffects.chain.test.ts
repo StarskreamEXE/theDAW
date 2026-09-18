@@ -22,7 +22,7 @@
  */
 import assert from 'node:assert/strict';
 
-import { buildEffectChain, type RackEffectDef, type RackEffectInstance } from './rackEffects.ts';
+import { buildEffectChain, getRackEffect, type RackEffectDef, type RackEffectInstance } from './rackEffects.ts';
 import type { ChainEntry } from '../state/effectChainStore.ts';
 
 /* ── fake audio graph ──────────────────────────────────────────────────────── */
@@ -294,5 +294,96 @@ assertWiring([`IN4->${built.tag}.in`, `${built.tag}.out->OUT4`]);
 h4.dispose();
 assert.equal(built.disposeCount, 1);
 assertWiring([]);
+
+/* ── a hosted VST3 is a LIVE node now, not an inert passthrough ─────────────
+   The entries above stay inert because they carry no `vst` block — there is no
+   plugin to host. An entry that HAS one goes through `buildEffectChain`'s
+   `vst3` branch, which builds its node from the whole ENTRY (a plugin is
+   identified by path and restored from stored state, neither of which fits
+   through a `Record<string, number>`). The seam here stands in for the real
+   bridge, which needs an AudioWorklet and a host process.
+
+   `getRackEffect('vst3')` stays undefined throughout: a hosted plugin is still
+   not a rack effect, and nothing about this branch puts one in the registry. */
+
+const hosted = (id: string, enabled = true): ChainEntry => ({
+  ...entry(id, 'vst3', enabled),
+  vst: { plugin_path: 'C:/VST3/Ozone 11.vst3', plugin_name: 'Ozone 11' },
+});
+
+{
+  assert.equal(getRackEffect('vst3'), undefined, 'a hosted plugin is not a rack effect');
+
+  const input5 = new FakeNode('IN5');
+  const output5 = new FakeNode('OUT5');
+  const vstCalls: string[] = [];
+  const vstFactory = (_c: BaseAudioContext, e: ChainEntry): RackEffectInstance | null => {
+    vstCalls.push(e.id);
+    const node = new FakeNode(`VST(${e.id})`);
+    return {
+      input: asNode(node),
+      output: asNode(node),
+      setParams: () => {},
+      dispose: () => { node.disconnect(); },
+    };
+  };
+
+  const a5 = entry('a5', 'alpha');
+  const v5 = hosted('v5');
+  const h5 = buildEffectChain(ctx, asNode(input5), asNode(output5), [a5, v5], { resolve, vstFactory });
+  const alpha5 = instOf(h5, 'a5');
+  assert.ok(alpha5);
+  assert.deepEqual(vstCalls, ['v5'], 'the factory is called with the entry, once');
+  assertWiring(
+    [`IN5->${alpha5.tag}.in`, `${alpha5.tag}.out->VST(v5)`, `VST(v5)->OUT5`],
+    'the plugin is wired INTO the chain, in order',
+  );
+  assert.deepEqual(h5.inertIds?.(), [], 'and it is no longer reported as inert');
+
+  // Bypass still means "routed around", and a bypassed entry that has never
+  // been built is still not built — which is what stops a switched-off plugin
+  // from spawning a host process.
+  const vstCallsBefore = vstCalls.length;
+  h5.rebuild([a5, { ...v5, enabled: false }]);
+  assert.equal(vstCalls.length, vstCallsBefore, 'no new factory call for the bypass');
+  assertWiring([`IN5->${alpha5.tag}.in`, `${alpha5.tag}.out->OUT5`], 'routed around, instance kept');
+  assert.deepEqual(h5.inertIds?.(), [], 'a bypassed entry is off by intent, not unrenderable');
+
+  h5.rebuild([a5, v5]);
+  assertWiring([`IN5->${alpha5.tag}.in`, `${alpha5.tag}.out->VST(v5)`, `VST(v5)->OUT5`], 'and back');
+  h5.dispose();
+  assertWiring([]);
+}
+
+/* ── no host binary: the SAME entry falls back to inert, and says so ───────── */
+{
+  const input6 = new FakeNode('IN6');
+  const output6 = new FakeNode('OUT6');
+  const warns: string[] = [];
+  const realWarn2 = console.warn;
+  console.warn = (...args: unknown[]) => { warns.push(args.map(String).join(' ')); };
+
+  const a6 = entry('a6', 'alpha');
+  const v6 = hosted('v6');
+  // A factory that declines is exactly what `createVstLiveNode` returns when
+  // this machine has no live host binary.
+  const h6 = buildEffectChain(ctx, asNode(input6), asNode(output6), [a6, v6], {
+    resolve,
+    vstFactory: () => null,
+  });
+  const alpha6 = instOf(h6, 'a6');
+  assert.ok(alpha6);
+  assert.equal(instOf(h6, 'v6'), undefined, 'no node for a plugin that cannot be hosted');
+  assertWiring([`IN6->${alpha6.tag}.in`, `${alpha6.tag}.out->OUT6`], 'the chain closes over it');
+  assert.deepEqual(h6.inertIds?.(), ['v6'], 'and the UI is told, so the row can say "render-only"');
+  assert.equal(warns.length, 1, 'warned once, like every other unrenderable entry');
+  assert.ok(warns[0].includes('v6'), `the warning names the entry: ${warns[0]}`);
+
+  // A BYPASSED entry that cannot be hosted is off by intent: nothing to report.
+  h6.rebuild([a6, { ...v6, enabled: false }]);
+  assert.deepEqual(h6.inertIds?.(), []);
+  h6.dispose();
+  console.warn = realWarn2;
+}
 
 console.log('rackEffects chain: bypass keeps the instance, unknown ids stay visible — passed');

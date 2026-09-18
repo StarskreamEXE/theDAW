@@ -31,6 +31,7 @@ import { SingScoreView } from './sing/SingScoreView';
 const LyricStudioView = lazy(() =>
   import('./lyricstudio/LyricStudioView').then((m) => ({ default: m.LyricStudioView })),
 );
+import { AudioEditorPanel } from './AudioEditorPanel';
 import { DrawPanel } from './DrawPanel';
 import { DetachableWindow } from './DetachableWindow';
 import { useBottomPanelStore, type BottomPanelTab } from '../../state/bottomPanelStore';
@@ -50,6 +51,7 @@ const TAB_DEFS: Array<{ id: BottomPanelTab; label: string }> = [
   { id: 'levels',   label: 'Levels' },
   { id: 'spectral', label: 'Visualize' },
   { id: 'midi',     label: 'MIDI' },
+  { id: 'audio-edit', label: 'Clip' },
   { id: 'step-seq', label: 'Sequence' },
   { id: 'draw',     label: 'DRAW' },
   { id: 'score',    label: 'Score' },
@@ -186,6 +188,11 @@ export const BottomMultiTabPanel: React.FC = () => {
             <Suspense fallback={null}>
               <MidiPanel />
             </Suspense>
+          </div>
+        )}
+        {activeTab === 'audio-edit' && (
+          <div className="absolute inset-0" data-tour="audio-edit-panel">
+            <AudioEditorPanel />
           </div>
         )}
         {activeTab === 'draw' && (

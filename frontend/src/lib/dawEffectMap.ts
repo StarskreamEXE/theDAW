@@ -14,6 +14,7 @@
  */
 import type { DawDevice } from './dawImportClient';
 import type { EffectChainNode } from './projectClient';
+import type { ChainEntry } from '../state/effectChainStore';
 import { getRackEffect, type RackParamDescriptor } from './rackEffects';
 
 /** Ordered name patterns -> theDAW effect id. Specific before generic. */
@@ -212,4 +213,55 @@ export function dawDeviceToEffectNode(device: DawDevice): EffectChainNode {
     parameters: mapped ? translateDawParams(mapped, params) : params,
     bypass,
   };
+}
+
+/**
+ * The same parsed device as a LIVE chain entry — what `buildEffectChain` needs
+ * to actually put it in the Perform graph.
+ *
+ * `dawDeviceToEffectNode` above stays exactly as it was: it produces the
+ * PERSISTED interchange node (`EffectChainNode`, mirroring the backend's
+ * model), where a plugin keeps its own `effect_name` (the device's name, which
+ * is what the user sees in the loader) and carries its identity in
+ * `vst_state`. Changing that shape would change the .tasmo format for every
+ * consumer, so the live conversion is a second, additive step rather than an
+ * edit to the first.
+ *
+ * The difference that matters: a live entry uses the chain builder's vocabulary
+ * — `effect: 'vst3'` plus a `vst` node — which is the ONLY shape
+ * `buildEffectChain`'s hosted-plugin branch recognises. Built from the device
+ * name alone (as the Perform views used to), a plugin resolved to no rack
+ * effect and no plugin path, so it could only ever be inert.
+ *
+ * `id` is supplied by the caller because it is load-bearing beyond this
+ * function: the live VST session registry is keyed by chain-entry id, so the id
+ * has to be stable across chain rebuilds, and Perform's controller mappings
+ * already address slots by `perform-<track>-<device>`.
+ *
+ * No `raw_state`: an imported DAW project carries the plugin's own preset data
+ * in a format neither host reads, so the plugin starts at its defaults and the
+ * user dials it in from its own GUI.
+ */
+export function dawDeviceToChainEntry(device: DawDevice, id: string): ChainEntry {
+  const node = dawDeviceToEffectNode(device);
+  const params = node.parameters ?? {};
+  const enabled = !node.bypass;
+  const vs = node.vst_state;
+  if (vs?.plugin_path) {
+    return {
+      id,
+      effect: 'vst3',
+      params,
+      enabled,
+      vst: { plugin_path: vs.plugin_path, plugin_name: vs.plugin_name },
+      label: vs.plugin_name || node.effect_name,
+    };
+  }
+  return { id, effect: node.effect_name, params, enabled };
+}
+
+/** Whether a parsed device is a re-hostable plugin (as opposed to a stock
+ *  effect this importer maps onto the rack, or one it can only preserve). */
+export function isHostedPluginDevice(device: DawDevice): boolean {
+  return !!dawDeviceToEffectNode(device).vst_state?.plugin_path;
 }

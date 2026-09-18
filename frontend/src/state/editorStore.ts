@@ -15,8 +15,9 @@ import {
 } from '../lib/clipComp';
 import { crossfadeRegions } from '../lib/crossfade';
 import { MIN_CLIP_SEC } from '../lib/clipDragMath';
+import { moveByOffset, moveIds, sameOrder } from '../lib/timeline/trackOrder';
 import type { WarpMarker } from '../lib/audioWarp';
-import type { ChainEntry, VstNode } from './effectChainStore';
+import type { ChainEntry, VstNode, VstStateHost } from './effectChainStore';
 import { rackEffectDefaults } from '../lib/rackEffects';
 import {
   holdsAfterRelease, modeAfterStop, recordsWhileHeld, sampleCurve, upsertAutomationPoint,
@@ -112,6 +113,17 @@ export interface InpaintSelection {
   clipId: string;
   startSec: number; // timeline seconds
   endSec: number;   // timeline seconds
+}
+
+/**
+ * A persistent time selection on the arrangement: `[startSec, endSec)` in
+ * timeline seconds, over every track or over the listed track ids.
+ * Structurally identical to `lib/timeline/timeSelection.ts` `TimeRange`.
+ */
+export interface EditorTimeRange {
+  startSec: number;
+  endSec: number;
+  scope: { kind: 'all-tracks' } | { kind: 'tracks'; ids: readonly string[] };
 }
 
 export interface AudioClip {
@@ -407,7 +419,14 @@ export const freezeSignature = (doc: {
   // A clip's muted flag is part of the shape because the bounce drops muted
   // clips, so toggling mute changes the rendered master.
   const clipPart = doc.clips.map(clipSignaturePart).join('|');
-  const trackPart = doc.tracks.map(trackSignaturePart).join('|');
+  // Track parts are sorted by id: the master bounce SUMS the tracks, so the
+  // arrangement's row order never reaches the render, and a pure reorder must
+  // not flag a frozen master stale. Each part still carries its id, so a change
+  // to any audible property of any track still changes the signature.
+  const trackPart = [...doc.tracks]
+    .sort((x, y) => (x.id < y.id ? -1 : x.id > y.id ? 1 : 0))
+    .map(trackSignaturePart)
+    .join('|');
   return [
     clipPart, trackPart,
     JSON.stringify(doc.masterFxChain), JSON.stringify(doc.masterVstChain), doc.bpm,
@@ -526,6 +545,19 @@ interface EditorStoreState {
   snap: SnapDivision;
   bpm: number;              // for snap math
   inpaintSelection: InpaintSelection | null;
+  /* ── Workspace selection (batch 11) ───────────────────────────────────────
+     Held here rather than in WaveformEditor's local state because EDIT is
+     conditionally mounted and a tab switch would otherwise drop it. Workspace
+     state: outside undo history and outside the saved project. Every action
+     that deletes a clip or track prunes these; loadProject resets them. */
+  /** Persistent time selection (timeline seconds); null = none. */
+  timeSelection: EditorTimeRange | null;
+  /** The edit cursor, timeline seconds, >= 0. Independent of the playhead. */
+  editCursorSec: number;
+  /** Multi-selected clip ids. `selectedClipId` stays the single focused clip. */
+  selectedClipIds: string[];
+  /** Multi-selected track ids. */
+  selectedTrackIds: string[];
   /** Master-bus insert FX chain (real-time psychoacoustic rack). Session-local —
    *  liveMixer routes the editor mix through it before the shared engine master. */
   masterFxChain: ChainEntry[];
@@ -594,7 +626,13 @@ interface EditorStoreState {
   unfreezeTrack: (trackId: string) => void;
 
   addClipToTrack: (clip: Omit<AudioClip, 'id'> & { id?: string }) => string;
-  updateClip: (id: string, updates: Partial<AudioClip>) => void;
+  /** Patch a clip. `coalesce` folds the write into whatever undo step is
+   *  already open instead of opening one keyed to this clip — the same opt-in
+   *  `stretchClipToFit` takes, for the same reason: a caller that already cut
+   *  the burst for a whole multi-write operation (a stretch drag; the stem
+   *  explode's track + clip + parent-mute sequence) must not have its last
+   *  write split off into a step of its own. */
+  updateClip: (id: string, updates: Partial<AudioClip>, opts?: { coalesce?: boolean }) => void;
   removeClip: (id: string) => void;
   splitClipAt: (id: string, atSec: number) => string | null;
   /** Shape one end of a clip's fade. */
@@ -692,6 +730,24 @@ interface EditorStoreState {
   setBpm: (b: number) => void;
   setInpaintSelection: (sel: InpaintSelection | null) => void;
   clearInpaintSelection: () => void;
+  /** Store a time selection. Stores null when either bound is non-finite,
+   *  start < 0 or end <= start; a 'tracks' scope keeps only known ids (deduped)
+   *  and becomes null when none are left. Not an undo step. */
+  setTimeSelection: (r: EditorTimeRange | null) => void;
+  /** Move the edit cursor (seconds), clamped to >= 0; non-finite is ignored. */
+  setEditCursor: (sec: number) => void;
+  /** Replace the clip multi-selection (deduped, unknown ids dropped). Does not
+   *  touch `selectedClipId`. */
+  setSelectedClipIds: (ids: readonly string[]) => void;
+  /** Replace the track multi-selection (deduped, unknown ids dropped). */
+  setSelectedTrackIds: (ids: readonly string[]) => void;
+  /** Move `ids` to sit before `beforeId` (null = end), keeping their current
+   *  relative order. One undo step; a move that changes nothing writes nothing.
+   *  Routing is keyed by id and is not touched. Unknown ids throw. */
+  moveTracks: (ids: readonly string[], beforeId: string | null) => void;
+  /** Move `ids` one row up (-1) or down (1); runs at the edge stay put. Same
+   *  undo rule as `moveTracks`. */
+  moveTracksByOffset: (ids: readonly string[], offset: -1 | 1) => void;
 
   /* ── Routing + buses ───────────────────────────────────────────────────────
      The STRUCTURAL ones (`addBus`, `removeBus`, `setTrackOutput`, `addSend`,
@@ -780,7 +836,16 @@ interface EditorStoreState {
   updateTrackEffectParams: (trackId: string, entryId: string, params: Record<string, number>) => void;
   /** Store a VST entry's captured native-editor state on a track chain node,
    *  so the dialed-in sound is applied at freeze/render time. */
-  setTrackVstRawState: (trackId: string, entryId: string, rawState: string) => void;
+  /** Store a captured plugin state on a track's VST entry. `stateHost` says
+   *  WHICH host produced it (see `effectChainStore.VstStateHost`); omitting it
+   *  means the old editor sidecar, which is what every caller that predates the
+   *  live host is. */
+  setTrackVstRawState: (
+    trackId: string,
+    entryId: string,
+    rawState: string,
+    stateHost?: VstStateHost,
+  ) => void;
   /** Replace an existing chain entry's effect with a live rack effect (reset to
    *  its defaults, enabled), keeping the entry's id + slot. Used to "rebuild" an
    *  imported device that came in inert so a controller mapping has a live home. */
@@ -860,7 +925,19 @@ interface EditorStoreState {
   addMasterVst: (plugin: VstNode) => void;
   /** Store a VST entry's captured native-editor state on a master VST chain
    *  node (staleness is caught by the freeze signature, which covers raw_state). */
-  setMasterVstRawState: (entryId: string, rawState: string) => void;
+  /** See `setTrackVstRawState` — the master VST chain's equivalent. */
+  setMasterVstRawState: (entryId: string, rawState: string, stateHost?: VstStateHost) => void;
+  /** Write a master VST entry's plugin parameters (normalized `p<index>` keys).
+   *
+   *  The master VST chain had a raw-state setter and no param setter, so a
+   *  `param` event streamed out of Ozone's own window while it sat on the
+   *  master had NOWHERE to land: the editor moved, the document did not, and an
+   *  automation lane on that slot read a value the plugin no longer held.
+   *
+   *  UNDO-EXEMPT, like `updateMasterEffectParams` and `setMasterVstRawState`:
+   *  keyed on the entry, so a 30 Hz burst from one editor gesture — and the
+   *  state capture that ends it — coalesce into a single step. */
+  setMasterVstParams: (entryId: string, params: Record<string, number>) => void;
   removeMasterVst: (entryId: string) => void;
   reorderMasterVst: (from: number, to: number) => void;
   clearMasterVst: () => void;
@@ -1270,6 +1347,65 @@ const docSnapshot = (s: EditorStoreState): EditorHistorySnapshot => ({
   buses: s.buses,
 });
 
+/** `ids` deduped, in first-seen order, keeping only members of `known`. */
+const keepKnown = (ids: readonly string[], known: ReadonlySet<string>): string[] => {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const id of ids) {
+    if (known.has(id) && !seen.has(id)) {
+      seen.add(id);
+      out.push(id);
+    }
+  }
+  return out;
+};
+
+/** A time selection with its 'tracks' scope pruned to `knownTrackIds`; null
+ *  when the scope is left empty. Returns the same object when nothing drops. */
+const pruneTimeSelection = (
+  r: EditorTimeRange | null,
+  knownTrackIds: ReadonlySet<string>,
+): EditorTimeRange | null => {
+  if (!r || r.scope.kind === 'all-tracks') return r;
+  const ids = keepKnown(r.scope.ids, knownTrackIds);
+  if (ids.length === 0) return null;
+  if (ids.length === r.scope.ids.length) return r;
+  return { ...r, scope: { kind: 'tracks', ids } };
+};
+
+/** `tracks` rearranged into `order` (a permutation of their ids), or null when
+ *  `order` is the order they already have. */
+const reorderedTracks = (tracks: readonly EditorTrack[], order: readonly string[]): EditorTrack[] | null => {
+  if (sameOrder(tracks.map((t) => t.id), order)) return null;
+  const byId = new Map(tracks.map((t) => [t.id, t]));
+  return order.map((id) => {
+    const t = byId.get(id);
+    if (!t) throw new Error(`Unknown track id: ${id}`);
+    return t;
+  });
+};
+
+type WorkspaceSelection =Pick<EditorStoreState, 'selectedClipIds' | 'selectedTrackIds' | 'timeSelection'>;
+
+/** The workspace selections pruned to the clips and tracks that exist. Used by
+ *  every path that can delete a clip or track, undo/redo included. Unchanged
+ *  slices keep their object identity. */
+const pruneSelections = (
+  s: WorkspaceSelection,
+  clips: readonly AudioClip[],
+  tracks: readonly EditorTrack[],
+): WorkspaceSelection => {
+  const trackIds = new Set(tracks.map((t) => t.id));
+  const clipIds = new Set(clips.map((c) => c.id));
+  const selectedClipIds = s.selectedClipIds.filter((id) => clipIds.has(id));
+  const selectedTrackIds = s.selectedTrackIds.filter((id) => trackIds.has(id));
+  return {
+    selectedClipIds: selectedClipIds.length === s.selectedClipIds.length ? s.selectedClipIds : selectedClipIds,
+    selectedTrackIds: selectedTrackIds.length === s.selectedTrackIds.length ? s.selectedTrackIds : selectedTrackIds,
+    timeSelection: pruneTimeSelection(s.timeSelection, trackIds),
+  };
+};
+
 /** The track the store ships with, before any project is loaded. */
 // The first document: six empty lanes (Daniel's DEFAULT_TRACK_COUNT), routed to
 // the master from the first frame (batch 6's routing graph).
@@ -1292,6 +1428,10 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   snap: '1/16',
   bpm: 120,
   inpaintSelection: null,
+  timeSelection: null,
+  editCursorSec: 0,
+  selectedClipIds: [],
+  selectedTrackIds: [],
   masterFxChain: [],
   masterVstChain: [],
   previewMode: 'live',
@@ -1331,6 +1471,12 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       buses: buses ?? [],
       clips,
       selectedClipId: null,
+      // Workspace state belongs to the document it was made in.
+      timeSelection: null,
+      editCursorSec: 0,
+      selectedClipIds: [],
+      selectedTrackIds: [],
+      inpaintSelection: null,
       playheadSec: 0,
       scrollSec: 0,
       isPlaying: false,
@@ -1374,16 +1520,21 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   },
 
   removeTrack: (id) => {
-    set((s) => ({
-      tracks: s.tracks.filter((t) => t.id !== id),
-      clips: s.clips.filter((c) => c.trackId !== id),
-      automationLanes: s.automationLanes.filter((l) => l.target.trackId !== id),
-      // Drops the node AND every edge that touched it — including sends INTO a
-      // deleted track, which would otherwise be a dangling edge `topoOrder`
-      // cannot resolve.
-      routing: graphRemoveNode(s.routing, id),
-      selectedClipId: s.clips.some((c) => c.id === s.selectedClipId && c.trackId === id) ? null : s.selectedClipId,
-    }));
+    set((s) => {
+      const tracks = s.tracks.filter((t) => t.id !== id);
+      const clips = s.clips.filter((c) => c.trackId !== id);
+      return {
+        tracks,
+        clips,
+        automationLanes: s.automationLanes.filter((l) => l.target.trackId !== id),
+        // Drops the node AND every edge that touched it — including sends INTO a
+        // deleted track, which would otherwise be a dangling edge `topoOrder`
+        // cannot resolve.
+        routing: graphRemoveNode(s.routing, id),
+        selectedClipId: s.clips.some((c) => c.id === s.selectedClipId && c.trackId === id) ? null : s.selectedClipId,
+        ...pruneSelections(s, clips, tracks),
+      };
+    });
     logInfo('editor', `Removed track: ${id}`);
   },
 
@@ -1416,14 +1567,16 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
         color: track.color,
         peaks: stem.peaks,
       };
+      const clips = [...others, stemClip];
       return {
-        clips: [...others, stemClip],
+        clips,
         tracks: s.tracks.map((t) =>
           t.id === trackId
             ? { ...t, fxChain: [], frozenOriginal: { clips: original, fxChain: t.fxChain ?? [] } }
             : t,
         ),
         selectedClipId: null,
+        ...pruneSelections(s, clips, s.tracks),
       };
     });
     logInfo('editor', `Froze track ${trackId}: printed FX into a stem`);
@@ -1435,12 +1588,14 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       if (!track || !track.frozenOriginal) return {};
       const fo = track.frozenOriginal;
       const others = s.clips.filter((c) => c.trackId !== trackId);
+      const clips = [...others, ...fo.clips];
       return {
-        clips: [...others, ...fo.clips],
+        clips,
         tracks: s.tracks.map((t) =>
           t.id === trackId ? { ...t, fxChain: fo.fxChain, frozenOriginal: undefined } : t,
         ),
         selectedClipId: null,
+        ...pruneSelections(s, clips, s.tracks),
       };
     });
     logInfo('editor', `Unfroze track ${trackId}: restored clips + FX`);
@@ -1492,10 +1647,14 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     return id;
   },
 
-  updateClip: (id, updates) => {
+  updateClip: (id, updates, opts) => {
     // Every clip gesture — move, trim, fade drag, stretch — is keyed by the clip
     // it is moving, so one drag is one step and the next clip's drag is another.
-    coalesceAs(`clip:${id}`);
+    // `coalesce` is the `stretchClipToFit` exception: the caller has already cut
+    // the burst for a whole operation, so this write joins THAT step whatever
+    // its key is, instead of starting a second one.
+    if (opts?.coalesce) coalesceWithOpenStep(`clip:${id}`);
+    else coalesceAs(`clip:${id}`);
     set((s) => ({
       // A trim / slip on a COMPED clip has to move every take's read head with
       // the clip's own, or the comp goes on playing the untrimmed takes and the
@@ -1509,6 +1668,9 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     set((s) => ({
       clips: s.clips.filter((c) => c.id !== id),
       selectedClipId: s.selectedClipId === id ? null : s.selectedClipId,
+      selectedClipIds: s.selectedClipIds.includes(id) ? s.selectedClipIds.filter((x) => x !== id) : s.selectedClipIds,
+      // An inpaint range on a clip that no longer exists has nothing to inpaint.
+      inpaintSelection: s.inpaintSelection?.clipId === id ? null : s.inpaintSelection,
     }));
     if (clip) logInfo('editor', `Removed clip: ${clip.label}`);
   },
@@ -1877,6 +2039,47 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   setInpaintSelection: (sel) => set({ inpaintSelection: sel }),
   clearInpaintSelection: () => set({ inpaintSelection: null }),
 
+  setTimeSelection: (r) => {
+    if (
+      !r || !Number.isFinite(r.startSec) || !Number.isFinite(r.endSec) ||
+      r.startSec < 0 || r.endSec <= r.startSec
+    ) {
+      set({ timeSelection: null });
+      return;
+    }
+    const scope: EditorTimeRange['scope'] = r.scope.kind === 'all-tracks'
+      ? { kind: 'all-tracks' }
+      : { kind: 'tracks', ids: keepKnown(r.scope.ids, new Set(get().tracks.map((t) => t.id))) };
+    if (scope.kind === 'tracks' && scope.ids.length === 0) {
+      set({ timeSelection: null });
+      return;
+    }
+    set({ timeSelection: { startSec: r.startSec, endSec: r.endSec, scope } });
+  },
+  setEditCursor: (sec) => {
+    if (!Number.isFinite(sec)) return;
+    set({ editCursorSec: Math.max(0, sec) });
+  },
+  setSelectedClipIds: (ids) =>
+    set((s) => ({ selectedClipIds: keepKnown(ids, new Set(s.clips.map((c) => c.id))) })),
+  setSelectedTrackIds: (ids) =>
+    set((s) => ({ selectedTrackIds: keepKnown(ids, new Set(s.tracks.map((t) => t.id))) })),
+
+  moveTracks: (ids, beforeId) => {
+    const { tracks } = get();
+    const next = reorderedTracks(tracks, moveIds(tracks.map((t) => t.id), ids, beforeId));
+    if (!next) return; // an unchanged order is no edit: no step, no write
+    beginUndoStep(); // a move is one discrete edit, however soon after the last
+    set({ tracks: next }); // routing is keyed by id, so it stays as it is
+  },
+  moveTracksByOffset: (ids, offset) => {
+    const { tracks } = get();
+    const next = reorderedTracks(tracks, moveByOffset(tracks.map((t) => t.id), ids, offset));
+    if (!next) return;
+    beginUndoStep();
+    set({ tracks: next });
+  },
+
   // ── Routing + buses ────────────────────────────────────────────────────────
 
   addBus: (name) => {
@@ -2068,13 +2271,24 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       frozenMaster: null,
     })),
 
-  setMasterVstRawState: (entryId, rawState) => {
+  setMasterVstRawState: (entryId, rawState, stateHost = 'pedalboard') => {
     // A native editor streams its state out as the user turns a knob in it.
     coalesceAs(`master:vst:${entryId}`);
     set((s) => ({
       masterVstChain: s.masterVstChain.map((e) =>
-        e.id === entryId && e.vst ? { ...e, vst: { ...e.vst, raw_state: rawState } } : e,
+        e.id === entryId && e.vst
+          ? { ...e, vst: { ...e.vst, raw_state: rawState, state_host: stateHost } }
+          : e,
       ),
+    }));
+  },
+
+  setMasterVstParams: (entryId, params) => {
+    // The same key `setMasterVstRawState` uses, so the knob burst and the state
+    // the editor commits at the end of that gesture are ONE step.
+    coalesceAs(`master:vst:${entryId}`);
+    set((s) => ({
+      masterVstChain: s.masterVstChain.map((e) => (e.id === entryId ? { ...e, params } : e)),
     }));
   },
 
@@ -2162,7 +2376,7 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     }));
   },
 
-  setTrackVstRawState: (trackId, entryId, rawState) => {
+  setTrackVstRawState: (trackId, entryId, rawState, stateHost = 'pedalboard') => {
     coalesceAs(`track:${trackId}:vst:${entryId}`); // see setMasterVstRawState
     set((s) => ({
       tracks: s.tracks.map((t) =>
@@ -2170,7 +2384,9 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
           ? {
               ...t,
               fxChain: (t.fxChain ?? []).map((e) =>
-                e.id === entryId && e.vst ? { ...e, vst: { ...e.vst, raw_state: rawState } } : e,
+                e.id === entryId && e.vst
+                  ? { ...e, vst: { ...e.vst, raw_state: rawState, state_host: stateHost } }
+                  : e,
               ),
             }
           : t,
@@ -2495,6 +2711,8 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       bpm: prev.bpm,
       routing: prev.routing,
       buses: prev.buses,
+      // The restored document may lack clips/tracks the selections name.
+      ...pruneSelections(s, prev.clips, prev.tracks),
       _undo: s._undo.slice(0, -1),
       _redo: [...s._redo, current],
       // undo/redo run under historyApplying, so the dirty subscription skips
@@ -2522,6 +2740,7 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       bpm: next.bpm,
       routing: next.routing,
       buses: next.buses,
+      ...pruneSelections(s, next.clips, next.tracks),
       _undo: [...s._undo, current],
       _redo: s._redo.slice(0, -1),
       dirty: true,

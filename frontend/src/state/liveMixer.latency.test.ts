@@ -41,6 +41,7 @@ import {
 } from './liveMixer.ts';
 import { getRackEffect, summingDelaysSec, type RackEffectDef } from '../lib/rackEffects.ts';
 import { useEditorStore, type EditorTrack } from './editorStore.ts';
+import { useVstLiveStore } from './vstLiveStore.ts';
 import type { ChainEntry } from './effectChainStore.ts';
 
 /** The compressor's declared look-ahead, straight from the Web Audio spec via
@@ -241,9 +242,66 @@ function inertEntriesAreReportedUncounted(): void {
     track('hosted', [entry('e1', 'vst3'), entry('e2', 'compressor')]),
     track('clean', [entry('e3', 'reverb')]),
   ]);
-  assert.deepEqual(rows[0].uncounted, ['e1'], 'a hosted VST3 is inert live but listed, because it prints at bounce');
+  assert.deepEqual(rows[0].uncounted, ['e1'], 'a hosted VST3 with no live session is listed, because it prints at bounce');
   assert.ok(close(rows[0].latencySec, COMPRESSOR_SEC), 'and contributes nothing to the live figure');
   assert.deepEqual(rows[1].uncounted, [], 'a resolvable enabled effect is counted');
+}
+
+/**
+ * A hosted VST3 that is LIVE moves the mixer.
+ *
+ * This is the half the case above does NOT cover, and the reason the mixer
+ * subscribes to `vstLiveStore`: once the plugin's host session is live the
+ * plugin really is in the path, and its latency — its own plus the bridge's
+ * fixed play-out buffer — is time every other track has to wait for. A live
+ * plugin that still read as `uncounted` would leave every other track early by
+ * exactly that much.
+ *
+ * `trackCompDelays` reads the store through `chainLatencyReport`'s default
+ * `liveLatencySec`, so setting the store IS the input here.
+ */
+function aLiveHostedPluginMovesTheAlignment(): void {
+  const before = useVstLiveStore.getState().entries;
+  try {
+    // 1024 plugin samples + 512 * (2 + 1) of bridge, at 48 kHz = 53.33 ms.
+    useVstLiveStore.getState().setReady('e1', {
+      plugin: { name: 'Ozone 11', vendor: 'iZotope', version: '11', category: 'Fx', identifier: 'ID', format: 'VST3' },
+      pluginLatencySamples: 1024,
+      bridgeLatencySamples: 512 * 3,
+      sampleRate: 48000,
+      hasEditor: true,
+    });
+    const pluginSec = (1024 + 1536) / 48000;
+
+    const rows = trackCompDelays([
+      track('hosted', [entry('e1', 'vst3')]),
+      track('clean', [entry('e3', 'reverb')]),
+    ]);
+    assert.ok(close(rows[0].latencySec, pluginSec), `the live plugin's latency is the track's, got ${rows[0].latencySec}`);
+    assert.deepEqual(rows[0].uncounted, [], 'it is no longer an entry the figure excludes');
+    assert.ok(close(rows[0].compSec, 0), 'the slowest track never waits');
+    assert.ok(close(rows[1].compSec, pluginSec), 'every other track waits for the plugin');
+
+    // Dropping the session takes the latency straight back out: the worklet
+    // falls to dry the moment the socket dies, so the mixer must stop
+    // compensating for a plugin that is no longer processing.
+    useVstLiveStore.getState().setStatus('e1', 'error', 'socket closed (1006)');
+    const after = trackCompDelays([
+      track('hosted', [entry('e1', 'vst3')]),
+      track('clean', [entry('e3', 'reverb')]),
+    ]);
+    assert.ok(close(after[0].latencySec, 0), 'a dropped session declares nothing');
+    assert.deepEqual(after[0].uncounted, ['e1'], 'and is an excluded entry again');
+    assert.ok(close(after[1].compSec, 0), 'so nothing waits for it any more');
+
+    // Bypass beats liveness: a bypassed entry is routed around whatever its
+    // session is doing.
+    useVstLiveStore.getState().setStatus('e1', 'live');
+    const off = trackCompDelays([track('hosted', [entry('e1', 'vst3', false)])]);
+    assert.ok(close(off[0].latencySec, 0), 'a bypassed plugin is not in the path');
+  } finally {
+    useVstLiveStore.setState({ entries: before });
+  }
 }
 
 /* ── 7. The read-out over the store ──────────────────────────────────────── */
@@ -443,6 +501,7 @@ aParamEditCanMoveTheAlignment();
 differentLatenciesMeetAtTheSlowest();
 aFrozenTrackIsAZeroLatencyInput();
 inertEntriesAreReportedUncounted();
+aLiveHostedPluginMovesTheAlignment();
 theReportMirrorsTheStore();
 theCompNodeIsSplicedBetweenPannerAndDestination();
 delaysAreRampedNeverJumped();

@@ -157,7 +157,10 @@ function pickBeats(beats: number, role?: string): number {
 }
 
 function entryTitle(id: string): string {
-  return useLibraryStore.getState().entries.find((e) => e.id === id)?.title ?? id.slice(0, 8);
+  // By id: `entries` holds only the loaded rows, so a crate song from a page
+  // nobody has open used to fall back to its uuid. `getById` also answers from
+  // the single-entry cache, and warms it for the next render when it cannot.
+  return useLibraryStore.getState().getById(id)?.title ?? id.slice(0, 8);
 }
 
 /** The key everything is transposed toward: the score's, or the first crate song's. */

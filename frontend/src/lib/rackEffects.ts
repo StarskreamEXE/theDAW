@@ -17,7 +17,16 @@
  */
 
 import { distCurve } from './synthVoiceKit';
+import { createVstLiveNode } from './vstLive/vstLiveNode';
+import { vstLiveLatencySec } from '../state/vstLiveStore';
 import type { ChainEntry } from '../state/effectChainStore';
+
+/** The effect id a hosted VST3 plugin carries. It is deliberately NOT a
+ *  `RACK_EFFECTS` entry — `getRackEffect('vst3')` stays undefined — because a
+ *  VST entry is not built from numeric params but from its `vst` block
+ *  (plugin path, stored state), which no `RackEffectFactory` signature can
+ *  carry. `buildEffectChain` and `chainLatencyReport` special-case it instead. */
+const VST3_EFFECT_ID = 'vst3';
 
 /** One scheduled spatial jump: position (x,y,z) to hold from absolute ctx time `when`. */
 export interface TeleportEvent {
@@ -2456,6 +2465,12 @@ export interface ChainLatencyOptions {
   /** Context sample rate, for declarations expressed in samples. Passed through
    *  verbatim; when omitted, such a declaration receives `undefined`. */
   sampleRate?: number;
+  /** Seconds a hosted `vst3` entry adds to the LIVE path, by `ChainEntry.id`.
+   *  Defaults to `vstLiveStore.vstLiveLatencySec`, which answers 0 for every
+   *  entry that is not live — so an entry only counts once its plugin is
+   *  actually in the graph. A test seam, and the one place PDC and the live
+   *  node cannot disagree about who is processing. */
+  liveLatencySec?: (entryId: string) => number;
 }
 
 /** What one chain entry contributed, and why it did not. */
@@ -2508,11 +2523,24 @@ export function chainLatencyReport(
   opts: ChainLatencyOptions = {},
 ): ChainLatencyReport {
   const resolveDef = opts.resolve ?? ((id: string) => RACK_BY_ID.get(id));
+  const liveLatency = opts.liveLatencySec ?? vstLiveLatencySec;
   let totalSec = 0;
   const perEntry: ChainLatencyEntry[] = [];
   for (const e of entries) {
     const def = e.enabled ? resolveDef(e.effect) : undefined;
     if (!def) {
+      // A hosted VST3 that is LIVE really is in the path and really does delay
+      // the chain — plugin latency plus the bridge's fixed buffer — so it
+      // counts, and the mixer's alignment follows its `ready` / `latency`
+      // events. A `vst3` entry that is not live answers 0 and stays
+      // `counted: false`, which is the same inert entry it always was.
+      const liveSec =
+        e.enabled && e.effect === VST3_EFFECT_ID ? Math.max(0, liveLatency(e.id)) : 0;
+      if (liveSec > 0) {
+        totalSec += liveSec;
+        perEntry.push({ id: e.id, effect: e.effect, latencySec: liveSec, counted: true });
+        continue;
+      }
       perEntry.push({ id: e.id, effect: e.effect, latencySec: 0, counted: false });
       continue;
     }
@@ -2584,6 +2612,13 @@ export interface BuildChainOptions {
    *  that no fake context can satisfy, so `rackEffects.chain.test.ts` injects
    *  fake single-node effects here to assert the wiring. */
   resolve?: (id: string) => RackEffectDef | undefined;
+  /** Build the live node for a `vst3` entry (default: the live VST bridge).
+   *  Takes the whole ENTRY, not a param record: a plugin is identified by its
+   *  path and restored from its stored state, neither of which fits through
+   *  `RackEffectFactory`'s `Record<string, number>`. Returning null leaves the
+   *  entry inert — reported by `inertIds()` and warned about once — which is
+   *  what happens when there is no host binary on this machine. */
+  vstFactory?: (ctx: BaseAudioContext, entry: ChainEntry) => RackEffectInstance | null;
 }
 
 interface LiveInstance {
@@ -2628,6 +2663,7 @@ export function buildEffectChain(
 ): ChainHandle {
   const instances = new Map<string, LiveInstance>(); // keyed by ChainEntry.id
   const resolveDef = opts.resolve ?? ((id: string) => RACK_BY_ID.get(id));
+  const vstFactory = opts.vstFactory ?? createVstLiveNode;
   /** `entryId:effectId` pairs already warned about, so a 60 Hz rebuild loop
    *  cannot spam — keyed on the pair, so an entry that is later pointed at a
    *  different unknown effect is reported again. */
@@ -2646,24 +2682,36 @@ export function buildEffectChain(
   const rebuild = (next: ChainEntry[]) => {
     clearWiring();
 
-    // Split the chain into what this graph can render and what it cannot.
-    const renderable: { entry: ChainEntry; def: RackEffectDef }[] = [];
-    const inertNow: string[] = [];
-    for (const e of next) {
-      const def = resolveDef(e.effect);
-      if (def) { renderable.push({ entry: e, def }); continue; }
-      if (!e.enabled) continue; // switched off by intent — nothing to report
-      inertNow.push(e.id);
+    // Split the chain into what this graph can render and what it cannot. A
+    // `def` of null is the `vst3` branch: not a rack effect, but hosted live by
+    // `vstFactory` — which may still decline (no host binary), in which case the
+    // entry falls back to inert exactly as it always was.
+    const renderable: { entry: ChainEntry; def: RackEffectDef | null }[] = [];
+    const inertIdSet = new Set<string>();
+    const reportInert = (e: ChainEntry) => {
+      inertIdSet.add(e.id);
       const warnKey = `${e.id}:${e.effect}`;
-      if (warned.has(warnKey)) continue;
+      if (warned.has(warnKey)) return;
       warned.add(warnKey);
       console.warn(
         `[rackEffects] chain entry ${e.id} (${e.label ?? e.effect}) has no live rack effect ` +
           `for id "${e.effect}" — it passes audio through untouched in the live graph and ` +
           `only renders at freeze/bounce.`,
       );
+    };
+    for (const e of next) {
+      const def = resolveDef(e.effect);
+      if (def) { renderable.push({ entry: e, def }); continue; }
+      // A hosted plugin is a candidate even while bypassed: the rule below —
+      // "a bypassed entry with no instance is never instantiated" — is what
+      // keeps a bypassed entry from opening a host process at all.
+      if (e.effect === VST3_EFFECT_ID && e.vst?.plugin_path) {
+        renderable.push({ entry: e, def: null });
+        continue;
+      }
+      if (!e.enabled) continue; // switched off by intent — nothing to report
+      reportInert(e);
     }
-    inert = inertNow;
 
     // Dispose only what LEFT the chain. A bypassed entry is still in it.
     const keepIds = new Set(renderable.map((r) => r.entry.id));
@@ -2682,11 +2730,27 @@ export function buildEffectChain(
       // is already in sync.
       if (!li && !e.enabled) continue;
       if (!li) {
-        const params = withDefaults(def, e.params);
-        li = { effect: e.effect, inst: def.make(ctx, params), params };
+        if (def) {
+          const params = withDefaults(def, e.params);
+          li = { effect: e.effect, inst: def.make(ctx, params), params };
+        } else {
+          // `vst3`: the factory returns a passthrough NOW and swaps the plugin
+          // in when its host session is ready, or null when this machine has no
+          // host to swap in — in which case the entry is inert, exactly as
+          // every hosted plugin was before the live host existed.
+          const inst = vstFactory(ctx, e);
+          if (!inst) {
+            if (e.enabled) reportInert(e);
+            continue;
+          }
+          li = { effect: e.effect, inst, params: { ...e.params } };
+        }
         instances.set(e.id, li);
       } else {
-        li.params = withDefaults(def, e.params);
+        // A `vst3` entry has no definition to merge defaults from: its params
+        // ARE the plugin's normalized parameter values (`p<index>`), and a
+        // default it did not author would be a value nobody asked for.
+        li.params = def ? withDefaults(def, e.params) : { ...e.params };
         li.inst.setParams(li.params);
       }
       if (!e.enabled) continue; // kept alive, routed around
@@ -2694,6 +2758,8 @@ export function buildEffectChain(
       prev = li.inst.output;
     }
     prev.connect(output);
+    // In chain order, whichever pass discovered them.
+    inert = next.filter((e) => inertIdSet.has(e.id)).map((e) => e.id);
   };
 
   rebuild(entries);

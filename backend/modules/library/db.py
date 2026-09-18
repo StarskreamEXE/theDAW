@@ -13,7 +13,8 @@ data we accumulate as features land:
                       inits / inpaint / stems-of / midi-of / derived-from
   - ``tag_index``     denormalized many-to-many (entry_id, tag) for fast filters
   - ``prompt_corpus`` (entry_id, prompt_kind, prompt_text) for LoRA labelling
-  - ``schema_meta``   key/value store for the schema version + first-init time
+  - ``schema_meta``   key/value store for the schema version, first-init time,
+                      and ``library_revision`` (one bump per committed write)
 
 Edge tables are designed so a future export to a real graph DB (kuzudb /
 oxigraph) is a ~30-line script.
@@ -26,17 +27,19 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional, Sequence
 
 log = logging.getLogger(__name__)
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
 
 
 # Each tuple is (schema_version_after_running, statements list).
@@ -296,11 +299,341 @@ _MIGRATIONS: list[tuple[int, list[str]]] = [
             """,
         ],
     ),
+    (
+        7,
+        [
+            # A library of ~200,000 imported songs. Every one of these backs a
+            # filter or a sort offered by ``list_entries_page``; without them a
+            # deep page is a full table sort, which is the whole problem.
+            #
+            # Each index ends (implicitly) with the rowid, so the ORDER BY
+            # clauses in ``_SORT_SQL`` -- which all end in ``e.rowid`` in the
+            # direction the index is scanned -- are answered by an index walk
+            # with no temp b-tree. That is what makes OFFSET 150000 cheap:
+            # SQLite skips rows before materializing their columns.
+            "CREATE INDEX IF NOT EXISTS idx_entries_kind ON entries(kind)",
+            "CREATE INDEX IF NOT EXISTS idx_entries_favorite ON entries(favorite)",
+            "CREATE INDEX IF NOT EXISTS idx_entries_title ON entries(title COLLATE NOCASE)",
+            # Not named in the ticket but required by it: `duration_desc` /
+            # `duration_asc` are offered sorts and are the only two with no
+            # index, so a deep page on them would sort the whole table.
+            "CREATE INDEX IF NOT EXISTS idx_entries_duration ON entries(duration_sec)",
+            # The library list always filters on `kind` (the tab strip), so the
+            # sort indexes above would still need a table lookup per skipped
+            # row. Leading with `kind` keeps the OFFSET walk inside the index.
+            "CREATE INDEX IF NOT EXISTS idx_entries_kind_created ON entries(kind, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_entries_kind_title ON entries(kind, title COLLATE NOCASE)",
+            "CREATE INDEX IF NOT EXISTS idx_entries_kind_plays ON entries(kind, play_count DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_entries_kind_duration ON entries(kind, duration_sec)",
+        ],
+    ),
+    (
+        8,
+        [
+            # Facet counts (the model / provider / source dropdowns). Every
+            # facet column AND every filter column the listing accepts lives in
+            # these two indexes, so each facet query is a COVERING index scan:
+            # no table lookup per row, which is the difference between 14 ms and
+            # 260 ms at 200,000 rows.
+            #
+            # Column order is what removes the temp b-tree as well: with
+            # ``kind`` equality-constrained (every tab but "all"), the rows
+            # arrive already grouped by ``model`` -- and by ``(model, source)``,
+            # which is what the derived `provider` facet groups on. `favorite`
+            # rides along last purely so it can be tested from the index.
+            #
+            # Measured at 200,000 rows (see tests/test_library_facets.py):
+            # worst facet query 65 ms with these, 170 ms without, and the
+            # `kind + favorite` combination regressed to 260 ms under the
+            # obvious (kind, model) index because it stopped being covering.
+            #
+            # No new COLUMN and no backfill: model / source / kind are already
+            # columns, and `provider` is derived from (model, source) rather
+            # than stored -- see :func:`infer_provider`.
+            "CREATE INDEX IF NOT EXISTS idx_entries_facet_model "
+            "ON entries(kind, model, source, favorite)",
+            "CREATE INDEX IF NOT EXISTS idx_entries_facet_source "
+            "ON entries(kind, source, favorite)",
+        ],
+    ),
 ]
+
+
+# ---- Full-text search ------------------------------------------------------
+#
+# ``entries_fts`` is a CONTENTLESS fts5 table (``content=''``): it stores the
+# inverted index only, keyed by ``entries.rowid``. That keeps it small, but it
+# also means a row can only be removed by handing fts5 back the EXACT values
+# that were inserted for it. Hence the invariant every writer below obeys:
+#
+#   For each ``entries.rowid``, ``entries_fts`` holds exactly the values
+#   ``_fts_projection()`` produces for that row against the committed state of
+#   ``entries`` + ``tag_index``. Any statement that changes those inputs must,
+#   in the SAME transaction, run the 'delete' form BEFORE the change and the
+#   insert form AFTER it.
+#
+# Deriving both forms from one projection is what makes that hold: the delete
+# reads the pre-write state, so the values always match what was indexed.
+# ``tests/test_library_paging.py`` checks the index against a brute-force scan
+# after a churn of edits and deletes, because a mismatched delete corrupts the
+# index silently (phantom hits, no error).
+
+_FTS_COLUMNS = ("title", "prompt", "tags", "notes", "lyrics")
+
+#: fts5 spells "remove this rowid" as an insert whose first value is the
+#: literal string 'delete', followed by the values originally indexed.
+_FTS_DELETE_LEAD = "'delete'"
+
+_FTS_TABLE_SQL = """
+    CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
+        title, prompt, tags, notes, lyrics, content=''
+    )
+"""
+
+
+def _fts_projection(lead: str = "") -> str:
+    """The indexed text for a set of entries, straight from SQL.
+
+    ``lead`` is prepended as an extra leading column, used to emit the literal
+    ``'delete'`` fts5 expects as the first value of a removal. ``json_extract``
+    is guarded by ``json_valid`` inside a CASE so a hand-edited or truncated
+    ``metadata_json`` degrades to an empty lyrics field instead of aborting the
+    transaction.
+    """
+    prefix = f"{lead}, " if lead else ""
+    return f"""
+        SELECT {prefix}e.rowid, e.title, e.prompt,
+               COALESCE((SELECT group_concat(t.tag, ' ') FROM tag_index t
+                         WHERE t.entry_id = e.id), ''),
+               e.notes,
+               COALESCE(CASE WHEN json_valid(e.metadata_json)
+                             THEN json_extract(e.metadata_json, '$.lyrics') END, '')
+        FROM entries e
+    """
+
+
+#: Letters and digits only (underscore excluded, matching fts5's unicode61
+#: tokenizer, which treats it as a separator). Everything a user can type that
+#: fts5 would read as an operator -- quotes, ``*``, ``^``, ``NEAR()``, ``:`` --
+#: is dropped here rather than escaped later, so a search string is never a
+#: query expression.
+_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
+
+#: Bounds the cost of a pathological query string.
+MAX_SEARCH_TOKENS = 16
+
+
+def search_tokens(q: Optional[str]) -> list[str]:
+    """The searchable tokens in ``q``. Empty when the string holds nothing a
+    tokenizer would keep -- in which case the search matches NOTHING, in both
+    the fts5 and the LIKE path, rather than silently matching everything."""
+    return [t.lower() for t in _TOKEN_RE.findall(q or "")][:MAX_SEARCH_TOKENS]
+
+
+def _fts_match_expr(tokens: Sequence[str]) -> str:
+    """An fts5 MATCH expression: every token quoted as a string literal and
+    prefix-matched, implicitly ANDed. ``_TOKEN_RE`` already excludes ``"``; the
+    doubling is kept so the quoting stays correct if the tokenizer widens."""
+    return " ".join('"' + t.replace('"', '""') + '"*' for t in tokens)
+
+
+@dataclass(frozen=True)
+class EntryFilters:
+    """What narrows a library listing. ``kinds=None`` means every kind (the
+    ``?kind=all`` tab); an empty set matches nothing. ``q`` is free text, not a
+    query language."""
+
+    kinds: Optional[frozenset[str]] = None
+    favorite: Optional[bool] = None
+    source: Optional[str] = None
+    q: Optional[str] = None
+
+
+#: ORDER BY per sort key. Every clause ends with ``e.rowid`` in the direction
+#: the backing index is scanned (SQLite appends the rowid ascending to every
+#: index key), so the whole ordering is answered by an index walk -- no temp
+#: b-tree -- and a deep OFFSET costs index steps, not row reads. The rowid also
+#: makes the order total, so consecutive pages never overlap or skip a row.
+_SORT_SQL: dict[str, str] = {
+    "created_desc": "e.created_at DESC, e.rowid ASC",
+    "created_asc": "e.created_at ASC, e.rowid DESC",
+    "title_asc": "e.title COLLATE NOCASE ASC, e.rowid ASC",
+    "title_desc": "e.title COLLATE NOCASE DESC, e.rowid DESC",
+    "plays_desc": "e.play_count DESC, e.rowid ASC",
+    "duration_desc": "e.duration_sec DESC, e.rowid DESC",
+    "duration_asc": "e.duration_sec ASC, e.rowid ASC",
+}
+
+#: The sort keys the API accepts, in the order they are documented.
+SORTS: tuple[str, ...] = tuple(_SORT_SQL)
+
+DEFAULT_SORT = "created_desc"
+
+
+# ---- Facets ----------------------------------------------------------------
+#
+# The filter dropdowns. ``model``, ``source`` and ``kind`` are columns and are
+# counted directly. ``provider`` is NOT stored anywhere -- it is derived from
+# ``(model, source)``, exactly as ``frontend/src/catalog/catalogProviders.ts``
+# derives it client-side, so the two can never disagree about which engine made
+# a track. Deriving it also means no migration, no backfill, and no second
+# place to keep in sync on every write.
+
+#: Facet fields the API accepts, in the order they are documented.
+FACET_FIELDS: tuple[str, ...] = ("model", "provider", "source", "kind")
+
+#: The column each column-backed facet groups on.
+_FACET_COLUMNS: dict[str, str] = {
+    "model": "e.model",
+    "source": "e.source",
+    "kind": "e.kind",
+}
+
+#: How many values one field reports. A dropdown cannot show more, and an
+#: unbounded list is exactly the response this endpoint exists to avoid.
+MAX_FACET_VALUES = 200
+
+#: ``model`` substring -> provider id, in priority order. Mirrors
+#: ``inferProvider`` in the frontend's ``catalogProviders.ts``.
+_PROVIDER_BY_MODEL_SUBSTRING: tuple[tuple[str, str], ...] = (
+    ("suno", "suno"),
+    ("magenta", "gemini-magenta"),
+    ("gemini", "gemini-magenta"),
+    ("udio", "udio"),
+    ("riffusion", "riffusion"),
+)
+
+#: theDAW's own generations and studio renders.
+DEFAULT_PROVIDER = "stable-audio"
+
+
+def infer_provider(model: Optional[str], source: Optional[str]) -> str:
+    """Which engine produced an entry, from the two columns that record it.
+
+    Always answers, so the ``provider`` facet -- unlike ``model`` -- never has
+    an "unset" bucket.
+    """
+    haystack = (model or "").lower()
+    for needle, provider in _PROVIDER_BY_MODEL_SUBSTRING:
+        if needle in haystack:
+            return provider
+    if (source or "") == "import":
+        return "import"
+    return DEFAULT_PROVIDER
+
+
+#: How many ids one ``IN (...)`` list carries. SQLite's parameter ceiling is
+#: 32766 on modern builds and 999 on very old ones; 900 is under both.
+_MAX_SQL_PARAMS = 900
+
+#: Entries removed per transaction by :meth:`LibraryDB.delete_entries_bulk`.
+#: Small enough that a crash loses little, large enough that clearing 50,000
+#: entries is 100 commits rather than 50,000.
+DEFAULT_DELETE_BATCH = 500
+
+
+def _chunks(items: Sequence[Any], size: int) -> Iterator[Sequence[Any]]:
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
 
 
 def _now() -> float:
     return time.time()
+
+
+def _entry_row(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalise a flattened entry payload into the ``entries`` column set.
+
+    Unknown keys are ignored; missing keys take the column default. Shared by
+    :meth:`LibraryDB.upsert_entry` and :meth:`LibraryDB.upsert_entries_bulk` so
+    the two can never drift into writing different rows for one payload
+    (``tests/test_library_bulk.py`` pins that they don't). ``created_at`` and
+    ``updated_at`` are the caller's business.
+    """
+    return {
+        "id": str(payload["id"]),
+        "kind": str(payload.get("kind") or "audio"),
+        "title": str(payload.get("title") or ""),
+        "prompt": str(payload.get("prompt") or ""),
+        "negative_prompt": str(payload.get("negative_prompt") or ""),
+        "model": str(payload.get("model") or ""),
+        "duration_sec": float(
+            payload.get("duration") or payload.get("duration_sec") or 0.0
+        ),
+        "steps": int(payload.get("steps") or 0),
+        "cfg": float(payload.get("cfg") or 0.0),
+        "seed": int(payload.get("seed") or 0),
+        "mime": str(payload.get("mime") or payload.get("mime_type") or "audio/wav"),
+        "audio_filename": str(payload.get("audio_filename") or ""),
+        "file_size_bytes": int(payload.get("file_size_bytes") or 0),
+        "source": str(payload.get("source") or "generate"),
+        "favorite": 1 if payload.get("favorite") else 0,
+        "rating": payload.get("rating")
+        if payload.get("rating") in ("like", "dislike")
+        else None,
+        "notes": str(payload.get("notes") or ""),
+        "timestamp": str(payload.get("timestamp") or ""),
+        "analysis_status": str(payload.get("analysis_status") or "pending"),
+        "stems_status": str(payload.get("stems_status") or "pending"),
+        "midi_status": str(payload.get("midi_status") or "pending"),
+        "metadata_json": json.dumps(payload.get("metadata_json") or {}),
+    }
+
+
+def _entry_tag_rows(payload: dict[str, Any], entry_id: str) -> list[tuple[str, str]]:
+    tags = payload.get("tags") or []
+    if not isinstance(tags, list):
+        return []
+    return [(entry_id, str(tag)) for tag in tags if tag]
+
+
+def _entry_prompt_rows(row: dict[str, Any]) -> list[tuple[str, str, str]]:
+    out: list[tuple[str, str, str]] = []
+    if row["prompt"]:
+        out.append((row["id"], "positive", row["prompt"]))
+    if row["negative_prompt"]:
+        out.append((row["id"], "negative", row["negative_prompt"]))
+    return out
+
+
+_UPSERT_ENTRY_SQL = """
+    INSERT INTO entries (
+        id, kind, title, prompt, negative_prompt, model,
+        duration_sec, steps, cfg, seed, mime, audio_filename,
+        file_size_bytes, source, favorite, rating, notes,
+        timestamp, created_at, updated_at,
+        analysis_status, stems_status, midi_status, metadata_json
+    ) VALUES (
+        :id, :kind, :title, :prompt, :negative_prompt, :model,
+        :duration_sec, :steps, :cfg, :seed, :mime, :audio_filename,
+        :file_size_bytes, :source, :favorite, :rating, :notes,
+        :timestamp, :created_at, :updated_at,
+        :analysis_status, :stems_status, :midi_status, :metadata_json
+    )
+    ON CONFLICT(id) DO UPDATE SET
+        kind = excluded.kind,
+        title = excluded.title,
+        prompt = excluded.prompt,
+        negative_prompt = excluded.negative_prompt,
+        model = excluded.model,
+        duration_sec = excluded.duration_sec,
+        steps = excluded.steps,
+        cfg = excluded.cfg,
+        seed = excluded.seed,
+        mime = excluded.mime,
+        audio_filename = excluded.audio_filename,
+        file_size_bytes = excluded.file_size_bytes,
+        source = excluded.source,
+        favorite = excluded.favorite,
+        rating = excluded.rating,
+        notes = excluded.notes,
+        timestamp = excluded.timestamp,
+        updated_at = excluded.updated_at,
+        analysis_status = excluded.analysis_status,
+        stems_status = excluded.stems_status,
+        midi_status = excluded.midi_status,
+        metadata_json = excluded.metadata_json
+"""
 
 
 class LibraryDB:
@@ -311,7 +644,11 @@ class LibraryDB:
     through ``_writelock`` so concurrent updates serialize cleanly.
     """
 
-    def __init__(self, path: Path) -> None:
+    #: One log line per process when the SQLite build has no FTS5, not one per
+    #: opened database.
+    _fts_warned = False
+
+    def __init__(self, path: Path, *, enable_fts: bool = True) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._writelock = threading.RLock()
@@ -322,7 +659,13 @@ class LibraryDB:
         # WAL gives us readers concurrent with writers.
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.execute("PRAGMA synchronous = NORMAL")
+        self._enable_fts = bool(enable_fts)
+        #: Whether library search runs on fts5. False when this SQLite build
+        #: lacks the module or a caller asked for the LIKE path; read it rather
+        #: than assuming, and see :meth:`_search_clause` for what changes.
+        self.fts_enabled = False
         self._migrate()
+        self._ensure_fts()
 
     def close(self) -> None:
         with self._writelock:
@@ -367,7 +710,120 @@ class LibraryDB:
                 self._conn.commit()
                 current = target_version
 
+    # ---- Search index -------------------------------------------------------
+
+    def _ensure_fts(self) -> None:
+        """Create ``entries_fts`` and backfill it once.
+
+        Deliberately NOT a migration statement: FTS5 is a property of the
+        SQLite build, not of the database file. A library first opened by a
+        Python without the module must pick the index up when it is next opened
+        by one that has it, which a bumped ``schema_version`` would prevent.
+        """
+        if not self._enable_fts:
+            return
+        with self._writelock:
+            try:
+                self._conn.execute(_FTS_TABLE_SQL)
+                self._conn.commit()
+            except sqlite3.OperationalError as e:
+                self._conn.rollback()
+                if not LibraryDB._fts_warned:
+                    LibraryDB._fts_warned = True
+                    log.warning(
+                        "library.db: this SQLite build has no FTS5 (%s); "
+                        "library search falls back to LIKE",
+                        e,
+                    )
+                return
+            self.fts_enabled = True
+            self._backfill_fts()
+
+    def _backfill_fts(self, *, batch: int = 5000) -> None:
+        """Index every pre-existing entry, in batches, exactly once.
+
+        Commits directly instead of going through ``_txn``: building an index
+        is not a library mutation, and a 200k backfill would otherwise push
+        ``library_revision`` forward 40 times on first open and make every
+        connected client refetch.
+        """
+        cur = self._conn.cursor()
+        try:
+            done = cur.execute(
+                "SELECT value FROM schema_meta WHERE key = 'fts_backfill'"
+            ).fetchone()
+            if done and str(done["value"]) == "1":
+                return
+            indexed = 0
+            last_rowid = 0
+            while True:
+                rows = cur.execute(
+                    "SELECT rowid FROM entries WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                    (last_rowid, batch),
+                ).fetchall()
+                if not rows:
+                    break
+                lo, hi = last_rowid, int(rows[-1]["rowid"])
+                cur.execute(
+                    f"INSERT INTO entries_fts(rowid, {', '.join(_FTS_COLUMNS)}) "
+                    f"{_fts_projection()} WHERE e.rowid > ? AND e.rowid <= ?",
+                    (lo, hi),
+                )
+                indexed += len(rows)
+                last_rowid = hi
+                self._conn.commit()
+            cur.execute(
+                "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('fts_backfill', '1')"
+            )
+            self._conn.commit()
+            if indexed:
+                log.info("library.db: indexed %d entries for search", indexed)
+        except Exception:
+            self._conn.rollback()
+            raise
+        finally:
+            cur.close()
+
+    def _fts_forget(self, cur: sqlite3.Cursor, entry_ids: Sequence[str]) -> None:
+        """Remove these entries from the search index, using the values the
+        index currently holds. MUST run BEFORE the rows change."""
+        if not self.fts_enabled or not entry_ids:
+            return
+        for chunk in _chunks(entry_ids, _MAX_SQL_PARAMS):
+            marks = ", ".join("?" * len(chunk))
+            cur.execute(
+                f"INSERT INTO entries_fts(entries_fts, rowid, {', '.join(_FTS_COLUMNS)}) "
+                f"{_fts_projection(_FTS_DELETE_LEAD)} WHERE e.id IN ({marks})",
+                list(chunk),
+            )
+
+    def _fts_index(self, cur: sqlite3.Cursor, entry_ids: Sequence[str]) -> None:
+        """Add these entries to the search index. MUST run AFTER the rows (and
+        their tags) are written."""
+        if not self.fts_enabled or not entry_ids:
+            return
+        for chunk in _chunks(entry_ids, _MAX_SQL_PARAMS):
+            marks = ", ".join("?" * len(chunk))
+            cur.execute(
+                f"INSERT INTO entries_fts(rowid, {', '.join(_FTS_COLUMNS)}) "
+                f"{_fts_projection()} WHERE e.id IN ({marks})",
+                list(chunk),
+            )
+
     # ---- Connection helper --------------------------------------------------
+
+    # One revision per committed mutating transaction. EVERY writing method
+    # goes through ``_txn`` (reads take ``_writelock`` and a bare cursor), so
+    # the bump belongs here and no writer can commit without moving it --
+    # deletes and cascades included. The statement is read-modify-write in a
+    # single SQL step and ``_writelock`` serializes writers, so the sequence
+    # is strictly increasing and never repeats a value. A rolled-back
+    # transaction rolls the bump back with it.
+    _BUMP_REVISION_SQL = """
+        INSERT INTO schema_meta (key, value) VALUES ('library_revision', '1')
+        ON CONFLICT(key) DO UPDATE
+            SET value = CAST(CAST(schema_meta.value AS INTEGER) + 1 AS TEXT)
+    """
 
     @contextmanager
     def _txn(self) -> Iterator[sqlite3.Cursor]:
@@ -375,6 +831,7 @@ class LibraryDB:
             cur = self._conn.cursor()
             try:
                 yield cur
+                cur.execute(self._BUMP_REVISION_SQL)
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
@@ -388,106 +845,108 @@ class LibraryDB:
         """Insert or update a single entry row from a flattened payload.
         Unknown keys are silently ignored; missing keys keep defaults."""
         now = _now()
-        row = {
-            "id": str(payload["id"]),
-            "kind": str(payload.get("kind") or "audio"),
-            "title": str(payload.get("title") or ""),
-            "prompt": str(payload.get("prompt") or ""),
-            "negative_prompt": str(payload.get("negative_prompt") or ""),
-            "model": str(payload.get("model") or ""),
-            "duration_sec": float(
-                payload.get("duration") or payload.get("duration_sec") or 0.0
-            ),
-            "steps": int(payload.get("steps") or 0),
-            "cfg": float(payload.get("cfg") or 0.0),
-            "seed": int(payload.get("seed") or 0),
-            "mime": str(payload.get("mime") or payload.get("mime_type") or "audio/wav"),
-            "audio_filename": str(payload.get("audio_filename") or ""),
-            "file_size_bytes": int(payload.get("file_size_bytes") or 0),
-            "source": str(payload.get("source") or "generate"),
-            "favorite": 1 if payload.get("favorite") else 0,
-            "rating": payload.get("rating")
-            if payload.get("rating") in ("like", "dislike")
-            else None,
-            "notes": str(payload.get("notes") or ""),
-            "timestamp": str(payload.get("timestamp") or ""),
-            "analysis_status": str(payload.get("analysis_status") or "pending"),
-            "stems_status": str(payload.get("stems_status") or "pending"),
-            "midi_status": str(payload.get("midi_status") or "pending"),
-            "metadata_json": json.dumps(payload.get("metadata_json") or {}),
-        }
+        row = _entry_row(payload)
+        entry_id = row["id"]
         with self._txn() as cur:
+            # Before the row changes: the index still holds the OLD values, and
+            # a contentless fts5 table can only be corrected with those.
+            self._fts_forget(cur, [entry_id])
             existing = cur.execute(
-                "SELECT created_at FROM entries WHERE id = ?", (row["id"],)
+                "SELECT created_at FROM entries WHERE id = ?", (entry_id,)
             ).fetchone()
             created_at = existing["created_at"] if existing else now
             cur.execute(
-                """
-                INSERT INTO entries (
-                    id, kind, title, prompt, negative_prompt, model,
-                    duration_sec, steps, cfg, seed, mime, audio_filename,
-                    file_size_bytes, source, favorite, rating, notes,
-                    timestamp, created_at, updated_at,
-                    analysis_status, stems_status, midi_status, metadata_json
-                ) VALUES (
-                    :id, :kind, :title, :prompt, :negative_prompt, :model,
-                    :duration_sec, :steps, :cfg, :seed, :mime, :audio_filename,
-                    :file_size_bytes, :source, :favorite, :rating, :notes,
-                    :timestamp, :created_at, :updated_at,
-                    :analysis_status, :stems_status, :midi_status, :metadata_json
-                )
-                ON CONFLICT(id) DO UPDATE SET
-                    kind = excluded.kind,
-                    title = excluded.title,
-                    prompt = excluded.prompt,
-                    negative_prompt = excluded.negative_prompt,
-                    model = excluded.model,
-                    duration_sec = excluded.duration_sec,
-                    steps = excluded.steps,
-                    cfg = excluded.cfg,
-                    seed = excluded.seed,
-                    mime = excluded.mime,
-                    audio_filename = excluded.audio_filename,
-                    file_size_bytes = excluded.file_size_bytes,
-                    source = excluded.source,
-                    favorite = excluded.favorite,
-                    rating = excluded.rating,
-                    notes = excluded.notes,
-                    timestamp = excluded.timestamp,
-                    updated_at = excluded.updated_at,
-                    analysis_status = excluded.analysis_status,
-                    stems_status = excluded.stems_status,
-                    midi_status = excluded.midi_status,
-                    metadata_json = excluded.metadata_json
-                """,
+                _UPSERT_ENTRY_SQL,
                 {**row, "created_at": created_at, "updated_at": now},
             )
             # Refresh tag_index for this entry.
-            cur.execute("DELETE FROM tag_index WHERE entry_id = ?", (row["id"],))
-            tags = payload.get("tags") or []
-            if isinstance(tags, list):
-                for tag in tags:
-                    if not tag:
-                        continue
-                    cur.execute(
-                        "INSERT OR IGNORE INTO tag_index (entry_id, tag) VALUES (?, ?)",
-                        (row["id"], str(tag)),
-                    )
+            cur.execute("DELETE FROM tag_index WHERE entry_id = ?", (entry_id,))
+            cur.executemany(
+                "INSERT OR IGNORE INTO tag_index (entry_id, tag) VALUES (?, ?)",
+                _entry_tag_rows(payload, entry_id),
+            )
             # Refresh prompt_corpus 'positive' + 'negative' rows from row data.
             cur.execute(
                 "DELETE FROM prompt_corpus WHERE entry_id = ? AND prompt_kind IN ('positive', 'negative')",
-                (row["id"],),
+                (entry_id,),
             )
-            if row["prompt"]:
+            cur.executemany(
+                "INSERT INTO prompt_corpus (entry_id, prompt_kind, prompt_text) VALUES (?, ?, ?)",
+                _entry_prompt_rows(row),
+            )
+            # After the row AND its tags are final, so the indexed values are
+            # exactly what the next _fts_forget will hand back.
+            self._fts_index(cur, [entry_id])
+
+    def upsert_entries_bulk(
+        self,
+        records: Iterable[dict[str, Any]],
+        batch: int = 1000,
+    ) -> int:
+        """Write many entries with ONE transaction (and one ``library_revision``
+        bump) per ``batch``, rather than one per row.
+
+        This is the import path for a large folder: 200,000 calls to
+        :meth:`upsert_entry` means 200,000 committed transactions, 200,000
+        revision bumps, and an fsync storm. Rows are identical to what
+        ``upsert_entry`` writes -- both go through :func:`_entry_row` -- and
+        ``created_at`` is preserved on rows that already exist, because the
+        ON CONFLICT branch never sets it.
+
+        ``records`` is consumed lazily, so a caller can stream a huge import
+        without materializing it. Returns the number of records written.
+        """
+        if int(batch) < 1:
+            raise ValueError(f"batch must be >= 1, got {batch!r}")
+        written = 0
+        pending: list[dict[str, Any]] = []
+        for payload in records:
+            pending.append(payload)
+            if len(pending) >= batch:
+                written += self._write_entry_batch(pending)
+                pending = []
+        if pending:
+            written += self._write_entry_batch(pending)
+        return written
+
+    def _write_entry_batch(self, payloads: list[dict[str, Any]]) -> int:
+        now = _now()
+        rows = [_entry_row(p) for p in payloads]
+        # A payload repeated inside one batch must not be forgotten/indexed
+        # twice: the IN-list statements below are set operations.
+        unique_ids = list(dict.fromkeys(r["id"] for r in rows))
+        tag_rows: list[tuple[str, str]] = []
+        prompt_rows: list[tuple[str, str, str]] = []
+        for payload, row in zip(payloads, rows):
+            tag_rows.extend(_entry_tag_rows(payload, row["id"]))
+            prompt_rows.extend(_entry_prompt_rows(row))
+
+        with self._txn() as cur:
+            self._fts_forget(cur, unique_ids)
+            cur.executemany(
+                _UPSERT_ENTRY_SQL,
+                [{**r, "created_at": now, "updated_at": now} for r in rows],
+            )
+            for chunk in _chunks(unique_ids, _MAX_SQL_PARAMS):
+                marks = ", ".join("?" * len(chunk))
                 cur.execute(
-                    "INSERT INTO prompt_corpus (entry_id, prompt_kind, prompt_text) VALUES (?, 'positive', ?)",
-                    (row["id"], row["prompt"]),
+                    f"DELETE FROM tag_index WHERE entry_id IN ({marks})", list(chunk)
                 )
-            if row["negative_prompt"]:
                 cur.execute(
-                    "INSERT INTO prompt_corpus (entry_id, prompt_kind, prompt_text) VALUES (?, 'negative', ?)",
-                    (row["id"], row["negative_prompt"]),
+                    f"DELETE FROM prompt_corpus WHERE entry_id IN ({marks}) "
+                    "AND prompt_kind IN ('positive', 'negative')",
+                    list(chunk),
                 )
+            cur.executemany(
+                "INSERT OR IGNORE INTO tag_index (entry_id, tag) VALUES (?, ?)",
+                tag_rows,
+            )
+            cur.executemany(
+                "INSERT INTO prompt_corpus (entry_id, prompt_kind, prompt_text) VALUES (?, ?, ?)",
+                prompt_rows,
+            )
+            self._fts_index(cur, unique_ids)
+        return len(rows)
 
     def get_entry(self, entry_id: str) -> Optional[dict[str, Any]]:
         with self._writelock:
@@ -559,6 +1018,8 @@ class LibraryDB:
 
     def delete_entry(self, entry_id: str) -> bool:
         with self._txn() as cur:
+            # While the row is still there to be read back out of the index.
+            self._fts_forget(cur, [entry_id])
             cur.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
             deleted = cur.rowcount > 0
             # ``relations`` is polymorphic (from_id / to_id may reference a
@@ -569,6 +1030,120 @@ class LibraryDB:
                 (entry_id, entry_id),
             )
             return deleted
+
+    def existing_entry_ids(self, entry_ids: Sequence[str]) -> set[str]:
+        """Which of these ids have a row. Lets a bulk delete tell "this entry
+        is gone" from "this entry never existed" without a query per id."""
+        ids = [str(entry_id) for entry_id in entry_ids]
+        if not ids:
+            return set()
+        found: set[str] = set()
+        with self._writelock:
+            cur = self._conn.cursor()
+            try:
+                for chunk in _chunks(ids, _MAX_SQL_PARAMS):
+                    marks = ", ".join("?" * len(chunk))
+                    rows = cur.execute(
+                        f"SELECT id FROM entries WHERE id IN ({marks})", list(chunk)
+                    ).fetchall()
+                    found.update(str(r["id"]) for r in rows)
+            finally:
+                cur.close()
+        return found
+
+    def entries_summary_for(
+        self,
+        entry_ids: Sequence[str],
+        *,
+        json_keys: Sequence[str] = (),
+    ) -> dict[str, dict[str, Any]]:
+        """The user-owned columns of these entries, plus chosen ``metadata_json`` keys.
+
+        The sibling of :meth:`existing_entry_ids` for a writer that has to
+        MERGE rather than overwrite: a bulk re-import needs to know, for a page
+        of ids at a time, which already exist and what the user has since done
+        to them -- without pulling ``metadata_json`` (kilobytes of provider
+        record per row) back for every one.
+
+        ``json_keys`` are JSON paths (``'$.suno_revision'``); each is bound as
+        a parameter, never interpolated, and lands in the result under its own
+        name. Missing ids are simply absent from the mapping.
+        """
+        ids = [str(entry_id) for entry_id in entry_ids]
+        if not ids:
+            return {}
+        paths = [str(key) for key in json_keys]
+        projection = "".join(
+            f", CASE WHEN json_valid(metadata_json)"
+            f" THEN json_extract(metadata_json, ?) END AS j{index}"
+            for index in range(len(paths))
+        )
+        out: dict[str, dict[str, Any]] = {}
+        with self._writelock:
+            cur = self._conn.cursor()
+            try:
+                for chunk in _chunks(ids, _MAX_SQL_PARAMS - len(paths)):
+                    marks = ", ".join("?" * len(chunk))
+                    rows = cur.execute(
+                        f"SELECT id, title, favorite, rating, notes, source,"
+                        f" timestamp{projection} FROM entries WHERE id IN ({marks})",
+                        [*paths, *chunk],
+                    ).fetchall()
+                    for row in rows:
+                        summary = {
+                            "id": str(row["id"]),
+                            "title": row["title"],
+                            "favorite": bool(row["favorite"]),
+                            "rating": row["rating"],
+                            "notes": row["notes"],
+                            "source": row["source"],
+                            "timestamp": row["timestamp"],
+                        }
+                        for index, key in enumerate(paths):
+                            summary[key] = row[f"j{index}"]
+                        out[summary["id"]] = summary
+            finally:
+                cur.close()
+        return out
+
+    def delete_entries_bulk(
+        self, entry_ids: Sequence[str], *, batch: int = DEFAULT_DELETE_BATCH
+    ) -> int:
+        """Delete many entries, ONE transaction per batch. Returns the number of
+        rows actually removed.
+
+        Does exactly what :meth:`delete_entry` does, a batch at a time: the
+        search index is corrected from the values it currently holds BEFORE the
+        rows change, the rows go (cascading to analysis / stems / midis / tags /
+        prompts / notation / shards), and the polymorphic ``relations`` edges
+        that name these ids are wiped by hand because they have no foreign key.
+
+        One revision bump per batch, not per row: clearing 50,000 entries must
+        not push ``library_revision`` forward 50,000 times and make every
+        connected client refetch that many times. Ids that are not there are
+        simply not deleted -- the caller decides whether that is an error.
+        """
+        ids = [str(entry_id) for entry_id in entry_ids]
+        if not ids:
+            return 0
+        # Two of the statements below carry the chunk as an ``IN (...)`` list,
+        # so a batch can never exceed the parameter ceiling.
+        size = max(1, min(int(batch), _MAX_SQL_PARAMS))
+        removed = 0
+        for chunk in _chunks(ids, size):
+            marks = ", ".join("?" * len(chunk))
+            params = list(chunk)
+            with self._txn() as cur:
+                # While the rows are still there to be read back out of it.
+                self._fts_forget(cur, chunk)
+                cur.execute(f"DELETE FROM entries WHERE id IN ({marks})", params)
+                removed += cur.rowcount
+                # Split rather than ``from_id IN (...) OR to_id IN (...)`` so
+                # one batch is never two parameter lists wide, and so each half
+                # can use its own index.
+                cur.execute(f"DELETE FROM relations WHERE from_id IN ({marks})", params)
+                cur.execute(f"DELETE FROM relations WHERE to_id IN ({marks})", params)
+        return removed
 
     def all_entry_ids(self) -> list[str]:
         with self._writelock:
@@ -583,6 +1158,317 @@ class LibraryDB:
             row = cur.execute("SELECT COUNT(*) AS c FROM entries").fetchone()
             cur.close()
             return int(row["c"]) if row else 0
+
+    # ---- Paged / filtered / searched listing ---------------------------------
+    #
+    # Everything below answers in SQL: no per-row filesystem access, no
+    # json.loads of metadata_json for a field that is already a column, and
+    # play_count read from the row it belongs to instead of a second pass over
+    # the whole table. The store builds records for the PAGE only.
+
+    def _search_clause(self, tokens: Sequence[str]) -> tuple[str, list[Any]]:
+        """``(clause, params)`` for a free-text search.
+
+        With fts5 this is a prefix MATCH per token, implicitly ANDed, phrased
+        as ``rowid IN (subquery)``. The phrasing is load-bearing, not style:
+        written as ``JOIN entries_fts ON entries_fts.rowid = e.rowid``, SQLite
+        drives the query from the ``kind`` index and asks fts5 "does THIS rowid
+        match?" once per row, re-running the full-text query 200,000 times --
+        measured at 18.8 s for one page and 5 minutes for the COUNT. The
+        subquery is materialized once instead: 5-32 ms for a page and <100 ms
+        for the count across every match size from 0 to 200,000 rows.
+
+        Without fts5 (a SQLite built without the module) the fallback is an
+        index-usable prefix LIKE on ``title`` plus an unindexed substring LIKE
+        on prompt / notes / tags / lyrics -- slower, and title matches are
+        anchored at the start rather than at any word, which is why it is only
+        ever the fallback. ``search_tokens`` has already dropped every fts5
+        operator, so neither form can be injected into.
+        """
+        if not tokens:
+            # A search string with nothing searchable in it matches nothing.
+            return "0", []
+        if self.fts_enabled:
+            return (
+                "e.rowid IN (SELECT rowid FROM entries_fts WHERE entries_fts MATCH ?)",
+                [_fts_match_expr(tokens)],
+            )
+        parts: list[str] = []
+        params: list[Any] = []
+        for token in tokens:
+            parts.append(
+                "(e.title LIKE ?"
+                " OR e.prompt LIKE ?"
+                " OR e.notes LIKE ?"
+                " OR COALESCE(CASE WHEN json_valid(e.metadata_json)"
+                "             THEN json_extract(e.metadata_json, '$.lyrics') END, '') LIKE ?"
+                " OR EXISTS (SELECT 1 FROM tag_index t"
+                "            WHERE t.entry_id = e.id AND t.tag LIKE ?))"
+            )
+            # Tokens are letters and digits only, so they carry no LIKE
+            # wildcard and need no ESCAPE clause.
+            params.extend([f"{token}%", *([f"%{token}%"] * 4)])
+        return " AND ".join(parts), params
+
+    def _filter_sql(self, filters: EntryFilters) -> tuple[str, list[Any]]:
+        """``(where, params)`` for one :class:`EntryFilters`."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if filters.q is not None:
+            search_clause, search_params = self._search_clause(search_tokens(filters.q))
+            clauses.append(search_clause)
+            params.extend(search_params)
+        if filters.kinds is not None:
+            kinds = sorted(filters.kinds)
+            if not kinds:
+                clauses.append("0")
+            elif len(kinds) == 1:
+                # The single-kind form (every library tab but "all") is what
+                # the idx_entries_kind_* composites are built for.
+                clauses.append("e.kind = ?")
+                params.append(kinds[0])
+            else:
+                clauses.append(f"e.kind IN ({', '.join('?' * len(kinds))})")
+                params.extend(kinds)
+        if filters.favorite is not None:
+            clauses.append("e.favorite = ?")
+            params.append(1 if filters.favorite else 0)
+        if filters.source:
+            clauses.append("e.source = ?")
+            params.append(filters.source)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        return where, params
+
+    @staticmethod
+    def _order_sql(sort: str) -> str:
+        try:
+            return _SORT_SQL[sort]
+        except KeyError:
+            raise ValueError(
+                f"sort must be one of {', '.join(SORTS)}, got {sort!r}"
+            ) from None
+
+    def list_entries_page(
+        self,
+        filters: EntryFilters,
+        *,
+        sort: str = DEFAULT_SORT,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """One page of ``entries`` rows, filtered / searched / sorted in SQL.
+
+        ``play_count`` and ``last_played_at`` ride along on the row (they are
+        columns), so nothing has to re-read the table to attach them. Raises
+        ``ValueError`` for an unknown ``sort``."""
+        order = self._order_sql(sort)
+        where, params = self._filter_sql(filters)
+        sql = f"SELECT e.* FROM entries e {where} ORDER BY {order} LIMIT ? OFFSET ?"
+        with self._writelock:
+            cur = self._conn.cursor()
+            rows = cur.execute(
+                sql, [*params, max(0, int(limit)), max(0, int(offset))]
+            ).fetchall()
+            cur.close()
+        return [dict(r) for r in rows]
+
+    def count_entries_filtered(self, filters: EntryFilters) -> int:
+        """How many entries match ``filters`` -- the ``total`` a paged client
+        sizes its scrollbar from."""
+        where, params = self._filter_sql(filters)
+        with self._writelock:
+            cur = self._conn.cursor()
+            row = cur.execute(
+                f"SELECT COUNT(*) AS c FROM entries e {where}", params
+            ).fetchone()
+            cur.close()
+            return int(row["c"]) if row else 0
+
+    def list_entry_ids(
+        self,
+        filters: EntryFilters,
+        cap: int,
+        *,
+        sort: str = DEFAULT_SORT,
+    ) -> list[str]:
+        """Matching entry ids in ``sort`` order, for select-all / shift-range.
+
+        Returns at most ``cap + 1`` ids: the extra one is how the caller tells
+        "more than the cap matched" (and answers 413) without paying for a
+        second COUNT over the same predicate.
+        """
+        order = self._order_sql(sort)
+        where, params = self._filter_sql(filters)
+        with self._writelock:
+            cur = self._conn.cursor()
+            rows = cur.execute(
+                f"SELECT e.id FROM entries e {where} ORDER BY {order} LIMIT ?",
+                [*params, max(0, int(cap)) + 1],
+            ).fetchall()
+            cur.close()
+        return [str(r["id"]) for r in rows]
+
+    # ---- Facets --------------------------------------------------------------
+
+    def facet_counts(
+        self, filters: EntryFilters, fields: Sequence[str]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """``{field: [{'value', 'count'}, ...]}`` over everything ``filters``
+        matches -- not over a page of it.
+
+        One aggregate query per field, sharing the page query's WHERE clause so
+        a dropdown can never offer a value the list would not show. Values come
+        back sorted by count descending, then by value ascending, with the
+        "unset" bucket last, and are capped at :data:`MAX_FACET_VALUES`.
+
+        Raises ``ValueError`` for a field outside :data:`FACET_FIELDS`.
+        """
+        wanted: list[str] = []
+        for field in fields:
+            if field not in FACET_FIELDS:
+                raise ValueError(
+                    f"fields must be among {', '.join(FACET_FIELDS)}, got {field!r}"
+                )
+            if field not in wanted:
+                wanted.append(field)
+        where, params = self._filter_sql(filters)
+        out: dict[str, list[dict[str, Any]]] = {}
+        with self._writelock:
+            cur = self._conn.cursor()
+            try:
+                for field in wanted:
+                    if field == "provider":
+                        out[field] = self._provider_facet(cur, where, params)
+                    else:
+                        out[field] = self._column_facet(
+                            cur, _FACET_COLUMNS[field], where, params
+                        )
+            finally:
+                cur.close()
+        return out
+
+    @staticmethod
+    def _column_facet(
+        cur: sqlite3.Cursor, column: str, where: str, params: list[Any]
+    ) -> list[dict[str, Any]]:
+        """Counts for one column-backed facet.
+
+        The nesting is load-bearing, not style. Grouping directly on
+        ``NULLIF(col, '')`` -- which is what folds the empty string and SQL NULL
+        into one "unset" bucket -- is an expression SQLite cannot match against
+        an index, so it sorts every matching row into a temp b-tree: 96-111 ms
+        at 200,000 rows. Grouping on the bare column in a subquery keeps the
+        index order (the scan is covering and needs no sort at all), and the
+        fold then runs over the handful of distinct values instead: 10-14 ms.
+        """
+        sql = (
+            "SELECT v, SUM(c) AS n FROM ("
+            f"  SELECT NULLIF({column}, '') AS v, COUNT(*) AS c"
+            f"  FROM entries e {where}"
+            f"  GROUP BY {column}"
+            ") GROUP BY v ORDER BY n DESC, v IS NULL, v LIMIT ?"
+        )
+        rows = cur.execute(sql, [*params, MAX_FACET_VALUES]).fetchall()
+        return [{"value": r["v"], "count": int(r["n"])} for r in rows]
+
+    @staticmethod
+    def _provider_facet(
+        cur: sqlite3.Cursor, where: str, params: list[Any]
+    ) -> list[dict[str, Any]]:
+        """Counts for the derived ``provider`` facet.
+
+        One query, grouped on the two columns the derivation reads; the fold
+        into provider ids runs in Python over the distinct ``(model, source)``
+        pairs -- a handful of rows -- so :func:`infer_provider` stays the single
+        definition of the rule rather than being restated as a SQL CASE.
+        """
+        rows = cur.execute(
+            f"SELECT e.model AS m, e.source AS s, COUNT(*) AS c "
+            f"FROM entries e {where} GROUP BY e.model, e.source",
+            params,
+        ).fetchall()
+        tally: dict[str, int] = {}
+        for row in rows:
+            provider = infer_provider(row["m"], row["s"])
+            tally[provider] = tally.get(provider, 0) + int(row["c"])
+        ranked = sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))
+        return [
+            {"value": value, "count": count}
+            for value, count in ranked[:MAX_FACET_VALUES]
+        ]
+
+    def play_counts_for(self, entry_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+        """``{id: {'play_count', 'last_played_at'}}`` for these ids only.
+
+        The list endpoint used to read the ENTIRE entries table to attach play
+        counts to a page of 200 rows."""
+        out: dict[str, dict[str, Any]] = {}
+        if not entry_ids:
+            return out
+        with self._writelock:
+            cur = self._conn.cursor()
+            for chunk in _chunks(list(entry_ids), _MAX_SQL_PARAMS):
+                marks = ", ".join("?" * len(chunk))
+                for row in cur.execute(
+                    "SELECT id, play_count, last_played_at FROM entries "
+                    f"WHERE id IN ({marks})",
+                    list(chunk),
+                ).fetchall():
+                    out[str(row["id"])] = {
+                        "play_count": int(row["play_count"] or 0),
+                        "last_played_at": row["last_played_at"],
+                    }
+            cur.close()
+        return out
+
+    def get_analysis_for(self, entry_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+        """Analysis rows for these ids only -- the page-sized sibling of
+        :meth:`get_all_analysis`, which loads every analyzed entry."""
+        out: dict[str, dict[str, Any]] = {}
+        if not entry_ids:
+            return out
+        with self._writelock:
+            cur = self._conn.cursor()
+            for chunk in _chunks(list(entry_ids), _MAX_SQL_PARAMS):
+                marks = ", ".join("?" * len(chunk))
+                for row in cur.execute(
+                    f"SELECT * FROM analysis WHERE entry_id IN ({marks})", list(chunk)
+                ).fetchall():
+                    out[str(row["entry_id"])] = dict(row)
+            cur.close()
+        return out
+
+    def registered_source_paths(self) -> set[str]:
+        """Every ``source_path`` a reference-in-place entry already points at.
+
+        One scan answers "which of these 200,000 files do I already have?" for
+        a whole import, which is what makes re-running a folder import cheap
+        and safe instead of duplicating the library.
+        """
+        with self._writelock:
+            cur = self._conn.cursor()
+            rows = cur.execute(
+                "SELECT CASE WHEN json_valid(metadata_json) "
+                "            THEN json_extract(metadata_json, '$.source_path') END AS sp "
+                "FROM entries"
+            ).fetchall()
+            cur.close()
+        return {str(r["sp"]) for r in rows if r["sp"]}
+
+    def library_revision(self) -> int:
+        """The counter ``_txn`` bumps once per committed write. 0 before the
+        first one. Cheaper than :meth:`library_counts` when only the revision
+        is wanted (every paged response carries it)."""
+        with self._writelock:
+            cur = self._conn.cursor()
+            row = cur.execute(
+                "SELECT value FROM schema_meta WHERE key = 'library_revision'"
+            ).fetchone()
+            cur.close()
+        try:
+            return int(row["value"])
+        except (TypeError, ValueError):
+            return 0
 
     def increment_play_count(self, entry_id: str) -> Optional[int]:
         """Bump play_count and stamp last_played_at for one entry. Returns the
@@ -628,6 +1514,27 @@ class LibraryDB:
                     _now(),
                 ),
             )
+
+    def add_relations_bulk(self, edges: Iterable[tuple[str, str, str]]) -> int:
+        """Insert many ``(from_id, to_id, kind)`` edges in ONE transaction.
+
+        The batched sibling of :meth:`add_relation`, for reindex: a library
+        with chimera lineage would otherwise open one transaction (and bump
+        ``library_revision``) per edge. Existing edges are left alone, same as
+        the single-edge form. Returns the number of edges offered."""
+        rows = [
+            (str(f), str(t), str(k), 1.0, "{}", _now()) for f, t, k in edges if f and t
+        ]
+        if not rows:
+            return 0
+        with self._txn() as cur:
+            cur.executemany(
+                "INSERT OR IGNORE INTO relations "
+                "(from_id, to_id, kind, weight, metadata_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+        return len(rows)
 
     def list_relations(
         self,
@@ -1007,6 +1914,47 @@ class LibraryDB:
             ).fetchall()
             cur.close()
             return [dict(r) for r in rows]
+
+    # The library tab strip's five category counts. One SELECT means one
+    # consistent snapshot: the sub-counts cannot disagree with each other or
+    # with ``revision``, which a writer could otherwise slip between. Children
+    # are JOINed to ``entries`` so a row whose parent is gone (legacy data, a
+    # DB restored from backup -- a live DB cascades) is never counted.
+    _COUNTS_SQL = """
+        SELECT
+            (SELECT COUNT(*) FROM entries WHERE kind = 'audio') AS tracks,
+            (SELECT COUNT(*) FROM stems s
+                JOIN entries e ON e.id = s.entry_id) AS stems,
+            (SELECT COUNT(*) FROM midis m
+                JOIN entries e ON e.id = m.entry_id) AS midi,
+            (SELECT COUNT(*) FROM entries WHERE kind IN ('video', 'image')) AS video,
+            (SELECT COUNT(*) FROM notation_artifacts n
+                JOIN entries e ON e.id = n.entry_id
+                WHERE n.kind != 'midi') AS score,
+            (SELECT value FROM schema_meta WHERE key = 'library_revision') AS revision
+    """
+
+    _COUNT_KEYS = ("tracks", "stems", "midi", "video", "score")
+
+    def library_counts(self) -> dict[str, Any]:
+        """``{'revision': int, 'counts': {tracks, stems, midi, video, score}}``.
+
+        ``tracks`` is audio entries; ``video`` is the VIDEO tab's kinds
+        (video + image); ``score`` is notation artifacts other than raw MIDI,
+        matching ``/_all/scores``. ``revision`` rises once per committed
+        mutating transaction (0 before the first one), so a client can tell a
+        newer snapshot from an older one and drop a late response.
+        """
+        with self._writelock:
+            cur = self._conn.cursor()
+            row = cur.execute(self._COUNTS_SQL).fetchone()
+            cur.close()
+        counts = {key: int(row[key] or 0) for key in self._COUNT_KEYS}
+        try:
+            revision = int(row["revision"])
+        except (TypeError, ValueError):
+            revision = 0
+        return {"revision": revision, "counts": counts}
 
     # ---- Shards (docs/design/loom.md) ----------------------------------------
 

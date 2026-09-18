@@ -19,6 +19,7 @@ import {
   captureEditorSession,
   captureProjectDocument,
 } from '../lib/projectImport';
+import { captureLiveVstStates } from './vstEditorStore';
 
 type ProjectTab = 'save' | 'open';
 
@@ -290,6 +291,13 @@ export const useProjectStore = create<ProjectState>()((set, get) => ({
     const path = savePath.trim();
     set({ busy: true, error: null });
     try {
+      // Whatever a live plugin is holding right now is part of this document.
+      // Without this the file records the state captured the last time an
+      // editor happened to be open, so a plugin dialed in from the FX row — or
+      // left running with its window closed — saves at settings it left long
+      // ago and loads back sounding different. Bounded, parallel, and it never
+      // rejects: a save must not fail because a plugin was slow.
+      await captureLiveVstStates();
       // Two distinct save paths:
       //  - An imported DAW project (pendingTracks seeded): save that structure,
       //    linking/embedding the sample files already on disk.

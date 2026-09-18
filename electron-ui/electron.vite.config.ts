@@ -4,6 +4,7 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { createLogger } from 'vite'
 import { plainAscii } from '../frontend/src/lib/plainText'
+import { buildInfoDefines } from '../frontend/buildInfo.config'
 
 // The desktop console carries the backend, the Electron main process and the
 // dev server in one stream, and it is read to find out what broke. Vite
@@ -51,6 +52,9 @@ export default defineConfig({
       }
     },
     plugins: [react(), tailwindcss()],
+    // Same build identity as frontend/vite.config.ts; electron-vite never
+    // loads that file, so the defines have to be repeated here.
+    define: buildInfoDefines(resolve(__dirname, '../frontend')),
     // alphaTab resolves its Bravura font + worker via import.meta.url relative
     // to its own dist/. Vite's dep pre-bundling rewrites that into .vite/deps/
     // where the worker does NOT exist, which wedges the renderer ("alphaTab.

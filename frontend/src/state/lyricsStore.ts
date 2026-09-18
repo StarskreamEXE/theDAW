@@ -155,10 +155,26 @@ let snapshots: Array<{ doc: LyricsDoc; lastTapped: number }> = [];
 
 const errorMessage = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
+/**
+ * Refresh the library row that carries these words. Through the store's own
+ * action, not a raw `setState` of `entries`: `entries` is a PROJECTION of the
+ * page cache, so writing it directly left the cached page row holding the old
+ * lyrics and the next re-projection (a page load, a filter change, a refresh)
+ * silently put them back — and for a row on no loaded page there was nothing
+ * in `entries` to patch at all. `upsertEntry` patches the cache and — unlike
+ * `updateEntry` — does not write to the backend a second time, which is right
+ * here because every caller has already persisted the lyrics server-side.
+ */
 const patchLibraryEntry = (entryId: string, lyrics: string): void => {
-  useLibraryStore.setState((s) => ({
-    entries: s.entries.map((e) => (e.id === entryId ? { ...e, lyrics } : e)),
-  }));
+  const lib = useLibraryStore.getState();
+  const current = lib.getById(entryId);
+  if (current) {
+    lib.upsertEntry({ ...current, lyrics });
+    return;
+  }
+  void lib.ensureEntry(entryId).then((entry) => {
+    if (entry) useLibraryStore.getState().upsertEntry({ ...entry, lyrics });
+  });
 };
 
 export const useLyricsStore = create<LyricsState>()((set, get) => {

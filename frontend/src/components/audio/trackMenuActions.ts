@@ -32,7 +32,8 @@ import { sendToDjAutomix } from '../../state/djAutomixStore';
 import { useMediaBucketStore } from '../../state/mediaBucketStore';
 import { usePlayAlongStore } from '../../state/playAlongStore';
 import { useFeatureToggleStore } from '../../state/featureToggleStore';
-import { useEditorStore, computePeaks } from '../../state/editorStore';
+import { useEditorStore, beginUndoStep, computePeaks } from '../../state/editorStore';
+import { planStemInsert, skippedAggregatesNote, stemClipPlacement } from './clipDoubleClick';
 import { useLyricsStore } from '../../state/lyricsStore';
 import { useTrackMenuJobs } from '../../state/trackMenuJobStore';
 import { sendTrackToVj } from '../../state/vjSetBus';
@@ -194,7 +195,7 @@ const toRollNotes = (notes: ArtifactNote[], bpm: number, prefix: string): PianoN
 };
 
 /** A playlist that flows by key and BPM from the entry, the entry first. */
-async function suggestFrom(entry: LibraryEntry): Promise<Array<{ id: string; title: string }>> {
+export async function suggestFrom(entry: LibraryEntry): Promise<Array<{ id: string; title: string }>> {
   const res = await fetch('/api/library/suggest-playlist', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -204,11 +205,32 @@ async function suggestFrom(entry: LibraryEntry): Promise<Array<{ id: string; tit
   const body = (await res.json()) as { tracks?: Array<{ id: string; title?: string }>; reason?: string };
   const rest = (body.tracks ?? []).filter((t) => t.id && t.id !== entry.id);
   if (rest.length === 0) throw new Error(body.reason || 'the suggester found no analyzed track to follow it');
-  const titles = new Map(useLibraryStore.getState().entries.map((e) => [e.id, e.title]));
-  return [
-    { id: entry.id, title: entry.title },
-    ...rest.map((t) => ({ id: t.id, title: t.title || titles.get(t.id) || t.id })),
-  ];
+  // The suggester answers over the WHOLE library, so most of what it names is
+  // on no loaded page: `entries` cannot title those, and they used to show as
+  // raw uuids. Ask the store by id instead — one fetch per row it has to go
+  // and get, all of them at once, bounded by the suggester's own result size.
+  const lib = useLibraryStore.getState();
+  const rows = await Promise.all(
+    rest.map(async (t) => {
+      if (t.title) return { id: t.id, title: t.title };
+      const known = lib.getById(t.id) ?? (await lib.ensureEntry(t.id));
+      return { id: t.id, title: known?.title || t.id };
+    }),
+  );
+  return [{ id: entry.id, title: entry.title }, ...rows];
+}
+
+/**
+ * Star / unstar an entry and confirm the change landed. The store logs a failed
+ * save and resolves, so the RECORD is what says whether it worked — and that
+ * record has to be read BY ID: a row on an evicted page is in no `entries`, so
+ * checking there reported "saved" for every one of them.
+ */
+export async function toggleFavoriteChecked(entryId: string, starring: boolean): Promise<void> {
+  await useLibraryStore.getState().toggleFavorite(entryId);
+  const lib = useLibraryStore.getState();
+  const now = lib.getById(entryId) ?? (await lib.ensureEntry(entryId));
+  if (now && now.favorite !== starring) throw new Error('the library did not save the change');
 }
 
 /** A point near the top left of what the NodeF.I. canvas shows, in graph units. */
@@ -355,8 +377,15 @@ async function run(row: TrackMenuRow, subject: TrackMenuSubject, ctx: TrackMenuA
       const opts = stemOptions(ctx);
       const refs = await ensureStems(entry.id, opts);
       if (refs.length === 0) throw new Error('separation produced no stems');
-      let placed = 0;
-      for (const ref of refs) {
+      // Sums of the other stems (`drums` over the LARSNET kit parts,
+      // `no_vocals` over everything but the vocal) are left off: placing one
+      // beside its members puts that audio in EDIT twice at double level. A
+      // run that reports no roles at all is placed whole, as before.
+      const plan = planStemInsert(refs);
+      // Download and decode everything first, so the store writes below land in
+      // one coalescing burst and the whole batch is a single undo step.
+      const decoded: Array<{ name: string; blob: Blob; peaks: Float32Array; duration: number }> = [];
+      for (const ref of plan.insert) {
         const res = await fetch(ref.url);
         if (!res.ok) {
           logWarn(SRC, `Stem ${ref.name} of "${title}" could not be read (${res.status})`);
@@ -364,8 +393,17 @@ async function run(row: TrackMenuRow, subject: TrackMenuSubject, ctx: TrackMenuA
         }
         const blob = await res.blob();
         const { peaks, duration } = await computePeaks(blob, 240);
+        decoded.push({ name: ref.name, blob, peaks, duration });
+      }
+      if (decoded.length === 0) throw new Error('no stem audio could be read');
+      // There is no parent clip on the timeline here, so the stems go in at the
+      // EDIT CURSOR — where the user is working — rather than at 0, which would
+      // bury them under whatever already starts the arrangement.
+      const startSec = Math.max(0, useEditorStore.getState().editCursorSec);
+      beginUndoStep();
+      for (const { name: stemName, blob, peaks, duration } of decoded) {
         const editor = useEditorStore.getState();
-        const name = `${entry.title} · ${ref.name}`;
+        const name = `${entry.title} · ${stemName}`;
         const trackId = editor.addTrack({ name });
         const color = useEditorStore.getState().tracks.find((t) => t.id === trackId)?.color ?? '#8b5cf6';
         const clipId = editor.addClipToTrack({
@@ -374,16 +412,20 @@ async function run(row: TrackMenuRow, subject: TrackMenuSubject, ctx: TrackMenuA
           audioBlob: blob,
           mimeType: 'audio/wav',
           sourceDuration: duration,
-          offsetIntoSource: 0,
-          durationSec: duration,
-          startSec: 0,
+          // The whole stem, from its head, at the cursor: the same placement
+          // helper the timeline's explode path uses, given a full-length window.
+          ...stemClipPlacement({ startSec, durationSec: duration, offsetIntoSource: 0 }, duration, startSec),
           color,
         });
         editor.cachePeaks(clipId, peaks);
-        placed += 1;
       }
-      if (placed === 0) throw new Error('no stem audio could be read');
-      logInfo(SRC, `Placed ${placed} stem track${placed === 1 ? '' : 's'} of "${title}" in EDIT (${opts.stems}-stem, ${opts.quality})`);
+      const placed = decoded.length;
+      const note = skippedAggregatesNote(plan.skipped);
+      logInfo(
+        SRC,
+        `Placed ${placed} stem track${placed === 1 ? '' : 's'} of "${title}" in EDIT at ${startSec.toFixed(2)}s`
+        + ` (${opts.stems}-stem, ${opts.quality})${note ? ` — ${note}` : ''}`,
+      );
       openCenter('edit');
       return;
     }
@@ -932,10 +974,7 @@ async function run(row: TrackMenuRow, subject: TrackMenuSubject, ctx: TrackMenuA
     case 'favorite': {
       const entry = requireEntry(subject);
       const starring = !entry.favorite;
-      await useLibraryStore.getState().toggleFavorite(entry.id);
-      // The store logs a failed save and resolves; the record says whether it landed.
-      const now = useLibraryStore.getState().entries.find((e) => e.id === entry.id);
-      if (now && now.favorite !== starring) throw new Error('the library did not save the change');
+      await toggleFavoriteChecked(entry.id, starring);
       if (starring) logInfo(SRC, `Starred "${title}". Stems, lyrics, MIDI and a score are queued for it`);
       return;
     }
@@ -964,9 +1003,14 @@ async function run(row: TrackMenuRow, subject: TrackMenuSubject, ctx: TrackMenuA
         if (failed) throw new Error(failed);
       } else {
         const saved = await importLyrics(entry.id, fmt, text);
-        useLibraryStore.setState((s) => ({
-          entries: s.entries.map((e) => (e.id === entry.id ? { ...e, lyrics: saved.text } : e)),
-        }));
+        // Through the store's own action, not a raw `setState` of `entries`.
+        // `entries` is a PROJECTION of the page cache: writing it directly left
+        // the cached page row holding the old lyrics, so the next re-projection
+        // (a page load, a filter change, a refresh) silently put them back.
+        // `upsertEntry` patches the cache and re-projects, and — unlike
+        // `updateEntry` — does not write to the backend a second time, which is
+        // right here because `importLyrics` above already persisted them.
+        useLibraryStore.getState().upsertEntry({ ...entry, lyrics: saved.text });
       }
       logInfo(SRC, `Loaded the lyrics of "${title}" from ${file.name}`);
       return;

@@ -326,7 +326,16 @@ export function autoRoutePerformFromProject(project: {
 }
 
 /** Resolve one device-parameter mapping to a live-chain route, or null when the
- *  device has no live rack equivalent or the parameter has no translation. */
+ *  device has no live rack equivalent or the parameter has no translation.
+ *
+ *  THE PLUGIN EXCLUSION STAYS. It is not "a VST3 cannot run live" any more —
+ *  the Perform grid spawns a host process per plugin entry. It is that a route
+ *  is `{paramKey, min, max}`: `translateDawParam` maps the source DAW's
+ *  parameter NAME onto a rack descriptor with a real range, and a VST3 plugin
+ *  has no such descriptor. Its parameters are opaque normalized indices that
+ *  only a RUNNING host can enumerate, and this resolver runs over a parsed
+ *  project file with nothing loaded. A route built here would scale a hardware
+ *  knob onto a range nobody has defined. */
 function deviceFxRoute(
   m: { device_index?: number; device_name: string; param_name: string; is_macro?: boolean },
   track: { devices?: { name: string; plugin_type?: string; plugin_path?: string | null; is_instrument?: boolean; is_rack?: boolean }[] },
@@ -340,6 +349,8 @@ function deviceFxRoute(
   if (flat < 0) return null;
   const device = devices[flat];
   if (device.is_instrument || device.is_rack) return null;
+  // See the doc comment: a hosted plugin runs live, but exposes no named,
+  // bounded parameter for a controller route to address.
   if (device.plugin_type === 'vst3' || device.plugin_type === 'audiounit' || device.plugin_path) return null;
   const effectId = resolveLiveEffectId(device.name);
   if (!effectId) return null;

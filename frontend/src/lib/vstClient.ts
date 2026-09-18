@@ -3,9 +3,11 @@
 // per-stage processing is an UPLOAD POST to /api/vst/process-file driven from
 // studioStore (mirroring /api/studio/process), so no other client calls are
 // needed here.
-import { getJson, postJson } from './apiJson';
+import { delJson, getJson, postJson } from './apiJson';
 
 export interface Vst3PluginInfo {
+  /** The bundle/file stem. Always present, because it costs nothing to read —
+   *  but it is the plugin FILE's name, not necessarily the plugin's own. */
   name: string;
   path: string;
   manufacturer: string;
@@ -13,6 +15,13 @@ export interface Vst3PluginInfo {
   category: string; // "effect" | "instrument" | "unknown"
   file_size_mb: number;
   last_modified: number;
+  /** The plugin's OWN name, read from the plugin by the backend metadata probe
+   *  ("Pro-Q 4" where `name` is "FabFilter Pro-Q 4"). Absent until that probe
+   *  lands, and for a plugin that never loads — always fall back to `name`. */
+  display_name?: string;
+  /** The plugin's VST3 identifier (probe-supplied), stable across file renames.
+   *  Absent for the same reasons as `display_name`. */
+  identifier?: string;
 }
 
 // Result of a native-GUI editor session (see /api/vst/open-editor). When status
@@ -56,6 +65,29 @@ export async function getContentBounds(): Promise<{ x: number; y: number; width:
   }
 }
 
+/** Handles a rect update for a plugin whose LIVE editor is open; returns true
+ *  when it took ownership of the call. Installed by `vstEditorStore` for as
+ *  long as a live editor session exists — see `setLiveEditorRectRouter`. */
+type LiveEditorRectRouter = (
+  pluginPath: string,
+  rect: VstEmbedRect & { sx?: number; sy?: number; close?: boolean },
+) => boolean;
+
+let liveEditorRectRouter: LiveEditorRectRouter | null = null;
+
+/**
+ * Point `vstApi.editorRect` at a live host session (or `null` to send rects
+ * back to the offline sidecar).
+ *
+ * A hook rather than a direct import because the flow runs the other way:
+ * `vstEditorStore` already depends on this module, and the live session
+ * registry depends on it too, so reaching for either from here would close an
+ * import cycle.
+ */
+export function setLiveEditorRectRouter(router: LiveEditorRectRouter | null): void {
+  liveEditorRectRouter = router;
+}
+
 export const vstApi = {
   scan: (refresh = false) =>
     getJson<{ plugins: Vst3PluginInfo[] }>(`/api/vst/scan?refresh=${refresh ? 'true' : 'false'}`),
@@ -80,11 +112,94 @@ export const vstApi = {
   editorRect: (
     pluginPath: string,
     rect: VstEmbedRect & { sx?: number; sy?: number; close?: boolean },
-  ) =>
-    postJson<{ status: string }>('/api/vst/editor-rect', { plugin_path: pluginPath, ...rect }),
+  ) => {
+    // A LIVE session's editor belongs to the host process that is making the
+    // sound, not to the offline sidecar, so its rect updates go over that
+    // session's socket. Routing here rather than at the call site means
+    // `VstEmbedHost` keeps pushing rects the one way it always has, and this is
+    // the single place both editors are reached from.
+    if (liveEditorRectRouter?.(pluginPath, rect)) return Promise.resolve({ status: 'live' });
+    return postJson<{ status: string }>('/api/vst/editor-rect', { plugin_path: pluginPath, ...rect });
+  },
   editorResult: (pluginPath: string) =>
     getJson<VstEditorResult>(`/api/vst/editor-result?plugin_path=${encodeURIComponent(pluginPath)}`),
   // The editor's natural (physical px) size, so the host can size its scroll area.
   editorSize: (pluginPath: string) =>
     getJson<{ status: string; w?: number; h?: number }>(`/api/vst/editor-size?plugin_path=${encodeURIComponent(pluginPath)}`),
 };
+
+/* ── live host sessions (/api/vst/live/*) ───────────────────────────────────
+   The LIVE path is a different thing from the routes above. Those drive the
+   offline pedalboard renderer and its one editor sidecar; these spawn a native
+   host process per chain entry that processes the signal in real time, and the
+   editor they open belongs to the instance that is making the sound. The wire
+   protocol behind `ws_url` is docs/design/vst-live-protocol.md. */
+
+/** What `GET /api/vst/live/host` says about the host binary on this machine. */
+export interface VstLiveHostInfo {
+  available: boolean;
+  path?: string;
+  version?: string;
+  /** Why it is not available — shown on the FX row, so it must be a sentence. */
+  reason?: string;
+}
+
+/** A spawned host process, from `POST /api/vst/live/session`. */
+export interface VstLiveSessionInfo {
+  session_id: string;
+  /** `ws://127.0.0.1:<port>` — loopback only; nothing leaves the machine. */
+  ws_url: string;
+  pid: number;
+  protocol: number;
+}
+
+/** Request body for `POST /api/vst/live/session`. */
+export interface VstLiveSessionRequest {
+  chain_entry_id: string;
+  plugin_path: string;
+  plugin_name?: string;
+  sample_rate: number;
+  block_size?: number;
+  channels?: number;
+  /** The entry's stored `raw_state`, written to the session's state file before
+   *  the spawn so the plugin starts where the user left it. */
+  raw_state?: string;
+}
+
+export const vstLiveApi = {
+  host: () => getJson<VstLiveHostInfo>('/api/vst/live/host'),
+  /** Idempotent per `chain_entry_id` while the process is alive. */
+  createSession: (body: VstLiveSessionRequest) =>
+    postJson<VstLiveSessionInfo>('/api/vst/live/session', body),
+  session: (id: string) =>
+    getJson<{ alive: boolean; pid: number; port: number; started_at: number; log_tail?: string }>(
+      `/api/vst/live/session/${encodeURIComponent(id)}`,
+    ),
+  /** Shuts the host down cleanly and returns the state it wrote on the way out. */
+  deleteSession: (id: string) =>
+    delJson<{ raw_state?: string }>(`/api/vst/live/session/${encodeURIComponent(id)}`),
+};
+
+/**
+ * Close a session during `pagehide`/`beforeunload`, where a normal `fetch` is
+ * cancelled with the document. `sendBeacon` cannot issue a DELETE, so this
+ * prefers a keepalive fetch and falls back to a beacon POST to the same path
+ * with an explicit method override — the backend treats either as a close.
+ *
+ * Returns nothing and never throws: an unload handler has no way to report a
+ * failure, and a leaked host process is reaped by `--parent-pid` anyway.
+ */
+export function closeLiveSessionOnUnload(id: string): void {
+  const url = `/api/vst/live/session/${encodeURIComponent(id)}`;
+  try {
+    void fetch(url, { method: 'DELETE', keepalive: true });
+    return;
+  } catch {
+    /* fall through to the beacon */
+  }
+  try {
+    navigator.sendBeacon?.(`${url}?_method=DELETE`);
+  } catch {
+    /* nothing else to try; --parent-pid covers it */
+  }
+}

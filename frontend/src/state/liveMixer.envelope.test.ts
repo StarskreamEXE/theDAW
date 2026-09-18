@@ -479,6 +479,24 @@ function anUnresolvableEntryContributesNothing(): void {
   assert.deepEqual(entryPrefixLatencies([]), {}, 'an empty chain has no entries to place');
 }
 
+/** A hosted VST3 that IS live is in the path, so everything behind it reads
+ *  its lane that much further back. The case above is the other half: an entry
+ *  with no live session (and every non-`vst3` unresolvable id) contributes 0.
+ *  Seam-driven — `liveLatencySec` is what `vstLiveStore` fills in production. */
+function aLiveHostedPluginShiftsTheEntriesBehindIt(): void {
+  const liveLatencySec = (id: string) => (id === 'v' ? 0.05 : 0);
+  assert.deepEqual(
+    entryPrefixLatencies([entry('v', 'vst3'), entry('c', 'compressor'), entry('z', 'reverb')], { liveLatencySec }),
+    { v: 0, c: 0.05, z: 0.056 },
+    'the plugin delays everything after it, and the compressor adds its own on top',
+  );
+  assert.deepEqual(
+    entryPrefixLatencies([entry('v', 'vst3', false), entry('c', 'compressor')], { liveLatencySec }),
+    { v: 0, c: 0 },
+    'a bypassed plugin is routed around, whatever its session reports',
+  );
+}
+
 /** The resolver seam `chainLatencyReport` takes is passed straight through, so
  *  the offline render (and a test) can declare latency without the registry. */
 function theResolverSeamIsHonoured(): void {
@@ -522,6 +540,7 @@ aDelayedCurveStillDegradesWhenItStartsBeforeNow();
 prefixLatencyIsTheSumOfEverythingAhead();
 aBypassedEntryDelaysNothing();
 anUnresolvableEntryContributesNothing();
+aLiveHostedPluginShiftsTheEntriesBehindIt();
 theResolverSeamIsHonoured();
 theFxFrameReadsTheLaneWhereTheArrivingAudioEnteredTheChain();
 

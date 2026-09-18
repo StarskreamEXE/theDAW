@@ -430,7 +430,9 @@ export const makeControlSource: XrControlSource = {
       if (!value) return true;
       if (!pendingPickId) return false;
       const { useLibraryStore } = await library();
-      const entry = useLibraryStore.getState().entries.find((e) => e.id === pendingPickId);
+      // By id: the picked row can be on a page the store no longer holds.
+      const lib = useLibraryStore.getState();
+      const entry = lib.getById(pendingPickId) ?? (await lib.ensureEntry(pendingPickId));
       if (!entry) return false;
       // Same path as dropping a library take onto the desktop stack:
       // fetch the audio blob, then addBlobsToChimera kicks off analysis.

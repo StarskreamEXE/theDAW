@@ -1015,6 +1015,14 @@ async def _on_shutdown() -> None:
         await asyncio.to_thread(stop_all_sidecars)
     except Exception:
         pass
+    try:
+        from backend.modules.vst.live_host import kill_all as stop_live_vst_hosts
+
+        # One native plugin host per live chain entry; each is asked to save
+        # its state before it is signalled, so this blocks — off the loop too.
+        await asyncio.to_thread(stop_live_vst_hosts)
+    except Exception:
+        pass
 
 
 @app.get("/api/modules")

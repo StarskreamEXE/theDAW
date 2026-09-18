@@ -4,8 +4,10 @@
 and blocks the main thread until it closes. To make it look native inside the
 Electron app, a background daemon thread here:
 
-  1. finds that editor window (the only sizeable, visible top-level window owned
-     by our PID),
+  1. finds that editor window — every top-level window of our PID is
+     enumerated and scored by :mod:`window_pick`, because a plugin also opens
+     preset browsers, splashes and tool windows and the first one EnumWindows
+     reaches is routinely not the editor,
   2. makes the Electron window its OWNER (not parent) so it stays pinned above
      the app and closes/minimizes with it, WITHOUT becoming a WS_CHILD (which
      crashes many plugin UIs),
@@ -30,9 +32,18 @@ import threading
 import time
 from pathlib import Path
 
+from backend.modules.vst.window_pick import (
+    Candidate,
+    format_candidate,
+    score_candidates,
+)
+
 # Win32 style / SetWindowPos / message constants.
 _WM_CLOSE = 0x0010
 _GWLP_HWNDPARENT = -8  # owner (NOT parent): keeps the editor pinned above Electron
+_GWL_STYLE = -16
+_GWL_EXSTYLE = -20
+_GW_OWNER = 4
 _SWP_NOSIZE = 0x0001  # move without resizing — let the plugin keep its natural size
 _SWP_NOZORDER = 0x0004
 _SWP_SHOWWINDOW = 0x0040
@@ -81,7 +92,7 @@ def _phys(rect: dict) -> tuple[int, int, int, int]:
     return x, y, w, h
 
 
-def _watch(parent_hwnd: int, rect_file: str | None) -> None:
+def _watch(parent_hwnd: int, rect_file: str | None, plugin_name: str | None) -> None:
     import ctypes
     from ctypes import wintypes
 
@@ -125,6 +136,19 @@ def _watch(parent_hwnd: int, rect_file: str | None) -> None:
         ctypes.c_int,
     ]
     gdi32.CreateRectRgn.restype = wintypes.HANDLE
+    # Only SetWindowRgn SUCCESS transfers ownership of the region to the window;
+    # a failed call leaves us holding a GDI object that nothing would ever free.
+    gdi32.DeleteObject.argtypes = [wintypes.HANDLE]
+    gdi32.DeleteObject.restype = wintypes.BOOL
+    # Window identity, for scoring + for the diagnostic log.
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.SetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
+    user32.SetWindowTextW.restype = wintypes.BOOL
+    user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetWindow.restype = wintypes.HWND
     user32.PostMessageW.argtypes = [
         wintypes.HWND,
         wintypes.UINT,
@@ -139,45 +163,99 @@ def _watch(parent_hwnd: int, rect_file: str | None) -> None:
     set_long = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
     set_long.argtypes = [wintypes.HWND, ctypes.c_int, LONG_PTR]
     set_long.restype = LONG_PTR
+    get_long = getattr(user32, "GetWindowLongPtrW", None) or user32.GetWindowLongW
+    get_long.argtypes = [wintypes.HWND, ctypes.c_int]
+    get_long.restype = LONG_PTR
 
     EnumProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     user32.EnumWindows.argtypes = [EnumProc, wintypes.LPARAM]
     user32.EnumWindows.restype = wintypes.BOOL
 
     our_pid = os.getpid()
-    console = kernel32.GetConsoleWindow()
-
-    def find_editor(timeout: float = 10.0):
-        found: list[int] = []
-
-        def cb(hwnd, _):
-            pid = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            if pid.value != our_pid:
-                return True
-            if console and hwnd == console:
-                return True
-            if not user32.IsWindowVisible(hwnd):
-                return True
-            r = wintypes.RECT()
-            user32.GetWindowRect(hwnd, ctypes.byref(r))
-            if (r.right - r.left) < 80 or (r.bottom - r.top) < 80:
-                return True
-            found.append(hwnd)
-            return False  # stop enumerating
-
-        proc = EnumProc(cb)
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            found.clear()
-            user32.EnumWindows(proc, 0)
-            if found:
-                return found[0]
-            time.sleep(0.12)
-        return None
+    console_hwnd = int(kernel32.GetConsoleWindow() or 0)
 
     def log(msg: str) -> None:
         print(f"[win_embed] {msg}", file=sys.stderr, flush=True)
+
+    def snapshot(hwnd: int) -> Candidate | None:
+        """Read one window's identity/geometry. None when it is unreadable."""
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        r = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(r)):
+            return None
+        if r.right < r.left or r.bottom < r.top:
+            return None  # minimized/degenerate; nothing to embed
+        cls_buf = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, cls_buf, 256)
+        title_buf = ctypes.create_unicode_buffer(512)
+        user32.GetWindowTextW(hwnd, title_buf, 512)
+        return Candidate(
+            hwnd=hwnd,
+            pid=int(pid.value),
+            class_name=cls_buf.value,
+            title=title_buf.value,
+            # LONG_PTR is signed and the style bits are not: mask to the 32 bits
+            # winuser.h documents, or WS_POPUP arrives as a negative number.
+            style=int(get_long(hwnd, _GWL_STYLE)) & 0xFFFFFFFF,
+            exstyle=int(get_long(hwnd, _GWL_EXSTYLE)) & 0xFFFFFFFF,
+            owner=int(user32.GetWindow(hwnd, _GW_OWNER) or 0),
+            rect=(r.left, r.top, r.right, r.bottom),
+            visible=bool(user32.IsWindowVisible(hwnd)),
+        )
+
+    def enumerate_candidates() -> list[Candidate]:
+        """EVERY top-level window of this process, not just the first match."""
+        cands: list[Candidate] = []
+
+        def cb(hwnd, _):
+            handle = int(hwnd) if hwnd else 0
+            if handle:
+                try:
+                    cand = snapshot(handle)
+                except Exception as e:  # a window can die mid-enumeration
+                    log(f"could not inspect hwnd=0x{handle:X}: {e}")
+                    cand = None
+                if cand is not None and cand.pid == our_pid:
+                    cands.append(cand)
+            return True  # keep going — the editor is rarely the first hit
+
+        user32.EnumWindows(EnumProc(cb), 0)
+        return cands
+
+    def find_editor(timeout: float = 10.0, previous: int | None = None):
+        """Score every window of our PID; log the whole pass either way."""
+        deadline = time.time() + timeout
+        attempt = 0
+        while True:
+            attempt += 1
+            cands = enumerate_candidates()
+            chosen = score_candidates(
+                cands, previous, our_pid=our_pid, console_hwnd=console_hwnd
+            )
+            prev_note = f" previous=0x{previous:X}" if previous else ""
+            log(
+                f"enum pass {attempt}: {len(cands)} window(s) of pid {our_pid}"
+                f"{prev_note} console=0x{console_hwnd:X}"
+            )
+            for cand in cands:
+                picked = chosen is not None and cand.hwnd == chosen.hwnd
+                log("  " + format_candidate(cand, picked))
+            if chosen is not None:
+                return chosen.hwnd
+            if time.time() >= deadline:
+                return None
+            time.sleep(0.12)
+
+    def set_title(hwnd) -> None:
+        """Replace pedalboard's own window title with the plugin's real name."""
+        if not plugin_name:
+            return
+        try:
+            ok = user32.SetWindowTextW(hwnd, plugin_name)
+            log(f"SetWindowTextW(0x{int(hwnd):X}, {plugin_name!r}) -> {bool(ok)}")
+        except Exception as e:
+            log(f"SetWindowTextW failed: {e}")
 
     def make_owned(hwnd) -> None:
         # OWNER, not parent: the editor stays a normal top-level window (so the
@@ -203,13 +281,17 @@ def _watch(parent_hwnd: int, rect_file: str | None) -> None:
         return (r.right - r.left, r.bottom - r.top)
 
     try:
-        log(f"watcher start; parent_hwnd={parent_hwnd} pid={our_pid}")
+        log(
+            f"watcher start; parent_hwnd={parent_hwnd} pid={our_pid} "
+            f"plugin_name={plugin_name!r}"
+        )
         hwnd = find_editor()
         if not hwnd:
             log("editor window not found within timeout; leaving it floating")
             return
-        log(f"found editor hwnd={int(hwnd) if hwnd else 0}")
+        log(f"found editor hwnd=0x{int(hwnd):X}")
         make_owned(hwnd)
+        set_title(hwnd)
         last_pos: tuple[int, int] | None = None
         last_clip: tuple[int, int, int, int] | None = None
         last_size: tuple[int, int] | None = None
@@ -218,14 +300,18 @@ def _watch(parent_hwnd: int, rect_file: str | None) -> None:
             # The editor may close (user) or recreate its window (some plugins do
             # on first paint). Re-acquire instead of dying; exit when truly gone.
             if not user32.IsWindow(hwnd):
-                hwnd2 = find_editor(timeout=1.5)
+                # Pass the hwnd we had: if the plugin kept it (it was merely
+                # hidden for a beat) we keep the editor instead of latching onto
+                # whichever popup happens to be on top right now.
+                hwnd2 = find_editor(timeout=1.5, previous=int(hwnd))
                 if not hwnd2:
                     log("editor window gone; watcher exiting")
                     return
                 hwnd = hwnd2
                 make_owned(hwnd)
+                set_title(hwnd)
                 last_pos = last_clip = None
-                log(f"re-acquired editor hwnd={int(hwnd)}")
+                log(f"re-acquired editor hwnd=0x{int(hwnd):X}")
 
             rect = _load_rect(rect_file)
             if rect:
@@ -257,7 +343,7 @@ def _watch(parent_hwnd: int, rect_file: str | None) -> None:
                 # move only (SWP_NOSIZE) so we never fight the plugin's own size.
                 px, py = vx - sx, vy - sy
                 if (px, py) != last_pos:
-                    user32.SetWindowPos(
+                    ok = user32.SetWindowPos(
                         hwnd,
                         None,
                         px,
@@ -266,6 +352,11 @@ def _watch(parent_hwnd: int, rect_file: str | None) -> None:
                         0,
                         _SWP_NOSIZE | _SWP_NOZORDER | _SWP_SHOWWINDOW,
                     )
+                    log(
+                        f"SetWindowPos hwnd=0x{int(hwnd):X} -> ({px},{py}) "
+                        f"viewport=({vx},{vy},{vw}x{vh}) scroll=({sx},{sy}) "
+                        f"natural={natural_size(hwnd)} ok={bool(ok)}"
+                    )
                     last_pos = (px, py)
 
                 # Clip to the viewport (window-local coords); window top-left sits
@@ -273,7 +364,24 @@ def _watch(parent_hwnd: int, rect_file: str | None) -> None:
                 clip = (sx, sy, vw, vh)
                 if clip != last_clip and vw > 2 and vh > 2:
                     rgn = gdi32.CreateRectRgn(sx, sy, sx + vw, sy + vh)
-                    user32.SetWindowRgn(hwnd, rgn, True)  # window owns rgn now
+                    if not rgn:
+                        # NULL means GDI refused (handle exhaustion): clipping is
+                        # off, so say so rather than let the editor silently
+                        # cover the UI.
+                        log(
+                            f"CreateRectRgn({sx},{sy},{sx + vw},{sy + vh}) returned "
+                            f"NULL (last_error={ctypes.get_last_error()}); "
+                            "editor left UNCLIPPED"
+                        )
+                    else:
+                        res = user32.SetWindowRgn(hwnd, rgn, True)
+                        log(
+                            f"SetWindowRgn hwnd=0x{int(hwnd):X} window-local "
+                            f"({sx},{sy},{sx + vw},{sy + vh}) -> {res}"
+                        )
+                        if not res:
+                            # Ownership only transfers on success.
+                            gdi32.DeleteObject(rgn)
                     last_clip = clip
             time.sleep(0.1)
     except Exception:
@@ -283,12 +391,20 @@ def _watch(parent_hwnd: int, rect_file: str | None) -> None:
         return
 
 
-def start_embed_watcher(parent_hwnd: int, rect_file: str | None) -> None:
+def start_embed_watcher(
+    parent_hwnd: int, rect_file: str | None, plugin_name: str | None = None
+) -> None:
     """Start the reparent/track watcher on a daemon thread. No-op off win32 or
-    when no parent HWND is supplied (the editor then stays a floating window)."""
+    when no parent HWND is supplied (the editor then stays a floating window).
+
+    ``plugin_name`` is the plugin's own name; when given it replaces the native
+    window title (otherwise the strip reads "Pedalboard", the title the host
+    library sets)."""
     plat: str = sys.platform
     if plat != "win32" or not parent_hwnd:
         return
     threading.Thread(
-        target=_watch, args=(int(parent_hwnd), rect_file), daemon=True
+        target=_watch,
+        args=(int(parent_hwnd), rect_file, plugin_name or None),
+        daemon=True,
     ).start()

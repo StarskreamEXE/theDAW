@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import io
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -35,10 +38,14 @@ from backend.modules.vst.host import (
     process_with_plugin,
     list_builtin_effects,
 )
+from backend.modules.vst.live_host import HostLocator
 from backend.lib import paths
 from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
+
+#: Render subprocesses are headless: no console window may flash on Windows.
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 router = APIRouter()
 
 # Per-plugin captured editor state (from the native-GUI sidecar) lands here.
@@ -136,6 +143,9 @@ class ScanResponse(BaseModel):
 class EditorRequest(BaseModel):
     plugin_path: str
     raw_state: str | None = None
+    # Which plugin inside a multi-plugin .vst3 to open. Omitted -> the loader's
+    # first entry, which need not be the one this chain node renders with.
+    plugin_name: str | None = None
     # Embedding (Electron/Windows): the host BrowserWindow HWND + initial embed
     # rect. When parent_hwnd is set the editor is reparented into that window over
     # the rect; omitted -> the editor opens as a floating window (default).
@@ -288,12 +298,178 @@ def process_audio(req: ProcessRequest):
     }
 
 
+#: Temp input/output/state files for ``state_host=thedaw`` renders.
+_RENDER_DIR = paths.data_path("vst_render")
+
+#: The render mode's documented exit codes (``native/vst-host/src/util/Args.cpp``),
+#: in words the user can act on. 0 never reaches this table.
+RENDER_EXIT_MEANINGS: dict[int, str] = {
+    1: "the rendered file could not be written",
+    2: "the host rejected its command line",
+    3: "the plugin file was not found",
+    4: "the plugin failed to load or initialize",
+    5: "the plugin does not support the uploaded channel layout",
+    6: "the host could not open its local socket",
+    7: "the uploaded audio could not be read by the host",
+}
+
+#: A render is faster than real time, but a plugin that hangs must not hold the
+#: request open forever.
+RENDER_TIMEOUT_SECONDS = 300.0
+
+
+def _render_log_tail(stderr: str, limit: int = 600) -> str:
+    lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+    if not lines:
+        return "The host logged nothing."
+    return "Log tail: " + " | ".join(lines[-8:])[:limit]
+
+
+def _render_report_warnings(stdout: str) -> list[str]:
+    """The ``warnings`` array out of the host's JSON report line, if any."""
+    for line in reversed((stdout or "").splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        found = payload.get("warnings")
+        if isinstance(found, list):
+            return [str(item) for item in found]
+        return []
+    return []
+
+
+def _render_with_thedaw_host(
+    plugin_path: str,
+    plugin_name: str,
+    audio_bytes: bytes,
+    state_blob: bytes | None,
+    param_map: dict,
+    warnings: list[str],
+) -> bytes:
+    """Render ``audio_bytes`` through ``thedaw-vst-host --render``.
+
+    Returns the rendered WAV bytes. Every failure raises ``HTTPException``;
+    there is deliberately no pedalboard fallback — a caller that asked for our
+    host and silently got a different renderer would be shipping audio it never
+    heard.
+
+    Raises:
+        HTTPException: 503 when the host binary is absent (with the locator's
+            reason), 502 when the host exits non-zero or times out, 500 when the
+            temp files cannot be written or the output cannot be read back.
+    """
+    locator = HostLocator()
+    host = locator.resolve()
+    if host is None:
+        raise HTTPException(status_code=503, detail=locator.describe()["reason"])
+
+    try:
+        _RENDER_DIR.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix="render-", dir=str(_RENDER_DIR)))
+    except OSError as e:
+        raise HTTPException(
+            status_code=500, detail=f"Could not create the render directory: {e}"
+        )
+
+    in_path = work / "in.wav"
+    out_path = work / "out.wav"
+    try:
+        try:
+            in_path.write_bytes(audio_bytes)
+            cmd = locator.launch_prefix(host) + [
+                "--render",
+                "--plugin",
+                plugin_path,
+                "--in",
+                str(in_path),
+                "--out",
+                str(out_path),
+                "--block-size",
+                "1024",
+                "--tail-seconds",
+                "auto",
+            ]
+            if plugin_name:
+                cmd += ["--plugin-name", plugin_name]
+            if state_blob:
+                state_path = work / "state.bin"
+                state_path.write_bytes(state_blob)
+                cmd += ["--state-file", str(state_path)]
+            if param_map:
+                params_path = work / "params.json"
+                params_path.write_text(json.dumps(param_map), encoding="utf-8")
+                cmd += ["--params-json", str(params_path)]
+        except OSError as e:
+            raise HTTPException(
+                status_code=500, detail=f"Could not stage the render input: {e}"
+            )
+
+        try:
+            done = subprocess.run(
+                cmd,
+                cwd=str(paths.PROJECT_ROOT),
+                capture_output=True,
+                text=True,
+                timeout=RENDER_TIMEOUT_SECONDS,
+                creationflags=_NO_WINDOW,
+                env=child_env(),
+            )
+        except subprocess.TimeoutExpired:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"The VST host did not finish the render within "
+                    f"{RENDER_TIMEOUT_SECONDS:.0f}s and was stopped."
+                ),
+            )
+        except OSError as e:
+            raise HTTPException(
+                status_code=502, detail=f"Could not start the VST host: {e}"
+            )
+
+        if done.returncode != 0:
+            code = int(done.returncode)
+            meaning = RENDER_EXIT_MEANINGS.get(
+                code, f"the host exited with code {code}"
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"The VST host could not render this file (exit code {code}): "
+                    f"{meaning}. " + _render_log_tail(done.stderr)
+                ),
+            )
+
+        try:
+            rendered = out_path.read_bytes()
+        except OSError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"The VST host reported success but its output could not be "
+                    f"read ({e}). " + _render_log_tail(done.stderr)
+                ),
+            )
+        warnings.extend(_render_report_warnings(done.stdout))
+        return rendered
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 @router.post("/process-file")
 async def process_file(
     audio: UploadFile = File(...),
     plugin_path: str = Form(...),
     params: str = Form("{}"),
     raw_state: str = Form(""),
+    state_host: str = Form(""),
+    plugin_name: str = Form(""),
 ):
     """Process an UPLOADED audio file through one VST3 plugin; return WAV bytes.
 
@@ -309,6 +485,58 @@ async def process_file(
         raise HTTPException(
             status_code=404, detail=f"VST3 plugin not found: {plugin_path}"
         )
+
+    mode = (state_host or "").strip().lower() or "pedalboard"
+    if mode not in ("pedalboard", "thedaw"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown state_host {state_host!r}: expected 'thedaw' or "
+                "'pedalboard' (or no value for the default)."
+            ),
+        )
+    if mode == "thedaw":
+        # Our own host renders the file. Deliberately a separate branch: it
+        # neither reads nor rewrites the audio here, so the bytes the plugin
+        # sees are the bytes that were uploaded.
+        host_warnings: list[str] = []
+        state_blob: bytes | None = None
+        if raw_state:
+            try:
+                state_blob = base64.b64decode(raw_state, validate=True)
+            except (binascii.Error, ValueError) as e:
+                raise HTTPException(
+                    status_code=400, detail=f"raw_state was not valid base64: {e}"
+                )
+        try:
+            host_params = json.loads(params) if params else {}
+            if not isinstance(host_params, dict):
+                host_warnings.append(
+                    "params was not a JSON object; no parameters applied"
+                )
+                host_params = {}
+        except json.JSONDecodeError as e:
+            host_warnings.append(
+                f"params was not valid JSON ({e}); no parameters applied"
+            )
+            host_params = {}
+        try:
+            uploaded = await audio.read()
+        except Exception as e:
+            raise HTTPException(
+                status_code=400, detail=f"Could not read uploaded audio: {e}"
+            )
+        rendered = _render_with_thedaw_host(
+            plugin_path, plugin_name, uploaded, state_blob, host_params, host_warnings
+        )
+        host_headers: dict[str, str] = {}
+        if host_warnings:
+            host_headers["X-Vst-Warnings"] = json.dumps(
+                host_warnings, ensure_ascii=True
+            )[:4000]
+            host_headers["Access-Control-Expose-Headers"] = "X-Vst-Warnings"
+        return Response(content=rendered, media_type="audio/wav", headers=host_headers)
+
     try:
         data = await audio.read()
         # soundfile returns (frames, channels) float32 — the layout pedalboard expects.
@@ -394,6 +622,8 @@ def open_editor(req: EditorRequest):
     ]
     if preset_in is not None:
         cmd += ["--preset-in", str(preset_in)]
+    if req.plugin_name:
+        cmd += ["--plugin-name", req.plugin_name]
 
     # Embedding: seed the rect file with the initial geometry and hand the sidecar
     # the parent HWND + rect file so its watcher reparents the editor in-window.
@@ -618,3 +848,145 @@ def _plugin_dicts(
     if hidden:
         log.info("Withholding %d VST3 plugin(s) this host cannot load", len(hidden))
     return [_plugin_dict(p) for p in plugins if p.loadable]
+
+
+# ---------------------------------------------------------------------------
+# Live VST hosting — /api/vst/live/*
+# ---------------------------------------------------------------------------
+# One native ``thedaw-vst-host`` process per live chain entry, so the user's
+# real plugin processes the live signal. The backend only spawns, tracks and
+# reaps those processes: the browser opens the returned ``ws_url`` itself and
+# no audio passes through here. Contract: docs/design/vst-live-protocol.md
+# ("Backend API"). The session manager lives in ``live_host.py``.
+#
+# The import sits with the routes rather than in the header block above so the
+# whole feature is one contiguous addition to this file.
+from backend.modules.vst import live_host  # noqa: E402
+from backend.modules.vst.live_host import LiveHostError  # noqa: E402
+
+
+class LiveSessionRequest(BaseModel):
+    """``POST /api/vst/live/session``.
+
+    Ranges are checked in the manager rather than declared here so that the
+    HTTP path and direct callers reject exactly the same things with exactly
+    the same messages.
+    """
+
+    chain_entry_id: str
+    plugin_path: str
+    sample_rate: int
+    plugin_name: str | None = None
+    block_size: int = 512
+    channels: int = 2
+    # Base64 of the shared VST3 state container — the SAME blob the offline
+    # (pedalboard) path stores on the chain entry. Written to the session's
+    # state file before the host starts, never logged.
+    raw_state: str | None = None
+
+
+class LiveSessionCreated(BaseModel):
+    session_id: str
+    ws_url: str
+    pid: int
+    protocol: int
+
+
+class LiveSessionInfo(BaseModel):
+    session_id: str
+    chain_entry_id: str
+    # The plugin's file name only: the API never echoes back its directory.
+    plugin_file: str
+    plugin_name: str | None = None
+    sample_rate: int
+    block_size: int
+    channels: int
+    alive: bool
+    pid: int
+    port: int | None = None
+    ws_url: str | None = None
+    protocol: int
+    started_at: float
+    ended_at: float | None = None
+    exit_code: int | None = None
+    has_state: bool
+    log_tail: list[str]
+
+
+class LiveSessionList(BaseModel):
+    sessions: list[LiveSessionInfo]
+
+
+class LiveSessionClosed(BaseModel):
+    session_id: str
+    chain_entry_id: str
+    exit_code: int | None = None
+    # The state the host wrote on its way out, base64, or null when it wrote
+    # none (a force-killed host that never got to save).
+    raw_state: str | None = None
+    log_tail: list[str]
+
+
+class LiveHostInfo(BaseModel):
+    available: bool
+    path: str | None = None
+    version: str | None = None
+    # Why live VST is off, so the UI can say how to turn it on.
+    reason: str | None = None
+
+
+@router.get("/live/host", response_model=LiveHostInfo)
+def live_host_status():
+    """Whether the native host is built, and if not, why live VST is off."""
+    return live_host.get_manager().host_info()
+
+
+@router.post("/live/session", response_model=LiveSessionCreated)
+def create_live_session(req: LiveSessionRequest):
+    """Start a host for a chain entry, or return the one it already has."""
+    try:
+        session = live_host.get_manager().create(
+            chain_entry_id=req.chain_entry_id,
+            plugin_path=req.plugin_path,
+            plugin_name=req.plugin_name,
+            sample_rate=req.sample_rate,
+            block_size=req.block_size,
+            channels=req.channels,
+            raw_state=req.raw_state,
+        )
+    except LiveHostError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
+    return {
+        "session_id": session.session_id,
+        "ws_url": session.ws_url,
+        "pid": session.pid,
+        "protocol": session.protocol,
+    }
+
+
+@router.get("/live/sessions", response_model=LiveSessionList)
+def list_live_sessions():
+    """Every tracked session, including ones that died recently."""
+    manager = live_host.get_manager()
+    manager.reap()
+    return {"sessions": [s.to_dict() for s in manager.list()]}
+
+
+@router.get("/live/session/{session_id}", response_model=LiveSessionInfo)
+def get_live_session(session_id: str):
+    """One session's state, with the tail of its host log."""
+    manager = live_host.get_manager()
+    manager.reap()
+    try:
+        return manager.get(session_id).to_dict()
+    except LiveHostError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
+
+
+@router.delete("/live/session/{session_id}", response_model=LiveSessionClosed)
+def delete_live_session(session_id: str):
+    """Shut a host down and return the plugin state it saved on the way out."""
+    try:
+        return live_host.get_manager().delete(session_id)
+    except LiveHostError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)

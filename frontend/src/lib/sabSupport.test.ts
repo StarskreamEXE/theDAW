@@ -1,5 +1,6 @@
 /**
- * Cross-origin isolation probe — the gate a live VST3 host will sit behind.
+ * Cross-origin isolation probe — and the fact that live VST hosting no longer
+ * sits behind it (see the `liveVstStatus` section at the bottom).
  *
  * Every assertion here drives `globalThis` directly, because that is the only
  * input these helpers have: a page is isolated or it is not, and the answer has
@@ -71,47 +72,49 @@ stub(undefined, undefined);
 assert.equal(sabAvailable(), false, 'neither half present');
 
 // --- liveVstStatus --------------------------------------------------------
-stub(false, realSab);
-const off = liveVstStatus();
-assert.equal(off.isolated, false);
-assert.equal(
-  off.reason,
-  'live VST needs cross-origin isolation (start with theDAW_ISOLATE=1; sidecar tabs are not yet proxied)',
-  'the un-isolated reason names the switch that turns isolation on',
-);
+// This no longer reports isolation AT ALL. The live host that was actually
+// built moves audio over a MessagePort and a loopback WebSocket, neither of
+// which is gated on cross-origin isolation — so the old answer sent users to
+// fix headers that were never the problem. What it reports now is whether the
+// backend found a host BINARY, which lives in vstLiveStore.
+const { useVstLiveStore } = await import('../state/vstLiveStore.ts');
 
-stub(true, realSab);
+// Un-isolated is deliberately exercised throughout: isolation must not change
+// a single one of these answers.
+stub(false, realSab);
+
+useVstLiveStore.setState({ host: { available: null } });
+const unknown = liveVstStatus();
+assert.equal(unknown.available, null, 'not probed yet is NOT "no" — a node opens optimistically');
+assert.match(unknown.reason, /check/i, 'and the row says it is still looking');
+
+useVstLiveStore.setState({ host: { available: true, path: 'C:/x/thedaw-vst-host.exe' } });
 const on = liveVstStatus();
-assert.equal(on.isolated, true);
-assert.equal(on.reason, 'isolated — live host not built yet');
+assert.equal(on.available, true);
+assert.ok(on.reason.length > 0);
 
-// Isolation is claimed but SharedArrayBuffer is gone: the page cannot host a
-// live plugin either, so the status must not read as ready.
-stub(true, undefined);
-const half = liveVstStatus();
-assert.equal(half.isolated, false, 'no SharedArrayBuffer means not usable, whatever the flag says');
-assert.equal(
-  half.reason,
-  'live VST needs cross-origin isolation (start with theDAW_ISOLATE=1; sidecar tabs are not yet proxied)',
-);
+useVstLiveStore.setState({ host: { available: false, reason: 'thedaw-vst-host.exe not built' } });
+const off = liveVstStatus();
+assert.equal(off.available, false);
+assert.equal(off.reason, 'thedaw-vst-host.exe not built', 'the backend’s own sentence is shown verbatim');
 
-// The reason is always a non-empty string — it is rendered into a title
-// attribute, and an empty title is an invisible tooltip.
-for (const [iso, sab] of [[true, realSab], [false, realSab], [undefined, undefined]] as const) {
-  stub(iso, sab);
-  assert.ok(liveVstStatus().reason.length > 0, 'every branch yields a reason to show');
-}
+// An unavailable host with no explanation still gets one: the reason is
+// rendered into a title attribute, and an empty title is an invisible tooltip.
+useVstLiveStore.setState({ host: { available: false } });
+assert.ok(liveVstStatus().reason.length > 0, 'every branch yields a reason to show');
 
-
-// The two states must not read the same — the badge's title is the only
-// place a user learns which one they are in.
-stub(false, realSab);
-const reasonOff = liveVstStatus().reason;
+// Isolation is irrelevant now, and this is the assertion that keeps it that
+// way: the same host state must read identically in both worlds.
+useVstLiveStore.setState({ host: { available: true } });
 stub(true, realSab);
-const reasonOn = liveVstStatus().reason;
-assert.notEqual(reasonOff, reasonOn, 'isolated and un-isolated say different things');
-assert.ok(reasonOff.includes('theDAW_ISOLATE=1'), 'the un-isolated reason tells you what to do');
-assert.ok(!reasonOn.includes('theDAW_ISOLATE'), 'the isolated reason does not send you to a flag already set');
+const isolated = liveVstStatus();
+stub(false, realSab);
+const plain = liveVstStatus();
+assert.deepEqual(isolated, plain, 'cross-origin isolation does not change live VST availability');
+for (const s of [isolated, plain]) {
+  assert.ok(!s.reason.includes('theDAW_ISOLATE'), 'and no branch sends the user after the headers');
+  assert.ok(!/isolat/i.test(s.reason), 'nor mentions isolation at all');
+}
 
 stub(undefined, realSab);
 console.log('sabSupport: all assertions passed');

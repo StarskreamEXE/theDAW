@@ -62,9 +62,9 @@ useGenerateParamsStore.setState({
   loras: [],
 });
 
-const message = handletheDAWAction({ type: 'generate' });
+const started = handletheDAWAction({ type: 'generate' });
 
-assert.equal(message, 'Generation started');
+assert.deepEqual(started, { ok: true, message: 'Generation started' });
 assert.ok(captured, 'assistant generate action should submit generation params');
 assert.equal(captured?.samplerType, 'dpmpp');
 assert.equal(captured?.sigmaMax, 0.5);
@@ -100,20 +100,20 @@ assert.equal(depthAfter('lossless'), '16');
 // locate_feature rings a real control, and declines the ids that have none
 // rather than dimming the app around a ring that would never appear.
 assert.equal(
-  handletheDAWAction({ type: 'locate_feature', payload: { feature_id: 'make' } }),
+  handletheDAWAction({ type: 'locate_feature', payload: { feature_id: 'make' } }).message,
   'Spotlighting MAKE (MAKE tab)',
 );
 assert.equal(useOnboardingStore.getState().soloFeatureId, 'make');
 
 useOnboardingStore.getState().endSpotlight();
 assert.match(
-  handletheDAWAction({ type: 'locate_feature', payload: { feature_id: 'nope' } }),
+  handletheDAWAction({ type: 'locate_feature', payload: { feature_id: 'nope' } }).message,
   /^No feature "nope"\. Known ids: make, /,
 );
 assert.equal(useOnboardingStore.getState().soloFeatureId, null);
 
 assert.match(
-  handletheDAWAction({ type: 'locate_feature', payload: { feature_id: 'feature-tour' } }),
+  handletheDAWAction({ type: 'locate_feature', payload: { feature_id: 'feature-tour' } }).message,
   /no one control to point at/,
 );
 assert.equal(useOnboardingStore.getState().soloFeatureId, null);
