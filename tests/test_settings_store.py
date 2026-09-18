@@ -52,7 +52,7 @@ def test_v7_file_gains_io_without_losing_existing_choices():
 
     merged = _merge_defaults(old)
 
-    assert merged["schema_version"] == SCHEMA_VERSION == 8
+    assert merged["schema_version"] == SCHEMA_VERSION == 9
     assert merged["io"] == DEFAULT_SETTINGS["io"]
     assert merged["io"] is not DEFAULT_SETTINGS["io"], "must be a deep copy"
     assert merged["app"]["launch_mode"] == "desktop"
