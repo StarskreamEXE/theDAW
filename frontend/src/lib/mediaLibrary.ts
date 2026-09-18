@@ -10,6 +10,7 @@
  * reason: it is picture plumbing, not part of the audio storage contract.
  */
 
+import { stripSourceId } from './displayName';
 import type { LibraryEntry } from '../state/libraryEntry';
 
 const BASE = '/api/library';
@@ -39,7 +40,8 @@ interface ServerMediaRecord {
 
 const toEntry = (r: ServerMediaRecord): LibraryEntry => ({
   id: r.id,
-  title: r.title,
+  // Same read-boundary strip as backendLocalProvider.toEntry.
+  title: stripSourceId(r.title),
   prompt: r.prompt ?? '',
   negativePrompt: '',
   model: '',

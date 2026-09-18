@@ -11,7 +11,8 @@ import { CoverArt } from '../catalog/CoverArt';
 import { importUrlToLibrary } from '../lib/onlineImport';
 import { importFolder } from '../lib/mediaLibrary';
 import { startQueue } from '../state/playlistQueue';
-import { DESKTOP_DROP_ORIGIN, dropHasLibraryOrFiles, entriesFromDrop } from '../lib/libraryDrop';
+import { DESKTOP_DROP_ORIGIN, LIBRARY_IDS_MIME, MIDI_ID_MIME, STEM_ID_MIME, dropHasLibraryOrFiles, entriesFromDrop } from '../lib/libraryDrop';
+import { midiRowPart, type LibraryMidiRow } from '../lib/libraryIndex';
 import { ContextMenu, useContextMenu, type ContextMenuItem } from '../components/ui/ContextMenu';
 import { useConvertMenu } from '../convert/ConvertMenu';
 import { LineageModal } from '../components/library/LineageModal';
@@ -1133,9 +1134,16 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
                 e.dataTransfer.setData('application/x-thedaw-library-id', entry.id);
                 e.dataTransfer.setData('text/plain', entry.title);
                 e.dataTransfer.effectAllowed = 'copyMove';
-                const dragItems = selectedEntryIds.includes(entry.id) && selectedEntries.length > 1
-                  ? selectedEntries
-                  : [entry];
+                const isMultiDrag = selectedEntryIds.includes(entry.id) && selectedEntries.length > 1;
+                // A >1 selection carries every selected id — the dragged row
+                // first, the rest in selection order — so the editor places each
+                // on its own track. The single id above still serves legacy
+                // single-id targets; single drags write nothing new.
+                if (isMultiDrag) {
+                  const ids = [entry.id, ...selectedEntries.filter((en) => en.id !== entry.id).map((en) => en.id)];
+                  e.dataTransfer.setData(LIBRARY_IDS_MIME, JSON.stringify(ids));
+                }
+                const dragItems = isMultiDrag ? selectedEntries : [entry];
                 const fetchBlob = useLibraryStore.getState().fetchAudioBlob;
                 setAudioDragData(e, dragItems.map((en) => ({
                   fetcher: () => fetchBlob(en),
@@ -2081,15 +2089,36 @@ const SubTabRow = React.memo<{
   onContext: (e: React.MouseEvent, payload: SubTabRowPayload) => void;
 }>(({ row, isMidi, parentTitle, isPlaying, isBusy, onPlay, onFavorite, onDelete, onContext }) => {
   const rowId = String(row.id ?? '');
-  const name = isMidi ? String(row.source ?? 'midi') : String(row.stem_name ?? 'stem');
+  // A per-stem MIDI carries `source: "stem"` for every part; the real
+  // instrument lives in the filename, which `midiRowPart` derives (shared with
+  // the pickers). A stem row uses its `stem_name` as before.
+  const name = isMidi
+    ? midiRowPart(row as unknown as LibraryMidiRow)
+    : String(row.stem_name ?? 'stem');
   const label = parentTitle ? `${parentTitle} · ${name}` : name;
   const favorite = !!row.favorite;
   const meta = isMidi ? `${row.engine ?? ''}` : `${row.model ?? ''} ${row.model_variant ?? ''}`.trim();
+  // A MIDI row drags onto the EDIT timeline carrying its own mime and its midi
+  // id (a row in `midis`, not a library entry). A stem row likewise drags with
+  // STEM_ID_MIME = its `stems` row id; the editor fetches the stem's audio.
+  // Both use a dedicated mime rather than LIBRARY_ID_MIME so a library-entry
+  // lookup can never miss the id and die silently.
+  const onDragStart = (e: React.DragEvent) => {
+    e.dataTransfer.setData(isMidi ? MIDI_ID_MIME : STEM_ID_MIME, rowId);
+    e.dataTransfer.setData('text/plain', label);
+    e.dataTransfer.effectAllowed = 'copy';
+  };
   return (
     <div
       className="group flex items-center gap-1 text-[10px] font-mono text-zinc-300 px-1 py-0.5 hover:bg-white/5 rounded"
+      draggable
+      onDragStart={onDragStart}
       onContextMenu={(e) => onContext(e, isMidi ? { kind: 'midi', midiId: rowId, label } : { kind: 'stem', row })}
-      title="Right-click for more — send to editor / init / inpaint / chimera"
+      title={
+        isMidi
+          ? 'Drag onto the timeline — or right-click for piano roll / step sequencer / editor'
+          : 'Drag onto the timeline — or right-click for more (send to editor / init / inpaint / chimera)'
+      }
     >
       <button
         type="button"

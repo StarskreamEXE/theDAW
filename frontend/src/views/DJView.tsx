@@ -540,6 +540,7 @@ export const DJView: React.FC = () => {
   const [cueB, setCueB] = useState(false);
   const [midiMapOpen, setMidiMapOpen] = useState(false);
   const [automixOn, setAutomixOn] = useState(false);
+  const [automixRestart, setAutomixRestart] = useState(0);
   const [flash, setFlash] = useState<string | null>(null);
   const automixRef = useRef<{ current: djEngine.DeckId; fading: boolean; fadeStart: number; fadeFrom: number; fadeTo: number; fadeSec: number } | null>(null);
   const [source, setSource] = useState<Source>({ kind: 'library' });
@@ -906,7 +907,11 @@ export const DJView: React.FC = () => {
   useEffect(() => {
     if (!automixPendingStart) return;
     useDjAutomix.getState().consumeStart();
+    useDjAutomix.getState().consumeTransition(); // drop a stale "transition now" so the restart doesn't blend off track 1
+    ejectDeck('A'); ejectDeck('B');            // clear decks so the sequencer seeds from track 1
+    applyCrossfade(-1);                        // full Deck A — the seed loads track 1 there; a parked +1 would mute it
     setAutomixOn(true);
+    setAutomixRestart((n) => n + 1);           // re-run the automix effect for a fresh seed even if already on
   }, [automixPendingStart]);
   useEffect(() => {
     if (!automixPendingStop) return;
@@ -1002,7 +1007,7 @@ export const DJView: React.FC = () => {
     }, 500);
     return () => window.clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [automixOn]);
+  }, [automixOn, automixRestart]);
 
   // Build the surface widget registry every render so each control's closure
   // carries live state/wiring; relocating a widget only changes where it draws.
@@ -2356,9 +2361,45 @@ const SourceTree: React.FC<{ source: Source; setSource: (s: Source) => void; lib
         <Group label="Sets" right={<button onClick={() => { const id = createSetlist(`Set ${new Date().toLocaleDateString()}`); setActive(id); setSource({ kind: 'set', id }); }} className="ml-auto p-0.5 text-purple-300 hover:text-purple-100" title="New set"><Plus className="w-3 h-3" /></button>} />
         {sets.length === 0 ? (
           <div className="pl-4 pr-1.5 py-0.5 text-[9px] font-mono text-zinc-700">No sets — click +</div>
-        ) : sets.map((s) => (
-          <Item key={s.id} active={source.kind === 'set' && source.id === s.id} onClick={() => { setActive(s.id); setSource({ kind: 'set', id: s.id }); }} right={<span className="text-[8px] text-zinc-600">{s.entries.length}</span>} title={`Open set "${s.name}"`}>{s.name}</Item>
-        ))}
+        ) : sets.map((s) => {
+          const isActive = source.kind === 'set' && source.id === s.id;
+          // Auto-DJ needs ≥2 real entries. Not `disabled` — browsers suppress
+          // the tooltip on a disabled control and drop it from tab order, so
+          // the "Add at least 2 tracks" hint would never reach the user.
+          const playable = s.entries.filter((e) => e.entryId).length >= 2;
+          // Row is a div (not the Item <button>) so the green ▶ Auto-DJ action
+          // can sit as a sibling button — nesting a button inside a button is
+          // invalid DOM. Clicking the name opens/activates the set; the ▶
+          // activates it AND starts Automix in one go (requestStart → the
+          // DJView watcher flips Automix on).
+          return (
+            <div
+              key={s.id}
+              className={`w-full flex items-center gap-1.5 pl-4 pr-1.5 py-0.5 text-[10px] font-mono rounded transition-colors ${isActive ? 'bg-purple-500/15 text-purple-200' : 'text-zinc-400 hover:bg-white/5 hover:text-zinc-200'}`}
+            >
+              <span className={`w-1 h-1 rounded-full shrink-0 ${isActive ? 'bg-purple-300' : 'bg-zinc-700'}`} />
+              <button
+                type="button"
+                onClick={() => { setActive(s.id); setSource({ kind: 'set', id: s.id }); }}
+                title={`Open set "${s.name}"`}
+                className="flex-1 min-w-0 truncate text-left bg-transparent"
+              >
+                {s.name}
+              </button>
+              <span className="text-[8px] text-zinc-600 shrink-0" title={`${s.entries.length} tracks`}>{s.entries.length}</span>
+              <button
+                type="button"
+                onClick={() => { if (!playable) return; setActive(s.id); setSource({ kind: 'set', id: s.id }); useDjAutomix.getState().requestStart(); }}
+                aria-disabled={!playable}
+                title={!playable ? 'Add at least 2 tracks to Auto-DJ this set' : `Auto-DJ "${s.name}" — load, beatmatch & crossfade the whole set hands-free`}
+                aria-label={`Play set ${s.name} with Auto-DJ`}
+                className={`shrink-0 p-0.5 rounded text-emerald-400 disabled:opacity-25 disabled:hover:bg-transparent ${playable ? 'hover:text-emerald-200 hover:bg-emerald-500/15' : 'opacity-25'}`}
+              >
+                <Play className="w-3 h-3" />
+              </button>
+            </div>
+          );
+        })}
       </div>
     </div>
   );

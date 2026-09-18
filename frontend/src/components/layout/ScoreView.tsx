@@ -1,5 +1,6 @@
-import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronLeft, ChevronRight, Download, FileMusic, Guitar, LayoutGrid, Loader2, Minus, Music2, Music4, Pause, Play, Plus, RefreshCw } from 'lucide-react';
+import React, { useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { ChevronLeft, ChevronRight, Download, Expand, FileMusic, Guitar, LayoutGrid, Loader2, Minus, Music2, Music4, Pause, Play, Plus, RefreshCw, Shrink } from 'lucide-react';
 import { useLibraryStore, type LibraryEntry } from '../../state/libraryStore';
 import { usePlayerStore } from '../../state/playerStore';
 import { logError, logInfo } from '../../state/logStore';
@@ -163,6 +164,77 @@ export const ScoreView: React.FC = () => {
     [entries, selectedEntryId],
   );
   const [artifacts, setArtifacts] = useState<NotationArtifact[]>([]);
+  // Focus mode: pop the whole Score panel to a fullscreen overlay and hide the
+  // artifact sidebar, so the follow-along (strip/highway/chords) is large and
+  // isolated instead of a tiny afterthought. Additive; default off.
+  const [focused, setFocused] = useState(false);
+  useEffect(() => {
+    if (!focused) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setFocused(false); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [focused]);
+  // The panel lives inside the bottom dock, whose row is `relative z-30`
+  // (Shell.tsx) — a stacking context. An in-tree `z-50` overlay is therefore
+  // ordered WITHIN z-30 and paints UNDER the app header (z-40) and the library
+  // edge tab (z-50), which keep intercepting clicks. Raising the child z-index
+  // cannot beat a sibling context, so in Focus mode we escape the context by
+  // portalling the panel to <body>. To keep the toggle from reloading the score,
+  // the portal target is a STABLE host node that we REPARENT NATIVELY
+  // (Node.appendChild moves a subtree without recreating it): React keeps
+  // rendering into the same host element across the toggle, so the heavy
+  // alphaTab/OSMD children are never unmounted/remounted. <body> has no
+  // transform ancestor, so the fixed overlay is not re-contained.
+  //
+  // The host is held in a LAZY REF, not useMemo: useMemo is a performance hint
+  // that React may drop, and a new container would remount the whole
+  // alphaTab/OSMD subtree AND orphan the superseded host (with stale DOM)
+  // inside the anchor. A ref guarantees one identity for the component's life,
+  // and because refs survive StrictMode's double render the node is created
+  // exactly once.
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  if (!hostRef.current && typeof document !== 'undefined') {
+    hostRef.current = document.createElement('div');
+  }
+  const overlayHost = hostRef.current;
+  const focusAnchorRef = useRef<HTMLDivElement | null>(null);
+  const focusToggleRef = useRef<HTMLButtonElement | null>(null);
+  // Only pull focus back on a real exit, never on the initial mount.
+  const wasFocusedRef = useRef(false);
+  useLayoutEffect(() => {
+    const host = overlayHost;
+    if (!host) return;
+    if (focused) {
+      // `z-60` is the repo's existing fullscreen-overlay step (HomeScreen.tsx,
+      // Shell.tsx), so reuse it rather than a one-off literal. It clears the
+      // header (z-40) and the edge tab (z-50). Where z ties (a z-50 modal or
+      // any other equal-z sibling), the body-APPENDED host wins on DOM order,
+      // since equal-z siblings paint in tree order. The tall modals
+      // (z-200/z-300) still draw above this.
+      //
+      // The transport footer is also z-50, so z alone would cover it. Instead we
+      // clear it GEOMETRICALLY: the footer is `fixed bottom-0 … h-16`
+      // (PlayerFooter.tsx), so `bottom-16` matches its height token exactly and
+      // leaves it visible — a follow-along you cannot play/pause/scrub is broken.
+      host.className = 'fixed inset-x-0 top-0 bottom-16 z-60';
+      if (host.parentNode !== document.body) document.body.appendChild(host);
+      // Keep the keyboard inside the overlay (Escape still exits: the handler
+      // is bound to window, and focus inside the host bubbles there).
+      host.tabIndex = -1;
+      host.focus();
+      wasFocusedRef.current = true;
+    } else {
+      // Reparent back into the in-flow anchor so default rendering is unchanged.
+      host.className = 'h-full';
+      const anchor = focusAnchorRef.current;
+      if (anchor && host.parentNode !== anchor) anchor.appendChild(host);
+      if (wasFocusedRef.current) {
+        wasFocusedRef.current = false;
+        focusToggleRef.current?.focus();
+      }
+    }
+  }, [focused, overlayHost]);
+  useEffect(() => () => { overlayHost?.remove(); }, [overlayHost]);
   const [selectedArtifactId, setSelectedArtifactId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [converting, setConverting] = useState(false);
@@ -614,9 +686,9 @@ export const ScoreView: React.FC = () => {
     }
   };
 
-  return (
-    <div className="h-full min-h-0 flex bg-[#07050a] text-zinc-200">
-      <div className="w-64 shrink-0 border-r border-white/5 flex flex-col min-h-0 bg-black/30">
+  const root = (
+    <div className="min-h-0 flex bg-[#07050a] text-zinc-200 h-full w-full">
+      <div className={`w-64 shrink-0 border-r border-white/5 flex-col min-h-0 bg-black/30 ${focused ? 'hidden' : 'flex'}`}>
         <div className="p-2 border-b border-white/5 flex items-center gap-2">
           <FileMusic className="w-4 h-4 text-emerald-300" />
           <div className="min-w-0">
@@ -804,6 +876,17 @@ export const ScoreView: React.FC = () => {
           {selectedArtifact && allowed.length > 0 && (
             <ModeSwitch allowed={allowed} value={effectiveMode} onChange={setMode} hint={modeHint} />
           )}
+          <button
+            type="button"
+            ref={focusToggleRef}
+            onClick={() => setFocused((v) => !v)}
+            className="shrink-0 rounded border border-white/10 bg-black/30 p-1 text-zinc-400 hover:text-emerald-200 hover:border-emerald-500/40 transition-colors"
+            title={focused ? 'Exit focus (Esc): restore the panel' : 'Focus: enlarge the follow-along to fullscreen and hide the sidebar'}
+            aria-label={focused ? 'Exit score focus' : 'Focus score (fullscreen)'}
+            aria-pressed={focused}
+          >
+            {focused ? <Shrink className="w-3 h-3" /> : <Expand className="w-3 h-3" />}
+          </button>
           <label htmlFor="score-instrument" className="sr-only">Instrument preset</label>
           <select
             id="score-instrument"
@@ -852,6 +935,17 @@ export const ScoreView: React.FC = () => {
           {renderPreview()}
         </div>
       </div>
+    </div>
+  );
+
+  // Focus escapes the dock's stacking context by portalling `root` into a
+  // body-level host; unfocused, the host is reparented into this in-flow
+  // anchor (display:contents adds no box) so default rendering is unchanged.
+  // `root` keeps a stable identity across the toggle, so its subtree
+  // (alphaTab/OSMD) is never remounted.
+  return (
+    <div ref={focusAnchorRef} className="contents">
+      {overlayHost ? createPortal(root, overlayHost) : root}
     </div>
   );
 };

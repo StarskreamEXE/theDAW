@@ -294,7 +294,7 @@ export const DetailsView: React.FC = () => {
       <div className="grid grid-cols-2 gap-x-6">
         <div>
           <Row icon={Database} label="Entry ID" value={entry.id} />
-          <Row icon={FileAudio} label="Filename" value={entry.title} />
+          <Row icon={FileAudio} label="Filename" value={entry.audioFilename} />
           <Row icon={Music} label="Source" value={entry.source} />
           <Row icon={Layers} label="Model" value={entry.model} />
           <Row icon={Hash} label="Seed" value={entry.seed === -1 ? 'random' : String(entry.seed)} />
