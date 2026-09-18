@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { Network, X, GitBranch, GitFork, Workflow, Maximize2, Minimize2, Sliders, Maximize, Copy, Crosshair, Package, GitMerge, Library as LibraryIcon, Home, Rocket } from 'lucide-react';
 import { ContextMenu, useContextMenu, type ContextMenuItem } from '../ui/ContextMenu';
 import { NodeInspector } from './NodeInspector';
+import { EDGE_COLOR_BY_KIND } from '../../lib/lineageInsights';
 import { SlideTrack } from '../audio/SlideTrack';
 
 const ForceGraph3D = lazy(() => import('react-force-graph-3d').then((m) => ({ default: m.default })));
@@ -308,16 +309,6 @@ const PAD = 24;
 const TOP_MARGIN = 8;
 // Vertical gap between the lineage DAG and the no-lineage band below it.
 const BAND_GAP = 72;
-
-const EDGE_COLOR_BY_KIND: Record<string, string> = {
-  chimera_source_of: '#a78bfa',
-  init_for: '#34d399',
-  inpaint_for: '#fbbf24',
-  stem_of: '#60a5fa',
-  midi_of: '#f472b6',
-  derived_from: '#94a3b8',
-  used_in_lora: '#fb7185',
-};
 
 // Translucent halo tint per cluster (by node `source`). Used by the
 // cluster-coloring overlay; colors picked to be distinct from the
