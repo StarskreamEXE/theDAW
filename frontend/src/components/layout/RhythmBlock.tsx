@@ -32,7 +32,7 @@ import {
   type RhythmResult,
 } from './rhythmReport';
 import { svgToPdf, svgToPng } from '../../lib/exportPicture';
-import { MeterMapChart } from './MeterMapChart';
+import { MeterMapChart, MeterMapLegend } from './MeterMapChart';
 import { meterMapHtml, meterMapSvgText } from './meterMapDraw';
 
 type SaveFormat = 'json' | 'md' | 'html' | 'svg' | 'png' | 'pdf';
@@ -257,6 +257,7 @@ export const RhythmBlock: React.FC<{
               <span className="text-zinc-600">Hover or focus a block for its numbers; click to keep them.</span>
             )}
           </p>
+          <MeterMapLegend />
         </div>
       )}
 
