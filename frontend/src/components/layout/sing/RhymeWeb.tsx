@@ -30,6 +30,8 @@ import {
 } from '../../../state/lyricAnalysisStore';
 import type { Device, DeviceFamily } from '../../../lib/lyricAnalysisClient';
 import { saveFile } from '../../../lib/saveFile';
+import { standaloneHtml, svgToPdf } from '../../../lib/exportPicture';
+import { logError } from '../../../state/logStore';
 
 export type WebLayout = 'arc' | 'ring';
 
@@ -396,6 +398,29 @@ export const RhymeWeb: React.FC<RhymeWebProps> = ({
     img.src = url;
   }, [svgText, title, web.height]);
 
+  /** The same picture as a one-page PDF cut to the drawing, drawn as vectors
+   *  so the words stay text. Recorded under the score kind, where PDFs live. */
+  const exportPdf = useCallback(() => {
+    const text = svgText();
+    if (!text) return;
+    void svgToPdf(text, W, web.height, { title: `${title} — rhyme web` })
+      .then((blob) => saveFile({ blob, suggestedName: `${fileStem(title)}-rhyme-web.pdf`, kind: 'score' }))
+      .catch((e: unknown) => logError('lyrics', `Could not save the web as PDF: ${e instanceof Error ? e.message : String(e)}`));
+  }, [svgText, title, web.height]);
+
+  /** The picture on a page of its own: the SVG inline, so the hover titles on
+   *  the arcs still answer in a browser. */
+  const exportHtml = useCallback(() => {
+    const text = svgText();
+    if (!text) return;
+    const html = standaloneHtml({ title: `${title} — rhyme web`, body: text, maxWidth: W });
+    void saveFile({
+      blob: new Blob([html], { type: 'text/html;charset=utf-8' }),
+      suggestedName: `${fileStem(title)}-rhyme-web.html`,
+      kind: 'lyric-web',
+    });
+  }, [svgText, title]);
+
   // Wide arcs first so the local chatter is drawn over them rather than
   // hidden under them, and the selected group last of all.
   const drawn = useMemo(() => {
@@ -527,6 +552,22 @@ export const RhymeWeb: React.FC<RhymeWebProps> = ({
             title="Save the chart as a 2x PNG"
           >
             <Download className="h-3 w-3" /> PNG
+          </button>
+          <button
+            type="button"
+            className="btn-ghost flex items-center gap-1 px-1.5 py-0.5 text-zinc-200"
+            onClick={exportPdf}
+            title="Save the chart as a one-page PDF, drawn as vectors"
+          >
+            <Download className="h-3 w-3" /> PDF
+          </button>
+          <button
+            type="button"
+            className="btn-ghost flex items-center gap-1 px-1.5 py-0.5 text-zinc-200"
+            onClick={exportHtml}
+            title="Save the chart as a web page of its own; the hover titles on the arcs still work"
+          >
+            <Download className="h-3 w-3" /> HTML
           </button>
           <button
             type="button"

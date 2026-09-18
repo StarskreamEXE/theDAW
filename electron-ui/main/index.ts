@@ -15,6 +15,13 @@ import * as crypto from 'crypto'
 import * as fs from 'fs'
 import * as path from 'path'
 import { pathToFileURL } from 'url'
+// Every backend line is folded to plain ASCII before it reaches the LOG panel
+// or the console. Python libraries print status with emoji -- basic-pitch does,
+// and those lines used to raise UnicodeEncodeError on a Windows console running
+// a legacy code page and take the conversion down with them. A glyph that
+// carries meaning is transliterated rather than dropped, so a key of F-sharp
+// still reads as F# in the log.
+import { plainAscii } from '../../frontend/src/lib/plainText'
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -448,7 +455,7 @@ function spawnBackend(): void {
     const parts = stdoutCarry.split('\n')
     stdoutCarry = parts.pop()!
     for (const raw of parts) {
-      const text = raw.replace(/\r$/, '')
+      const text = plainAscii(raw.replace(/\r$/, ''))
       if (!text) continue
       log(`[backend:stdout] ${text}`)
       const cls = text.includes('[LOAD]') ? 'load' : ''
@@ -465,7 +472,7 @@ function spawnBackend(): void {
     const parts = stderrCarry.split('\n')
     stderrCarry = parts.pop()!
     for (const raw of parts) {
-      const text = raw.replace(/\r$/, '')
+      const text = plainAscii(raw.replace(/\r$/, ''))
       if (!text) continue
       log(`[backend:stderr] ${text}`)
       sendLoadingLog(text, stderrLineClass(text))
@@ -694,26 +701,52 @@ function requestedDisplayBounds(
   }
 }
 
+function flushPendingOpenFile(): void {
+  if (!pendingOpenFile || !mainWindow || mainWindow.isDestroyed()) return
+  mainWindow.webContents.send('open-file', pendingOpenFile)
+  pendingOpenFile = null
+}
+
+/**
+ * loadURL, with its promise settled.
+ *
+ * Electron attaches its own did-stop-loading / did-fail-load listeners to the
+ * WebContents to settle the promise loadURL returns, and removes them when it
+ * settles. Dropping the promise on the floor leaves a rejection unhandled when a
+ * load is superseded or refused -- which happens in dev whenever the Vite server
+ * is not up yet, and this machine's console carries repeated
+ * "connect failed: 10055" from exactly that. Awaiting it lets those listeners go.
+ * ERR_ABORTED is the ordinary case of one navigation replacing another.
+ */
+function load(url: string): void {
+  if (!mainWindow) return
+  mainWindow.webContents.loadURL(url).catch((err: Error) => {
+    const msg = String(err?.message ?? err)
+    if (msg.includes('ERR_ABORTED')) return
+    log(`Renderer load failed for ${url}: ${msg}`)
+  })
+}
+
 function loadRenderer(): void {
   if (!mainWindow) return
   // Flush any file the app was opened with once the renderer has loaded.
-  mainWindow.webContents.on('did-finish-load', () => {
-    if (pendingOpenFile && mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('open-file', pendingOpenFile)
-      pendingOpenFile = null
-    }
-  })
+  // removeListener first: this function runs once today, but a second call
+  // would stack a second flush on the same WebContents, and a listener that
+  // accumulates on a reload is exactly what the MaxListenersExceededWarning in
+  // the console is reporting.
+  mainWindow.webContents.removeListener('did-finish-load', flushPendingOpenFile)
+  mainWindow.webContents.on('did-finish-load', flushPendingOpenFile)
   const devURL = process.env.ELECTRON_RENDERER_URL
   if (!app.isPackaged && devURL) {
-    mainWindow.loadURL(devURL)
+    load(devURL)
   } else if (!app.isPackaged) {
     // 127.0.0.1, not 'localhost': the Vite dev server binds 0.0.0.0 (IPv4
     // only, see electron.vite.config.ts) and Chromium prefers ::1 for
     // 'localhost' on Windows, which loads a blank ERR_CONNECTION_REFUSED
     // window with a running dev server sitting right there.
-    mainWindow.loadURL('http://127.0.0.1:5173')
+    load('http://127.0.0.1:5173')
   } else {
-    mainWindow.loadURL('app://./index.html')
+    load('app://./index.html')
   }
 }
 

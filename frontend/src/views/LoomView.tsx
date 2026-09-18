@@ -15,7 +15,7 @@
  * and primary ink so it reads on every theme.
  */
 import React, { useEffect, useMemo, useState } from 'react';
-import { Play } from 'lucide-react';
+import { Play, Dices } from 'lucide-react';
 import { useLoomStore, type EdgeSel } from '../state/loomStore';
 import { useShardIndexStore, type ShardRow } from '../state/shardIndexStore';
 import { useLibraryStore } from '../state/libraryStore';
@@ -252,7 +252,9 @@ const RootInspector: React.FC = () => {
       <div className="flex flex-col gap-2 rounded-md border border-white/15 p-2">
         <Stepper id="loom-seed" label="seed (the dice)" value={colony.seed ?? DEFAULT_SEED} min={0} max={999999} onChange={setSeed} hint="Every roll — gates, rules, growth — hashes from this. Same seed, same colony." />
         <div className="flex gap-1">
-          <button type="button" onClick={() => setSeed(Math.floor(Math.random() * 100000))} className={btn}>⚄ new dice</button>
+          <button type="button" onClick={() => setSeed(Math.floor(Math.random() * 100000))} className={btn}>
+            <Dices className="size-3" aria-hidden="true" /> new dice
+          </button>
           <button type="button" onClick={() => growNow()} className={`${btn} border-emerald-300/70`}>✚ grow now</button>
           <button type="button" onClick={reset} className={`${btn} ml-auto`} title="Back to one pacemaker and one loop">reseed</button>
         </div>
