@@ -464,7 +464,7 @@ const MixVizRack: React.FC<MixVizRackProps> = (p) => {
       <VizRackRow
         row="input" label="Input" accent="#22d3ee" overlayAccent="#a855f7"
         url={p.sourceUrl} overlayUrl={p.outputUrl} playLabel="MIX Input"
-        placeholder="drop audio or click ⬆ to load"
+        placeholder="drop audio, or click to load"
         mode={p.inputMode} onMode={p.setInputMode} overlay={p.inputOverlay} onToggleOverlay={p.toggleInputOverlay}
         open={inputOpen} onToggleOpen={() => prefs.setRow('input', inputOpen ? 'closed' : 'open')}
         bodyPx={prefs.bodyPx}

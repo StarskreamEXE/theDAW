@@ -214,7 +214,7 @@ export const TOUR_STEPS: ChapteredStep[] = [
     tip: (
       <>
         <Kbd>→</Kbd> next · <Kbd>←</Kbd> back · <Kbd>Esc</Kbd> leave. Replay it any time from HOME or
-        the <Em>☰</Em> menu.
+        the <Em>menu</Em>.
       </>
     ),
     primaryLabel: 'Start tour',
@@ -305,7 +305,7 @@ export const TOUR_STEPS: ChapteredStep[] = [
   {
     id: 'app-menu',
     chapter: 'basics',
-    title: 'The ☰ menu',
+    title: 'The menu',
     body: (
       <>
         Project open and save, DAW import, backup, updates, Edit Layout and <Em>Settings</Em> all live
@@ -775,7 +775,7 @@ export const TOUR_STEPS: ChapteredStep[] = [
     body: (
       <>
         Start in <Em>MAKE</Em>: type a prompt and press <Em>CREATE</Em>. Every chapter of this tour
-        stays in the <Em>☰</Em> menu under Help, and the ones you finished are ticked when you come
+        stays in the <Em>menu</Em> under Help, and the ones you finished are ticked when you come
         back.
       </>
     ),
