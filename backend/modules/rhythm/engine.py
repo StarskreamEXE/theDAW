@@ -54,7 +54,10 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
-RHYTHM_VERSION = 2
+# 3: the tempo run rule can follow a staircase, and fit_meter carries a
+#    permutation p-value. Both change what a map says, so every cached analysis
+#    from 2 is stale and is re-read rather than served.
+RHYTHM_VERSION = 3
 
 SR = 22050
 _HOP = 512
