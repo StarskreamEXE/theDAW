@@ -33,6 +33,73 @@ quietLogger.error = (msg, options) => {
 quietLogger.warn = (msg, options) => baseWarn(clean(msg), options);
 quietLogger.info = (msg, options) => baseInfo(clean(msg), options);
 
+// ---------------------------------------------------------------------------
+// Cross-origin isolation — OPT-IN, off by default.
+//
+// COOP: same-origin + COEP: require-corp are what make `crossOriginIsolated`
+// true, and that flag is the only thing that lets SharedArrayBuffer be
+// constructed — the ring buffer a live plugin host (#29) and disk streaming
+// (#66) both need to hand an AudioWorklet. They cannot be added by the page
+// after the fact, so they have to come from the server.
+//
+// They are NOT on by default, and that is deliberate. COEP makes the browser
+// reject any embedded document that does not carry an embedder policy of its
+// own, and three tabs people open every day embed sidecars on their own
+// origins — Underfit (:8791), VST Foundry (:5472), the Lyria sidecar — none of
+// which sends one. The companion QR code is a cross-origin <img> from
+// api.qrserver.com (components/layout/Shell.tsx) and goes the same way. COOP
+// additionally severs the window handle behind the VJ pop-out in the packaged
+// app, where the pop-out is loaded from the backend's http origin rather than
+// app://. Until those are proxied same-origin (T29B), turning isolation on by
+// default would trade working tabs for a capability nothing ships yet.
+//
+// And it would cost that on the LAN for nothing: a phone reaching this dev
+// server at http://<LAN-IP>:5173 is not a secure context, so the browser
+// withholds isolation there however correct the headers are — COEP is still
+// ENFORCED (embeds break) while crossOriginIsolated stays false (no payoff).
+//
+// So: set `theDAW_ISOLATE=1` in the environment to turn it on. Unset, every
+// response is byte-identical to what it was before this block existed.
+// electron-ui/main/index.ts reads the SAME variable for packaged builds, and
+// frontend/src/lib/sabSupport.ts is what reads the result at runtime.
+export const ISOLATION_ENABLED = process.env.theDAW_ISOLATE === '1';
+
+/**
+ * The document headers isolation needs, or nothing at all.
+ *
+ * Split out as a pure function of the flag so the decision can be read (and
+ * tested) without booting a dev server: `enabled` false must yield an EMPTY
+ * map, not a map of empty strings, because Vite spreads this into
+ * `server.headers` and a present-but-empty header still goes on the wire.
+ */
+export function isolationHeaders(enabled: boolean): Record<string, string> {
+  if (!enabled) return {};
+  return {
+    'Cross-Origin-Opener-Policy': 'same-origin',
+    'Cross-Origin-Embedder-Policy': 'require-corp',
+  };
+}
+
+// The VJ and SwayCommand builds are backend-served DOCUMENTS this app puts in
+// an iframe. A cross-origin-isolated page will not embed a child document that
+// does not itself carry an embedder policy — same origin or not, an iframe is
+// checked against the embedder's COEP, so without this the two tabs would go
+// blank with ERR_BLOCKED_BY_RESPONSE the moment isolation was turned on. The
+// backend is out of this ticket's write set, so the dev proxy stamps both
+// headers on the way through; a packaged build gets them from the matching
+// branches of the app:// handler in electron-ui/main/index.ts.
+// COOP rides along for the same reason in reverse: the VJ tab can be POPPED
+// OUT into its own window and is then driven by postMessage through the handle
+// window.open() returned. A COOP: same-origin opener that opens a document
+// without COOP: same-origin is put in a different browsing context group and
+// that handle is severed — the pop-out would open and then ignore every
+// command. Same origin is not enough; the policy has to match.
+const embedHeaders = (proxyRes: {headers: Record<string, string | string[] | undefined>}): void => {
+  proxyRes.headers['cross-origin-opener-policy'] = 'same-origin';
+  proxyRes.headers['cross-origin-embedder-policy'] = 'require-corp';
+  proxyRes.headers['cross-origin-resource-policy'] = 'same-origin';
+};
+
 export default defineConfig(({mode}) => {
   const env = loadEnv(mode, '.', '');
   return {
@@ -102,6 +169,9 @@ export default defineConfig(({mode}) => {
       // To turn live reload back on: set ENABLE_HMR=true in the environment.
       port: 5173,
       strictPort: true,
+      // Empty unless theDAW_ISOLATE=1 — see ISOLATION_ENABLED above. Vite sends
+      // no header for an empty map, so the default path is exactly what it was.
+      headers: isolationHeaders(ISOLATION_ENABLED),
       proxy: {
         '/api': {
           target: 'http://127.0.0.1:8600',
@@ -110,10 +180,29 @@ export default defineConfig(({mode}) => {
           timeout: 0,
           proxyTimeout: 0,
           configure: (proxy) => {
+            // Under require-corp the browser demands a Cross-Origin-Resource-
+            // Policy on anything the document pulls in. The backend does not
+            // send one (it is out of this ticket's reach), so the proxy stamps
+            // it on the way through. same-origin is correct because these
+            // responses reach the page as http://<dev-host>:<port>/api/… —
+            // the page's own origin. A packaged build needs the same header on
+            // the app:// handler's /api branch; see electron-ui/main/index.ts.
+            // Not registered at all when isolation is off: no listener, no
+            // header, nothing between the backend and the page that was not
+            // there before.
+            if (ISOLATION_ENABLED) {
+              proxy.on('proxyRes', (proxyRes) => {
+                proxyRes.headers['cross-origin-resource-policy'] = 'same-origin';
+              });
+            }
             proxy.on('error', (_err, _req, res) => {
               // For HTTP errors res is ServerResponse; for WebSocket errors it
               // is a net.Socket (no writeHead). Guard before writing headers.
-              const r = res as Record<string, unknown>;
+              // Double cast: Socket and ServerResponse share no index
+              // signature, so TS rejects the direct assertion. This line was
+              // never type-checked before — vite.config.ts only entered the
+              // program when src/lib/isolationHeaders.test.ts imported it.
+              const r = res as unknown as Record<string, unknown>;
               if (typeof r['writeHead'] === 'function' && !r['headersSent']) {
                 (r['writeHead'] as (s: number, h: Record<string, string>) => void)(
                   502, { 'Content-Type': 'application/json' }
@@ -131,6 +220,12 @@ export default defineConfig(({mode}) => {
         '/vj-app': {
           target: 'http://127.0.0.1:8600',
           changeOrigin: true,
+          // A no-op when isolation is off: the listener is never attached,
+          // so the proxied response reaches the page exactly as the backend
+          // sent it.
+          configure: (proxy) => {
+            if (ISOLATION_ENABLED) proxy.on('proxyRes', embedHeaders);
+          },
         },
         // SwayCommand cockpit embed build. Same-origin in dev is REQUIRED, not
         // cosmetic: Chromium gives a cross-origin hidden iframe zero rAF
@@ -138,6 +233,12 @@ export default defineConfig(({mode}) => {
         '/sway-app': {
           target: 'http://127.0.0.1:8600',
           changeOrigin: true,
+          // A no-op when isolation is off: the listener is never attached,
+          // so the proxied response reaches the page exactly as the backend
+          // sent it.
+          configure: (proxy) => {
+            if (ISOLATION_ENABLED) proxy.on('proxyRes', embedHeaders);
+          },
         },
       },
       hmr: process.env.ENABLE_HMR === 'true',

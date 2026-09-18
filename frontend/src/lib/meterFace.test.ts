@@ -3,7 +3,7 @@ import { euclidPattern, GEN_DEFAULT_OPTS, GEN_KINDS } from './loomGen.ts';
 import { dbToVelocity } from './rollLoom.ts';
 import { roundUpToBar, type MeterSegment } from './meterMap.ts';
 import type { RhythmAnalysis } from './rhythmSeed.ts';
-import { usePianoRollStore, type PianoNote } from '../state/pianoRollStore.ts';
+import { migrateNotes, usePianoRollStore, type PianoNote } from '../state/pianoRollStore.ts';
 import {
   addChange, addChangeBar, addChangePastEnd, clampSelection, formatOption, genOptionSpecs, genPreview, genStatus, genTarget, genWrite,
   groupChoices, laneForms, lanePitches, matchApply, matchError, meterLabel, newLaneCycle, parseGroupsValue, parseMeterLabel,
@@ -281,14 +281,16 @@ const SONG: MeterSegment[] = [{ bar: 0, meter: M78 }, { bar: 4, meter: M54 }, { 
   // WRITE euclid 5 of 12 into lane B: one cycle from step 0, lane B's old notes replaced, lane A's kept.
   const res = genWrite(st(), sel, euclid(5, 12), lanePitches('C', 'major'), 'w1');
   st().replaceAll(res.notes);
-  assert.deepEqual(st().notes, [
+  // Through migrateNotes because the store ticks every note it takes in, and
+  // these literals are written in steps.
+  assert.deepEqual(st().notes, migrateNotes([
     note('a3', 3),
     { id: 'w1-0', note: 60, step: 0, length: 1, velocity: 96, lane: 1 },
     { id: 'w1-1', note: 62, step: 3, length: 1, velocity: 96, lane: 1 },
     { id: 'w1-2', note: 64, step: 5, length: 1, velocity: 96, lane: 1 },
     { id: 'w1-3', note: 65, step: 8, length: 1, velocity: 96, lane: 1 },
     { id: 'w1-4', note: 67, step: 10, length: 1, velocity: 96, lane: 1 },
-  ]);
+  ]));
   assert.deepEqual([0, 3, 5, 8, 10], hitSteps(euclidPattern(5, 12, 0)));
   assert.equal(genStatus(res.written, res.target.name), 'GEN WROTE 5 NOTES IN LANE B.');
 

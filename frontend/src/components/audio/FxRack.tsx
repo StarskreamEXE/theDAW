@@ -11,6 +11,7 @@
 
 import { Blocks, ChevronUp, ChevronDown, SlidersHorizontal, X } from 'lucide-react';
 import { RACK_EFFECTS, getRackEffect } from '../../lib/rackEffects';
+import { liveVstStatus } from '../../lib/sabSupport';
 import type { ChainEntry } from '../../state/effectChainStore';
 import { SpatializerPad } from './SpatializerPad';
 import { OwlPad } from './OwlPad';
@@ -78,6 +79,10 @@ export function FxRack({
 }: FxRackProps) {
   const addId = `${idPrefix}-add`;
   const expanded = layout === 'expanded';
+  // Why a VST3 row is inert. Read once per render (not per row) — it is the
+  // same answer for every entry in the document, and it only changes when the
+  // page is reloaded with different headers, which remounts this anyway.
+  const vstStatus = liveVstStatus();
 
   return (
     <div className="flex flex-col gap-2">
@@ -172,6 +177,19 @@ export function FxRack({
               >
                 {label}
               </span>
+              {/* Plain text, not a control: it reports why this plugin makes no
+                  sound live (the chain skips it — rackEffects' inertIds()). A
+                  live host needs a SharedArrayBuffer ring, which needs the page
+                  to be cross-origin isolated; the title says which half is
+                  missing. No wrapping <label> — there is nothing to label. */}
+              {entry.effect === 'vst3' && (
+                <span
+                  title={vstStatus.reason}
+                  className="shrink-0 rounded-sm border border-amber-400/30 bg-amber-400/10 px-1 py-px font-sans text-[10px] font-bold uppercase tracking-wide text-amber-300/70"
+                >
+                  inert live
+                </span>
+              )}
               {entry.vst && onOpenVst && (
                 <button
                   onClick={() => onOpenVst(entry)}

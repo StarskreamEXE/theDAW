@@ -321,10 +321,36 @@ export function meterFromAnalysis(seg: { numerator?: number; denominator?: numbe
 }
 
 /**
+ * The ticks one STEP is worth for this note, read off the note itself: `ticks`
+ * is what `length` comes to in ticks, so their ratio is the grid the note was
+ * counted on. Reading it from the note rather than importing the model's PPQ is
+ * deliberate — `pianoRollStore` imports this module for real at runtime, and
+ * importing a value back would close that loop.
+ *
+ * Null when the note carries no ticks (it was built by a helper that predates
+ * them), in which case a repeat is left tick-less too rather than inventing a
+ * grid for it.
+ */
+const perStepOf = (n: LaneNote): number | null => {
+  if (typeof n.tick !== 'number' || !Number.isFinite(n.tick)) return null;
+  if (typeof n.ticks !== 'number' || !Number.isFinite(n.ticks)) return null;
+  if (!Number.isFinite(n.length) || n.length <= 0) return null;
+  return n.ticks / n.length;
+};
+
+/**
  * Lane notes written out across the roll. A lane with a cycle shorter than
  * the roll repeats its notes every cycle; a note placed past its lane's first
  * cycle wraps into it. Notes with no lane, or a lane without a cycle, pass
- * through. Repeats get the id `<id>~<k>`. Sorted by step, then pitch.
+ * through (the same object, ticks and all). Repeats get the id `<id>~<k>`.
+ * Sorted by step, then pitch.
+ *
+ * A repeat that carries ticks gets its OWN: it sits a whole number of cycles
+ * away from the note it came from, and a cycle is a whole number of steps, so
+ * the arithmetic is exact and the rounding only mops up float dust. Without
+ * this a repeat kept the base note's tick while showing a different step, and
+ * anything downstream that trusted the tick placed every repeat on top of the
+ * first one.
  */
 export function unrollLanes<T extends LaneNote>(notes: readonly T[], lanes: readonly PolyLane[], totalSteps: number): T[] {
   const cycles = new Map(lanes.map((l) => [l.id, l.cycleSteps]));
@@ -333,9 +359,22 @@ export function unrollLanes<T extends LaneNote>(notes: readonly T[], lanes: read
     const cyc = n.lane === undefined ? null : cycles.get(n.lane) ?? null;
     if (!cyc || cyc <= 0 || cyc >= totalSteps) { out.push(n); continue; }
     const base = ((n.step % cyc) + cyc) % cyc;
+    const per = perStepOf(n);
     for (let k = 0; base + k * cyc < totalSteps - EPS; k += 1) {
       const step = base + k * cyc;
-      out.push({ ...n, id: k === 0 ? n.id : `${n.id}~${k}`, step, length: Math.min(n.length, totalSteps - step) });
+      const length = Math.min(n.length, totalSteps - step);
+      out.push({
+        ...n,
+        id: k === 0 ? n.id : `${n.id}~${k}`,
+        step,
+        length,
+        ...(per === null
+          ? {}
+          : {
+            tick: Math.max(0, Math.round((n.tick as number) + (step - n.step) * per)),
+            ticks: Math.max(1, Math.round(length * per)),
+          }),
+      });
     }
   }
   return out.sort((a, b) => a.step - b.step || a.note - b.note);

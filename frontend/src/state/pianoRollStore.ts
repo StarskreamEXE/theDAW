@@ -12,18 +12,62 @@ import {
   type BendPointInput,
   type LaneBend,
 } from '../lib/pitchBend';
+// lib/rollSelection imports only the PianoNote TYPE back from here, which is
+// erased at compile, so this is a one-way runtime dependency.
+import { clampVelocity } from '../lib/rollSelection';
+
+/**
+ * Per-note expression — the three MPE dimensions a note can carry on its own,
+ * independent of its channel's wheel. The roll only STORES these; nothing plays
+ * or writes them yet (that is #42). Ranges are fixed here so every later reader
+ * agrees: `pressure` and `timbre` are 0..1, `pitchBend` is -1..1 of whatever
+ * bend range the note's channel is in.
+ */
+export interface NoteExpression {
+  /** Aftertouch / channel pressure, 0..1. */
+  pressure?: number;
+  /** The third MPE dimension (CC 74 "timbre" / slide), 0..1. */
+  timbre?: number;
+  /** Bend at the note, -1..1 of its channel's range. */
+  pitchBend?: number;
+}
 
 export interface PianoNote {
   id: string;
   /** MIDI note number (0-127). 60 = middle C. */
   note: number;
-  /** Step index where the note starts (16th notes from 0). */
+  /**
+   * Where the note starts, in 16th-note steps from 0. DERIVED from `tick`:
+   * every write goes to `tick` first and this is recomputed as
+   * `tick / ticksPerStep()`. It keeps its fraction, so a swung or off-grid note
+   * reads back at its real place. Kept for one release because a long tail of
+   * callers still reads (and writes) steps.
+   */
   step: number;
-  /** Length in steps. */
+  /** Length in steps. DERIVED from `ticks`, exactly as `step` is from `tick`. */
   length: number;
   velocity: number;
   /** Polymeter lane id (see `lanes`). Absent means lane 0, which spans the whole roll. */
   lane?: number;
+  /**
+   * THE position: ticks from the roll's start at `PPQ` ticks to the quarter
+   * note. Whole, never negative.
+   *
+   * Optional ONLY because a couple of dozen note-building call sites outside
+   * this module still construct notes from `step`/`length` alone. Every note
+   * the STORE holds has it: each list coming in goes through `withTicks`, which
+   * migrates a tick-less note (`tick = step × ticksPerStep`) and re-ticks a note
+   * whose `step` was rewritten behind the model's back (a paste, a lane unroll,
+   * a virtuoso transform). Read it through `noteTick` rather than directly if
+   * the note might not have come from the store.
+   */
+  tick?: number;
+  /** THE length, in ticks at `PPQ`. Whole and at least 1. See `tick`. */
+  ticks?: number;
+  /** MIDI channel 1-16 (NOT the 0-15 wire value). Absent means "no channel of its own". */
+  channel?: number;
+  /** Per-note expression; absent when the note carries none. */
+  expr?: NoteExpression;
 }
 
 /** The roll's meter: time signatures by bar, the pickup before bar 0, and the polymeter lanes. */
@@ -41,6 +85,16 @@ interface PianoRollState {
   /** Lowest and highest MIDI note numbers in view (inclusive). */
   lowestNote: number;
   highestNote: number;
+  /** Every selected note, in the order the selection took them (so the last one
+   *  in is the primary). Replaced whole on every change, never mutated. */
+  selectedIds: Set<string>;
+  /**
+   * The PRIMARY selected note — the newest one in `selectedIds`, or null with
+   * nothing selected. DERIVED: it is written only by the selection helper that
+   * writes `selectedIds`, never on its own, so the two can never disagree. It
+   * stays for one release so callers that only ever meant "the one selected
+   * note" keep working; new code reads `selectedIds`.
+   */
   selectedNoteId: string | null;
   isPlaying: boolean;
   currentStep: number;
@@ -64,6 +118,24 @@ interface PianoRollState {
    * as notes do. At most MAX_BENT_LANES lanes have points.
    */
   bends: LaneBend[];
+  /**
+   * The timing feel the roll's Q and SWING controls hold, 0-100 and -50..50.
+   * They belong to the roll rather than to the control that shows them: a tab
+   * switch used to reset both to 100 / 0, so the amount someone dialled in was
+   * gone the next time they came back. Persisted (localStorage) so a reload
+   * keeps them too. They are NOT undo history — they are a setting, not an
+   * edit; what they DO to the notes (applyTimingFeel's one replaceAll) is the
+   * undoable part.
+   */
+  quantizePct: number;
+  swingPct: number;
+  /**
+   * The groove template the roll's feel applies, by id (`lib/grooveTemplate`).
+   * It sits beside Q and SWING for the same reason they do — it is a setting,
+   * not an edit — and rides in the same persisted record, so a tab switch or a
+   * reload comes back to the feel someone chose.
+   */
+  grooveId: string;
 
   setBpm: (bpm: number) => void;
   setTotalSteps: (s: number) => void;
@@ -71,7 +143,34 @@ interface PianoRollState {
   addNote: (note: Omit<PianoNote, 'id'>) => string;
   removeNote: (id: string) => void;
   updateNote: (id: string, patch: Partial<PianoNote>) => void;
+  /** Select exactly `id`, or nothing. The one-note form of `setSelection`. */
   setSelectedNote: (id: string | null) => void;
+  /** Replace the selection. Ids with no note are dropped; `primary` takes the
+   *  primary slot when it survives, otherwise the last surviving id does. */
+  setSelection: (ids: Iterable<string>, primary?: string | null) => void;
+  /** Add to the selection, keeping what is already there. The last id added becomes primary. */
+  addToSelection: (ids: Iterable<string>) => void;
+  /** In or out: a selected note leaves the selection, an unselected one joins it as primary. */
+  toggleSelection: (id: string) => void;
+  selectAll: () => void;
+  clearSelection: () => void;
+  /**
+   * Move every selected note by `dSteps` steps and `dNotes` semitones. The
+   * DELTA is clamped, not each note, so the selection keeps its shape and stops
+   * against the roll's edges as one block; only the direction of travel is
+   * limited, so a note already outside the pitch range can still come back.
+   */
+  nudgeSelected: (dSteps: number, dNotes: number) => void;
+  /** Set `ids` to one velocity, clamped 1-127. */
+  setVelocity: (ids: Iterable<string>, velocity: number) => void;
+  /** Multiply the velocity of `ids`, clamped 1-127. */
+  scaleVelocity: (ids: Iterable<string>, factor: number) => void;
+  /** Quantize amount, 0-100; persisted. */
+  setQuantizePct: (pct: number) => void;
+  /** Swing/rag amount, -50..50; persisted. */
+  setSwingPct: (pct: number) => void;
+  /** The groove template id the feel applies; persisted. Blank falls back to the default. */
+  setGrooveId: (id: string) => void;
   setPlaying: (playing: boolean) => void;
   setCurrentStep: (s: number) => void;
   replaceAll: (notes: PianoNote[]) => void;
@@ -287,9 +386,278 @@ const seed = (): PianoNote[] => {
   const arr: PianoNote[] = [];
   const pitches = [60, 64, 67, 72, 67, 64, 60, 67]; // C E G C G E C G
   for (let i = 0; i < pitches.length; i += 1) {
-    arr.push({ id: uid(), note: pitches[i], step: i * 2, length: 2, velocity: 90 });
+    arr.push(withTicks({ id: uid(), note: pitches[i], step: i * 2, length: 2, velocity: 90 }));
   }
   return arr;
+};
+
+// ── Selection ────────────────────────────────────────────────────────────────
+
+/** The selection slice: the set AND the primary it derives, which are only ever
+ *  written together. `primary` wins the primary slot when it survives the
+ *  filter; otherwise the newest surviving id does (a Set keeps insertion order). */
+type SelectionSlice = Pick<PianoRollState, 'selectedIds' | 'selectedNoteId'>;
+
+const selectionOf = (notes: readonly PianoNote[], ids: Iterable<string>, primary?: string | null): SelectionSlice => {
+  const live = new Set(notes.map((n) => n.id));
+  const selectedIds = new Set<string>();
+  for (const id of ids) if (live.has(id)) selectedIds.add(id);
+  let newest: string | null = null;
+  for (const id of selectedIds) newest = id;
+  return { selectedIds, selectedNoteId: primary != null && selectedIds.has(primary) ? primary : newest };
+};
+
+/** Nothing selected — a fresh Set each time, because the state's Sets are
+ *  replaced rather than mutated and no two states may share one. */
+const noSelection = (): SelectionSlice => ({ selectedIds: new Set<string>(), selectedNoteId: null });
+
+// ── Note validation ──────────────────────────────────────────────────────────
+
+/**
+ * The shortest note the 16th grid holds when a caller gives a LENGTH IN STEPS.
+ *
+ * The model has TWO length floors on purpose, and they are deliberately
+ * different:
+ *
+ *   • a length in STEPS floors at one step (this constant). A step length is
+ *     something the GRID drew — a drawn, dragged or resized note, an import
+ *     counted in steps — and the roll cannot draw, hit-test or hand back a note
+ *     thinner than one cell, so a sub-step step-length is a rounding artefact,
+ *     not an intention. Rounding it up to a cell is what keeps a dragged note
+ *     visible and grabbable.
+ *   • a length in TICKS floors at one tick (`MIN_NOTE_TICKS`). A tick length
+ *     came from the model's own clock — a recorded take, a bend-laden import,
+ *     an off-grid paste — where a 32nd-of-a-step flam IS the intention. Floors
+ *     of a whole step there would quantise exactly the material the tick model
+ *     exists to preserve; one tick is only the "this is still a note, not a
+ *     note-off" bound.
+ *
+ * So a caller that gives `ticks` may go far shorter than a caller that gives
+ * `length`, and `timingOf` applies whichever floor matches the field it used.
+ */
+export const MIN_NOTE_LENGTH = 1;
+
+const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+
+// ── Ticks: the note model's clock ────────────────────────────────────────────
+//
+// Design source (design only — nothing copied): Tracktion Engine
+// `modules/tracktion_engine/midi/tracktion_MidiNote.h` (GPL-3 / commercial),
+// whose MidiNote keeps ONE authoritative musical position and length and hands
+// out quantised positions as a computed view rather than writing them back.
+// The same split here: `tick`/`ticks` are the note, `step`/`length` are the
+// 16th-note view of it, and quantise never becomes the stored truth.
+
+/**
+ * Ticks to the quarter note. 960 is divisible by 3, 4, 5, 6, 8, 12, 16, 32 and
+ * 64, so triplets, quintuplets and 64ths all land on whole ticks — which is why
+ * finer quantise does not need another model change.
+ */
+export const PPQ = 960;
+
+/** The roll's own grid: sixteenths, so four steps to the beat. */
+export const ROLL_STEPS_PER_BEAT = 4;
+
+/** The shortest note the model holds at all: one tick. */
+export const MIN_NOTE_TICKS = 1;
+
+const validStepsPerBeat = (stepsPerBeat?: number): number =>
+  isNum(stepsPerBeat) && stepsPerBeat > 0 ? stepsPerBeat : ROLL_STEPS_PER_BEAT;
+
+/** Ticks in one step of a grid of `stepsPerBeat` steps to the beat (4 = the roll's 16ths). */
+export const ticksPerStep = (stepsPerBeat?: number): number => PPQ / validStepsPerBeat(stepsPerBeat);
+
+/** A step position as ticks: whole (ticks are integers), never negative. */
+export const tickOfStep = (step: number, stepsPerBeat?: number): number =>
+  Math.max(0, Math.round((isNum(step) ? step : 0) * ticksPerStep(stepsPerBeat)));
+
+/** A tick position as steps, fraction kept — this is what makes `step` a view of `tick`. */
+export const stepOfTick = (tick: number, stepsPerBeat?: number): number =>
+  Math.max(0, isNum(tick) ? tick : 0) / ticksPerStep(stepsPerBeat);
+
+/**
+ * The ticks a note really has.
+ *
+ * `tick`/`ticks` win when they are there AND still agree with `step`/`length`
+ * (within half a tick, which is as close as the two can be told apart). They
+ * lose when they disagree, because the only way that happens is a pure helper
+ * outside the model — `noteClipboard.pasteNotes`, `meterMap.unrollLanes`, the
+ * virtuoso transforms — having rewritten `step` on a spread copy. Re-ticking
+ * from the rewritten step is what keeps those helpers working untouched, and a
+ * note that never left the store can never take that branch: its `step` is
+ * `tick / ticksPerStep`, so the two always agree.
+ *
+ * `stepsPerBeat` is the grid the CALLER counts steps on, and it is consulted on
+ * the tick-less branch ONLY. A note that already has a `tick` came from the
+ * store, whose `step`/`length` are always counted on the roll's own grid
+ * (`ROLL_STEPS_PER_BEAT`), so that — never the caller's grid — is what the
+ * agreement check compares against. Otherwise a caller asking for the notes on
+ * a triplet grid (`noteEvents(store.notes, 3)`) would find every note in
+ * disagreement and rewrite every authoritative tick to `round(tick * 4/3)`.
+ */
+const timingOf = (n: Partial<PianoNote>, stepsPerBeat?: number): { tick: number; ticks: number } => {
+  const per = ticksPerStep();
+  const keepTick = isNum(n.tick) && (!isNum(n.step) || Math.abs(n.tick - n.step * per) < 0.5);
+  const tick = keepTick ? Math.max(0, Math.round(n.tick as number)) : tickOfStep(isNum(n.step) ? n.step : 0, stepsPerBeat);
+  const keepTicks = isNum(n.ticks) && (!isNum(n.length) || Math.abs(n.ticks - n.length * per) < 0.5);
+  const ticks = keepTicks
+    ? Math.max(MIN_NOTE_TICKS, Math.round(n.ticks as number))
+    : Math.max(MIN_NOTE_TICKS, tickOfStep(Math.max(MIN_NOTE_LENGTH, isNum(n.length) ? n.length : MIN_NOTE_LENGTH), stepsPerBeat));
+  return { tick, ticks };
+};
+
+/** A note's start in ticks, migrating one that has none. Pure. */
+export const noteTick = (n: Partial<PianoNote>, stepsPerBeat?: number): number => timingOf(n, stepsPerBeat).tick;
+
+/** A note's length in ticks, migrating one that has none. Pure. */
+export const noteTicks = (n: Partial<PianoNote>, stepsPerBeat?: number): number => timingOf(n, stepsPerBeat).ticks;
+
+/** A whole MIDI channel 1-16, or undefined when there is none to keep. */
+const validChannel = (v: unknown): number | undefined =>
+  isNum(v) ? Math.max(1, Math.min(16, Math.round(v))) : undefined;
+
+const clampUnit = (v: number): number => Math.max(0, Math.min(1, v));
+
+/** Expression with each dimension in range, or undefined when nothing is left. */
+const validExpr = (e: unknown): NoteExpression | undefined => {
+  if (!e || typeof e !== 'object') return undefined;
+  const src = e as NoteExpression;
+  const out: NoteExpression = {};
+  if (isNum(src.pressure)) out.pressure = clampUnit(src.pressure);
+  if (isNum(src.timbre)) out.timbre = clampUnit(src.timbre);
+  if (isNum(src.pitchBend)) out.pitchBend = Math.max(-1, Math.min(1, src.pitchBend));
+  return Object.keys(out).length > 0 ? out : undefined;
+};
+
+/**
+ * A note with its ticks settled and `step`/`length` recomputed from them, plus
+ * channel and expression brought into range. THE way a note list gets into the
+ * store: every load, import, paste and recording goes through it, so the tick
+ * invariant holds for every note the roll holds.
+ *
+ * `note` and `velocity` are deliberately left alone here — whole-list ingest
+ * never validated them and starting now would silently rewrite existing
+ * projects. The add/update path (`validNote`) still clamps both.
+ */
+export const withTicks = (n: PianoNote, stepsPerBeat?: number): PianoNote => {
+  // The step VIEW is always the roll's own 16ths — `stepsPerBeat` says how an
+  // incoming tick-less `step` was counted, not how the store writes one back.
+  // Keeping it fixed is what makes `step === tick / ticksPerStep()` hold for
+  // every note in the store, whatever grid it arrived on.
+  const per = ticksPerStep();
+  const { tick, ticks } = timingOf(n, stepsPerBeat);
+  const out: PianoNote = { ...n, tick, ticks, step: tick / per, length: ticks / per };
+  const channel = validChannel(n.channel);
+  if (channel === undefined) delete out.channel;
+  else out.channel = channel;
+  const expr = validExpr(n.expr);
+  if (expr === undefined) delete out.expr;
+  else out.expr = expr;
+  return out;
+};
+
+/** A note list brought into the model — see `withTicks`. */
+export const migrateNotes = (notes: readonly PianoNote[], stepsPerBeat?: number): PianoNote[] =>
+  notes.map((n) => withTicks(n, stepsPerBeat));
+
+/**
+ * A note's fields brought inside the model's bounds: a whole MIDI note 0-127, a
+ * whole velocity 1-127 (0 is a note-off, never a note), a start at or after the
+ * roll's beginning and a length of at least one step, a whole tick at or after
+ * 0, a length of at least one tick, a channel 1-16 and expression in range.
+ *
+ * `step` keeps its FRACTION on purpose — swing, micro-timing and an imported
+ * off-grid take all place notes between 16ths, and the scheduler fires them at
+ * their exact time. Only the fields present in `patch` are touched, and `id` is
+ * never one of them: two notes with one id would break the selection outright.
+ */
+const validNote = <T extends Partial<PianoNote>>(patch: T): Omit<T, 'id'> => {
+  const { id: _drop, ...rest } = patch;
+  const out = { ...rest } as Partial<PianoNote>;
+  if ('note' in out) out.note = Math.max(0, Math.min(127, Math.round(isNum(out.note) ? out.note : 0)));
+  if ('velocity' in out) out.velocity = clampVelocity(out.velocity as number);
+  if ('step' in out) out.step = Math.max(0, isNum(out.step) ? out.step : 0);
+  if ('length' in out) out.length = Math.max(MIN_NOTE_LENGTH, isNum(out.length) ? out.length : MIN_NOTE_LENGTH);
+  if ('tick' in out) out.tick = Math.max(0, Math.round(isNum(out.tick) ? out.tick : 0));
+  if ('ticks' in out) out.ticks = Math.max(MIN_NOTE_TICKS, Math.round(isNum(out.ticks) ? out.ticks : MIN_NOTE_TICKS));
+  if ('channel' in out) {
+    const channel = validChannel(out.channel);
+    if (channel === undefined) delete out.channel;
+    else out.channel = channel;
+  }
+  if ('expr' in out) {
+    const expr = validExpr(out.expr);
+    if (expr === undefined) delete out.expr;
+    else out.expr = expr;
+  }
+  return out as Omit<T, 'id'>;
+};
+
+/**
+ * `patch` validated and applied to `base`, keeping the two timing pairs in step:
+ * a patch that names `tick`/`ticks` moves the derived `step`/`length`, and one
+ * that names `step`/`length` re-ticks the note. Ticks lead when a patch somehow
+ * names both.
+ */
+const patchedNote = (base: PianoNote, patch: Partial<PianoNote>): PianoNote => {
+  const p = validNote(patch) as Partial<PianoNote>;
+  const out: PianoNote = { ...base, ...p };
+  // A patch that names a channel or expression the model cannot hold is asking
+  // for NONE, so the one the note had goes rather than surviving the write.
+  if ('channel' in patch && !('channel' in p)) delete out.channel;
+  if ('expr' in patch && !('expr' in p)) delete out.expr;
+  const per = ticksPerStep();
+  if ('tick' in p) out.step = (out.tick as number) / per;
+  else if ('step' in p) out.tick = tickOfStep(out.step);
+  if ('ticks' in p) out.length = (out.ticks as number) / per;
+  else if ('length' in p) out.ticks = Math.max(MIN_NOTE_TICKS, tickOfStep(out.length));
+  return out;
+};
+
+// ── The timing feel, persisted ───────────────────────────────────────────────
+
+/** Where the roll's Q / SWING amounts live between sessions. */
+const FEEL_KEY = 'thedaw.roll.feel.v1';
+const DEFAULT_QUANTIZE_PCT = 100;
+const DEFAULT_SWING_PCT = 0;
+/** The feel's groove before anyone picks one: the roll's own swing. */
+export const DEFAULT_GROOVE_ID = 'swing';
+
+type RollFeel = { quantizePct: number; swingPct: number; grooveId: string };
+
+const clampQuantizePct = (v: number): number =>
+  Math.max(0, Math.min(100, Math.round(isNum(v) ? v : DEFAULT_QUANTIZE_PCT)));
+const clampSwingPct = (v: number): number => Math.max(-50, Math.min(50, Math.round(isNum(v) ? v : DEFAULT_SWING_PCT)));
+/** Any non-blank string is a groove id — the templates live elsewhere, and an id
+ *  for a groove this session does not have simply finds nothing. */
+const cleanGrooveId = (v: unknown): string => (typeof v === 'string' && v.trim() ? v.trim() : DEFAULT_GROOVE_ID);
+
+const loadFeel = (): RollFeel => {
+  try {
+    if (typeof localStorage === 'undefined') throw new Error('no storage');
+    const raw = localStorage.getItem(FEEL_KEY);
+    if (!raw) throw new Error('nothing saved');
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') throw new Error('not an object');
+    const o = parsed as Record<string, unknown>;
+    return {
+      quantizePct: clampQuantizePct(o.quantizePct as number),
+      swingPct: clampSwingPct(o.swingPct as number),
+      // A record written before grooves had a home has no id; the default fills in.
+      grooveId: cleanGrooveId(o.grooveId),
+    };
+  } catch {
+    return { quantizePct: DEFAULT_QUANTIZE_PCT, swingPct: DEFAULT_SWING_PCT, grooveId: DEFAULT_GROOVE_ID };
+  }
+};
+
+const saveFeel = (feel: RollFeel): void => {
+  try {
+    if (typeof localStorage === 'undefined') return;
+    localStorage.setItem(FEEL_KEY, JSON.stringify(feel));
+  } catch {
+    /* private mode / quota: the feel just does not survive the reload */
+  }
 };
 
 // ── Undo / redo plumbing (module-scoped) ─────────────────────────────────────
@@ -316,6 +684,7 @@ export const usePianoRollStore = create<PianoRollState>()((set, get) => ({
   totalSteps: DEFAULT_STEPS, // 16 bars at 16ths — a roomy default canvas
   lowestNote: FULL_LOW, // A0 — full piano in view, scrollable
   highestNote: FULL_HIGH, // C8
+  selectedIds: new Set<string>(),
   selectedNoteId: null,
   isPlaying: false,
   currentStep: 0,
@@ -326,6 +695,7 @@ export const usePianoRollStore = create<PianoRollState>()((set, get) => ({
   lanes: sanitizeLanes(DEFAULT_LANES),
   activeLane: 0,
   bends: [],
+  ...loadFeel(),
   _undo: [],
   _redo: [],
 
@@ -339,33 +709,122 @@ export const usePianoRollStore = create<PianoRollState>()((set, get) => ({
     set((s) => {
       const lane = note.lane ?? (s.activeLane !== 0 ? s.activeLane : undefined);
       const { lane: _drop, ...rest } = note;
-      return { notes: [...s.notes, { ...rest, ...(lane !== undefined ? { lane } : {}), id }], selectedNoteId: id };
+      // withTicks settles the timing whichever pair the caller gave.
+      const notes = [...s.notes, withTicks({ ...validNote(rest), ...(lane !== undefined ? { lane } : {}), id } as PianoNote)];
+      // A note just drawn is the whole selection, as it has always been.
+      return { notes, ...selectionOf(notes, [id]) };
     });
     return id;
   },
 
   removeNote: (id) =>
-    set((s) => ({
-      notes: s.notes.filter((n) => n.id !== id),
-      selectedNoteId: s.selectedNoteId === id ? null : s.selectedNoteId,
-    })),
+    set((s) => {
+      const notes = s.notes.filter((n) => n.id !== id);
+      if (notes.length === s.notes.length) return {};
+      return { notes, ...(s.selectedIds.has(id) ? selectionOf(notes, s.selectedIds, s.selectedNoteId) : {}) };
+    }),
 
   updateNote: (id, patch) =>
     set((s) => ({
-      notes: s.notes.map((n) => (n.id === id ? { ...n, ...patch } : n)),
+      notes: s.notes.map((n) => (n.id === id ? patchedNote(n, patch) : n)),
     })),
 
-  setSelectedNote: (selectedNoteId) => set({ selectedNoteId }),
+  setSelectedNote: (id) => set((s) => selectionOf(s.notes, id ? [id] : [])),
+  setSelection: (ids, primary) => set((s) => selectionOf(s.notes, ids, primary)),
+  addToSelection: (ids) => set((s) => selectionOf(s.notes, [...s.selectedIds, ...ids])),
+  toggleSelection: (id) =>
+    set((s) => {
+      if (!s.selectedIds.has(id)) return selectionOf(s.notes, [...s.selectedIds, id], id);
+      const kept = [...s.selectedIds].filter((x) => x !== id);
+      return selectionOf(s.notes, kept, s.selectedNoteId === id ? null : s.selectedNoteId);
+    }),
+  selectAll: () => set((s) => selectionOf(s.notes, s.notes.map((n) => n.id))),
+  clearSelection: () => set((s) => (s.selectedIds.size === 0 ? {} : noSelection())),
+
+  nudgeSelected: (dSteps, dNotes) =>
+    set((s) => {
+      const picked = s.notes.filter((n) => s.selectedIds.has(n.id));
+      if (picked.length === 0) return {};
+      const lastStep = Math.max(0, s.totalSteps - 1);
+      const lo = Math.min(s.lowestNote, s.highestNote);
+      const hi = Math.max(s.lowestNote, s.highestNote);
+      const minStep = picked.reduce((m, n) => Math.min(m, n.step), Infinity);
+      const maxStep = picked.reduce((m, n) => Math.max(m, n.step), -Infinity);
+      const minNote = picked.reduce((m, n) => Math.min(m, n.note), Infinity);
+      const maxNote = picked.reduce((m, n) => Math.max(m, n.note), -Infinity);
+      // Clamp the delta in its direction of travel only: at a wall the move is
+      // dropped, but a note already past a wall can still be moved back inside.
+      let ds = isNum(dSteps) ? dSteps : 0;
+      if (ds > 0) ds = Math.min(ds, Math.max(0, lastStep - maxStep));
+      else if (ds < 0) ds = Math.max(ds, Math.min(0, -minStep));
+      let dn = Math.round(isNum(dNotes) ? dNotes : 0);
+      if (dn > 0) dn = Math.min(dn, Math.max(0, hi - maxNote));
+      else if (dn < 0) dn = Math.max(dn, Math.min(0, lo - minNote));
+      if (ds === 0 && dn === 0) return {};
+      // Through patchedNote so the move lands on the ticks, not only on the view.
+      return { notes: s.notes.map((n) => (s.selectedIds.has(n.id) ? patchedNote(n, { step: n.step + ds, note: n.note + dn }) : n)) };
+    }),
+
+  setVelocity: (ids, velocity) =>
+    set((s) => {
+      const want = ids instanceof Set ? (ids as Set<string>) : new Set(ids);
+      if (want.size === 0) return {};
+      const v = clampVelocity(velocity);
+      let changed = false;
+      const notes = s.notes.map((n) => {
+        if (!want.has(n.id) || n.velocity === v) return n;
+        changed = true;
+        return { ...n, velocity: v };
+      });
+      // No write when a drag lands on the value the notes already hold, so a
+      // held pointer records no undo step of its own.
+      return changed ? { notes } : {};
+    }),
+
+  scaleVelocity: (ids, factor) =>
+    set((s) => {
+      const want = ids instanceof Set ? (ids as Set<string>) : new Set(ids);
+      if (want.size === 0 || !isNum(factor)) return {};
+      let changed = false;
+      const notes = s.notes.map((n) => {
+        if (!want.has(n.id)) return n;
+        const v = clampVelocity(n.velocity * factor);
+        if (v === n.velocity) return n;
+        changed = true;
+        return { ...n, velocity: v };
+      });
+      return changed ? { notes } : {};
+    }),
+
+  setQuantizePct: (pct) =>
+    set((s) => {
+      const quantizePct = clampQuantizePct(pct);
+      saveFeel({ quantizePct, swingPct: s.swingPct, grooveId: s.grooveId });
+      return { quantizePct };
+    }),
+  setSwingPct: (pct) =>
+    set((s) => {
+      const swingPct = clampSwingPct(pct);
+      saveFeel({ quantizePct: s.quantizePct, swingPct, grooveId: s.grooveId });
+      return { swingPct };
+    }),
+  setGrooveId: (id) =>
+    set((s) => {
+      const grooveId = cleanGrooveId(id);
+      saveFeel({ quantizePct: s.quantizePct, swingPct: s.swingPct, grooveId });
+      return { grooveId };
+    }),
+
   setPlaying: (isPlaying) => set({ isPlaying }),
   setCurrentStep: (currentStep) => set({ currentStep }),
-  replaceAll: (notes) => set({ notes, selectedNoteId: null }),
+  replaceAll: (notes) => set({ notes: migrateNotes(notes), ...noSelection() }),
   clear: () =>
-    set((s) => ({ notes: [], selectedNoteId: null, editingClipId: null, recordedRange: null, bends: clearedBends(s.bends) })),
+    set((s) => ({ notes: [], ...noSelection(), editingClipId: null, recordedRange: null, bends: clearedBends(s.bends) })),
 
   setEditingClip: (editingClipId) => set({ editingClipId }),
   loadFromClip: (clipId, incoming, bpm, totalSteps, meter, incomingBends) =>
     set((s) => {
-      const notes = incoming.map((n) => ({ ...n }));
+      const notes = migrateNotes(incoming);
       const m = mergeMeter(s, meter);
       const fit = notes.length > 0 ? fitToNotes(notes, m.meterMap, m.pickupSteps) : null;
       return {
@@ -379,7 +838,7 @@ export const usePianoRollStore = create<PianoRollState>()((set, get) => ({
         ),
         ...(fit ? { lowestNote: fit.lowestNote, highestNote: fit.highestNote } : {}),
         editingClipId: clipId,
-        selectedNoteId: null,
+        ...noSelection(),
         isPlaying: false,
         currentStep: 0,
         recordedRange: null,
@@ -388,18 +847,18 @@ export const usePianoRollStore = create<PianoRollState>()((set, get) => ({
 
   importNotes: (incoming, bpm, meter, incomingBends) =>
     set((s) => {
-      const notes = incoming.map((n) => ({ ...n }));
+      const notes = migrateNotes(incoming);
       const m = mergeMeter(s, meter);
       const bends = replacedBends(s, m.lanes, incomingBends);
       if (notes.length === 0) {
-        return { notes, ...m, bends, selectedNoteId: null, currentStep: 0, isPlaying: false, recordedRange: null };
+        return { notes, ...m, bends, ...noSelection(), currentStep: 0, isPlaying: false, recordedRange: null };
       }
       return {
         notes,
         ...m,
         bends,
         ...fitToNotes(notes, m.meterMap, m.pickupSteps),
-        selectedNoteId: null,
+        ...noSelection(),
         currentStep: 0,
         isPlaying: false,
         recordedRange: null,
@@ -411,7 +870,7 @@ export const usePianoRollStore = create<PianoRollState>()((set, get) => ({
 
   placeRecording: (incoming, range) =>
     set((s) => {
-      const notes = incoming.map((n) => ({ ...n }));
+      const notes = migrateNotes(incoming);
       // Keep at least the 256-step default — never shrink the grid for a short
       // take. Expand the pitch range to include the take (full keyboard stays).
       const lo = notes.length
@@ -426,7 +885,7 @@ export const usePianoRollStore = create<PianoRollState>()((set, get) => ({
         lowestNote: lo,
         highestNote: hi,
         recordedRange: range,
-        selectedNoteId: null,
+        ...noSelection(),
         currentStep: 0,
         isPlaying: false,
       };
@@ -542,6 +1001,10 @@ export const usePianoRollStore = create<PianoRollState>()((set, get) => ({
       ...prev,
       // A lane the step is going back to may not have the active one.
       activeLane: prev.lanes.some((l) => l.id === s.activeLane) ? s.activeLane : 0,
+      // Nor may it have the notes that were selected: a step back over an added
+      // note, a paste or a cut leaves ids behind that no longer exist, and a
+      // dead id in the set would survive into the next copy, nudge or delete.
+      ...selectionOf(prev.notes, s.selectedIds, s.selectedNoteId),
       _undo: s._undo.slice(0, -1),
       _redo: [...s._redo, current],
     });
@@ -558,6 +1021,8 @@ export const usePianoRollStore = create<PianoRollState>()((set, get) => ({
     set({
       ...next,
       activeLane: next.lanes.some((l) => l.id === s.activeLane) ? s.activeLane : 0,
+      // Same as undo: only the ids the step forward still has stay selected.
+      ...selectionOf(next.notes, s.selectedIds, s.selectedNoteId),
       _undo: [...s._undo, current],
       _redo: s._redo.slice(0, -1),
     });
@@ -605,18 +1070,23 @@ export const rollMeterOf = (s: Pick<PianoRollState, 'meterMap' | 'pickupSteps' |
   lanes: s.lanes.map((l) => ({ ...l })),
 });
 
-/** Convert the store's note list into the shared MIDI util's note format. */
+/**
+ * Convert the store's note list into the shared MIDI util's note format.
+ *
+ * Straight from the notes' OWN ticks, rescaled from `PPQ` to the file's `ppq` —
+ * it no longer re-derives a position from `step`, so nothing is quantised a
+ * second time on the way out. At `ppq === PPQ` the ticks come through untouched.
+ */
 export const pianoNotesToMidiNotes = (
   notes: PianoNote[],
   ppq: number,
 ): Array<{ tick: number; note: number; velocity: number; durationTicks: number; channel: number }> => {
-  // 16th note = ppq / 4 ticks
-  const stepTicks = ppq / 4;
+  const scale = (isNum(ppq) && ppq > 0 ? ppq : PPQ) / PPQ;
   return notes.map((n) => ({
-    tick: Math.round(n.step * stepTicks),
+    tick: Math.round(noteTick(n) * scale),
     note: n.note,
     velocity: Math.max(1, Math.min(127, n.velocity)),
-    durationTicks: Math.max(1, Math.round(n.length * stepTicks)),
+    durationTicks: Math.max(1, Math.round(noteTicks(n) * scale)),
     channel: 0,
   }));
 };

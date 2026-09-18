@@ -66,6 +66,68 @@ export interface EffectChainNode {
   id?: string;
 }
 
+// --- The master chains + the editor's automation lanes, as the FILE carries
+// them (backend ChainVst / ChainEntry / AutomationLaneTarget /
+// EditorAutomationPoint / EditorAutomationLane) ---
+
+/** The plugin identity on a master-chain entry. Mirrors the store's `VstNode`,
+ *  `raw_state` included — that opaque blob IS the dialed-in sound, and it is why
+ *  the master chains are not written as the per-track `EffectChainNode`. */
+export interface TasmoChainVst {
+  plugin_path: string;
+  plugin_name: string;
+  raw_state?: string | null;
+}
+
+/**
+ * One insert on the MASTER bus, in the store's own `ChainEntry` shape (see
+ * `state/effectChainStore.ts`). Both master chains are `ChainEntry[]` live, so
+ * the file keeps that shape rather than translating through the interchange
+ * node and losing `label` and `raw_state` on the way.
+ *
+ * Optionality mirrors the backend model, which requires `id` and `effect` and
+ * defaults the rest: `id` is load-bearing, because an automation lane targets a
+ * chain entry BY id.
+ */
+export interface TasmoChainEntry {
+  id: string;
+  effect: string;
+  params?: Record<string, number>;
+  enabled?: boolean;
+  vst?: TasmoChainVst | null;
+  label?: string | null;
+}
+
+/** What an automation lane writes to; mirrors the store's `AutomationTarget`.
+ *  `kind` is "trackVolume" | "trackPan" | "trackFx" | "masterFx" — typed as a
+ *  plain string because the file is only as trustworthy as whoever edited it,
+ *  and the reader is the strict half. */
+export interface TasmoAutomationTarget {
+  kind: string;
+  track_id?: string | null;
+  entry_id?: string | null;
+  param_key?: string | null;
+}
+
+/** One breakpoint. `curve` shapes the segment that STARTS here, in [-1, 1];
+ *  absent (every lane written before curves existed) means linear. */
+export interface TasmoAutomationPoint {
+  t: number;
+  v: number;
+  curve?: number | null;
+}
+
+/** One automated parameter's lane. The backend REJECTS points that do not
+ *  ascend by `t` or that are non-finite, so both sides agree on what a
+ *  samplable curve is. An EMPTY lane is valid: that is a lane the user cleared
+ *  but did not delete. */
+export interface TasmoAutomationLane {
+  id: string;
+  target: TasmoAutomationTarget;
+  points: TasmoAutomationPoint[];
+  enabled?: boolean;
+}
+
 /** Persisted controller (MIDI-learn) auto-attach for a saved session — the
  *  resolved Sway bindings + unattached list, so reopening re-wires the hardware
  *  to the same targets. Mirrors the frontend SwayResolveResult + source name. */
@@ -73,6 +135,31 @@ export interface TasmoControllerMappings {
   source_name: string;
   bindings: SwayBinding[];
   unattached: SwayUnattached[];
+}
+
+/**
+ * A timeline marker as the FILE carries it (backend `Locator`). `position` is
+ * timeline seconds; `color` is carried for files that have one (the editor's
+ * `TimelineMarker` has no colour of its own, so it round-trips untouched).
+ */
+export interface TasmoLocator {
+  id: string;
+  name: string;
+  position: number;
+  color?: string | null;
+}
+
+/**
+ * The transport's cycle region as the FILE carries it (backend `Loop`).
+ *
+ * `enabled` is separate from the bounds on purpose: the editor keeps the region
+ * when the loop is switched off, so flattening the two would reopen a session
+ * with the user's region thrown away.
+ */
+export interface TasmoLoop {
+  enabled: boolean;
+  start_sec: number;
+  end_sec: number;
 }
 
 /**
@@ -89,6 +176,39 @@ export interface TasmoFollowAction {
   a: string;
   b?: string | null;
   chance?: number;
+}
+
+/**
+ * One alternate recording of a clip as the FILE carries it (backend `Take`).
+ *
+ * `audio_file` is stored exactly like the clip's own — `audio/<name>` in an
+ * embedded save, an absolute path once the archive has been extracted — so a
+ * take's bytes are fetched through the same `/clip-audio` route the clip's are.
+ * Optionality mirrors the backend model, which defaults everything but `id`.
+ */
+export interface TasmoTake {
+  id: string;
+  name?: string;
+  audio_file?: string | null;
+  mime_type?: string;
+  offset_into_source?: number;
+  source_duration?: number;
+}
+
+/**
+ * One stretch of a comped clip as the FILE carries it (backend `CompRegion`),
+ * in CLIP-relative seconds. The list IS the comp: region `i` runs to region
+ * `i+1`'s `start_sec` and the last runs to the clip's end. `crossfade_sec` is
+ * the fade across this region's LEADING boundary (0 = a butt cut).
+ *
+ * The backend REJECTS a list that does not ascend or that names a take the clip
+ * does not have, so both sides agree on what a playable comp is; `clipComp`'s
+ * `normalizeComp` is the reader's half, clamping the rest into the clip box.
+ */
+export interface TasmoCompRegion {
+  start_sec: number;
+  take_index: number;
+  crossfade_sec?: number;
 }
 
 // --- Save payload (built in the frontend, validated by the backend) ---
@@ -134,6 +254,14 @@ export interface TasmoClipInput {
   lanes?: TasmoPolyLane[] | null;
   /** Piano-roll clips: each lane's pitch bend. */
   roll_bends?: TasmoLaneBend[] | null;
+  /** Alternate recordings of this clip, one file entry each, and the comp
+   *  across them. `active_take_index` names the take the clip's OWN
+   *  `audio_file` / `offset_into_source` mirror, so a reader that ignores all
+   *  three still gets the clip the user was hearing. Optional: a payload built
+   *  before takes existed stays valid (the backend defaults them to None). */
+  takes?: TasmoTake[] | null;
+  comp?: TasmoCompRegion[] | null;
+  active_take_index?: number | null;
 }
 
 export interface TasmoTrackInput {
@@ -190,7 +318,17 @@ export interface TasmoProjectInput {
   import_warnings?: string[];
   /** Session-view scene names in row order; empty when there is no grid. */
   scenes?: string[];
-  locators?: Array<{ id: string; name: string; position: number; color?: string | null }>;
+  /** Timeline markers in position order; omitted when the project has none. */
+  locators?: TasmoLocator[];
+  /** The transport's cycle region, or null when the project has none. */
+  loop?: TasmoLoop | null;
+  /** The master bus's insert rack and its hosted-VST chain, and the EDIT
+   *  session's automation lanes. Omitted (backend: None) only by a payload
+   *  built before they were written; an EMPTY array is a real statement — this
+   *  project has none — and clears on load. */
+  master_fx_chain?: TasmoChainEntry[];
+  master_vst_chain?: TasmoChainEntry[];
+  automation_lanes?: TasmoAutomationLane[];
   source_daw_version?: string | null;
   controller_mappings?: TasmoControllerMappings | null;
   /** Perform-tab scene-launch + modulation routing (see performRouting.ts). */
@@ -242,6 +380,13 @@ export interface TasmoLoadedClip {
   lanes?: TasmoPolyLane[] | null;
   /** Each lane's pitch bend; absent in .tasmo files written before the roll had pitch bend. */
   roll_bends?: TasmoLaneBend[] | null;
+  /** Alternate recordings, the comp across them, and which take the clip's own
+   *  fields mirror; all three absent in .tasmo files written before takes
+   *  existed, which is why the loader treats their absence as "not comped"
+   *  rather than as damage. */
+  takes?: TasmoTake[] | null;
+  comp?: TasmoCompRegion[] | null;
+  active_take_index?: number | null;
 }
 
 export interface TasmoLoadedTrack {
@@ -277,6 +422,16 @@ export interface TasmoProjectLoaded {
   import_warnings?: string[];
   /** Session-view scene names in row order; empty when there is no grid. */
   scenes?: string[];
+  /** Timeline markers; absent in files written before they were persisted. */
+  locators?: TasmoLocator[];
+  /** The transport's cycle region; absent in those same older files. */
+  loop?: TasmoLoop | null;
+  /** The master bus's two chains and the editor's automation lanes. Absent (or
+   *  null) in files written before they were persisted, which the loader leaves
+   *  the live state alone for; an empty array clears it. */
+  master_fx_chain?: TasmoChainEntry[] | null;
+  master_vst_chain?: TasmoChainEntry[] | null;
+  automation_lanes?: TasmoAutomationLane[] | null;
   controller_mappings?: TasmoControllerMappings | null;
   perform_routing?: PerformRoutingSnapshot | null;
 }

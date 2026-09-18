@@ -879,6 +879,76 @@ async function warnIfBackendLacksLaunchToken(): Promise<void> {
 // Production: custom protocol for renderer files
 // ---------------------------------------------------------------------------
 
+/** Statuses the fetch spec forbids a body on. Re-wrapping one of these with a
+ *  stream body throws, which would turn a perfectly good 204 into a hard
+ *  failure of whatever request produced it. 1xx is deliberately absent: the
+ *  Response constructor rejects any status below 200 outright, so 101/103 are
+ *  handled by the range guard below, not by passing a null body. */
+const NULL_BODY_STATUS = new Set([204, 205, 304])
+
+/**
+ * Cross-origin isolation: OPT-IN, off by default, same switch as the dev
+ * server (`ISOLATION_ENABLED` in frontend/vite.config.ts).
+ *
+ * COOP + COEP are what make SharedArrayBuffer constructible, but COEP also
+ * blocks every embedded document that carries no embedder policy of its own —
+ * the Underfit (:8791), VST Foundry (:5472) and Lyria sidecar tabs, which run
+ * on their own origins — and COOP severs the window handle the VJ pop-out is
+ * driven through, because the packaged pop-out loads from the backend's http
+ * origin, not app://. Until those are proxied same-origin (T29B), isolation
+ * stays behind the flag: start the app with theDAW_ISOLATE=1 to get it.
+ *
+ * With the flag unset, nothing below runs — the handler returns the very
+ * Response object net.fetch produced, so not one byte of any response changes.
+ */
+const ISOLATION_ENABLED = process.env.theDAW_ISOLATE === '1'
+
+/**
+ * Re-issue a response with cross-origin isolation headers attached.
+ *
+ * A Response that came out of `net.fetch` has an immutable header guard, so
+ * its headers cannot be appended to in place — the only way to add one is to
+ * construct a new Response around the same body. The body is passed through
+ * untouched, so streamed responses (audio, model downloads, SSE) stay streamed.
+ *
+ * `document` responses — the renderer's own HTML and the embedded VJ /
+ * SwayCommand builds — get COOP + COEP, which is what makes
+ * `crossOriginIsolated` true and SharedArrayBuffer constructible (see
+ * frontend/src/lib/sabSupport.ts). Everything else gets only
+ * Cross-Origin-Resource-Policy, which is what an isolated document demands of
+ * each subresource it pulls in. In dev the same headers come from
+ * `server.headers` and the proxy hooks in frontend/vite.config.ts.
+ *
+ * The proxy branches that call this assume the backend sets no `Set-Cookie`:
+ * the header would survive the copy, but nothing in theDAW's API issues one,
+ * and a future cookie-bearing route should be checked against this path rather
+ * than assumed to pass through intact.
+ */
+function withIsolationHeaders(res: Response, kind: 'document' | 'resource'): Response {
+  // The default path: hand back the exact object net.fetch returned. No new
+  // Response, no header copy, no body re-plumbing — so a streamed response
+  // cannot be perturbed by a feature that is switched off.
+  if (!ISOLATION_ENABLED) return res
+  // The Response constructor accepts 200-599 and throws on anything else, so a
+  // 1xx or a malformed status is handed back untouched rather than re-wrapped
+  // into an exception that would take the whole request down.
+  if (res.status < 200 || res.status > 599) return res
+  const headers = new Headers(res.headers)
+  // The body we are about to re-attach is the DECODED stream — net.fetch has
+  // already undone any gzip/br — so the upstream encoding and length describe
+  // bytes that no longer exist. Left in place they make the renderer try to
+  // inflate plain text, or truncate it at the compressed length.
+  headers.delete('content-encoding')
+  headers.delete('content-length')
+  headers.set('Cross-Origin-Resource-Policy', 'same-origin')
+  if (kind === 'document') {
+    headers.set('Cross-Origin-Opener-Policy', 'same-origin')
+    headers.set('Cross-Origin-Embedder-Policy', 'require-corp')
+  }
+  const body = NULL_BODY_STATUS.has(res.status) ? null : res.body
+  return new Response(body, { status: res.status, statusText: res.statusText, headers })
+}
+
 function registerAppProtocol(): void {
   protocol.handle('app', (request) => {
     const url = new URL(request.url)
@@ -896,6 +966,10 @@ function registerAppProtocol(): void {
           body: request.body,
           duplex: 'half',
         } as RequestInit)
+        // A subresource of an isolated document, so CORP — and only CORP. The
+        // /api branch keeps its method, headers, body, streaming and 502
+        // behaviour exactly as before; one response header is the whole change.
+        .then((res) => withIsolationHeaders(res, 'resource'))
         .catch((err) => {
           // The reason travels with the status. A bare 502 here was read as
           // "huggingface.co is down" for two days; the header says which hop
@@ -904,7 +978,14 @@ function registerAppProtocol(): void {
           log(`API proxy failed: ${request.method} ${url.pathname} -> ${why}`)
           return new Response(`theDAW backend unreachable at ${BACKEND_BASE}: ${why}`, {
             status: 502,
-            headers: { 'x-thedaw-proxy-error': 'backend-unreachable' },
+            headers: {
+              'x-thedaw-proxy-error': 'backend-unreachable',
+              // Only under isolation: without CORP the isolated renderer cannot
+              // read the 502 at all — it would surface as an opaque network
+              // error and hide the reason this header exists to carry. Off by
+              // default, the 502 is exactly the one-header response it was.
+              ...(ISOLATION_ENABLED ? { 'Cross-Origin-Resource-Policy': 'same-origin' } : {}),
+            },
           })
         })
     }
@@ -918,6 +999,12 @@ function registerAppProtocol(): void {
           method: request.method,
           headers: request.headers,
         })
+        // The VJ build is a DOCUMENT in an iframe of an isolated page, and an
+        // iframe is checked against its embedder's COEP: without an embedder
+        // policy of its own it is blocked and the tab goes blank. Its own
+        // subresources are served from this same branch, so they get the same
+        // treatment and the whole build loads.
+        .then((res) => withIsolationHeaders(res, 'document'))
         .catch(() => new Response('backend unavailable', { status: 502 }))
     }
 
@@ -930,6 +1017,8 @@ function registerAppProtocol(): void {
           method: request.method,
           headers: request.headers,
         })
+        // Same as /vj-app: an embedded document needs its own embedder policy.
+        .then((res) => withIsolationHeaders(res, 'document'))
         .catch(() => new Response('backend unavailable', { status: 502 }))
     }
 
@@ -948,7 +1037,13 @@ function registerAppProtocol(): void {
       return new Response('Forbidden', { status: 403 })
     }
 
-    return net.fetch(pathToFileURL(resolved).href)
+    // The renderer's own files. index.html is the top-level document whose
+    // COOP + COEP decide whether the whole app is cross-origin isolated; the
+    // bundles, styles, fonts and the /splash and /owl iframes beside it are
+    // served from this same branch, so handing every one of them the document
+    // pair is both correct (each embedded HTML file needs its own COEP) and
+    // harmless for the rest — COOP/COEP on a script or a font is ignored.
+    return net.fetch(pathToFileURL(resolved).href).then((res) => withIsolationHeaders(res, 'document'))
   })
 }
 

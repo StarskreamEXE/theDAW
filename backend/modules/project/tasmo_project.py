@@ -1,8 +1,9 @@
 """TasmoProject Pydantic model — the full project state for .tasmo files."""
 
 from __future__ import annotations
+import math
 from datetime import datetime, timezone
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class VstPluginState(BaseModel):
@@ -31,6 +32,20 @@ class Locator(BaseModel):
     color: str | None = None
 
 
+class Loop(BaseModel):
+    """The transport's cycle region, in timeline seconds.
+
+    ``enabled`` is stored separately from the bounds so turning the loop off
+    does not throw the region away — that is how the editor holds it
+    (``loopEnabled`` / ``loopStart`` / ``loopEnd``), and a file that flattened
+    the two would reopen with the user's region gone.
+    """
+
+    enabled: bool = False
+    start_sec: float = 0.0
+    end_sec: float = 0.0
+
+
 class AutomationPoint(BaseModel):
     time: float
     value: float
@@ -40,6 +55,131 @@ class AutomationPoint(BaseModel):
 class AutomationLane(BaseModel):
     target: str
     points: list[AutomationPoint] = []
+
+
+class ChainVst(BaseModel):
+    """The plugin identity on a master-chain entry (frontend ``VstNode``).
+
+    ``raw_state`` is the opaque base64 blob the plugin's native editor produced.
+    It is what makes a hosted VST worth persisting at all — the dialed-in sound
+    — and it is the reason the master chains are NOT stored as
+    ``EffectChainNode``: that model carries a ``VstPluginState.parameters``
+    snapshot and has nowhere to put an opaque state blob.
+    """
+
+    plugin_path: str = ""
+    plugin_name: str = ""
+    raw_state: str | None = None
+
+
+class ChainEntry(BaseModel):
+    """One insert on the MASTER bus, in the shape the editor holds it.
+
+    Mirrors ``ChainEntry`` in ``frontend/src/state/effectChainStore.ts`` field
+    for field, because both master chains ARE ``ChainEntry[]`` in the store and
+    a lossy translation is what would make a reloaded master sound different
+    from the one the user saved. ``id`` is required and stable: automation lanes
+    key off it (``AutomationLaneTarget.entry_id``), so a chain that reloaded
+    with fresh ids would reload with its automation pointing at nothing.
+
+    Per-track and per-bus chains keep using ``EffectChainNode`` — that shape is
+    the .tasmo interchange node (bypass/parameters/vst_state), written by DAW
+    importers as well as by theDAW. This one is theDAW's own live rack.
+    """
+
+    id: str
+    effect: str
+    params: dict[str, float] = {}
+    enabled: bool = True
+    vst: ChainVst | None = None
+    label: str | None = None
+
+
+class AutomationLaneTarget(BaseModel):
+    """What an editor automation lane writes to (frontend ``AutomationTarget``).
+
+    ``kind`` is "trackVolume" | "trackPan" | "trackFx" | "masterFx"; the other
+    three name the track, the chain entry and the effect parameter the kind
+    needs. Not validated here on purpose, exactly as ``FollowAction`` is not:
+    storage stays tolerant so a hand-edited or older file still loads, and the
+    app is the strict half — the reader drops a lane whose target names a track
+    or a chain entry the loaded project does not have, rather than restoring a
+    lane that writes nowhere.
+    """
+
+    kind: str = ""
+    track_id: str | None = None
+    entry_id: str | None = None
+    param_key: str | None = None
+
+
+class EditorAutomationPoint(BaseModel):
+    """One breakpoint: timeline seconds -> value, in the param's own units.
+
+    ``curve`` shapes the segment that STARTS here, in [-1, 1]; None (the only
+    form a lane written before curves existed has) means linear. Named ``t`` /
+    ``v`` / ``curve`` after the frontend's ``AutomationPoint``, which is the
+    only thing that reads them.
+    """
+
+    t: float
+    v: float
+    curve: float | None = None
+
+
+class EditorAutomationLane(BaseModel):
+    """One automated parameter's breakpoints (frontend ``AutomationLane``).
+
+    Distinct from ``AutomationLane`` above, which is the flat importer shape
+    (``target`` as one string, ``time``/``value``/``curve_type`` points) carried
+    on ``TasmoProject.automation``. This one is the EDIT session's lane: a
+    structured target the editor can resolve back to a fader, a knob or an FX
+    parameter, and the points the lane editor draws.
+    """
+
+    id: str
+    target: AutomationLaneTarget = Field(default_factory=AutomationLaneTarget)
+    points: list[EditorAutomationPoint] = []
+    enabled: bool = True
+
+    @model_validator(mode="after")
+    def _check_points(self) -> EditorAutomationLane:
+        """Structural sanity only — a lane that cannot be sampled is corrupt.
+
+        The points are a CURVE, read by walking neighbouring pairs, so:
+
+        - they ASCEND strictly by ``t``. Two points at the same time describe a
+          segment with no length, and a backwards pair describes one that runs
+          the wrong way; a sampler has no reading of either.
+        - ``t``, ``v`` and ``curve`` are FINITE. JSON has no NaN but msgpack
+          does, and a NaN ``t`` compares false against everything: it would slip
+          past the ascending check and then sample nowhere.
+
+        An EMPTY lane is valid and kept — ``clearAutomationLane`` leaves exactly
+        that, a lane the user emptied but did not delete.
+
+        Raised as ``ValueError`` so the message surfaces through pydantic's
+        ValidationError the way ``Clip._check_comp`` reports a bad comp.
+        """
+        previous: float | None = None
+        for index, point in enumerate(self.points):
+            if not math.isfinite(point.t) or not math.isfinite(point.v):
+                raise ValueError(
+                    f"Invalid automation lane {self.id!r}: point {index} has a "
+                    f"non-finite t/v"
+                )
+            if point.curve is not None and not math.isfinite(point.curve):
+                raise ValueError(
+                    f"Invalid automation lane {self.id!r}: point {index} has a "
+                    f"non-finite curve"
+                )
+            if previous is not None and point.t <= previous:
+                raise ValueError(
+                    f"Invalid automation lane {self.id!r}: points must ascend by "
+                    f"t (point {index} is at {point.t}, after {previous})"
+                )
+            previous = point.t
+        return self
 
 
 class FollowAfter(BaseModel):
@@ -73,6 +213,47 @@ class FollowAction(BaseModel):
     a: str = ""
     b: str | None = None
     chance: float = 1.0
+
+
+class Take(BaseModel):
+    """One alternate recording of a clip — a second pass over the same bars.
+
+    Takes hang off the CLIP rather than a parallel track, because a clip in this
+    format already names its own audio: an alternate take is simply another
+    audio file on the same clip. ``audio_file`` is stored exactly like
+    ``Clip.audio_file`` (an absolute path when linked, ``audio/<name>`` when
+    embedded), so nothing new has to understand how take bytes are carried.
+
+    ``offset_into_source`` and ``source_duration`` are per take because two
+    passes are not the same length and are not trimmed at the same point. The
+    take the clip is currently playing is mirrored onto the clip's own fields
+    (``audio_file`` / ``offset_into_source`` / ...) — that invariant is what
+    lets every reader that knows nothing about takes keep working. See
+    ``frontend/src/lib/clipComp.ts`` for the model these mirror.
+    """
+
+    id: str
+    name: str = ""
+    audio_file: str | None = None
+    mime_type: str = ""
+    offset_into_source: float = 0.0
+    source_duration: float = 0.0
+
+
+class CompRegion(BaseModel):
+    """One stretch of a comped clip, in CLIP-relative seconds.
+
+    A comp is the choice of which take plays where, as an ordered list of
+    boundaries: region ``i`` runs from its own ``start_sec`` to region
+    ``i+1``'s, and the last one runs to the clip's end. There is no stored
+    segment object — the boundary list IS the comp — and ``crossfade_sec`` is
+    the fade across this region's LEADING boundary (0 = a butt cut; meaningless
+    on the first region, whose boundary is the clip head).
+    """
+
+    start_sec: float = 0.0
+    take_index: int = 0
+    crossfade_sec: float = 0.0
 
 
 class Clip(BaseModel):
@@ -143,7 +324,74 @@ class Clip(BaseModel):
     generation_seed: int | None = None
     generation_params: dict | None = None
     warp_markers: list[dict] | None = None
+    # Alternate recordings of this clip, the comp across them, and which take
+    # the clip's OWN fields currently mirror. Defaulted exactly like
+    # `warp_markers` above, so a .tasmo written before takes existed still
+    # validates and loads with all three as None — and no format_version bump
+    # comes with them, because a reader that ignores the keys still gets a
+    # correct project: the clip plays its active take, which is what its own
+    # `audio_file` / `offset_into_source` already name.
+    takes: list[Take] | None = None
+    comp: list[CompRegion] | None = None
+    active_take_index: int | None = None
     effect_chain: list[EffectChainNode] = []
+
+    @model_validator(mode="after")
+    def _check_comp(self) -> Clip:
+        """A comp that cannot be played is a corrupt file, not a tolerable one.
+
+        The rules, all structural, each one something a downstream reader would
+        otherwise have to guess its way out of:
+
+        - the regions ASCEND by ``start_sec``. The list is a boundary list, so
+          an out-of-order (or duplicated) start describes a region with no
+          length or a boundary that goes backwards — there is no reading of it.
+        - every ``take_index`` names a take that exists. A comp region pointing
+          past the end of ``takes`` selects audio that is not in the file.
+        - ``start_sec`` and ``crossfade_sec`` are FINITE. JSON has no NaN, but
+          msgpack does, and a NaN boundary compares false against everything:
+          it would slip past the ascending check and then place a segment
+          nowhere.
+        - ``active_take_index`` names a take that exists, when there are takes.
+          It says which take the clip's own ``audio_file`` mirrors, so an index
+          past the end makes the clip's audio and its take list disagree about
+          what is playing.
+
+        Raised as ``ValueError`` so the message surfaces through pydantic's
+        ValidationError the same way ``TasmoFile`` reports a bad archive.
+        """
+        take_count = len(self.takes or [])
+        active = self.active_take_index
+        if active is not None and take_count > 0 and not 0 <= active < take_count:
+            raise ValueError(
+                f"Invalid clip {self.id!r}: active_take_index {active} names no "
+                f"take, the clip has {take_count}"
+            )
+        comp = self.comp
+        if not comp:
+            return self
+        previous: float | None = None
+        for index, region in enumerate(comp):
+            if not math.isfinite(region.start_sec) or not math.isfinite(
+                region.crossfade_sec
+            ):
+                raise ValueError(
+                    f"Invalid clip {self.id!r}: comp region {index} has a "
+                    f"non-finite start_sec/crossfade_sec"
+                )
+            if previous is not None and region.start_sec <= previous:
+                raise ValueError(
+                    f"Invalid clip {self.id!r}: comp regions must ascend by "
+                    f"start_sec (region {index} starts at {region.start_sec}, "
+                    f"after {previous})"
+                )
+            previous = region.start_sec
+            if not 0 <= region.take_index < take_count:
+                raise ValueError(
+                    f"Invalid clip {self.id!r}: comp region {index} names take "
+                    f"{region.take_index}, but the clip has {take_count} take(s)"
+                )
+        return self
 
 
 class Track(BaseModel):
@@ -216,7 +464,33 @@ class TasmoProject(BaseModel):
     # so a saved project reloaded with every edge collapsed onto the master.
     buses: list[Bus] = []
     locators: list[Locator] = []
+    # The transport's cycle region. None for a project that has none, and absent
+    # entirely from files written before the loop was persisted — defaulted for
+    # exactly the reason `buses` is. Paired with `locators`, which carries the
+    # timeline markers: both are per-project document state the editor clears on
+    # load, so without them a saved session reopened with no markers and no loop.
+    loop: Loop | None = None
     automation: list[AutomationLane] = []
+    # The MASTER bus's two insert chains and the EDIT session's automation lanes
+    # — the last of the session state a .tasmo could not carry. Without them a
+    # saved project reopened with the master rack and the master VST chain still
+    # holding the PREVIOUS project's plugins (the editor does not clear them on
+    # load) and with every automation lane gone (it does clear those).
+    #
+    # None and [] mean DIFFERENT things here, which is why all three are
+    # `| None` rather than defaulted lists like `buses`:
+    #   None — the file says nothing, i.e. it was written before this existed.
+    #          The reader leaves the live state alone, so a legacy project opens
+    #          exactly as it always did.
+    #   []   — the file says this project HAS no master FX / master VSTs / lanes.
+    #          The reader clears, so the previous project's master rack does not
+    #          bleed into this one.
+    # Every save from here on writes all three, so only files written before
+    # this are ever None. No format_version bump: a reader that ignores
+    # the keys still gets a correct project, one with an unprocessed master.
+    master_fx_chain: list[ChainEntry] | None = None
+    master_vst_chain: list[ChainEntry] | None = None
+    automation_lanes: list[EditorAutomationLane] | None = None
     generation_history: list[dict] = []
     source_daw: str | None = None
     source_daw_version: str | None = None

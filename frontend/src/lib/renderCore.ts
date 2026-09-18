@@ -92,6 +92,37 @@
  * A freeze STEM is one path, so its trim was always exact; the stem scope
  * builds no comp delay and is untouched by this.
  *
+ * SINCE T46C a COMPED clip prints what it previews, and it does so without a
+ * line of scheduling maths living here. The comp model is `lib/clipComp`'s and
+ * the segment walk is `scheduleClipSources`'s — the same function the live
+ * mixer drives, reached offline through `deps.scheduleSources`. All this file
+ * owns is the two halves the live engine owns for itself: having every take's
+ * audio in RAM (the decode loop below decodes each take's Blob once, at the
+ * bounce's rate, through the same `deps.decode` the clip's own blob goes
+ * through) and handing the scheduler a `TakeBufferResolver` instead of one
+ * buffer. A clip that is not comped passes the single buffer exactly as it
+ * always has, so every non-comped render is unchanged node for node.
+ *   - WHAT IS STILL THE ACTIVE TAKE, deliberately: the spatializer's teleport
+ *     schedule, which slices `clip.audioBlob` (= the active take, by
+ *     `AudioClip.takes`'s mirroring invariant). That matches live playback,
+ *     whose `chunksFor` reads the same blob — onset-driven panning follows the
+ *     clip's nominal audio rather than re-slicing per comp region.
+ *   - A TAKE THAT IS NOT IN THE MAP is not a reason to fail a bounce or to
+ *     print silence: the clip renders every segment from its active take, and
+ *     says so in the log. Reachable ONLY if the take list mutates between the
+ *     decode loop and the scheduling loop — a decode that fails rejects the
+ *     whole bounce, so a take that was in the list when the loop ran is in the
+ *     map. That is a DELIBERATE DIVERGENCE from live playback, which skips the
+ *     segment whose take it cannot peek (`liveMixer.takeResolver` returns
+ *     `undefined` and the scheduler builds no source for it). Live is right to:
+ *     a buffer it cannot peek is one the decode budget evicted, and it will be
+ *     back on the next pass. A bounce has no next pass and one file to hand the
+ *     user, so a hole in the middle of a clip is the worst answer available —
+ *     it degrades to the pre-comp render of that clip instead, which is audio
+ *     the user has heard. The divergence is one clip's fallback, not a
+ *     scheduling rule: the resolver still answers per take, so the moment every
+ *     take IS in the map the two paths are the same again.
+ *
  * DESIGN SOURCES (read for their design only — NO code was copied from either):
  *   - Tracktion Engine `modules/tracktion_engine/model/export/
  *     tracktion_Renderer.h`, `Renderer::Parameters` (GPL-3.0 or commercial) —
@@ -117,10 +148,12 @@ import {
 import {
   applyEnvelopeEvents, entryPrefixLatencies, fxLaneSampleTime, laneEnvelopeEvents,
   scheduleClipSources, trackCompDelays, wireRoutingGraph,
-  type RoutingEndpoints, type TrackCompRow,
+  type RoutingEndpoints, type TakeBufferResolver, type TrackCompRow,
 } from '../state/liveMixer';
+import { logWarn } from '../state/logStore';
 import { MASTER_ID, topoOrder, type RoutingGraph } from '../state/routingGraph';
 import { sliceChunks as defaultSliceChunks, type AudioChunk } from './audioAnalysis';
+import { isComped } from './clipComp';
 import {
   SPATIAL_TELEPORT, buildEffectChain, chainLatencySec, ensureChopModule, teleportXYZ,
   type ChainHandle,
@@ -324,6 +357,10 @@ interface TrackNodes {
 interface BusStrip {
   input: GainNode;
   output: GainNode;
+  /** The bus's rack, kept so a `CONN_SIDECHAIN` edge aimed at one of its entries
+   *  can be handed that entry's key input. `null` under `includeFx: false`,
+   *  where there is no rack to key. */
+  fx: ChainHandle | null;
 }
 
 /** `-1 <= pan <= 1`, the clamp all three renderers applied. */
@@ -543,11 +580,73 @@ export async function renderBounce(req: BounceRequest, deps: RenderDeps): Promis
   const buffers = new Map<Blob, AudioBuffer>();
   try {
     for (const clip of scoped) {
+      // The clip's OWN blob, unconditionally — this is the loop the three
+      // renderers had, and a second clip on the same Blob has always asked for
+      // it again (`deps.decode` is `lib/decodeCache`, which answers the second
+      // ask from RAM).
       buffers.set(clip.audioBlob, await deps.decode(decodeCtx, clip.audioBlob));
+      // A COMPED clip plays more than one of its takes, so every take's audio
+      // has to be resident before the scheduler asks for it. ONE decode per
+      // distinct Blob: the active take's blob IS `clip.audioBlob` (the
+      // mirroring invariant), so it is already in the map and is not decoded
+      // twice — and a take shared with an earlier clip is not decoded again
+      // either. A clip with takes but NO comp is not comped: it plays its
+      // active take and reaches none of this.
+      if (!isComped(clip)) continue;
+      for (const take of clip.takes ?? []) {
+        // A take with no blob is a malformed entry off disk, not a decode
+        // failure: asking `deps.decode` for `undefined` would reject the whole
+        // bounce over one bad row. It is skipped here and resolves to nothing
+        // below, which is what a take with no audio should do.
+        if (!take?.audioBlob || buffers.has(take.audioBlob)) continue;
+        buffers.set(take.audioBlob, await deps.decode(decodeCtx, take.audioBlob));
+      }
     }
   } finally {
     decodeCtx.close().catch(() => {});
   }
+
+  /**
+   * What the clip scheduler is handed: ONE buffer for an ordinary clip (exactly
+   * as before), a take resolver for a comped one.
+   *
+   * The resolver is the whole of this file's part in comping — the segments,
+   * their crossfades and their source offsets are `scheduleClipSources`'s, which
+   * is the live scheduler, so the printed file and the preview cannot diverge
+   * without one of them being rewritten.
+   *
+   * A take whose buffer is missing degrades the CLIP, not the bounce: rendering
+   * the comp with a hole in it would print silence where the user hears audio,
+   * so every segment is played from the single active buffer — the pre-comp
+   * render of that clip — and the log says which clip and how many takes were
+   * short. See the header for why this diverges from live's skip-the-segment.
+   */
+  const sourceFor = (clip: AudioClip, active: AudioBuffer): AudioBuffer | TakeBufferResolver => {
+    if (!isComped(clip)) return active;
+    const takes = clip.takes ?? [];
+    const takeBuffers = takes.map((t) => (t?.audioBlob ? buffers.get(t.audioBlob) : undefined));
+    const missing = takeBuffers.filter((b) => !b).length;
+    if (missing > 0) {
+      logWarn(
+        'editor',
+        `Bounce: comped clip "${clip.label}" is missing ${missing} of ${takes.length} decoded `
+        + 'takes — rendering every segment from its active take.',
+      );
+      return active;
+    }
+    const activeIndex = clip.activeTakeIndex ?? 0;
+    // THE ACTIVE INDEX ANSWERS FROM THE CLIP'S OWN BUFFER, whatever the take
+    // list says — `liveMixer.takeResolver` resolves it off `clip.audioBlob`
+    // rather than off `takes[i]` for exactly this reason. An `activeTakeIndex`
+    // that points past the list is a broken document, not a silent clip: the
+    // mirrored fields still hold real audio, and both paths play it. Every
+    // OTHER index comes from the take list, and one outside it resolves to
+    // nothing — which schedules no source, the answer a missing buffer has
+    // always given. (`clipComp.normalizeComp` drops out-of-range regions, so
+    // the comp itself should never ask.)
+    return (takeIndex: number) => takeBuffers[takeIndex]
+      ?? (takeIndex === activeIndex ? active : undefined);
+  };
 
   /** A track stem has no master bus to run a master rack on. */
   const useMasterFx = req.includeFx && scope.kind !== 'track';
@@ -641,15 +740,16 @@ export async function renderBounce(req: BounceRequest, deps: RenderDeps): Promis
       muteGain.gain.value = req.includeTrackMix && b.mute ? 0 : 1;
       const output = ctx.createGain();
       const chain = b.fxChain ?? [];
+      let fx: ChainHandle | null = null;
       if (req.includeFx) {
-        const fx = deps.buildChain(ctx, input, gain, chain); // input -> [fx] -> gain
+        fx = deps.buildChain(ctx, input, gain, chain); // input -> [fx] -> gain
         chains.push(fx);
         renderedBusChains.push({ id: b.id, fxChain: chain });
       } else {
         input.connect(gain);
       }
       gain.connect(muteGain).connect(output);
-      busStrips.set(b.id, { input, output });
+      busStrips.set(b.id, { input, output, fx });
     }
   }
 
@@ -841,6 +941,16 @@ export async function renderBounce(req: BounceRequest, deps: RenderDeps): Promis
       // Every strip this render actually built. On the degraded path it is
       // these, not the damaged file, that decide who reaches the master.
       liveIds: () => [...trackNodeById.keys(), ...busStrips.keys()],
+      // SIDECHAIN KEYS, resolved off the racks THIS render built — which is what
+      // makes the bounce key exactly as the preview does: both engines hand the
+      // one wiring pass a lookup from (node, entry) to that instance's `keyIn`,
+      // and the follower behind it is pure Web Audio, so the same key samples
+      // produce the same gain here and live. Under `includeFx: false` there is
+      // no rack on either side, so there is nothing to key and nothing resolves.
+      keyInputOf: (nodeId, entryId) => {
+        const fx = trackNodeById.get(nodeId)?.fx ?? busStrips.get(nodeId)?.fx;
+        return fx?.instances().find((i) => i.id === entryId)?.inst.keyIn;
+      },
     };
     wireRoutingGraph(deps.routing as RoutingGraph, ends);
   } else {
@@ -868,7 +978,8 @@ export async function renderBounce(req: BounceRequest, deps: RenderDeps): Promis
     // clip's timeline time IS its context time. The clip's own gain rides the
     // fade envelope (`clipPeakGain`, NOT the track volume); the track fader is
     // a node of its own, so per-track inserts process the post-fade signal.
-    deps.scheduleSources(ctx, clip, buf, destination, 0, 0);
+    // `sourceFor` is `buf` itself for every clip that is not comped.
+    deps.scheduleSources(ctx, clip, sourceFor(clip, buf), destination, 0, 0);
   }
 
   // ── Spatializer teleport ─────────────────────────────────────────────────
@@ -895,6 +1006,8 @@ export async function renderBounce(req: BounceRequest, deps: RenderDeps): Promis
         const events: { when: number; x: number; y: number; z: number }[] = [];
         let idx = 0;
         for (const c of trackClips) {
+          // The ACTIVE take, even on a comped clip — `liveMixer.chunksFor`
+          // slices the same blob, so preview and print agree (see the header).
           const buf = buffers.get(c.audioBlob);
           if (!buf) continue;
           const offset = Math.min(c.offsetIntoSource, Math.max(0, buf.duration - 0.01));

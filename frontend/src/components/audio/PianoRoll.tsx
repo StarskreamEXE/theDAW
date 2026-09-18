@@ -1,6 +1,6 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Check, Info, Minus, Plus, Save, Scissors, Trash2, Unlink, Waves } from 'lucide-react';
-import { DEFAULT_LANES, usePianoRollStore, type PianoNote } from '../../state/pianoRollStore';
+import { DEFAULT_GROOVE_ID, DEFAULT_LANES, usePianoRollStore, type PianoNote } from '../../state/pianoRollStore';
 import { usePlaybackStore } from '../../state/playbackStore';
 import { getEngineCtx } from '../../state/playerStore';
 import { useEditorStore, computePeaks } from '../../state/editorStore';
@@ -34,7 +34,32 @@ import { BEND_TAIL_SEC, type VoiceBend } from '../../lib/pitchBendVoice';
 import { midiFileToRoll, rollToMidiFile } from '../../lib/rollMidi';
 import { playedRollNotes, rollClipFields } from '../../lib/rollClip';
 import { copyNotes, duplicateNotes, pasteNotes, type NoteClipboardPayload } from '../../lib/noteClipboard';
+import {
+  MARQUEE_MIN_PX,
+  VELOCITY_LANE_HEIGHT,
+  VELOCITY_MAX,
+  gridPointAt,
+  marqueeBox,
+  marqueeRect,
+  notesInMarquee,
+  velocityBarHeight,
+  velocityNudgeWrites,
+  velocityTargets,
+  velocityToY,
+  yToVelocity,
+  type MarqueeRect,
+  type RollGeometry,
+  type RollPoint,
+} from '../../lib/rollSelection';
 import { syncopationByBar } from '../../lib/syncopation';
+import {
+  applyGroove,
+  builtinGrooves,
+  fromVirtuosoTemplate,
+  swingToGroove,
+  type GrooveTemplate,
+} from '../../lib/grooveTemplate';
+import { buildGrooveFromMidiBytes } from '../../lib/grooveExtract';
 import { BendLane } from './BendLane';
 import { MidiMapper } from './MidiMapper';
 import { ContextMenu, useContextMenu, type ContextMenuItem } from '../ui/ContextMenu';
@@ -49,6 +74,7 @@ import {
   DockFlyout,
   FIELD,
   FIELD_LEGEND,
+  FIELD_SELECT,
   FIELD_VALUE,
   FLYOUT_CARD,
   KEY_ON,
@@ -119,7 +145,7 @@ const LANE_FORMS: readonly LaneForm[] = [
 ];
 
 const ROLL_HELP =
-  'Click empty cell = add · Click note = select / second click = delete · Drag right edge = resize · Delete key removes selection · Ctrl/Cmd+C = copy · Ctrl/Cmd+X = cut · Ctrl/Cmd+V = paste at the insertion point (the playhead while playing, otherwise the last step you clicked) · Ctrl/Cmd+D = duplicate after the selection · Right-click note for actions · Ctrl+wheel = zoom · Shift+wheel = scroll';
+  'Click empty cell = add · Click note = select / second click on the only selected note = delete · Drag empty grid = marquee (Shift adds to the selection) · Shift-click note = add to the selection · Ctrl/Cmd-click note = in or out · Ctrl/Cmd+A = select all · Arrows nudge the selection (Shift = 4 steps / an octave) · Drag right edge = resize · Delete key removes the selection · Ctrl/Cmd+C = copy · Ctrl/Cmd+X = cut · Ctrl/Cmd+V = paste at the insertion point (the playhead while playing, otherwise the last step you clicked) · Ctrl/Cmd+D = duplicate after the selection · Velocity lane under the grid: drag a bar, or sweep across bars to draw · Right-click note for actions · Ctrl+wheel = zoom · Shift+wheel = scroll';
 
 /**
  * The roll's note clipboard: module-level, so it survives a remount and is
@@ -467,33 +493,104 @@ export const PianoRollZoom: React.FC<{ stepPx: number; onStepPxChange: (px: numb
   </>
 );
 
-/** Q and SWING sliders with APPLY: the timing feel, applied on demand. */
+/**
+ * The FEEL picker's first entry: the SWING slider, as a groove (the old
+ * behaviour). It is the store's `DEFAULT_GROOVE_ID`, so a roll that has never
+ * picked a groove — and a persisted feel record with a stale id — lands here.
+ */
+const SLIDER_GROOVE_ID = DEFAULT_GROOVE_ID;
+/** A step is a 16th and a beat is a quarter everywhere in the roll. */
+const FEEL_STEPS_PER_BEAT = 4;
+const GROOVE_FILE_ACCEPT = '.mid,.midi,audio/midi';
+
+/**
+ * Q and SWING sliders, a GROOVE picker, and APPLY: the timing feel, applied on
+ * demand.
+ *
+ * Both amounts live in the roll's store, not in this key: they were component
+ * state, so switching to the ARP face and back — or a reload — put them back to
+ * 100 / 0 and silently threw away what had been dialled in. The store persists
+ * them (localStorage). APPLY is unchanged: one `replaceAll`, one undo step.
+ *
+ * The feel is a groove template (`lib/grooveTemplate.ts`): lateness per slot of
+ * the bar rather than one scalar on every odd 16th. The picker's first entry IS
+ * that old scalar — `swingToGroove(swingPct)` reproduces it exactly, bar starts
+ * and all — so a document that sounded a certain way still does. The named
+ * grooves (and one learned from a MIDI file) take their depth from QUANT, the
+ * existing strength amount; the slider entry needs no depth because the SWING
+ * amount already is one.
+ *
+ * The choice lives in the store beside the two amounts, persisted in the same
+ * feel record. A groove learned from a MIDI file is NOT in that record (it is a
+ * whole pocket, not an id), so its id resolves to nothing after a reload and
+ * falls back to the slider — the roll's oldest, safest feel.
+ */
 export const PianoRollFeel: React.FC = () => {
   const noteCount = usePianoRollStore((s) => s.notes.length);
-  const [quantizePct, setQuantizePct] = useState(100);
-  const [swingPct, setSwingPct] = useState(0);
+  const quantizePct = usePianoRollStore((s) => s.quantizePct);
+  const swingPct = usePianoRollStore((s) => s.swingPct);
+  const setQuantizePct = usePianoRollStore((s) => s.setQuantizePct);
+  const setSwingPct = usePianoRollStore((s) => s.setSwingPct);
+  const grooveId = usePianoRollStore((s) => s.grooveId);
+  const setGrooveId = usePianoRollStore((s) => s.setGrooveId);
+  const [imported, setImported] = useState<GrooveTemplate | null>(null);
+  const grooveFileRef = useRef<HTMLInputElement>(null);
+  const builtins = useMemo(() => builtinGrooves(), []);
+
+  const loadGrooveFile = async (file: File | undefined) => {
+    if (!file) return;
+    try {
+      const pocket = buildGrooveFromMidiBytes(await file.arrayBuffer(), file.name.replace(/\.[^.]+$/, ''));
+      if (!pocket) {
+        logError('piano-roll', `${file.name} has no notes to learn a groove from.`);
+        return;
+      }
+      const groove = fromVirtuosoTemplate(pocket);
+      setImported(groove);
+      setGrooveId(groove.id);
+      logInfo('piano-roll', `Groove learned from ${file.name}`);
+    } catch (err) {
+      logError('piano-roll', `Could not read a groove from ${file.name}: ${String(err)}`);
+    }
+  };
 
   const applyTimingFeel = () => {
-    const { notes, replaceAll, meterMap, pickupSteps } = usePianoRollStore.getState();
+    const { notes, replaceAll, meterMap, pickupSteps, totalSteps } = usePianoRollStore.getState();
     if (notes.length === 0) return;
     const q = Math.max(0, Math.min(1, quantizePct / 100));
-    const swing = Math.max(-0.49, Math.min(0.49, swingPct / 100));
-    const adjusted = notes.map((note) => {
+    const quantized = notes.map((note) => {
       const quantizedStep = Math.round(note.step);
       const quantizedLength = Math.max(1, Math.round(note.length));
-      let step = note.step + (quantizedStep - note.step) * q;
-      const length = Math.max(1, note.length + (quantizedLength - note.length) * q);
-      const gridStep = Math.round(step);
-      // Delay or pull back the off-16ths in each beat. Positive = swing/rag lag;
-      // negative = push/syncopate ahead. Keep step >= 0 so the phrase stays valid.
-      // Parity counts from the bar's start, so after a bar with an odd number of
-      // steps (5/16, 7/16) the next bar's downbeat stays on the beat.
-      const fromBar = Math.round(gridStep - barAt(meterMap, gridStep, pickupSteps).start);
-      if (fromBar % 2 === 1) step = Math.max(0, step + swing);
-      return { ...note, step, length };
+      return {
+        ...note,
+        step: note.step + (quantizedStep - note.step) * q,
+        length: Math.max(1, note.length + (quantizedLength - note.length) * q),
+      };
     });
+    // An id that resolves to nothing — a stale one out of the persisted feel
+    // record, or the MIDI groove of a previous session — IS the slider entry,
+    // so resolve first and read the depth off what came back: the slider groove
+    // IS the swing amount and applies whole, while every other groove is a
+    // shape, and QUANT is how far into that shape the notes go.
+    const picked =
+      grooveId === SLIDER_GROOVE_ID
+        ? null
+        : ((imported && imported.id === grooveId ? imported : builtins.find((g) => g.id === grooveId)) ?? null);
+    const groove = picked ?? swingToGroove(swingPct);
+    // The slot counts from the bar's start, so after a bar with an odd number of
+    // steps (5/16, 7/16) the next bar's downbeat still lands on the beat. The
+    // last step of the grid is the ceiling: a deep groove cannot drag the roll's
+    // final notes off the end of it.
+    const adjusted = applyGroove(
+      quantized,
+      groove,
+      FEEL_STEPS_PER_BEAT,
+      picked ? q : 1,
+      (step) => barAt(meterMap, step, pickupSteps).start,
+      Math.max(0, totalSteps - 1),
+    );
     replaceAll(adjusted);
-    logInfo('piano-roll', `Applied timing feel: quantize ${quantizePct}% · swing/rag ${swingPct}%`);
+    logInfo('piano-roll', `Applied timing feel: quantize ${quantizePct}% · groove ${groove.name}`);
   };
 
   return (
@@ -525,6 +622,49 @@ export const PianoRollFeel: React.FC = () => {
           className={RANGE}
         />
         <span className={`${FIELD_VALUE} w-5.5`}>{swingPct > 0 ? '+' : ''}{swingPct}</span>
+      </div>
+      <div
+        className={FIELD}
+        title="Groove: the feel APPLY lays over the grid, as lateness per slot of the bar. The SWING slider is the first entry; the named grooves take their depth from QUANT."
+      >
+        <label htmlFor="piano-roll-groove" className={FIELD_LEGEND}>Groove</label>
+        <select
+          id="piano-roll-groove"
+          name="piano-roll-groove"
+          // An id nothing answers to shows as the slider entry, which is what it applies as.
+          value={
+            grooveId === imported?.id || builtins.some((g) => g.id === grooveId) ? grooveId : SLIDER_GROOVE_ID
+          }
+          onChange={(e) => setGrooveId(e.target.value)}
+          className={`${FIELD_SELECT} max-w-28`}
+        >
+          <option value={SLIDER_GROOVE_ID}>Swing slider</option>
+          {builtins.map((g) => (
+            <option key={g.id} value={g.id}>{g.name}</option>
+          ))}
+          {imported && <option value={imported.id}>{imported.name}</option>}
+        </select>
+        <label htmlFor="piano-roll-groove-file" className="sr-only">Groove from a MIDI file</label>
+        <input
+          ref={grooveFileRef}
+          type="file"
+          id="piano-roll-groove-file"
+          name="piano-roll-groove-file"
+          accept={GROOVE_FILE_ACCEPT}
+          className="hidden"
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            e.target.value = '';
+            void loadGrooveFile(file);
+          }}
+        />
+        <StripKey
+          mini
+          onClick={() => grooveFileRef.current?.click()}
+          aria-label="Learn a groove from a MIDI file"
+          description="Read a MIDI file's timing pocket — how late or early each slot of the bar is played — and add it to the groove list"
+          legend="MIDI…"
+        />
       </div>
       <StripKey
         onClick={applyTimingFeel}
@@ -1083,6 +1223,209 @@ const RollPlayhead: React.FC<{ stepPx: number }> = ({ stepPx }) => {
   );
 };
 
+/** How much an arrow key moves the selected notes' velocity, and under Shift. */
+const VELOCITY_KEY_STEP = 1;
+const VELOCITY_KEY_COARSE = 10;
+
+/**
+ * The velocity lane: the strip under the grid where every note's velocity is a
+ * bar standing at the note's own x position, so a bar sits under the note it
+ * belongs to and scrolls and zooms with it (it lives inside the grid's scroll
+ * box, as the bend lane does).
+ *
+ * Before this, velocity could only be moved ±10 at a time from a note's
+ * right-click menu, one note per trip.
+ *
+ * Editing:
+ *   - press a bar and drag up or down to set that note's velocity
+ *   - keep dragging sideways to DRAW across a phrase: every note the sweep
+ *     crosses takes the velocity the pointer is at, and a sweep that skips
+ *     pixels still catches the notes between (lib/rollSelection notesInStepSpan)
+ *   - a sweep that passes over a SELECTED note writes only the selected notes
+ *     it passed, which is how one voice of a chord is isolated — otherwise the
+ *     bars of a chord sit on top of each other and all move together
+ *   - the lane takes focus, and the up / down arrows move every selected note's
+ *     velocity by the same amount (Shift for 10), so a crescendo stays one
+ *
+ * The bars are windowed to the steps in view, so a long roll draws no more of
+ * them than the grid does.
+ */
+const VelocityLane: React.FC<{
+  stepPx: number;
+  totalSteps: number;
+  win: { from: number; to: number };
+}> = ({ stepPx, totalSteps, win }) => {
+  const notes = usePianoRollStore((s) => s.notes);
+  const selectedIds = usePianoRollStore((s) => s.selectedIds);
+  const surfaceRef = useRef<HTMLDivElement | null>(null);
+  // The step the last pointer sample sat on, so a sweep covers the gap between samples.
+  const dragRef = useRef<number | null>(null);
+  // Unique per instance: every roll on the page gets its own help paragraph,
+  // so aria-describedby can never point at another instance's copy.
+  const helpId = useId();
+
+  const width = Math.max(1, totalSteps * stepPx);
+  const height = VELOCITY_LANE_HEIGHT;
+
+  const bars = useMemo(
+    () => notes.filter((n) => n.step <= win.to && n.step + n.length >= win.from),
+    [notes, win],
+  );
+
+  /** The reading beside the legend: one selected velocity, a range, or a dash. */
+  const reading = useMemo(() => {
+    const picked = notes.filter((n) => selectedIds.has(n.id));
+    if (picked.length === 0) return '—';
+    const lo = picked.reduce((m, n) => Math.min(m, n.velocity), VELOCITY_MAX);
+    const hi = picked.reduce((m, n) => Math.max(m, n.velocity), 1);
+    return lo === hi ? String(lo) : `${lo}–${hi}`;
+  }, [notes, selectedIds]);
+
+  // Every write reads the store rather than this render's props: a sweep fires
+  // faster than React re-renders, and each sample must see the note list the
+  // one before it left.
+  const writeAt = useCallback(
+    (fromStep: number, toStep: number, y: number) => {
+      const s = usePianoRollStore.getState();
+      const ids = velocityTargets(s.notes, fromStep, toStep, s.selectedIds);
+      if (ids.length > 0) s.setVelocity(ids, yToVelocity(y, height));
+    },
+    [height],
+  );
+
+  const localPoint = (e: React.PointerEvent): { x: number; y: number } => {
+    const r = surfaceRef.current?.getBoundingClientRect();
+    return { x: e.clientX - (r?.left ?? 0), y: e.clientY - (r?.top ?? 0) };
+  };
+
+  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    const { x, y } = localPoint(e);
+    const step = x / Math.max(1e-6, stepPx);
+    dragRef.current = step;
+    writeAt(step, step, y);
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+    // preventDefault below suppresses the compatibility mousedown, and with it
+    // the focus it would have given the strip, so the strip takes focus itself
+    // — otherwise the arrow keys would not reach it after a click.
+    surfaceRef.current?.focus();
+    e.preventDefault();
+  };
+
+  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const from = dragRef.current;
+    if (from === null) return;
+    const { x, y } = localPoint(e);
+    const step = x / Math.max(1e-6, stepPx);
+    writeAt(from, step, y);
+    dragRef.current = step;
+  };
+
+  const endDrag = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (dragRef.current === null) return;
+    dragRef.current = null;
+    e.currentTarget.releasePointerCapture?.(e.pointerId);
+  };
+
+  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+    // The lane keeps the key even with nothing selected, so an arrow here never
+    // falls through to the roll's own nudge or the EDIT timeline's.
+    e.preventDefault();
+    e.stopPropagation();
+    const s = usePianoRollStore.getState();
+    const by = (e.shiftKey ? VELOCITY_KEY_COARSE : VELOCITY_KEY_STEP) * (e.key === 'ArrowUp' ? 1 : -1);
+    // One write per velocity the selection lands on, so every note moves by the
+    // same amount and the whole nudge is a single undo step.
+    for (const w of velocityNudgeWrites(s.notes, s.selectedIds, by)) s.setVelocity(w.ids, w.velocity);
+  };
+
+  return (
+    <div className="shrink-0 border-t border-white/8 bg-black/30" data-velocity-lane="">
+      <div className="h-6.5 flex items-center gap-1.5 px-1.5 border-b border-white/5">
+        <span className={FIELD_LEGEND}>Velocity</span>
+        <span className={FIELD_VALUE} title="The selected notes' velocity">{reading}</span>
+        <span className="flex-1" />
+        <span className="text-[12px] font-semibold et-ink-3 tabular-nums whitespace-nowrap">
+          {selectedIds.size > 0 ? `${selectedIds.size} selected` : `${notes.length} note${notes.length === 1 ? '' : 's'}`}
+        </span>
+      </div>
+      {/* role="application": the arrow keys set velocity here, so a screen
+          reader must send them through instead of moving its own cursor. */}
+      <div
+        ref={surfaceRef}
+        role="application"
+        tabIndex={0}
+        aria-label={`Velocity lane, ${notes.length} note${notes.length === 1 ? '' : 's'}, ${
+          selectedIds.size > 0 ? `${selectedIds.size} selected at velocity ${reading}` : 'none selected'
+        }`}
+        aria-describedby={helpId}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
+        onKeyDown={onKeyDown}
+        className="relative cursor-ns-resize outline-none focus-visible:ring-2 focus-visible:ring-[rgb(var(--et-accent))]"
+        style={{ width, height }}
+      >
+        <svg width={width} height={height} className="absolute inset-0 pointer-events-none" shapeRendering="crispEdges">
+          {/* Quarter marks, so a bar's height reads as a value without a scale. */}
+          {[0.25, 0.5, 0.75].map((f) => (
+            <line
+              key={f}
+              x1={0}
+              x2={width}
+              y1={Math.round(height * (1 - f)) + 0.5}
+              y2={Math.round(height * (1 - f)) + 0.5}
+              stroke="rgb(255 255 255 / 0.06)"
+              strokeWidth={1}
+            />
+          ))}
+          {bars.map((n) => {
+            const on = selectedIds.has(n.id);
+            const h = velocityBarHeight(n.velocity, height);
+            return (
+              <rect
+                key={n.id}
+                x={n.step * stepPx}
+                y={velocityToY(n.velocity, height)}
+                width={Math.max(2, n.length * stepPx - 1)}
+                height={Math.max(1, h)}
+                fill={on ? 'rgb(var(--et-accent))' : 'rgb(var(--et-accent) / 0.34)'}
+                stroke={on ? 'rgb(255 255 255 / 0.9)' : 'rgb(var(--et-accent) / 0.7)'}
+                strokeWidth={1}
+              />
+            );
+          })}
+        </svg>
+      </div>
+      <p id={helpId} className="sr-only">
+        Each bar is a note&apos;s velocity, 1 at the floor and 127 at the top. Drag a bar up or down to set it, and
+        keep dragging sideways to draw across the notes you pass. With notes selected, a drag writes only the selected
+        ones it passes. The up and down arrow keys move every selected note&apos;s velocity by one, or by ten with Shift.
+      </p>
+    </div>
+  );
+};
+
+/**
+ * True when a key belongs to a portalled menu, listbox or dialog rather than to
+ * the roll.
+ *
+ * The roll's window listeners run on the CAPTURE phase and claim their keys
+ * whenever `ownsKey('piano-roll')` says so — and that is true while the POINTER
+ * merely rests on the dock, even though the keyboard is somewhere else
+ * entirely. A context menu, a select's listbox and a modal all render through a
+ * portal, outside the roll's root, so without this the roll would eat the arrow
+ * keys that move a menu's highlight and the Ctrl/Cmd+A inside a dialog's field.
+ */
+const inPortalledOverlay = (target: EventTarget | null, root: HTMLElement | null): boolean => {
+  const t = target instanceof Element ? target : null;
+  if (!t || root?.contains(t)) return false;
+  return !!t.closest('[role="menu"], [role="listbox"], [role="dialog"]');
+};
+
 export const PianoRoll: React.FC<{
   stepPx: number;
   onStepPxChange: (px: number) => void;
@@ -1097,7 +1440,7 @@ export const PianoRoll: React.FC<{
   const totalSteps = usePianoRollStore((s) => s.totalSteps);
   const lowestNote = usePianoRollStore((s) => s.lowestNote);
   const highestNote = usePianoRollStore((s) => s.highestNote);
-  const selectedNoteId = usePianoRollStore((s) => s.selectedNoteId);
+  const selectedIds = usePianoRollStore((s) => s.selectedIds);
   const recordedRange = usePianoRollStore((s) => s.recordedRange);
   const meterMap = usePianoRollStore((s) => s.meterMap);
   const pickupSteps = usePianoRollStore((s) => s.pickupSteps);
@@ -1109,6 +1452,9 @@ export const PianoRoll: React.FC<{
   const removeNote = usePianoRollStore((s) => s.removeNote);
   const updateNote = usePianoRollStore((s) => s.updateNote);
   const setSelectedNote = usePianoRollStore((s) => s.setSelectedNote);
+  const setSelection = usePianoRollStore((s) => s.setSelection);
+  const addToSelection = usePianoRollStore((s) => s.addToSelection);
+  const toggleSelection = usePianoRollStore((s) => s.toggleSelection);
   const clear = usePianoRollStore((s) => s.clear);
   const undo = usePianoRollStore((s) => s.undo);
   const redo = usePianoRollStore((s) => s.redo);
@@ -1213,8 +1559,35 @@ export const PianoRoll: React.FC<{
     [highestNote],
   );
   const xToStep = useCallback((x: number): number => Math.floor(x / stepPx), [stepPx]);
+  /** What lib/rollSelection needs to turn grid pixels into steps and notes. */
+  const geo: RollGeometry = useMemo(
+    () => ({ stepPx, noteHeight: NOTE_HEIGHT, highestNote }),
+    [stepPx, highestNote],
+  );
+
+  /**
+   * Which selection a modifier click means. Shift adds, Ctrl/Cmd toggles, and a
+   * plain click is handled by the caller (select, or delete the one selected
+   * note). Returns true when it handled the click.
+   */
+  const modifierSelect = (e: { shiftKey: boolean; ctrlKey: boolean; metaKey: boolean }, id: string): boolean => {
+    if (e.ctrlKey || e.metaKey) {
+      toggleSelection(id);
+      return true;
+    }
+    if (e.shiftKey) {
+      addToSelection([id]);
+      return true;
+    }
+    return false;
+  };
 
   const handleGridClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    // The click that ends a marquee drag is not a click on a cell.
+    if (suppressClickRef.current) {
+      suppressClickRef.current = false;
+      return;
+    }
     const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
@@ -1223,8 +1596,8 @@ export const PianoRoll: React.FC<{
     const targetStep = xToStep(x);
     if (targetStep < 0 || targetStep >= totalSteps) return;
     insertStepRef.current = targetStep;
-    // If clicked on an existing note → select it, or remove it when it was
-    // already selected before this press. Only stored notes count; a lane
+    // If clicked on an existing note → select it, or remove it when it was the
+    // one selected note before this press. Only stored notes count; a lane
     // repeat is drawn, not stored, and clicks pass through it.
     const hit = notes.find(
       (n) => n.note === targetNote && targetStep >= n.step && targetStep < n.step + n.length,
@@ -1232,7 +1605,10 @@ export const PianoRoll: React.FC<{
     if (hit) {
       const press = pressRef.current;
       pressRef.current = null;
-      const wasSelected = press ? press.id === hit.id && press.wasSelected : selectedNoteId === hit.id;
+      if (modifierSelect(e, hit.id)) return;
+      const wasSelected = press
+        ? press.id === hit.id && press.wasSelected
+        : selectedIds.size === 1 && selectedIds.has(hit.id);
       if (wasSelected) {
         removeNote(hit.id);
       } else {
@@ -1246,9 +1622,22 @@ export const PianoRoll: React.FC<{
   };
 
   // A press on a note selects it. The click that ends the press deletes the
-  // note only when it was selected before the press and the press did not
-  // resize it, so the first click selects and a second click deletes.
+  // note only when it was the ONLY selected note before the press and the press
+  // did not resize it, so the first click selects and a second click deletes —
+  // and a click inside a multi-selection collapses the selection onto that note
+  // rather than deleting a note the user had merely swept over.
   const pressRef = useRef<{ id: string; wasSelected: boolean } | null>(null);
+  /** True for the click that ends a marquee drag, which must not add or select. */
+  const suppressClickRef = useRef(false);
+  /**
+   * A marquee in flight: where it started (in grid space and in client px, so
+   * the "is this a drag yet" test is in pixels at any zoom), whether Shift was
+   * held at the press, and the rectangle the last move produced.
+   */
+  const marqueeRef = useRef<
+    { origin: RollPoint; startX: number; startY: number; shift: boolean; rect: MarqueeRect | null } | null
+  >(null);
+  const [marquee, setMarquee] = useState<MarqueeRect | null>(null);
   // Where a paste lands. The roll has NO edit cursor — its only step marker is
   // the transport playhead (`currentStep`), which is reset to 0 on play and is
   // stale once playback stops — so the insertion point is the playhead while the
@@ -1262,31 +1651,103 @@ export const PianoRoll: React.FC<{
   const resizeRef = useRef<{ id: string; startX: number; initialLength: number } | null>(null);
   const onNotePointerDown = (e: React.PointerEvent, note: PianoNote, edge: 'right' | 'body') => {
     e.stopPropagation();
-    pressRef.current = { id: note.id, wasSelected: usePianoRollStore.getState().selectedNoteId === note.id };
+    // A press on a note is never a marquee.
+    marqueeRef.current = null;
+    const picked = usePianoRollStore.getState().selectedIds;
+    pressRef.current = { id: note.id, wasSelected: picked.size === 1 && picked.has(note.id) };
     insertStepRef.current = note.step;
-    setSelectedNote(note.id);
+    // A modifier click is decided by the click handler, so the press leaves the
+    // selection alone; and a press on a note already in the selection keeps the
+    // whole selection, so grabbing one bar of a chord does not collapse it.
+    if (!(e.shiftKey || e.ctrlKey || e.metaKey) && !picked.has(note.id)) setSelectedNote(note.id);
     if (edge === 'right') {
       resizeRef.current = { id: note.id, startX: e.clientX, initialLength: note.length };
       (e.target as Element).setPointerCapture?.(e.pointerId);
     }
   };
+
+  /** A press on empty grid opens a marquee; the drag is only confirmed on the move. */
+  const onGridPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    // A press that starts off every note clears a note press that ended without a click.
+    pressRef.current = null;
+    // A fresh press: whatever the last drag armed, it can only ever swallow its
+    // OWN click, never a later one.
+    suppressClickRef.current = false;
+    if (e.button !== 0) {
+      marqueeRef.current = null;
+      return;
+    }
+    const rect = gridRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    marqueeRef.current = {
+      origin: gridPointAt(e.clientX - rect.left, e.clientY - rect.top, geo),
+      startX: e.clientX,
+      startY: e.clientY,
+      shift: e.shiftKey,
+      rect: null,
+    };
+    // Capture on the grid so a marquee dragged outside the scroll box still ends here.
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+  };
+
   const onPointerMove = (e: React.PointerEvent) => {
     const op = resizeRef.current;
-    if (!op) return;
-    const dx = e.clientX - op.startX;
-    if (Math.abs(dx) >= 3 && pressRef.current?.id === op.id) pressRef.current.wasSelected = false;
-    const deltaSteps = Math.round(dx / stepPx);
-    const newLen = Math.max(1, op.initialLength + deltaSteps);
-    updateNote(op.id, { length: newLen });
+    if (op) {
+      const dx = e.clientX - op.startX;
+      if (Math.abs(dx) >= 3 && pressRef.current?.id === op.id) pressRef.current.wasSelected = false;
+      const deltaSteps = Math.round(dx / stepPx);
+      const newLen = Math.max(1, op.initialLength + deltaSteps);
+      updateNote(op.id, { length: newLen });
+      return;
+    }
+    const mq = marqueeRef.current;
+    if (!mq) return;
+    // Until the pointer has travelled far enough this is still a click, which
+    // is how a click on an empty cell keeps adding a note.
+    if (!mq.rect && Math.abs(e.clientX - mq.startX) < MARQUEE_MIN_PX && Math.abs(e.clientY - mq.startY) < MARQUEE_MIN_PX) return;
+    const rect = gridRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const next = marqueeRect(mq.origin, gridPointAt(e.clientX - rect.left, e.clientY - rect.top, geo));
+    mq.rect = next;
+    setMarquee(next);
   };
+
   const onPointerUp = (e: React.PointerEvent) => {
     if (resizeRef.current) {
       (e.target as Element).releasePointerCapture?.(e.pointerId);
       resizeRef.current = null;
     }
+    const mq = marqueeRef.current;
+    marqueeRef.current = null;
+    if (!mq) return;
+    (e.target as Element).releasePointerCapture?.(e.pointerId);
+    if (!mq.rect) return;
+    setMarquee(null);
+    // Shift extends what was already selected; a plain marquee replaces it,
+    // and an empty one clears — a rubber band states the whole selection.
+    const hits = notesInMarquee(usePianoRollStore.getState().notes, mq.rect);
+    if (mq.shift) addToSelection(hits);
+    else setSelection(hits);
+    // The click that follows this release is the end of the drag, not a cell click.
+    suppressClickRef.current = true;
   };
 
-  // Delete / Backspace removes selected note.
+  /**
+   * A drag that ends without a pointerup — a cancelled touch or pen gesture, or
+   * a capture lost to another element — leaves nothing behind: no rubber band
+   * on screen, no armed click suppression, and the selection untouched, because
+   * a cancelled marquee never stated one.
+   */
+  const cancelMarquee = (e: React.PointerEvent) => {
+    if (!marqueeRef.current) return;
+    marqueeRef.current = null;
+    (e.target as Element).releasePointerCapture?.(e.pointerId);
+    setMarquee(null);
+    suppressClickRef.current = false;
+  };
+
+  // Delete / Backspace removes the whole selection, in ONE write of `notes`
+  // (so one undo step) whenever more than one note is going.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Delete' && e.key !== 'Backspace') return;
@@ -1298,14 +1759,50 @@ export const PianoRoll: React.FC<{
       // is showing) must not act on it.
       if (!ownsKey('piano-roll')) return;
       if (rootRef.current?.offsetParent === null) return;
-      if (selectedNoteId) {
-        e.preventDefault();
-        removeNote(selectedNoteId);
-      }
+      const s = usePianoRollStore.getState();
+      if (s.selectedIds.size === 0) return;
+      e.preventDefault();
+      if (s.selectedIds.size === 1 && s.selectedNoteId) removeNote(s.selectedNoteId);
+      else s.replaceAll(s.notes.filter((n) => !s.selectedIds.has(n.id)));
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [selectedNoteId, removeNote]);
+  }, [removeNote]);
+
+  // The arrow keys nudge the selection: a step sideways, a semitone up or down,
+  // and with Shift four steps or an octave. The whole selection moves by the
+  // same amount (the store clamps the DELTA), so a chord keeps its shape.
+  //
+  // CAPTURE phase with stopImmediatePropagation, for the same reason the
+  // clipboard keys below use it: `WaveformEditor` binds the arrows on `window`
+  // in the bubble phase with no `ownsKey` gate, so one press would nudge a
+  // roll note AND a timeline clip. Once the roll owns the key it swallows the
+  // arrow whether or not it had anything to move. The bend and velocity lanes
+  // are excluded: both take the arrows for their own points and bars, and a
+  // window capture listener runs before their element handlers can stop it.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight' && e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+      const t = e.target as HTMLElement | null;
+      if (t?.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"]')) return;
+      if (t?.closest('[data-bend-lane], [data-velocity-lane]')) return;
+      if (inPortalledOverlay(e.target, rootRef.current)) return;
+      if (!ownsKey('piano-roll')) return;
+      if (rootRef.current?.offsetParent === null) return; // roll hidden (ARP face showing)
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      const s = usePianoRollStore.getState();
+      if (s.selectedIds.size === 0) return;
+      const coarse = e.shiftKey;
+      if (e.key === 'ArrowLeft') s.nudgeSelected(coarse ? -4 : -1, 0);
+      else if (e.key === 'ArrowRight') s.nudgeSelected(coarse ? 4 : 1, 0);
+      else if (e.key === 'ArrowUp') s.nudgeSelected(0, coarse ? 12 : 1);
+      else s.nudgeSelected(0, coarse ? -12 : -1);
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, []);
 
   // Undo / redo and the note clipboard. Ctrl/Cmd+Z = undo, Ctrl/Cmd+Shift+Z or
   // Ctrl+Y = redo, Ctrl/Cmd+C / X / V / D = copy / cut / paste / duplicate.
@@ -1323,9 +1820,12 @@ export const PianoRoll: React.FC<{
     const onKey = (e: KeyboardEvent) => {
       if (!(e.ctrlKey || e.metaKey)) return;
       const k = e.key.toLowerCase();
-      if (k !== 'z' && k !== 'y' && k !== 'c' && k !== 'x' && k !== 'v' && k !== 'd') return;
+      if (k !== 'z' && k !== 'y' && k !== 'a' && k !== 'c' && k !== 'x' && k !== 'v' && k !== 'd') return;
       const t = e.target as HTMLElement | null;
       if (t?.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"]')) return;
+      // A portalled menu, listbox or dialog keeps its own Ctrl/Cmd+A and its
+      // own clipboard keys, even while the pointer rests on the dock.
+      if (inPortalledOverlay(e.target, rootRef.current)) return;
       if (!ownsKey('piano-roll')) return;
       if (rootRef.current?.offsetParent === null) return; // roll hidden (ARP face showing)
       if (k === 'z' || k === 'y') {
@@ -1333,6 +1833,14 @@ export const PianoRoll: React.FC<{
         e.stopImmediatePropagation();
         if (k === 'y' || e.shiftKey) redo();
         else undo();
+        return;
+      }
+      if (k === 'a') {
+        // Select all the roll's notes, not the page's text, and not the EDIT
+        // timeline's clips (its own Ctrl/Cmd+A runs on the bubble phase).
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        usePianoRollStore.getState().selectAll();
         return;
       }
       // The ONE escape from here on: a live text selection, which the browser
@@ -1345,12 +1853,12 @@ export const PianoRoll: React.FC<{
       e.preventDefault();
       e.stopImmediatePropagation();
       const s = usePianoRollStore.getState();
-      // The roll selects one note at a time (`selectedNoteId`); the helpers take
-      // a set of ids, so a marquee selection later needs no change here.
-      const selectedIds = s.selectedNoteId ? [s.selectedNoteId] : [];
+      // The whole selection — the helpers have always taken a set of ids, so the
+      // marquee needed no change here beyond handing them the real one.
+      const picked = s.selectedIds;
       const range = { lowestNote: s.lowestNote, highestNote: s.highestNote, totalSteps: s.totalSteps };
       if (k === 'c' || k === 'x') {
-        const payload = copyNotes(s.notes, selectedIds);
+        const payload = copyNotes(s.notes, picked);
         if (!payload) return; // nothing selected: the clipboard keeps what it had
         noteClipboard = payload;
         if (k === 'x') {
@@ -1361,12 +1869,13 @@ export const PianoRoll: React.FC<{
       }
       const added = k === 'v'
         ? (noteClipboard ? pasteNotes(noteClipboard, s.isPlaying ? Math.floor(s.currentStep) : insertStepRef.current, range) : [])
-        : duplicateNotes(s.notes, selectedIds, range);
+        : duplicateNotes(s.notes, picked, range);
       if (added.length === 0) return;
       s.replaceAll([...s.notes, ...added]);
-      // The earliest pasted note takes the selection, so a repeated Ctrl/Cmd+D
-      // marches forward instead of stacking copies on the original.
-      s.setSelectedNote(added[0].id);
+      // The block that just landed IS the selection, so a repeated Ctrl/Cmd+D
+      // marches forward instead of stacking copies on the original, and the
+      // earliest of them is the primary.
+      s.setSelection(added.map((n) => n.id), added[0].id);
       // A paste moves the insertion point PAST the block it just wrote, so a
       // second Ctrl/Cmd+V lands after it instead of stacking an identical set in
       // place. A duplicate leaves the point on the copy it selected.
@@ -1446,6 +1955,8 @@ export const PianoRoll: React.FC<{
           className="flex-1 overflow-auto"
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
+          onPointerCancel={cancelMarquee}
+          onLostPointerCapture={cancelMarquee}
           onScroll={handleGridScroll}
           onWheel={handleGridWheel}
         >
@@ -1454,8 +1965,7 @@ export const PianoRoll: React.FC<{
 
           <div
             ref={gridRef}
-            // A press that starts off every note clears a note press that ended without a click.
-            onPointerDown={() => { pressRef.current = null; }}
+            onPointerDown={onGridPointerDown}
             onClick={handleGridClick}
             className="relative cursor-crosshair"
             style={{ width: gridWidth, height: gridHeight }}
@@ -1541,7 +2051,7 @@ export const PianoRoll: React.FC<{
               // The form's minimum drawn width grows the note to the right only; its start and stored length stay.
               const width = Math.max(lane.form.minPx, n.length * stepPx - 1);
               const top = row * NOTE_HEIGHT;
-              const selected = n.id === selectedNoteId;
+              const selected = selectedIds.has(n.id);
               return (
                 <div
                   key={n.id}
@@ -1550,11 +2060,22 @@ export const PianoRoll: React.FC<{
                     e.stopPropagation();
                     const press = pressRef.current;
                     pressRef.current = null;
+                    if (suppressClickRef.current) {
+                      suppressClickRef.current = false;
+                      return;
+                    }
+                    if (modifierSelect(e, n.id)) return;
                     if (press?.id === n.id && press.wasSelected) removeNote(n.id);
                     else setSelectedNote(n.id);
                   }}
                   onPointerDown={(e) => onNotePointerDown(e, n, 'body')}
-                  onContextMenu={(e) => { e.stopPropagation(); setSelectedNote(n.id); noteMenu.open(e, n); }}
+                  onContextMenu={(e) => {
+                    e.stopPropagation();
+                    // Right-click acts on this note, so it takes the selection
+                    // unless it is already part of one.
+                    if (!selectedIds.has(n.id)) setSelectedNote(n.id);
+                    noteMenu.open(e, n);
+                  }}
                   className={`absolute rounded-sm border z-10 transition-[filter] ${lane.form.fill} ${selected ? 'border-white brightness-125' : `${lane.form.edge} hover:brightness-110`}`}
                   style={{ ...lane.form.style, left, width, top: top + 1, height: NOTE_HEIGHT - 2 }}
                   title={`${noteLabel(n.note)} · step ${n.step + 1} · ${n.length} step${n.length === 1 ? '' : 's'}${lanes.length > 1 ? ` · lane ${lane.name}` : ''}`}
@@ -1566,11 +2087,22 @@ export const PianoRoll: React.FC<{
                 </div>
               );
             })}
+            {/* The marquee itself: drawn above the notes, never in the way of
+                the pointer, and gone the moment the drag ends. */}
+            {marquee && (
+              <div
+                aria-hidden="true"
+                className="absolute z-20 border border-[rgb(var(--et-ink)/0.8)] bg-[rgb(var(--et-accent)/0.14)] pointer-events-none"
+                style={marqueeBox(marquee, geo)}
+              />
+            )}
           </div>
 
-          {/* The bend lane, inside the grid's scroll box so it keeps the
-              grid's x scale and scrolls with it: a point stays under the note
-              it bends at every zoom and every scroll position. */}
+          {/* The velocity and bend lanes, inside the grid's scroll box so they
+              keep the grid's x scale and scroll with it: a bar stays under its
+              note, and a point under the note it bends, at every zoom and every
+              scroll position. */}
+          <VelocityLane stepPx={stepPx} totalSteps={totalSteps} win={view} />
           {showBend && <BendLane stepPx={stepPx} totalSteps={totalSteps} />}
         </div>
       </div>

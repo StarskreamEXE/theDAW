@@ -29,15 +29,20 @@ import {
 } from '../lib/recordingEngine.ts';
 import { micConstraints } from '../lib/recordingEngine.ts';
 import { useEditorStore } from './editorStore.ts';
+import { useFeatureToggleStore } from './featureToggleStore.ts';
+import { useIoDevicesStore } from './ioDevicesStore.ts';
 import { usePlayerStore } from './playerStore.ts';
 import {
   LEVEL_WRITE_MS,
   PUNCH_CHOICES,
+  ROUND_TRIP_MAX_MS,
   currentPassPunchWindow,
   initRecording,
+  latencyCompSec,
   musicalConstraints,
   punchWindow,
   punchWindowFrom,
+  recordingDeviceKey,
   resetRecording,
   setRecordingDeps,
   mergeRecordingPrefs,
@@ -73,6 +78,8 @@ setRecordingPrefsStorage({
 interface FakeEngine extends RecordingEngine {
   /** Every call, in order, for the ordering assertions. */
   readonly calls: string[];
+  /** The source a track was armed WITH — which device the take comes from. */
+  armedSource(trackId: string): RecordingSource | undefined;
   /** Resolve / reject the `start()` currently in flight. */
   resolveStart(): void;
   rejectStart(err: unknown): void;
@@ -103,6 +110,9 @@ function fakeEngine(events: string[]): FakeEngine {
     },
     armed() {
       return [...armedMap.keys()];
+    },
+    armedSource(trackId) {
+      return armedMap.get(trackId);
     },
     start() {
       calls.push('start');
@@ -227,9 +237,10 @@ function harness(trackIds: readonly string[] = []): Harness {
     loopEnd: 0,
   });
   usePlayerStore.setState({ isPlaying: false });
-  // `punch` is a PERSISTED preference, so `resetRecording()` deliberately
-  // leaves it alone — the harness is what returns it to the default.
-  useRecordingPrefs.setState({ punch: 'off' });
+  // `punch` and `roundTrip` are PERSISTED preferences, so `resetRecording()`
+  // deliberately leaves them alone — the harness is what returns them to the
+  // defaults. An uncalibrated device is what every other block assumes.
+  useRecordingPrefs.setState({ punch: 'off', roundTrip: {}, takeMode: 'takes' });
 
   const events: string[] = [];
   const engine = fakeEngine(events);
@@ -849,6 +860,11 @@ function setLoop(start: number, end: number): void {
   es().updateTrack('trk-a', { armed: true });
   es().clearLoop();
   rp().setPunch('in-out');
+  // Two presses over the same stretch, so this block says outright that it is
+  // about the NOTICE and not about placement: in the default `takes` mode the
+  // second press lands on the first press's clip as a take. That rule has a
+  // section of its own at the end of this file.
+  rp().setTakeMode('clips');
 
   await pass(h, [fakeTake('trk-a', 2, 12)]);
 
@@ -902,6 +918,11 @@ function setLoop(start: number, end: number): void {
   es().updateTrack('trk-a', { armed: true });
   setLoop(4, 10);
   rp().setPunch('in-out');
+  // `clips` mode: this block is about the UNDO STEP a punched pass leaves, and
+  // two presses into one window are what pins it. The default `takes` mode
+  // would fold the second press into the first clip — pinned at the end of
+  // this file, undo step included.
+  rp().setTakeMode('clips');
   const undoDepth = () => (useEditorStore.getState() as unknown as { _undo: unknown[] })._undo.length;
 
   const before = undoDepth();
@@ -1264,6 +1285,190 @@ function setLoop(start: number, end: number): void {
   rp().setPunch('off');
 }
 
+/* ------------------ the round trip reaches take placement ------------------ */
+
+// The whole point of #69: a measured loop, persisted per device, has to come
+// back out at the one place a take becomes a clip. `takeClipPlacement` is not
+// spied on — the CLIP is checked instead, which proves the number went through
+// the real arithmetic rather than merely reaching a call.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+
+  // In node there is no device list, so `resolveGlobal('audio_input')` reports
+  // the OS default — the `''` key, which is the one an uncalibrated install
+  // uses too. Saving under it is what a calibrator run does.
+  assert.equal(recordingDeviceKey(), '', 'with nothing enumerated, the key is the OS default');
+  assert.equal(latencyCompSec(), 0, 'and an unmeasured device compensates by nothing');
+
+  rp().setRoundTrip(recordingDeviceKey(), { ms: 250, measuredAt: '2026-09-17T10:00:00.000Z', confidence: 0.9 });
+  assert.equal(latencyCompSec(), 0.25, 'the saved ms is read back as seconds');
+
+  rs().recordPress();
+  await flush();
+  h.engine.resolveStart();
+  await flush();
+  h.engine.setTakes([fakeTake('trk-a', 4, 6.5)]);
+  rs().stopRecording();
+  await flush();
+
+  const clip = es().clips[0];
+  assert.equal(clip.startSec, 3.75, 'the clip slides EARLIER by the measured round trip');
+  assert.equal(clip.durationSec, 2.5, 'the take keeps its length — only the anchor moves');
+  assert.equal(clip.offsetIntoSource, 0, 'and nothing is trimmed off its front');
+}
+
+// A comp larger than the anchor clamps at 0 rather than going negative: the
+// timeline has no time before zero. (`takeClipPlacement`'s own rule — this pins
+// that the store's hand-off does not defeat it.)
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  rp().setRoundTrip('', { ms: 900, measuredAt: '2026-09-17T10:00:00.000Z', confidence: 0.8 });
+
+  rs().recordPress();
+  await flush();
+  h.engine.resolveStart();
+  await flush();
+  h.engine.setTakes([fakeTake('trk-a', 0.2, 1.2)]);
+  rs().stopRecording();
+  await flush();
+
+  assert.equal(es().clips[0].startSec, 0, 'clamped at the start of the timeline');
+  assert.equal(es().clips[0].durationSec, 1, 'and the take is not trimmed to pay for it');
+}
+
+// Device PARITY: the take is captured on the same device the calibration was
+// measured on. Without this the engine opened the OS default while the
+// compensation came from whatever the user had chosen — one microphone's
+// latency applied to another's recording.
+{
+  const h = harness(['trk-a']);
+  // A resolved global input, as `ioDevicesStore` would report after the user
+  // picks one in Settings.
+  useFeatureToggleStore.setState((s) => ({
+    settings: { ...s.settings, io: { ...s.settings.io, audio_input: { id: 'usb-mic-3', label: 'Scarlett 2i2' } } },
+  }));
+  useIoDevicesStore.setState({ audioIn: [{ id: 'usb-mic-3', label: 'Scarlett 2i2' }], labelsKnown: true });
+  assert.equal(recordingDeviceKey(), 'usb-mic-3', 'the key follows the resolved global input');
+
+  es().updateTrack('trk-a', { armed: true });
+  assert.deepEqual(
+    h.engine.armedSource('trk-a'),
+    { kind: 'mic', deviceId: 'usb-mic-3' },
+    'the ARM carries that device, so the take is recorded on it',
+  );
+
+  // And the compensation is read from that same device's entry.
+  rp().setRoundTrip('usb-mic-3', { ms: 40, measuredAt: '2026-09-17T10:00:00.000Z', confidence: 0.95 });
+  rp().setRoundTrip('', { ms: 400, measuredAt: '2026-09-17T10:00:00.000Z', confidence: 0.95 });
+  assert.equal(latencyCompSec(), 0.04, 'the chosen device, not the OS default entry');
+
+  rs().recordPress();
+  await flush();
+  h.engine.resolveStart();
+  await flush();
+  h.engine.setTakes([fakeTake('trk-a', 4, 6.5)]);
+  rs().stopRecording();
+  await flush();
+  assert.equal(es().clips[0].startSec, 3.96, 'the clip is placed by the device it was recorded on');
+
+  // Back to the OS default for every block after this one.
+  useFeatureToggleStore.setState((s) => ({
+    settings: { ...s.settings, io: { ...s.settings.io, audio_input: { id: '', label: '' } } },
+  }));
+  useIoDevicesStore.setState({ audioIn: [], labelsKnown: false });
+  assert.equal(recordingDeviceKey(), '');
+}
+
+// With nothing chosen the arm still says "the default", exactly as before —
+// `micConstraints` drops an empty device id, so the open is byte-for-byte the
+// call every pass made before device parity existed.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  assert.deepEqual(h.engine.armedSource('trk-a'), { kind: 'mic', deviceId: '' });
+  const audio = musicalConstraints(micConstraints('')).audio as Record<string, unknown>;
+  assert.equal('deviceId' in audio, false, 'an empty id names no device at all');
+}
+
+// A measurement for ANOTHER device does not compensate this one.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  rp().setRoundTrip('some-other-mic', { ms: 250, measuredAt: '2026-09-17T10:00:00.000Z', confidence: 1 });
+  assert.equal(latencyCompSec(), 0, 'the map is keyed by device, and this is not that device');
+
+  rs().recordPress();
+  await flush();
+  h.engine.resolveStart();
+  await flush();
+  h.engine.setTakes([fakeTake('trk-a', 4, 6.5)]);
+  rs().stopRecording();
+  await flush();
+  assert.equal(es().clips[0].startSec, 4, 'so the take lands on its own anchor');
+}
+
+// Nothing unusable is ever stored, so nothing unusable can reach placement.
+{
+  harness([]);
+  const key = 'validation-probe';
+  for (const bad of [Number.NaN, Infinity, -1, ROUND_TRIP_MAX_MS + 1]) {
+    rp().setRoundTrip(key, { ms: bad, measuredAt: 'now', confidence: 1 });
+    assert.equal(rp().roundTrip[key], undefined, `ms ${bad} is not a measurement`);
+    assert.equal(latencyCompSec(key), 0);
+  }
+  // A good one goes in, and clearing takes it out again.
+  rp().setRoundTrip(key, { ms: 12.5, measuredAt: 'now', confidence: 2 });
+  assert.equal(rp().roundTrip[key].ms, 12.5);
+  assert.equal(rp().roundTrip[key].confidence, 1, 'confidence is clamped into 0..1');
+  // A saved entry REPLACES a worse one — a re-run is the fix for a bad reading.
+  rp().setRoundTrip(key, { ms: 30, measuredAt: 'later', confidence: 0.6 });
+  assert.equal(rp().roundTrip[key].ms, 30);
+  rp().clearRoundTrip(key);
+  assert.equal(rp().roundTrip[key], undefined);
+  rp().clearRoundTrip(key); // idempotent
+  assert.equal(rp().roundTrip[key], undefined);
+}
+
+// Hydrating the map: only usable entries survive, and a corrupt one never
+// reaches `latencyCompSec`.
+{
+  const base: Parameters<typeof mergeRecordingPrefs>[1] = {
+    punch: 'off',
+    roundTrip: { stale: { ms: 5, measuredAt: 'x', confidence: 1 } },
+    takeMode: 'takes',
+    setPunch: rp().setPunch,
+    setTakeMode: rp().setTakeMode,
+    setRoundTrip: rp().setRoundTrip,
+    clearRoundTrip: rp().clearRoundTrip,
+  };
+  const merged = mergeRecordingPrefs(
+    {
+      punch: 'in',
+      roundTrip: {
+        good: { ms: 21.5, measuredAt: '2026-01-01T00:00:00.000Z', confidence: 0.77 },
+        nan: { ms: Number.NaN, measuredAt: 'x', confidence: 1 },
+        negative: { ms: -4, measuredAt: 'x', confidence: 1 },
+        absurd: { ms: 60_000, measuredAt: 'x', confidence: 1 },
+        notAnObject: 7,
+        noMs: { measuredAt: 'x', confidence: 1 },
+      },
+    },
+    base,
+  );
+  assert.deepEqual(Object.keys(merged.roundTrip), ['good'], 'only the usable entry hydrates');
+  assert.equal(merged.roundTrip.good.ms, 21.5);
+  assert.equal(merged.roundTrip.good.confidence, 0.77);
+  assert.equal(merged.punch, 'in', 'the punch mode still hydrates alongside it');
+  // Nothing persisted at all is an empty map, not undefined — `placeTakes`
+  // indexes it on every pass.
+  assert.deepEqual(mergeRecordingPrefs(null, base).roundTrip, {});
+  assert.deepEqual(mergeRecordingPrefs({ roundTrip: [] }, base).roundTrip, {}, 'an array is not a map');
+  assert.deepEqual(mergeRecordingPrefs({ roundTrip: 'nope' }, base).roundTrip, {});
+  assert.equal(typeof mergeRecordingPrefs(null, base).setRoundTrip, 'function', 'hydrating keeps the actions');
+}
+
 // A persisted value this build does not know hydrates to `off` — never to a
 // window nothing can compute.
 // `mergeRecordingPrefs` IS the hydrate — it is the store's `merge` option — so
@@ -1271,7 +1476,15 @@ function setLoop(start: number, end: number): void {
 // (only setState / getState / getInitialState / subscribe), so its own hydrate
 // cannot be re-run from out here.
 {
-  const base = { punch: 'in-out' as const, setPunch: rp().setPunch };
+  const base: Parameters<typeof mergeRecordingPrefs>[1] = {
+    punch: 'in-out',
+    roundTrip: {},
+    takeMode: 'takes',
+    setPunch: rp().setPunch,
+    setTakeMode: rp().setTakeMode,
+    setRoundTrip: rp().setRoundTrip,
+    clearRoundTrip: rp().clearRoundTrip,
+  };
   assert.equal(mergeRecordingPrefs({ punch: 'sideways' }, base).punch, 'off', 'an unknown persisted mode is not a mode');
   assert.equal(mergeRecordingPrefs({ punch: 42 }, base).punch, 'off');
   assert.equal(mergeRecordingPrefs(null, base).punch, 'off', 'nothing persisted is off, not undefined');
@@ -1280,6 +1493,370 @@ function setLoop(start: number, end: number): void {
   const good = mergeRecordingPrefs({ punch: 'out' }, base);
   assert.equal(good.punch, 'out');
   assert.equal(typeof good.setPunch, 'function', 'hydrating does not drop the actions');
+
+  // The take mode hydrates the same way, and defaults to `takes` — a build that
+  // has never seen the preference records takes, not stacked clips.
+  assert.equal(mergeRecordingPrefs({}, base).takeMode, 'takes');
+  assert.equal(mergeRecordingPrefs(null, base).takeMode, 'takes');
+  assert.equal(mergeRecordingPrefs({ takeMode: 'clips' }, base).takeMode, 'clips');
+  assert.equal(mergeRecordingPrefs({ takeMode: 'stack' }, base).takeMode, 'takes', 'an unknown mode is not a mode');
+  assert.equal(mergeRecordingPrefs({ takeMode: 7 }, base).takeMode, 'takes');
+}
+
+/* ------------- a second pass over a clip is a TAKE of it (#45) -------------- */
+
+// The subject: `placeTakes` matching a pass onto the clip it lands on, through
+// `lib/takePlacement`. The RULE itself is pinned in that file's own suite — what
+// is pinned here is the store's application of it: which clip a pass reaches,
+// what the clip looks like afterwards, and that a pass is still one undo step.
+
+/** The clip a pass produced, with the takes fields read out. */
+const takeShape = (clipId: string) => {
+  const c = es().clips.find((x) => x.id === clipId)!;
+  return {
+    labels: (c.takes ?? []).map((t) => t.label),
+    active: c.activeTakeIndex,
+    startSec: c.startSec,
+    durationSec: c.durationSec,
+    blob: c.audioBlob,
+  };
+};
+
+// First pass over an empty bar: a clip of its own, with no takes on it. Second
+// pass over the same bar: appended to that clip, active, and called `Take 2`.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  assert.equal(rp().takeMode, 'takes', 'takes is the default mode');
+
+  const first = fakeTake('trk-a', 4, 8);
+  await pass(h, [first]);
+  assert.equal(es().clips.length, 1, 'the first pass over an empty bar is a clip');
+  const clipId = es().clips[0].id;
+  assert.equal(es().clips[0].takes, undefined, 'and carries no takes until a second pass arrives');
+  assert.equal(es().clips[0].label, 'Take 1');
+
+  // Pressed from the same playhead, so the anchors agree exactly — the common
+  // case, and the one with nothing to rebase.
+  const second = fakeTake('trk-a', 4, 8.5);
+  await pass(h, [second]);
+  assert.equal(es().clips.length, 1, 'the second pass over it is a TAKE, not a second clip');
+  const after = takeShape(clipId);
+  assert.deepEqual(after.labels, ['Take 1', 'Take 2'], 'the clip\'s own media became take 1');
+  assert.equal(after.active, 1, 'and the new pass is what the clip plays');
+  assert.equal(after.blob, second.blob, 'the clip mirrors the active take\'s bytes');
+  assert.equal(after.startSec, 4, 'a take does not move the clip');
+  assert.equal(after.durationSec, 4, 'nor re-length it');
+  assert.equal(es().clips[0].offsetIntoSource, 0, 'and reads the take from its head when the anchors agree');
+
+  // A pass that started EARLIER than the clip: the clip keeps its own start, so
+  // the take is read from half a second in. Reading it from its own head would
+  // play the clip half a second early and run out half a second short.
+  const third = fakeTake('trk-a', 3.5, 9);
+  await pass(h, [third]);
+  assert.deepEqual(takeShape(clipId).labels, ['Take 1', 'Take 2', 'Take 3'], 'the label counts THIS clip\'s takes');
+  assert.equal(takeShape(clipId).active, 2);
+
+  // The take carries the same field set a clip gets: it IS its source, read
+  // from the moment the clip begins.
+  const t = es().clips[0].takes![2];
+  assert.equal(t.sourceDuration, 5.5, 'the take keeps its own recorded length');
+  assert.equal(t.offsetIntoSource, 0.5, 'rebased onto the clip\'s head: 4 s clip, 3.5 s take');
+  assert.equal(t.mimeType, 'audio/webm');
+  assert.equal(t.id, third.meta.id, 'and the engine\'s take id is the take\'s id');
+  // The mirror is what every path that knows nothing about takes reads.
+  const mirrored = es().clips[0];
+  assert.equal(mirrored.offsetIntoSource, 0.5, 'the clip plays the take from the right second');
+  assert.equal(mirrored.sourceDuration, 5.5);
+  assert.equal(mirrored.startSec + mirrored.durationSec, 8, 'over the clip\'s own 4 s, ending where it always did');
+}
+
+// THE OTHER DIRECTION: a pass that starts AFTER the clip does. There are no
+// bytes from before the recording started, so it cannot be read as this clip —
+// it lands as its own clip rather than playing the clip's head from nowhere.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  await pass(h, [fakeTake('trk-a', 4, 12)]);       // the clip: 4 → 12
+  const clipId = es().clips[0].id;
+
+  await pass(h, [fakeTake('trk-a', 6, 12)]);       // a pass starting two bars in
+  assert.equal(es().clips.length, 2, 'a take that cannot cover the clip\'s head is a clip of its own');
+  assert.equal(es().clips.find((c) => c.id === clipId)!.takes, undefined, 'and the clip is untouched');
+
+  // Nor does a pass that stops short of the clip's end become a take: the tail
+  // would fall silent the moment it was activated.
+  await pass(h, [fakeTake('trk-a', 4, 9)]);
+  assert.equal(es().clips.length, 3, 'a fragment is not a take');
+  assert.equal(es().clips.find((c) => c.id === clipId)!.takes, undefined);
+}
+
+// The peaks decoded after the placement still land — on the clip, which is
+// mirroring the take that was just appended.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  await pass(h, [fakeTake('trk-a', 0, 4)]);
+  await pass(h, [fakeTake('trk-a', 0, 4)]);
+  await flush();
+  assert.equal(es().clips.length, 1);
+  assert.equal(es().clips[0].peaks?.length, 2, 'the decode reaches the clip it was appended to');
+}
+
+// A pass that lands nowhere near the clip is a clip of its own — the rule is a
+// match, not a magnet.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  await pass(h, [fakeTake('trk-a', 0, 4)]);
+  await pass(h, [fakeTake('trk-a', 30, 34)]);
+  assert.equal(es().clips.length, 2, 'two passes, two bars, two clips');
+  assert.deepEqual(es().clips.map((c) => c.label), ['Take 1', 'Take 2'], 'and the session numbering still numbers them');
+}
+
+// `clips` mode is the old behaviour, exactly: every pass is its own clip.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  rp().setTakeMode('clips');
+
+  await pass(h, [fakeTake('trk-a', 4, 8)]);
+  await pass(h, [fakeTake('trk-a', 4, 8)]);
+  assert.equal(es().clips.length, 2, 'clips mode stacks, as every pass did before takes existed');
+  assert.equal(es().clips[0].takes, undefined);
+  assert.equal(es().clips[1].takes, undefined);
+
+  rp().setTakeMode('sideways' as never);
+  assert.equal(rp().takeMode, 'takes', 'an unknown mode falls back to the default');
+}
+
+// THE PUNCH CROP RUNS FIRST. The raw take spans both bars and would match the
+// clip at bar 20 on its own; cropped to the window it does not come near it, so
+// it lands as its own clip. Matching the uncropped span would have buried a
+// punched pass inside a clip it never reached.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  rp().setTakeMode('clips');
+  await pass(h, [fakeTake('trk-a', 20, 24)]);   // the clip at bar 20
+  assert.equal(es().clips.length, 1);
+  rp().setTakeMode('takes');
+
+  setLoop(0, 8);
+  rp().setPunch('in-out');
+  await pass(h, [fakeTake('trk-a', 2, 30)]);    // raw: 2 → 30; cropped: 2 → 8
+
+  assert.equal(es().clips.length, 2, 'the cropped span is what is matched');
+  const fresh = es().clips.find((c) => c.startSec === 2)!;
+  assert.equal(fresh.durationSec, 6, 'and it is the cropped clip that landed');
+  assert.equal(es().clips.find((c) => c.startSec === 20)!.takes, undefined, 'the far clip was never touched');
+}
+
+// A punched pass that DOES land on the clip is a take of it, cropped span and
+// all — the crop decides the match, then the take carries the crop.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  rp().setTakeMode('clips');
+  await pass(h, [fakeTake('trk-a', 4, 10)]);
+  rp().setTakeMode('takes');
+  const clipId = es().clips[0].id;
+
+  setLoop(4, 10);
+  rp().setPunch('in-out');
+  await pass(h, [fakeTake('trk-a', 2, 12)]);    // cropped to 4 → 10
+
+  assert.equal(es().clips.length, 1, 'the punched pass is a take of the clip it punched into');
+  const t = es().clips[0].takes![1];
+  assert.equal(t.offsetIntoSource, 2, 'the take carries the crop as an offset, keeping its bytes');
+  assert.equal(t.sourceDuration, 10, 'and the whole pass as its source');
+  assert.equal(takeShape(clipId).durationSec, 6, 'the clip itself is untouched');
+}
+
+// A MIDI clip is never a take target: the pass lands beside it.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  const midiId = es().addClipToTrack({
+    trackId: 'trk-a',
+    label: 'Roll',
+    audioBlob: new Blob(['midi'], { type: 'audio/wav' }),
+    mimeType: 'audio/wav',
+    sourceDuration: 8,
+    offsetIntoSource: 0,
+    durationSec: 8,
+    startSec: 0,
+    color: '#000000',
+    sourceKind: 'piano-roll',
+  });
+  // The track has no instrument and its LATEST clip decides — so a pass onto it
+  // is still the mic engine's. (`capturesMidi` would hand the track to the MIDI
+  // capture otherwise, and no mic take would exist to place.)
+  await pass(h, [fakeTake('trk-a', 0, 8)]);
+
+  assert.equal(es().clips.length, 2, 'the audio pass does not become a take of a rendered roll');
+  assert.equal(es().clips.find((c) => c.id === midiId)!.takes, undefined);
+}
+
+// A FROZEN track's clips are one printed stem, and unfreezing replaces it with
+// the originals it was printed from — a take hung off the stem would go with it.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  es().freezeTrack('trk-a', { audioBlob: new Blob(['stem'], { type: 'audio/wav' }), durationSec: 8 });
+  assert.equal(es().clips.length, 1, 'the stem is the track\'s one clip');
+  const stemId = es().clips[0].id;
+
+  await pass(h, [fakeTake('trk-a', 0, 8)]);
+
+  assert.equal(es().clips.length, 2, 'the pass lands beside the stem, not inside it');
+  assert.equal(es().clips.find((c) => c.id === stemId)!.takes, undefined, 'the stem is untouched');
+  // (`unfreezeTrack` replaces every clip on the track with the originals it
+  // printed, so a pass recorded while frozen is dropped either way — that is
+  // the freeze contract and it predates takes. What this pins is that the take
+  // model is not what loses it: the stem never becomes a take list.)
+}
+
+// A COMPED clip does not play its active take — it plays its comp — so an
+// append that only activated would file the pass away inaudibly. The comp's
+// LAST region is retargeted onto the new take, and the user's own boundary
+// stays where they put it.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  await pass(h, [fakeTake('trk-a', 0, 8)]);
+  const clipId = es().clips[0].id;
+  await pass(h, [fakeTake('trk-a', 0, 8)]);        // take 2
+  assert.equal(es().clips[0].takes?.length, 2);
+
+  // A comp of two regions: the head plays the active take, and from 4 s it
+  // plays take 1.
+  es().setCompRegionAt(clipId, 4, 0);
+  const comp = es().clips[0].comp!;
+  assert.equal(comp.length, 2, 'the fixture is a real comp');
+  assert.equal(comp[1].startSec, 4);
+
+  const undoDepth = () => (useEditorStore.getState() as unknown as { _undo: unknown[] })._undo.length;
+  const before = undoDepth();
+  await pass(h, [fakeTake('trk-a', 0, 8)]);        // take 3
+
+  const after = es().clips[0];
+  assert.equal(after.takes?.length, 3, 'the pass is still a take of the clip');
+  assert.equal(after.comp?.length, 2, 'the comp survives, boundary and all');
+  assert.equal(after.comp![1].startSec, 4, 'at the second the user put it');
+  assert.equal(after.comp![1].takeIndex, 2, 'and its last region plays the pass that just landed');
+  // KNOWN GAP (the same one the two-track block below pins): `addTakeToClip`
+  // and `setCompRegionAt` each open an undo step, so a pass onto a COMPED clip
+  // costs two — one undo leaves the take appended and active with the comp
+  // still on the old take. The coalesce seam belongs to `editorStore` (T46H).
+  assert.equal(undoDepth(), before + 2, 'two steps for a pass onto a comped clip — see the gap above');
+}
+
+// A STRETCHED clip reads more source seconds than its timeline span, so a pass
+// that covers its span does not cover what it reads: it lands as its own clip.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  await pass(h, [fakeTake('trk-a', 0, 8)]);
+  const clipId = es().clips[0].id;
+  es().updateClip(clipId, { timeStretchRate: 2 });
+  await pass(h, [fakeTake('trk-a', 0, 8)]);
+  assert.equal(es().clips.length, 2, 'a stretched clip is never a take target');
+  assert.equal(es().clips[0].takes?.length ?? 0, 0, 'and gained no take');
+}
+
+// THE DECODE RACE. The peaks of a pass arrive after the placement, and by then
+// a LATER pass may have appended and activated a take of its own: the write
+// would hang this pass's peaks on that pass's take, and the length repair would
+// re-length a clip it no longer measured.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  await pass(h, [fakeTake('trk-a', 0, 8)]);
+  const clipId = es().clips[0].id;
+  const settled = es().clips[0].peaks;
+  assert.equal(settled?.length, 2, 'the first pass decoded normally');
+
+  // The second pass's decode is held open.
+  let release: ((v: { peaks: Float32Array; duration: number }) => void) | null = null;
+  setRecordingDeps({
+    computePeaks: () => new Promise((res) => { release = res; }),
+  });
+  await pass(h, [fakeTake('trk-a', 0, 8)]);        // take 2, decode pending
+  assert.equal(es().clips[0].takes?.length, 2);
+
+  // A THIRD pass lands and activates its own take while that decode is open.
+  setRecordingDeps({ computePeaks: async () => ({ peaks: new Float32Array([0.9]), duration: 8 }) });
+  await pass(h, [fakeTake('trk-a', 0, 8)]);        // take 3
+  assert.equal(es().clips[0].takes?.length, 3);
+  assert.equal(es().clips[0].activeTakeIndex, 2);
+  const takeThreePeaks = es().clips[0].takes![2].peaks;
+
+  // Now let the second pass's decode finish. It must write nothing.
+  release!({ peaks: new Float32Array([0.1, 0.2, 0.3]), duration: 99 });
+  await flush();
+  await flush();
+  const clip = es().clips.find((c) => c.id === clipId)!;
+  assert.equal(clip.durationSec, 8, 'the stale decode does not re-length the clip');
+  assert.equal(clip.takes![2].peaks, takeThreePeaks, 'nor overwrite the active take\'s peaks');
+  assert.equal(clip.takes!.length, 3);
+}
+
+// ONE UNDO STEP, and it restores the clip as it was before the pass: the takes
+// are gone and the clip is playing its own media again.
+{
+  const h = harness(['trk-a']);
+  es().updateTrack('trk-a', { armed: true });
+  const undoDepth = () => (useEditorStore.getState() as unknown as { _undo: unknown[] })._undo.length;
+
+  const first = fakeTake('trk-a', 4, 8);
+  await pass(h, [first]);
+  const clipId = es().clips[0].id;
+  const beforeSecondPass = undoDepth();
+
+  await pass(h, [fakeTake('trk-a', 4, 8)]);
+  assert.equal(undoDepth(), beforeSecondPass + 1, 'a pass that becomes a take is one undo step');
+  assert.equal(es().clips[0].takes?.length, 2);
+
+  es().undo();
+  const back = es().clips.find((c) => c.id === clipId)!;
+  assert.equal(es().clips.length, 1, 'the clip is still there — it was never replaced');
+  assert.equal(back.takes, undefined, 'and the take the pass added is gone');
+  assert.equal(back.audioBlob, first.blob, 'the clip plays its own media again');
+  assert.equal(back.startSec, 4);
+  assert.equal(back.durationSec, 4);
+  assert.equal(es().tracks.find((t) => t.id === 'trk-a')?.armed, true, 'and the arm is left alone');
+}
+
+// TWO tracks, one press, both landing on clips that are already there.
+//
+// KNOWN GAP, pinned here rather than left to be discovered: `addTakeToClip`
+// opens an undo step of its own (`editorStore.ts`, the takes actions all do),
+// so a pass that appends to TWO clips leaves two steps where a pass that lands
+// two new CLIPS leaves one. Every clip is still restored — it just takes one
+// undo per appended take. The fix is one line in `editorStore.addTakeToClip`:
+// the `opts?.coalesce ? coalesceWithOpenStep(key) : beginUndoStep(key)` seam
+// `moveCompBoundary` already has, called with `coalesce` from here. That file
+// belongs to T46D, so this suite pins what the store does today.
+{
+  const h = harness(['trk-a', 'trk-b']);
+  es().updateTrack('trk-a', { armed: true });
+  es().updateTrack('trk-b', { armed: true });
+  const undoDepth = () => (useEditorStore.getState() as unknown as { _undo: unknown[] })._undo.length;
+
+  await pass(h, [fakeTake('trk-a', 4, 8), fakeTake('trk-b', 4, 8)]);
+  assert.equal(es().clips.length, 2, 'the first press is two clips');
+  const before = undoDepth();
+
+  await pass(h, [fakeTake('trk-a', 4, 8), fakeTake('trk-b', 4, 8)]);
+  assert.equal(es().clips.length, 2, 'the second press adds no clips');
+  assert.deepEqual(es().clips.map((c) => c.takes?.length), [2, 2], 'a take on each');
+  assert.equal(undoDepth(), before + 2, 'one step per appended take — see the gap above');
+
+  es().undo();
+  es().undo();
+  assert.deepEqual(es().clips.map((c) => c.takes), [undefined, undefined], 'and undo restores every clip');
+  assert.equal(es().clips.length, 2, 'without losing the clips they were appended to');
 }
 
 resetRecording();

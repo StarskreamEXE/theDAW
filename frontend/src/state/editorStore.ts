@@ -4,6 +4,15 @@ import type { PianoNote } from './pianoRollStore';
 import type { MeterSegment, PolyLane } from '../lib/meterMap';
 import type { LaneBend } from '../lib/pitchBend';
 import { clampClipFades, type FadeCurve } from '../lib/clipFade';
+import {
+  compDigest,
+  moveBoundary as compMoveBoundary,
+  normalizeComp,
+  setRegionAt as compSetRegionAt,
+  splitCompAt,
+  type ClipTake,
+  type CompRegion,
+} from '../lib/clipComp';
 import { crossfadeRegions } from '../lib/crossfade';
 import { MIN_CLIP_SEC } from '../lib/clipDragMath';
 import type { WarpMarker } from '../lib/audioWarp';
@@ -21,13 +30,34 @@ import {
   ensureTrackNode,
   removeNode as graphRemoveNode,
   removeSend as graphRemoveSend,
+  removeSidechain as graphRemoveSidechain,
   setOutput as graphSetOutput,
   setSendGain as graphSetSendGain,
+  setSidechain as graphSetSidechain,
+  sidechainsInto,
   type RoutingGraph,
   type RoutingRefusal,
 } from './routingGraph';
 
+/**
+ * Which strip's rack an effect entry sits on, for the sidechain actions.
+ *
+ * Tracks and buses share ONE id namespace in the routing graph (see
+ * `removeBus`), so both arms carry the routing node id in the same field — the
+ * discriminant is there to make a call site say which kind of strip it means
+ * rather than to change what is looked up. The master is deliberately absent:
+ * the wiring pass keys track and bus racks, and the master rack is downstream of
+ * the sum, where "duck this from that track" has no meaning the mixer can honour.
+ */
+export type FxNodeScope =
+  | { kind: 'track'; id: string }
+  | { kind: 'bus'; id: string };
+
 export type { AutomationMode } from '../lib/automationModes';
+/** Re-exported so a consumer of `AudioClip.takes` / `AudioClip.comp` needs one
+ *  import, not two. The model itself lives in `lib/clipComp`, which imports
+ *  nothing from `state/`. */
+export type { ClipTake, CompRegion } from '../lib/clipComp';
 
 export type ToolMode = 'move' | 'cut' | 'split';
 
@@ -169,6 +199,27 @@ export interface AudioClip {
   /** Warp anchors tying moments of the source to moments of the clip, in
    *  clip-relative seconds. Read through lib/audioWarp. */
   warpMarkers?: WarpMarker[];
+  /** Alternate recordings of this clip — a second pass over the same bars, a
+   *  third, a fourth. Takes hang off the CLIP rather than a parallel lane
+   *  because our clips already carry their own bytes.
+   *
+   *  THE INVARIANT, which every field above depends on: `audioBlob`,
+   *  `mimeType`, `sourceDuration`, `offsetIntoSource` and `peaks` ALWAYS
+   *  mirror `takes[activeTakeIndex ?? 0]`. Switching the active take copies
+   *  those five fields across, so every existing path — decode, peaks,
+   *  schedule, live playback, every offline bounce, export — keeps working on
+   *  a clip with takes without knowing they exist. */
+  takes?: ClipTake[];
+  /** Which take plays across which stretch of the clip, as ordered
+   *  clip-relative boundaries (lib/clipComp). Absent, empty, or with fewer
+   *  than two takes to choose between, the clip behaves EXACTLY as it always
+   *  has: one region names one take, and the clip's own `audioBlob` — the
+   *  active take, per the invariant above — is what plays. */
+  comp?: CompRegion[];
+  /** Index into `takes` of the take the five mirrored fields currently hold.
+   *  Undefined = 0, which is what a clip recorded before takes existed reads
+   *  as (it has no `takes` either, so nothing resolves against it). */
+  activeTakeIndex?: number;
 }
 
 export interface EditorTrack {
@@ -298,6 +349,44 @@ export const clipSourceSpanSec = (clip: Pick<AudioClip, 'durationSec' | 'timeStr
   clip.durationSec * clipStretchRate(clip);
 
 /**
+ * Which TAKES a comped clip can reach, and what each one actually plays.
+ *
+ * `compDigest` covers the boundaries, the crossfades and the active index — the
+ * CHOICE — but a choice is only as stable as the things it chooses between:
+ * replacing a take's audio while every boundary stays put renders differently
+ * and would otherwise sign the same. So every field of a take that reaches the
+ * rendered audio is here: the id catches a take being swapped or reordered,
+ * `sourceDuration` + `offsetIntoSource` catch a trim, and the blob's size
+ * catches new bytes behind an unchanged id and length. The id is percent-encoded
+ * because the separators around it (`:` between signature fields, `|` between
+ * clips, `,` between takes) are all legal characters in an id, and an id
+ * carrying one could otherwise forge a neighbouring field.
+ */
+const takesDigest = (takes: readonly ClipTake[] | undefined): string =>
+  (takes ?? [])
+    .map((t) => `${encodeURIComponent(t.id)}@${t.sourceDuration}+${t.offsetIntoSource}#${t.audioBlob?.size ?? 0}`)
+    .join(',');
+
+/** One clip's contribution to a freeze signature. Shared by the master
+ *  signature and the per-track one, so the two can never drift apart. */
+const clipSignaturePart = (c: AudioClip): string => [
+  c.id, c.trackId, c.startSec, c.durationSec, c.offsetIntoSource,
+  c.fadeInSec ?? 0, c.fadeOutSec ?? 0, c.fadeInCurve ?? 'linear', c.fadeOutCurve ?? 'linear',
+  clipPeakGain(c), c.muted ? 1 : 0,
+  c.timeStretchRate ?? 1, c.stretchMode ?? 'repitch',
+  JSON.stringify(c.warpMarkers ?? []),
+  c.audioBlob.size,
+  // Comping reaches the render exactly twice: through WHICH take plays where
+  // (the digest) and through WHAT those takes hold (the take list).
+  compDigest(c.comp, c.activeTakeIndex),
+  takesDigest(c.takes),
+].join(':');
+
+/** One track strip's contribution. */
+const trackSignaturePart = (t: EditorTrack): string =>
+  `${t.id}:${t.volume}:${t.pan}:${t.mute}:${t.solo}:${JSON.stringify(t.fxChain ?? [])}`;
+
+/**
  * Signature of everything that reaches the rendered master, so a frozen render
  * can be flagged stale after an edit (and an unchanged document re-uses it).
  *
@@ -317,24 +406,31 @@ export const freezeSignature = (doc: {
 }): string => {
   // A clip's muted flag is part of the shape because the bounce drops muted
   // clips, so toggling mute changes the rendered master.
-  const clipPart = doc.clips
-    .map((c) => [
-      c.id, c.trackId, c.startSec, c.durationSec, c.offsetIntoSource,
-      c.fadeInSec ?? 0, c.fadeOutSec ?? 0, c.fadeInCurve ?? 'linear', c.fadeOutCurve ?? 'linear',
-      clipPeakGain(c), c.muted ? 1 : 0,
-      c.timeStretchRate ?? 1, c.stretchMode ?? 'repitch',
-      JSON.stringify(c.warpMarkers ?? []),
-      c.audioBlob.size,
-    ].join(':'))
-    .join('|');
-  const trackPart = doc.tracks
-    .map((t) => `${t.id}:${t.volume}:${t.pan}:${t.mute}:${t.solo}:${JSON.stringify(t.fxChain ?? [])}`)
-    .join('|');
+  const clipPart = doc.clips.map(clipSignaturePart).join('|');
+  const trackPart = doc.tracks.map(trackSignaturePart).join('|');
   return [
     clipPart, trackPart,
     JSON.stringify(doc.masterFxChain), JSON.stringify(doc.masterVstChain), doc.bpm,
   ].join('::');
 };
+
+/**
+ * The same signature scoped to ONE track's printed stem: that track's clips and
+ * that track's strip, and nothing else.
+ *
+ * What drops out is what a track stem does not contain. The master racks are
+ * downstream of every stem, and the tempo reaches no audio clip at all (a clip
+ * carries its own bytes at its own timeline position) — folding either in would
+ * stale every track's stem the moment the master rack or the tempo field moved,
+ * which is exactly the over-invalidation a per-track signature exists to avoid.
+ *
+ * `clips` may be the whole document: the filter is here, so a caller cannot
+ * sign a track against someone else's clips.
+ */
+export const trackFreezeSignature = (track: EditorTrack, clips: readonly AudioClip[]): string => [
+  clips.filter((c) => c.trackId === track.id).map(clipSignaturePart).join('|'),
+  trackSignaturePart(track),
+].join('::');
 
 /** Stable identity for a target, so a control resolves to its one lane. */
 export const automationTargetKey = (target: AutomationTarget): string =>
@@ -529,6 +625,62 @@ interface EditorStoreState {
    *  intact. */
   applyClipRender: (id: string, updates: Partial<AudioClip>, peaks?: Float32Array) => void;
 
+  /* ── Takes + comping (#46) ─────────────────────────────────────────────────
+     Every action below preserves the ONE invariant `AudioClip.takes` documents:
+     the clip's `audioBlob` / `mimeType` / `sourceDuration` / `offsetIntoSource`
+     / `peaks` mirror `takes[activeTakeIndex]`. That is what lets every path
+     that knows nothing about takes — decode, peaks, schedule, every offline
+     bounce, export — keep working on a clip that has them.
+
+     Each one opens an undo step of its own (the `setClipFadeCurve` rule: a
+     discrete edit must be undoable however close it lands to the last one). The
+     single exception is a boundary DRAG, which says `coalesce` and folds into
+     the step its pointer-down opened, exactly like `stretchClipToFit`. */
+
+  /** Append an alternate recording. The clip's CURRENT media becomes `takes[0]`
+   *  first when it has no takes yet, so the invariant holds from the first
+   *  append. `activate` switches to the new take; without it the clip goes on
+   *  playing what it was playing. */
+  addTakeToClip: (clipId: string, take: ClipTake, opts?: { activate?: boolean }) => void;
+  /** Play a different take: re-mirrors the five fields onto the clip. The comp
+   *  is NOT touched — an un-comped clip stays un-comped (this is take
+   *  switching), and a comped one goes on playing the comp. */
+  setActiveTake: (clipId: string, takeIndex: number) => void;
+  /** Click-to-pick: play `takeIndex` from `atSec` to the next boundary. On a
+   *  clip with no comp the head is seeded with the ACTIVE take first, so the
+   *  pick claims the stretch that was clicked and not the whole clip. */
+  setCompRegionAt: (clipId: string, atSec: number, takeIndex: number) => void;
+  /** Drag the boundary that opens `regionIndex` (region 0 is the clip head, not
+   *  a boundary). Pass `{ coalesce: true }` from the drag itself. */
+  moveCompBoundary: (clipId: string, regionIndex: number, toSec: number, opts?: { coalesce?: boolean }) => void;
+  /** Crossfade at `regionIndex`'s leading boundary, in seconds; 0 is a butt
+   *  cut. Region 0 has no boundary to fade across and is refused. */
+  setCompCrossfade: (clipId: string, regionIndex: number, sec: number) => void;
+  /** Back to one take across the whole clip — the active one — keeping every
+   *  take available. */
+  clearComp: (clipId: string) => void;
+  /**
+   * Print the comp: the rendered audio becomes the clip's one source and the
+   * takes are dropped. The clip keeps its own length, gain, fades, stretch ratio
+   * and warp — every one of those is a property of the CLIP, not of the bytes it
+   * reads — so `rendered` is a SOURCE, not a finished clip, and the caller
+   * (T46G, rendering through `renderCore`) owes this action two things:
+   *
+   *  - render the comp with `timeStretchRate` forced to 1, spanning
+   *    `clipSourceSpanSec(clip)` seconds, because the clip goes on reading its
+   *    print through its own ratio. A print of the clip as it SOUNDS is half the
+   *    audio a rate-2 clip needs. A render shorter than that span is refused
+   *    here (logged, nothing written) rather than silently truncating the clip;
+   *  - refuse to flatten at all while `clip.warpMarkers?.length`, because the
+   *    warp map ties moments of the OLD source to moments of the clip and
+   *    nothing re-bases it onto the print.
+   */
+  flattenComp: (clipId: string, rendered: { blob: Blob; mimeType: string; durationSec: number; peaks?: Float32Array }) => void;
+  /** The cheap alternative to flattening: throw the other takes away and keep
+   *  what is already playing. Renders nothing — the active take IS the clip's
+   *  media, per the invariant. */
+  keepActiveTakeOnly: (clipId: string) => void;
+
   setSelected: (id: string | null) => void;
   setTool: (t: ToolMode) => void;
   setZoom: (z: number) => void;
@@ -577,6 +729,30 @@ interface EditorStoreState {
   setSendGain: (fromId: string, toId: string, gain: number, opts?: { coalesce?: boolean }) => void;
   /** Drop a send. A send that does not exist is a no-op. */
   removeSend: (fromId: string, toId: string) => void;
+
+  /**
+   * Key ONE effect entry from another strip's output — the store half of a
+   * sidechain. `sourceNodeId` names the track or bus whose post-pan signal
+   * drives the effect's detector; `null` clears the entry's key.
+   *
+   * SINGLE-SOURCE by construction: every existing key on that entry is removed
+   * before the new one is added, because the surface that calls this is a
+   * one-of picker. (The MODEL allows several sources to key one entry and the
+   * engines sum them — `RackEffectInstance.keyIn` is a gain node for exactly
+   * that reason — so this is a UI rule stated here, not a limit of the graph.)
+   *
+   * Refusable, and refused ATOMICALLY: a `'cycle'` leaves the graph untouched
+   * down to object identity, the previous key included, so a rejected pick
+   * cannot silently unkey what was working. `setTrackOutput` / `addSend`'s
+   * contract, applied to the edge that most needs it — a sidechain that closes
+   * a loop is silence in Web Audio, not feedback.
+   */
+  setEffectSidechain: (
+    scope: FxNodeScope, entryId: string, sourceNodeId: string | null,
+  ) => RoutingRefusal | null;
+  /** Clear every key feeding one effect entry. A entry with no key is a no-op,
+   *  and leaves `routing` at the very same object. */
+  removeEffectSidechain: (scope: FxNodeScope, entryId: string) => void;
 
   // Bus FX racks (mirror the per-track ones)
   addBusEffect: (busId: string, effectId: string) => void;
@@ -720,6 +896,24 @@ interface EditorHistorySnapshot {
 }
 
 /**
+ * Every key feeding effect entry `entryId` on `nodeId`, removed.
+ *
+ * Written through the model's own `removeSidechain` per source rather than by
+ * filtering `edges` here, so the one definition of what a sidechain edge IS
+ * stays in `routingGraph`. Returns the VERY SAME graph object when there was
+ * nothing to remove, which is what lets the callers skip a `set()` — the live
+ * mixer's subscription is gated on the `routing` reference.
+ */
+function clearEntryKeys(g: RoutingGraph, nodeId: string, entryId: string): RoutingGraph {
+  let out = g;
+  for (const e of sidechainsInto(g, nodeId)) {
+    if (e.targetEntryId !== entryId) continue;
+    out = graphRemoveSidechain(out, e.from, nodeId, entryId);
+  }
+  return out;
+}
+
+/**
  * The graph a loaded document should hold: whatever it saved (when it saved
  * one), reconciled against the document it is being loaded WITH.
  *
@@ -802,6 +996,181 @@ export const defaultTracks = (): EditorTrack[] =>
 
 const uid = (): string =>
   typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `id-${Math.random().toString(36).slice(2)}-${Date.now()}`;
+
+/* ── Takes + comping helpers ──────────────────────────────────────────────────
+ * The arithmetic lives in `lib/clipComp` (which imports nothing). What is left
+ * here is the CLIP side of the invariant: copying a take onto the clip, reading
+ * one back off it, and adding/removing the two optional keys without leaving
+ * `undefined` behind — an absent comp and an empty one mean the same thing, and
+ * only one of the two survives a round trip through JSON.
+ */
+
+/** The five fields the clip mirrors from its active take. Switching takes is
+ *  this copy and nothing else. `peaks` is copied even when it is undefined:
+ *  keeping the previous take's peaks would draw the wrong waveform. */
+const mirrorOfTake = (take: ClipTake): Pick<
+  AudioClip, 'audioBlob' | 'mimeType' | 'sourceDuration' | 'offsetIntoSource' | 'peaks'
+> => ({
+  audioBlob: take.audioBlob,
+  mimeType: take.mimeType,
+  sourceDuration: take.sourceDuration,
+  offsetIntoSource: take.offsetIntoSource,
+  peaks: take.peaks,
+});
+
+/** The clip's own media AS a take — what `takes[0]` is seeded with the first
+ *  time a second take lands on a clip that never had any. */
+const takeFromClip = (clip: AudioClip): ClipTake => ({
+  id: uid(),
+  label: clip.label,
+  audioBlob: clip.audioBlob,
+  mimeType: clip.mimeType,
+  sourceDuration: clip.sourceDuration,
+  offsetIntoSource: clip.offsetIntoSource,
+  peaks: clip.peaks,
+});
+
+/** The clip's takes, seeding one from its own media when it has none. */
+const takesOf = (clip: AudioClip): ClipTake[] =>
+  (clip.takes && clip.takes.length > 0 ? clip.takes : [takeFromClip(clip)]);
+
+/** Which take the clip is mirroring. Undefined — and anything that does not
+ *  name a take — reads as 0, which is what a clip recorded before takes existed
+ *  resolves to. */
+const activeIndexOf = (clip: AudioClip, takeCount: number): number => {
+  const i = clip.activeTakeIndex;
+  return Number.isInteger(i) && (i as number) >= 0 && (i as number) < takeCount ? (i as number) : 0;
+};
+
+/** Hold `takes` and point the clip at `takeIndex`, re-mirroring only when the
+ *  active take actually MOVES. A re-copy of the take that is already active
+ *  would drop peaks decoded onto the clip after that take was captured
+ *  (`cachePeaks` writes the clip, not the take), and the mirror is already
+ *  correct in that case anyway. */
+const withActiveTake = (clip: AudioClip, takes: ClipTake[], takeIndex: number): AudioClip => {
+  const switched = clip.takes === undefined || activeIndexOf(clip, takes.length) !== takeIndex;
+  return {
+    ...clip,
+    takes,
+    activeTakeIndex: takeIndex,
+    ...(switched ? mirrorOfTake(takes[takeIndex]) : {}),
+  };
+};
+
+/** Store `regions` on the clip, or drop the key when there is nothing to store. */
+const withComp = (clip: AudioClip, regions: CompRegion[]): AudioClip => {
+  if (regions.length > 0) return { ...clip, comp: regions };
+  if (clip.comp === undefined) return clip;
+  const { comp: _dropped, ...rest } = clip;
+  return rest as AudioClip;
+};
+
+/**
+ * Push a clip-level edit back onto the take list, so the invariant survives an
+ * edit made THROUGH THE CLIP rather than through a take. Returns the new list,
+ * or null when there is nothing to mirror.
+ *
+ * `offsetIntoSource` is a TRIM (trim-left, slip): it moves the clip's read head,
+ * and a comped clip reads every take through its own head — so every take moves
+ * by the same delta, which is the rule `splitClipAt` already applies to the
+ * right half of a cut. Without it, trimming a comped clip moved the clip alone:
+ * the comp went on playing untrimmed takes, and the next take switch (or a comp
+ * collapsing to a switch) re-mirrored the untrimmed offset and threw the trim
+ * away.
+ *
+ * The other fields describe ONE take's bytes, so they land on the active take
+ * alone: a bounce (`applyClipRender`) replaces what the ACTIVE take holds, it
+ * does not re-record the alternates. That is also what keeps decoded peaks:
+ * cached on the clip only, they were lost on every switch away and back.
+ *
+ * An update that REPLACES THE AUDIO is the case where those two rules meet — the
+ * offline Time/Pitch bake writes a new blob and `offsetIntoSource: 0` together.
+ * There the offset describes the new bytes, not a trim of the old ones, so it
+ * goes to the active take with them and the alternates (which were not re-baked)
+ * keep their own heads.
+ *
+ * A caller that writes `takes` or `activeTakeIndex` itself is doing take surgery
+ * by hand and is left alone — mirroring against a stale active index would be
+ * worse than not mirroring at all.
+ */
+const mirrorOntoTakes = (clip: AudioClip, updates: Partial<AudioClip>): ClipTake[] | null => {
+  const takes = clip.takes;
+  if (!takes || takes.length === 0) return null;
+  if ('takes' in updates || 'activeTakeIndex' in updates) return null;
+  const replacesAudio = updates.audioBlob !== undefined;
+  const movesHead = typeof updates.offsetIntoSource === 'number' && Number.isFinite(updates.offsetIntoSource);
+  const shift = movesHead && !replacesAudio ? (updates.offsetIntoSource as number) - clip.offsetIntoSource : 0;
+  const onActive: Partial<ClipTake> = {};
+  if (movesHead && replacesAudio) onActive.offsetIntoSource = updates.offsetIntoSource as number;
+  if (updates.audioBlob !== undefined) onActive.audioBlob = updates.audioBlob;
+  if (updates.mimeType !== undefined) onActive.mimeType = updates.mimeType;
+  if (typeof updates.sourceDuration === 'number' && Number.isFinite(updates.sourceDuration)) {
+    onActive.sourceDuration = updates.sourceDuration;
+  }
+  if ('peaks' in updates) onActive.peaks = updates.peaks;
+  const touchesActive = Object.keys(onActive).length > 0;
+  if (shift === 0 && !touchesActive) return null;
+  const active = activeIndexOf(clip, takes.length);
+  return takes.map((t, i) => {
+    const shifted = shift === 0 ? t : { ...t, offsetIntoSource: t.offsetIntoSource + shift };
+    return i === active && touchesActive ? { ...shifted, ...onActive } : shifted;
+  });
+};
+
+/** `{ ...clip, ...updates }` with the take list kept in step (`mirrorOntoTakes`). */
+const clipWithUpdates = (clip: AudioClip, updates: Partial<AudioClip>): AudioClip => {
+  const takes = mirrorOntoTakes(clip, updates);
+  return takes ? { ...clip, ...updates, takes } : { ...clip, ...updates };
+};
+
+/**
+ * Store a comp — unless every stretch of the clip plays ONE take, in which case
+ * that is not a comp, it is a take SWITCH, and it is stored as one: the comp
+ * goes and the active take moves to the take the single region named.
+ *
+ * Without this rule a one-region comp could name take 2 while the clip's own
+ * blob still mirrored take 0 — and the clip's blob is what every path that knows
+ * nothing about comping plays (`clipComp.isComped` is the gate, and it is
+ * already true at one region). The rule holds wherever a comp is WRITTEN, so a
+ * pick that merges the last boundary away and a split that hands one half a
+ * single region both come out as plain clips playing the right audio.
+ */
+const withCompChoice = (clip: AudioClip, takes: ClipTake[], regions: CompRegion[]): AudioClip => {
+  if (regions.length > 1) return withComp(clip, regions);
+  const only = regions[0]?.takeIndex ?? activeIndexOf(clip, takes.length);
+  return withComp(withActiveTake(clip, takes, only), []);
+};
+
+/** The clip with no takes, no comp and no active index — its media stands on
+ *  its own again. */
+const withoutTakes = (clip: AudioClip): AudioClip => {
+  if (clip.takes === undefined && clip.comp === undefined && clip.activeTakeIndex === undefined) return clip;
+  const { takes: _t, comp: _c, activeTakeIndex: _a, ...rest } = clip;
+  return rest as AudioClip;
+};
+
+/** Do two region lists say the same thing? An operation that changed nothing
+ *  must write nothing: a fresh array with identical contents is still a new
+ *  `clips` array, and every one of those is an undo step. */
+const sameComp = (a: readonly CompRegion[], b: readonly CompRegion[]): boolean =>
+  a.length === b.length
+  && a.every((r, i) => r.startSec === b[i].startSec
+    && r.takeIndex === b[i].takeIndex
+    && (r.crossfadeSec ?? 0) === (b[i].crossfadeSec ?? 0));
+
+/** Did a comp action leave the clip exactly as it found it? Every field the
+ *  actions below can touch, and no other — so a refused pick or a boundary drag
+ *  clamped against its neighbour writes nothing at all rather than an undo step
+ *  with no edit in it. */
+const sameTakesState = (a: AudioClip, b: AudioClip): boolean =>
+  a.takes === b.takes
+  && a.activeTakeIndex === b.activeTakeIndex
+  && a.audioBlob === b.audioBlob
+  && a.mimeType === b.mimeType
+  && a.sourceDuration === b.sourceDuration
+  && a.offsetIntoSource === b.offsetIntoSource
+  && a.peaks === b.peaks
+  && sameComp(a.comp ?? [], b.comp ?? []);
 
 // ── Undo / redo plumbing (module-scoped) ─────────────────────────────────────
 const HISTORY_LIMIT = 100;
@@ -1091,7 +1460,18 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
 
   addClipToTrack: (clip) => {
     const id = clip.id ?? uid();
-    const full: AudioClip = { ...clip, id };
+    // Duplicate and paste hand this a spread of an existing clip, so the two
+    // comping fields land here by inheritance. `takes` is shared BY REFERENCE:
+    // the takes are immutable media (blobs and peak arrays that are only ever
+    // read, and the decode cache is keyed by Blob identity), so a duplicate
+    // costs no audio memory and no extra decode. The COMP is copied, because it
+    // is the one part a user edits per clip — the copy's boundaries must be able
+    // to move without dragging the original's with them.
+    const full: AudioClip = {
+      ...clip,
+      id,
+      ...(clip.comp ? { comp: clip.comp.map((r) => ({ ...r })) } : {}),
+    };
     set((s) => {
       // If the track's name is still auto-generated and this is its first clip, inherit the clip label.
       const tracks = s.tracks.map((t) => {
@@ -1117,7 +1497,10 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     // it is moving, so one drag is one step and the next clip's drag is another.
     coalesceAs(`clip:${id}`);
     set((s) => ({
-      clips: s.clips.map((c) => (c.id === id ? { ...c, ...updates } : c)),
+      // A trim / slip on a COMPED clip has to move every take's read head with
+      // the clip's own, or the comp goes on playing the untrimmed takes and the
+      // next take switch reverts the trim (`mirrorOntoTakes`).
+      clips: s.clips.map((c) => (c.id === id ? clipWithUpdates(c, updates) : c)),
     }));
   },
 
@@ -1157,20 +1540,41 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     // capped at half the half, which matched a fade-handle limit that is gone.)
     // fadeInSec / fadeOutSec are optional on AudioClip, and the clamp reads an
     // absent fade as 0.
-    const left: AudioClip = {
+    //
+    // Takes and comp ride along. The comp is CLIP-relative timeline seconds, so
+    // it is partitioned at `relSplit`; each half is re-normalized against its own
+    // new length by `splitCompAt`, and a half whose partition comes back empty
+    // loses the key rather than keeping an empty list.
+    //
+    // The takes are the same audio read from a later point: the LEFT half keeps
+    // the array it had (same objects, same blobs), and the right half advances
+    // every take's read head by the same source conversion the clip's own
+    // `offsetIntoSource` uses above — in SOURCE seconds, not timeline ones, or a
+    // stretched clip's takes would replay the seam exactly as the clip itself
+    // used to. The blobs stay shared by reference, so a split costs no audio.
+    //
+    // A half left with a single region is stored as a take switch, exactly as a
+    // pick that merges the last boundary away is (`withCompChoice`) — which is
+    // also what re-points the half at the take its own stretch actually plays.
+    const compParts = splitCompAt(clip.comp ?? [], relSplit, clip.durationSec);
+    const rightTakes = clip.takes?.map((t) => ({ ...t, offsetIntoSource: t.offsetIntoSource + relSplitInSource }));
+    const half = (c: AudioClip, takes: ClipTake[] | undefined, regions: CompRegion[]): AudioClip =>
+      (takes && takes.length > 0 ? withCompChoice(c, takes, regions) : withComp(c, regions));
+    const left: AudioClip = half({
       ...clip,
       durationSec: relSplit,
       ...clampClipFades({ durationSec: relSplit, fadeInSec: clip.fadeInSec, fadeOutSec: 0 }),
-    };
-    const right: AudioClip = {
+    }, clip.takes, compParts.left);
+    const right: AudioClip = half({
       ...clip,
       id: newId,
       startSec: clip.startSec + relSplit,
       offsetIntoSource: clip.offsetIntoSource + relSplitInSource,
       durationSec: rightDur,
       label: `${clip.label}_b`,
+      ...(rightTakes ? { takes: rightTakes } : {}),
       ...clampClipFades({ durationSec: rightDur, fadeInSec: 0, fadeOutSec: clip.fadeOutSec }),
-    };
+    }, rightTakes, compParts.right);
     set((s) => ({
       clips: s.clips.flatMap((c) => (c.id === id ? [left, right] : [c])),
       selectedClipId: newId,
@@ -1283,13 +1687,180 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   applyClipRender: (id, updates, peaks) => {
     if (!get().clips.some((c) => c.id === id)) return;
     historyApplying = true;
+    // The render (and the peaks decoded from it) belongs to the take it was made
+    // from, not just to the clip: written to the clip alone, a bounce left the
+    // comp's other regions playing the DRY audio while the active take's played
+    // wet, and the next take switch threw the bounce — and every cached peak
+    // array — away. See `mirrorOntoTakes`.
+    const merged = peaks ? { ...updates, peaks } : updates;
     set((s) => ({
-      clips: s.clips.map((c) => (c.id === id ? { ...c, ...updates, ...(peaks ? { peaks } : {}) } : c)),
+      clips: s.clips.map((c) => (c.id === id ? clipWithUpdates(c, merged) : c)),
       // The saved project carries the clip's audio, so new audio still makes the
       // document dirty, as it did when this went through updateClip.
       dirty: true,
     }));
     historyApplying = false;
+  },
+
+  // ── Takes + comping (#46) ──────────────────────────────────────────────────
+  // The model is `lib/clipComp`; these actions are the document side of it. Each
+  // one computes the NEXT clip and writes only if it differs, so a refused edit
+  // costs neither a render nor an undo step.
+
+  addTakeToClip: (clipId, take, opts) => {
+    beginUndoStep();
+    set((s) => {
+      const clip = s.clips.find((c) => c.id === clipId);
+      if (!clip || !take) return {};
+      // The clip's current media becomes take 0 before the append, so the
+      // invariant holds from the very first alternate: take 0 is the pass that
+      // was already there, and the clip goes on mirroring it.
+      const base = takesOf(clip);
+      const takes = [...base, take];
+      const active = opts?.activate ? takes.length - 1 : activeIndexOf(clip, base.length);
+      const next = withActiveTake(clip, takes, active);
+      if (sameTakesState(next, clip)) return {};
+      return { clips: s.clips.map((c) => (c.id === clipId ? next : c)) };
+    });
+  },
+
+  setActiveTake: (clipId, takeIndex) => {
+    beginUndoStep();
+    set((s) => {
+      const clip = s.clips.find((c) => c.id === clipId);
+      const takes = clip?.takes;
+      if (!clip || !takes || !Number.isInteger(takeIndex) || takeIndex < 0 || takeIndex >= takes.length) return {};
+      // The comp is deliberately untouched: with none, this is take switching and
+      // the clip stays un-comped; with one, the comp names its takes itself and
+      // the active index only decides which take the clip MIRRORS.
+      const next = withActiveTake(clip, takes, takeIndex);
+      if (sameTakesState(next, clip)) return {};
+      return { clips: s.clips.map((c) => (c.id === clipId ? next : c)) };
+    });
+  },
+
+  setCompRegionAt: (clipId, atSec, takeIndex) => {
+    beginUndoStep();
+    set((s) => {
+      const clip = s.clips.find((c) => c.id === clipId);
+      const takes = clip?.takes;
+      if (!clip || !takes || takes.length === 0) return {};
+      if (!Number.isInteger(takeIndex) || takeIndex < 0 || takeIndex >= takes.length) return {};
+      // `setRegionAt` on an EMPTY comp seeds one region over the whole clip,
+      // because a model with no boundaries has no earlier choice to preserve.
+      // The store does have one — the active take is what the head is playing —
+      // so it seeds that first and picks into it. Without this, picking take 2
+      // at 3 s would silently retake the first 3 s as well.
+      const seeded: CompRegion[] = clip.comp && clip.comp.length > 0
+        ? clip.comp
+        : [{ startSec: 0, takeIndex: activeIndexOf(clip, takes.length) }];
+      const comp = normalizeComp(
+        compSetRegionAt(seeded, atSec, takeIndex, clip.durationSec),
+        takes.length,
+        clip.durationSec,
+      );
+      // A pick that merges the last boundary away leaves one take playing
+      // everywhere, which `withCompChoice` stores as the take switch it is.
+      const next = withCompChoice(clip, takes, comp);
+      if (sameTakesState(next, clip)) return {};
+      return { clips: s.clips.map((c) => (c.id === clipId ? next : c)) };
+    });
+  },
+
+  moveCompBoundary: (clipId, regionIndex, toSec, opts) => {
+    // The `stretchClipToFit` rule: a DRAG folds into the step its pointer-down
+    // opened, anything else cuts a step of its own.
+    if (opts?.coalesce) coalesceWithOpenStep(`clip:${clipId}:comp`);
+    else beginUndoStep(`clip:${clipId}:comp`);
+    set((s) => {
+      const clip = s.clips.find((c) => c.id === clipId);
+      if (!clip?.comp || clip.comp.length === 0) return {};
+      const next = withComp(clip, compMoveBoundary(clip.comp, regionIndex, toSec, clip.durationSec));
+      if (sameTakesState(next, clip)) return {};
+      return { clips: s.clips.map((c) => (c.id === clipId ? next : c)) };
+    });
+  },
+
+  setCompCrossfade: (clipId, regionIndex, sec) => {
+    beginUndoStep();
+    set((s) => {
+      const clip = s.clips.find((c) => c.id === clipId);
+      const comp = clip?.comp;
+      // Region 0 opens at the clip head, which is not a boundary between two
+      // takes — `clipComp` strips a crossfade there, so it is refused here.
+      if (!clip || !comp || !Number.isInteger(regionIndex) || regionIndex < 1 || regionIndex >= comp.length) return {};
+      if (!Number.isFinite(sec)) return {};
+      // Stored as asked. A crossfade longer than the regions it joins is fitted
+      // by `compSegments` when the segments are derived, so the number the user
+      // dialed survives a later boundary drag that makes room for it again.
+      const v = sec > 0 ? sec : 0;
+      const next = withComp(clip, comp.map((r, i) => (
+        i === regionIndex
+          ? (v > 0 ? { startSec: r.startSec, takeIndex: r.takeIndex, crossfadeSec: v } : { startSec: r.startSec, takeIndex: r.takeIndex })
+          : r
+      )));
+      if (sameTakesState(next, clip)) return {};
+      return { clips: s.clips.map((c) => (c.id === clipId ? next : c)) };
+    });
+  },
+
+  clearComp: (clipId) => {
+    beginUndoStep();
+    set((s) => {
+      const clip = s.clips.find((c) => c.id === clipId);
+      if (!clip) return {};
+      // The takes stay: this un-comps the clip back to the one it is mirroring,
+      // it does not throw the alternates away.
+      const next = withComp(clip, []);
+      if (sameTakesState(next, clip)) return {};
+      return { clips: s.clips.map((c) => (c.id === clipId ? next : c)) };
+    });
+  },
+
+  flattenComp: (clipId, rendered) => {
+    beginUndoStep();
+    const clip = get().clips.find((c) => c.id === clipId);
+    if (!clip || !rendered?.blob) return;
+    // THE CONTRACT, enforced rather than assumed: `rendered` is a SOURCE at rate
+    // 1, long enough to cover every source second the clip reads
+    // (`clipSourceSpanSec`, which is `durationSec * rate`). The clip keeps its
+    // own ratio and reads the print through it, so a print of the clip AS IT
+    // SOUNDS — rate already applied — is half the audio a rate-2 clip needs, and
+    // accepting it would silently truncate the clip to its first half.
+    const span = clipSourceSpanSec(clip);
+    if (!(Number.isFinite(rendered.durationSec) && rendered.durationSec + 1e-3 >= span)) {
+      logError(
+        'editor',
+        `Flatten refused: the render is ${Number.isFinite(rendered.durationSec) ? rendered.durationSec.toFixed(3) : String(rendered.durationSec)}s `
+        + `but the clip reads ${span.toFixed(3)}s of source. Render the comp with timeStretchRate forced to 1.`,
+      );
+      return;
+    }
+    const next: AudioClip = {
+      ...withoutTakes(clip),
+      audioBlob: rendered.blob,
+      mimeType: rendered.mimeType || clip.mimeType,
+      // A printed comp starts at the head of its own bytes.
+      sourceDuration: rendered.durationSec,
+      offsetIntoSource: 0,
+      // Cleared when the caller has none: peaks describe the OLD source.
+      peaks: rendered.peaks,
+    };
+    if (sameTakesState(next, clip)) return;
+    set((s) => ({ clips: s.clips.map((c) => (c.id === clipId ? next : c)) }));
+  },
+
+  keepActiveTakeOnly: (clipId) => {
+    beginUndoStep();
+    set((s) => {
+      const clip = s.clips.find((c) => c.id === clipId);
+      if (!clip) return {};
+      // Nothing is rendered and nothing moves: the clip's media already IS the
+      // active take, so dropping the list is the whole edit.
+      const next = withoutTakes(clip);
+      if (sameTakesState(next, clip)) return {};
+      return { clips: s.clips.map((c) => (c.id === clipId ? next : c)) };
+    });
   },
 
   setSelected: (id) => set({ selectedClipId: id }),
@@ -1388,6 +1959,28 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   removeSend: (fromId, toId) => {
     beginUndoStep();
     set((s) => ({ routing: graphRemoveSend(s.routing, fromId, toId) }));
+  },
+
+  setEffectSidechain: (scope, entryId, sourceNodeId) => {
+    beginUndoStep();
+    const nodeId = scope.id;
+    // Cleared on a LOCAL copy: nothing is written until the whole move is known
+    // to succeed, so a refused pick leaves the entry keyed exactly as it was.
+    const cleared = clearEntryKeys(get().routing, nodeId, entryId);
+    if (sourceNodeId === null) {
+      if (cleared !== get().routing) set({ routing: cleared });
+      return null;
+    }
+    const res = graphSetSidechain(cleared, sourceNodeId, nodeId, entryId);
+    if (!res.ok) return res.reason;
+    set({ routing: res.graph });
+    return null;
+  },
+
+  removeEffectSidechain: (scope, entryId) => {
+    beginUndoStep();
+    const next = clearEntryKeys(get().routing, scope.id, entryId);
+    if (next !== get().routing) set({ routing: next });
   },
 
   // Bus FX racks — the per-track actions with `buses` in place of `tracks`.

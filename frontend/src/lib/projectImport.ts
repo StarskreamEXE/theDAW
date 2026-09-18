@@ -13,8 +13,13 @@ import {
   useEditorStore,
   computePeaks,
   type AudioClip,
+  type AutomationLane,
+  type AutomationPoint,
+  type AutomationTarget,
+  type AutomationTargetKind,
   type EditorBus,
   type EditorTrack,
+  type TimelineMarker,
 } from '../state/editorStore';
 import {
   addBus as graphAddBus,
@@ -27,6 +32,7 @@ import {
   MASTER_ID,
   type RoutingGraph,
 } from '../state/routingGraph';
+import { normalizeComp, type ClipTake, type CompRegion } from './clipComp';
 import type { PianoNote } from '../state/pianoRollStore';
 import { useAppUiStore } from '../state/appUiStore';
 import { renderNotesToBlob, type RenderNote } from './midiSynth';
@@ -40,6 +46,12 @@ import {
   type EffectChainNode,
   type TasmoBus,
   type TasmoControllerMappings,
+  type TasmoLocator,
+  type TasmoLoop,
+  type TasmoCompRegion,
+  type TasmoTake,
+  type TasmoChainEntry,
+  type TasmoAutomationLane,
   clipMeterToTasmo,
   pianoNoteToTasmo,
   tasmoMeterToClip,
@@ -211,6 +223,128 @@ export interface ProjectImportResult {
   effectsLive: number;
 }
 
+// ── Takes + the comp at the file boundary ────────────────────────────────────
+//
+// A clip's alternate takes are stored as one file entry each, alongside the
+// clip's own; the comp is the boundary list `lib/clipComp.ts` defines. Mirrors
+// `Take` / `CompRegion` in backend/modules/project/tasmo_project.py.
+//
+// THE INVARIANT both directions keep (clipComp.ts states it in full): the
+// clip's `audioBlob` / `mimeType` / `sourceDuration` / `offsetIntoSource` /
+// `peaks` ARE `takes[activeTakeIndex]`. On the way out that means the active
+// take's file is the same bytes as the clip's own; on the way in it means the
+// active take is built from the blob the clip already fetched rather than from
+// a second fetch of identical bytes — which also keeps them the SAME Blob
+// OBJECT, the key `lib/decodeCache` caches decoded audio under.
+
+/** The active take index a file names, clamped to a take that exists. Anything
+ *  that is not an in-range integer reads as 0, exactly as `clipComp` treats a
+ *  nonsense index. */
+const activeTakeIndexOf = (raw: unknown, takeCount: number): number => {
+  if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 0 || raw >= takeCount) return 0;
+  return raw;
+};
+
+/** The file's comp regions → `clipComp`'s, dropping anything malformed. The
+ *  result is still run through `normalizeComp` against the real take count and
+ *  clip length, which is what makes it safe for the segment walk. */
+const tasmoCompToClip = (raw: unknown): CompRegion[] => {
+  const out: CompRegion[] = [];
+  for (const item of Array.isArray(raw) ? raw : []) {
+    if (!item || typeof item !== 'object') continue;
+    const r = item as Record<string, unknown>;
+    if (typeof r.start_sec !== 'number' || !Number.isFinite(r.start_sec)) continue;
+    if (typeof r.take_index !== 'number' || !Number.isInteger(r.take_index)) continue;
+    const xfade = typeof r.crossfade_sec === 'number' && r.crossfade_sec > 0 ? r.crossfade_sec : undefined;
+    out.push(xfade === undefined
+      ? { startSec: r.start_sec, takeIndex: r.take_index }
+      : { startSec: r.start_sec, takeIndex: r.take_index, crossfadeSec: xfade });
+  }
+  return out;
+};
+
+/**
+ * Rebuild a loaded clip's takes and comp, or `{}` when the file carries none —
+ * which is every .tasmo written before takes existed, and is why a legacy file
+ * loads through here completely unchanged.
+ *
+ * Every non-active take's bytes are fetched the way the clip's own are. If ANY
+ * of them fails to load the takes and the comp are dropped TOGETHER: a comp
+ * indexes into the take list by position, so loading a subset would silently
+ * repoint every region past the gap at the wrong recording. The clip itself is
+ * unharmed — it keeps the active take's audio it already has, which is exactly
+ * how it behaved before it had takes.
+ */
+const loadTakes = async (
+  c: TasmoLoadedClip,
+  clip: AudioClip,
+): Promise<Pick<AudioClip, 'takes' | 'comp' | 'activeTakeIndex'>> => {
+  const raw = Array.isArray(c.takes) ? c.takes.filter((t) => !!t && typeof t === 'object') : [];
+  if (raw.length === 0) return {};
+  const active = activeTakeIndexOf(c.active_take_index, raw.length);
+
+  // Fetched in parallel — a comped clip has as many requests as takes, and
+  // doing them one after another would stack the whole list's latency onto
+  // opening the project. `Promise.all` keeps the ORDER, which is load-bearing:
+  // the comp indexes takes by position.
+  const loaded = await Promise.all(raw.map(async (t, i): Promise<ClipTake | null> => {
+    const label = t.name || `Take ${i + 1}`;
+    if (i === active) {
+      // The clip's own media IS this take (the invariant), so it is reused
+      // rather than re-fetched: one less request, and one Blob object.
+      return {
+        id: t.id || uid('take'),
+        label,
+        audioBlob: clip.audioBlob,
+        mimeType: clip.mimeType,
+        sourceDuration: clip.sourceDuration,
+        offsetIntoSource: clip.offsetIntoSource,
+        peaks: clip.peaks,
+      };
+    }
+    if (!t.audio_file) {
+      logWarn('project', `Clip "${c.name}": take "${label}" has no audio file — takes dropped`);
+      return null;
+    }
+    const res = await fetch(projectApi.clipAudioUrl(t.audio_file));
+    if (!res.ok) {
+      logWarn(
+        'project',
+        `Clip "${c.name}": take "${label}" audio not loadable (${res.status}) — takes dropped`,
+      );
+      return null;
+    }
+    const blob = await res.blob();
+    const stored = t.source_duration;
+    return {
+      id: t.id || uid('take'),
+      label,
+      audioBlob: blob,
+      mimeType: t.mime_type || blob.type || 'audio/wav',
+      // The stored length when the file has a usable one; otherwise decode for
+      // it, the same way the clip's own duration is arrived at. Peaks stay
+      // lazy for an inactive take — nothing draws it until it is selected.
+      sourceDuration:
+        typeof stored === 'number' && Number.isFinite(stored) && stored > 0
+          ? stored
+          : (await computePeaks(blob, 240)).duration,
+      offsetIntoSource: Math.max(0, t.offset_into_source ?? 0),
+    };
+  }));
+
+  // One unloadable take drops the whole list, comp included: the comp indexes
+  // takes by POSITION, so keeping the rest would repoint every region past the
+  // gap at the wrong recording.
+  const takes = loaded.filter((t): t is ClipTake => t !== null);
+  if (takes.length !== loaded.length) return {};
+
+  // An empty comp is NOT COMPED, which is the absence of the field rather than
+  // an empty list — a clip with takes and no comp plays its active take and
+  // nothing downstream can tell it apart from a clip that never had any.
+  const comp = normalizeComp(tasmoCompToClip(c.comp), takes.length, clip.durationSec);
+  return { takes, comp: comp.length ? comp : undefined, activeTakeIndex: active };
+};
+
 /** Build one editor clip from a loaded .tasmo clip, or null if it has nothing
  *  playable (missing audio file on disk, or a MIDI clip with no notes). */
 const buildClip = async (
@@ -267,7 +401,7 @@ const buildClip = async (
   const offsetIntoSource = Math.max(0, Math.min(c.offset_into_source ?? 0, Math.max(0, duration - 0.01)));
   const available = Math.max(0, duration - offsetIntoSource);
   const durationSec = span > 0.02 ? Math.min(span, available) : available;
-  return {
+  const clip: AudioClip = {
     id: c.id || uid('clip'),
     trackId,
     label: c.name || 'clip',
@@ -296,7 +430,388 @@ const buildClip = async (
     fadeInSec: c.fade_in || undefined,
     fadeOutSec: c.fade_out || undefined,
   };
+  // The alternate takes and the comp across them, when the file has any. The
+  // clip built above is the ACTIVE take by the invariant, so this only adds to
+  // it — a file carrying none leaves the clip exactly as it was.
+  return { ...clip, ...(await loadTakes(c, clip)) };
 };
+
+// ── Markers + the loop region at the file boundary ───────────────────────────
+//
+// Both are per-project document state that `loadProject` CLEARS (editorStore.ts:
+// "Markers, automation lanes and the loop region are cleared with the tracks"),
+// so until they were written they could not survive save -> open at all. The
+// file already had `locators` for markers; the loop is a new defaulted object.
+// Mirrors `Locator` / `Loop` in backend/modules/project/tasmo_project.py.
+//
+// Like every other reader here, these NEVER throw: a hand-edited entry with a
+// missing name or a nonsense position is dropped, not fatal.
+
+/**
+ * State the EDIT session does NOT write into a `.tasmo`, listed in ONE place so
+ * a gap is discoverable instead of being rediscovered by whoever next notices
+ * something missing after a reload.
+ *
+ * EMPTY, and the test below pins it empty. The last three entries — the master
+ * FX chain, the master VST chain and the automation lanes — are written and
+ * restored by `captureProjectDocument` / `applyTasmoMasterAndAutomation`, and
+ * the IMPORTED-DAW save branch in projectStore.ts (`pendingTracks.length > 0`)
+ * now builds its project-level payload through that same helper, so it no
+ * longer drops markers, the loop, the buses or any of the three either.
+ *
+ * Adding session state that a save does not carry means adding its name here in
+ * the same change, so the omission is written down rather than discovered.
+ */
+export const TASMO_UNSAVED_STATE: readonly string[] = [];
+
+/** Timeline markers → the file's `locators`, in the order the store holds them
+ *  (sorted by position). The editor's marker has no colour, so none is written. */
+export function markersToLocators(markers: readonly TimelineMarker[]): TasmoLocator[] {
+  return markers
+    .filter((m) => m && Number.isFinite(m.t) && m.t >= 0)
+    .map((m) => ({ id: m.id, name: m.label, position: m.t }));
+}
+
+/** The inverse: the file's `locators` → timeline markers. An entry without a
+ *  usable position is dropped; a missing name becomes the marker's index, which
+ *  is what `addMarker` labels an unnamed marker with. */
+export function locatorsToMarkers(raw: unknown): TimelineMarker[] {
+  const out: TimelineMarker[] = [];
+  for (const item of Array.isArray(raw) ? raw : []) {
+    if (!item || typeof item !== 'object') continue;
+    const l = item as Record<string, unknown>;
+    const pos = l.position;
+    if (typeof pos !== 'number' || !Number.isFinite(pos) || pos < 0) continue;
+    const name = typeof l.name === 'string' && l.name ? l.name : String(out.length + 1);
+    out.push({ id: typeof l.id === 'string' && l.id ? l.id : uid('marker'), t: pos, label: name });
+  }
+  return out.sort((a, b) => a.t - b.t);
+}
+
+/** The shortest cycle worth keeping, in seconds. The same threshold `setLoopRegion`
+ *  enforces, applied on BOTH sides of the file so a 20 ms cycle a hand-edited file
+ *  asks for is no more reachable than one the UI would refuse to make. */
+const MIN_LOOP_SEC = 0.05;
+
+/** The editor's loop region → the file's `loop`, or null when there is no region
+ *  to keep. `enabled` is written independently of the bounds so switching the
+ *  loop off does not throw the region away. */
+export function loopToTasmo(loop: { loopEnabled: boolean; loopStart: number; loopEnd: number }): TasmoLoop | null {
+  const { loopEnabled, loopStart, loopEnd } = loop;
+  if (!Number.isFinite(loopStart) || !Number.isFinite(loopEnd)) return null;
+  const start = Math.max(0, loopStart);
+  if (loopEnd - start <= MIN_LOOP_SEC) return null;
+  return { enabled: !!loopEnabled, start_sec: start, end_sec: loopEnd };
+}
+
+/** The inverse. A missing, null or empty region reads as null, which the load
+ *  path leaves alone — i.e. today's behaviour for a file without the key. */
+export function tasmoToLoop(raw: unknown): { enabled: boolean; start: number; end: number } | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const l = raw as Record<string, unknown>;
+  const start = typeof l.start_sec === 'number' && Number.isFinite(l.start_sec) ? Math.max(0, l.start_sec) : NaN;
+  const end = typeof l.end_sec === 'number' && Number.isFinite(l.end_sec) ? l.end_sec : NaN;
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end - start <= MIN_LOOP_SEC) return null;
+  return { enabled: l.enabled === true, start, end };
+}
+
+/**
+ * Put a loaded project's markers and loop region back on the timeline.
+ *
+ * Called AFTER `loadProject`, which has just cleared both — so a file carrying
+ * neither leaves the freshly cleared state exactly as it is, which is what every
+ * project written before this did. Uses only the editor store's existing public
+ * setters (`addMarker`, `setLoopRegion`, `setLoopEnabled`); marker ids are NOT
+ * preserved, because `addMarker` mints its own — nothing outside the store keys
+ * off a marker id, and the file's id is only there to identify the entry.
+ */
+export function applyTasmoMarkersAndLoop(project: Pick<TasmoProjectLoaded, 'locators' | 'loop'>): void {
+  const store = useEditorStore.getState();
+  for (const m of locatorsToMarkers(project.locators)) store.addMarker(m.t, m.label);
+  const loop = tasmoToLoop(project.loop);
+  if (loop) {
+    // setLoopRegion enables the loop for any region worth having; setLoopEnabled
+    // then honours a region the user had saved switched OFF.
+    store.setLoopRegion(loop.start, loop.end);
+    store.setLoopEnabled(loop.enabled);
+  }
+}
+
+// ── The master chains + automation lanes at the file boundary ────────────────
+//
+// The last three pieces of session state a `.tasmo` could not carry. They are
+// per-project document state like the markers and the loop, but they fail in
+// two OPPOSITE ways, which is why the reader treats an absent key and an empty
+// one differently:
+//
+//  - `loadProject` CLEARS `automationLanes` (it says so: lanes key off
+//    trackId/entryId, so carrying them across a load leaves them pointing at
+//    tracks that no longer exist), so an unsaved lane was simply gone.
+//  - `loadProject` does NOT clear `masterFxChain` / `masterVstChain`, so the
+//    master rack of whatever was open before SURVIVED into the project the user
+//    just opened, and then got written into its next save.
+//
+// So: a key that is absent/null leaves the live state alone (a file written
+// before this existed opens exactly as it always did), and a key that is
+// present — including an empty array — replaces it.
+//
+// Mirrors `ChainEntry` / `EditorAutomationLane` in
+// backend/modules/project/tasmo_project.py.
+
+/** The four target kinds the editor can automate. A lane naming anything else
+ *  is a hand-edited file, and is dropped rather than restored as a lane that
+ *  writes nowhere. */
+const AUTOMATION_KINDS: readonly AutomationTargetKind[] = [
+  'trackVolume',
+  'trackPan',
+  'trackFx',
+  'masterFx',
+];
+
+/** A non-empty string, or undefined for anything else a file might hold. */
+const nonEmpty = (v: unknown): string | undefined =>
+  typeof v === 'string' && v ? v : undefined;
+
+/** A params record with only the finite numbers kept — a NaN param would reach
+ *  an AudioParam and silence the node it belongs to. */
+const numericParams = (raw: unknown): Record<string, number> => {
+  const out: Record<string, number> = {};
+  if (!raw || typeof raw !== 'object') return out;
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v === 'number' && Number.isFinite(v)) out[k] = v;
+  }
+  return out;
+};
+
+/** A live master-chain entry → the file's shape. Optional fields are left out
+ *  rather than written as null, so an ordinary rack effect writes the same four
+ *  keys it always would. */
+export function chainEntryToTasmo(e: ChainEntry): TasmoChainEntry {
+  return {
+    id: e.id,
+    effect: e.effect,
+    params: e.params ?? {},
+    enabled: !!e.enabled,
+    ...(e.vst
+      ? {
+          vst: {
+            plugin_path: e.vst.plugin_path,
+            plugin_name: e.vst.plugin_name,
+            // The dialed-in native-editor state. Absent when the plugin has
+            // never been opened, which is not the same as an empty blob.
+            ...(e.vst.raw_state ? { raw_state: e.vst.raw_state } : {}),
+          },
+        }
+      : {}),
+    ...(e.label ? { label: e.label } : {}),
+  };
+}
+
+/** The inverse, for a whole chain. An entry without a usable `id`/`effect` is
+ *  dropped: the id is what automation targets, so an entry that has none cannot
+ *  be the entry a lane means. `requireVst` is set for the master VST chain,
+ *  where an entry with no plugin names nothing to host. */
+export function tasmoToChainEntries(raw: unknown, requireVst = false): ChainEntry[] {
+  const out: ChainEntry[] = [];
+  for (const item of Array.isArray(raw) ? raw : []) {
+    if (!item || typeof item !== 'object') continue;
+    const e = item as Record<string, unknown>;
+    if (typeof e.id !== 'string' || !e.id) continue;
+    if (typeof e.effect !== 'string' || !e.effect) continue;
+    const v = e.vst as Record<string, unknown> | null | undefined;
+    const vst =
+      v && typeof v === 'object' && typeof v.plugin_path === 'string' && v.plugin_path
+        ? {
+            plugin_path: v.plugin_path,
+            plugin_name: typeof v.plugin_name === 'string' ? v.plugin_name : v.plugin_path,
+            ...(typeof v.raw_state === 'string' && v.raw_state ? { raw_state: v.raw_state } : {}),
+          }
+        : undefined;
+    if (requireVst && !vst) {
+      logWarn('project', `Master VST "${e.id}" names no plugin; dropped`);
+      continue;
+    }
+    out.push({
+      id: e.id,
+      effect: e.effect,
+      params: numericParams(e.params),
+      // The backend defaults `enabled` to true, so only an explicit false is off.
+      enabled: e.enabled !== false,
+      ...(vst ? { vst } : {}),
+      ...(typeof e.label === 'string' && e.label ? { label: e.label } : {}),
+    });
+  }
+  return out;
+}
+
+/** The lane's breakpoints in the file shape, keeping only what can be sampled:
+ *  finite points that strictly ascend in `t`. Nothing is reordered — a point
+ *  that does not advance the curve is dropped, the way a malformed locator is —
+ *  because the backend REJECTS a lane whose points do not ascend, and a save
+ *  the backend refuses is worse than a lane that lost a duplicate boundary. */
+const sanitizePoints = (points: readonly AutomationPoint[]): AutomationPoint[] => {
+  const out: AutomationPoint[] = [];
+  let last = -Infinity;
+  for (const p of points) {
+    if (!p || !Number.isFinite(p.t) || !Number.isFinite(p.v) || p.t <= last) continue;
+    const curve = typeof p.curve === 'number' && Number.isFinite(p.curve)
+      ? Math.max(-1, Math.min(1, p.curve))
+      : 0;
+    // A zero curve is linear, which is the ABSENCE of the key — the same rule
+    // `automationModes.makePoint` writes points by.
+    out.push(curve === 0 ? { t: p.t, v: p.v } : { t: p.t, v: p.v, curve });
+    last = p.t;
+  }
+  return out;
+};
+
+/** The editor's automation lanes → the file's `automation_lanes`. `only` limits
+ *  the result to lanes whose track is in the payload being written: the imported-
+ *  DAW save branch writes ITS tracks, not the editor's, so a lane naming a track
+ *  that will not be in the file is left out instead of saved as a dangler. */
+export function automationLanesToTasmo(
+  lanes: readonly AutomationLane[],
+  only?: ReadonlySet<string>,
+): TasmoAutomationLane[] {
+  const out: TasmoAutomationLane[] = [];
+  for (const l of lanes) {
+    if (!l || !l.target || !AUTOMATION_KINDS.includes(l.target.kind)) continue;
+    if (only && l.target.trackId !== undefined && !only.has(l.target.trackId)) continue;
+    out.push({
+      id: l.id,
+      target: {
+        kind: l.target.kind,
+        ...(l.target.trackId !== undefined ? { track_id: l.target.trackId } : {}),
+        ...(l.target.entryId !== undefined ? { entry_id: l.target.entryId } : {}),
+        ...(l.target.paramKey !== undefined ? { param_key: l.target.paramKey } : {}),
+      },
+      points: sanitizePoints(l.points ?? []),
+      enabled: l.enabled !== false,
+    });
+  }
+  return out;
+}
+
+/**
+ * Whether a restored lane still has something to write to, given the project
+ * that has just been loaded. This is the whole reason `loadProject` clears the
+ * lanes in the first place: a lane pointing at a track or an FX slot that is not
+ * there rides a control that does not exist, and no UI can show or remove it.
+ *
+ * A track's FX entry ids round-trip (`effectNodeToChainEntry` keeps `node.id`),
+ * so a lane saved against one resolves — unless the file predates chain-entry
+ * ids, in which case the entries get fresh ones and the lane is dropped, which
+ * is the honest outcome.
+ */
+export function automationTargetResolver(
+  tracks: readonly EditorTrack[],
+  masterFxChain: readonly ChainEntry[],
+): (target: AutomationTarget) => boolean {
+  const trackIds = new Set(tracks.map((t) => t.id));
+  const trackEntries = new Map<string, Set<string>>();
+  for (const t of tracks) trackEntries.set(t.id, new Set((t.fxChain ?? []).map((e) => e.id)));
+  const masterEntries = new Set(masterFxChain.map((e) => e.id));
+  return (target) => {
+    if (target.kind === 'masterFx') {
+      return !!target.entryId && !!target.paramKey && masterEntries.has(target.entryId);
+    }
+    if (!target.trackId || !trackIds.has(target.trackId)) return false;
+    if (target.kind !== 'trackFx') return true;
+    return !!target.entryId && !!target.paramKey && !!trackEntries.get(target.trackId)?.has(target.entryId);
+  };
+}
+
+/** The file's `automation_lanes` → editor lanes, dropping any that cannot be
+ *  sampled or cannot be resolved against the loaded project. Never throws: a
+ *  hand-edited lane is worth less than the project it sits in. */
+export function tasmoToAutomationLanes(
+  raw: unknown,
+  canTarget: (target: AutomationTarget) => boolean,
+): AutomationLane[] {
+  const out: AutomationLane[] = [];
+  for (const item of Array.isArray(raw) ? raw : []) {
+    if (!item || typeof item !== 'object') continue;
+    const l = item as Record<string, unknown>;
+    const t = (l.target ?? {}) as Record<string, unknown>;
+    const kind = AUTOMATION_KINDS.find((k) => k === t.kind);
+    if (!kind) continue;
+    const trackId = nonEmpty(t.track_id);
+    const entryId = nonEmpty(t.entry_id);
+    const paramKey = nonEmpty(t.param_key);
+    const target: AutomationTarget = {
+      kind,
+      ...(trackId !== undefined ? { trackId } : {}),
+      ...(entryId !== undefined ? { entryId } : {}),
+      ...(paramKey !== undefined ? { paramKey } : {}),
+    };
+    if (!canTarget(target)) {
+      logWarn('project', `Automation lane for ${kind} targets nothing in this project; dropped`);
+      continue;
+    }
+    const points = sanitizePoints(
+      (Array.isArray(l.points) ? l.points : []).filter(
+        (p): p is AutomationPoint => !!p && typeof p === 'object',
+      ),
+    );
+    out.push({
+      id: nonEmpty(l.id) ?? uid('lane'),
+      target,
+      points,
+      enabled: l.enabled !== false,
+    });
+  }
+  return out;
+}
+
+/**
+ * Put a loaded project's master chains and automation lanes back on the editor.
+ *
+ * Called AFTER `loadProject`, like `applyTasmoMarkersAndLoop`, and for the same
+ * reason: the tracks have to exist before a lane can be resolved against them.
+ *
+ * This writes the three document slices THROUGH THE STORE rather than through
+ * per-entry setters, because every one of those setters would corrupt what it
+ * restored: `addMasterEffect` mints a fresh entry id (and an automation lane
+ * targets an entry BY id, so the chain would reload with its automation
+ * orphaned) and seeds the rack defaults over the saved params;
+ * `beginAutomationTouch` / `recordAutomationPoint` no-op outside a record mode
+ * and merge any two points closer than the store's 20 ms floor, i.e. they would
+ * silently redraw the user's curve. `useEditorStore.setState` is the same public
+ * store API `loadProjectIntoEditor` already uses to reset the history below, and
+ * the ONE call keeps the three slices in step for the history subscription.
+ */
+export function applyTasmoMasterAndAutomation(
+  project: Pick<TasmoProjectLoaded, 'master_fx_chain' | 'master_vst_chain' | 'automation_lanes'>,
+): void {
+  const store = useEditorStore.getState();
+  // Absent/null = the file says nothing: keep what is live (legacy behaviour).
+  // Present, even empty = the file says this project has none: replace.
+  const masterFxChain =
+    project.master_fx_chain == null
+      ? store.masterFxChain
+      : tasmoToChainEntries(project.master_fx_chain);
+  const hasVst = project.master_vst_chain != null;
+  const masterVstChain = hasVst
+    ? tasmoToChainEntries(project.master_vst_chain, true)
+    : store.masterVstChain;
+  const automationLanes =
+    project.automation_lanes == null
+      ? store.automationLanes
+      : tasmoToAutomationLanes(
+          project.automation_lanes,
+          automationTargetResolver(store.tracks, masterFxChain),
+        );
+  useEditorStore.setState({
+    masterFxChain,
+    masterVstChain,
+    automationLanes,
+    // A rendered master belongs to the VST chain it was printed from, so a new
+    // chain invalidates it — the rule `clearMasterVst` and every master-VST
+    // mutator already keep. Without this a freshly opened project could play the
+    // PREVIOUS project's frozen master.
+    ...(hasVst ? { frozenMaster: null, previewMode: 'live' as const } : {}),
+  });
+}
 
 // ── Routing + buses at the file boundary ─────────────────────────────────────
 //
@@ -490,6 +1005,24 @@ export async function loadProjectIntoEditor(
   const { routing, buses } = tasmoToRouting(routedTracks, project.buses);
   useEditorStore.getState().loadProject({ tracks: outTracks, clips: outClips, bpm, routing, buses });
 
+  // Markers and the loop region, which loadProject has just cleared. Restored
+  // here rather than at either call site so BOTH ways into the editor (Open a
+  // .tasmo, and a DAW import that round-trips through one) get them.
+  applyTasmoMarkersAndLoop(project);
+  // The master rack, the master VST chain and the automation lanes, for the
+  // same reason and in the same place. This one runs SECOND because it resolves
+  // each lane against the tracks `loadProject` has just put in the store.
+  applyTasmoMasterAndAutomation(project);
+  // `addMarker` is an ordinary document mutation, so the history subscription
+  // (editorStore.ts, `state.markers !== prev.markers`) has just flagged the
+  // freshly opened project dirty and pushed an undo step that would rewind the
+  // markers out of it. A just-opened project is by definition unmodified and has
+  // no history — loadProject says so itself — so put both back. Both calls are
+  // public store API; the slices are unchanged by this point, so the same
+  // subscription sees nothing to record.
+  useEditorStore.getState().markSaved();
+  useEditorStore.setState({ _undo: [], _redo: [] });
+
   // Restore persisted controller (Sway) auto-attach bindings so a re-opened
   // session re-wires the hardware to the same track/FX targets. Track ids are
   // preserved on load and FX entry ids now round-trip (see effectNodeToChainEntry),
@@ -558,14 +1091,89 @@ const extForMime = (mime: string): string => {
   return 'wav';
 };
 
-export interface CapturedSession {
+/**
+ * A clip's takes and comp in the file shape, with one `files` entry pushed per
+ * take. Returns `{}` for a clip with no takes, so a session that has never
+ * recorded an alternate writes byte-identical payloads to the ones it did
+ * before takes existed.
+ *
+ * The ACTIVE take gets its own file even though its bytes are already in the
+ * clip's own entry. That duplication buys the property that matters here: each
+ * take's file is named for the take, so the take list survives an
+ * active-take switch, a re-save and a reload without any entry having to be
+ * understood as "the one that is also the clip's". `save-session` de-duplicates
+ * nothing, and neither does this — correctness first; a content-addressed
+ * archive is the fix if it ever costs enough to matter.
+ */
+const takesToTasmo = (
+  clip: AudioClip,
+  files: Array<{ name: string; blob: Blob }>,
+): Pick<TasmoClipInput, 'takes' | 'comp' | 'active_take_index'> => {
+  const takes = clip.takes ?? [];
+  if (takes.length === 0) return {};
+  const out: TasmoTake[] = takes.map((t) => {
+    const fname = `${clip.id}-${t.id}.${extForMime(t.mimeType || t.audioBlob.type || 'audio/wav')}`;
+    files.push({ name: fname, blob: t.audioBlob });
+    return {
+      id: t.id,
+      name: t.label,
+      audio_file: `audio/${fname}`,
+      mime_type: t.mimeType,
+      offset_into_source: t.offsetIntoSource,
+      source_duration: t.sourceDuration,
+    };
+  });
+  // Normalized on the way out too, so what lands in the file is a comp the
+  // backend's ascending/in-range check accepts and the reader can play.
+  const comp: TasmoCompRegion[] = normalizeComp(clip.comp, out.length, clip.durationSec).map((r) => ({
+    start_sec: r.startSec,
+    take_index: r.takeIndex,
+    crossfade_sec: r.crossfadeSec ?? 0,
+  }));
+  return {
+    takes: out,
+    comp,
+    // Which take the clip's OWN audio_file mirrors. Always written when there
+    // are takes: a reader that defaulted it to 0 would hand back a clip whose
+    // fields and active take disagree. An index that names no take reads as 0,
+    // which is the store's own rule (`activeIndexOf` in editorStore.ts) — NOT
+    // the last take, which would write a file claiming the clip is playing a
+    // recording it never held.
+    active_take_index: activeTakeIndexOf(clip.activeTakeIndex, out.length),
+  };
+};
+
+/**
+ * Everything a save must carry that is not a track: the project-level document
+ * state. Split out from `CapturedSession` because the two save branches in
+ * projectStore.ts disagree about the TRACKS (an imported DAW project saves the
+ * structure it was imported from, with its files on disk; a live session saves
+ * the EDIT timeline with its blobs embedded) and agree about everything else.
+ * Building it in one place is what stops the imported branch from quietly
+ * dropping half the document again.
+ */
+export interface CapturedDocument {
+  controllerMappings?: TasmoControllerMappings;
+  /** The project's mix buses. The master is never one of them. */
+  buses: TasmoBus[];
+  /** The timeline markers, as the file's `locators`. */
+  locators: TasmoLocator[];
+  /** The transport's cycle region, or null when there is none. */
+  loop: TasmoLoop | null;
+  /** The master bus's insert rack and its hosted-VST chain, in the file shape.
+   *  Always written — an empty array says "this project has no master FX",
+   *  which is what stops the next project from inheriting these. */
+  masterFxChain: TasmoChainEntry[];
+  masterVstChain: TasmoChainEntry[];
+  /** The automation lanes, minus any naming a track the payload will not have. */
+  automationLanes: TasmoAutomationLane[];
+}
+
+export interface CapturedSession extends CapturedDocument {
   tracks: TasmoTrackInput[];
   files: Array<{ name: string; blob: Blob }>;
   bpm: number;
   clipCount: number;
-  controllerMappings?: TasmoControllerMappings;
-  /** The project's mix buses. The master is never one of them. */
-  buses: TasmoBus[];
 }
 
 /** Snapshot the live Sway auto-attach bindings for persistence into a .tasmo,
@@ -574,6 +1182,38 @@ export function captureControllerMappings(): TasmoControllerMappings | undefined
   const s = useSwayImportStore.getState();
   if (!s.bindings.length && !s.unattached.length) return undefined;
   return { source_name: s.sourceName, bindings: s.bindings, unattached: s.unattached };
+}
+
+/**
+ * Snapshot the project-level document state for a save.
+ *
+ * `trackIds` names the tracks the payload being built will actually contain.
+ * Only the automation lanes care: a lane keys off a track id, so writing the
+ * editor's lanes into an imported-DAW save — whose tracks are the IMPORTER's,
+ * with the importer's ids — would fill the file with lanes that resolve against
+ * nothing. Omit it (the live-session save, whose tracks ARE the editor's) and
+ * every lane is written.
+ */
+export function captureProjectDocument(trackIds?: readonly string[]): CapturedDocument {
+  const editor = useEditorStore.getState();
+  return {
+    controllerMappings: captureControllerMappings(),
+    buses: busesToTasmo(editor.routing, editor.buses),
+    // Markers and the loop region are part of what the project IS, and were
+    // dropped by every save until batch 10. See TASMO_UNSAVED_STATE for what
+    // still is not written — which is now nothing.
+    locators: markersToLocators(editor.markers),
+    loop: loopToTasmo(editor),
+    // The master bus's two chains. `loadProject` does NOT clear them, so before
+    // they were written the master rack of whatever was open previously stayed
+    // on the project the user opened next — and was saved into it.
+    masterFxChain: editor.masterFxChain.map(chainEntryToTasmo),
+    masterVstChain: editor.masterVstChain.map(chainEntryToTasmo),
+    automationLanes: automationLanesToTasmo(
+      editor.automationLanes,
+      trackIds ? new Set(trackIds) : undefined,
+    ),
+  };
 }
 
 /**
@@ -618,6 +1258,9 @@ export function captureEditorSession(): CapturedSession {
           fade_in: c.fadeInSec ?? 0,
           fade_out: c.fadeOutSec ?? 0,
           offset_into_source: c.offsetIntoSource ?? 0,
+          // The alternate takes (one embedded file each) and the comp across
+          // them. Absent from the payload entirely for a clip with no takes.
+          ...takesToTasmo(c, files),
         };
       });
     return {
@@ -643,7 +1286,8 @@ export function captureEditorSession(): CapturedSession {
     files,
     bpm: editor.bpm,
     clipCount,
-    controllerMappings: captureControllerMappings(),
-    buses: busesToTasmo(editor.routing, editor.buses),
+    // The tracks above ARE the editor's, so no lane can name one the payload
+    // lacks — the filter is left off.
+    ...captureProjectDocument(),
   };
 }

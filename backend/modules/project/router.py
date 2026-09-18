@@ -129,18 +129,21 @@ def _register_project_media(project: TasmoProject, *paths: str) -> None:
 
     Opening a project is the user's consent for the files it names, so each
     clip's linked folder joins the allowlist. In-archive relative refs
-    (``audio/kick.wav``) are ignored by register_paths."""
-    media_access.register_paths(
-        [
-            *paths,
-            *(
-                clip.audio_file
-                for track in project.tracks
-                for clip in track.clips
-                if clip.audio_file
-            ),
-        ]
-    )
+    (``audio/kick.wav``) are ignored by register_paths.
+
+    A clip's takes are enumerated as well as its own ``audio_file``. Embedded
+    takes extract beside the clip's audio, so the clip's own path covered them
+    incidentally -- but not when the clip's own file is gone while a take's is
+    still there (nothing registers the folder and ``/clip-audio`` answers 403),
+    and not when a linked project's alternate passes were recorded into another
+    folder."""
+
+    refs: list[str | None] = [*paths]
+    for track in project.tracks:
+        for clip in track.clips:
+            refs.append(clip.audio_file)
+            refs.extend(take.audio_file for take in (clip.takes or []))
+    media_access.register_paths(refs)
 
 
 class SaveRequest(BaseModel):
@@ -205,8 +208,9 @@ async def save_session(
 
     The plain ``/save`` endpoint only links files already on disk, which cannot
     capture in-browser editor clips (their audio lives in memory). This accepts
-    the project JSON plus one upload per clip — each clip's ``audio_file`` points
-    at ``audio/<filename>`` and the matching upload is written into the archive."""
+    the project JSON plus one upload per clip and per take; matched by archive
+    filename — each ``audio_file`` points at ``audio/<filename>`` and the
+    matching upload is written into the archive."""
     try:
         project_data = json.loads(project)
         tasmo = TasmoProject.model_validate(project_data)

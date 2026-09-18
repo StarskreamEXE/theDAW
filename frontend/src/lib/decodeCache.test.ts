@@ -105,7 +105,35 @@ class FakeContext {
   }
 }
 
-const { DECODE_TIMEOUT_MS, decodeClipBlob, peekDecoded } = await import('./decodeCache.ts');
+const {
+  DECODE_TIMEOUT_MS,
+  decodeClipBlob,
+  peekDecoded,
+  configureDecodeCache,
+  defaultDecodeBudgetBytes,
+  decodeCacheStats,
+  releaseDecoded,
+  pinDecoded,
+  unpinDecoded,
+  withPinned,
+  clearDecodeCache,
+} = await import('./decodeCache.ts');
+
+/** A fake buffer with real accounting fields: 2 channels × 128 frames × 4 bytes
+ *  is exactly 1 KiB, so budgets below read in KiB and the arithmetic in the
+ *  assertions is exact rather than approximate. */
+const KIB = 1024;
+const makeKib = (tag: string, kib: number, sampleRate = 44100) =>
+  ({
+    tag,
+    numberOfChannels: 2,
+    length: kib * 128,
+    sampleRate,
+    duration: (kib * 128) / sampleRate,
+  }) as unknown as AudioBuffer;
+
+/** A fresh Blob per call — identity is the cache key, contents are irrelevant. */
+const clipBlob = () => new Blob([new Uint8Array([1])], { type: 'audio/wav' });
 
 /* ── one decode serves every caller ───────────────────────────────────────── */
 
@@ -419,7 +447,434 @@ const { DECODE_TIMEOUT_MS, decodeClipBlob, peekDecoded } = await import('./decod
   assert.equal(peekDecoded(fake.ctx, blob), fresh);
 }
 
+/* ── out of the box, nothing is ever evicted ──────────────────────────────── */
+
+{
+  // The budget the module STARTS with, before anything configures it. It is
+  // unbounded on purpose: the live mixer awaits decodeClipBlob for every clip in
+  // turn and only then reads them all back with peekDecoded, so a budget that
+  // evicted the earliest clips while the later ones decoded would make them peek
+  // as undefined and never be scheduled — silent clips, not a slower load. Until
+  // scheduleClips pins what it schedules (wave-2), eviction stays off.
+  assert.equal(
+    decodeCacheStats().budgetBytes,
+    Number.POSITIVE_INFINITY,
+    'the fresh default budget is unbounded',
+  );
+
+  const evictedBefore = decodeCacheStats().evictions;
+  const fake = new FakeContext();
+  const blobs: Blob[] = [];
+  for (let i = 0; i < 12; i += 1) {
+    const blob = clipBlob();
+    blobs.push(blob);
+    fake.will({ kind: 'resolve', buffer: makeKib(`bulk-${i}`, 64) });
+    await decodeClipBlob(fake.ctx, blob);
+  }
+
+  // 768 KiB of clips decoded one after another, exactly as ensureDecoded does…
+  assert.equal(decodeCacheStats().bytes, 12 * 64 * KIB);
+  assert.equal(decodeCacheStats().evictions, evictedBefore, 'the default evicts nothing');
+  assert.equal(decodeCacheStats().overBudget, false, 'and cannot be over an unbounded budget');
+  // …and every one of them is still there when the scheduler peeks them back.
+  for (const blob of blobs) {
+    assert.notEqual(peekDecoded(fake.ctx, blob), undefined, 'every decoded clip peeks back');
+  }
+
+  // The value to turn eviction on WITH is available, but opting in is explicit.
+  assert.equal(typeof defaultDecodeBudgetBytes(), 'number');
+  assert.ok(defaultDecodeBudgetBytes() > 0);
+}
+
+/* ── the byte budget: accounting is exact ─────────────────────────────────── */
+
+{
+  clearDecodeCache();
+  configureDecodeCache({ budgetBytes: 4 * KIB });
+
+  const before = decodeCacheStats();
+  assert.equal(before.entries, 0, 'clearDecodeCache emptied the index');
+  assert.equal(before.bytes, 0);
+  assert.equal(before.budgetBytes, 4 * KIB);
+  assert.equal(before.pinnedBytes, 0);
+  assert.equal(before.overBudget, false);
+
+  const blob = clipBlob();
+  const buf = makeKib('accounted', 3);
+  const fake = new FakeContext().will({ kind: 'resolve', buffer: buf });
+  await decodeClipBlob(fake.ctx, blob);
+
+  const stats = decodeCacheStats();
+  // numberOfChannels × length × 4 — the whole of the accounting rule.
+  assert.equal(stats.bytes, 2 * 3 * 128 * 4);
+  assert.equal(stats.bytes, 3 * KIB);
+  assert.equal(stats.entries, 1);
+  assert.equal(stats.overBudget, false, '3 KiB under a 4 KiB budget');
+}
+
+/* ── over budget evicts the least recently USED, not the oldest ───────────── */
+
+{
+  clearDecodeCache();
+  configureDecodeCache({ budgetBytes: 4 * KIB });
+  const evictedBefore = decodeCacheStats().evictions;
+
+  const a = clipBlob();
+  const b = clipBlob();
+  const c = clipBlob();
+  const d = clipBlob();
+  const bufA = makeKib('a', 1);
+  const bufB = makeKib('b', 1);
+  const bufC = makeKib('c', 1);
+  const bufD = makeKib('d', 2);
+  const fake = new FakeContext()
+    .will({ kind: 'resolve', buffer: bufA })
+    .will({ kind: 'resolve', buffer: bufB })
+    .will({ kind: 'resolve', buffer: bufC })
+    .will({ kind: 'resolve', buffer: bufD });
+
+  await decodeClipBlob(fake.ctx, a);
+  await decodeClipBlob(fake.ctx, b);
+  await decodeClipBlob(fake.ctx, c);
+  assert.equal(decodeCacheStats().bytes, 3 * KIB, 'three 1 KiB clips fit under 4 KiB');
+  assert.equal(decodeCacheStats().evictions, evictedBefore, 'nothing evicted while under budget');
+
+  // A is the oldest by insertion — but the scheduler peeks it again, which is a
+  // USE. The victim must be B, or the cache would throw away the clip that is
+  // being played and keep the one nobody has touched since it landed.
+  assert.equal(peekDecoded(fake.ctx, a), bufA);
+
+  await decodeClipBlob(fake.ctx, d); // 3 + 2 = 5 KiB > 4 KiB
+  assert.equal(decodeCacheStats().evictions, evictedBefore + 1, 'exactly one eviction');
+  assert.equal(decodeCacheStats().bytes, 4 * KIB);
+  assert.equal(decodeCacheStats().entries, 3);
+  assert.equal(peekDecoded(fake.ctx, b), undefined, 'the least recently used clip went');
+  assert.equal(peekDecoded(fake.ctx, a), bufA, 'the recently touched clip stayed');
+  assert.equal(peekDecoded(fake.ctx, c), bufC);
+  assert.equal(peekDecoded(fake.ctx, d), bufD, 'the buffer just decoded is never the victim');
+
+  // Asking for B again is transparent to the caller: it re-decodes, exactly
+  // once, and the cache stays inside its budget by evicting the next LRU (C).
+  const again = makeKib('b-again', 1);
+  fake.will({ kind: 'resolve', buffer: again });
+  const callsBefore = fake.calls.length;
+  assert.equal(await decodeClipBlob(fake.ctx, b), again, 'an evicted clip re-decodes');
+  assert.equal(fake.calls.length, callsBefore + 1, 'and re-decodes once');
+  assert.equal(await decodeClipBlob(fake.ctx, b), again, 'then it is cached again');
+  assert.equal(fake.calls.length, callsBefore + 1);
+  assert.equal(decodeCacheStats().bytes, 4 * KIB);
+  // The peeks above are themselves uses, in the order they were written, so by
+  // the time B came back A was the stalest entry — which is the property under
+  // test stated the other way round.
+  assert.equal(peekDecoded(fake.ctx, a), undefined, 'A had become the least recently used');
+  assert.equal(peekDecoded(fake.ctx, c), bufC, 'and C, peeked more recently, stayed');
+}
+
+/* ── a pinned buffer is never evicted ─────────────────────────────────────── */
+
+{
+  clearDecodeCache();
+  configureDecodeCache({ budgetBytes: 2 * KIB });
+
+  const pinned = clipBlob();
+  const loose = clipBlob();
+  const fresh = clipBlob();
+  const bufP = makeKib('pinned', 1);
+  const bufL = makeKib('loose', 1);
+  const bufF = makeKib('fresh', 1);
+  const fake = new FakeContext()
+    .will({ kind: 'resolve', buffer: bufP })
+    .will({ kind: 'resolve', buffer: bufL })
+    .will({ kind: 'resolve', buffer: bufF });
+
+  await decodeClipBlob(fake.ctx, pinned);
+  pinDecoded(pinned, 44100); // what scheduleClips will do for every source it starts
+  await decodeClipBlob(fake.ctx, loose);
+  assert.equal(decodeCacheStats().pinnedBytes, 1 * KIB, 'pinned bytes are reported separately');
+
+  // The pinned clip is the least recently used, so an LRU-only cache would take
+  // it — and silence a source that is already playing from that buffer.
+  await decodeClipBlob(fake.ctx, fresh);
+  assert.equal(peekDecoded(fake.ctx, pinned), bufP, 'a pinned buffer survives its LRU turn');
+  assert.equal(peekDecoded(fake.ctx, loose), undefined, 'the unpinned neighbour went instead');
+  assert.equal(peekDecoded(fake.ctx, fresh), bufF);
+  assert.equal(decodeCacheStats().bytes, 2 * KIB);
+
+  // Nested pins: two overlapping schedulings of the same clip, and the first one
+  // ending must not unpin the buffer the second is still playing.
+  pinDecoded(pinned, 44100);
+  unpinDecoded(pinned, 44100);
+  const second = clipBlob();
+  fake.will({ kind: 'resolve', buffer: makeKib('second', 1) });
+  await decodeClipBlob(fake.ctx, second);
+  assert.equal(peekDecoded(fake.ctx, pinned), bufP, 'still pinned by the outstanding pin');
+
+  // The last unpin releases it, and then it is an ordinary LRU candidate again.
+  unpinDecoded(pinned, 44100);
+  assert.equal(decodeCacheStats().pinnedBytes, 0);
+  assert.notEqual(peekDecoded(fake.ctx, second), undefined); // make `pinned` the LRU again
+  const third = clipBlob();
+  fake.will({ kind: 'resolve', buffer: makeKib('third', 1) });
+  await decodeClipBlob(fake.ctx, third);
+  assert.equal(peekDecoded(fake.ctx, pinned), undefined, 'the released buffer is evictable');
+}
+
+/* ── pins win over the budget, and the overrun is reported not hidden ─────── */
+
+{
+  clearDecodeCache();
+  configureDecodeCache({ budgetBytes: 2 * KIB });
+  const evictedBefore = decodeCacheStats().evictions;
+
+  const one = clipBlob();
+  const two = clipBlob();
+  const three = clipBlob();
+  const fake = new FakeContext()
+    .will({ kind: 'resolve', buffer: makeKib('one', 1) })
+    .will({ kind: 'resolve', buffer: makeKib('two', 1) })
+    .will({ kind: 'resolve', buffer: makeKib('three', 1) });
+
+  await decodeClipBlob(fake.ctx, one);
+  pinDecoded(one, 44100);
+  await decodeClipBlob(fake.ctx, two);
+  pinDecoded(two, 44100);
+  await decodeClipBlob(fake.ctx, three);
+
+  // Every entry is either pinned or the one just decoded, so there is nothing
+  // the cache is allowed to drop. Going over budget is correct — dropping a
+  // buffer a live source is playing is not — but it is stated in the stats so a
+  // caller that over-pins is visible rather than mysteriously fat.
+  const stats = decodeCacheStats();
+  assert.equal(stats.entries, 3);
+  assert.equal(stats.bytes, 3 * KIB);
+  assert.equal(stats.pinnedBytes, 2 * KIB);
+  assert.equal(stats.overBudget, true, 'over budget because everything evictable was pinned');
+  assert.equal(stats.evictions, evictedBefore, 'no pinned buffer was taken');
+
+  // clearDecodeCache honours the same rule.
+  clearDecodeCache();
+  const after = decodeCacheStats();
+  assert.equal(after.entries, 2, 'clear keeps pinned entries');
+  assert.equal(after.bytes, 2 * KIB);
+  assert.equal(peekDecoded(fake.ctx, three), undefined, 'and drops the unpinned ones');
+  assert.equal(peekDecoded(fake.ctx, one)?.length, 1 * 128);
+
+  unpinDecoded(one, 44100);
+  unpinDecoded(two, 44100);
+  clearDecodeCache();
+  assert.equal(decodeCacheStats().entries, 0);
+  assert.equal(decodeCacheStats().bytes, 0);
+}
+
+/* ── withPinned holds the pin for exactly the work it wraps ───────────────── */
+
+{
+  clearDecodeCache();
+  configureDecodeCache({ budgetBytes: 1 * KIB });
+
+  const held = clipBlob();
+  const fake = new FakeContext().will({ kind: 'resolve', buffer: makeKib('held', 1) });
+  await decodeClipBlob(fake.ctx, held);
+
+  const inside = withPinned(held, 44100, () => decodeCacheStats().pinnedBytes);
+  assert.equal(inside, 1 * KIB, 'pinned for the duration of the callback');
+  assert.equal(decodeCacheStats().pinnedBytes, 0, 'and released after it');
+
+  // An async body keeps the pin until the promise settles, and a throw still
+  // releases it — a leaked pin is a buffer that can never be evicted again.
+  const asyncPin = withPinned(held, 44100, async () => {
+    await Promise.resolve();
+    return decodeCacheStats().pinnedBytes;
+  });
+  assert.equal(decodeCacheStats().pinnedBytes, 1 * KIB, 'still pinned while awaiting');
+  assert.equal(await asyncPin, 1 * KIB);
+  assert.equal(decodeCacheStats().pinnedBytes, 0);
+
+  assert.throws(() => {
+    withPinned(held, 44100, () => {
+      throw new Error('scheduling failed');
+    });
+  }, /scheduling failed/);
+  assert.equal(decodeCacheStats().pinnedBytes, 0, 'a throwing body does not leak its pin');
+
+  await assert.rejects(
+    withPinned(held, 44100, async () => {
+      await Promise.resolve();
+      throw new Error('async scheduling failed');
+    }),
+    /async scheduling failed/,
+  );
+  assert.equal(decodeCacheStats().pinnedBytes, 0);
+
+  // An unpin with no matching pin is a no-op, not a negative counter.
+  unpinDecoded(held, 44100);
+  assert.equal(decodeCacheStats().pinnedBytes, 0);
+}
+
+/* ── a clip with a decode in flight is not evicted out from under it ──────── */
+
+{
+  clearDecodeCache();
+  configureDecodeCache({ budgetBytes: 2 * KIB });
+
+  const busy = clipBlob(); // resident at 44100, and decoding at 48000
+  const idle = clipBlob();
+  const incoming = clipBlob();
+
+  const at44 = new FakeContext(44100).will({ kind: 'resolve', buffer: makeKib('busy-44', 1) });
+  await decodeClipBlob(at44.ctx, busy);
+  at44.will({ kind: 'resolve', buffer: makeKib('idle', 1) });
+  await decodeClipBlob(at44.ctx, idle);
+
+  const at48 = new FakeContext(48000).will({ kind: 'hang' });
+  const stuck = decodeClipBlob(at48.ctx, busy);
+  await settle();
+
+  // `busy` is the least recently used, but a decode of that very Blob is in
+  // flight; taking its other-rate entry now would race the decode that is about
+  // to write beside it. The next candidate goes instead.
+  const arriving = new FakeContext(44100).will({ kind: 'resolve', buffer: makeKib('incoming', 1) });
+  await decodeClipBlob(arriving.ctx, incoming);
+  assert.equal(peekDecoded(at44.ctx, busy)?.length, 1 * 128, 'the busy blob was skipped');
+  assert.equal(peekDecoded(at44.ctx, idle), undefined, 'the idle neighbour was evicted');
+
+  elapse();
+  await assert.rejects(stuck, /decodeAudioData timeout/);
+}
+
+/* ── a failed decode costs the cache nothing ──────────────────────────────── */
+
+{
+  clearDecodeCache();
+  configureDecodeCache({ budgetBytes: 4 * KIB });
+  const blob = clipBlob();
+  const fake = new FakeContext().will({ kind: 'reject', error: new Error('EncodingError') });
+
+  await assert.rejects(decodeClipBlob(fake.ctx, blob), /EncodingError/);
+  const stats = decodeCacheStats();
+  assert.equal(stats.entries, 0, 'a rejected decode is not accounted');
+  assert.equal(stats.bytes, 0);
+  assert.equal(stats.overBudget, false);
+}
+
+/* ── releasing a clip frees it without waiting for a budget ───────────────── */
+
+{
+  clearDecodeCache();
+  configureDecodeCache({}); // unbounded: nothing will ever evict these for us
+
+  const deleted = clipBlob();
+  const kept = clipBlob();
+  const live = new FakeContext(48000).will({ kind: 'resolve', buffer: makeKib('del-48', 1, 48000) });
+  const bounce = new FakeContext(44100).will({ kind: 'resolve', buffer: makeKib('del-44', 1) });
+  await decodeClipBlob(live.ctx, deleted);
+  await decodeClipBlob(bounce.ctx, deleted);
+  bounce.will({ kind: 'resolve', buffer: makeKib('kept-44', 1) });
+  await decodeClipBlob(bounce.ctx, kept);
+  assert.equal(decodeCacheStats().entries, 3, 'the deleted clip is resident at two rates');
+  assert.equal(decodeCacheStats().bytes, 3 * KIB);
+
+  // The user deletes the clip. Nothing else can tell this module that: the LRU
+  // index holds a strong reference to the Blob, and with no budget there is no
+  // eviction to collect it, so both rates would stay resident forever.
+  releaseDecoded(deleted);
+  assert.equal(peekDecoded(live.ctx, deleted), undefined, 'every rate of the clip went');
+  assert.equal(peekDecoded(bounce.ctx, deleted), undefined);
+  assert.equal(decodeCacheStats().entries, 1, 'and only that clip');
+  assert.equal(decodeCacheStats().bytes, 1 * KIB);
+  assert.notEqual(peekDecoded(bounce.ctx, kept), undefined);
+
+  // Releasing a clip that was never decoded is a no-op, not a throw.
+  releaseDecoded(clipBlob());
+  assert.equal(decodeCacheStats().entries, 1);
+
+  // A pinned clip is not released — the pin means something is playing it, and
+  // that outranks a caller who thinks the clip is gone.
+  pinDecoded(kept, 44100);
+  releaseDecoded(kept);
+  assert.notEqual(peekDecoded(bounce.ctx, kept), undefined, 'a pinned clip survives release');
+  unpinDecoded(kept, 44100);
+  releaseDecoded(kept);
+  assert.equal(peekDecoded(bounce.ctx, kept), undefined, 'and goes once unpinned');
+  assert.equal(decodeCacheStats().entries, 0);
+
+  // Nor is a clip released while a decode of it is in flight — that decode is
+  // about to write an entry the release would not have seen.
+  const busy = clipBlob();
+  const at44 = new FakeContext(44100).will({ kind: 'resolve', buffer: makeKib('busy-44', 1) });
+  await decodeClipBlob(at44.ctx, busy);
+  const at48 = new FakeContext(48000).will({ kind: 'hang' });
+  const stuck = decodeClipBlob(at48.ctx, busy);
+  await settle();
+  releaseDecoded(busy);
+  assert.notEqual(peekDecoded(at44.ctx, busy), undefined, 'release defers to an in-flight decode');
+  elapse();
+  await assert.rejects(stuck, /decodeAudioData timeout/);
+  releaseDecoded(busy);
+  assert.equal(peekDecoded(at44.ctx, busy), undefined, 'and works once it has settled');
+}
+
+/* ── the budget to opt in WITH follows the machine, capped at 1 GiB ───────── */
+
+{
+  const GIB = 1024 * 1024 * 1024;
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  const stubNavigator = (value: unknown) => {
+    Object.defineProperty(globalThis, 'navigator', {
+      value,
+      configurable: true,
+      writable: true,
+    });
+  };
+
+  // A 2 GB machine: a quarter of it, which is well under the cap.
+  stubNavigator({ deviceMemory: 2 });
+  assert.equal(defaultDecodeBudgetBytes(), 0.25 * 2 * GIB);
+
+  // A 64 GB workstation: a quarter would be 16 GiB, so the 1 GiB cap decides.
+  stubNavigator({ deviceMemory: 64 });
+  assert.equal(defaultDecodeBudgetBytes(), GIB);
+
+  // Firefox and Safari do not report deviceMemory at all.
+  stubNavigator({});
+  assert.equal(defaultDecodeBudgetBytes(), GIB, 'no deviceMemory falls back to 1 GiB');
+
+  stubNavigator(undefined);
+  assert.equal(defaultDecodeBudgetBytes(), GIB, 'no navigator at all falls back to 1 GiB');
+
+  // It is read at call time, not frozen at module load, so the Electron preload
+  // (or a test) that installs a navigator later is seen.
+  stubNavigator({ deviceMemory: 3 });
+  assert.equal(defaultDecodeBudgetBytes(), 0.25 * 3 * GIB);
+
+  // This is the one call that turns eviction on.
+  configureDecodeCache({ budgetBytes: defaultDecodeBudgetBytes() });
+  assert.equal(decodeCacheStats().budgetBytes, 0.75 * GIB);
+
+  // Nonsense from a caller — or no argument at all — turns eviction back OFF
+  // rather than guessing. A budget the caller did not mean is how live buffers
+  // get dropped.
+  configureDecodeCache({ budgetBytes: Number.NaN });
+  assert.equal(decodeCacheStats().budgetBytes, Number.POSITIVE_INFINITY);
+  configureDecodeCache({ budgetBytes: -1 });
+  assert.equal(decodeCacheStats().budgetBytes, Number.POSITIVE_INFINITY);
+  configureDecodeCache({});
+  assert.equal(decodeCacheStats().budgetBytes, Number.POSITIVE_INFINITY);
+
+  // …but an explicit 0 is a real budget: cache nothing that is not pinned.
+  configureDecodeCache({ budgetBytes: 0 });
+  assert.equal(decodeCacheStats().budgetBytes, 0);
+
+  if (original) Object.defineProperty(globalThis, 'navigator', original);
+  else delete (globalThis as { navigator?: unknown }).navigator;
+  clearDecodeCache();
+  configureDecodeCache({});
+}
+
 globalThis.setTimeout = realSetTimeout;
 globalThis.clearTimeout = realClearTimeout;
 
-console.log('shared decode cache: dedupe, in-flight sharing, timeout and failure recovery passed');
+console.log(
+  'shared decode cache: dedupe, in-flight sharing, timeout and failure recovery, ' +
+    'byte budget, LRU eviction, pinning and stats passed',
+);

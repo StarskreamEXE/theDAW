@@ -7,8 +7,8 @@ import { meterMapToMidiEvents, normalizeMeterMap, unrollLanes, type MeterSegment
 import { notesToSmf } from './midiWrite.ts';
 import { MAX_BENT_LANES, bendValueAt, unrollBend, type BendPoint, type BendShape, type LaneBend } from './pitchBend.ts';
 import { playedRollNotes } from './rollClip.ts';
-import { midiFileToRoll, rollToMidiFile } from './rollMidi.ts';
-import { pianoNotesToMidiNotes, type PianoNote } from '../state/pianoRollStore.ts';
+import { ROLL_PPQ, midiFileToRoll, rollToMidiFile } from './rollMidi.ts';
+import { PPQ, migrateNotes, pianoNotesToMidiNotes, usePianoRollStore, withTicks, type PianoNote } from '../state/pianoRollStore.ts';
 
 const hex = (b: Uint8Array): string => Buffer.from(b).toString('hex');
 const hasBytes = (hay: Uint8Array, needle: number[]): boolean => {
@@ -298,6 +298,85 @@ const bytes = encodeMidi(file);
   }))), 'm2');
   assert.equal(again.meter.lanes.length, MAX_BENT_LANES + 1);
   assert.deepEqual(canonical(again.notes), canonical(many.notes));
+}
+
+// ── Ticks through the file ───────────────────────────────────────────────────
+
+// A round trip at the model's own PPQ is EXACT, off-grid notes included: the
+// export writes each note's ticks and the import reads them back, so nothing is
+// quantised to the 16th grid in either direction.
+{
+  const notes: PianoNote[] = migrateNotes([
+    { id: 'on-grid', note: 60, step: 0, length: 4, velocity: 100 },
+    // 605 ticks is 2.52 steps — between two 16ths, where a swung or humanised
+    // note lives. The old export rounded it to a step; this one does not.
+    { id: 'off-grid', note: 64, velocity: 90, tick: 605, ticks: 61 } as PianoNote,
+    { id: 'tiny', note: 67, velocity: 80, tick: 4801, ticks: 1 } as PianoNote,
+  ]);
+  const roll = { notes, lanes: [LANES[0]], totalSteps: 64, bpm: 120, meterMap: [MAP[0]], pickupSteps: 0, bends: [] };
+  const exported = rollToMidiFile(roll, PPQ);
+  assert.equal(exported.ppq, PPQ);
+  assert.deepEqual(
+    exported.tracks[0].notes.map((n) => [n.tick, n.durationTicks]),
+    [[0, 960], [605, 61], [4801, 1]],
+    'the file carries the notes\' own ticks, unrounded',
+  );
+  const back = midiFileToRoll(parseMidi(encodeMidi(exported)), 'x');
+  assert.deepEqual(back.notes.map((n) => [n.tick, n.ticks]), notes.map((n) => [n.tick, n.ticks]), 'ticks survive a 960 PPQ trip exactly');
+  // And the step view the roll draws is derived from those ticks, not re-snapped.
+  assert.deepEqual(back.notes.map((n) => [n.step, n.length]), notes.map((n) => [n.step, n.length]));
+  // The store keeps them as they came back.
+  usePianoRollStore.getState().importNotes(back.notes);
+  assert.deepEqual(usePianoRollStore.getState().notes.map((n) => n.tick), [0, 605, 4801]);
+}
+
+// A file at another PPQ scales into the model rather than snapping: 480 doubles,
+// 96 is x10, and the step view follows.
+{
+  const at = (ppq: number, tick: number, durationTicks: number) =>
+    midiFileToRoll(parseMidi(encodeMidi({
+      ppq,
+      bpm: 120,
+      tracks: [{ name: 'x', notes: [{ tick, note: 60, velocity: 100, durationTicks, channel: 0 }] }],
+    })), 's').notes[0];
+
+  const half = at(480, 605, 61);
+  assert.deepEqual([half.tick, half.ticks], [1210, 122], '480 PPQ doubles into 960');
+  assert.equal(half.step, 1210 / 240);
+  const coarse = at(96, 25, 7);
+  assert.deepEqual([coarse.tick, coarse.ticks], [250, 70], '96 PPQ scales x10');
+  assert.equal(coarse.step, 250 / 240, 'and lands between 16ths rather than on one');
+  // A zero-length note is still a note: the codec gives it the file's shortest
+  // tick, which scales to ten of the model's at 96 PPQ.
+  assert.equal(at(96, 0, 0).ticks, 10);
+  // A 480 PPQ export of a 480-grid roll is unchanged from what it always was.
+  const whole = at(480, 960, 480);
+  assert.deepEqual([whole.tick, whole.ticks, whole.step, whole.length], [1920, 960, 8, 4]);
+}
+
+// A looping lane's repeats are re-ticked from where the unroll put them, which
+// is exact because a lane cycle is a whole number of steps — an off-grid note in
+// a looping lane keeps its offset in every pass.
+{
+  const swung: PianoNote = withTicks({ id: 'sw', note: 48, velocity: 100, tick: 605, ticks: 60, lane: 1 } as PianoNote);
+  const roll = {
+    notes: [swung],
+    lanes: [LANES[0], { id: 1, name: 'B', cycleSteps: 8 }],
+    totalSteps: 32,
+    bpm: 120,
+    meterMap: [MAP[0]],
+    pickupSteps: 0,
+    bends: [],
+  };
+  const out = rollToMidiFile(roll, PPQ).tracks[0].notes;
+  // 8 steps = 1920 ticks a pass, and the 5-tick offset off the grid rides along.
+  assert.deepEqual(out.map((n) => n.tick), [605, 2525, 4445, 6365]);
+  assert.deepEqual([...new Set(out.map((n) => n.durationTicks))], [60]);
+  // The SHIPPED export (PianoRoll's .mid button) takes the default ppq, 480,
+  // where an odd model tick has no exact home: it rounds by at most half a file
+  // tick, which is one model tick. Nothing quantises to the grid.
+  const atDefault = rollToMidiFile(roll).tracks[0].notes[0].tick * (PPQ / ROLL_PPQ);
+  assert.ok(Math.abs(atDefault - 605) <= 1, `default ppq put tick 605 at ${atDefault}`);
 }
 
 console.log('rollMidi: ok');

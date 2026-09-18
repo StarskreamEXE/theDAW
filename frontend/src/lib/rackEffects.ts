@@ -32,6 +32,20 @@ export interface RackEffectInstance {
   input: AudioNode;
   /** Processed signal leaves here. */
   output: AudioNode;
+  /**
+   * KEY (sidechain) input — present only on instances of a definition that
+   * declares `keyInput: true`. Connect another strip's post-pan tap here and the
+   * effect's detector reads THAT signal instead of only its own input; leave it
+   * unconnected and the instance behaves exactly as it did before there was one
+   * (see `makeKeyFollower` for why that is exact rather than approximate).
+   *
+   * A `GainNode` rather than the detector itself, so the caller has one stable
+   * node to connect into for the life of the instance, and so several sources
+   * keying one entry simply SUM — which is what a mixer does with several
+   * inputs, and what `wireRoutingGraph` relies on when a graph holds more than
+   * one `CONN_SIDECHAIN` edge aimed at the same `targetEntryId`.
+   */
+  keyIn?: AudioNode;
   /** Push new parameter values onto the live nodes (click-free where possible). */
   setParams: (p: Record<string, number>) => void;
   /** Spatializer only: drive panner position from a transport-synced schedule
@@ -119,6 +133,16 @@ export interface RackEffectDef {
   make: RackEffectFactory;
   /** The param that acts as wet/dry; the panel gives it a fixed header slot. */
   mixKey?: string;
+  /**
+   * This effect can be KEYED from another strip: its instance exposes
+   * `RackEffectInstance.keyIn`, and the UI offers a "Key from" picker for it.
+   *
+   * Declared on the DEFINITION rather than inferred from the instance because
+   * the picker has to exist before anything is built — `EffectWindows` asks the
+   * registry, not the live graph, and an offline bounce has no live graph to
+   * ask at all. A definition that sets this MUST return a `keyIn` from `make`.
+   */
+  keyInput?: boolean;
   /** Sensible starting points for this effect (plus the implicit Default). */
   presets?: readonly RackEffectPreset[];
   /** Declared XY pads; each pair also stays reachable as individual controls. */
@@ -1471,13 +1495,172 @@ const makeParametricEq: RackEffectFactory = (ctx, params) => {
   };
 };
 
-/* Compressor: native DynamicsCompressor + makeup gain. */
+/* ── the key (sidechain) follower ───────────────────────────────────────────────
+   A `DynamicsCompressorNode` has ONE input and no key, so "duck the bass from
+   the kick" cannot be expressed by handing the native node a second signal. It
+   has to be built: the key drives a gain node ON the audio path, and the whole
+   detector is made of audio nodes.
+
+   THE DESIGN CHOICE, and it is the one the bounce depends on. The obvious
+   alternative — a second `DynamicsCompressorNode` fed the key, whose `reduction`
+   is polled and written onto the audio path — CANNOT be used here, because
+   `reduction` is a float a JS timer reads. Live that timer runs at whatever rate
+   the tab gets; in an `OfflineAudioContext` a 300 s bounce renders in a fraction
+   of a second and the timer fires a handful of times or not at all. The two
+   renders would not merely round differently, they would duck at different
+   moments. `export == preview` is a hard rule in this app, so the follower is
+   built entirely out of nodes and NO JAVASCRIPT IS IN THE LOOP: given the same
+   key samples, live and offline compute the same gain sample for sample.
+
+     keyIn (sens) -> shaper (full-wave rectify) -> lowpass (smooth) -> depth
+                                                                       |
+                            input -> comp -> makeup -> [ gain ] -> output
+                                                          ^ intrinsic 1, plus
+                                                            the negative depth
+
+   An `AudioParam` sums its connected inputs with its INTRINSIC value — the same
+   arithmetic `makeGater` already leans on (`gate.gain.value = 0`, bias + LFO
+   connected to it) — so a gain whose intrinsic value is 1, fed a negative
+   envelope, is `1 - reduction`.
+
+   WHY IT IS EXACTLY TRANSPARENT UNKEYED. With nothing connected to `keyIn` the
+   shaper sees silence, and the rectifier curve is sampled at an ODD length so
+   its centre sample is |0| = 0 exactly; a biquad with a zero input and zero
+   state stays at zero; the depth gain scales zero. The param computes
+   `1 + 0 = 1` and a multiply by 1 is exact in float32, so every existing render
+   of a compressor is sample-for-sample what it was before this node existed.
+
+   WHY THE GAIN CAN NEVER GO NEGATIVE (which would invert the signal rather than
+   duck it): the rectifier's output is bounded by 1 because the shaper clamps
+   inputs outside [-1, 1] to its end samples, and the smoothing filter is a
+   biquad lowpass at `Q = 0.5` — critically damped, a double real pole, whose
+   impulse response is non-negative with unit area. A non-negative unit-area
+   kernel cannot lift a signal above its own maximum, so the envelope stays in
+   [0, 1] and the reduction stays in [0, `depth`] with `depth < 1`.
+
+   LATENCY: none. `KEY_FOLLOWER_LATENCY_SEC` is the term this adds to a keyed
+   effect's declaration, and it is 0 by construction — every node of the
+   follower is on the CONTROL path, and the only node it adds to the AUDIO path
+   is a `GainNode`, which the spec gives no latency. The smoothing filter's group
+   delay is real, but it delays the ENVELOPE, not the signal, so an effect that
+   declares anything for it would push its whole chain late for a lag nothing
+   downstream experiences. (See `RackEffectDef.latencySec`: a value belongs there
+   only when the OUTPUT ONSET lags the input.) */
+
+/** Samples in the rectifier curve. ODD, so index `(N-1)/2` is exactly x = 0 and
+ *  a silent key maps to exactly zero reduction. */
+const KEY_SHAPER_SAMPLES = 1025;
+
+/** Smoothing filter Q. 0.5 is the critically damped double pole: no overshoot,
+ *  which is what bounds the envelope by the rectifier's own maximum. */
+const KEY_SMOOTH_Q = 0.5;
+
+/**
+ * Seconds a key follower adds to the AUDIO path: zero, by construction. Exported
+ * so a keyed effect's latency declaration can state the term explicitly instead
+ * of silently omitting it, and so a test can pin that the number is zero rather
+ * than merely absent.
+ */
+export const KEY_FOLLOWER_LATENCY_SEC = 0;
+
+/** The follower, as its owner holds it. */
+interface KeyFollower {
+  /** The node a key source connects into. */
+  keyIn: GainNode;
+  /** Re-read `keySens` / `keySmooth` / `keyDuck` off a param set. */
+  setParams: (p: Record<string, number>) => void;
+  dispose: () => void;
+}
+
+/**
+ * Build the detector and splice a key-driven gain onto `path`, returning the
+ * follower plus the node the audio now leaves from.
+ *
+ * `path` keeps feeding the new gain, so the caller's existing wiring upstream of
+ * it is untouched; the caller must publish `audioOut` as the instance's output.
+ */
+function makeKeyFollower(
+  ctx: BaseAudioContext,
+  path: AudioNode,
+  params: Record<string, number>,
+): { follower: KeyFollower; audioOut: GainNode } {
+  const keyIn = ctx.createGain();
+  const shaper = ctx.createWaveShaper();
+  const curve = new Float32Array(KEY_SHAPER_SAMPLES);
+  for (let i = 0; i < KEY_SHAPER_SAMPLES; i += 1) {
+    curve[i] = Math.abs(-1 + (2 * i) / (KEY_SHAPER_SAMPLES - 1));
+  }
+  shaper.curve = curve;
+  // No oversampling: the curve is |x|, whose only harmonic content is the
+  // rectification itself, and the smoothing filter below removes it. Oversampling
+  // would add its own resampling latency to a path that has none.
+  shaper.oversample = 'none';
+  const smooth = ctx.createBiquadFilter();
+  smooth.type = 'lowpass';
+  smooth.Q.value = KEY_SMOOTH_Q;
+  const depth = ctx.createGain();
+  const audioOut = ctx.createGain();
+  // The intrinsic value the reduction is subtracted FROM. Set explicitly rather
+  // than left at its default so the arithmetic is stated where it is relied on.
+  audioOut.gain.value = 1;
+
+  keyIn.connect(shaper).connect(smooth).connect(depth);
+  depth.connect(audioOut.gain);
+  path.connect(audioOut);
+
+  const setParams = (p: Record<string, number>) => {
+    const t = ctx.currentTime;
+    // Sensitivity is gain INTO the rectifier, so the shaper's own [-1, 1] clamp
+    // is the detector's ceiling: at +12 dB a key peaking at -12 dBFS already
+    // reaches full reduction.
+    keyIn.gain.setValueAtTime(dbToGain(clamp(p.keySens ?? 12, 0, 48)), t);
+    // A one-pole time constant expressed as a corner frequency: tau = 1/(2*pi*f).
+    // Clamped above 0.05 Hz so a 20 s smoothing cannot be asked for by a damaged
+    // param set, and below a fifth of Nyquist so it stays a smoother rather than
+    // an audio-band filter of the envelope.
+    const tau = clamp(p.keySmooth ?? 80, 1, 500) / 1000;
+    const hz = clamp(1 / (2 * Math.PI * tau), 0.05, ctx.sampleRate / 10);
+    smooth.frequency.setValueAtTime(hz, t);
+    // Depth as the FRACTION of the signal the key removes at full envelope:
+    // `1 - 10^(-duck/20)`, negated because it is subtracted from unity. A duck
+    // of 0 dB is 0 — the picker can be set while the effect stays transparent.
+    const duckDb = clamp(p.keyDuck ?? 12, 0, 48);
+    depth.gain.setValueAtTime(-(1 - dbToGain(-duckDb)), t);
+  };
+  setParams(params);
+
+  return {
+    follower: {
+      keyIn,
+      setParams,
+      dispose: () => {
+        try {
+          keyIn.disconnect();
+          shaper.disconnect();
+          smooth.disconnect();
+          depth.disconnect();
+          audioOut.disconnect();
+        } catch {
+          /* already gone */
+        }
+      },
+    },
+    audioOut,
+  };
+}
+
+/* Compressor: native DynamicsCompressor + makeup gain, plus a key follower whose
+   reduction is zero until something is connected to `keyIn`. */
 const makeCompressor: RackEffectFactory = (ctx, params) => {
   const input = ctx.createGain();
   const comp = ctx.createDynamicsCompressor();
   const makeup = ctx.createGain();
   input.connect(comp);
   comp.connect(makeup);
+  // Post-makeup: the key ducks what the compressor produced, which is where a
+  // sidechain sits on a console and what keeps the internal detector's own
+  // behaviour identical to the unkeyed version.
+  const { follower, audioOut } = makeKeyFollower(ctx, makeup, params);
   const setParams = (p: Record<string, number>) => {
     const t = ctx.currentTime;
     comp.threshold.setValueAtTime(clamp(p.threshold ?? -24, -60, 0), t);
@@ -1486,11 +1669,13 @@ const makeCompressor: RackEffectFactory = (ctx, params) => {
     comp.attack.setValueAtTime(clamp((p.attack ?? 10) / 1000, 0, 1), t);
     comp.release.setValueAtTime(clamp((p.release ?? 150) / 1000, 0, 1), t);
     ramp(makeup.gain, dbToGain(clamp(p.makeup ?? 0, 0, 24)), ctx);
+    follower.setParams(p);
   };
   setParams(params);
   return {
     input,
-    output: makeup,
+    output: audioOut,
+    keyIn: follower.keyIn,
     setParams,
     dispose: () => {
       try {
@@ -1500,6 +1685,7 @@ const makeCompressor: RackEffectFactory = (ctx, params) => {
       } catch {
         /* already gone */
       }
+      follower.dispose();
     },
   };
 };
@@ -2032,7 +2218,14 @@ export const RACK_EFFECTS: readonly RackEffectDef[] = [
     id: 'compressor',
     label: 'Compressor',
     group: 'EQ & Dynamics',
-    description: 'Dynamics compressor with makeup gain (threshold/ratio/attack/release).',
+    description:
+      'Dynamics compressor with makeup gain (threshold/ratio/attack/release), keyable from another strip.',
+    // The one keyable effect in the rack today. The other two candidates a
+    // sidechain UI usually offers do not exist here to key: there is no noise
+    // gate (`gater` is an LFO tremolo, whose opening is a phase and not a
+    // detector) and no separate ducker — a compressor keyed from another strip
+    // IS the ducker, which is why one is not added.
+    keyInput: true,
     params: [
       { key: 'threshold', label: 'Threshold', min: -60, max: 0, step: 0.5, default: -24, unit: 'dB', group: 'Detector' },
       { key: 'ratio', label: 'Ratio', min: 1, max: 20, step: 0.1, default: 3, unit: ':1', group: 'Detector' },
@@ -2040,6 +2233,12 @@ export const RACK_EFFECTS: readonly RackEffectDef[] = [
       { key: 'attack', label: 'Attack', min: 0, max: 200, step: 1, default: 10, unit: 'ms', group: 'Envelope' },
       { key: 'release', label: 'Release', min: 5, max: 1000, step: 5, default: 150, unit: 'ms', curve: 'log', group: 'Envelope' },
       { key: 'makeup', label: 'Makeup', min: 0, max: 24, step: 0.5, default: 0, unit: 'dB', group: 'Output' },
+      // The key follower. Inert until a `CONN_SIDECHAIN` edge connects something
+      // to `keyIn`, so these three change nothing on an unkeyed compressor
+      // whatever they are set to — see `makeKeyFollower`.
+      { key: 'keyDuck', label: 'Key Duck', min: 0, max: 48, step: 0.5, default: 12, unit: 'dB', group: 'Key', tip: 'How far the key signal pulls this down at full level. 0 = keyed but transparent.' },
+      { key: 'keySens', label: 'Key Sens', min: 0, max: 48, step: 0.5, default: 12, unit: 'dB', group: 'Key', tip: 'Gain into the key detector — at 12 dB a key peaking at -12 dBFS already ducks fully.' },
+      { key: 'keySmooth', label: 'Key Smooth', min: 1, max: 500, step: 1, default: 80, unit: 'ms', curve: 'log', group: 'Key', tip: 'Key envelope time constant. Short = it follows every transient; long = it breathes.' },
     ],
     xy: [{ label: 'Threshold / Ratio', x: 'threshold', y: 'ratio' }],
     presets: [
@@ -2055,6 +2254,14 @@ export const RACK_EFFECTS: readonly RackEffectDef[] = [
     // seconds and independent of sample rate and of every compressor param.
     // Source: W3C Web Audio API, §1.19.4 DynamicsCompressorNode "Processing"
     // (https://webaudio.github.io/web-audio-api/), read 2026-09-15.
+    //
+    // THE KEY FOLLOWER ADDS NOTHING TO THIS, and the zero is a statement rather
+    // than an omission: the declaration is `0.006 + KEY_FOLLOWER_LATENCY_SEC`,
+    // and that constant is 0 because every node the follower adds is on the
+    // CONTROL path — the one node it puts on the audio path is a `GainNode`.
+    // The value stays a plain number (not a function of the key params) because
+    // the number does not depend on them, and `rackEffects.latency.test.ts`
+    // reads it as one. `rackEffects.sidechain.test.ts` pins the sum.
     latencySec: 0.006,
     // The envelope follower's gain reduction is a function of everything that
     // came before it, over attack/release times up to a second. A chunk boundary

@@ -38,17 +38,30 @@
  * LATENCY GROUP instead and their reference is assembled by
  * `alignedLegacyMix`: one legacy render per group, each shifted by its own
  * declared latency, summed. Case E is the two-track minimum of it.
+ *
+ * T46C adds CASE F, and it is not a legacy diff either — the legacy bodies
+ * predate comping entirely, as they predate buses. Its reference is the LIVE
+ * strip, built by hand here (`liveStripRender`): `gain -> muteGain -> panner`,
+ * the shape `liveMixer.buildTrackNodes` makes, driven by the same
+ * `scheduleClipSources` the live engine drives, with the same take resolver
+ * (`takeIndex -> peekDecoded(takes[i].audioBlob)`) the live scheduler builds.
+ * That is what `export == preview` means for a comped clip, asserted as
+ * arithmetic rather than as a claim about the renderer: both sides decode
+ * through the one `lib/decodeCache` at 44.1 kHz and therefore read the SAME
+ * buffers, so any disagreement is the offline path resolving a different take
+ * or placing a segment differently.
  */
 import {
   BOUNCE_SAMPLE_RATE, encodeBounce, renderBounce, renderExtentSec, trimLeadingSec,
   type BounceRequest, type BounceScope, type RenderDeps,
 } from '../../src/lib/renderCore';
-import { decodeClipBlob } from '../../src/lib/decodeCache';
+import { isComped } from '../../src/lib/clipComp';
+import { decodeClipBlob, peekDecoded } from '../../src/lib/decodeCache';
 import { buildEffectChain } from '../../src/lib/rackEffects';
 import { encodeWav } from '../../src/lib/wavEncode';
-import { scheduleClipSources } from '../../src/state/liveMixer';
+import { scheduleClipSources, type TakeBufferResolver } from '../../src/state/liveMixer';
 import type {
-  AudioClip, EditorBus, EditorTrack, AutomationLane as AutomationLaneT,
+  AudioClip, ClipTake, EditorBus, EditorTrack, AutomationLane as AutomationLaneT,
 } from '../../src/state/editorStore';
 import {
   addBus, addSend, emptyGraph, ensureTrackNode, setOutput, type RoutingGraph,
@@ -255,6 +268,120 @@ function skewProject(): Project {
     clip({ id: 'S2-tail', trackId: 'S2', audioBlob: STEREO, startSec: 27, durationSec: 3 }),
   ];
   return { clips, tracks: [wet, dry], masterFxChain: [], automationLanes: [] };
+}
+
+/* ── Case F's project: a COMPED clip, two takes, one crossfaded boundary ──── */
+
+/** The two takes' audio, deliberately far apart in pitch: if the offline render
+ *  resolved the wrong take for a region, the diff is a whole tone generator out,
+ *  not a rounding difference. `TAKE_B` is also a different channel count, which
+ *  is the other thing a wrong resolution would show up as. */
+const TAKE_A = makeWav(2, 4.0, 220, 77);
+const TAKE_B = makeWav(1, 4.0, 880, 88);
+/** A third clip on the comped track that has NO takes at all, so the case also
+ *  asserts the ordinary path is untouched by the comped one beside it. */
+const PLAIN_SRC = makeWav(2, 4.0, 330, 99);
+
+const takeOf = (id: string, audioBlob: Blob): ClipTake => ({
+  id, label: id, audioBlob, mimeType: 'audio/wav', sourceDuration: 4, offsetIntoSource: 0,
+});
+
+/**
+ * One track carrying a comped clip and a plain one, and a second track carrying
+ * a plain clip — no rack anywhere, so nothing declares latency and the render
+ * trim is 0, which keeps the case about the comp and nothing else.
+ *
+ * The comp is the minimum the ticket names and the one that exercises both
+ * kinds of boundary: take A from the clip head, take B from 1.5 s with a 0.3 s
+ * crossfade at that boundary. ACTIVE TAKE 1, so the clip's mirrored fields hold
+ * take B — the invariant is then load-bearing in the reference as well as in
+ * the renderer, instead of being hidden by a default of 0.
+ */
+function compedProject(): Project {
+  const takes = [takeOf('K1-a', TAKE_A), takeOf('K1-b', TAKE_B)];
+  const tComp = track({ id: 'K1', name: 'comped', volume: 0.8, pan: -0.3 });
+  const tPlain = track({ id: 'K2', name: 'plain', volume: 0.7, pan: 0.35 });
+  const clips: AudioClip[] = [
+    clip({
+      id: 'K1-comped', trackId: 'K1', audioBlob: takes[1].audioBlob,
+      startSec: 0.25, durationSec: 3.5, fadeInSec: 0.3, fadeOutSec: 0.4, gain: 0.9,
+      takes,
+      activeTakeIndex: 1,
+      comp: [
+        { startSec: 0, takeIndex: 0 },
+        { startSec: 1.5, takeIndex: 1, crossfadeSec: 0.3 },
+      ],
+    }),
+    clip({ id: 'K1-plain', trackId: 'K1', audioBlob: PLAIN_SRC, startSec: 5, durationSec: 2.5 }),
+    clip({ id: 'K2-plain', trackId: 'K2', audioBlob: STEREO, startSec: 1, durationSec: 3 }),
+  ];
+  return { clips, tracks: [tComp, tPlain], masterFxChain: [], automationLanes: [] };
+}
+
+/**
+ * THE LIVE REFERENCE. `liveMixer.buildTrackNodes` builds `gain -> muteGain ->
+ * [fx] -> panner -> comp -> routing`, and `liveMixer.scheduleClips` hands each
+ * clip to `scheduleClipSources` with the buffer (or, for a comped clip, the take
+ * resolver) it peeked out of `lib/decodeCache`. With no rack, no mute, no solo
+ * and no routing, that strip is `gain -> muteGain -> panner -> master`, and
+ * every node of it but the fader and the panner is unity — so this renders the
+ * live graph, offline, from the top of the timeline.
+ *
+ * NOTHING HERE READS `renderCore`. The clip scheduling is the shared seam on
+ * purpose — that IS the thing being asserted — but the strip, the decode, the
+ * resolver and the summing are written out here from the live mixer's described
+ * shape, so a change to `renderCore`'s own graph cannot move this side with it.
+ *
+ * `nowSec = fromSec = 0`: playback from the top, where the context clock IS the
+ * timeline — the same pin the offline render makes.
+ */
+async function liveStripRender(p: Project, req: BounceRequest): Promise<Rendered> {
+  const sr = BOUNCE_SAMPLE_RATE;
+  const lengthSec = renderExtentSec(p.clips, req.scope);
+  const ctx = new OfflineAudioContext(2, Math.ceil(lengthSec * sr), sr);
+
+  // Decode every blob the clips can play — the clip's own and, for a comped
+  // clip, each take's — at the bounce rate, through the one shared cache.
+  const decodeCtx = new AudioContext({ sampleRate: sr });
+  try {
+    for (const c of p.clips) {
+      await decodeClipBlob(decodeCtx, c.audioBlob);
+      if (!isComped(c)) continue;
+      for (const t of c.takes ?? []) await decodeClipBlob(decodeCtx, t.audioBlob);
+    }
+  } finally {
+    decodeCtx.close().catch(() => {});
+  }
+
+  const anySolo = p.tracks.some((t) => t.solo);
+  const strips = new Map<string, GainNode>();
+  for (const t of p.tracks) {
+    const gain = ctx.createGain();
+    gain.gain.value = t.volume;
+    const muteGain = ctx.createGain();
+    muteGain.gain.value = t.mute || (anySolo && !t.solo) ? 0 : 1;
+    const panner = ctx.createStereoPanner();
+    panner.pan.value = Math.max(-1, Math.min(1, t.pan));
+    gain.connect(muteGain).connect(panner).connect(ctx.destination);
+    strips.set(t.id, gain);
+  }
+
+  for (const c of p.clips) {
+    if (c.muted) continue;
+    const gain = strips.get(c.trackId);
+    if (!gain) continue;
+    const takes = c.takes ?? [];
+    const resolver: TakeBufferResolver = (i) => {
+      const t = takes[i];
+      return t ? peekDecoded(ctx, t.audioBlob) : undefined;
+    };
+    const source = isComped(c) ? resolver : peekDecoded(ctx, c.audioBlob);
+    if (!source) continue;
+    scheduleClipSources(ctx, c, source, gain, 0, 0);
+  }
+
+  const rendered = await ctx.startRendering();
+  return { blob: encodeBounce(rendered, req), rendered };
 }
 
 /* ── Case D's project: ONE track, so the whole render is on the routed path ── */
@@ -502,7 +629,7 @@ async function compare(a: Blob, b: Blob, trimSec: number): Promise<Diff> {
 /* ── Cases ───────────────────────────────────────────────────────────────── */
 
 interface CaseResult {
-  renderer: 'A' | 'B' | 'C' | 'D' | 'E';
+  renderer: 'A' | 'B' | 'C' | 'D' | 'E' | 'F';
   name: string;
   /** Diff of the WAV files the app writes (16-bit PCM for all three today). */
   deltas: Delta[];
@@ -518,7 +645,7 @@ interface CaseResult {
 async function runCases(): Promise<CaseResult[]> {
   const out: CaseResult[] = [];
   const add = async (
-    renderer: 'A' | 'B' | 'C' | 'D' | 'E', name: string,
+    renderer: 'A' | 'B' | 'C' | 'D' | 'E' | 'F', name: string,
     run: () => Promise<{
       legacy: Rendered; core: Rendered; extra?: string;
       /** How far forward T14's render trim is EXPECTED to have moved the core
@@ -702,6 +829,79 @@ async function runCases(): Promise<CaseResult[]> {
         + 'ending on the render\'s last sample, so this asserts the padded context too: '
         + 'un-padded, S2\'s comp pushes that clip\'s last 6 ms past the end of the window '
         + 'and the trim zero-fills it.',
+    };
+  });
+
+  /* F — COMPING. `export == preview` for a clip that plays more than one take.
+     There is no legacy body: the three inline renderers predate takes entirely.
+     The reference is the LIVE strip (`liveStripRender`) — the node shape
+     `liveMixer.buildTrackNodes` makes, the resolver `liveMixer.scheduleClips`
+     builds, rendered offline from the top of the timeline — so the case asserts
+     the preview against the print rather than the renderer against itself.
+
+     Two takes (220 Hz stereo and 880 Hz MONO), one boundary at 1.5 s with a
+     0.3 s crossfade, ACTIVE TAKE 1. Beside it on the same track, and on a second
+     track, plain clips with no takes: those must come out untouched, so the case
+     is also a statement that the comped clip changes nothing around it.
+
+     WHAT MAKES IT BITE. Both sides read the SAME decoded buffers (one
+     `lib/decodeCache`, one rate), so the only way to differ is to resolve a
+     different take or to place a segment differently — and the takes are a
+     whole tone generator and a channel count apart, so either is max |Δ| near
+     full scale, not a rounding residual. Measured: with renderCore's resolver
+     mutated to answer take 0 for every index, this case reads max |Δ| 1.247
+     (ch0) / 7.980e-1 (ch1) — OVER GATE — while every other case stays
+     bit-identical.
+
+     WHAT IT ASSERTS, in full: the decode (both sides hold every take), the
+     resolution (each region reads its own take), the segment placement (the
+     boundary at 1.5 s) and the crossfade across it — because the same
+     `scheduleClipSources` walks `compSegments` on both sides, and a bounce that
+     placed a segment or a fade differently would land off the live strip. That
+     is the point of putting the shared behaviour in one function rather than
+     two: this case cannot go stale against the scheduler, because it IS the
+     scheduler on both sides of the diff.
+
+     No rack anywhere, so nothing declares latency and the render trim is 0. */
+  await add('F', 'comped · two takes, one 0.3 s crossfade · offline vs the live strip', async () => {
+    const p = compedProject();
+    const req: BounceRequest = {
+      scope: { kind: 'master' }, sampleRate: BOUNCE_SAMPLE_RATE,
+      includeFx: false, includeAutomation: false, includeTrackMix: true, float32: false,
+    };
+    const live = await seeded(() => liveStripRender(p, req));
+    const c = await seeded(() => core(p, req));
+    return {
+      legacy: live,
+      core: c,
+      expectTrimSec: 0,
+      extra: 'reference = the LIVE strip (gain -> muteGain -> panner) driven by the same '
+        + 'scheduleClipSources and the same take resolver, rendered offline from t = 0. '
+        + 'Both sides decode through the one decodeCache at 44.1 kHz, so they read the same '
+        + 'buffers and any delta is a take resolved or a segment placed differently.',
+    };
+  });
+
+  /* F2 — the same project with the comp REMOVED from the clip (its takes left
+     in place). A clip with takes and no comp is take SWITCHING: it plays its
+     active take and nothing about the render may change. Asserted against the
+     live strip the same way, so the non-comped path is pinned on both sides. */
+  await add('F', 'takes without a comp · take switching changes nothing', async () => {
+    const p = compedProject();
+    const comped = p.clips.find((c) => c.id === 'K1-comped')!;
+    comped.comp = [];
+    const req: BounceRequest = {
+      scope: { kind: 'master' }, sampleRate: BOUNCE_SAMPLE_RATE,
+      includeFx: false, includeAutomation: false, includeTrackMix: true, float32: false,
+    };
+    const live = await seeded(() => liveStripRender(p, req));
+    const c = await seeded(() => core(p, req));
+    return {
+      legacy: live,
+      core: c,
+      expectTrimSec: 0,
+      extra: 'the same project with comp = [] — the clip plays takes[activeTakeIndex] (its own '
+        + 'mirrored blob) on both sides, through the single-buffer path.',
     };
   });
 

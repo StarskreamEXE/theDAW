@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import {
   DEFAULT_BPM, DEFAULT_TEMPO_MAP, beatToTime, getBarAtBeat, getBarLength, getBeatAtBar, getBeatLength,
-  getSecPerBeatAt, getTempoAtBeat, normalizeTempoMap, timeToBeat, type TempoEvent, type TempoPoint,
+  getSecPerBeatAt, getTempoAtBeat, normalizeTempoMap, remapOnTempoChange, timeToBeat,
+  type TempoEvent, type TempoPoint,
 } from './tempoMap.ts';
 import { beatsFromSeconds, secondsFromBeats, type TempoEntry } from './notechart.ts';
 import type { MeterSegment } from './meterMap.ts';
@@ -15,7 +16,9 @@ const M68 = { num: 6, den: 8, groups: [3, 3] };
 // A seeded default: an empty or missing map is one 120 bpm event at beat 0.
 {
   assert.equal(DEFAULT_BPM, 120);
-  assert.deepEqual(normalizeTempoMap(undefined), [{ beat: 0, bpm: 120, timeSec: 0, secPerBeat: 0.5 }]);
+  // `slope` is the ramp field: 0 means "this segment holds", which is every
+  // segment of every map written before ramps existed.
+  assert.deepEqual(normalizeTempoMap(undefined), [{ beat: 0, bpm: 120, timeSec: 0, secPerBeat: 0.5, slope: 0 }]);
   assert.deepEqual(normalizeTempoMap([]), normalizeTempoMap(null));
   assert.deepEqual(normalizeTempoMap(DEFAULT_TEMPO_MAP), normalizeTempoMap([]));
   assert.equal(getTempoAtBeat(undefined, 0), 120);
@@ -296,6 +299,185 @@ const M68 = { num: 6, den: 8, groups: [3, 3] };
       assert.equal(beatToTime(events, beat), refBeatToTime(beat), `boundary beatToTime(${beat})`);
     }
   }
+}
+
+/* ========================= tempo ramps ==================================== */
+
+/**
+ * The reference the closed form is checked against: Simpson's rule on
+ * `60 / bpm(b)` with the bpm interpolated linearly in BEATS. Nothing about the
+ * implementation is reused here — it is the definition of the integral, and
+ * nothing else, so agreement is evidence and not a tautology.
+ */
+function integrateRamp(b0: number, v0: number, b1: number, v1: number, beat: number, steps = 20000): number {
+  const bpmAt = (u: number): number => v0 + ((v1 - v0) * (u - b0)) / (b1 - b0);
+  const f = (u: number): number => 60 / bpmAt(u);
+  const n = steps % 2 === 0 ? steps : steps + 1;
+  const h = (beat - b0) / n;
+  if (h === 0) return 0;
+  let sum = f(b0) + f(beat);
+  for (let i = 1; i < n; i += 1) sum += f(b0 + i * h) * (i % 2 === 1 ? 4 : 2);
+  return (h / 3) * sum;
+}
+
+// The closed form IS the integral: 1e-6 against numeric integration, over
+// ramps up, down, shallow and steep, sampled all the way across each segment.
+{
+  const ramps: [number, number, number, number][] = [
+    [0, 120, 16, 90],     // down
+    [0, 90, 16, 174],     // up
+    [0, 128, 32, 128.5],  // shallow: the case a naive ln(v1/v0) loses to cancellation
+    [0, 20, 8, 300],      // the whole clamp range in eight beats
+    [4, 174, 12, 60],     // not starting at beat 0
+  ];
+  for (const [b0, v0, b1, v1] of ramps) {
+    const map: TempoEvent[] = [{ beat: b0, bpm: v0, curve: 'linear' }, { beat: b1, bpm: v1 }];
+    const t0 = beatToTime(map, b0);
+    for (let i = 0; i <= 40; i += 1) {
+      const beat = b0 + ((b1 - b0) * i) / 40;
+      const want = t0 + integrateRamp(b0, v0, b1, v1, beat);
+      const got = beatToTime(map, beat);
+      assert.ok(Math.abs(got - want) < 1e-6, `ramp ${v0}->${v1} at beat ${beat}: ${got} !~ ${want}`);
+      // ... and the inverse lands back on the beat it came from.
+      near(timeToBeat(map, got), beat, 1e-9);
+    }
+    // The far end of the ramp is the next event's own seconds, so the segment
+    // after it starts exactly where the ramp stopped — no seam.
+    near(beatToTime(map, b1), t0 + integrateRamp(b0, v0, b1, v1, b1), 1e-6);
+  }
+}
+
+// A ramp is strictly monotonic in both directions, and the tempo it reports
+// walks linearly from one event to the next.
+{
+  const map: TempoEvent[] = [{ beat: 0, bpm: 90, curve: 'linear' }, { beat: 16, bpm: 174 }, { beat: 32, bpm: 60 }];
+  let prevSec = -Infinity;
+  let prevBeat = -Infinity;
+  for (let i = 0; i <= 2000; i += 1) {
+    const beat = -8 + (i / 2000) * 56;
+    const sec = beatToTime(map, beat);
+    assert.ok(sec > prevSec, `beatToTime must rise: ${sec} after ${prevSec} at beat ${beat}`);
+    prevSec = sec;
+    const back = timeToBeat(map, -4 + (i / 2000) * 40);
+    assert.ok(back > prevBeat, `timeToBeat must rise: ${back} after ${prevBeat}`);
+    prevBeat = back;
+  }
+  // bpm(b) = v0 + k·Δb over the ramp; the step segment after it holds.
+  assert.equal(getTempoAtBeat(map, 0), 90);
+  assert.equal(getTempoAtBeat(map, 8), 132); // halfway between 90 and 174
+  near(getTempoAtBeat(map, 4), 90 + 84 * 0.25);
+  assert.equal(getTempoAtBeat(map, 16), 174); // the event owns its own beat
+  assert.equal(getTempoAtBeat(map, 24), 174); // step: it holds
+  assert.equal(getTempoAtBeat(map, 32), 60);
+  assert.equal(getTempoAtBeat(map, 1e6), 60); // the last event has nothing to ramp to
+  assert.equal(getSecPerBeatAt(map, 8), 60 / 132);
+  assert.equal(getSecPerBeatAt(map, 24), 60 / 174);
+  // In FRONT of the first event a ramp does not run backwards: its start tempo
+  // extends, exactly as a step event's always has.
+  assert.equal(getTempoAtBeat(map, -4), 90);
+  assert.equal(beatToTime(map, -4), beatToTime([{ beat: 0, bpm: 90 }], -4));
+}
+
+// A ramp changes NOTHING for a map that does not use one, and the shapes that
+// cannot ramp fall back to a step bit-for-bit.
+{
+  const step: TempoEvent[] = [{ beat: 0, bpm: 120 }, { beat: 16, bpm: 90 }, { beat: 32, bpm: 174 }];
+  const spelled: TempoEvent[] = step.map((e) => ({ ...e, curve: 'step' as const }));
+  // A 'linear' LAST event: nothing to ramp to.
+  const lastLinear: TempoEvent[] = [{ beat: 0, bpm: 120 }, { beat: 16, bpm: 90 }, { beat: 32, bpm: 174, curve: 'linear' }];
+  // A 'linear' event whose next tempo is the SAME: k = 0, so the integral is
+  // the plain product — and must be the very same float, not merely close.
+  const flat: TempoEvent[] = [{ beat: 0, bpm: 120, curve: 'linear' }, { beat: 16, bpm: 120 }];
+  const flatStep: TempoEvent[] = [{ beat: 0, bpm: 120 }, { beat: 16, bpm: 120 }];
+  for (const b of [-4, 0, 1 / 3, 7.5, 16, 23.75, 32, 40.125, 1e4]) {
+    assert.equal(beatToTime(spelled, b), beatToTime(step, b), `explicit 'step' at ${b}`);
+    assert.equal(beatToTime(lastLinear, b), beatToTime(step, b), `trailing 'linear' at ${b}`);
+    assert.equal(beatToTime(flat, b), beatToTime(flatStep, b), `zero-slope ramp at ${b}`);
+    assert.equal(getTempoAtBeat(flat, b), getTempoAtBeat(flatStep, b));
+  }
+  for (const s of [-2, 0, 0.75, 8, 12.5, 20, 1e3]) {
+    assert.equal(timeToBeat(spelled, s), timeToBeat(step, s));
+    assert.equal(timeToBeat(lastLinear, s), timeToBeat(step, s));
+    assert.equal(timeToBeat(flat, s), timeToBeat(flatStep, s));
+  }
+  // The normalized shape says it too: a step segment's slope is 0.
+  assert.deepEqual(normalizeTempoMap(spelled).map((p) => p.slope), [0, 0, 0]);
+  assert.deepEqual(normalizeTempoMap(lastLinear).map((p) => p.slope), [0, 0, 0]);
+  assert.deepEqual(normalizeTempoMap(flat).map((p) => p.slope), [0, 0]);
+  assert.deepEqual(normalizeTempoMap([{ beat: 0, bpm: 90, curve: 'linear' }, { beat: 16, bpm: 174 }]).map((p) => p.slope), [84 / 16, 0]);
+}
+
+// Ramps do not defeat the identity cache, and normalizing one still costs once.
+{
+  const ramp: TempoEvent[] = [{ beat: 0, bpm: 90, curve: 'linear' }, { beat: 32, bpm: 150 }];
+  const first = normalizeTempoMap(ramp);
+  assert.equal(normalizeTempoMap(ramp), first, 'same array -> same normalized points');
+  assert.notEqual(normalizeTempoMap([...ramp]), first, 'a new array normalizes again');
+  assert.ok(Object.isFrozen(first));
+  assert.ok(Object.isFrozen(first[0]));
+  beatToTime(ramp, 0);
+  const t0 = performance.now();
+  let sink = 0;
+  for (let i = 0; i < 20000; i += 1) sink += beatToTime(ramp, (i / 20000) * 32);
+  const elapsed = performance.now() - t0;
+  assert.ok(Number.isFinite(sink));
+  // Reported, never asserted: a wall clock on a machine running three other
+  // suites at once measures the machine, not the code. What IS asserted is the
+  // thing that would make it slow — the cache still returning one array above.
+  console.info(`  tempoMap: 20 000 ramped beatToTime calls in ${elapsed.toFixed(1)} ms`);
+}
+
+/* ===================== remapOnTempoChange ================================= */
+{
+  const prev: TempoEvent[] = [{ beat: 0, bpm: 120 }];
+  const next: TempoEvent[] = [{ beat: 0, bpm: 60 }];
+  // Beat-anchored items move to their beat's new seconds; second-anchored ones
+  // (no `beat`) do not move at all.
+  assert.deepEqual(
+    remapOnTempoChange(prev, next, [{ beat: 0, sec: 0 }, { beat: 4, sec: 2 }, { sec: 2 }, { beat: 8, sec: 4 }]),
+    [0, 4, 2, 8],
+  );
+  // A halved tempo doubles every musical position, and nothing else.
+  assert.deepEqual(remapOnTempoChange(prev, next, []), []);
+  // An unchanged map moves nothing — the same array, or one that normalizes the
+  // same way (both empty maps are the seeded 120 default).
+  assert.deepEqual(remapOnTempoChange(prev, prev, [{ beat: 4, sec: 999 }]), [999]);
+  assert.deepEqual(remapOnTempoChange([], null, [{ beat: 4, sec: 999 }]), [999]);
+  // ... and two DISTINCT arrays with equal content are an unchanged map too.
+  // This is the undo-back-onto-the-same-tempo case: identity differs, so only a
+  // point-by-point comparison can stop every clip being nudged by a rounding
+  // error. `sec: 999` is deliberately not where beat 4 is — a recomputation
+  // would return 2 and be caught here.
+  const twin: TempoEvent[] = [{ beat: 0, bpm: 120 }];
+  assert.notEqual(twin as unknown, prev as unknown);
+  assert.notEqual(normalizeTempoMap(twin), normalizeTempoMap(prev), 'distinct arrays normalize to distinct objects');
+  assert.deepEqual(remapOnTempoChange(prev, twin, [{ beat: 4, sec: 999 }, { sec: 7 }]), [999, 7]);
+  // A ramp map rebuilt event-for-event is the same map as well, curve included.
+  const rampA: TempoEvent[] = [{ beat: 0, bpm: 90, curve: 'linear' }, { beat: 16, bpm: 174 }];
+  const rampB: TempoEvent[] = [{ beat: 0, bpm: 90, curve: 'linear' }, { beat: 16, bpm: 174 }];
+  assert.deepEqual(remapOnTempoChange(rampA, rampB, [{ beat: 8, sec: 999 }]), [999]);
+  // But a real difference — even only in the CURVE — does move things.
+  const stepped: TempoEvent[] = [{ beat: 0, bpm: 90 }, { beat: 16, bpm: 174 }];
+  assert.deepEqual(
+    remapOnTempoChange(rampA, stepped, [{ beat: 8, sec: beatToTime(rampA, 8) }]),
+    [beatToTime(stepped, 8)],
+  );
+  assert.notEqual(beatToTime(rampA, 8), beatToTime(stepped, 8), 'the ramp and the step really do differ at beat 8');
+  // A junk beat is not a musical anchor: the item keeps its seconds.
+  assert.deepEqual(remapOnTempoChange(prev, next, [{ beat: Number.NaN, sec: 3 }]), [3]);
+  // Into and out of a ramp: the remapped seconds are exactly `beatToTime(next)`.
+  const ramped: TempoEvent[] = [{ beat: 0, bpm: 120, curve: 'linear' }, { beat: 16, bpm: 60 }, { beat: 32, bpm: 174 }];
+  const beats = [0, 3.5, 16, 24, 40];
+  assert.deepEqual(
+    remapOnTempoChange(prev, ramped, beats.map((beat) => ({ beat, sec: beatToTime(prev, beat) }))),
+    beats.map((beat) => beatToTime(ramped, beat)),
+  );
+  // ... and remapping BACK returns the original seconds, so the helper is the
+  // inverse of itself across a pair of maps.
+  assert.deepEqual(
+    remapOnTempoChange(ramped, prev, beats.map((beat) => ({ beat, sec: beatToTime(ramped, beat) }))),
+    beats.map((beat) => beatToTime(prev, beat)),
+  );
 }
 
 console.log('tempoMap: ok');

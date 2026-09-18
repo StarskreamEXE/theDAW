@@ -35,6 +35,8 @@ import { schemaForRackEffect } from './effects/effectSchema';
 import { VstEmbedHost } from './VstEmbedHost';
 import { GanPluginStage } from './GanPluginStage';
 import { useEditorStore } from '../../state/editorStore';
+import { sidechainsInto, wouldCycle, type RoutingRefusal } from '../../state/routingGraph';
+import { requireFeature } from '../../notices/featureGateStore';
 import { useVstEditorStore } from '../../state/vstEditorStore';
 import { useGanStore } from '../../state/ganStore';
 import { EFFECT_LABELS, type ChainEntry } from '../../state/effectChainStore';
@@ -235,6 +237,91 @@ function reorderEntry(scope: FxScope, from: number, to: number): void {
   else if (scope.kind === 'masterVst') st.reorderMasterVst(from, to);
   else st.reorderTrackEffect(scope.trackId, from, to);
 }
+
+// ── "Key from": the sidechain picker ─────────────────────────────────────────
+
+/** Why the graph said no, in the picker's own words. Only `'cycle'` is
+ *  reachable from a list that offers other strips and nothing else; the rest are
+ *  named rather than swallowed, because a silent no-op on a `<select>` that
+ *  visibly moved is the worst outcome. */
+function keyRefusalMessage(reason: RoutingRefusal): string {
+  if (reason === 'cycle') {
+    return 'That strip already receives this one, so keying from it would feed the mix back '
+      + 'into itself — which in Web Audio is silence, not feedback.';
+  }
+  return `The routing graph refused the key (${reason}).`;
+}
+
+/**
+ * The "Key from" `<select>`: choose which strip's output drives this effect's
+ * key input, or none.
+ *
+ * Its own component so it can hold hooks — the card renders it only for an
+ * effect that declares `keyInput`, and hooks cannot be called conditionally.
+ *
+ * An option that would close a loop is DISABLED rather than offered and then
+ * rejected (`MixerStrips`' output picker does the same), because the model's
+ * `wouldCycle` is the same predicate the store will apply. A refusal that gets
+ * through anyway — the store is the authority, and the graph can move between
+ * render and click — is surfaced as a notice.
+ */
+const KeyFromPicker: React.FC<{ nodeId: string; entryId: string; label: string }> = ({
+  nodeId, entryId, label,
+}) => {
+  const routing = useEditorStore((s) => s.routing);
+  const tracks = useEditorStore((s) => s.tracks);
+  const buses = useEditorStore((s) => s.buses);
+  const setEffectSidechain = useEditorStore((s) => s.setEffectSidechain);
+  const selectId = `fxwin-key-${entryId}`;
+
+  // The entry's current key, straight off the graph — no mirrored state, so an
+  // undo or a mixer edit moves this select with it.
+  const current = sidechainsInto(routing, nodeId).find((e) => e.targetEntryId === entryId)?.from ?? '';
+
+  // Every OTHER track, then every bus. The master is not offered: it is
+  // downstream of everything, so keying from it is a loop by definition.
+  const sources = [
+    ...tracks.filter((t) => t.id !== nodeId).map((t) => ({ id: t.id, name: t.name })),
+    ...buses.filter((b) => b.id !== nodeId).map((b) => ({ id: b.id, name: b.name })),
+  ];
+
+  return (
+    <div className="flex items-center gap-2 rounded border border-purple-500/20 bg-purple-500/5 px-2 py-1.5">
+      <label htmlFor={selectId} className="font-display text-xs font-bold uppercase tracking-wider text-purple-300/80 shrink-0">
+        Key from
+      </label>
+      <select
+        id={selectId}
+        name={selectId}
+        value={current}
+        title={`Sidechain key input for ${label}`}
+        onChange={(e) => {
+          const next = e.target.value;
+          const refusal = setEffectSidechain({ kind: 'track', id: nodeId }, entryId, next || null);
+          if (!refusal) return;
+          requireFeature({
+            id: 'routing:refused',
+            kind: 'error',
+            title: 'That key was refused',
+            message: keyRefusalMessage(refusal),
+            autoDismissMs: 6000,
+          });
+        }}
+        className="flex-1 min-w-0 rounded-md bg-white/5 border border-white/10 px-1 py-0.5 text-xs text-zinc-300 hover:text-white focus:outline-hidden focus:ring-1 focus:ring-[rgb(var(--et-accent))]"
+      >
+        <option value="">None</option>
+        {sources.map((s) => {
+          const loops = wouldCycle(routing, s.id, nodeId);
+          return (
+            <option key={s.id} value={s.id} disabled={loops && s.id !== current}>
+              {loops ? `${s.name} (would feed back)` : s.name}
+            </option>
+          );
+        })}
+      </select>
+    </div>
+  );
+};
 
 // ── The floating window card ─────────────────────────────────────────────────
 
@@ -458,7 +545,14 @@ const EffectWindowCard: React.FC<{
           </div>
         )
       ) : (
-        <div className="p-2 overflow-y-auto min-h-0">
+        <div className="p-2 overflow-y-auto min-h-0 flex flex-col gap-2">
+          {/* The key picker, for an effect that takes one. TRACK scope only:
+              `wireRoutingGraph` keys track and bus racks, and a bus rack has no
+              window here, so a track window is the whole surface. The master
+              rack is downstream of the sum and is deliberately not keyable. */}
+          {win.scope.kind === 'track' && getRackEffect(entry.effect)?.keyInput && (
+            <KeyFromPicker nodeId={win.scope.trackId} entryId={entry.id} label={label} />
+          )}
           <FxRack
             chain={[entry]}
             idPrefix={`fxwin-${entry.id}`}

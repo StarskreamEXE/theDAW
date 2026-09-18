@@ -5,8 +5,9 @@
  * blocks run in order and each one states the tempo/meter/anchor it needs.
  */
 import assert from 'node:assert/strict';
-import { CLOCK_LEAD_SEC, beatClock, type ClockGrid } from './beatClock.ts';
+import { CLOCK_BPM_MAX, CLOCK_BPM_MIN, CLOCK_LEAD_SEC, beatClock, clampClockBpm, type ClockGrid } from './beatClock.ts';
 import type { MeterSegment } from './meterMap.ts';
+import { beatToTime, type TempoEvent } from './tempoMap.ts';
 
 const M78 = { num: 7, den: 8, groups: [3, 2, 2] };
 const M44 = { num: 4, den: 4, groups: [] };
@@ -209,6 +210,241 @@ beatClock.setBeatsPerBar(7);
   off();
   beatClock.setBpm(120, 'edit');
   assert.deepEqual(seen, [128]);
+}
+
+/* ===================== the clock holds a tempo MAP ======================== */
+
+// The app's one tempo clamp, exported so the store reuses it instead of
+// inventing a third range. The numbers are the ones `setBpm` has always had.
+{
+  assert.equal(CLOCK_BPM_MIN, 20);
+  assert.equal(CLOCK_BPM_MAX, 300);
+  assert.equal(clampClockBpm(1), 20);
+  assert.equal(clampClockBpm(9999), 300);
+  assert.equal(clampClockBpm(128.5), 128.5);
+}
+
+// --- a tempo CHANGE: 120 until beat 8, then 60, 4/4, bar 0 at t = 0 ---------
+{
+  const MAP: TempoEvent[] = [{ beat: 0, bpm: 120 }, { beat: 8, bpm: 60 }];
+  beatClock.setMeterMap([{ bar: 0, meter: M44 }]);
+  beatClock.setTempoMap(MAP);
+  beatClock.setAnchor(0, 0);
+  assert.deepEqual(beatClock.tempoMap, MAP);
+  // The scalar reports where the map STARTS; it cannot say more than that.
+  assert.equal(beatClock.bpm, 120);
+  assert.equal(beatClock.beatSec(), 0.5);
+  // Bars start at beats 0, 4, 8, 12, 16 -> 0, 2, 4, 8, 12 s (4 s of 120 bpm,
+  // then 1 s a beat). The old scalar closed form would say 0, 2, 4, 6, 8.
+  assert.deepEqual([0, 1, 2, 3, 4].map((b) => beatClock.timeOf(b)), [0, 2, 4, 8, 12]);
+  // A step INTO a bar is a fraction of the bar's beats, converted — not a
+  // fraction of a bar length computed at the starting tempo.
+  assert.equal(beatClock.timeOf(2, 8, 16), 6);
+  assert.equal(beatClock.timeOf(1, 8, 16), 3); // still inside the 120 bpm run
+  // nextGrid walks the map: bar 3 is at 8 s, not at the 6 s even spacing.
+  assert.deepEqual([0, 0.1, 4, 4.1, 8].map((t) => beatClock.nextGrid('bar', t)), [0, 2, 4, 8, 8]);
+  assert.deepEqual([0.1, 4.1].map((t) => beatClock.nextGrid('2bar', t)), [4, 12]);
+  assert.deepEqual([0.1, 4.1].map((t) => beatClock.nextGrid('half', t)), [1, 6]);
+  // ... and so do the sub-beat grids, which used to be uniform in seconds.
+  assert.deepEqual([0.1, 4.1].map((t) => beatClock.nextGrid('beat', t)), [0.5, 5]);
+  assert.deepEqual([0.1, 4.1].map((t) => beatClock.nextGrid('8th', t)), [0.25, 4.5]);
+  assert.deepEqual([0.1, 4.1].map((t) => beatClock.nextGrid('16th', t)), [0.125, 4.25]);
+  assert.equal(beatClock.nextGrid('now', 4.1), 4.1);
+  // phase reads through the map too: 6 s is beat 10, i.e. bar 2 beat 2.
+  assert.deepEqual(beatClock.phase(6), { bar: 2, beat: 2, sixteenth: 0, beatFrac: 0, barFrac: 0.5 });
+  assert.deepEqual(beatClock.phase(4), { bar: 2, beat: 0, sixteenth: 0, beatFrac: 0, barFrac: 0 });
+}
+
+// --- a RAMP: 60 bpm rising linearly to 120 over 16 beats --------------------
+{
+  const RAMP: TempoEvent[] = [{ beat: 0, bpm: 60, curve: 'linear' }, { beat: 16, bpm: 120 }];
+  beatClock.setTempoMap(RAMP);
+  beatClock.setAnchor(0, 0);
+  const at = (beat: number): number => beatToTime(RAMP, beat);
+  // Every grid line is the seconds of a grid BEAT under the ramp — the whole
+  // point of the map reaching nextGrid.
+  for (const [grid, unit] of [['bar', 4], ['2bar', 8], ['half', 2], ['beat', 1], ['8th', 0.5], ['16th', 0.25]] as const) {
+    for (const beat of [0.5, 3.9, 7, 15.5, 20]) {
+      const t = at(beat);
+      const line = beatClock.nextGrid(grid, t);
+      const n = Math.ceil(beat / unit - 1e-9);
+      assert.ok(Math.abs(line - at(n * unit)) < 1e-9, `nextGrid(${grid}) at beat ${beat}: ${line} !~ ${at(n * unit)}`);
+      assert.ok(line >= t - 1e-9, `nextGrid(${grid}) must not land in the past`);
+    }
+  }
+  // A ramp is slower at the start, so the first bar takes longer than the last:
+  // the lines are NOT evenly spaced, which the scalar form could never produce.
+  const bars = [0, 1, 2, 3, 4].map((b) => beatClock.timeOf(b));
+  const gaps = bars.slice(1).map((s, i) => s - bars[i]);
+  for (let i = 1; i < gaps.length; i += 1) assert.ok(gaps[i] < gaps[i - 1], 'a rising ramp shortens every bar');
+  assert.equal(bars[0], 0);
+  assert.ok(Math.abs(bars[4] - at(16)) < 1e-12);
+  // phase runs forward through it without a jump.
+  let prevBar = -1;
+  for (let i = 0; i <= 200; i += 1) {
+    const p = beatClock.phase((i / 200) * at(16));
+    assert.ok(p.bar >= prevBar && p.bar <= 4, `bar must not go backwards: ${p.bar} after ${prevBar}`);
+    assert.ok(p.beatFrac >= 0 && p.barFrac >= 0);
+    prevBar = p.bar;
+  }
+}
+
+// --- clamping, empty maps, and collapsing back to a constant tempo ----------
+{
+  // Every event is clamped to the clock's range, and only the events that
+  // needed it are rewritten (the caller's array is never mutated).
+  const wild: TempoEvent[] = [{ beat: 0, bpm: 9999 }, { beat: 8, bpm: 1 }, { beat: 16, bpm: 174 }];
+  beatClock.setTempoMap(wild);
+  assert.deepEqual(beatClock.tempoMap.map((e) => e.bpm), [300, 20, 174]);
+  assert.deepEqual(wild.map((e) => e.bpm), [9999, 1, 174], 'the input array is left alone');
+  assert.equal(beatClock.bpm, 300);
+  // An already-legal map is stored by identity, so `tempoMap.ts`'s cache hits
+  // and pushing the SAME array again is a true no-op: no re-anchor, and — the
+  // part a subscriber can see — no event. `tempoStore` pushes on every store
+  // change, so a store edit that left the map alone must not wake the app.
+  const legal: TempoEvent[] = [{ beat: 0, bpm: 90 }, { beat: 16, bpm: 140 }];
+  beatClock.setTempoMap(legal);
+  assert.equal(beatClock.bpm, 90);
+  let emits = 0;
+  const offNoop = beatClock.subscribe(() => { emits += 1; });
+  const anchor = beatClock.state.anchor;
+  for (let i = 0; i < 5; i += 1) beatClock.setTempoMap(legal);
+  assert.equal(emits, 0, 'the same array five times emits nothing');
+  assert.equal(beatClock.state.anchor, anchor, 'and does not re-anchor');
+  // A DIFFERENT array with the same content is a real install (identity is all
+  // the clock can cheaply know), so it emits exactly once per call.
+  beatClock.setTempoMap([...legal]);
+  assert.equal(emits, 1);
+  beatClock.setTempoMap([{ beat: 0, bpm: 128 }]);
+  assert.equal(emits, 2);
+  // setBpm's own no-op survives: one event, the same bpm, and the same source
+  // (the block above left it on 'edit'), so there is nothing to do.
+  assert.equal(beatClock.state.source, 'edit');
+  beatClock.setBpm(128, 'edit');
+  assert.equal(emits, 2, 'same bpm, same source, one event: nothing happens');
+  // A MULTI-event map collapses even at the same starting tempo, though —
+  // `setBpm` means constant tempo, and the map is not.
+  beatClock.setTempoMap([{ beat: 0, bpm: 128 }, { beat: 8, bpm: 90 }]);
+  assert.equal(emits, 3);
+  beatClock.setBpm(128, 'edit');
+  assert.equal(emits, 4, 'the map collapses back to one event');
+  assert.equal(beatClock.tempoMap.length, 1);
+  offNoop();
+  beatClock.setTempoMap(legal);
+  assert.equal(emits, 4, 'an unsubscribed listener hears nothing');
+  // An empty or missing map leaves the tempo where it is, as one event.
+  beatClock.setTempoMap([]);
+  assert.deepEqual(beatClock.tempoMap, [{ beat: 0, bpm: 90 }]);
+  beatClock.setTempoMap(legal);
+  beatClock.setTempoMap(null);
+  assert.equal(beatClock.bpm, 90);
+  // setBpm is the constant-tempo shorthand: it replaces the whole map, even
+  // when the bpm it is handed is the one already showing.
+  beatClock.setTempoMap(legal);
+  assert.equal(beatClock.tempoMap.length, 2);
+  beatClock.setBpm(90, 'edit');
+  assert.deepEqual(beatClock.tempoMap, [{ beat: 0, bpm: 90 }]);
+  assert.equal(beatClock.bpm, 90);
+}
+
+// --- the clock's map carries NO authoritative seconds -----------------------
+// A single event that pinned beat 4 at 10 s would put beat 0 at 8 s, and then
+// `nextGrid`'s constant-tempo closed form (which measures from the anchor)
+// would disagree with `timeOf` / `phase` (which measure through the map) by a
+// constant 8 s. The clock is a live phase, not a score: it rebases.
+{
+  beatClock.setMeterMap([{ bar: 0, meter: M44 }]);
+  beatClock.setTempoMap([{ beat: 4, bpm: 120, timeSec: 10 }]);
+  beatClock.setAnchor(0, 0);
+  assert.deepEqual(beatClock.tempoMap, [{ beat: 4, bpm: 120 }], 'the seconds are dropped on the way in');
+  assert.equal(beatClock.bpm, 120);
+  // Beat 0 is at the anchor, so all three agree.
+  assert.equal(beatClock.timeOf(0), 0);
+  assert.equal(beatClock.timeOf(1), 2);
+  assert.equal(beatClock.nextGrid('bar', 0.1), 2);
+  assert.equal(beatClock.nextGrid('beat', 0.1), 0.5);
+  assert.deepEqual(beatClock.phase(0), { bar: 0, beat: 0, sixteenth: 0, beatFrac: 0, barFrac: 0 });
+  assert.deepEqual(beatClock.phase(2), { bar: 1, beat: 0, sixteenth: 0, beatFrac: 0, barFrac: 0 });
+  // Every grid line agrees with the map it was quantized against.
+  for (const t of [0, 0.1, 1.9, 2, 5.5]) {
+    assert.equal(beatClock.nextGrid('bar', t), beatClock.timeOf(Math.ceil(t / 2 - 1e-9)), `bar line at ${t}`);
+  }
+  // The same is true of a MULTI-event map: seconds are dropped from every event.
+  beatClock.setTempoMap([{ beat: 0, bpm: 120, timeSec: 99 }, { beat: 8, bpm: 60, timeSec: 199 }]);
+  beatClock.setAnchor(0, 0);
+  assert.deepEqual(beatClock.tempoMap, [{ beat: 0, bpm: 120 }, { beat: 8, bpm: 60 }]);
+  assert.deepEqual([0, 1, 2, 3].map((b) => beatClock.timeOf(b)), [0, 2, 4, 8]);
+  // A curve survives the rewrite even though the seconds do not.
+  beatClock.setTempoMap([{ beat: 0, bpm: 60, curve: 'linear', timeSec: 5 }, { beat: 16, bpm: 120 }]);
+  assert.deepEqual(beatClock.tempoMap, [{ beat: 0, bpm: 60, curve: 'linear' }, { beat: 16, bpm: 120 }]);
+  assert.equal(beatClock.timeOf(0), beatClock.state.anchor);
+}
+
+// --- timeOf INTO a bar under a ramp, and under a changing meter as well -----
+{
+  const RAMP: TempoEvent[] = [{ beat: 0, bpm: 60, curve: 'linear' }, { beat: 16, bpm: 120 }];
+  beatClock.setMeterMap([{ bar: 0, meter: M44 }]);
+  beatClock.setTempoMap(RAMP);
+  beatClock.setAnchor(0, 0);
+  // A step into the bar is a fraction of its BEATS, converted through the ramp
+  // — not a fraction of a bar length computed at the starting tempo, which is
+  // what the closed form would have said (and is 0.5 s longer here).
+  assert.equal(beatClock.timeOf(1, 8, 16), beatToTime(RAMP, 6));
+  assert.equal(beatClock.timeOf(2, 4, 16), beatToTime(RAMP, 9));
+  assert.equal(beatClock.timeOf(3, 12, 8), beatToTime(RAMP, 12 + 6)); // 12 of 8 steps = 1.5 bars on
+  assert.notEqual(beatClock.timeOf(1, 8, 16), beatClock.timeOf(1) + 0.5 * beatClock.barSec(1));
+  // Zero steps is still the bar line itself, on the same path as before.
+  assert.equal(beatClock.timeOf(2, 0, 16), beatToTime(RAMP, 8));
+
+  // ... and with a meter map that CHANGES as well: 4/4, 7/8 at bar 2, 4/4 at
+  // bar 4 -> bars start at beats 0, 4, 8, 11.5, 15, 19. Both maps are read at
+  // once: the bar line comes from the meter, its seconds from the ramp.
+  const BARS = [0, 4, 8, 11.5, 15, 19];
+  beatClock.setMeterMap([{ bar: 0, meter: M44 }, { bar: 2, meter: M78 }, { bar: 4, meter: M44 }]);
+  beatClock.setAnchor(0, 0);
+  assert.deepEqual(BARS.map((_, b) => beatClock.timeOf(b)), BARS.map((beat) => beatToTime(RAMP, beat)));
+  // Half of a 7/8 bar is 1.75 quarter notes, and those are ramped too.
+  assert.equal(beatClock.timeOf(2, 8, 16), beatToTime(RAMP, 8 + 1.75));
+  assert.equal(beatClock.timeOf(4, 8, 16), beatToTime(RAMP, 15 + 2)); // 4/4 again
+  // nextGrid walks the same uneven bar lines. Ask from the MIDDLE of each bar:
+  // `nextBarLine` snaps anything within ~1e-6 of a line onto it, so a query a
+  // microsecond past a bar line would legitimately return that line again.
+  for (let b = 1; b < BARS.length; b += 1) {
+    const mid = beatToTime(RAMP, (BARS[b - 1] + BARS[b]) / 2);
+    assert.equal(beatClock.nextGrid('bar', mid), beatToTime(RAMP, BARS[b]), `bar ${b}`);
+  }
+  // The bars are neither equal in beats nor equal in seconds: the two maps are
+  // both really being read, and a ramp keeps shortening what the meter sets.
+  const secs = BARS.map((beat) => beatToTime(RAMP, beat));
+  const gaps = secs.slice(1).map((s, i) => s - secs[i]);
+  assert.ok(gaps[1] < gaps[0], 'same meter, faster ramp: bar 1 is shorter than bar 0');
+  assert.ok(gaps[2] < gaps[1], 'the 7/8 bar is shorter again — fewer beats AND faster');
+  assert.ok(gaps[3] < gaps[2], 'two 7/8 bars, same beats: only the ramp separates them');
+  // Back in 4/4 the bar grows despite the faster tempo, because it is half a
+  // beat longer. If the meter were being ignored this would shrink.
+  assert.ok(gaps[4] > gaps[3], 'the 4/4 bar after the change is longer than the 7/8 before it');
+}
+
+// --- installing a map preserves the phase, exactly as setBpm does -----------
+{
+  beatClock.setMeterMap([{ bar: 0, meter: M44 }]);
+  beatClock.setBpm(120, 'edit');
+  beatClock.setAnchor(0, 0);
+  // now() is 0 with no AudioContext, so the clock is 0 beats in; re-anchoring
+  // must keep it there whatever map arrives.
+  assert.deepEqual(beatClock.phase(0), { bar: 0, beat: 0, sixteenth: 0, beatFrac: 0, barFrac: 0 });
+  beatClock.setTempoMap([{ beat: 0, bpm: 174 }, { beat: 8, bpm: 60 }]);
+  assert.deepEqual(beatClock.phase(0), { bar: 0, beat: 0, sixteenth: 0, beatFrac: 0, barFrac: 0 });
+  assert.equal(beatClock.state.anchor, 0);
+  // A subscriber hears the map land, just as it hears a bpm change.
+  const seen: number[] = [];
+  const off = beatClock.subscribe((s) => seen.push(s.bpm));
+  beatClock.setTempoMap([{ beat: 0, bpm: 128 }, { beat: 8, bpm: 96 }]);
+  assert.deepEqual(seen, [128]);
+  off();
+  beatClock.setBpm(120, 'edit');
+  assert.deepEqual(seen, [128]);
+  assert.equal(beatClock.bpm, 120);
 }
 
 console.log('beatClock: ok');

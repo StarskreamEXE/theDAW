@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import { clipRenderInput, clipRollLoad, playedRollNotes, rollClipFields, type RollClipInput, type RollLoadArgs } from './rollClip.ts';
 import { clipMeterToTasmo, pianoNoteToTasmo, tasmoMeterToClip, tasmoNotesToPiano, type TasmoStepNote } from './projectClient.ts';
-import { rollMeterOf, usePianoRollStore, type PianoNote } from '../state/pianoRollStore.ts';
+import { migrateNotes, rollMeterOf, tickOfStep, usePianoRollStore, type PianoNote } from '../state/pianoRollStore.ts';
 import { unrollLanes, type MeterSegment } from './meterMap.ts';
 import { copyBends, type LaneBend } from './pitchBend.ts';
 
@@ -51,13 +51,21 @@ const played = playedRollNotes(original.notes, original.meter.lanes, TOTAL);
 assert.equal(played.length, 2 + 2 * 5);
 
 /** loadFromClip's arguments carry the original roll. */
-const assertLoad = (args: RollLoadArgs, clipId: string) => {
+const assertLoad = (args: RollLoadArgs, clipId: string, source: 'roll' | 'tasmo') => {
   const [id, notes, bpm, total, meter, bends] = args;
   assert.equal(id, clipId);
   assert.equal(bpm, BPM);
   assert.equal(total, TOTAL);
   assert.deepEqual(meter, original.meter);
-  assert.deepEqual(withoutIds(notes), withoutIds(original.notes));
+  // migrateNotes because one of the two callers loads a clip that came back out
+  // of .tasmo JSON, whose note shape carries step and length but no ticks. It is
+  // a no-op for the clip that never left memory (ticks that agree are kept).
+  assert.deepEqual(withoutIds(migrateNotes(notes)), withoutIds(original.notes));
+  // …so the wrap alone cannot tell a preserved tick from a reconstructed one.
+  // These two say which side is which: the in-memory clip arrives ticked, and
+  // the .tasmo reload arrives with no ticks at all for loadFromClip to migrate.
+  if (source === 'roll') for (const n of notes) assert.equal(n.tick, tickOfStep(n.step), `${n.id} reached the roll un-ticked`);
+  else assert.ok(notes.some((n) => n.tick === undefined), 'a .tasmo reload carries no ticks');
   assert.deepEqual(withoutPointIds(bends), withoutPointIds(original.bends));
 };
 
@@ -95,7 +103,7 @@ assert.notEqual(fields.sourceLanes, st().lanes);
 // 3. Open the clip in the roll.
 const clip: RollClipInput = { id: 'clip-1', ...fields };
 const firstLoad = clipRollLoad(clip);
-assertLoad(firstLoad, 'clip-1');
+assertLoad(firstLoad, 'clip-1', 'roll');
 assert.deepEqual(firstLoad[1], original.notes);
 assert.deepEqual(firstLoad[5], original.bends);
 
@@ -139,12 +147,16 @@ const reloaded: RollClipInput = {
   sourcePianoRoll: tasmoNotesToPiano(saved.midi_notes, 'pn'),
   ...tasmoMeterToClip(saved),
 };
-assert.deepEqual(withoutIds(reloaded.sourcePianoRoll), withoutIds(played));
+// The .tasmo note shape carries no ticks — `pianoNoteToTasmo` writes step and
+// length — so the reloaded notes are migrated for the comparison, exactly as the
+// store migrates them when the clip is opened in step 7 below.
+assert.deepEqual(withoutIds(migrateNotes(reloaded.sourcePianoRoll ?? [])), withoutIds(played));
+assert.ok((reloaded.sourcePianoRoll ?? []).some((n) => n.tick === undefined), 'the reload really is tick-less');
 assert.equal(reloaded.sourcePianoRoll?.some((n) => 'lane' in n), false);
 
 // 7. Open the reloaded clip in the roll.
 const secondLoad = clipRollLoad(reloaded);
-assertLoad(secondLoad, 'clip-1');
+assertLoad(secondLoad, 'clip-1', 'tasmo');
 st().loadFromClip('other', [], 120, 16, { meterMap: M44, pickupSteps: 0, lanes: LANE_A });
 st().loadFromClip(...secondLoad);
 assertRoll('clip-1');

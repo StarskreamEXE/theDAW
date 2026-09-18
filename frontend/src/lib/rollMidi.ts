@@ -14,6 +14,13 @@
  * file this module wrote comes back with its lanes in the same order. With no
  * bend every note is in lane A, as before.
  *
+ * TIMING: notes travel on TICKS, not on the 16th grid. An export writes each
+ * note's own `tick`/`ticks` rescaled from the model's PPQ (960) to the file's,
+ * and an import writes the file's ticks back scaled to 960 and derives the
+ * step view from them — so a round trip through a 960 PPQ file is exact and a
+ * 480 or 96 PPQ file scales rather than snapping to the grid. Bends still speak
+ * in steps: a curve is drawn against the grid, not against a note.
+ *
  * No Vite-only imports, so node tests load it.
  */
 import {
@@ -36,7 +43,18 @@ import {
 } from './pitchBend';
 import { meterMapToMidiEvents, midiEventsToMeterMap, unrollLanes, type MeterSegment, type PolyLane } from './meterMap';
 import type { MidiBend, MidiBendRange, MidiFileData, MidiNote } from './midi';
-import { DEFAULT_LANES, laneName, sanitizeLanes, type PianoNote, type RollMeter } from '../state/pianoRollStore';
+import {
+  DEFAULT_LANES,
+  MIN_NOTE_TICKS,
+  PPQ,
+  laneName,
+  noteTick,
+  noteTicks,
+  sanitizeLanes,
+  ticksPerStep,
+  type PianoNote,
+  type RollMeter,
+} from '../state/pianoRollStore';
 
 export const ROLL_PPQ = 480;
 
@@ -62,15 +80,21 @@ export interface RollMidiImport {
 /** The roll as one MIDI track at its own tempo and time signatures, with each bent lane's wheel and range on its channel. */
 export function rollToMidiFile(s: RollMidiSource, ppq = ROLL_PPQ): MidiFileData {
   const stepTicks = ppq / 4;
+  // The note model's ticks rescaled to the file's resolution. At ppq === PPQ
+  // this is 1 and every note's tick goes out exactly as it is stored.
+  const toFile = ppq / PPQ;
   const channels = laneChannels(s.lanes, s.bends);
   const played = unrollLanes(s.notes, s.lanes, s.totalSteps);
   // Nothing sounds past the roll's end or its last note's end, so no wheel message is written past it.
   const soundEnd = played.reduce((m, n) => Math.max(m, n.step + n.length), s.totalSteps);
+  // Straight from each note's ticks — an unrolled repeat is re-ticked from the
+  // step unrollLanes moved it to, which is exact because a lane cycle is a whole
+  // number of steps. Nothing is quantised on the way out.
   const notes: MidiNote[] = played.map((n) => ({
-    tick: Math.round(n.step * stepTicks),
+    tick: Math.round(noteTick(n) * toFile),
     note: n.note,
     velocity: Math.max(1, Math.min(127, n.velocity)),
-    durationTicks: Math.max(1, Math.round(n.length * stepTicks)),
+    durationTicks: Math.max(1, Math.round(noteTicks(n) * toFile)),
     channel: channels.get(playingLane(n.lane, s.lanes)) ?? 0,
   }));
   const bends: MidiBend[] = [];
@@ -163,15 +187,25 @@ export function midiFileToRoll(data: MidiFileData, idPrefix = 'imp'): RollMidiIm
   groups.forEach((g, id) => g.channels.forEach((ch) => laneOf.set(ch, id)));
 
   const stamp = Math.random().toString(36).slice(2);
+  // The file's ticks rescaled to the model's PPQ (960): a 480 file doubles, a 96
+  // file is x10, a 960 file comes through untouched. `step`/`length` are then
+  // derived from those ticks, so an off-grid note keeps where it really was
+  // instead of being snapped to the nearest 16th on the way in.
+  const toModel = PPQ / ppq;
+  const perStep = ticksPerStep();
   const notes: PianoNote[] = raw
     .map((n, i) => {
       const lane = laneOf.get(n.channel) ?? 0;
+      const tick = Math.max(0, Math.round(n.tick * toModel));
+      const ticks = Math.max(MIN_NOTE_TICKS, Math.round(n.durationTicks * toModel));
       return {
         id: `${idPrefix}-${stamp}-${i}`,
         note: n.note,
-        step: Math.round(n.tick / stepTicks),
-        length: Math.max(1, Math.round(n.durationTicks / stepTicks)),
+        step: tick / perStep,
+        length: ticks / perStep,
         velocity: n.velocity,
+        tick,
+        ticks,
         ...(lane > 0 ? { lane } : {}),
       };
     })

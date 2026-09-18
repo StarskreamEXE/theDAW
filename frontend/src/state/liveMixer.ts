@@ -30,7 +30,7 @@
  * here while a live editor session is registered (see playerStore.setLiveTransport).
  *
  * The OFFLINE bounce is kept as-is for export / commit / send-to-init — those
- * genuinely need a rendered file. liveMixer only replaces the live PREVIEW.
+ * actually need a rendered file. liveMixer only replaces the live PREVIEW.
  *
  * Honesty / scope: live updates cover the MIXER params (volume/pan/mute/solo)
  * plus per-clip mute (a retained gain gate per scheduled clip). Structural clip
@@ -56,7 +56,7 @@ import {
   setLiveTransport,
   registerChainProbe,
 } from './playerStore';
-import { logError } from './logStore';
+import { logError, logWarn } from './logStore';
 import {
   ensureSoundfontReady,
   isLiveSynthReady,
@@ -81,13 +81,29 @@ import {
   type RackEffectDef,
 } from '../lib/rackEffects';
 import { sliceChunks, type AudioChunk } from '../lib/audioAnalysis';
-import { decodeClipBlob, peekDecoded } from '../lib/decodeCache';
+import {
+  configureDecodeCache,
+  decodeClipBlob,
+  defaultDecodeBudgetBytes,
+  peekDecoded,
+  pinDecoded,
+  unpinDecoded,
+} from '../lib/decodeCache';
+import {
+  compSegments,
+  isComped,
+  normalizeComp,
+  type ClipTake,
+  type CompRegion,
+} from '../lib/clipComp';
 import type { ChainEntry } from './effectChainStore';
 import {
+  CONN_SIDECHAIN,
   CONN_SEND,
   MASTER_ID,
   outputOf,
   sendsFrom,
+  sidechainsInto,
   topoOrder,
   type RoutingGraph,
 } from './routingGraph';
@@ -370,12 +386,186 @@ function applyMixLive(): void {
   applyBusMix(useEditorStore.getState().buses, (id) => busNodes.get(id), ctx.currentTime);
 }
 
-/** Decode every clip's blob we'll need (cached by Blob identity + sample rate). */
+/* ── Decode retention: what this module must pin, and when ────────────────────
+   `lib/decodeCache` can evict least-recently-used buffers to stay inside a byte
+   budget, and this module is the one caller that cannot survive an eviction it
+   did not expect: it PREFETCHES every clip with `decodeClipBlob` (async, one at
+   a time) and then reads them all back with `peekDecoded` inside a scheduling
+   loop that cannot await. A buffer dropped between those two passes does not
+   re-decode — the clip is silently not scheduled.
+
+   So every buffer this module depends on is pinned for as long as it depends on
+   it, in two overlapping stages:
+
+     1. PREFETCH. Each decode is pinned the moment it resolves, so a later
+        decode in the same pass cannot evict an earlier one.
+     2. SCHEDULE. Each buffer a clip actually plays takes a pin of its own,
+        released when that clip's last source ends (or when the transport tears
+        the pass down). The prefetch pins are dropped once scheduling is over,
+        which is what releases the clips that were muted, MIDI-driven, or on a
+        vanished track and so never scheduled at all.
+
+   Pins nest, so the two stages do not interfere and two clips sharing one blob
+   hold two pins on it. Only with all of this in place is it safe to turn the
+   budget on at all — see `enableDecodeBudget`.
+
+   `decodeCache.releaseDecoded(blob)` is the other half of this — telling the
+   cache a clip is GONE, so its PCM and its encoded Blob are freed without
+   waiting for the budget to notice. Nothing calls it: wiring it to clip removal
+   needs to know when a deleted clip can no longer be undone back, which is a
+   ticket of its own. */
+
+/** One outstanding pin: a decoded blob at one sample rate. */
+export interface DecodePin {
+  blob: Blob;
+  rate: number;
+}
+
+/**
+ * A release for the pins in `pins` that runs at most ONCE, however many times it
+ * is called. Pins are counted, so a double release would drop somebody else's
+ * pin on the same blob — the live path deliberately has two ways to reach a
+ * release (the last source ending, and the transport tearing the pass down) and
+ * this is what makes them safe to both fire.
+ *
+ * `pins` is read AT RELEASE TIME, not captured here. The live path builds the
+ * release before it hands `takeResolver` the array to fill — the resolver is
+ * called from inside `scheduleClipSources`, so there is nothing to snapshot yet
+ * — and a copy taken at construction would therefore always be empty and free
+ * nothing at all. The array must not be reused for a second clip.
+ */
+export function releaseOnce(pins: readonly DecodePin[]): () => void {
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    for (const pin of pins) unpinDecoded(pin.blob, pin.rate);
+  };
+}
+
+/** The clip fields the decode side reads: its own blob, and its takes' blobs. */
+export interface DecodableClip {
+  audioBlob: Blob;
+  takes?: ClipTake[];
+  comp?: CompRegion[];
+  activeTakeIndex?: number;
+}
+
+/**
+ * Every distinct blob a clip needs decoded.
+ *
+ * Gated on the clip being COMPED, not on it merely having takes: switching the
+ * active take rewrites the clip's own mirrored fields, so the next play decodes
+ * the new blob through this same one-blob path. Decoding the alternates eagerly
+ * would cost a decode and ~81 MiB per four-minute take that nothing is going to
+ * play. So a clip that is not comped decodes exactly what it always did.
+ */
+function clipBlobs(clip: DecodableClip): Blob[] {
+  if (!isComped(clip)) return [clip.audioBlob];
+  const out: Blob[] = [clip.audioBlob];
+  for (const take of clip.takes ?? []) {
+    if (take?.audioBlob && !out.includes(take.audioBlob)) out.push(take.audioBlob);
+  }
+  return out;
+}
+
+/**
+ * The buffer resolver `scheduleClipSources` is handed for one clip: which
+ * decoded buffer each take index plays from, PINNED as it is handed over and
+ * recorded in `pins` so the caller can release exactly what it took.
+ *
+ * The ACTIVE take resolves to the clip's OWN blob — which the `AudioClip.takes`
+ * invariant says is that take's audio — so a clip that is not comped peeks
+ * exactly the blob this scheduler has always peeked, takes or no takes. Only the
+ * alternates are looked up in the take list.
+ */
+export function takeResolver(
+  ctx: BaseAudioContext,
+  clip: DecodableClip,
+  pins: DecodePin[],
+): TakeBufferResolver {
+  const rate = ctx.sampleRate;
+  return (takeIndex) => {
+    const blob = takeIndex === (clip.activeTakeIndex ?? 0)
+      ? clip.audioBlob
+      : clip.takes?.[takeIndex]?.audioBlob;
+    if (!blob) return undefined;
+    const buffer = peekDecoded(ctx, blob);
+    if (!buffer) return undefined;
+    pinDecoded(blob, rate);
+    pins.push({ blob, rate });
+    return buffer;
+  };
+}
+
+/**
+ * Decode every blob the pass will need, pinning each one as it lands.
+ *
+ * The pin is taken INSIDE the loop rather than afterwards because the loop is
+ * the hazard: under a budget, decoding clip N can evict clip 1, which the
+ * scheduler then cannot peek back. `pins` is appended to as the walk proceeds,
+ * so a caller still holds (and can release) whatever was taken even if a later
+ * decode rejects.
+ */
+export async function prefetchDecodes(
+  ctx: BaseAudioContext,
+  clips: readonly DecodableClip[],
+  pins: DecodePin[],
+): Promise<void> {
+  const rate = ctx.sampleRate;
+  for (const clip of clips) {
+    for (const blob of clipBlobs(clip)) {
+      await decodeClipBlob(ctx, blob);
+      pinDecoded(blob, rate);
+      pins.push({ blob, rate });
+    }
+  }
+}
+
+/** Prefetch pins for the pass being set up. One array for the module's lifetime
+ *  — never reassigned — so a superseded `start()` still pushing into it cannot
+ *  strand its pins outside the list that gets released. */
+const prefetchPins: DecodePin[] = [];
+
+function releasePrefetchPins(): void {
+  for (const pin of prefetchPins) unpinDecoded(pin.blob, pin.rate);
+  prefetchPins.length = 0;
+}
+
+/** One release per scheduled clip, for the transport to call when it stops the
+ *  sources itself instead of letting them end. */
+let clipPinReleases: (() => void)[] = [];
+
+/** Turned on once, at editor mount. Eviction is only safe now that every buffer
+ *  the scheduler depends on is pinned above; before that, a budget turned a big
+ *  project into silence rather than into a smaller cache. */
+let decodeBudgetEnabled = false;
+
+/**
+ * Give the shared decode cache its byte budget. Idempotent — `attach()` may run
+ * many times over a session as the editor mounts and unmounts.
+ *
+ * ONE-WAY and GLOBAL: `lib/decodeCache` is a module singleton shared with every
+ * other decoder in the app, and nothing turns the budget back off. That is safe
+ * because this module is the only `peekDecoded` caller — the only one that reads
+ * a buffer back synchronously and so cannot survive an eviction it did not
+ * expect. `lib/renderCore` awaits `deps.decode` and holds every buffer in a Map
+ * of its own for the whole render, and `WaveformEditor` only ever awaits
+ * `decodeClipBlob`; an eviction is invisible to both — at worst the next request
+ * decodes again. If a third kind of caller ever peeks, it has to pin first.
+ */
+export function enableDecodeBudget(): void {
+  if (decodeBudgetEnabled) return;
+  decodeBudgetEnabled = true;
+  configureDecodeCache({ budgetBytes: defaultDecodeBudgetBytes() });
+}
+
+/** Decode every clip's blob we'll need (cached by Blob identity + sample rate),
+ *  and every take's for a comped one. Pinned as each lands; released once
+ *  `scheduleClips` has taken its own pins on the buffers that will play. */
 async function ensureDecoded(clips: AudioClip[]): Promise<void> {
   const ctx = getEngineCtx();
-  for (const clip of clips) {
-    await decodeClipBlob(ctx, clip.audioBlob);
-  }
+  await prefetchDecodes(ctx, clips, prefetchPins);
 }
 
 /** Topology signature of an FX chain (order + effect + enabled), so the store
@@ -512,6 +702,18 @@ export function sendKey(from: string, to: string): string {
   return `${from}|${to}`;
 }
 
+/** Routing complaints already made, so a rewire loop cannot spam the log with a
+ *  damaged edge it re-reads on every pass. Module-level and never cleared: the
+ *  same damaged edge is the same complaint for the life of the session. */
+const routingWarned = new Set<string>();
+
+/** Log `msg` the first time `key` is seen, and never again. */
+function warnOnce(key: string, msg: string): void {
+  if (routingWarned.has(key)) return;
+  routingWarned.add(key);
+  logWarn('editor', msg);
+}
+
 /** The node lookups `wireRoutingGraph` needs. The live mixer resolves them off
  *  its own maps; a test resolves them off fakes. */
 export interface RoutingEndpoints {
@@ -521,6 +723,16 @@ export interface RoutingEndpoints {
   inputNodeOf: (id: string) => AudioNode | undefined;
   /** Make a fresh gain node for one send, opened at that send's amount. */
   makeSendGain: (gain: number) => GainNode;
+  /**
+   * The KEY input of one effect entry on one node's rack — `RackEffectInstance.keyIn`
+   * for the live (or offline) instance built for `entryId`, and `undefined` when
+   * that entry has no instance, is not a keyable effect, or is not built at all.
+   *
+   * Optional, and the pass simply makes no key connection without it: the two
+   * engines both supply it, and the older routing suites construct a
+   * `RoutingEndpoints` by hand with no notion of a rack.
+   */
+  keyInputOf?: (nodeId: string, entryId: string) => AudioNode | undefined;
   /**
    * Every id that HAS a live strip, whatever the graph says. Read only on the
    * degraded path, and it is what makes the fallback's promise true: a damaged
@@ -548,6 +760,23 @@ export interface RoutingEndpoints {
  * pass walks the UNION of the graph's nodes and `ends.liveIds()`, so a strip the
  * damaged graph forgot is still connected. Silence is never an outcome: a user
  * whose project file is damaged must still hear their audio.
+ *
+ * SIDECHAINS are a THIRD pass, after both of those. A `CONN_SIDECHAIN` edge taps
+ * the source's output — the very node the main path and the sends tap, so a key
+ * costs no extra strip and hears exactly what the mix hears — and lands on the
+ * KEY input of one named effect entry on the destination's rack. It is walked
+ * last because it is the only edge whose destination is not a strip but
+ * something INSIDE one, so it needs every rack to have been built, and because
+ * doing it after the outputs keeps the wire log's first two sections exactly
+ * what they were.
+ *
+ * A key is REFUSED — skipped and logged once — when the model says the edge is
+ * invalid (a `CONN_SIDECHAIN` with no `targetEntryId`, which `validateGraph`
+ * names and no mutator can produce). It is skipped SILENTLY when the entry has
+ * no key input right now: a bypassed entry that was never instantiated, an
+ * effect that takes no key, or an entry the user has since deleted are all
+ * ordinary states of a live document, not damage. Neither case can make noise:
+ * an unconnected `keyIn` leaves its effect exactly as it was.
  */
 export function wireRoutingGraph(
   graph: RoutingGraph,
@@ -594,6 +823,29 @@ export function wireRoutingGraph(
       out.connect(g);
       g.connect(target);
       gains.set(sendKey(id, send.to), g);
+    }
+  }
+
+  // Keys last. Not on the degraded path: a graph we could not order is one we
+  // cannot trust to be acyclic either, and a key closes a Web Audio loop exactly
+  // as an output does.
+  if (!degraded && ends.keyInputOf) {
+    for (const id of order) {
+      for (const edge of sidechainsInto(graph, id)) {
+        if (!edge.targetEntryId) {
+          warnOnce(
+            `sidechain:${edge.from}>${id}`,
+            `Sidechain "${edge.from}" -> "${id}" names no effect entry (validateGraph reports it); `
+              + 'the key is not connected.',
+          );
+          continue;
+        }
+        const source = ends.outputNodeOf(edge.from);
+        if (!source) continue; // a key from a node with no live strip
+        const key = ends.keyInputOf(id, edge.targetEntryId);
+        if (!key) continue; // the entry is bypassed-and-uninstantiated, gone, or takes no key
+        source.connect(key);
+      }
     }
   }
   return gains;
@@ -706,6 +958,7 @@ function applyTrackChainsLive(): void {
   const tracks = useEditorStore.getState().tracks;
   const byId = new Map<string, EditorTrack>(tracks.map((t): [string, EditorTrack] => [t.id, t]));
   let chainsMoved = false;
+  const rebuilt: string[] = [];
   for (const [id, n] of trackNodes) {
     const chain = byId.get(id)?.fxChain ?? [];
     const full = JSON.stringify(chain);
@@ -713,9 +966,10 @@ function applyTrackChainsLive(): void {
     n.fxFullSig = full;
     chainsMoved = true;
     const topo = chainTopoSig(chain);
-    if (topo !== n.fxTopoSig) { n.fxTopoSig = topo; n.fx.rebuild(chain); }
+    if (topo !== n.fxTopoSig) { n.fxTopoSig = topo; n.fx.rebuild(chain); rebuilt.push(id); }
     else for (const e of chain) n.fx.updateParams(e.id, e.params);
   }
+  rewireKeysAfterChainRebuild(rebuilt);
   // A track ADDED or REMOVED mid-playback changes the inputs of the sum without
   // moving any surviving track's signature: a new track has no node for the loop
   // above to compare against, and a removed one just stops being looked up — yet
@@ -738,6 +992,7 @@ function applyBusChainsLive(): void {
   const buses = useEditorStore.getState().buses;
   const byId = new Map<string, MixBus>(buses.map((b): [string, MixBus] => [b.id, b]));
   let chainsMoved = false;
+  const rebuilt: string[] = [];
   for (const [id, n] of busNodes) {
     const chain = byId.get(id)?.fxChain ?? [];
     const full = JSON.stringify(chain);
@@ -745,10 +1000,35 @@ function applyBusChainsLive(): void {
     n.fxFullSig = full;
     chainsMoved = true;
     const topo = chainTopoSig(chain);
-    if (topo !== n.fxTopoSig) { n.fxTopoSig = topo; n.fx.rebuild(chain); }
+    if (topo !== n.fxTopoSig) { n.fxTopoSig = topo; n.fx.rebuild(chain); rebuilt.push(id); }
     else for (const e of chain) n.fx.updateParams(e.id, e.params);
   }
+  rewireKeysAfterChainRebuild(rebuilt);
   if (chainsMoved) syncTrackLatency();
+}
+
+/**
+ * Re-run the routing pass when a rack REBUILD landed on a strip something keys.
+ *
+ * A key connection is an edge into a node INSIDE a rack, and `buildEffectChain`
+ * is free to replace that node: an entry whose effect id changed is disposed and
+ * re-made, and — the case that actually bites — an entry that was BYPASSED when
+ * the chain was first built has no instance at all, so it had no `keyIn` for the
+ * routing pass to find, and enabling it later builds the instance without anyone
+ * connecting the key. Both leave a project that says "keyed" playing unkeyed
+ * until the next unrelated routing edit.
+ *
+ * Gated on the graph, so the overwhelming case — a rack rebuild on a strip
+ * nothing keys — costs one `Set` walk and no node work. A rack edit that is only
+ * a param push does not reach here at all: `rebuilt` is empty.
+ */
+function rewireKeysAfterChainRebuild(rebuilt: readonly string[]): void {
+  if (rebuilt.length === 0) return;
+  const graph = useEditorStore.getState().routing;
+  const keyed = sidechainTargetIds(graph);
+  if (keyed.size === 0) return;
+  if (!rebuilt.some((id) => keyed.has(id))) return;
+  wireRouting(graph);
 }
 
 /* Reconciliation signatures. Structure (which strips exist, and which edges
@@ -1414,7 +1694,24 @@ function wireRouting(graph: RoutingGraph): void {
       return g;
     },
     liveIds: () => [...trackNodes.keys(), ...busNodes.keys()],
+    // The key input of one entry on one strip's rack. Tracks and buses share the
+    // routing node namespace (`editorStore.removeBus` says so), so one lookup
+    // over both maps is exact rather than merely convenient.
+    keyInputOf: (nodeId, entryId) => {
+      const fx = trackNodes.get(nodeId)?.fx ?? busNodes.get(nodeId)?.fx;
+      return fx?.instances().find((i) => i.id === entryId)?.inst.keyIn;
+    },
   });
+}
+
+/** Node ids that some `CONN_SIDECHAIN` edge keys. A rack REBUILD on one of these
+ *  can replace the very instance a key is connected to, so the caller re-wires.
+ *  Exported because it is the whole of that decision and the code around it
+ *  touches the module's live singletons; see `state/liveMixer.sidechain.test.ts`. */
+export function sidechainTargetIds(graph: RoutingGraph): Set<string> {
+  const ids = new Set<string>();
+  for (const e of graph.edges) if (e.connType === CONN_SIDECHAIN) ids.add(e.to);
+  return ids;
 }
 
 /** Build (or rebuild) per track: gain -> [insert FX] -> panner -> comp. Where the
@@ -1628,7 +1925,27 @@ export function computeClipSchedule(
 
 /** Everything `scheduleClipSources` reads off a clip. `AudioClip` satisfies it
  *  structurally, and building one in a test needs no Blob. */
-export type SchedulableClip = ScheduleClip & FadeClip & { id: string; startSec: number; gain?: number };
+export type SchedulableClip = ScheduleClip & FadeClip & {
+  id: string;
+  startSec: number;
+  gain?: number;
+  /** Which of the clip's takes its mirrored source fields hold; undefined = 0.
+   *  Read ONLY to ask the buffer resolver below for that take — the schedule
+   *  maths never sees it. */
+  activeTakeIndex?: number;
+  /** Alternate recordings. Present with a `comp` naming two or more of them,
+   *  this clip plays one stretch per comp region (see `compParts`); present
+   *  without one, the clip's own mirrored fields ARE the active take and
+   *  nothing here behaves differently. */
+  takes?: ClipTake[];
+  comp?: CompRegion[];
+};
+
+/** Which decoded buffer a given take plays from, for a caller that has more
+ *  than one (a comped clip). Returning undefined means "nothing decoded for
+ *  that take", which schedules nothing, exactly as a missing buffer always
+ *  has. A caller with ONE buffer passes the `AudioBuffer` itself. */
+export type TakeBufferResolver = (takeIndex: number) => AudioBuffer | undefined;
 
 /** The audio-context surface the per-clip wiring needs — the two factories, and
  *  nothing else. `AudioContext` satisfies it; so does a stand-in. The real one
@@ -1646,6 +1963,202 @@ export interface ScheduledClipNodes {
   sources: AudioBufferSourceNode[];
 }
 
+export interface ScheduleClipOptions {
+  /** Called ONCE, after the last of this clip's sources has ended and the
+   *  shared nodes are disconnected. The live scheduler releases the clip's
+   *  decode-cache pins here; an offline render passes nothing. It does NOT fire
+   *  when the caller tears the sources down itself (`clearSources` nulls every
+   *  `onended` before stopping), which is why the live path also holds its pins
+   *  in a list it can release directly. */
+  onEnded?: () => void;
+}
+
+/* ── Comping: one clip, several takes ─────────────────────────────────────────
+   A comped clip plays a different take over each stretch of its length. The
+   MODEL for that is `lib/clipComp` — which region owns which stretch, and how
+   far the two sides of a boundary overlap — and it is pure arithmetic shared
+   with the offline renderer, so preview and export cannot drift. What is here
+   is only the wiring: one `computeClipSchedule` per comp segment (so every bit
+   of warp/stretch/seek maths above is reused untouched), each on its own gain
+   carrying the boundary crossfade, all of them feeding the clip's ONE fade
+   envelope and its ONE mute gate. */
+
+/** One stretch of a clip that plays from one buffer: a comp segment, or — for
+ *  every clip that is not comped — the whole clip. */
+interface ClipPart {
+  buffer: AudioBuffer;
+  /** Where this part opens, measured from the clip's head. 0 when not comped. */
+  startSec: number;
+  /** How far INTO the part playback begins (the seek position, rebased). */
+  intoPart: number;
+  /** The part's own schedule, with `targetStart` measured from the part's head. */
+  schedule: ClipSchedule;
+  /**
+   * The boundary crossfades at this part's two ends, in seconds. Both 0 when not
+   * comped, and at a butt cut.
+   *
+   * ALREADY FITTED to `schedule.durationSec`, so `clipFade.clampClipFades` never
+   * has to choose a side. `lib/clipComp` guarantees the two fit inside the
+   * segment's NOMINAL length, but a take whose decoded buffer runs out early
+   * shortens the part under them, and the clamp's tie-break would then shrink
+   * whichever side it likes — turning a seam that summed to unity into one that
+   * ducks. The fade-IN wins here instead: it is the seam with audio on both
+   * sides of it, while a fade-out that no longer fits is one whose audio has
+   * already run out. (Where the outgoing take is the one that ran out, the seam
+   * does not sum — there is no audio left there to sum with. Nothing can fix
+   * that but decoding more audio.)
+   */
+  fadeInSec: number;
+  fadeOutSec: number;
+}
+
+interface ClipParts {
+  /** True only when the comp branch really produced the parts. A clip with
+   *  takes but no comp, and one that fell back (warp + comp), is false — and
+   *  false is what keeps the node set of every clip playing today identical. */
+  comped: boolean;
+  parts: ClipPart[];
+  /** The clip's playable length, for the whole-clip fade envelope. Independent
+   *  of where the playhead is, exactly as `ClipSchedule.durationSec` is. */
+  durationSec: number;
+}
+
+/** Warnings that describe a CLIP rather than a moment, emitted once per clip:
+ *  playback re-schedules on every play, seek and loop restart, and the same
+ *  sentence sixty times over is noise, not a diagnostic. */
+const scheduleWarned = new Set<string>();
+
+/** A comp the app has no defined behaviour for. A PERMANENT property of the
+ *  clip, so it is said once and not again until the clip is edited away. */
+const WARN_WARP_COMP = 'warp-comp:';
+/** A take that has not decoded. TRANSIENT — it may be there on the next play —
+ *  so this class is forgotten at the top of every scheduling pass and a gap that
+ *  is still there says so again. */
+const WARN_TAKE_BUFFER = 'take-buffer:';
+
+function warnOnceForClip(key: string, msg: string): void {
+  if (scheduleWarned.has(key)) return;
+  scheduleWarned.add(key);
+  logWarn('editor', msg);
+}
+
+/**
+ * Forget clip warnings so they can be said again.
+ *
+ * `'transient'` drops only the conditions that can come and go (a take that had
+ * not decoded yet) and is what every scheduling pass does; `'all'` drops the
+ * permanent ones too and belongs to `dispose()`, where the session's clips stop
+ * being this module's clips.
+ */
+export function resetScheduleWarnings(scope: 'transient' | 'all' = 'transient'): void {
+  if (scope === 'all') { scheduleWarned.clear(); return; }
+  for (const key of [...scheduleWarned]) {
+    if (key.startsWith(WARN_TAKE_BUFFER)) scheduleWarned.delete(key);
+  }
+}
+
+/**
+ * Split a clip into the parts that will play.
+ *
+ * Not comped — the overwhelmingly common case — is ONE part: the active take's
+ * buffer and the clip's own schedule, i.e. precisely what this function's caller
+ * did inline before comping existed.
+ *
+ * Comped is one part per `compSegments` entry. Each gets a synthetic
+ * `ScheduleClip` whose source offset is its take's own offset advanced by the
+ * segment's position (at the clip's stretch rate, since one timeline second eats
+ * `rate` source seconds) and whose length is the segment's, so the shared
+ * `computeClipSchedule` does all of the offset/rate/buffer-ran-out/seek maths
+ * for a segment exactly as it does for a clip.
+ *
+ * v1: a clip carrying warp markers AND a comp plays its ACTIVE TAKE only. What a
+ * warp map means when each stretch comes from a different recording — whether
+ * the markers are the clip's or each take's — is undecided, and guessing would
+ * bake the guess into saved projects. It says so once, in the log.
+ */
+function compParts(
+  clip: SchedulableClip,
+  resolve: TakeBufferResolver,
+  into: number,
+): ClipParts | null {
+  const takes = clip.takes;
+  const wantsComp = isComped(clip) && !!takes && takes.length > 1;
+  const warped = (clip.warpMarkers?.length ?? 0) > 0;
+
+  if (wantsComp && warped) {
+    warnOnceForClip(
+      `${WARN_WARP_COMP}${clip.id}`,
+      `Clip "${clip.id}" has both warp markers and a comp; playing the active take only `
+      + '(warping a comp is not defined yet).',
+    );
+  }
+
+  if (wantsComp && !warped && takes) {
+    const segments = compSegments(
+      normalizeComp(clip.comp, takes.length, clip.durationSec),
+      clip.durationSec,
+    );
+    if (segments.length > 0) {
+      const parts: ClipPart[] = [];
+      let durationSec = 0;
+      let missing = false;
+      for (const seg of segments) {
+        const take = takes[seg.takeIndex];
+        // `clipComp` sanitizes the structure but cannot know what decoded: a
+        // take whose buffer is not in the cache schedules nothing, the same as
+        // a clip whose own blob has not decoded. Skip it, say so once, never
+        // throw — the rest of the comp still plays.
+        const buffer = take ? resolve(seg.takeIndex) : undefined;
+        if (!buffer) { missing = true; continue; }
+        const length = seg.endSec - seg.startSec;
+        const synthetic: ScheduleClip = {
+          offsetIntoSource: take.offsetIntoSource + seg.startSec * stretchRateOf(clip),
+          durationSec: length,
+          timeStretchRate: clip.timeStretchRate,
+          stretchMode: clip.stretchMode,
+        };
+        // From the part's head, so `durationSec` is the part's full playable
+        // length whatever the playhead is doing (`computeClipSchedule` derives
+        // it before it trims), and so a part the playhead has already passed
+        // still contributes to the clip's effective length.
+        const full = computeClipSchedule(synthetic, buffer.duration, 0);
+        if (!full) continue;
+        durationSec = Math.max(durationSec, seg.startSec + full.durationSec);
+        const intoPart = Math.max(0, into - seg.startSec);
+        const schedule = intoPart > 0
+          ? computeClipSchedule(synthetic, buffer.duration, intoPart)
+          : full;
+        if (!schedule) continue; // the playhead is past this segment
+        // Fit the two seam fades inside what this part can actually play, so
+        // `clampClipFades` never has to pick a side. See `ClipPart`.
+        const playable = schedule.durationSec;
+        const fadeInSec = Math.min(seg.fadeInSec, playable);
+        const fadeOutSec = Math.max(0, Math.min(seg.fadeOutSec, playable - fadeInSec));
+        parts.push({ buffer, startSec: seg.startSec, intoPart, schedule, fadeInSec, fadeOutSec });
+      }
+      if (missing) {
+        warnOnceForClip(
+          `${WARN_TAKE_BUFFER}${clip.id}`,
+          `Clip "${clip.id}": a comped take has no decoded audio; those stretches are silent.`,
+        );
+      }
+      if (parts.length === 0) return null;
+      return { comped: true, parts, durationSec };
+    }
+  }
+
+  // Not comped (or fallen back): ONE buffer, the clip's own schedule.
+  const buffer = resolve(clip.activeTakeIndex ?? 0);
+  if (!buffer) return null; // nothing decoded for that take
+  const schedule = computeClipSchedule(clip, buffer.duration, into);
+  if (!schedule) return null;
+  return {
+    comped: false,
+    durationSec: schedule.durationSec,
+    parts: [{ buffer, startSec: 0, intoPart: into, schedule, fadeInSec: 0, fadeOutSec: 0 }],
+  };
+}
+
 /**
  * Wire one clip up for playback and start it:
  *
@@ -1657,21 +2170,40 @@ export interface ScheduledClipNodes {
  * they share the one envelope and the one gate, which are therefore torn down
  * only once the LAST source has ended. Returns `null` — having built nothing —
  * when the clip has nothing left to play.
+ *
+ * `buf` is either the one decoded buffer to play, or a resolver that maps a
+ * take index to one. Both do the same thing here: a plain buffer is wrapped as
+ * `() => buf`, and either way the buffer is resolved ONCE, for the clip's
+ * active take. The resolver form exists so a comping caller can hand over
+ * several takes' buffers through this one seam instead of a second scheduler.
  */
 export function scheduleClipSources(
   ctx: ClipNodeFactory,
   clip: SchedulableClip,
-  buf: AudioBuffer,
+  buf: AudioBuffer | TakeBufferResolver,
   destination: AudioNode,
   nowSec: number,
   fromSec: number,
+  options: ScheduleClipOptions = {},
 ): ScheduledClipNodes | null {
+  const resolve: TakeBufferResolver = typeof buf === 'function' ? buf : () => buf;
   // How far into this clip the playhead already is (0 if clip is in the future).
   const into = Math.max(0, fromSec - clip.startSec);
-  // One entry per buffer play: one for an ordinary clip, one per warp segment
-  // for a warped one, already trimmed to `into`. Null = nothing left to play.
-  const schedule = computeClipSchedule(clip, buf.duration, into);
-  if (!schedule) return null;
+  // ONE part for every clip that is not comped — the active take's buffer and
+  // the clip's own schedule, exactly as this read them inline before comping —
+  // and one part per comp segment when it is.
+  const plan = compParts(clip, resolve, into);
+  if (!plan) return null;
+
+  // Every source, across every part — the shared nodes go when the LAST of them
+  // ends, not when the last one of some part does. Counted BEFORE anything is
+  // built: a plan with no sources at all cannot happen (`computeClipSchedule`
+  // returns null rather than an empty segment list, and `compParts` keeps no
+  // part for a null schedule), and counting here means that if it ever did, it
+  // would cost no nodes instead of leaving a connected pair behind.
+  let pending = 0;
+  for (const part of plan.parts) pending += part.schedule.segments.length;
+  if (pending === 0) return null;
 
   const clipStartCtx = nowSec + (clip.startSec - fromSec); // may be < now when straddling
 
@@ -1679,11 +2211,12 @@ export function scheduleClipSources(
   // `peak` is the clip's own gain — the envelope rises to it instead of to unity,
   // so clip gain lands before the track fader and its insert FX, matching the
   // three offline bounce paths in WaveformEditor. The envelope is applied ONCE,
-  // over the whole clip, however many segments the clip plays as.
+  // over the whole clip, however many segments the clip plays as — a comp is no
+  // exception: its seams are separate gains UNDER this one.
   const clipGain = ctx.createGain();
   applyFadeAutomation(clipGain.gain, clip, clipStartCtx, into, {
     peak: clipPeakGain(clip),
-    effectiveDurationSec: schedule.durationSec,
+    effectiveDurationSec: plan.durationSec,
   });
 
   // Live mute gate, kept separate from clipGain so a mid-playback mute toggle
@@ -1692,21 +2225,58 @@ export function scheduleClipSources(
   muteGate.gain.value = 1;
   clipGain.connect(muteGate).connect(destination);
 
+  // Everything that outlives the individual sources and is torn down with the
+  // last of them: the envelope, the gate, and a comp's per-seam gains.
+  const shared: { disconnect(): void }[] = [clipGain, muteGate];
+
   const clipSources: AudioBufferSourceNode[] = [];
-  let pending = schedule.segments.length;
-  for (const seg of schedule.segments) {
-    const src = ctx.createBufferSource();
-    src.buffer = buf;
-    src.playbackRate.value = seg.playbackRate;
-    src.connect(clipGain);
-    src.start(Math.max(nowSec, clipStartCtx + seg.targetStart), seg.sourceOffset, seg.sourceDuration);
-    src.onended = () => {
-      pending -= 1;
-      try { src.disconnect(); } catch { /* already gone */ }
-      if (pending > 0) return;
-      try { clipGain.disconnect(); muteGate.disconnect(); } catch { /* already gone */ }
-    };
-    clipSources.push(src);
+  for (const part of plan.parts) {
+    const partStartCtx = clipStartCtx + part.startSec;
+    // A comp seam is a crossfade between two takes of the SAME performance, so
+    // it is the LINEAR pair (`in + out = 1`) — correlated material sums, and
+    // equal power would bulge through the middle of the seam. The two sides get
+    // mirror images of one fade over one window (`lib/clipComp` overlaps them by
+    // exactly the crossfade and gives each the full length), so the sum across
+    // the seam is unity by construction. A clip that is not comped has no seam
+    // and gets no gain at all, which is what keeps its node set unchanged.
+    let sink: AudioNode = clipGain;
+    if (plan.comped) {
+      const seamGain = ctx.createGain();
+      applyFadeAutomation(
+        seamGain.gain,
+        {
+          durationSec: part.schedule.durationSec,
+          fadeInSec: part.fadeInSec,
+          fadeOutSec: part.fadeOutSec,
+          fadeInCurve: 'linear',
+          fadeOutCurve: 'linear',
+        },
+        partStartCtx,
+        part.intoPart,
+        { peak: 1, effectiveDurationSec: part.schedule.durationSec },
+      );
+      seamGain.connect(clipGain);
+      shared.push(seamGain);
+      sink = seamGain;
+    }
+
+    for (const seg of part.schedule.segments) {
+      const src = ctx.createBufferSource();
+      src.buffer = part.buffer;
+      src.playbackRate.value = seg.playbackRate;
+      src.connect(sink);
+      src.start(Math.max(nowSec, partStartCtx + seg.targetStart), seg.sourceOffset, seg.sourceDuration);
+      src.onended = () => {
+        pending -= 1;
+        try { src.disconnect(); } catch { /* already gone */ }
+        if (pending > 0) return;
+        for (const node of shared) {
+          try { node.disconnect(); } catch { /* already gone */ }
+        }
+        options.onEnded?.();
+      };
+      clipSources.push(src);
+    }
   }
   return { muteGate, sources: clipSources };
 }
@@ -1717,6 +2287,11 @@ function scheduleClips(clips: AudioClip[], fromSec: number): void {
   const now = ctx.currentTime;
   sources = [];
   clipMuteGains = new Map();
+  clipPinReleases = [];
+  // A take that had not decoded last time may have decoded since — and if it
+  // still has not, this pass says so again rather than going quiet about a clip
+  // that is still playing silence.
+  resetScheduleWarnings('transient');
   for (const clip of clips) {
     // Muted clips are not scheduled at all; a mute toggled DURING playback is
     // handled live by the clip's mute gate (see applyClipMutesLive).
@@ -1726,17 +2301,33 @@ function scheduleClips(clips: AudioClip[], fromSec: number): void {
     if (liveMidiActive && isMidiClip(clip)) continue;
     const nodes = trackNodes.get(clip.trackId);
     if (!nodes) continue;
-    const buf = peekDecoded(ctx, clip.audioBlob);
-    if (!buf) continue;
-
-    const scheduled = scheduleClipSources(ctx, clip, buf, nodes.gain, now, fromSec);
-    if (!scheduled) continue;
+    // One resolver per clip. For everything that is not comped it hands over the
+    // clip's own blob for the active take — which by the `AudioClip.takes`
+    // invariant IS the active take's audio, and is the whole of take switching.
+    // A comped clip asks it for each take in turn instead. Either way every
+    // buffer it hands over is pinned, and released below.
+    const pins: DecodePin[] = [];
+    const release = releaseOnce(pins);
+    const scheduled = scheduleClipSources(
+      ctx, clip, takeResolver(ctx, clip, pins), nodes.gain, now, fromSec, { onEnded: release },
+    );
+    if (!scheduled) { release(); continue; }
+    clipPinReleases.push(release);
     clipMuteGains.set(clip.id, scheduled.muteGate);
     for (const src of scheduled.sources) sources.push(src);
   }
+  // The pass's own pins now hold everything that will play, so the prefetch's
+  // can go — which is what frees the clips that were never scheduled. Safe to do
+  // here rather than after `scheduleTeleports` (which also peeks, on the active
+  // take): only a DECODE evicts, and the pass has no decodes left to run.
+  releasePrefetchPins();
 }
 
-/** Onset-sliced chunks for a clip's decoded buffer (cached by Blob identity). */
+/** Onset-sliced chunks for a clip's decoded buffer (cached by Blob identity).
+ *  On the ACTIVE take: a comped clip's onsets are a property of the performance
+ *  the user is looking at, and slicing a comp's seams would make the teleport
+ *  positions depend on a comp edit. (The teleport loop below reads the active
+ *  take's buffer for the same reason.) */
 function chunksFor(clip: AudioClip): AudioChunk[] {
   const buf = peekDecoded(getEngineCtx(), clip.audioBlob);
   if (!buf) return [];
@@ -2284,6 +2875,12 @@ function clearSources(): void {
     try { g.disconnect(); } catch { /* already gone */ }
   }
   clipMuteGains = new Map();
+  // Nulling `onended` above means no source will announce its own end, so the
+  // decode-cache pins this pass took are released here instead. `releaseOnce`
+  // makes that safe for the clips whose sources DID end first.
+  for (const release of clipPinReleases) release();
+  clipPinReleases = [];
+  releasePrefetchPins();
   clearMidiTimers();
   // Release per-channel synth routing while the track nodes it points at are
   // still alive. clearSources() runs at the top of every start() and from
@@ -2403,6 +3000,10 @@ async function start(fromSec: number): Promise<void> {
   try {
     await ensureDecoded(clips);
   } catch (e) {
+    // The clips that DID decode before the failure are pinned; nothing is going
+    // to schedule them now, so they are released here rather than held until the
+    // next stop or play.
+    releasePrefetchPins();
     logError('editor', `Live decode failed: ${e instanceof Error ? e.message : String(e)}`);
     return;
   }
@@ -2594,6 +3195,9 @@ export function reactivate(): void {
 /** Register this module as playerStore's live transport so the footer's normal
  *  transport buttons drive it. Call on editor mount. Returns an unregister. */
 export function attach(): () => void {
+  // Safe now: `prefetchDecodes` and `takeResolver` pin every buffer this module
+  // will peek back, so eviction can only take clips nothing is playing.
+  enableDecodeBudget();
   setLiveTransport({ play, pause, stop, seek });
   return () => {
     dispose();
@@ -2605,6 +3209,9 @@ export function dispose(): void {
   clearSources();
   stopClock();
   playing = false;
+  // The session's clips stop being ours, so the permanent warnings about them go
+  // too: the next project's clip with the same id is a different clip.
+  resetScheduleWarnings('all');
   if (unsubEditor) { unsubEditor(); unsubEditor = null; }
   disposeTrackNodes();
   trackNodes = new Map();

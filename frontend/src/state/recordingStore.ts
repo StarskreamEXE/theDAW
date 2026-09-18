@@ -25,6 +25,13 @@
  *   - PLACEMENT is owned here: `takeClipPlacement` turns a take into clip
  *     coordinates and `editorStore.addClipToTrack` is given the same field set
  *     `lib/sendToTargets.ts:sendAudioToEditor` fills in, peaks included.
+ *   - LATENCY COMPENSATION is owned here too, because placement is. The engine
+ *     takes a `latencyCompSec` and always has; what it never had was a
+ *     producer. `useRecordingPrefs.roundTrip` is that producer — one measured
+ *     round trip per input device, written by the loopback calibrator
+ *     (`lib/roundTripProbe.ts`) and read by `latencyCompSec()` on the way into
+ *     `takeClipPlacement`. A device that was never measured compensates by 0,
+ *     which is the behaviour every pass had before this existed.
  *
  * Two recorders, one press
  * ------------------------
@@ -141,7 +148,7 @@ import {
   type RecordingEngine,
   type Take,
 } from '../lib/recordingEngine';
-import { beginUndoStep, computePeaks, useEditorStore } from './editorStore';
+import { beginUndoStep, clipStretchRate, computePeaks, useEditorStore } from './editorStore';
 import { usePlayerStore } from './playerStore';
 import { currentTransportSec } from './liveMixer';
 import {
@@ -151,7 +158,10 @@ import {
   useMetronomeStore,
 } from './metronomeStore';
 import { callEditorPlay } from './editorPlaybackBridge';
+import { resolveGlobal } from './ioDevicesStore';
 import { capturesMidi } from '../lib/midiCapture';
+import type { ClipTake } from '../lib/clipComp';
+import { matchClipForTake, nextTakeLabel, takeReadOffsetFor } from '../lib/takePlacement';
 import { EDITOR_TIMELINE_ID } from '../components/audio/trackMenuModel';
 
 /* -------------------------------------------------------------------------- */
@@ -199,6 +209,91 @@ export interface RecordingNotice {
 const asPunchMode = (v: unknown): PunchMode =>
   (PUNCH_CHOICES as readonly unknown[]).includes(v) ? (v as PunchMode) : 'off';
 
+/**
+ * What a pass does when it lands on top of a clip that is already there.
+ *
+ *   - `takes` — it becomes an alternate TAKE of that clip and the clip plays
+ *     it (`lib/takePlacement` decides which clip, if any). The default: a
+ *     performer re-recording a phrase means the new pass to replace the old
+ *     one, and stacking a second clip over the first only sounds like both.
+ *   - `clips` — every pass lands as its own clip, which is what every pass did
+ *     before takes existed. Kept as a preference rather than removed, because
+ *     layering IS what a user overdubbing a harmony onto the same lane wants.
+ */
+export type TakeMode = 'takes' | 'clips';
+
+export const TAKE_MODES: readonly TakeMode[] = ['takes', 'clips'];
+
+/** Coerce anything — a stale persisted value included — to a real take mode. */
+const asTakeMode = (v: unknown): TakeMode =>
+  (TAKE_MODES as readonly unknown[]).includes(v) ? (v as TakeMode) : 'takes';
+
+/* -------------------------------------------------------------------------- */
+/*                        the round-trip calibration                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One device's measured input→output round trip.
+ *
+ * `ms` is the WHOLE loop — see `lib/roundTripLatency.roundTripMs` for why both
+ * halves carry the same sign against the grid. `confidence` and `measuredAt`
+ * are kept because a saved number the user cannot judge is worse than none:
+ * the calibrator shows both, so a 0.55-confidence reading from six months ago
+ * is visibly a candidate for re-running rather than a fact.
+ */
+export interface RoundTripEntry {
+  /** The loop, milliseconds. Always finite and >= 0. */
+  ms: number;
+  /** ISO timestamp of the run that produced it. */
+  measuredAt: string;
+  /** `estimateOffset`'s confidence, 0..1. */
+  confidence: number;
+}
+
+/**
+ * Widest round trip that is a measurement rather than a mistake, ms. A second
+ * is already an unusable device stack; anything past it is a mis-correlation,
+ * and clamping it here keeps a bad persisted entry from throwing every take at
+ * the front of the timeline.
+ */
+export const ROUND_TRIP_MAX_MS = 1000;
+
+/**
+ * How the calibration map is keyed: the RESOLVED input device id, with `''`
+ * meaning "whatever the OS calls the default" — which is `ioResolve.Resolved`'s
+ * own contract for that field, so nothing here invents a second convention.
+ */
+export type DeviceKey = string;
+
+/** Drop anything that is not a usable entry. Used on hydrate AND on write, so
+ *  a caller cannot put a NaN in either. */
+const asRoundTripEntry = (v: unknown): RoundTripEntry | null => {
+  if (!v || typeof v !== 'object') return null;
+  const e = v as { ms?: unknown; measuredAt?: unknown; confidence?: unknown };
+  if (typeof e.ms !== 'number' || !Number.isFinite(e.ms) || e.ms < 0 || e.ms > ROUND_TRIP_MAX_MS) return null;
+  const confidence =
+    typeof e.confidence === 'number' && Number.isFinite(e.confidence)
+      ? Math.min(1, Math.max(0, e.confidence))
+      : 0;
+  return {
+    ms: e.ms,
+    measuredAt: typeof e.measuredAt === 'string' ? e.measuredAt : '',
+    confidence,
+  };
+};
+
+/** Every usable entry of a persisted map, and nothing else. */
+export function asRoundTripMap(v: unknown): Record<DeviceKey, RoundTripEntry> {
+  const out: Record<DeviceKey, RoundTripEntry> = {};
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return out;
+  for (const [key, value] of Object.entries(v as Record<string, unknown>)) {
+    if (typeof key !== 'string') continue;
+    const entry = asRoundTripEntry(value);
+    if (entry) out[key] = entry;
+  }
+  return out;
+}
+
 /* -------------------------------------------------------------------------- */
 /*                            the preference store                            */
 /* -------------------------------------------------------------------------- */
@@ -206,8 +301,25 @@ const asPunchMode = (v: unknown): PunchMode =>
 export interface RecordingPrefsState {
   /** The punch window's mode. */
   punch: PunchMode;
+  /**
+   * Measured round trip per input device. Keyed by `DeviceKey`; absent means
+   * "never measured on this device", which is 0 compensation — today's
+   * behaviour, unchanged for anyone who never opens the calibrator.
+   */
+  roundTrip: Record<DeviceKey, RoundTripEntry>;
+  /** Where a pass lands when a clip is already there. Anything unknown falls
+   *  back to `takes`. */
+  takeMode: TakeMode;
   /** Choose it. Anything unknown falls back to `off`. */
   setPunch: (mode: PunchMode) => void;
+  /** Choose it. Anything unknown falls back to `takes`. */
+  setTakeMode: (mode: TakeMode) => void;
+  /** Save a measurement for one device. A value that is not a usable entry
+   *  (NaN, negative, past `ROUND_TRIP_MAX_MS`) CLEARS that device instead of
+   *  being stored — a bad number must never reach take placement. */
+  setRoundTrip: (deviceKey: DeviceKey, entry: RoundTripEntry) => void;
+  /** Forget one device's measurement. */
+  clearRoundTrip: (deviceKey: DeviceKey) => void;
 }
 
 /**
@@ -304,20 +416,44 @@ export function mergeRecordingPrefs(
   persisted: unknown,
   current: RecordingPrefsState,
 ): RecordingPrefsState {
-  return { ...current, punch: asPunchMode((persisted as { punch?: unknown } | null)?.punch) };
+  const p = persisted as { punch?: unknown; roundTrip?: unknown; takeMode?: unknown } | null;
+  return {
+    ...current,
+    punch: asPunchMode(p?.punch),
+    roundTrip: asRoundTripMap(p?.roundTrip),
+    takeMode: asTakeMode(p?.takeMode),
+  };
 }
 
 export const useRecordingPrefs = create<RecordingPrefsState>()(
   persist(
     (set) => ({
       punch: 'off',
+      roundTrip: {},
+      takeMode: 'takes',
       setPunch: (mode: PunchMode) => set({ punch: asPunchMode(mode) }),
+      setTakeMode: (mode: TakeMode) => set({ takeMode: asTakeMode(mode) }),
+      setRoundTrip: (deviceKey: DeviceKey, entry: RoundTripEntry) =>
+        set((s) => {
+          const clean = asRoundTripEntry(entry);
+          const next = { ...s.roundTrip };
+          if (clean) next[deviceKey] = clean;
+          else delete next[deviceKey];
+          return { roundTrip: next };
+        }),
+      clearRoundTrip: (deviceKey: DeviceKey) =>
+        set((s) => {
+          if (!(deviceKey in s.roundTrip)) return {};
+          const next = { ...s.roundTrip };
+          delete next[deviceKey];
+          return { roundTrip: next };
+        }),
     }),
     {
       name: 'thedaw-recording-prefs',
       version: 1,
       storage: createJSONStorage(() => prefsJsonBackend),
-      partialize: (s) => ({ punch: s.punch }),
+      partialize: (s) => ({ punch: s.punch, roundTrip: s.roundTrip, takeMode: s.takeMode }),
       merge: (persisted, current) => mergeRecordingPrefs(persisted, current),
     },
   ),
@@ -325,6 +461,53 @@ export const useRecordingPrefs = create<RecordingPrefsState>()(
 
 /** The mode a press would punch with. */
 export const punchMode = (): PunchMode => useRecordingPrefs.getState().punch;
+
+/** Where a pass made RIGHT NOW would land on top of an existing clip. */
+export const takeMode = (): TakeMode => useRecordingPrefs.getState().takeMode;
+
+/**
+ * Which device a calibration belongs to.
+ *
+ * The recorder opens the microphone with NO device id
+ * (`syncArmed` arms `{ kind: 'mic' }`, and `musicalConstraints` carries over
+ * only what it was given), so today every pass records on whatever the OS calls
+ * the default — which is what `resolveGlobal('audio_input')` reports as `''`
+ * when the user has chosen nothing. Keying on the resolved id rather than on
+ * the literal empty string means a user who HAS picked a global input keeps
+ * their calibration filed under that device, and the calibrator measures
+ * through the same id, so the two always agree about what was measured.
+ */
+export const recordingDeviceKey = (): DeviceKey => {
+  try {
+    return resolveGlobal('audio_input').deviceId;
+  } catch {
+    // `placeTakes` is on the press path, whose actions are documented as never
+    // throwing. A resolution that cannot run means "no named device", which is
+    // the OS-default key — the same answer a fresh install gives.
+    return '';
+  }
+};
+
+/**
+ * The measurement for the device a press would use, or `null`.
+ *
+ * Deliberately NOT a hook: `placeTakes` runs outside React.
+ */
+export const roundTripFor = (deviceKey: DeviceKey = recordingDeviceKey()): RoundTripEntry | null =>
+  useRecordingPrefs.getState().roundTrip[deviceKey] ?? null;
+
+/**
+ * What `takeClipPlacement` must remove from a take's start, seconds.
+ *
+ * `recordingEngine.ts:300-319`: the parameter has been there since the engine
+ * landed, documented as "the input round trip", with no producer in `src` —
+ * this is that producer. Absent (never measured, or a persisted entry this
+ * build rejected) is 0, which is exactly the behaviour every pass has today.
+ */
+export function latencyCompSec(deviceKey: DeviceKey = recordingDeviceKey()): number {
+  const entry = roundTripFor(deviceKey);
+  return entry ? entry.ms / 1000 : 0;
+}
 
 export interface RecordingStoreState {
   status: RecordingStatus;
@@ -601,7 +784,18 @@ function syncArmed(ids: readonly string[]): void {
   const want = new Set(micIds);
   for (const id of e.armed()) if (!want.has(id)) e.disarm(id);
   const have = new Set(e.armed());
-  for (const id of micIds) if (!have.has(id)) e.arm(id, { kind: 'mic' });
+  // The arm source names the RESOLVED global input, not "whatever the OS calls
+  // the default". Without it a take is captured on the OS default while its
+  // latency compensation is filed under the device the user actually chose, so
+  // a calibration measured on one microphone would be applied to another. The
+  // engine builds its constraints with `micConstraints(source.deviceId)` and
+  // that is a SOFT constraint, so a device that vanished between the enumerate
+  // and the press still degrades to the OS default rather than refusing to
+  // record. `''` keeps meaning exactly that default — `micConstraints` omits
+  // the field entirely for an empty id, which is the behaviour every pass has
+  // had until now.
+  const deviceId = recordingDeviceKey();
+  for (const id of micIds) if (!have.has(id)) e.arm(id, { kind: 'mic', deviceId });
   if (!sameIds(st().armedTrackIds, ids)) setState({ armedTrackIds: [...ids] });
 }
 
@@ -739,25 +933,69 @@ export function currentPassPunchWindow(): { from: number; to: number } | null {
  * clip to the window instead. Peaks are decoded afterwards and cached onto the
  * clip — a decode that fails costs the waveform drawing, never the take.
  *
+ * A pass that lands ON a clip that is already there does not become a second
+ * clip: `lib/takePlacement.matchClipForTake` matches it to that clip and it is
+ * appended as an alternate TAKE which the clip then plays. The match runs after
+ * the punch crop, so what is tested is the span that would have been laid down.
+ * A take must be able to BE the clip — cover it end to end from a readable
+ * head, `takePlacement.takeReadOffsetFor` — and its read head is rebased onto
+ * the clip's start, because the clip keeps its own position and a take brings
+ * bytes rather than a place to put them. A pass that covers only part of a clip
+ * is not a take of it and lands beside it; that is comp material, and comping
+ * has a UI coming (T46G).
+ * The `record.takeMode` preference turns it off (`'clips'`), which is the
+ * behaviour every pass had before takes existed.
+ *
+ * One caveat, pinned by the suite: `editorStore.addTakeToClip` opens an undo
+ * step of its own, so a pass that appends to TWO clips at once costs two undos
+ * rather than one. Everything is restored either way; closing it needs the
+ * `coalesce` option `moveCompBoundary` already has, which is `editorStore`'s to
+ * add.
+ *
+ * `place.startSec` is the take's anchor already slid back by the device's
+ * measured round trip, so it is where the clip really belongs on the timeline —
+ * which is why the punch window is intersected with it rather than with the raw
+ * anchor: the window is in timeline coordinates and so, now, is the clip.
+ *
  * That same decode is the repair for a take whose CLOCK never moved (see the
  * header): a zero length, or a pass whose transport never rolled, takes its
  * length from the blob instead. The repair is deliberately narrow — a clip the
  * clock measured correctly is never overwritten, because the user may have
  * trimmed it in the moments the decode took.
  */
+/**
+ * Which take a clip is playing, as a comparable string — the take count and the
+ * active index, plus a marker for a clip that is no longer there at all. Used
+ * to decide whether a decode that started before the clip changed may still
+ * write to it.
+ */
+function takeStateOf(clipId: string): string {
+  const clip = useEditorStore.getState().clips.find((c) => c.id === clipId);
+  if (!clip) return 'gone';
+  // The active take's id is part of the identity so a remove-then-append that
+  // lands on the same count and index still reads as a different clip.
+  const i = clip.activeTakeIndex ?? 0;
+  return `${clip.takes?.length ?? 0}:${i}:${clip.takes?.[i]?.id ?? ''}`;
+}
+
 function placeTakes(takes: readonly Take[]): void {
   if (takes.length === 0) return;
   const punchWin = passPunchWindow;
+  // ONE device per pass, so the compensation is read once rather than per take:
+  // a device swapped between two takes of the same press is not a thing that
+  // can happen, and re-reading it would only invite the two to disagree.
+  const comp = latencyCompSec();
   beginUndoStep();
   let faulted: RecordingError | null = null;
   let placed = 0;
   let dropped = 0;
   for (const take of takes) {
     if (take.meta.error) faulted = take.meta.error;
-    const place = takeClipPlacement(take);
+    const place = takeClipPlacement(take, { latencyCompSec: comp });
     const editor = useEditorStore.getState();
     if (!editor.tracks.some((t) => t.id === place.trackId)) continue; // the track was deleted mid-pass
-    const color = editor.tracks.find((t) => t.id === place.trackId)?.color ?? FALLBACK_CLIP_COLOR;
+    const track = editor.tracks.find((t) => t.id === place.trackId);
+    const color = track?.color ?? FALLBACK_CLIP_COLOR;
     const measured = place.durationSec > 0 && transportRolled;
     // The punch crop. Only on a take the CLOCK measured: an unmeasured one has
     // no true extent to intersect the window with (its length is about to come
@@ -778,25 +1016,100 @@ function placeTakes(takes: readonly Take[]): void {
       durationSec = to - from;
       offsetIntoSource = from - place.startSec;
     }
-    takeSeq += 1;
     placed += 1;
-    const clipId = editor.addClipToTrack({
-      trackId: place.trackId,
-      label: `Take ${takeSeq}`,
-      audioBlob: take.blob,
-      mimeType: take.meta.mime,
-      // The SOURCE is the whole pass however the window cropped it: the bytes
-      // outside the punch are trimmed off the clip, not thrown away.
-      sourceDuration: place.durationSec,
-      offsetIntoSource,
-      durationSec,
-      startSec,
-      color,
-    });
+    // A pass that lands ON a clip is a TAKE of it, not a second clip stacked
+    // over the first. The crop above has already run, so the span tested is the
+    // one that would have been laid down — a punched pass is matched against
+    // where it really goes, not against the whole take it was cut out of.
+    // `measured` gates it for the same reason the crop is gated: a take whose
+    // clock never moved has no true extent yet — its length arrives from the
+    // decode — and the repair that supplies it writes the CLIP's length, which
+    // on an existing clip would resize somebody else's work.
+    const span = { startSec, durationSec, offsetIntoSource };
+    // A FROZEN track's clips are one printed stem, and unfreezing throws it away
+    // for the originals it was printed from — a take hung off it would go with
+    // it. The pass lands as its own clip, where it survives the unfreeze.
+    // A STRETCHED or WARPED clip reads more (or other) source seconds than its
+    // timeline span — `clipSourceSpanSec`, and the markers tie moments of the
+    // OLD source to clip moments — so a take that covers the timeline span
+    // does not cover what the clip reads. Such a clip is never a target.
+    const candidates = measured && takeMode() === 'takes' && !track?.frozenOriginal
+      ? editor.clips.filter(
+          (c) => c.trackId === place.trackId && clipStretchRate(c) === 1 && !c.warpMarkers?.length,
+        )
+      : [];
+    const onto = matchClipForTake(candidates, span);
+    const target = onto ? editor.clips.find((c) => c.id === onto) : undefined;
+    // The read head the CLIP needs, which is not the head the take was cropped
+    // to: the clip keeps its own start, so the take is read from the moment the
+    // clip begins. `matchClipForTake` refuses every clip this cannot be computed
+    // for, so a null here is only reachable if the two disagreed — in which case
+    // the pass takes the clip branch, which is always correct.
+    const readOffset = target ? takeReadOffsetFor(target, span) : null;
+    let clipId: string;
+    if (target && readOffset !== null) {
+      const alternate: ClipTake = {
+        id: take.meta.id,
+        label: nextTakeLabel(target),
+        audioBlob: take.blob,
+        mimeType: take.meta.mime,
+        // Same field set the new-clip branch fills in, and for the same reason:
+        // a take IS its source. The OFFSET is the one field that differs — it is
+        // rebased onto the clip's head, so the clip reads the take from the
+        // moment it itself begins.
+        sourceDuration: place.durationSec,
+        offsetIntoSource: readOffset,
+      };
+      // `addTakeToClip` seeds the clip's CURRENT media as take 1 when it has
+      // none, so the pass it is replacing is never lost, and `activate` makes
+      // the new one what the clip plays — which is what pressing record over a
+      // phrase asks for. The clip keeps its own position and length: a take is
+      // an alternate reading of that stretch of timeline, not a re-placement of
+      // it.
+      editor.addTakeToClip(target.id, alternate, { activate: true });
+      clipId = target.id;
+      // A COMPED clip does not play its active take — it plays its comp — so
+      // `activate` alone would file the pass away inaudibly. The comp's LAST
+      // region is retargeted onto it, which is the closest thing to "this is
+      // what the clip plays now" that leaves the user's earlier boundaries
+      // standing. (Retargeting every region would silently delete the comp.)
+      const targetComp = target.comp;
+      if (targetComp && targetComp.length > 0) {
+        const newIndex = target.takes && target.takes.length > 0 ? target.takes.length : 1;
+        useEditorStore.getState().setCompRegionAt(target.id, targetComp[targetComp.length - 1].startSec, newIndex);
+      }
+    } else {
+      takeSeq += 1;
+      clipId = editor.addClipToTrack({
+        trackId: place.trackId,
+        label: `Take ${takeSeq}`,
+        audioBlob: take.blob,
+        mimeType: take.meta.mime,
+        // The SOURCE is the whole pass however the window cropped it: the bytes
+        // outside the punch are trimmed off the clip, not thrown away.
+        sourceDuration: place.durationSec,
+        offsetIntoSource,
+        durationSec,
+        startSec,
+        color,
+      });
+    }
+    // WHAT THE DECODE IS ALLOWED TO WRITE, decided now rather than when it
+    // resolves. `applyClipRender` writes the clip AND mirrors onto its ACTIVE
+    // take, so a decode that lands after a later pass has appended and activated
+    // a take would hang this pass's peaks on that pass's take, and the length
+    // repair would re-length a clip that is no longer the one it measured. The
+    // take list and the active index together are that identity: unchanged, the
+    // clip is still playing what this pass just put on it.
+    const placedTakeState = takeStateOf(clipId);
     void deps
       .computePeaks(take.blob, TAKE_PEAK_BINS)
       .then(({ peaks, duration }) => {
         const store = useEditorStore.getState();
+        // Something moved under us: the peaks belong to a take that is no longer
+        // the one the write would reach, and the newer pass's own decode is
+        // about to supply the peaks for what IS playing.
+        if (takeStateOf(clipId) !== placedTakeState) return;
         if (!measured && Number.isFinite(duration) && duration > 0) {
           // `applyClipRender` is history-exempt and keeps the redo stack, so the
           // pass is still one undo step however long the decode took.

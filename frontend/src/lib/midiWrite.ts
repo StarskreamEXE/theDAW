@@ -16,12 +16,23 @@
  * ticks, on its channel, with a note's `channel` choosing where it plays. The
  * range's CC 38 counts 1/128 semitones, the way SpessaSynth reads it, since
  * the soundfont render is what reads these wheels.
+ *
+ * TIMING: this writer's input is absolute SECONDS, so it is the wrong door for
+ * the roll's own .mid export — that goes through `lib/rollMidi.rollToMidiFile`,
+ * which writes each note's `tick` straight out at the FILE's PPQ (480 by
+ * default, so half the model's 960): no second quantise, but an odd model tick
+ * rounds by at most half a file tick. Ask it for `PPQ` and nothing moves. What
+ * arrives here (a vocal take, a soundfont render's note list) was never on a
+ * tick grid to begin with. `SMF_PPQ` is exported so a caller that DOES hold
+ * model ticks can convert once, knowingly, instead of guessing the grid.
  */
 import { RANGE_LSB_SPESSA, bendRangeMessages, meterEventMetas, pitchWheelMessage } from './midi';
 import { meterMapToMidiEvents, type MeterEvent, type MeterSegment } from './meterMap';
 import type { RenderNote } from './midiSynth';
 
-const PPQ = 480;
+/** The ticks-per-quarter grid every file this module writes uses. */
+export const SMF_PPQ = 480;
+const PPQ = SMF_PPQ;
 const DEFAULT_BPM = 120;
 
 /** The tempo meta's microseconds per quarter, and the seconds one tick lasts at that tempo. */

@@ -38,6 +38,7 @@ import {
 } from '../../state/editorStore';
 import {
   CONN_OUTPUT,
+  CONN_SIDECHAIN,
   MASTER_ID,
   outputOf,
   sendsFrom,
@@ -78,6 +79,31 @@ export interface SendRow {
   to: string;
   label: string;
   gain: number;
+}
+
+/**
+ * The strips `nodeId` KEYS: the display name of every node one of its
+ * `CONN_SIDECHAIN` edges lands on, deduplicated and in edge order.
+ *
+ * Pure and exported for the same reason `outputOptions` and `sendRows` are —
+ * nothing in the JSX below may derive a list — though unlike those two it has no
+ * test of its own: `MixerStrips.test.ts` is outside this ticket's write set, so
+ * this is covered by the typechecker and by the model beneath it and nothing
+ * more. It is one filter and a `Set` for exactly that reason.
+ */
+export function keyTargetNames(
+  graph: RoutingGraph,
+  buses: readonly EditorBus[],
+  nodeId: string,
+): string[] {
+  const seen = new Set<string>();
+  const names: string[] = [];
+  for (const e of graph.edges) {
+    if (e.connType !== CONN_SIDECHAIN || e.from !== nodeId || seen.has(e.to)) continue;
+    seen.add(e.to);
+    names.push(nodeLabel(graph, buses, e.to));
+  }
+  return names;
 }
 
 /** A node's display name: its bus strip's if it has one, else the graph node's. */
@@ -213,6 +239,40 @@ const SELECT =
 const MINI_BTN =
   'w-4 h-4 rounded font-display text-xs font-bold leading-none flex items-center justify-center border';
 const OFF_BTN = 'bg-black/40 text-zinc-500 border-white/5 hover:text-white';
+
+/**
+ * "KEY → <strip>" on a strip whose output is keying a sidechain effect somewhere
+ * else, and nothing at all on one that is not.
+ *
+ * ON THE SOURCE STRIP, pointing at the destination. A key is the one connection
+ * a mixer cannot show with a fader: it leaves the strip, it is set from a
+ * window buried in another lane's rack, and it is inaudible on this strip. The
+ * arrow points the way the signal goes, which is the same direction the output
+ * picker and the send rows above it read.
+ *
+ * Static text, no control: a `<span>` with a `title`, so there is no label or
+ * ARIA relationship to get wrong (CLAUDE.md rule 3 is about controls). The key
+ * is EDITED where it is owned — the effect's own window — and duplicating that
+ * choice here would be a second owner of one piece of document state.
+ */
+const KeyBadge: React.FC<{
+  graph: RoutingGraph;
+  buses: readonly EditorBus[];
+  nodeId: string;
+  name: string;
+}> = ({ graph, buses, nodeId, name }) => {
+  const targets = keyTargetNames(graph, buses, nodeId);
+  if (targets.length === 0) return null;
+  const list = targets.join(', ');
+  return (
+    <span
+      className="rounded border border-amber-500/40 bg-amber-500/10 px-1 py-0.5 text-[10px] font-mono uppercase tracking-wider text-amber-300 truncate"
+      title={`${name} keys a sidechain effect on ${list}`}
+    >
+      {`KEY → ${list}`}
+    </span>
+  );
+};
 
 /** Surface a refusal on the app's notice stack. */
 function toastRefusal(what: string, reason: RoutingRefusal): void {
@@ -672,6 +732,7 @@ export const MixerStrips: React.FC = () => {
               onPick={(toId) => route(t.id, toId)}
             />
             <SendList graph={routing} buses={buses} nodeId={t.id} name={t.name} />
+            <KeyBadge graph={routing} buses={buses} nodeId={t.id} name={t.name} />
             {/* Above the fader, below the sends: the bar reads the END of the
                 strip, so it already includes everything the controls above it
                 do and the fader right under it moves it. */}
@@ -758,6 +819,9 @@ export const MixerStrips: React.FC = () => {
               value={outputOf(routing, b.id) ?? MASTER_ID}
               onPick={(toId) => route(b.id, toId)}
             />
+            {/* A bus is a legal key source too — the model treats its output
+                like any other node's — so the badge is on both kinds of strip. */}
+            <KeyBadge graph={routing} buses={buses} nodeId={b.id} name={b.name} />
             <StripMeter stripId={b.id} name={b.name} registry={meterEls} />
             <LevelRow
               name={b.name}

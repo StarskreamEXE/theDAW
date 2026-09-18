@@ -7,7 +7,7 @@ then reports max |Δ| and RMS Δ per channel, for the rendered buffer and for th
 encoded WAV. A case fails if either domain exceeds 1e-4 **or** the two sides are
 not the same length and channel count.
 
-Three groups of cases are no longer a plain legacy-vs-core diff, and each says
+Four groups of cases are no longer a plain legacy-vs-core diff, and each says
 so up front:
 
 - Since T14 a bounce is shifted forward by the latency its chains declare, so
@@ -56,6 +56,32 @@ so up front:
   no longer considers active. The same loss reproduces in a hand-built
   `source -> gain -> panner -> delay` graph, and both are exact with the count
   pinned to the bounce's stereo.
+
+- Case **F** is COMPING (two of them), and the legacy bodies predate takes
+  entirely, so there is no legacy render either. Its reference is the **live
+  strip**, built by hand in `main.ts` (`liveStripRender`): `gain -> muteGain ->
+  panner`, the shape `liveMixer.buildTrackNodes` makes, driven by the same
+  `scheduleClipSources` and the same take resolver
+  (`takeIndex -> peekDecoded(takes[i].audioBlob)`) the live scheduler builds,
+  rendered offline from the top of the timeline. That is `export == preview`
+  asserted as arithmetic: both sides decode through the one `lib/decodeCache` at
+  44.1 kHz and therefore read the *same* buffers, so the only way to differ is
+  to resolve a different take or to place a segment differently.
+  - `F · comped` is a clip with two takes (220 Hz stereo / 880 Hz **mono**) and
+    one boundary at 1.5 s with a 0.3 s crossfade, active take 1, with plain
+    clips beside it on the same track and on a second track — so it also states
+    that a comped clip changes nothing around it. The two takes are a whole tone
+    generator and a channel count apart, so a wrongly resolved take is max |Δ|
+    near full scale, never a rounding residual — measured at 1.247 / 7.980e-1
+    with `renderCore`'s resolver mutated to answer take 0 for every index.
+    It asserts the decode, the take resolution, the segment placement (the
+    boundary at 1.5 s) and the crossfade across it: the same
+    `scheduleClipSources` walks `compSegments` on both sides, so the case cannot
+    go stale against the scheduler — it *is* the scheduler on both sides of the
+    diff, with only the buffer supply and the strip differing.
+  - `F · takes without a comp` is the same project with `comp = []`. Takes with
+    no comp is take SWITCHING, which must render exactly as a clip with no takes
+    at all: the single-buffer path, both sides.
 
 Run from `frontend/`: `node scripts/ab-bounce/run.mjs` (exit 1 on any failure).
 It starts Vite on an **OS-assigned free port** — never 3000 — and drives the

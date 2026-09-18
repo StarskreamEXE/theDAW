@@ -17,7 +17,7 @@ import { useEditorStore } from './editorStore';
 import {
   loadProjectIntoEditor,
   captureEditorSession,
-  captureControllerMappings,
+  captureProjectDocument,
 } from '../lib/projectImport';
 
 type ProjectTab = 'save' | 'open';
@@ -297,13 +297,31 @@ export const useProjectStore = create<ProjectState>()((set, get) => ({
       //    bytes (editor clips are in-memory blobs with no path to link).
       let res: { path: string; manifest: ProjectManifest };
       if (pendingTracks.length > 0) {
+        // The TRACKS are the imported structure; everything else about the
+        // project comes from the same capture helper the live-session branch
+        // uses. This branch used to build its own payload from four fields, so
+        // saving an imported project wrote no markers, no loop, no buses, no
+        // master chains and no automation — state the format carries and the
+        // user can see in the editor while the save dialog is open.
+        //
+        // The lane filter is the reason the helper takes the track ids: an
+        // automation lane keys off a TRACK id, and these tracks are the
+        // importer's, so a lane naming an editor track is left out rather than
+        // written as a dangler.
+        const doc = captureProjectDocument(pendingTracks.map((t) => t.id));
         const project: TasmoProjectInput = {
           project_name: name,
           tempo,
           tracks: pendingTracks,
           source_daw: sourceDaw,
           import_warnings: importWarnings,
-          controller_mappings: captureControllerMappings(),
+          buses: doc.buses,
+          locators: doc.locators,
+          loop: doc.loop,
+          master_fx_chain: doc.masterFxChain,
+          master_vst_chain: doc.masterVstChain,
+          automation_lanes: doc.automationLanes,
+          controller_mappings: doc.controllerMappings ?? null,
           perform_routing: pendingPerformRouting,
         };
         logInfo('project', `POST /api/project/save — ${path} embed=${embedAudio}`);
@@ -327,6 +345,18 @@ export const useProjectStore = create<ProjectState>()((set, get) => ({
           // this the file could name a bus that had nowhere to live, and the
           // session reopened with every edge collapsed onto the master.
           buses: session.buses,
+          // Timeline markers and the transport's cycle region. Both are cleared
+          // by loadProject, so before these two keys existed a saved session
+          // reopened with every marker and the loop region gone.
+          locators: session.locators,
+          loop: session.loop,
+          // The master bus's insert rack, its hosted-VST chain and the
+          // automation lanes. Written even when empty: an empty array is what
+          // tells the loader this project HAS none, so the master rack of the
+          // project opened before it does not carry over into this one.
+          master_fx_chain: session.masterFxChain,
+          master_vst_chain: session.masterVstChain,
+          automation_lanes: session.automationLanes,
           controller_mappings: session.controllerMappings ?? null,
         };
         logInfo(

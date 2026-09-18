@@ -679,6 +679,78 @@ function theEnvelopeFollowsTheSchedule(): void {
   assert.ok(methods.includes('setValueCurveAtTime'), 'a named fade curve reaches lib/clipFade through the same call');
 }
 
+/**
+ * T46A: the buffer argument widened to `AudioBuffer | (takeIndex) => AudioBuffer`
+ * so a comped clip can hand over several takes' buffers through this one
+ * scheduler instead of growing a second one.
+ *
+ * The pin is that NOTHING changed for the single-buffer form every call site
+ * uses today: the schedule a plain `AudioBuffer` produces is captured here and
+ * the resolver form is asserted deep-equal against it. The resolver is asked
+ * once, for `clip.activeTakeIndex ?? 0`.
+ */
+function takeResolverSeam(): void {
+  const clip: SchedulableClip = {
+    id: 'clip-t', startSec: 10, offsetIntoSource: 1, durationSec: 4,
+    fadeInSec: 1, fadeOutSec: 1, gain: 0.5,
+  };
+  const buf20 = { duration: 20 } as unknown as BufArg;
+  const resolver = (fn: (takeIndex: number) => unknown): BufArg => fn as unknown as BufArg;
+
+  /** Everything one wiring pass produced, as plain data to compare. */
+  const drive = (buf: BufArg, c: SchedulableClip = clip) => {
+    const ctx = fakeCtx();
+    const dest = fakeNode('destination');
+    const scheduled = scheduleClipSources(
+      ctx as unknown as CtxArg, c, buf, dest as unknown as DestArg, 100, 8,
+    );
+    return {
+      built: scheduled !== null,
+      nodes: ctx.created.map((n) => ({
+        kind: n.kind,
+        started: n.started,
+        calls: n.gain.calls,
+        rate: n.playbackRate.value,
+        buffer: n.buffer,
+        outputs: n.outputs.map((o) => o.kind),
+      })),
+    };
+  };
+
+  // The pre-change result: the argument form every call site passes today.
+  const plain = drive(buf20);
+  assert.ok(plain.built, 'a plain AudioBuffer still schedules');
+  assert.deepEqual(plain.nodes.map((n) => n.kind), ['gain', 'gain', 'source']);
+  assert.deepEqual(plain.nodes[2].started, [[102, 1, 4]], 'and starts where it always did');
+
+  // The resolver form: asked ONCE, for take 0, and it wires up the same graph.
+  const asked: number[] = [];
+  const viaResolver = drive(resolver((i) => { asked.push(i); return buf20; }));
+  assert.deepEqual(asked, [0], 'the resolver is asked once, for the active take');
+  assert.deepEqual(viaResolver, plain, 'a resolver schedules byte-for-byte what the plain buffer did');
+
+  // `activeTakeIndex` is what it is asked for, and undefined means take 0.
+  const askedTwo: number[] = [];
+  drive(resolver((i) => { askedTwo.push(i); return buf20; }), { ...clip, activeTakeIndex: 2 });
+  assert.deepEqual(askedTwo, [2], 'the ACTIVE take is the one resolved');
+  const askedNone: number[] = [];
+  drive(resolver((i) => { askedNone.push(i); return buf20; }), { ...clip, activeTakeIndex: undefined });
+  assert.deepEqual(askedNone, [0], 'an absent active take is take 0');
+
+  // The resolved buffer really is the one that plays: a shorter take for take 1
+  // runs out early, exactly as a shorter single buffer would.
+  const short = drive(
+    resolver((i) => (i === 1 ? { duration: 3 } : buf20)),
+    { ...clip, activeTakeIndex: 1 },
+  );
+  assert.deepEqual(short.nodes[2].started, [[102, 1, 2]], 'the resolved take decides the schedule');
+
+  // Nothing decoded for that take builds nothing, like a missing buffer always has.
+  const none = drive(resolver(() => undefined));
+  assert.equal(none.built, false, 'an unresolved take schedules nothing');
+  assert.deepEqual(none.nodes, [], 'and costs no nodes');
+}
+
 pinTheEnvelope();
 scheduleWithNoNewFields();
 scheduleWithTimeStretch();
@@ -686,6 +758,7 @@ scheduleWithWarpMarkers();
 warpClampedToTheClipBox();
 junkMarkersFallThroughToStretch();
 liveWiring();
+takeResolverSeam();
 theEnvelopeFollowsTheSchedule();
 
 console.log('liveMixer.schedule: ok');
