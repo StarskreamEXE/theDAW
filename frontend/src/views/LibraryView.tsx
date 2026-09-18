@@ -17,6 +17,7 @@ import { useConvertMenu } from '../convert/ConvertMenu';
 import { LineageModal } from '../components/library/LineageModal';
 import { SuggestPlaylistModal } from '../components/library/SuggestPlaylistModal';
 import { StemsRunModal, type StemsRunOptions } from '../components/library/StemsRunModal';
+import { TrackInfo } from '../components/library/TrackInfo';
 import { MicRecorder } from '../components/audio/MicRecorder';
 import { Section } from '../components/ui/Section';
 import { useLibraryStore, type LibraryEntry } from '../state/libraryStore';
@@ -114,9 +115,22 @@ const saveEntryFile = (entry: LibraryEntry, url: string) =>
 const bundleFileName = (id: string, title: string): string =>
   `${Array.from(title || 'entry', (c) => (/[\p{L}\p{N}._-]/u.test(c) ? c : '_')).slice(0, 60).join('')}_${id.slice(0, 8)}.zip`;
 
+type LibrarySubTab = 'tracks' | 'stems' | 'midi' | 'video' | 'score' | 'info';
+
+/** How far `el` sits below the top of the scroll region `region`, in the
+ *  region's own scroll pixels. The Shell scales the app with CSS zoom, so a
+ *  client-rect distance is divided by the region's zoom first. */
+const offsetInRegion = (el: HTMLElement, region: HTMLElement): { top: number; bottom: number } => {
+  const r = region.getBoundingClientRect();
+  const e = el.getBoundingClientRect();
+  const zoom = region.offsetHeight > 0 ? r.height / region.offsetHeight : 1;
+  const z = zoom > 0 ? zoom : 1;
+  return { top: (e.top - r.top) / z, bottom: (e.bottom - r.top) / z };
+};
+
 export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpand?: () => void }> = ({ onSwitchTab, onExpand }) => {
   const [viewMode, setViewMode] = useState<'list' | 'grid'>('list');
-  const [subTab, setSubTab] = useState<'tracks' | 'stems' | 'midi' | 'video' | 'score'>('tracks');
+  const [subTab, setSubTab] = useState<LibrarySubTab>('tracks');
   const [lineageOpen, setLineageOpen] = useState<string | null>(null);
   const [suggestOpen, setSuggestOpen] = useState(false);
   const [selectedEntryIds, setSelectedEntryIds] = useState<string[]>([]);
@@ -351,13 +365,15 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
 
   // Fetch stems / midi indexes lazily when their sub-tab opens.
   useEffect(() => {
-    if (subTab === 'stems' && allStems === null) {
+    // INFO lists the selected track's stems, MIDI and scores too.
+    const info = subTab === 'info';
+    if ((subTab === 'stems' || info) && allStems === null) {
       void fetch('/api/library/_all/stems')
         .then((r) => r.json())
         .then((j) => setAllStems(j.stems || []))
         .catch(() => setAllStems([]));
     }
-    if (subTab === 'midi' && allMidis === null) {
+    if ((subTab === 'midi' || info) && allMidis === null) {
       void fetch('/api/library/_all/midi')
         .then((r) => r.json())
         .then((j) => setAllMidis(j.midis || []))
@@ -371,7 +387,7 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
           setMediaEntries([]);
         });
     }
-    if (subTab === 'score' && allScores === null) {
+    if ((subTab === 'score' || info) && allScores === null) {
       void fetch('/api/library/_all/scores')
         .then((r) => r.json())
         .then((j) => setAllScores(j.scores || []))
@@ -554,6 +570,15 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
     });
   };
 
+  const parentTitles = useMemo(() => Object.fromEntries(entries.map((e) => [e.id, e.title])), [entries]);
+  // Only an audio track has stems, MIDI or scores to look for.
+  const selectedEntry = selectedEntryId
+    ? entries.find((e) => e.id === selectedEntryId && (e.kind ?? 'audio') === 'audio') ?? null
+    : null;
+  /** The selected track has nothing in a Stems / MIDI / Score list that has loaded. */
+  const missingFor = (byParent: Record<string, unknown[]>, loadedRows: unknown[] | null): boolean =>
+    !!selectedEntry && loadedRows !== null && !byParent[selectedEntry.id]?.length;
+
   const openScoreForEntry = (entryId: string) => {
     setSelectedEntry(entryId);
     showBottomTab('score');
@@ -659,6 +684,48 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
     // Selecting a track no longer auto-opens the Details tab (per user).
     // Details is still reachable via the bottom-panel tab + open-lineage events.
   };
+
+  // Select one track by id, as a plain click on its row does: from a group
+  // title in Stems / MIDI / Score, or a relative in INFO.
+  const selectEntryById = (id: string) => {
+    setSelectedEntryIds([id]);
+    setSelectionAnchorId(id);
+    setSelectedEntry(id);
+  };
+
+  // The library stays on the last clicked track: every tab opens at that
+  // track (its row in Tracks, its group in Stems / MIDI / Score), and a
+  // selection made while a tab is open brings the track into view there.
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const followedTabRef = useRef<LibrarySubTab | null>(null);
+  const tabLoaded =
+    subTab === 'stems' ? allStems !== null
+      : subTab === 'midi' ? allMidis !== null
+        : subTab === 'score' ? allScores !== null
+          : true;
+  useEffect(() => {
+    const region = listRef.current;
+    if (!region || !tabLoaded) return;
+    const raf = window.requestAnimationFrame(() => {
+      const tabChanged = followedTabRef.current !== subTab;
+      followedTabRef.current = subTab;
+      const el = selectedEntryId
+        ? region.querySelector<HTMLElement>(`[data-follow-id="${CSS.escape(selectedEntryId)}"]`)
+        : null;
+      // A new tab opens at its top, and moves only when the track is not
+      // already in view there, so the tab's own toolbar stays in sight.
+      if (tabChanged) region.scrollTop = 0;
+      if (!el) return;
+      const { top, bottom } = offsetInRegion(el, region);
+      const margin = 4;
+      if (top < 0 || bottom - top > region.clientHeight) {
+        region.scrollTop += top - margin;
+      } else if (bottom > region.clientHeight) {
+        region.scrollTop += tabChanged ? top - margin : bottom - region.clientHeight + margin;
+      }
+    });
+    return () => window.cancelAnimationFrame(raf);
+  }, [subTab, selectedEntryId, tabLoaded]);
 
   const handleEntryContextMenu = (event: React.MouseEvent, entry: LibraryEntry) => {
     event.stopPropagation();
@@ -1111,12 +1178,16 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
           <SubTabButton active={subTab === 'score'} onClick={() => setSubTab('score')}>
             Score ({allScores?.length ?? '…'})
           </SubTabButton>
+          <SubTabButton active={subTab === 'info'} onClick={() => setSubTab('info')}>
+            Info
+          </SubTabButton>
         </div>
 
         {/* THE scroll region: only the per-tab lists scroll; everything
             above (stats / search / filters / sub-tab strip) stays pinned.
             It is also the drop target for audio files from the desktop. */}
         <div
+          ref={listRef}
           className={`flex-1 min-h-0 overflow-y-auto no-scrollbar flex flex-col transition-colors ${fileDragOver ? 'ring-1 ring-inset ring-purple-400/60 bg-purple-500/5' : ''}`}
           onDragOver={onListDragOver}
           onDragLeave={onListDragLeave}
@@ -1192,6 +1263,7 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
             <div
               key={entry.id}
               data-library-entry-id={entry.id}
+              data-follow-id={entry.id}
               draggable
               onDragStart={(e) => {
                 e.dataTransfer.setData('application/x-thedaw-library-id', entry.id);
@@ -1371,39 +1443,94 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
         )}
         </>)}
 
-        {subTab === 'stems' && (
+        {subTab === 'stems' && (<>
+          {selectedEntry && missingFor(stemsByParent, allStems) && (
+            <NothingForTrack
+              entryId={selectedEntry.id}
+              title={selectedEntry.title}
+              what="stems"
+              action={{
+                label: runningKind?.id === selectedEntry.id && runningKind.kind === 'stems' ? 'Running stems…' : 'Separate stems…',
+                icon: <Scissors className="size-3.5" aria-hidden="true" />,
+                disabled: runningKind?.id === selectedEntry.id && runningKind.kind === 'stems',
+                onClick: () => setStemsModal({ entryId: selectedEntry.id, entryTitle: selectedEntry.title }),
+              }}
+            />
+          )}
           <SubTabList
             byParent={stemsByParent}
-            parentTitles={Object.fromEntries(entries.map((e) => [e.id, e.title]))}
+            parentTitles={parentTitles}
             kind="stem"
             placeholder={allStems === null ? 'Loading stems…' : 'No stems yet. Enable auto-stems in Settings or right-click a track → Separate stems.'}
             onMutated={refreshStems}
+            selectedId={selectedEntryId}
+            onSelectParent={selectEntryById}
           />
-        )}
-        {subTab === 'midi' && (
+        </>)}
+        {subTab === 'midi' && (<>
+          {selectedEntry && missingFor(midisByParent, allMidis) && (
+            <NothingForTrack
+              entryId={selectedEntry.id}
+              title={selectedEntry.title}
+              what="MIDI"
+              action={{
+                label: runningKind?.id === selectedEntry.id && runningKind.kind === 'midi' ? 'Running MIDI…' : 'Convert to MIDI',
+                icon: <FileMusic className="size-3.5" aria-hidden="true" />,
+                disabled: runningKind?.id === selectedEntry.id && runningKind.kind === 'midi',
+                onClick: () => { void runJobForEntry(selectedEntry.id, 'midi'); },
+              }}
+            />
+          )}
           <SubTabList
             byParent={midisByParent}
-            parentTitles={Object.fromEntries(entries.map((e) => [e.id, e.title]))}
+            parentTitles={parentTitles}
             kind="midi"
             placeholder={allMidis === null ? 'Loading MIDI…' : 'No MIDI yet. Enable auto-MIDI in Settings or right-click a track → Convert to MIDI.'}
             onMutated={refreshMidi}
+            selectedId={selectedEntryId}
+            onSelectParent={selectEntryById}
           />
-        )}
+        </>)}
         {subTab === 'video' && (
           <MediaGrid
             entries={mediaEntries}
             onChanged={refreshMedia}
           />
         )}
-        {subTab === 'score' && (
+        {subTab === 'score' && (<>
+          {selectedEntry && missingFor(scoresByParent, allScores) && (
+            <NothingForTrack
+              entryId={selectedEntry.id}
+              title={selectedEntry.title}
+              what="scores"
+              action={{
+                label: 'Open in SCORE',
+                icon: <FileMusic className="size-3.5" aria-hidden="true" />,
+                onClick: () => openScoreForEntry(selectedEntry.id),
+              }}
+            />
+          )}
           <ScoreList
             byParent={scoresByParent}
-            parentTitles={Object.fromEntries(entries.map((e) => [e.id, e.title]))}
+            parentTitles={parentTitles}
             placeholder={allScores === null
               ? 'Loading scores…'
               : 'No scores yet. Open a track in SCORE, pick an instrument and press MAKE.'}
             onOpen={openScoreForEntry}
             onRefresh={refreshScores}
+            selectedId={selectedEntryId}
+            onSelectParent={selectEntryById}
+          />
+        </>)}
+        {subTab === 'info' && (
+          <TrackInfo
+            entryId={selectedEntryId}
+            stems={allStems === null ? null : (selectedEntryId ? stemsByParent[selectedEntryId] ?? [] : [])}
+            midis={allMidis === null ? null : (selectedEntryId ? midisByParent[selectedEntryId] ?? [] : [])}
+            scores={allScores === null ? null : (selectedEntryId ? scoresByParent[selectedEntryId] ?? [] : [])}
+            onOpenDetails={openDetailsForEntry}
+            onOpenLineage={(id) => setLineageOpen(id)}
+            onSelectEntry={selectEntryById}
           />
         )}
         </div>
@@ -2147,6 +2274,58 @@ const MediaCard: React.FC<{
 };
 
 
+/** A song's group in Stems / MIDI / Score, ringed when it is the selected track. */
+const groupFrame = (selected: boolean): string =>
+  `rounded border p-2 bg-white/3 ${selected ? 'border-purple-500/60 ring-1 ring-purple-500/60' : 'border-white/5'}`;
+
+/** A group's song title; a click selects that song. A group whose song has
+ *  left the library shows its id and cannot be selected. */
+const GroupTitle: React.FC<{
+  title: string | undefined;
+  fallback: string;
+  selected: boolean;
+  tone: string;
+  onSelect: () => void;
+}> = ({ title, fallback, selected, tone, onSelect }) =>
+  title ? (
+    <button
+      type="button"
+      className={`mb-1 block w-full truncate text-left text-xs font-bold uppercase tracking-wider ${tone} hover:text-zinc-100`}
+      onClick={onSelect}
+      aria-current={selected ? 'true' : undefined}
+      title={`Select ${title}`}
+    >
+      {title}
+    </button>
+  ) : (
+    <div className={`mb-1 truncate text-xs font-bold uppercase tracking-wider ${tone}`}>{fallback}</div>
+  );
+
+/** The selected track has nothing in this tab: say so at the top of the list,
+ *  with the key that makes it. */
+const NothingForTrack: React.FC<{
+  entryId: string;
+  title: string;
+  what: string;
+  action: { label: string; icon: React.ReactNode; onClick: () => void; disabled?: boolean };
+}> = ({ entryId, title, what, action }) => (
+  <div data-follow-id={entryId} className="mb-2 flex flex-col gap-1.5 rounded border border-purple-500/60 bg-purple-500/6 p-2 ring-1 ring-purple-500/60">
+    <span className="truncate text-xs font-bold uppercase tracking-wider text-purple-300" title={title}>
+      {title}
+    </span>
+    <span className="text-xs font-bold text-zinc-400">No {what} for this track yet.</span>
+    <button
+      type="button"
+      className="flex items-center gap-1.5 self-start rounded border border-white/10 px-2 py-1 text-xs font-bold text-zinc-200 transition-colors hover:border-purple-400/50 hover:text-zinc-100 disabled:opacity-40"
+      onClick={action.onClick}
+      disabled={action.disabled}
+    >
+      {action.icon}
+      {action.label}
+    </button>
+  </div>
+);
+
 interface SubTabListProps {
   byParent: Record<string, Array<Record<string, unknown>>>;
   parentTitles: Record<string, string>;
@@ -2154,6 +2333,10 @@ interface SubTabListProps {
   placeholder: string;
   /** Re-fetch the index in place after a favorite toggle or delete. */
   onMutated: () => void | Promise<void>;
+  /** The library's selected track, whose group is marked. */
+  selectedId: string | null;
+  /** Select a group's track. */
+  onSelectParent: (entryId: string) => void;
 }
 
 type SubTabRowPayload =
@@ -2230,7 +2413,7 @@ const SubTabRow = React.memo<{
 SubTabRow.displayName = 'SubTabRow';
 
 
-const SubTabList: React.FC<SubTabListProps> = ({ byParent, parentTitles, kind, placeholder, onMutated }) => {
+const SubTabList: React.FC<SubTabListProps> = ({ byParent, parentTitles, kind, placeholder, onMutated, selectedId, onSelectParent }) => {
   const parentIds = Object.keys(byParent);
   // Shared ContextMenu primitive — fixes drift under .dense-layout
   // zoom and gives consistent close-on-outside behavior across the
@@ -2450,10 +2633,14 @@ const SubTabList: React.FC<SubTabListProps> = ({ byParent, parentTitles, kind, p
   return (
     <div className="flex flex-col gap-2 relative">
       {parentIds.map((pid) => (
-        <div key={pid} className="border border-white/5 rounded p-2 bg-white/3">
-          <div className="text-[9px] font-black uppercase tracking-widest text-purple-300 mb-1 truncate">
-            {parentTitles[pid] ?? pid}
-          </div>
+        <div key={pid} data-follow-id={pid} className={groupFrame(pid === selectedId)}>
+          <GroupTitle
+            title={parentTitles[pid]}
+            fallback={pid}
+            selected={pid === selectedId}
+            tone="text-purple-300"
+            onSelect={() => onSelectParent(pid)}
+          />
           <div className="flex flex-col gap-0.5">
             {byParent[pid].map((row, idx) => {
               const rowId = String(row.id ?? '');
@@ -2510,7 +2697,9 @@ const ScoreList: React.FC<{
   placeholder: string;
   onOpen: (entryId: string) => void;
   onRefresh: () => void | Promise<void>;
-}> = ({ byParent, parentTitles, placeholder, onOpen, onRefresh }) => {
+  selectedId: string | null;
+  onSelectParent: (entryId: string) => void;
+}> = ({ byParent, parentTitles, placeholder, onOpen, onRefresh, selectedId, onSelectParent }) => {
   const parentIds = Object.keys(byParent);
 
   const downloadScore = (id: string, kind: string) => {
@@ -2561,10 +2750,14 @@ const ScoreList: React.FC<{
     <div className="flex flex-col gap-2">
       {refreshBtn}
       {parentIds.map((pid) => (
-        <div key={pid} className="border border-white/5 rounded p-2 bg-white/3">
-          <div className="text-[9px] font-black uppercase tracking-widest text-emerald-300 mb-1 truncate">
-            {parentTitles[pid] ?? pid}
-          </div>
+        <div key={pid} data-follow-id={pid} className={groupFrame(pid === selectedId)}>
+          <GroupTitle
+            title={parentTitles[pid]}
+            fallback={pid}
+            selected={pid === selectedId}
+            tone="text-emerald-300"
+            onSelect={() => onSelectParent(pid)}
+          />
           <div className="flex flex-col gap-0.5">
             {byParent[pid].map((row, idx) => {
               const id = String(row.id ?? '');
