@@ -136,9 +136,9 @@ jobs:
             --deselect tests/test_modeldl.py::test_download_error_path_records_detail \
             --deselect tests/test_modeldl.py::test_clear_removes_finished_jobs
 
-  # `npm run lint` in frontend/ is `tsc --noEmit`, so this is the type check
-  # the repo already defines rather than a second, CI-only invocation that
-  # could drift from it.
+  # `npm run lint` in frontend/ is `tsc --noEmit` plus the canonical-class
+  # check (scripts/check-canonical-classes.mjs, the same rule VS Code reports
+  # as suggestCanonicalClasses), so CI runs exactly what the repo defines.
   frontend-typecheck:
     runs-on: ubuntu-latest
     timeout-minutes: 15

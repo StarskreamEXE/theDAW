@@ -171,7 +171,7 @@ export function XrBusPanel(): React.ReactElement {
       )}
 
       <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2">
-        <div className="grid items-start gap-x-6 gap-y-3 [grid-template-columns:repeat(auto-fill,minmax(280px,1fr))]">
+        <div className="grid items-start gap-x-6 gap-y-3 grid-cols-[repeat(auto-fill,minmax(280px,1fr))]">
           {Object.entries(groups).map(([group, items]) => (
             <fieldset key={group} className="min-w-0 border-0 p-0">
               <legend className="mb-1 text-[9px] font-black uppercase tracking-widest text-cyan-300/80">
