@@ -11,7 +11,7 @@
  *                size, off-center shrink (horizontal fisheye)
  *   CONTROLLER — the device's exact grid (KNOBS → FADERS → BUTTONS)
  *
- * Slots auto-fill from the catalog; a 🔒 lock pins an item so auto-fill skips
+ * Slots auto-fill from the catalog; a lock pins an item so auto-fill skips
  * it, and the ⠿ grip drag-reorders. All wired to slideStore (persisted).
  *
  * The AUDIO/VISUAL toggle lives UP in the bottom-panel tab row
@@ -21,7 +21,7 @@
  * control-sync bus + the VJ iframe for real-time two-way sync.
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Rows3, Crosshair, LayoutGrid, RotateCcw, ChevronLeft, ChevronRight, Plus, Settings2, X, Trash2, Film, Target, Wand2, Sliders, Sparkles, Radio, Crosshair as MapPin, Check } from 'lucide-react';
+import { Rows3, Crosshair, LayoutGrid, RotateCcw, ChevronLeft, ChevronRight, Plus, Settings2, X, Trash2, Film, Target, Wand2, Sliders, Sparkles, Radio, Crosshair as MapPin, Check, Lock, Unlock } from 'lucide-react';
 import './track-controls.css';
 import { TrackFader, TrackKnob, TrackPad } from './TrackControls';
 import WorldsCollidePanel from './WorldsCollidePanel';
@@ -190,9 +190,14 @@ const Slot: React.FC<SlotProps> = React.memo(({ index, kind, content, item, lock
       <button
         className={`sl-lock${locked ? ' on' : ''}`}
         title={locked ? 'Locked — auto-fill skips this slot' : 'Unlocked — auto-fill may use this slot'}
+        aria-label={locked ? 'Locked, auto-fill skips this slot' : 'Unlocked, auto-fill may use this slot'}
+        aria-pressed={locked}
         onClick={() => toggleLock(index, item)}
       >
-        {locked ? '🔒' : '🔓'}
+        {/* A drawn icon rather than an emoji: an emoji renders in whatever the
+            platform's font decides, at a size the surrounding type does not
+            control, and it carries colour this interface did not choose. */}
+        {locked ? <Lock className="size-3" aria-hidden="true" /> : <Unlock className="size-3" aria-hidden="true" />}
       </button>
       {widget}
     </div>

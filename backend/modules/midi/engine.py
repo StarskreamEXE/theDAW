@@ -393,7 +393,7 @@ def _run_basic_pitch(audio_path: Path, output_path: Path) -> dict:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=str(output_path.parent)) as td:
         td_path = Path(td)
-        # basic-pitch prints status with emoji (🚨, etc.). On Windows the
+        # basic-pitch prints status with emoji. On Windows the
         # console/log stream is often a legacy code page (cp1252), so the
         # library's own print() raises UnicodeEncodeError ('charmap' codec
         # can't encode '\U0001f6a8') and kills a conversion that would

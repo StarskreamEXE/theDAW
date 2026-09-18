@@ -580,7 +580,7 @@ export const FEATURES: FeatureEntry[] = [
     id: 'app-menu',
     name: 'App menu',
     what: 'Settings, models, projects, docs and the feature tour',
-    how: ['Click the ☰ button at the far right of the header.', 'Open Settings to download and switch on models and modules.'],
+    how: ['Click the menu button at the far right of the header.', 'Open Settings to download and switch on models and modules.'],
     where: 'Header, far right',
     surface: { kind: 'shell' },
     aliases: ['hamburger', 'settings', 'preferences', 'options', 'models', 'project'],
@@ -605,32 +605,32 @@ export const FEATURES: FeatureEntry[] = [
     locate: tourTarget('import'),
   },
   {
-    // Lives in a modal behind the ☰ menu, so LOCATE rings the menu button.
+    // Lives in a modal behind the menu, so LOCATE rings the menu button.
     id: 'asset-library',
     name: 'Asset Library',
     what: 'A searchable catalog of downloadable example projects, plugins, volumetric captures and cockpit scenes',
     how: [
-      'Open the ☰ menu at the far right of the header and choose Asset Library.',
+      'Open the menu at the far right of the header and choose Asset Library.',
       'Search or filter the list for what you want.',
       'Press an item’s main button to install it and open it where it is used, or save a copy to a folder.',
     ],
-    where: 'Header, ☰ menu',
+    where: 'Header, menu',
     surface: { kind: 'shell' },
     aliases: ['assets', 'downloads', 'examples', 'example projects', 'presets'],
     guide: 'App Menu and Project Operations',
     locate: tourTarget('app-menu'),
   },
   {
-    // A section of the Settings modal, so LOCATE rings the ☰ menu button too.
+    // A section of the Settings modal, so LOCATE rings the menu button too.
     id: 'settings-io',
     name: 'Inputs & outputs',
     what: 'The devices theDAW plays through and listens to: main and cue outputs, microphone, MIDI in and out, and the pop-out screen',
     how: [
-      'Open the ☰ menu at the far right of the header and choose Settings.',
+      'Open the menu at the far right of the header and choose Settings.',
       'Find the Inputs & outputs section.',
       'Pick a device for each slot, or open Per-surface to send one surface somewhere else.',
     ],
-    where: 'Header, ☰ menu → Settings',
+    where: 'Header, menu, then Settings',
     surface: { kind: 'shell' },
     aliases: ['audio output', 'audio interface', 'sound card', 'output device', 'headphones', 'mic', 'midi input', 'midi output', 'monitor'],
     locate: tourTarget('app-menu'),
@@ -686,8 +686,8 @@ export const FEATURES: FeatureEntry[] = [
     id: 'feature-tour',
     name: 'Feature tour',
     what: 'The guided walkthrough of the app, replayable any time',
-    how: ['Open the ☰ menu, or HOME, and start the tour.', 'Use ← and → to move, Esc to leave.'],
-    where: 'HOME and the ☰ menu',
+    how: ['Open the menu, or HOME, and start the tour.', 'Use ← and → to move, Esc to leave.'],
+    where: 'HOME and the menu',
     surface: { kind: 'shell' },
     aliases: ['walkthrough', 'onboarding', 'intro', 'guided', 'first run'],
     guide: 'HOME Screen and Onboarding Tour',
