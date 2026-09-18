@@ -12,6 +12,10 @@
  * initial bundle, the way ScoreView loads them.
  */
 
+import type React from 'react';
+import { flushSync } from 'react-dom';
+import { createRoot } from 'react-dom/client';
+
 /** Pixels to PDF points: CSS px are 96 to the inch, points 72. */
 const PT_PER_PX = 72 / 96;
 
@@ -160,3 +164,33 @@ ${body}
 /** `title` as a file stem: lowercase, words joined by dashes. */
 export const fileStem = (title: string, fallback = 'picture'): string =>
   (title || fallback).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || fallback;
+
+/**
+ * A React SVG tree as a string, rendered by the browser rather than by
+ * `react-dom/server`.
+ *
+ * The server renderer is a second copy of React's whole rendering path, and
+ * pulling it into a browser bundle for one export button costs a dependency
+ * re-optimization and a full page reload every time the dev server notices it.
+ * Rendering into a detached node and serialising what the DOM actually built is
+ * smaller, and it is also more faithful: what lands in the file is what the
+ * browser would have drawn.
+ */
+export const renderSvgToString = (element: React.ReactElement): string => {
+  const holder = document.createElement('div');
+  holder.style.position = 'fixed';
+  holder.style.left = '-100000px';
+  holder.style.top = '0';
+  holder.setAttribute('aria-hidden', 'true');
+  document.body.appendChild(holder);
+  const root = createRoot(holder);
+  try {
+    // Synchronous, because the caller wants the markup on the next line.
+    flushSync(() => root.render(element));
+    const svg = holder.firstElementChild;
+    return svg ? new XMLSerializer().serializeToString(svg) : '';
+  } finally {
+    root.unmount();
+    holder.remove();
+  }
+};

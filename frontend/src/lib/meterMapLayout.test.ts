@@ -172,3 +172,68 @@ assert.deepEqual(factsFor(data, 123.4), [
 ]);
 
 console.log('meterMapLayout: ok');
+
+// ── tempo labels never overlap ──────────────────────────────────────────────
+// The songwriter's House of the Rising Sun moves through eight tempos. Two
+// changes close together put two labels in the same pixels, and a number a
+// reader cannot separate from its neighbour says less than no number at all.
+import { placeTempoFlags, TIER_H } from '../components/layout/meterMapDraw';
+
+const eightTempos = {
+  ...data,
+  duration: 273,
+  tempo: [
+    { start_sec: 0, bpm: 130 },
+    { start_sec: 31, bpm: 200 },
+    { start_sec: 68, bpm: 160 },
+    { start_sec: 74, bpm: 174 },
+    { start_sec: 80, bpm: 202 },
+    { start_sec: 176, bpm: 200 },
+    { start_sec: 205, bpm: 198 },
+    { start_sec: 240, bpm: 128 },
+  ],
+};
+
+{
+  const W = 1000;
+  const x = (t: number) => (t / 273) * W;
+  const flags = placeTempoFlags(eightTempos, W, x);
+  assert.equal(flags.length, 7, 'the first tempo is the starting tempo, not a change');
+
+  // No two labels on the same tier may overlap.
+  const boxes = flags
+    .filter((f) => f.label)
+    .map((f) => {
+      const w = f.label.length * 12 * 0.58;
+      return { tier: f.tier, lo: f.anchor === 'start' ? f.lx : f.lx - w, hi: f.anchor === 'start' ? f.lx + w : f.lx };
+    });
+  for (let i = 0; i < boxes.length; i += 1) {
+    for (let j = i + 1; j < boxes.length; j += 1) {
+      if (boxes[i].tier !== boxes[j].tier) continue;
+      const clear = boxes[i].hi <= boxes[j].lo || boxes[j].hi <= boxes[i].lo;
+      assert.ok(clear, `labels ${i} and ${j} overlap on tier ${boxes[i].tier}`);
+    }
+  }
+  // The three changes inside twelve seconds are what forces a second tier.
+  assert.ok(flags.some((f) => f.tier > 0), 'three changes in twelve seconds should step a label up');
+  // Every label stays on the canvas.
+  for (const f of boxes) {
+    assert.ok(f.lo >= -0.01 && f.hi <= W + 0.01, `a label ran off the canvas: ${f.lo}..${f.hi}`);
+  }
+  // The flag itself never moves off its own change.
+  for (const [i, f] of flags.entries()) {
+    assert.ok(Math.abs(f.x - x(eightTempos.tempo[i + 1].start_sec)) < 1e-9, 'a flag moved off its change');
+  }
+  assert.equal(TIER_H, 13);
+}
+
+// A narrow chart is the crowded case: the same eight tempos in a DETAILS panel.
+{
+  const W = 320;
+  const flags = placeTempoFlags(eightTempos, W, (t) => (t / 273) * W);
+  const drawn = flags.filter((f) => f.label);
+  assert.ok(drawn.length >= 4, `too many labels dropped at ${W}px: ${drawn.length} of ${flags.length}`);
+  assert.equal(flags.length, 7, 'a flag is never dropped, only its label');
+}
+
+console.log('meterMapLayout: tempo flags ok');
