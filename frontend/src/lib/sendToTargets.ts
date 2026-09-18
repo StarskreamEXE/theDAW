@@ -51,9 +51,10 @@ export type AudioSendTarget =
 export type MidiSendTarget = 'piano-roll' | 'step-seq';
 
 /**
- * Append an audio blob to the waveform editor — either to the tail of the
- * first existing track, or as a new track. Decodes peaks so the waveform
- * shows up immediately.
+ * Put an audio blob on the EDIT timeline. The first empty lane takes it, so a
+ * fresh timeline fills from lane 1 down. When every lane holds something,
+ * 'editor-new-track' adds a lane and 'editor-first-track' appends after the
+ * last clip on lane 1. Decodes peaks so the waveform shows up immediately.
  */
 export async function sendAudioToEditor(
   audio: SendableAudio,
@@ -61,21 +62,23 @@ export async function sendAudioToEditor(
 ): Promise<string | null> {
   try {
     const editor = useEditorStore.getState();
+    const taken = new Set(editor.clips.map((c) => c.trackId));
+    const empty = editor.tracks.find((t) => !taken.has(t.id));
     let trackId: string;
-    if (target === 'editor-new-track' || editor.tracks.length === 0) {
+    let tail = 0;
+    if (empty) {
+      trackId = empty.id;
+    } else if (target === 'editor-new-track' || editor.tracks.length === 0) {
       trackId = editor.addTrack({ name: audio.label });
     } else {
       trackId = editor.tracks[0].id;
+      tail = Math.max(
+        0,
+        ...editor.clips
+          .filter((c) => c.trackId === trackId)
+          .map((c) => c.startSec + c.durationSec),
+      );
     }
-    const tail =
-      target === 'editor-new-track'
-        ? 0
-        : Math.max(
-            0,
-            ...editor.clips
-              .filter((c) => c.trackId === trackId)
-              .map((c) => c.startSec + c.durationSec),
-          );
     const blob = await audio.fetcher();
     const { peaks, duration } = await computePeaks(blob, 240);
     const trackColor =
