@@ -33,7 +33,7 @@
 import assert from 'node:assert/strict';
 // Static imports are safe despite the global installs below: neither module
 // reads `window` or `navigator` at module scope, only inside its functions.
-import { beginUndoStep, useEditorStore, type EditorBus, type EditorTrack } from './editorStore.ts';
+import { beginUndoStep, DEFAULT_TRACK_COUNT, useEditorStore, type EditorBus, type EditorTrack } from './editorStore.ts';
 import { MASTER_ID, outputOf, sendsFrom, validateGraph } from './routingGraph.ts';
 import { initEditorAutosave, flushPendingAutosave, useAutosaveRecoveryStore } from '../lib/editorAutosave.ts';
 
@@ -150,10 +150,11 @@ function aProjectWithNoRoutingIsMigratedOnLoad(): void {
   assert.deepEqual(validateGraph(g), [], 'the migrated graph is sane');
   assert.deepEqual(st().buses, [], 'and a migrated project has no buses');
 
-  // A load with NO tracks falls back to one track — which must be routed too.
+  // A load with NO tracks falls back to the six default lanes — every one of
+  // which must be routed too.
   st().loadProject({ tracks: [], clips: [] });
-  assert.equal(st().tracks.length, 1, 'an empty load still yields the fallback track');
-  assert.equal(outputOf(st().routing, st().tracks[0].id), MASTER_ID, 'and the fallback track is routed');
+  assert.equal(st().tracks.length, DEFAULT_TRACK_COUNT, 'an empty load still yields the default lanes');
+  for (const t of st().tracks) assert.equal(outputOf(st().routing, t.id), MASTER_ID, `default lane ${t.id} is routed`);
 }
 
 function aLoadedGraphIsKeptButCompleted(): void {
