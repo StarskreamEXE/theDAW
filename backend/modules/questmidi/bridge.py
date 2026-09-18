@@ -24,10 +24,10 @@ import subprocess
 from typing import Awaitable, Callable, Optional
 
 from backend.core.adb import resolve_adb_path
+from backend.modules.questmidi import port_config
 
 log = logging.getLogger(__name__)
 
-DEFAULT_PORT = 8765
 # The backend's own HTTP port, reversed alongside the MIDI port so a
 # USB-tethered headset reaches the whole API — including the XR control-bus
 # relay at ws://127.0.0.1:8600/api/xr/control/ws — on its own loopback with
@@ -37,10 +37,11 @@ ClientSend = Callable[[list[int]], Awaitable[None]]
 
 
 def _port() -> int:
-    try:
-        return int(os.getenv("theDAW_QUESTMIDI_PORT") or DEFAULT_PORT)
-    except ValueError:
-        return DEFAULT_PORT
+    return port_config.host_port()
+
+
+def _device_port() -> int:
+    return port_config.device_port()
 
 
 def _http_port() -> int:
@@ -157,13 +158,13 @@ async def _handle_quest(
 # ---- lifecycle ---------------------------------------------------------------
 
 
-def _run_adb_reverse(port: int) -> bool:
+def _run_adb_reverse(device_port: int, host_port: int) -> bool:
     adb = _adb_path()
     if not adb:
         return False
     try:
         subprocess.run(
-            [adb, "reverse", f"tcp:{port}", f"tcp:{port}"],
+            [adb, "reverse", f"tcp:{device_port}", f"tcp:{host_port}"],
             capture_output=True,
             timeout=10,
             check=True,
@@ -180,8 +181,11 @@ async def reattach_adb() -> bool:
     port AND the backend HTTP port (control-bus relay) in one pass; only the
     MIDI port decides the reported ok state, matching what this bridge owns."""
     loop = asyncio.get_running_loop()
-    _s.adb_reverse_ok = await loop.run_in_executor(None, _run_adb_reverse, _port())
-    await loop.run_in_executor(None, _run_adb_reverse, _http_port())
+    _s.adb_reverse_ok = await loop.run_in_executor(
+        None, _run_adb_reverse, _device_port(), _port()
+    )
+    http_port = _http_port()
+    await loop.run_in_executor(None, _run_adb_reverse, http_port, http_port)
     return _s.adb_reverse_ok
 
 
@@ -246,6 +250,7 @@ def status() -> dict:
     return {
         "started": _s.started,
         "port": _port(),
+        "device_port": _device_port(),
         "port_in_use": _s.port_in_use,
         "adb_path": _adb_path(),
         "adb_reverse_ok": _s.adb_reverse_ok,
