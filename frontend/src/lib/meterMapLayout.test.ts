@@ -177,7 +177,7 @@ console.log('meterMapLayout: ok');
 // The songwriter's House of the Rising Sun moves through eight tempos. Two
 // changes close together put two labels in the same pixels, and a number a
 // reader cannot separate from its neighbour says less than no number at all.
-import { placeTempoFlags, TIER_H } from '../components/layout/MeterMapChart';
+import { placeTempoFlags, TIER_H } from '../components/layout/meterMapDraw';
 
 const eightTempos = {
   ...data,
