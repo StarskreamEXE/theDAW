@@ -15,6 +15,13 @@ import * as crypto from 'crypto'
 import * as fs from 'fs'
 import * as path from 'path'
 import { pathToFileURL } from 'url'
+// Every backend line is folded to plain ASCII before it reaches the LOG panel
+// or the console. Python libraries print status with emoji -- basic-pitch does,
+// and those lines used to raise UnicodeEncodeError on a Windows console running
+// a legacy code page and take the conversion down with them. A glyph that
+// carries meaning is transliterated rather than dropped, so a key of F-sharp
+// still reads as F# in the log.
+import { plainAscii } from '../../frontend/src/lib/plainText'
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -443,7 +450,7 @@ function spawnBackend(): void {
     const parts = stdoutCarry.split('\n')
     stdoutCarry = parts.pop()!
     for (const raw of parts) {
-      const text = raw.replace(/\r$/, '')
+      const text = plainAscii(raw.replace(/\r$/, ''))
       if (!text) continue
       log(`[backend:stdout] ${text}`)
       const cls = text.includes('[LOAD]') ? 'load' : ''
@@ -460,7 +467,7 @@ function spawnBackend(): void {
     const parts = stderrCarry.split('\n')
     stderrCarry = parts.pop()!
     for (const raw of parts) {
-      const text = raw.replace(/\r$/, '')
+      const text = plainAscii(raw.replace(/\r$/, ''))
       if (!text) continue
       log(`[backend:stderr] ${text}`)
       sendLoadingLog(text, stderrLineClass(text))

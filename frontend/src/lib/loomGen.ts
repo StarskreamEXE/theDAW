@@ -75,7 +75,7 @@ export const GEN_DEFAULT_OPTS: Record<GenKind, GenOpts> = {
 };
 
 export const GEN_GLYPH: Record<GenKind, string> = {
-  fib: 'φ', fractal: '∆', euclid: 'E', life: '⚘', rand: '⚄', frag: '⁂', echo: '∞', accel: '↗', gliss: '≈',
+  fib: 'φ', fractal: '∆', euclid: 'E', life: 'Ψ', rand: '※', frag: '⁂', echo: '∞', accel: '↗', gliss: '≈',
 };
 
 export const GEN_BLURB: Record<GenKind, string> = {

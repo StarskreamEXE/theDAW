@@ -3,6 +3,7 @@ import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
 import {createLogger, defineConfig, loadEnv} from 'vite';
+import {plainAscii} from './src/lib/plainText';
 
 // During startup the frontend comes up before the backend binds :8600, so every
 // proxied /api request (health, modules, library, assistant, …) fails with
@@ -10,13 +11,27 @@ import {createLogger, defineConfig, loadEnv} from 'vite';
 // which floods the console for 20-30s and looks like a crash. Those are benign
 // retries — the app's own loading screen reflects real readiness — so this
 // logger drops just that proxy-error noise and passes every other log through.
+//
+// The same logger also takes the emoji out of every line Vite writes. Vite
+// announces optimized dependencies with a sparkle, and a pictograph in a
+// diagnostic stream carries no information: the console is read to find out
+// what broke. It is also a hazard on Windows, where a console on a legacy code
+// page raises UnicodeEncodeError on an astral-plane character and can take the
+// operation down with it (see backend/modules/midi/engine.py, which already
+// works around exactly that for basic-pitch). Musical symbols and the dingbats
+// Every glyph is folded to the ASCII that means the same thing; see lib/plainText.
 const quietLogger = createLogger();
 const baseError = quietLogger.error.bind(quietLogger);
+const baseWarn = quietLogger.warn.bind(quietLogger);
+const baseInfo = quietLogger.info.bind(quietLogger);
+const clean = (msg: string): string => (typeof msg === 'string' ? plainAscii(msg) : msg);
 quietLogger.error = (msg, options) => {
   const s = typeof msg === 'string' ? msg : '';
   if (s.includes('proxy error') || s.includes('ECONNREFUSED')) return;
-  baseError(msg, options);
+  baseError(clean(msg), options);
 };
+quietLogger.warn = (msg, options) => baseWarn(clean(msg), options);
+quietLogger.info = (msg, options) => baseInfo(clean(msg), options);
 
 export default defineConfig(({mode}) => {
   const env = loadEnv(mode, '.', '');
