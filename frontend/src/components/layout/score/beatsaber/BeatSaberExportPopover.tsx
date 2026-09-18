@@ -256,7 +256,7 @@ export const BeatSaberExportPopover: React.FC<BeatSaberExportPopoverProps> = ({
         </fieldset>
       )}
 
-      {error && <div className="text-rose-300 break-words">{error}</div>}
+      {error && <div className="text-rose-300 wrap-break-word">{error}</div>}
 
       <div className="flex items-center justify-end gap-1.5 border-t border-white/10 pt-2">
         <button type="button" onClick={onClose} className="px-2 py-0.5 rounded hover:bg-white/10" disabled={busy}>
