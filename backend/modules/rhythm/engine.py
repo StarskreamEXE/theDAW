@@ -66,7 +66,11 @@ _TG_WIN = 384  # tempogram window in frames: ~8.9 s at hop 512 / 22.05 kHz
 _TEMPO_SMOOTH_SEC = 2.0
 _TEMPO_STEP = 0.04  # a sustained local-tempo step this large starts a run
 _TEMPO_STEP_MIN_SEC = 3.0
-_TEMPO_RUN_MIN_SEC = 8.0  # shorter runs fold into a neighbour
+_TEMPO_RUN_MIN_SEC = 16.0  # shorter runs fold into a neighbour
+# Two adjacent runs whose tempos agree this closely are one run. Needed because
+# a merged run is re-valued from its own span, which can land it on its
+# neighbour's tempo; without the fold the ten masters report 48 runs instead of 31.
+_TEMPO_SAME = math.log(1.02)
 L_MIN, L_MAX = 2, 16  # at the tracked beat; finer levels go to 32
 METER_WINDOW_BEATS = 48
 _METER_STRIDE_BEATS = 4
@@ -674,32 +678,80 @@ def _fold_octaves(local: np.ndarray, reference: float) -> np.ndarray:
 
 
 def _tempo_runs(curve: np.ndarray, frame_sec: float) -> list[tuple[int, int, float]]:
-    """``(start_frame, end_frame, bpm)`` runs of the smoothed local tempo. A new
-    run starts where the curve leaves the current run's tempo by more than
-    ``_TEMPO_STEP`` for at least ``_TEMPO_STEP_MIN_SEC``; runs shorter than
-    ``_TEMPO_RUN_MIN_SEC`` then fold into the neighbour they are closer to."""
+    """``(start_frame, end_frame, bpm)`` runs of the smoothed local tempo.
+
+    A new run starts where the curve leaves the tempo the current run has
+    settled on by more than ``_TEMPO_STEP``, for at least
+    ``_TEMPO_STEP_MIN_SEC``; runs shorter than ``_TEMPO_RUN_MIN_SEC`` fold into
+    the neighbour they are closer to, and adjacent runs that end up at the same
+    tempo are folded together.
+
+    The scan this replaces could not follow a staircase, and that -- not the
+    tempo curve -- was the binding constraint on every metamorphic reading the
+    engine produced. Handed the songwriter's own eight tempos for House of the
+    Rising Sun as a perfect curve, the old rule returned THREE runs; the rule
+    below returns six, and the curve was never touched. Three defects, all in
+    the excursion scan:
+
+      * an excursion ended only when the curve came back to within a step of
+        the OLD reference, so a tempo that moved and stayed moved ran to the
+        end of the song;
+      * the new reference was the median of the whole excursion, so on a
+        150-180-210 climb the reference became 180 and neither 150 nor 210 was
+        ever a run;
+      * the scan resumed at the excursion's END, so nothing inside one was
+        examined -- which is why a 234-second run could never be subdivided.
+
+    The repair is to re-reference against the current run as it grows, to end
+    an excursion when the curve settles somewhere new rather than only when it
+    comes home, and to resume inside the new run instead of past it.
+    """
     n = int(curve.size)
     if n == 0:
         return []
     min_frames = max(1, int(round(_TEMPO_STEP_MIN_SEC / frame_sec)))
     step = math.log(1.0 + _TEMPO_STEP)
-    runs: list[tuple[int, int, float]] = []
+    logs = np.log(np.maximum(curve, _EPS))
+
+    def away(frame: int, reference: float) -> bool:
+        return abs(float(logs[frame]) - math.log(max(reference, _EPS))) > step
+
+    bounds: list[int] = [0]
     start = 0
-    ref = float(np.median(curve[: min(n, min_frames)]))
     i = 0
     while i < n:
-        if abs(math.log(max(curve[i], _EPS) / ref)) > step:
+        # The reference is what this run has settled on SO FAR, not what it
+        # looked like in its first three seconds.
+        ref = float(np.median(curve[start : max(start + 1, i)]))
+        if away(i, ref):
             j = i
-            while j < n and abs(math.log(max(curve[j], _EPS) / ref)) > step:
+            while j < n and away(j, ref):
+                # The excursion also ends when it has itself settled: once it
+                # has dwelt long enough to be a run, judge the next frame
+                # against ITS tempo rather than against the one being left.
+                if j - i >= min_frames:
+                    settled = float(np.median(curve[i:j]))
+                    if away(j, settled):
+                        break
                 j += 1
             if j - i >= min_frames:
-                runs.append((start, i, float(np.median(curve[start:i]))))
+                bounds.append(i)
                 start = i
-                ref = float(np.median(curve[i:j]))
-            i = j
+                # Resume INSIDE the new run, so a run that later steps again is
+                # still scanned rather than skipped over.
+                i = min(i + min_frames, n)
+                continue
+            i = max(j, i + 1)
             continue
         i += 1
-    runs.append((start, n, float(np.median(curve[start:n]))))
+    bounds.append(n)
+
+    # Value each run by its own span, once the spans are final.
+    runs = [
+        (a, b, float(np.median(curve[a:b])))
+        for a, b in zip(bounds[:-1], bounds[1:])
+        if b > a
+    ]
 
     min_run = int(round(_TEMPO_RUN_MIN_SEC / frame_sec))
     changed = True
@@ -708,8 +760,6 @@ def _tempo_runs(curve: np.ndarray, frame_sec: float) -> list[tuple[int, int, flo
         for k, (a, b, bpm) in enumerate(runs):
             if b - a >= min_run:
                 continue
-            # Fold into the neighbour whose tempo is closer; the neighbour's
-            # tempo stands (it is the one with enough music behind it).
             cands = []
             if k > 0:
                 cands.append((abs(math.log(bpm / runs[k - 1][2])), k - 1))
@@ -717,11 +767,32 @@ def _tempo_runs(curve: np.ndarray, frame_sec: float) -> list[tuple[int, int, flo
                 cands.append((abs(math.log(bpm / runs[k + 1][2])), k + 1))
             _, into = min(cands)
             lo, hi = min(k, into), max(k, into)
-            merged = (runs[lo][0], runs[hi][1], runs[into][2])
+            # The merged span is re-valued from the music it now covers. Taking
+            # the neighbour's bpm made a run report a tempo that was not the
+            # tempo of the span it labelled.
+            merged = (
+                runs[lo][0],
+                runs[hi][1],
+                float(np.median(curve[runs[lo][0] : runs[hi][1]])),
+            )
             runs = runs[:lo] + [merged] + runs[hi + 1 :]
             changed = True
             break
-    return runs
+
+    # Two adjacent runs at the same tempo are one run. Without this the
+    # re-valuing above splits a steady stretch into neighbours that agree.
+    folded: list[tuple[int, int, float]] = []
+    for run in runs:
+        if (
+            folded
+            and abs(math.log(max(run[2], _EPS) / max(folded[-1][2], _EPS)))
+            <= _TEMPO_SAME
+        ):
+            a, _, _ = folded[-1]
+            folded[-1] = (a, run[1], float(np.median(curve[a : run[1]])))
+        else:
+            folded.append(run)
+    return folded
 
 
 def _track_beats(
