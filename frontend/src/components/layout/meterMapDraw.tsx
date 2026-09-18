@@ -339,36 +339,77 @@ export const drawMeterMap = (d: MeterMapData, o: DrawOptions): { nodes: React.Re
   return { nodes, height: chartHeight() + maxTier * TIER_H };
 };
 
-/** The legend as SVG rows at a width. */
-const drawLegend = (W: number, top: number): { nodes: React.ReactNode; height: number } => {
-  const items: Array<{ swatch: React.ReactNode; words: string }> = LEGEND_ORDER.map((f) => ({
-    swatch: <rect width={26} height={12} rx={2} fill={FAMILY_COLOUR[f]} />,
+/** The box every legend swatch is drawn in. */
+export const SWATCH_W = 30;
+export const SWATCH_H = 14;
+
+/** One row of the legend: a swatch drawn in a SWATCH_W x SWATCH_H box, and
+ *  what the mark means. */
+export interface LegendItem {
+  key: string;
+  swatch: React.ReactNode;
+  words: string;
+}
+
+/** The guess hatch, its strokes cut to the swatch box by arithmetic so the
+ *  swatch needs no clip path (and so no id to keep unique). */
+const hatchSwatch = (colour: string): React.ReactNode => {
+  const lines: React.ReactNode[] = [];
+  for (let sx = -SWATCH_H; sx < SWATCH_W; sx += 7) {
+    const x0 = Math.max(sx, 0);
+    const x1 = Math.min(sx + SWATCH_H, SWATCH_W);
+    lines.push(
+      <line key={sx} x1={x0} y1={SWATCH_H - (x0 - sx)} x2={x1} y2={SWATCH_H - (x1 - sx)} stroke={colour} strokeWidth={2.5} strokeOpacity={0.75} />,
+    );
+  }
+  return (
+    <g>
+      <rect width={SWATCH_W} height={SWATCH_H} rx={2} fill={colour} fillOpacity={0.18} />
+      {lines}
+    </g>
+  );
+};
+
+/** Every mark the drawing makes, in the order the legend reads: the six bar
+ *  families, then the guess, the tatum badge, the tempo flag and the
+ *  syncopation lane. The saved file and the block on screen both draw this. */
+export const legendItems = (): LegendItem[] => [
+  ...LEGEND_ORDER.map((f) => ({
+    key: f,
+    swatch: <rect width={SWATCH_W} height={SWATCH_H} rx={2} fill={FAMILY_COLOUR[f]} />,
     words: FAMILY_WORDS[f],
-  }));
-  items.push({
+  })),
+  { key: 'guess', swatch: hatchSwatch(FAMILY_COLOUR.m4), words: 'guess (confidence under 0.10)' },
+  {
+    key: 'tatum',
     swatch: (
       <g>
-        <rect width={26} height={12} rx={2} fill={FAMILY_COLOUR.m4} fillOpacity={0.18} />
-        {[0, 6, 12, 18, 24].map((sx) => (
-          <line key={sx} x1={sx - 4} y1={12} x2={sx + 8} y2={0} stroke={FAMILY_COLOUR.m4} strokeWidth={2.5} />
-        ))}
+        <rect width={SWATCH_W} height={SWATCH_H} rx={2} fill={FAMILY_COLOUR.m4} />
+        <text x={SWATCH_W / 2} y={11} fill="#fff" fontFamily={SANS} fontSize={10} fontWeight={700} textAnchor="middle" style={{ paintOrder: 'stroke', stroke: INK, strokeWidth: 2.5 }}>
+          8TH
+        </text>
       </g>
     ),
-    words: 'guess (conf < 0.10)',
-  });
-  items.push({
-    swatch: (
-      <rect width={26} height={12} rx={2} fill={PANEL} stroke={LINE_STRONG}>
-        <title>8TH</title>
-      </rect>
-    ),
     words: '8TH / 16TH: read at the tatum, not the tracked beat',
-  });
-  items.push({ swatch: <path d="M 8 1 L 18 1 L 13 10 Z" fill={TEMPO_COLOUR} />, words: 'tempo change' });
-  items.push({
-    swatch: <rect width={26} height={7} y={5} fill={SYNC_COLOUR} opacity={0.85} />,
-    words: 'syncopation per bar',
-  });
+  },
+  { key: 'tempo', swatch: <path d="M 10 2 L 20 2 L 15 10 Z" fill={TEMPO_COLOUR} />, words: 'tempo change, with the new bpm' },
+  {
+    key: 'sync',
+    swatch: (
+      <g>
+        <rect x={1} y={8} width={6} height={6} fill={SYNC_COLOUR} opacity={0.85} />
+        <rect x={8} y={3} width={6} height={11} fill={SYNC_COLOUR} opacity={0.85} />
+        <rect x={15} y={10} width={6} height={4} fill={SYNC_COLOUR} opacity={0.85} />
+        <rect x={22} y={5} width={6} height={9} fill={SYNC_COLOUR} opacity={0.85} />
+      </g>
+    ),
+    words: 'syncopation per bar (lower lane)',
+  },
+];
+
+/** The legend as SVG rows at a width. */
+const drawLegend = (W: number, top: number): { nodes: React.ReactNode; height: number } => {
+  const items = legendItems();
   const cols = W >= 900 ? 3 : W >= 560 ? 2 : 1;
   const colW = W / cols;
   const rowH = 22;
@@ -378,9 +419,9 @@ const drawLegend = (W: number, top: number): { nodes: React.ReactNode; height: n
         const cx = (i % cols) * colW;
         const cy = top + Math.floor(i / cols) * rowH;
         return (
-          <g key={i} transform={`translate(${cx} ${cy})`}>
-            <g transform="translate(0 2)">{it.swatch}</g>
-            <text x={34} y={12} fill={MUTED} fontFamily={SANS} fontSize={12} fontWeight={600}>
+          <g key={it.key} transform={`translate(${cx} ${cy})`}>
+            <g transform="translate(0 1)">{it.swatch}</g>
+            <text x={SWATCH_W + 8} y={12} fill={MUTED} fontFamily={SANS} fontSize={12} fontWeight={600}>
               {it.words}
             </text>
           </g>
