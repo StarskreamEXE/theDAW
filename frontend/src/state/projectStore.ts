@@ -11,6 +11,7 @@ import type { PerformRoutingSnapshot } from './performRouting';
 import { logError, logInfo } from './logStore';
 import { useStatusBarStore } from './statusBarStore';
 import { useEditorStore } from './editorStore';
+import { meterToTasmo } from '../lib/timeSignatureIO';
 import {
   loadProjectIntoEditor,
   captureEditorSession,
@@ -32,6 +33,9 @@ interface ProjectState {
   embedAudio: boolean;
   savePath: string;
   pendingTracks: TasmoTrackInput[];
+  /** Meter of a seeded (imported) project, carried through so saving it does
+   *  not drop the source's time signature. Null when nothing seeded one. */
+  pendingTimeSignature: number[] | null;
   sourceDaw: string | null;
   importWarnings: string[];
   // Perform-tab routing carried from a Perform save seed, so save() persists it
@@ -86,6 +90,7 @@ export const useProjectStore = create<ProjectState>()((set, get) => ({
   embedAudio: false,
   savePath: '',
   pendingTracks: [],
+  pendingTimeSignature: null,
   sourceDaw: null,
   importWarnings: [],
   pendingPerformRouting: null,
@@ -102,6 +107,7 @@ export const useProjectStore = create<ProjectState>()((set, get) => ({
         projectName: seed.project_name || 'Untitled',
         tempo: seed.tempo ?? 120,
         pendingTracks: seed.tracks ?? [],
+        pendingTimeSignature: seed.time_signature ?? null,
         sourceDaw: seed.source_daw ?? null,
         importWarnings: seed.import_warnings ?? [],
         pendingPerformRouting: seed.perform_routing ?? null,
@@ -173,6 +179,7 @@ export const useProjectStore = create<ProjectState>()((set, get) => ({
       embedAudio,
       savePath,
       pendingTracks,
+      pendingTimeSignature,
       sourceDaw,
       importWarnings,
       pendingPerformRouting,
@@ -195,6 +202,7 @@ export const useProjectStore = create<ProjectState>()((set, get) => ({
         const project: TasmoProjectInput = {
           project_name: name,
           tempo,
+          time_signature: pendingTimeSignature ?? [4, 4],
           tracks: pendingTracks,
           source_daw: sourceDaw,
           import_warnings: importWarnings,
@@ -217,6 +225,9 @@ export const useProjectStore = create<ProjectState>()((set, get) => ({
         const project: TasmoProjectInput = {
           project_name: name,
           tempo: session.bpm,
+          // The meter is document state exactly as the tempo is; without it a
+          // 7/8 session reopened in whatever meter the session it replaced held.
+          time_signature: meterToTasmo(session.timeSignature),
           tracks: session.tracks,
           controller_mappings: session.controllerMappings ?? null,
         };

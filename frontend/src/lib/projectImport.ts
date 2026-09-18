@@ -14,6 +14,7 @@ import {
   computePeaks,
   type AudioClip,
   type EditorTrack,
+  type TimeSignature,
 } from '../state/editorStore';
 import type { PianoNote } from '../state/pianoRollStore';
 import { useAppUiStore } from '../state/appUiStore';
@@ -34,6 +35,7 @@ import { logError, logInfo } from '../state/logStore';
 import { useSwayImportStore, startSwayImportDriver } from '../state/swayImportStore';
 import { usePerformRoutingStore } from '../state/performRouting';
 import { tasmoLoadedToDawProject } from './tasmoToSession';
+import { meterFromTasmo } from './timeSignatureIO';
 
 const TRACK_COLORS = ['#8b5cf6', '#a855f7', '#ec4899', '#06b6d4', '#10b981', '#facc15', '#f97316', '#ef4444'];
 
@@ -315,7 +317,12 @@ export async function loadProjectIntoEditor(
     }
   }
 
-  useEditorStore.getState().loadProject({ tracks: outTracks, clips: outClips, bpm });
+  useEditorStore.getState().loadProject({
+    tracks: outTracks,
+    clips: outClips,
+    bpm,
+    timeSignature: meterFromTasmo(project.time_signature),
+  });
 
   // Restore persisted controller (Sway) auto-attach bindings so a re-opened
   // session re-wires the hardware to the same track/FX targets. Track ids are
@@ -389,6 +396,9 @@ export interface CapturedSession {
   tracks: TasmoTrackInput[];
   files: Array<{ name: string; blob: Blob }>;
   bpm: number;
+  /** Project meter, saved alongside the tempo so a non-4/4 session reopens in
+   *  the meter it was written in. */
+  timeSignature: TimeSignature;
   clipCount: number;
   controllerMappings?: TasmoControllerMappings;
 }
@@ -466,6 +476,7 @@ export function captureEditorSession(): CapturedSession {
     tracks,
     files,
     bpm: editor.bpm,
+    timeSignature: editor.timeSignature,
     clipCount,
     controllerMappings: captureControllerMappings(),
   };

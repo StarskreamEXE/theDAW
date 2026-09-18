@@ -466,8 +466,10 @@ export default function App() {
     };
   }, []);
 
-  const handleAssistantAction = useCallback((action: { type: string; payload?: any }) => {
-    const result = handletheDAWAction(action);
+  const handleAssistantAction = useCallback(async (action: { type: string; payload?: any }) => {
+    // `handletheDAWAction` is async for the editor tools (they await the audio
+    // re-render), so the result has to be awaited or this logs "[object Promise]".
+    const result = await handletheDAWAction(action);
     logInfo('assistant', `Action: ${action.type} → ${result}`);
   }, []);
 

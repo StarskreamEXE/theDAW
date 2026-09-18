@@ -9,6 +9,7 @@ import {
 } from 'lucide-react';
 import { deriveStyle, deriveLyrics } from '../../catalog/catalogSearch';
 import { addBlobsToChimera } from '../../lib/chimeraClient';
+import { stripSourceId } from '../../lib/displayName';
 import { SlideTrack } from './SlideTrack';
 import { SemanticWave } from './SemanticWave';
 import { MetamorphPanel } from './MetamorphPanel';
@@ -25,7 +26,8 @@ import type { AudioDragItem } from '../../lib/audioDnD';
 import { useExternalDragStore } from '../../state/externalDragStore';
 import { useEditorStore, computePeaks, sampleLane, clipPeakGain, snapStepSec, SNAP_DIVISIONS, TRACK_HEIGHT_MIN, TRACK_HEIGHT_MAX, type AudioClip, type EditorTrack, type SnapDivision, type AutomationTarget, type AutomationLane as AutomationLaneT, type TimelineMarker } from '../../state/editorStore';
 import { useLibraryStore, type LibraryEntry } from '../../state/libraryStore';
-import { LIBRARY_ID_MIME, dropHasLibraryOrFiles, entriesFromDrop } from '../../lib/libraryDrop';
+import { LIBRARY_ID_MIME, MIDI_ID_MIME, STEM_ID_MIME, dropHasLibraryOrFiles, entriesFromDrop } from '../../lib/libraryDrop';
+import { magnetStart, magnetTargetsFor } from '../../lib/timelineMagnet';
 import { useVstStore } from '../../state/vstStore';
 import { useVstEditorStore } from '../../state/vstEditorStore';
 import type { ChainEntry } from '../../state/effectChainStore';
@@ -45,10 +47,10 @@ import {
   type AddToTrackEntry,
   type AddToTrackTarget,
 } from './addToTrackMenu';
-import { cachedLibraryMidiCount, loadLibraryMidi } from '../../lib/libraryIndex';
+import { cachedLibraryMidiCount, loadLibraryMidi, stemAudioUrl } from '../../lib/libraryIndex';
 import { AUDIO_ACCEPT, MIDI_ACCEPT, midiFileLabel } from '../../lib/fileFilters';
 import { importAudioFiles, type AudioImportOrigin } from '../../lib/importAudioFiles';
-import { fetchBlobWithRetry } from '../../lib/fetchRetry';
+import { fetchBlobWithRetry, fetchMidiBytesWithRetry } from '../../lib/fetchRetry';
 import { useBottomPanelStore } from '../../state/bottomPanelStore';
 import { useGenerateParamsStore } from '../../state/generateParamsStore';
 import { classifyModelGate } from '../../lib/modelDownloadClient';
@@ -56,7 +58,8 @@ import { setLocalOnly } from '../../lib/storageClient';
 import { requireFeature } from '../../notices/featureGateStore';
 import { logError, logInfo } from '../../state/logStore';
 import { registerEditorPlayback, unregisterEditorPlayback } from '../../state/editorPlaybackBridge';
-import { publishSelectedTracks } from '../../state/editorSelectionBridge';
+import { publishSelectedClips, publishSelectedTracks } from '../../state/editorSelectionBridge';
+import { ctrlDragClickModifiers, mergeSelection, pruneSelection, rangeSelection, toggleSelection } from './waveformSelection';
 import * as liveMixer from '../../state/liveMixer';
 import { useDjAnalysisStore } from '../../state/djAnalysisStore';
 import { ContextMenu, useContextMenu, type ContextMenuItem, type ContextMenuPosition } from '../ui/ContextMenu';
@@ -435,6 +438,9 @@ interface PointerOp {
   initialTrackIndex: number;
   initialClips?: Array<{ id: string; startSec: number; trackIndex: number }>;
   dragItems?: AudioDragItem[];
+  /** `ctrl-drag-pending` only: Shift was held at pointer-down, so a click that
+   *  never became a drag replays as Shift+Ctrl (additive range). */
+  shiftKey?: boolean;
 }
 
 const CTRL_DRAG_MOVE_THRESHOLD_PX = 4;
@@ -712,7 +718,11 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
    *  height. Uniform across tracks by design — see editorStore.trackHeight. */
   const trackH = useEditorStore((s) => s.trackHeight);
   const setTrackHeight = useEditorStore((s) => s.setTrackHeight);
-  const setSelected = useEditorStore((s) => s.setSelected);
+  /** The ONE writer for the clip selection. `setSelectedClips` keeps
+   *  `selectedClipId` pinned to the first entry, so nothing here ever writes the
+   *  two fields separately (which is how the canvas and the assistant's
+   *  `editor_select_clips` used to drift apart). */
+  const setSelectedClips = useEditorStore((s) => s.setSelectedClips);
   const setTool = useEditorStore((s) => s.setTool);
   const setZoom = useEditorStore((s) => s.setZoom);
   const setSnap = useEditorStore((s) => s.setSnap);
@@ -1328,7 +1338,10 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     }
   }, [extractRegionWav, updateClip]);
 
-  const [selectedClipIds, setSelectedClipIds] = useState<string[]>([]);
+  // The clip multi-selection is the STORE's, not a second copy in local state:
+  // a tool-driven `editor_select_clips` / `editor_select_range` has to show up on
+  // the canvas, and a canvas multi-select has to be readable by those same tools.
+  const selectedClipIds = useEditorStore((s) => s.selectedClipIds);
   const [selectedTrackIds, setSelectedTrackIds] = useState<string[]>([]);
 
   // Publish the track selection for non-React consumers (the Sway control
@@ -1336,6 +1349,13 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   useEffect(() => {
     publishSelectedTracks(selectedTrackIds);
   }, [selectedTrackIds]);
+
+  // Same for the clip selection. editorTools publishes after its own writes;
+  // this covers the canvas's (and undo/redo's, and loadProject's) writes, so the
+  // bridge is current no matter which side moved the selection.
+  useEffect(() => {
+    publishSelectedClips(selectedClipIds);
+  }, [selectedClipIds]);
 
   // --- Inpaint panel state ---
   type InpaintPhase =
@@ -1594,18 +1614,21 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const selectedClipCount = selectedClipIds.length || (selectedClipId ? 1 : 0);
 
   useEffect(() => {
-    setSelectedClipIds((prev) => prev.filter((id) => clips.some((clip) => clip.id === id)));
+    // pruneSelection hands back the SAME array when nothing died, so this effect
+    // does not write the store on every clips/tracks change (which, now that it
+    // also depends on the selection it prunes, would never settle).
+    const pruned = pruneSelection(selectedClipIds, clips.map((clip) => clip.id));
+    if (pruned !== selectedClipIds) setSelectedClips(pruned);
     setSelectedTrackIds((prev) => prev.filter((id) => tracks.some((track) => track.id === id)));
-  }, [clips, tracks]);
+  }, [clips, tracks, selectedClipIds, setSelectedClips]);
 
   const deleteSelectedClips = useCallback(() => {
     const ids = selectedClipIds.length > 0 ? selectedClipIds : selectedClipId ? [selectedClipId] : [];
     if (ids.length === 0) return;
     ids.forEach((id) => removeClip(id));
-    setSelectedClipIds([]);
+    setSelectedClips([]);
     setSelectedTrackIds([]);
-    setSelected(null);
-  }, [removeClip, selectedClipId, selectedClipIds, setSelected]);
+  }, [removeClip, selectedClipId, selectedClipIds, setSelectedClips]);
 
   const duplicateSelectedClips = useCallback(() => {
     const ids = selectedClipIds.length > 0 ? selectedClipIds : selectedClipId ? [selectedClipId] : [];
@@ -1619,31 +1642,27 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       ...clip,
       startSec: clip.startSec + clip.durationSec,
     }));
-    setSelectedClipIds(newIds);
+    setSelectedClips(newIds);
     setSelectedTrackIds([]);
-    setSelected(newIds[0] ?? null);
     logInfo('editor', `Duplicated ${newIds.length} clip${newIds.length === 1 ? '' : 's'}`);
-  }, [addClipToTrack, clips, selectedClipId, selectedClipIds, setSelected]);
+  }, [addClipToTrack, clips, selectedClipId, selectedClipIds, setSelectedClips]);
 
   const selectClipSingle = useCallback((clipId: string | null) => {
-    setSelectedClipIds(clipId ? [clipId] : []);
+    setSelectedClips(clipId ? [clipId] : []);
     setSelectedTrackIds([]);
-    setSelected(clipId);
-  }, [setSelected]);
+  }, [setSelectedClips]);
 
   const selectTrackSingle = useCallback((trackId: string | null) => {
     setSelectedTrackIds(trackId ? [trackId] : []);
-    setSelectedClipIds([]);
-    setSelected(null);
-  }, [setSelected]);
+    setSelectedClips([]);
+  }, [setSelectedClips]);
 
   const toggleTrackSelection = useCallback((trackId: string) => {
     setSelectedTrackIds((prev) => (
       prev.includes(trackId) ? prev.filter((id) => id !== trackId) : [...prev, trackId]
     ));
-    setSelectedClipIds([]);
-    setSelected(null);
-  }, [setSelected]);
+    setSelectedClips([]);
+  }, [setSelectedClips]);
 
   const selectTrackWithModifiers = useCallback((trackId: string, e?: { metaKey?: boolean; ctrlKey?: boolean }) => {
     if (e?.metaKey || e?.ctrlKey) toggleTrackSelection(trackId);
@@ -1656,29 +1675,25 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
 
     if (range && selectedClipId) {
       const orderedIds = [...clips].sort((a, b) => a.startSec - b.startSec).map((c) => c.id);
-      const a = orderedIds.indexOf(selectedClipId);
-      const b = orderedIds.indexOf(clipId);
-      if (a >= 0 && b >= 0) {
-        const [start, end] = a < b ? [a, b] : [b, a];
-        const rangeIds = orderedIds.slice(start, end + 1);
-        setSelectedClipIds((prev) => (additive ? Array.from(new Set([...prev, ...rangeIds])) : rangeIds));
+      // The clicked clip leads whatever comes back, so the store's
+      // `selectedClipId` stays on it and the NEXT shift-click ranges from there —
+      // the anchor behaviour the old setSelected(clipId) gave us.
+      const rangeIds = rangeSelection(orderedIds, selectedClipId, clipId);
+      if (rangeIds) {
+        setSelectedClips(additive ? mergeSelection(selectedClipIds, rangeIds) : rangeIds);
         setSelectedTrackIds([]);
-        setSelected(clipId);
         return;
       }
     }
 
     if (additive) {
-      setSelectedClipIds((prev) => (
-        prev.includes(clipId) ? prev.filter((id) => id !== clipId) : [...prev, clipId]
-      ));
+      setSelectedClips(toggleSelection(selectedClipIds, clipId));
       setSelectedTrackIds([]);
-      setSelected(clipId);
       return;
     }
 
     selectClipSingle(clipId);
-  }, [clips, selectedClipId, selectClipSingle, setSelected]);
+  }, [clips, selectedClipId, selectedClipIds, selectClipSingle, setSelectedClips]);
 
   const getSelectionForInit = useCallback((): AudioClip[] => {
     if (selectedClipIds.length > 0) return clips.filter((c) => selectedClipIds.includes(c.id));
@@ -2051,11 +2066,10 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       const { id: _omit, ...rest } = c;
       return addClipToTrack({ ...rest, trackId, startSec: Math.max(0, anchor + (c.startSec - earliest)) });
     });
-    setSelectedClipIds(newIds);
+    setSelectedClips(newIds);
     setSelectedTrackIds([]);
-    setSelected(newIds[0] ?? null);
     logInfo('editor', `Pasted ${newIds.length} clip${newIds.length === 1 ? '' : 's'} at ${anchor.toFixed(2)}s`);
-  }, [addClipToTrack, setSelected, snapSec]);
+  }, [addClipToTrack, setSelectedClips, snapSec]);
 
   /** Split every selected clip that straddles the playhead. splitClipAt already
    *  refuses cuts within 50ms of an edge, so a clip barely overlapping is skipped. */
@@ -2068,11 +2082,10 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     }
     const newIds = targets.map((c) => splitClipAt(c.id, at)).filter((id): id is string => !!id);
     if (newIds.length > 0) {
-      setSelectedClipIds(newIds);
+      setSelectedClips(newIds);
       setSelectedTrackIds([]);
-      setSelected(newIds[0]);
     }
-  }, [getActionClips, setSelected, splitClipAt]);
+  }, [getActionClips, setSelectedClips, splitClipAt]);
 
   /** One nudge step: the snap grid when snapping is on, else a flat 50ms.
    *  Shift multiplies by 4 for coarse moves. */
@@ -2113,10 +2126,9 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const selectAllClips = useCallback(() => {
     if (clips.length === 0) return;
     const ids = clips.map((c) => c.id);
-    setSelectedClipIds(ids);
+    setSelectedClips(ids);
     setSelectedTrackIds([]);
-    setSelected(ids[0]);
-  }, [clips, setSelected]);
+  }, [clips, setSelectedClips]);
 
   /** Fit the whole arrangement in the viewport, then scroll back to the top. */
   const zoomToFit = useCallback(() => {
@@ -2940,6 +2952,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         initialOffsetIntoSource: clip.offsetIntoSource,
         initialTrackIndex: Math.max(0, tracks.findIndex((t) => t.id === clip.trackId)),
         dragItems,
+        shiftKey: e.shiftKey,
       };
       return;
     }
@@ -3002,8 +3015,30 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       // Vertical track shift.
       const trackDelta = Math.round(dySec / trackH);
       const moveTargets = op.initialClips?.length ? op.initialClips : [{ id: op.clipId, startSec: op.initialStartSec, trackIndex: op.initialTrackIndex }];
+      // Magnetism is resolved ONCE, on the clip under the pointer, and the
+      // resulting shift is applied to the whole selection. Magnetising each
+      // clip on its own would pull a multi-clip drag apart, destroying exactly
+      // the spacing the user is dragging.
+      const movingIds = moveTargets.map((t) => t.id);
+      const magnets = magnetTargetsFor(clips, movingIds, [
+        useEditorStore.getState().playheadSec,
+        ...markers.map((m) => m.t),
+        loopEnabled ? loopStart : null,
+        loopEnabled ? loopEnd : null,
+      ]);
+      const lead = moveTargets.find((t) => t.id === op.clipId) ?? moveTargets[0];
+      const leadDur = clips.find((c) => c.id === lead.id)?.durationSec ?? 0;
+      const desiredLead = lead.startSec + dxSec;
+      // Snap off means off — a free drag, no grid and no magnet. Otherwise the
+      // pull is 8 px wide, converted through the current zoom so it feels the
+      // same at 5 px/s as at 400.
+      const snappedLead =
+        snap === 'off'
+          ? desiredLead
+          : magnetStart(desiredLead, leadDur, magnets, pxToSec(8), snapSec(desiredLead));
+      const appliedDx = snappedLead - lead.startSec;
       moveTargets.forEach((target) => {
-        const newStart = Math.max(0, snapSec(target.startSec + dxSec));
+        const newStart = Math.max(0, target.startSec + appliedDx);
         const targetIdx = Math.max(0, Math.min(tracks.length - 1, target.trackIndex + trackDelta));
         const newTrackId = tracks[targetIdx].id;
         updateClip(target.id, { startSec: newStart, trackId: newTrackId });
@@ -3030,7 +3065,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const onPointerUp = (e: React.PointerEvent) => {
     const op = opRef.current;
     if (op?.kind === 'ctrl-drag-pending') {
-      selectClipWithModifiers(op.clipId, { ctrlKey: true });
+      selectClipWithModifiers(op.clipId, ctrlDragClickModifiers(op));
       opRef.current = null;
       return;
     }
@@ -3042,7 +3077,9 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
 
   // --- Drag-and-drop from the Library, or audio files from the desktop ---
   const onTimelineDragOver = (e: React.DragEvent) => {
-    if (dropHasLibraryOrFiles(e.dataTransfer)) {
+    // Every in-app mime the drop understands, or the gate refuses the drag and
+    // no drop ever fires.
+    if (dropHasLibraryOrFiles(e.dataTransfer, [LIBRARY_ID_MIME, MIDI_ID_MIME, STEM_ID_MIME])) {
       e.preventDefault();
       e.dataTransfer.dropEffect = 'copy';
     }
@@ -3091,7 +3128,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   ) =>
     placeAudioOnTrack(
       {
-        label: entry.title ?? `clip_${entry.id.slice(0, 6)}`,
+        label: stripSourceId(entry.title) || `clip_${entry.id.slice(0, 6)}`,
         mimeType: entry.mimeType,
         entryId: entry.id,
         fallbackDuration: entry.duration,
@@ -3115,13 +3152,17 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
 
   const onTimelineDrop = async (e: React.DragEvent) => {
     const dt = e.dataTransfer;
-    if (!dropHasLibraryOrFiles(dt)) return;
+    if (!dropHasLibraryOrFiles(dt, [LIBRARY_ID_MIME, MIDI_ID_MIME, STEM_ID_MIME])) return;
     e.preventDefault();
     if (!timelineRef.current) return;
     // Everything the DataTransfer and the pointer give is read before the
     // import awaits: the browser locks the DataTransfer once the handler yields.
     const entryId = dt.getData(LIBRARY_ID_MIME);
-    const fromDesktop = !entryId;
+    const midiId = dt.getData(MIDI_ID_MIME);
+    const stemId = dt.getData(STEM_ID_MIME);
+    const midiLabel = dt.getData('text/plain') || 'midi';
+    const stemLabel = dt.getData('text/plain') || 'stem';
+    const fromDesktop = !entryId && !midiId && !stemId;
     const rect = timelineRef.current.getBoundingClientRect();
     // Viewport px -> local px: yPx is compared against trackH (local) to pick the
     // target lane, so an unscaled value dropped clips onto the wrong track.
@@ -3129,6 +3170,55 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     const yPx = viewportPxToLocal(e.clientY - rect.top);
     const droppedBelowAllTracks = yPx >= tracks.length * trackH;
     const startSec = droppedBelowAllTracks ? 0 : snapSec(pxToSec(xPx));
+
+    // A MIDI row carries a `midis` id, which entriesFromDrop can never resolve
+    // against the library. Fetch the bytes and place a piano-roll clip instead
+    // — the same destination the right-click "send to piano roll" path uses.
+    if (midiId) {
+      const laneIdx = Math.max(0, Math.min(tracks.length - 1, Math.floor(yPx / trackH)));
+      try {
+        const bytes = await fetchMidiBytesWithRetry(`/api/midi/file/${midiId}`, { label: midiLabel });
+        // A null track id means "make one" — what a drop below every lane means.
+        await addMidiClipFromBytes(
+          bytes,
+          midiLabel,
+          startSec,
+          droppedBelowAllTracks ? null : (tracks[laneIdx]?.id ?? null),
+        );
+      } catch (err) {
+        logError('editor', `MIDI drop failed for ${midiLabel}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return;
+    }
+
+    // A stem row carries a `stems` id, not a library entry id, so — like MIDI —
+    // it cannot resolve through entriesFromDrop. Fetch the stem's audio and
+    // place it as a clip, with the same lane/time math as a library drop: the
+    // pointer's track, or a fresh track when dropped below every lane.
+    if (stemId) {
+      const stemTarget = droppedBelowAllTracks
+        ? resolveAddTarget(null, stemLabel)
+        : tracks[Math.max(0, Math.min(tracks.length - 1, Math.floor(yPx / trackH)))];
+      if (!stemTarget) return;
+      try {
+        await placeAudioOnTrack(
+          {
+            label: stemLabel,
+            mimeType: 'audio/wav',
+            // The shared retrying fetcher, like every other stem-audio read:
+            // it status-checks (a 404/500 body would otherwise become a Blob
+            // that only fails later in computePeaks) and rides out the
+            // single-worker backend's model-load stalls.
+            fetch: () => fetchBlobWithRetry(stemAudioUrl({ id: stemId }), { label: stemLabel }),
+          },
+          stemTarget,
+          startSec,
+        );
+      } catch (err) {
+        logError('editor', `Stem drop failed for ${stemLabel}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return;
+    }
 
     // A desktop drop imports its audio files to the library first, so both
     // paths continue from library entries.
@@ -3268,9 +3358,8 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     // Clear the multi-selection too, not just the single-clip pointer. Clearing
     // only `selectedClipId` left clips visibly ringed and Delete still armed on a
     // timeline the user had just clicked away from — so the next Del destroyed
-    // clips they believed were released.
-    setSelected(null);
-    setSelectedClipIds([]);
+    // clips they believed were released. (setSelectedClips now clears both.)
+    setSelectedClips([]);
     setSelectedTrackIds([]);
   };
 

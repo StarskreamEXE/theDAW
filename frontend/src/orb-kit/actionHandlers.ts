@@ -5,9 +5,13 @@ import { FEATURES, featureById } from '../onboarding/featureRegistry';
 import { useOnboardingStore } from '../onboarding/onboardingStore';
 import { useAppUiStore } from '../state/appUiStore';
 import { useEditorStore } from '../state/editorStore';
+import { summarizeEditor } from './appContext';
 import { useSetlistStore } from '../state/setlistStore';
 import { useDjAutomix } from '../state/djAutomixStore';
 import { logInfo } from '../state/logStore';
+import * as editorTools from '../state/editorTools';
+import type { ToolResult } from '../state/editorTools';
+import * as editorToolBridge from './editorToolBridge';
 
 export interface AssistantActionPayload {
     type: string;
@@ -146,7 +150,276 @@ function editorClipMiss(payload: Record<string, unknown> | undefined): string {
     return `No clip "${asked}". Clips: ${labels}`;
 }
 
-export function handletheDAWAction(action: AssistantActionPayload): string {
+/* ── the editor tool table ───────────────────────────────────────────────────
+ *
+ * Everything T09-T12 built is reached from here. A table rather than fifty more
+ * `case` labels for three reasons: the keys ARE the contract (a test compares
+ * them to `assistantEvents.ts`'s allowlist and, through it, to the Python
+ * catalog), one entry per tool makes an undeclared or unhandled name impossible
+ * to miss in review, and the uniform shape is what lets the dispatcher await
+ * the async half without every branch repeating it.
+ *
+ * Each entry does exactly two things: narrow the payload to the arguments its
+ * tool actually declares, and hand them to the facade. It does NOT validate
+ * values — `state/editorTools.ts` owns that, and duplicating its rules here is
+ * how the two drift until a tool refuses for one reason and explains another.
+ *
+ * The narrowing is not cosmetic. `editorTools`' argument types carry test seams
+ * (`render`, `ctxFactory`, `sample_rate`) that replace the MIDI synth and the
+ * audio context; passing a model's raw payload through would let a tool call
+ * set them.
+ */
+type EditorToolRun = (payload: Record<string, unknown>) => ToolResult | Promise<ToolResult>;
+
+/** The facade's functions, and nothing else from the module. */
+type EditorFacade = {
+    -readonly [K in keyof typeof editorTools as (typeof editorTools)[K] extends (...args: never[]) => unknown ? K : never]: (typeof editorTools)[K];
+};
+
+/**
+ * Every table entry calls the facade through this object rather than the
+ * module namespace, so a test can stub ONE facade function and observe exactly
+ * the arguments an entry's own mapping produced — without rendering audio, and
+ * without letting a seam in through a tool payload. Nothing reachable from a
+ * payload writes to it; only {@link overrideEditorFacadeForTest} does.
+ */
+const facade = { ...editorTools } as EditorFacade;
+
+function pick<K extends string>(payload: Record<string, unknown>, keys: readonly K[]): Record<K, unknown> {
+    const out = {} as Record<K, unknown>;
+    for (const key of keys) {
+        if (payload[key] !== undefined) out[key] = payload[key];
+    }
+    return out;
+}
+
+/** Both aliases for "which clip", so a model that speaks in labels works. */
+const CLIP = ['clip_id', 'clip'] as const;
+const TRACK = ['track_id', 'track'] as const;
+const AUTOMATION_TARGET = ['lane_id', 'kind', 'track_id', 'track', 'entry_id', 'param_key'] as const;
+
+/** A clip by id or exact label, with no opinion about whether it exists. */
+function lookupClip(ref: unknown) {
+    const asked = ref === undefined || ref === null ? '' : String(ref).trim();
+    if (!asked) return undefined;
+    const clips = useEditorStore.getState().clips;
+    return clips.find((c) => c.id === asked) ?? clips.find((c) => c.label.toLowerCase() === asked.toLowerCase());
+}
+
+const STRETCH_TARGETS = ['ratio', 'target_bpm', 'target_duration_sec'] as const;
+
+/** Where an `editor_stretch_clip` call goes, and with exactly which arguments. */
+export type StretchRoute =
+    | { route: 'refuse'; error: string; args?: undefined }
+    | { route: 'backend'; args: Record<(typeof CLIP)[number] | (typeof STRETCH_TARGETS)[number], unknown>; error?: undefined }
+    | { route: 'facade'; args: Record<(typeof CLIP)[number] | 'target_bpm' | 'target_duration_sec', unknown>; error?: undefined };
+
+/**
+ * Stretch routes on what the clip IS.
+ *
+ * A piano-roll clip is re-rendered from its notes locally — exact, and it keeps
+ * the notes and the audio in step. An audio clip needs a pitch-preserving
+ * stretch, which only the backend has. An unresolved clip goes to the facade so
+ * the "No clip X. Known clips: …" message is written in one place.
+ *
+ * Pure (reads the store, writes nothing, calls nothing) so the routing and the
+ * ratio-to-duration conversion can be asserted without rendering or a network.
+ */
+export function planStretch(payload: Record<string, unknown>): StretchRoute {
+    const targets = STRETCH_TARGETS.filter((k) => payload[k] !== undefined && payload[k] !== null && payload[k] !== '');
+    if (targets.length !== 1) {
+        return {
+            route: 'refuse',
+            error: `stretch: pass exactly one of ratio, target_bpm or target_duration_sec (got ${targets.length ? targets.join(' and ') : 'none'})`,
+        };
+    }
+
+    const clip = lookupClip(payload.clip_id ?? payload.clip);
+    const isMidi = !!clip && clip.sourceKind === 'piano-roll' && !!clip.sourcePianoRoll?.length;
+    if (clip && !isMidi) return { route: 'backend', args: pick(payload, [...CLIP, ...STRETCH_TARGETS]) };
+
+    const args = pick(payload, [...CLIP, 'target_bpm', 'target_duration_sec']);
+    if (targets[0] === 'ratio' && clip) {
+        // `stretchPlan` has no ratio target; for a MIDI clip a ratio is simply a
+        // duration, and converting here keeps one validator for both paths.
+        const ratio = Number(payload.ratio);
+        if (!Number.isFinite(ratio) || ratio <= 0) return { route: 'refuse', error: 'stretch: ratio must be a positive number' };
+        args.target_duration_sec = clip.durationSec * ratio;
+    }
+    return { route: 'facade', args };
+}
+
+async function stretchClipTool(payload: Record<string, unknown>): Promise<ToolResult> {
+    const plan = planStretch(payload);
+    if (plan.route === 'refuse') return { ok: false, error: plan.error };
+    if (plan.route === 'backend') return editorToolBridge.stretchAudioClip(plan.args);
+    return facade.stretchClip(plan.args);
+}
+
+const EDITOR_TOOLS: Record<string, EditorToolRun> = {
+    // -- notes ---------------------------------------------------------------
+    editor_quantize_clip: (p) => facade.quantizeClip(pick(p, [...CLIP, 'grid', 'strength', 'swing', 'quantize_ends'])),
+    editor_get_notes: (p) => facade.getNotes(pick(p, CLIP)),
+    editor_set_notes: (p) => facade.setNotes(pick(p, [...CLIP, 'notes'])),
+    editor_nudge_notes: (p) => facade.nudgeNotes(pick(p, [...CLIP, 'steps', 'ms', 'ticks', 'bpm'])),
+    editor_transpose_clip: (p) => facade.transposeClip(pick(p, [...CLIP, 'semitones'])),
+    editor_scale_velocity: (p) => facade.scaleVelocity(pick(p, [...CLIP, 'factor', 'offset', 'min', 'max'])),
+    editor_humanize_clip: (p) => facade.humanizeClip(pick(p, [...CLIP, 'timing_steps', 'velocity', 'seed'])),
+    editor_fix_overlaps: (p) => facade.fixOverlaps(pick(p, [...CLIP, 'mode'])),
+    editor_filter_notes: (p) =>
+        facade.filterNotes(
+            pick(p, [...CLIP, 'min_length_steps', 'min_velocity', 'min_pitch', 'max_pitch', 'max_gap_steps']),
+        ),
+    editor_set_clip_instrument: (p) => facade.setClipInstrument(pick(p, [...CLIP, 'program'])),
+
+    // -- tempo and time ------------------------------------------------------
+    editor_set_clip_source_bpm: (p) => facade.setClipSourceBpm(pick(p, [...CLIP, 'bpm'])),
+    editor_stretch_clip: stretchClipTool,
+    editor_detect_tempo: (p) => editorToolBridge.detectTempo(pick(p, CLIP)),
+    editor_set_time_signature: (p) => facade.setTimeSignature(pick(p, ['num', 'den', 'time_signature'])),
+    editor_nudge_clip: (p) => facade.nudgeClip(pick(p, [...CLIP, 'delta_sec', 'beats', 'bars'])),
+
+    // -- transport -----------------------------------------------------------
+    editor_play: () => facade.play(),
+    editor_stop: () => facade.stop(),
+    editor_seek_bar: (p) => facade.seekBar(pick(p, ['bar'])),
+    editor_loop_selection: (p) => facade.loopSelection(pick(p, ['clip_ids'])),
+
+    // -- clip geometry and audio ---------------------------------------------
+    editor_set_clip: (p) =>
+        facade.setClip(
+            pick(p, [...CLIP, 'gain', 'fade_in_sec', 'fade_out_sec', 'muted', 'duration_sec', 'label', 'instrument_program']),
+        ),
+    editor_trim_clip: (p) => facade.trimClip(pick(p, [...CLIP, 'in_sec', 'out_sec'])),
+    editor_duplicate_clip: (p) => facade.duplicateClip(pick(p, [...CLIP, 'at_sec'])),
+    editor_merge_clips: (p) => facade.mergeClips(pick(p, ['clip_ids'])),
+    // The catalog says clip_id_a / clip_id_b (symmetric with every other
+    // *_id argument); the facade's parameters are clip_a / clip_b.
+    editor_crossfade_clips: (p) =>
+        facade.crossfadeClips({
+            clip_a: p.clip_id_a ?? p.clip_a,
+            clip_b: p.clip_id_b ?? p.clip_b,
+            overlap_sec: p.overlap_sec,
+        }),
+    editor_reverse_clip: (p) => facade.reverseClip(pick(p, CLIP)),
+    editor_normalize_clip: (p) => facade.normalizeClip(pick(p, [...CLIP, 'peak_db'])),
+    editor_bounce_clip: (p) => facade.bounceClip(pick(p, [...CLIP, 'flatten'])),
+
+    // -- selection and grid --------------------------------------------------
+    editor_select_clips: (p) => facade.selectClips(pick(p, ['clip_ids'])),
+    editor_select_range: (p) => facade.selectRange(pick(p, ['start_sec', 'end_sec', 'track_ids'])),
+    editor_select_notes: (p) =>
+        facade.selectNotes(pick(p, [...CLIP, 'note_ids', 'min_pitch', 'max_pitch', 'start_step', 'end_step'])),
+    editor_set_snap: (p) => facade.setSnap(pick(p, ['snap', 'grid'])),
+    editor_set_tool: (p) => facade.setTool(pick(p, ['tool'])),
+
+    // -- tracks --------------------------------------------------------------
+    // Routed to the facade rather than handled inline: it is the only path that
+    // takes solo through `toggleSolo` (solo is exclusive in this store, so a
+    // plain field write lets two tracks both claim it), and the only one that
+    // knows freezing is UI-only.
+    editor_set_track: (p) =>
+        facade.setTrack(pick(p, [...TRACK, 'name', 'volume', 'pan', 'mute', 'solo', 'armed', 'frozen', 'instrument_program'])),
+    editor_reorder_tracks: (p) => facade.reorderTracks(pick(p, ['track_ids'])),
+    editor_duplicate_track: (p) => facade.duplicateTrack(pick(p, TRACK)),
+    editor_freeze_track: (p) => facade.freezeTrack(pick(p, TRACK)),
+
+    // -- analysis (backend DSP) ----------------------------------------------
+    editor_analyze_clip: (p) => editorToolBridge.analyzeClip(pick(p, CLIP)),
+    editor_compare_timing: (p) =>
+        editorToolBridge.compareTiming(pick(p, ['midi_clip_id', 'audio_clip_id', 'max_match_sec'])),
+    editor_get_waveform_peaks: (p) => editorToolBridge.getWaveformPeaks(pick(p, [...CLIP, 'buckets'])),
+
+    // -- markers -------------------------------------------------------------
+    editor_remove_marker: (p) => facade.removeMarker(pick(p, ['marker_id', 'marker', 'name'])),
+    // `name` is the NEW label here; the facade resolves by marker_id/marker and
+    // takes the new one as `label`, so passing `name` straight through would
+    // rename the marker to itself.
+    editor_rename_marker: (p) =>
+        facade.renameMarker({ marker_id: p.marker_id ?? p.marker, label: p.name ?? p.label }),
+
+    // -- automation ----------------------------------------------------------
+    editor_add_automation_lane: (p) => facade.addAutomationLane(pick(p, AUTOMATION_TARGET)),
+    editor_set_automation_points: (p) => facade.setAutomationPoints(pick(p, [...AUTOMATION_TARGET, 'points'])),
+
+    // -- safety net ----------------------------------------------------------
+    editor_undo: () => facade.undo(),
+    editor_redo: () => facade.redo(),
+    editor_snapshot: (p) => facade.snapshot(pick(p, ['name'])),
+    editor_restore: (p) => facade.restore(pick(p, ['name'])),
+};
+
+/** The tool names this table serves. Read by `actionHandlers.test.ts` to prove
+ *  the allowlist, the catalog and the handlers describe one set of tools. */
+export const editorToolNames = (): string[] => Object.keys(EDITOR_TOOLS);
+
+/**
+ * Test seam: swap one table entry, get back the function that puts it back.
+ *
+ * Exists because the dispatcher's own guarantee — whatever a tool does, the
+ * model gets a sentence back — can only be proved with a tool that misbehaves,
+ * and the facade is an ES module namespace that cannot be monkeypatched. Only
+ * existing entries can be swapped, so a test cannot smuggle a new tool name
+ * past the allowlist/catalog contract.
+ */
+export function overrideEditorToolForTest(name: string, run: EditorToolRun): () => void {
+    const original = EDITOR_TOOLS[name];
+    if (!original) throw new Error(`overrideEditorToolForTest: no editor tool "${name}"`);
+    EDITOR_TOOLS[name] = run;
+    return () => {
+        EDITOR_TOOLS[name] = original;
+    };
+}
+
+/**
+ * Test seam: stub ONE facade function, get back the function that puts it back.
+ *
+ * Unlike {@link overrideEditorToolForTest} this leaves the table entry — and so
+ * its argument mapping — in place: the stub receives exactly what the entry
+ * produced from a payload. That is how the mapping is asserted without running
+ * the real MIDI renderer or audio context, whose behaviour in Node is not the
+ * dispatcher's to depend on.
+ */
+export function overrideEditorFacadeForTest<K extends keyof EditorFacade>(name: K, fn: EditorFacade[K]): () => void {
+    const original = facade[name];
+    if (typeof original !== 'function') throw new Error(`overrideEditorFacadeForTest: no facade function "${String(name)}"`);
+    facade[name] = fn;
+    return () => {
+        facade[name] = original;
+    };
+}
+
+/** A facade result as the one string the model gets back. Failures come back as
+ *  the error text, never as a throw: the whole point is that the model reads
+ *  what went wrong and tries something else in the same turn. */
+const spoken = (result: ToolResult): string => (result.ok ? result.message : result.error);
+
+const thrownReason = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+/**
+ * Run one table entry and ALWAYS come back with a string.
+ *
+ * The facade promises not to throw, but that is a promise about code, not a
+ * proof: a store action that throws on a bad record or a rejected dynamic
+ * import escapes it. A throw out of here would take the whole relay call down,
+ * and the model would read a timeout instead of the reason. A synchronous tool
+ * still answers synchronously.
+ */
+function runEditorTool(type: string, run: EditorToolRun, payload: Record<string, unknown>): string | Promise<string> {
+    let result: ToolResult | Promise<ToolResult>;
+    try {
+        result = run(payload);
+    } catch (e) {
+        return `${type}: ${thrownReason(e)}`;
+    }
+    if (!(result instanceof Promise)) return spoken(result);
+    // Async tools (anything that re-renders audio or calls the backend) resolve
+    // to their message only once the work is actually done, so the model never
+    // reads "quantized" before the bounce finished.
+    return result.then(spoken).catch((e: unknown) => `${type}: ${thrownReason(e)}`);
+}
+
+export function handletheDAWAction(action: AssistantActionPayload): string | Promise<string> {
     const { type, payload } = action;
     const params = useGenerateParamsStore.getState();
     const gen = useGenerateStore.getState();
@@ -281,15 +554,9 @@ export function handletheDAWAction(action: AssistantActionPayload): string {
 
         // --- EDIT arrangement (editor_* vocabulary) ---
         case 'editor_get_state': {
-            const ed = useEditorStore.getState();
-            return JSON.stringify({
-                tracks: ed.tracks.map((t) => ({ id: t.id, name: t.name, volume: t.volume, pan: t.pan, mute: t.mute, solo: t.solo })),
-                clips: ed.clips.map((c) => ({ id: c.id, label: c.label, trackId: c.trackId, startSec: c.startSec, durationSec: c.durationSec, muted: !!c.muted })),
-                bpm: ed.bpm,
-                playheadSec: ed.playheadSec,
-                isPlaying: ed.isPlaying,
-                selectedClipId: ed.selectedClipId,
-            });
+            // Same summarizer as the app context's editorState block, so the
+            // action can never disagree with what the model was already shown.
+            return JSON.stringify(summarizeEditor(useEditorStore.getState()));
         }
 
         case 'editor_add_track': {
@@ -305,19 +572,11 @@ export function handletheDAWAction(action: AssistantActionPayload): string {
             return `Removed track "${track.name}" and its clips`;
         }
 
-        case 'editor_set_track': {
-            const track = findEditorTrack(payload);
-            if (!track) return editorTrackMiss(payload);
-            const updates: Record<string, unknown> = {};
-            if (payload?.volume !== undefined) updates.volume = Number(payload.volume);
-            if (payload?.pan !== undefined) updates.pan = Number(payload.pan);
-            if (payload?.mute !== undefined) updates.mute = booleanValue(payload, ['mute'], track.mute);
-            if (payload?.solo !== undefined) updates.solo = booleanValue(payload, ['solo'], track.solo);
-            if (payload?.name !== undefined && payload?.track_id !== undefined) updates.name = String(payload.name);
-            if (!Object.keys(updates).length) return 'editor_set_track: nothing to change (pass volume/pan/mute/solo/name)';
-            useEditorStore.getState().updateTrack(track.id, updates);
-            return `Updated track "${track.name}": ${Object.keys(updates).join(', ')}`;
-        }
+        // `editor_set_track` used to live here. It moved into EDITOR_TOOLS when
+        // T13 extended it with armed / instrument_program / frozen: this version
+        // wrote `solo` as a plain field (solo is exclusive in the store, so two
+        // tracks could both hold it) and dropped a rename addressed by track
+        // name. The facade does both correctly.
 
         case 'editor_move_clip': {
             const clip = findEditorClip(payload);
@@ -480,8 +739,15 @@ export function handletheDAWAction(action: AssistantActionPayload): string {
             });
         }
 
-        default:
-            return `Unknown action: ${type}`;
+        default: {
+            // The editor tool table is consulted last so a name that already has
+            // a `case` above keeps it — the two sets are disjoint, and letting
+            // the switch win means adding a table entry can never silently
+            // change the behaviour of a tool that already shipped.
+            const run = EDITOR_TOOLS[type];
+            if (!run) return `Unknown action: ${type}`;
+            return runEditorTool(type, run, payload ?? {});
+        }
     }
 }
 

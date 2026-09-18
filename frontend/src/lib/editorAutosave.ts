@@ -2,7 +2,7 @@
  * EDIT autosave + crash recovery on a content-addressed OPFS asset layer.
  *
  * The arrangement's JSON side (tracks, clips minus bytes, FX chains,
- * automation, markers, bpm, loop) is written to
+ * automation, markers, bpm, meter, loop) is written to
  * `thedaw-editor-autosave/manifest.json` in the Origin Private File System,
  * debounced behind the editor store's own document-change signal. Clip audio —
  * the part a refresh used to destroy, since clips hold in-memory Blobs — is
@@ -27,6 +27,7 @@ import {
   computePeaks,
   type AudioClip,
   type EditorTrack,
+  type TimeSignature,
 } from '../state/editorStore';
 import { logError, logInfo, logWarn } from '../state/logStore';
 
@@ -50,6 +51,9 @@ interface AutosaveManifest {
   version: 1;
   savedAt: string;
   bpm: number;
+  /** Project meter. Optional on READ only: manifests written before the field
+   *  existed have none, and those documents are 4/4 by definition. */
+  timeSignature?: TimeSignature;
   tracks: SerializedTrack[];
   clips: SerializedClip[];
   masterFxChain: unknown[];
@@ -193,6 +197,7 @@ async function buildManifest(assets: FileSystemDirectoryHandle): Promise<Autosav
     version: 1,
     savedAt: new Date().toISOString(),
     bpm: s.bpm,
+    timeSignature: s.timeSignature,
     tracks,
     clips,
     masterFxChain: s.masterFxChain as unknown[],
@@ -340,7 +345,15 @@ async function restoreFromAutosave(): Promise<void> {
   );
 
   const store = useEditorStore.getState();
-  store.loadProject({ tracks, clips, bpm: manifest.bpm });
+  // A manifest with no meter predates the field; such a document is 4/4, so it
+  // is passed explicitly rather than left to inherit whatever meter the session
+  // being replaced happened to hold.
+  store.loadProject({
+    tracks,
+    clips,
+    bpm: manifest.bpm,
+    timeSignature: manifest.timeSignature ?? { num: 4, den: 4 },
+  });
   // loadProject clears the per-project extras; put the autosaved ones back.
   // dirty stays TRUE: a restored autosave is by definition unsaved work.
   useEditorStore.setState({
@@ -407,6 +420,7 @@ export function initEditorAutosave(): void {
       state.automationLanes === prev.automationLanes &&
       state.markers === prev.markers &&
       state.bpm === prev.bpm &&
+      state.timeSignature === prev.timeSignature &&
       state.loopEnabled === prev.loopEnabled &&
       state.loopStart === prev.loopStart &&
       state.loopEnd === prev.loopEnd
