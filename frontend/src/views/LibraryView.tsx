@@ -1401,7 +1401,7 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
             parentTitles={Object.fromEntries(entries.map((e) => [e.id, e.title]))}
             placeholder={allScores === null
               ? 'Loading scores…'
-              : 'No scores yet. Open a track → Score and use MAKE SHEET / MAKE TABS / ARRANGE.'}
+              : 'No scores yet. Open a track in SCORE, pick an instrument and press MAKE.'}
             onOpen={openScoreForEntry}
             onRefresh={refreshScores}
           />

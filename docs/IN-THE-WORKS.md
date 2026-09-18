@@ -231,6 +231,21 @@ driven in the live app yet; items stay here until that happens.
 
 ---
 
+## P1 — from the user, 2026-09-16 (marked done only when the user says so)
+
+- [ ] **A notation writing tool in SCORE.** Write and correct notation by hand
+  over what the maker produced: place, move and delete notes on a staff or a
+  tab line, change durations, add chord symbols, and save the result as a new
+  MusicXML or alphaTex artifact beside the generated one. Study first: what
+  OSMD and alphaTab expose for editing, versus a small editor of our own over
+  the MusicXML. — L — `frontend/src/components/layout/ScoreView.tsx`
+- [ ] **Part names in the SCORE PAGE view.** STRIP pins every part's name to
+  the left edge while it scrolls; the PAGE view still names parts only on the
+  first system of the score, so page 2 onward has unnamed staves. Print a name
+  or abbreviation on every system. — S — `frontend/src/components/layout/ScoreView.tsx` (MusicXmlPreview)
+
+---
+
 ## P1 — from the user, 2026-09-14 (marked done only when the user says so)
 
 Queued behind the sixteen branches waiting for review; the user asked for these

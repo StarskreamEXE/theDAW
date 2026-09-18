@@ -27,7 +27,7 @@
  */
 import React, { useEffect, useRef, useState } from 'react';
 import { FileAudio, FolderInput, FolderOpen } from 'lucide-react';
-import { TopBarButton } from './TopBarButton';
+import { TopBarButton, topBarButtonClass } from './TopBarButton';
 import { KnownFilesMenu } from '../ui/KnownFilesMenu';
 import { AUDIO_ACCEPT, AUDIO_EXTS } from '../../lib/fileFilters';
 import { importAudioFiles, isAudioFile, type AudioImportOrigin } from '../../lib/importAudioFiles';
@@ -48,7 +48,7 @@ const PICKER_ORIGIN: AudioImportOrigin = { prompt: 'Imported from file picker', 
 const DROP_ORIGIN: AudioImportOrigin = { prompt: 'Imported from header drop', tags: ['imported', 'drop'] };
 
 const ITEM_CLS =
-  'w-full flex items-center gap-2 px-2 py-1 rounded text-left text-[10px] text-zinc-300 hover:bg-purple-500/15 hover:text-zinc-100 transition-colors outline-none focus-visible:bg-purple-500/15 focus-visible:text-zinc-100 focus-visible:ring-1 focus-visible:ring-purple-400/60';
+  'w-full flex items-center gap-2 px-2 py-1 rounded text-left text-[10px] text-zinc-300 hover:bg-[rgb(var(--et-accent)/0.15)] hover:text-zinc-100 transition-colors outline-none focus-visible:bg-[rgb(var(--et-accent)/0.15)] focus-visible:text-zinc-100 focus-visible:ring-1 focus-visible:ring-[rgb(var(--et-accent)/0.6)]';
 
 export interface ImportMenuProps {
   /** Opens the .tasmo project modal on its Open tab. */
@@ -101,9 +101,9 @@ export const ImportMenu: React.FC<ImportMenuProps> = ({ onOpenProject, onImportD
   const openPicker = () => fileInputRef.current?.click();
 
   const items: MenuAction[] = [
-    { id: 'audio', label: 'Audio files… (to the library)', icon: FileAudio, iconCls: 'text-emerald-300', onSelect: openPicker },
-    { id: 'project', label: 'Open project… (.tasmo)', icon: FolderOpen, iconCls: 'text-sky-300', onSelect: onOpenProject },
-    { id: 'daw', label: 'DAW project… (Ableton)', icon: FolderInput, iconCls: 'text-sky-300', onSelect: onImportDawProject },
+    { id: 'audio', label: 'Audio files… (to the library)', icon: FileAudio, iconCls: '', onSelect: openPicker },
+    { id: 'project', label: 'Open project… (.tasmo)', icon: FolderOpen, iconCls: '', onSelect: onOpenProject },
+    { id: 'daw', label: 'DAW project… (Ableton)', icon: FolderInput, iconCls: '', onSelect: onImportDawProject },
   ];
 
   // Close on outside click + Escape while the menu is open.
@@ -208,7 +208,6 @@ export const ImportMenu: React.FC<ImportMenuProps> = ({ onOpenProject, onImportD
           onClick={() => setOpen((v) => !v)}
           icon={<FolderInput className="w-3.5 h-3.5" aria-hidden="true" />}
           title="Import: audio files, a .tasmo project or a DAW project — or drop audio files here"
-          accent="sky"
           active={open || dragOver}
           ariaHasPopup="menu"
           ariaExpanded={open}
@@ -259,7 +258,7 @@ export const ImportMenu: React.FC<ImportMenuProps> = ({ onOpenProject, onImportD
                   onClick={() => selectItem(item)}
                   className={ITEM_CLS}
                 >
-                  <Icon className={`w-3.5 h-3.5 shrink-0 ${item.iconCls}`} />
+                  <Icon className={`w-3.5 h-3.5 shrink-0 ${item.iconCls || 'text-[rgb(var(--et-accent))]'}`} />
                   <span className="flex-1 min-w-0 truncate">{item.label}</span>
                 </button>
               );
@@ -271,6 +270,7 @@ export const ImportMenu: React.FC<ImportMenuProps> = ({ onOpenProject, onImportD
         id={RECENT_ID}
         exts={RECENT_EXTS}
         label="Recent audio"
+        triggerClassName={topBarButtonClass(false)}
         onFiles={(files) => void runImport(files, PICKER_ORIGIN)}
       />
     </>
