@@ -52,6 +52,7 @@ import { useMidiDevicesStore } from '../state/midiDevicesStore';
 import { useMidiTriggerStore } from '../state/midiTriggerStore';
 import { useStatusBarStore } from '../state/statusBarStore';
 import { useSwayOpenStore } from '../state/swayOpenStore';
+import { SwayTrackMenu, type SwayTrackLoad, type SwayTrackMenuRequest } from '../components/sway/SwayTrackMenu';
 
 /** Where the cockpit is mounted. Must match backend/modules/sway/sidecar.py. */
 const SWAY_SRC = '/sway-app/';
@@ -443,6 +444,8 @@ interface SwayUrlResponse {
 
 export const SwayView: React.FC = () => {
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  /** A track the cockpit reported a right-click on, until the menu closes. */
+  const [trackMenu, setTrackMenu] = useState<SwayTrackMenuRequest | null>(null);
   const [embedState, setEmbedState] = useState<EmbedState>('checking');
   const [detail, setDetail] = useState<string | null>(null);
   const [build, setBuild] = useState<SwayUrlResponse['build']>(null);
@@ -610,6 +613,18 @@ export const SwayView: React.FC = () => {
             action.name !== null ? openSwayScene(action.name) : openSwaySceneFromPath(action.path ?? '');
           void opening.then((ok) => {
             if (!ok) void sendScenes(lastOpenFailure());
+          });
+          break;
+        }
+        case 'track-menu': {
+          // The cockpit's point is inside its frame; the menu opens in this window.
+          const rect = iframeRef.current?.getBoundingClientRect();
+          setTrackMenu({
+            trackId: action.trackId,
+            name: action.name,
+            empty: action.empty,
+            x: (rect?.left ?? 0) + action.x,
+            y: (rect?.top ?? 0) + action.y,
           });
           break;
         }
@@ -815,6 +830,14 @@ export const SwayView: React.FC = () => {
           </div>
         )}
 
+        <SwayTrackMenu
+          request={trackMenu}
+          onClose={() => setTrackMenu(null)}
+          onLoad={(load: SwayTrackLoad) => {
+            post({ type: 'sway/load-audio', v: PROTOCOL, trackId: load.trackId, path: load.url, name: load.name });
+            logInfo('sway', `${load.name} sent to ${load.trackId ? 'the clicked SWAY track' : 'an empty SWAY track'}`);
+          }}
+        />
         {embedState === 'ready' ? (
           <iframe
             key={frameKey}

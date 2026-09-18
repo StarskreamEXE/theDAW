@@ -231,6 +231,93 @@ driven in the live app yet; items stay here until that happens.
 
 ---
 
+## P1 — from the user, 2026-09-17, second list (marked done only when the user says so)
+
+One theDAW branch, `edit-lineup-and-sway-import`, cut from `main`; the SWAY
+item also needs the SwayCommand branch `sway-track-menu` and a `SWAY_REF` bump
+in `.github/workflows/release.yml` once that lands.
+
+- [ ] **EDIT: a clip drags to any lane, and a gap makes a lane.** The lane under
+  the pointer is the target (`laneTargetAtY` in
+  `frontend/src/components/audio/laneTarget.ts`); the band at a lane's edge,
+  the space above the first lane and the space below the last are "a new lane
+  here", drawn as a line with a label, made on release (`insertTrack` in
+  `frontend/src/state/editorStore.ts`). Library and desktop drops use the same
+  resolver. — S
+- [ ] **EDIT: zoom out to the whole set.** The zoom floor is 0.25 px/s
+  (`ZOOM_MIN`), the toolbar keys step by 1.25x, and the fit key (Shift+F, the
+  frame icon) fits any length. — XS
+- [ ] **Send to EDIT fills lane 1 first.** `sendAudioToEditor` in
+  `frontend/src/lib/sendToTargets.ts` takes the first empty lane; when every
+  lane holds something, "Own lane in EDIT" adds one and "End of EDIT lane 1"
+  appends after lane 1's last clip. — XS
+- [ ] **EDIT starts with six empty lanes.** `DEFAULT_TRACK_COUNT` in the editor
+  store; a project with no lanes loads the same six. — XS
+- [ ] **EDIT beat match (DJ sync).** `frontend/src/lib/beatMatch.ts`: the
+  stretch ratio picks the half/double-time reading nearest unity, the first
+  analysed beat goes on the project grid, the project tempo follows the
+  master. Right-click a clip: "Beat match to project (N bpm)" and, with more
+  selected, "Beat match N selected to this clip". Toolbar: SYNC beside the BPM
+  field (one clip: to the project; several: the rest to the first selected).
+  Clips with no library analysis are skipped and the LOG says so. A clip's
+  readout shows its matched tempo (`AudioClip.bpm`). — M
+- [ ] **SWAY: right-click a track adds audio from the library, a file or a
+  link.** Cockpit posts `sway/track-menu`, the host opens `SwayTrackMenu`
+  (`frontend/src/components/sway/SwayTrackMenu.tsx`) and answers
+  `sway/load-audio` with a library URL; every source is imported to the
+  library first. Cap `host-track-menu`. Cockpit side in SwayCommand branch
+  `sway-track-menu`. — M
+## P1 — from the user, 2026-09-17 (marked done only when the user says so)
+
+Three branches, each cut from `main`; they merge in any order. The legend goes
+on `meter-map-tempo-flags` because the on-screen meter map exists only there.
+
+- [ ] **The meter map has no legend on screen.** `drawLegend` in
+  `frontend/src/components/layout/meterMapDraw.tsx` runs only inside
+  `meterMapSvgText`, which builds the saved file. `MeterMapChart` in DETAILS
+  draws `drawMeterMap` alone, so the family colours, the guess hatch, the
+  8TH/16TH badge, the tempo flag and the syncopation lane are unexplained.
+  Plan: one list of legend items in `meterMapDraw.tsx` feeds both the file and
+  a `MeterMapLegend` in `MeterMapChart.tsx`; `RhythmBlock.tsx` shows it under
+  the map as wrapping HTML rows at 12px bold. — XS — branch
+  `meter-map-tempo-flags`
+- [ ] **The LOOM right rail folds.** The CELL / CODE / CRATE rail
+  (`frontend/src/views/LoomView.tsx:138`, `w-96`) takes Score's collapsible
+  rail. Folded, it is a 32px strip (`w-8`, thinner than Score's `w-10`) with the
+  rail's name written down it, and a click anywhere on the strip opens it. Open,
+  the fold key sits at the rail's inner edge, left of the tabs. The state is
+  remembered per viewer (`loom.railCollapsed.v1`). One shared component,
+  `frontend/src/components/ui/CollapsibleRail.tsx`, serves LOOM and Score. — S —
+  branch `rails-collapse-loom-score`
+- [ ] **The Score notation rail follows the same rules.** The folded strip
+  (`frontend/src/components/layout/ScoreView.tsx:546`) goes from `w-10` to
+  `w-8`, the whole strip opens the rail, and the fold key moves from the left
+  end of the header to the right end, beside the score. — XS — branch
+  `rails-collapse-loom-score`
+- [ ] **The library stays on the last clicked track across its tabs.** Stems,
+  MIDI and Score list every song's group from the top of the scroll region
+  (`frontend/src/views/LibraryView.tsx:1374-1405`), so after clicking song X in
+  Tracks the other tabs open somewhere else. Plan: on every tab switch the
+  selected track's group scrolls into view and wears the accent ring; a song
+  with nothing in that tab gets a line saying so, with the key that makes it
+  (Separate stems, Convert to MIDI, Open in SCORE); a group's title selects that
+  song; returning to Tracks scrolls the selected row back into view. — S —
+  branch `library-follow-track-info`
+- [ ] **An INFO tab in the library strip.** After Score, a sixth tab shows the
+  selected track in one column: everything DETAILS shows (identity, generation
+  settings, prompt, notes, tags, lyrics, analysis, embedded tags, ffprobe,
+  notation identity, the cached meter reading, chimera sources) and everything
+  the lineage inspector shows (parents and children with their relation, counts
+  by relation, ancestors and descendants, recurring prompt terms and tags), plus
+  the track's stems, MIDI and scores. Keys at the top open the full DETAILS tab
+  and the LINEAGE window. New file
+  `frontend/src/components/library/TrackInfo.tsx`; reads
+  `/api/library/entries/{id}`, `/api/analysis/{id}`, `/api/rhythm/{id}`,
+  `/api/notation/{id}/identity` and `/api/library/{id}/lineage`. — M — branch
+  `library-follow-track-info`
+
+---
+
 ## P1 — from the user, 2026-09-16 (marked done only when the user says so)
 
 - [ ] **A notation writing tool in SCORE.** Write and correct notation by hand

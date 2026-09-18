@@ -24,7 +24,7 @@ import { ownsKey } from '../../lib/keyScope';
 import { encodeWav } from '../../lib/wavEncode';
 import type { AudioDragItem } from '../../lib/audioDnD';
 import { useExternalDragStore } from '../../state/externalDragStore';
-import { useEditorStore, computePeaks, sampleLane, clipPeakGain, snapStepSec, SNAP_DIVISIONS, TRACK_HEIGHT_MIN, TRACK_HEIGHT_MAX, type AudioClip, type EditorTrack, type SnapDivision, type AutomationTarget, type AutomationLane as AutomationLaneT, type TimelineMarker } from '../../state/editorStore';
+import { useEditorStore, computePeaks, sampleLane, clipPeakGain, snapStepSec, SNAP_DIVISIONS, TRACK_HEIGHT_MIN, TRACK_HEIGHT_MAX, ZOOM_MIN, ZOOM_MAX, type AudioClip, type EditorTrack, type SnapDivision, type AutomationTarget, type AutomationLane as AutomationLaneT, type TimelineMarker } from '../../state/editorStore';
 import { useLibraryStore, type LibraryEntry } from '../../state/libraryStore';
 import { LIBRARY_ID_MIME, dropHasLibraryOrFiles, entriesFromDrop } from '../../lib/libraryDrop';
 import { useVstStore } from '../../state/vstStore';
@@ -64,6 +64,8 @@ import { registerEditorPlayback, unregisterEditorPlayback } from '../../state/ed
 import { publishSelectedTracks } from '../../state/editorSelectionBridge';
 import * as liveMixer from '../../state/liveMixer';
 import { useDjAnalysisStore } from '../../state/djAnalysisStore';
+import { laneTargetAtY } from './laneTarget';
+import { alignedStart, beatMatchPlan, firstBeatInClip } from '../../lib/beatMatch';
 import { ContextMenu, useContextMenu, type ContextMenuItem, type ContextMenuPosition } from '../ui/ContextMenu';
 import { SurfacePlayKey } from '../ui/SurfacePlayKey';
 import { StemsRunModal, type StemsRunOptions } from '../library/StemsRunModal';
@@ -738,6 +740,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const setBpm = useEditorStore((s) => s.setBpm);
   const setPlayhead = useEditorStore((s) => s.setPlayhead);
   const addTrack = useEditorStore((s) => s.addTrack);
+  const insertTrack = useEditorStore((s) => s.insertTrack);
   const removeTrack = useEditorStore((s) => s.removeTrack);
   const updateTrack = useEditorStore((s) => s.updateTrack);
   const toggleSolo = useEditorStore((s) => s.toggleSolo);
@@ -955,6 +958,15 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   /** The track header column; the FX rack opens clear of it. */
   const trackHeaderColRef = useRef<HTMLDivElement>(null);
   const opRef = useRef<PointerOp | null>(null);
+  /** The gap a dragged clip or a drop is hovering, as the index the new lane
+   *  takes; null while over a lane. Drawn as a line between the lanes. */
+  const [laneInsert, setLaneInsert] = useState<number | null>(null);
+  const laneInsertRef = useRef<number | null>(null);
+  const showLaneInsert = (idx: number | null) => {
+    if (laneInsertRef.current === idx) return;
+    laneInsertRef.current = idx;
+    setLaneInsert(idx);
+  };
   const inpaintDragRef = useRef<{ clipId: string; anchorSec: number } | null>(null);
   const previewSourceRef = useRef<AudioBufferSourceNode | null>(null);
   // Playhead drag
@@ -1371,9 +1383,19 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   // Time-stretch (tempo, pitch preserved) + transpose (semitones, tempo preserved)
   // through the FFmpeg backend (rubberband when available), then replace the clip's
   // audio with the result. tempo > 1 shortens the clip; pitch leaves length alone.
+  /** The tempo a clip plays at: what a beat match or stretch set, else the
+   *  library analysis of its source. Null for MIDI clips and unanalysed audio. */
+  const clipKnownBpm = useCallback((clip: AudioClip): number | null => {
+    if (clip.sourceKind === 'piano-roll') return null;
+    if (clip.bpm && clip.bpm > 0) return clip.bpm;
+    const d = clip.libraryEntryId ? useDjAnalysisStore.getState().byId[clip.libraryEntryId]?.data : undefined;
+    return d?.bpm && d.bpm > 0 ? d.bpm : null;
+  }, []);
+
   const applyTimePitch = useCallback(async (clipId: string, tempo: number, semitones: number) => {
     const clip = useEditorStore.getState().clips.find((c) => c.id === clipId);
     if (!clip) return;
+    const known = clipKnownBpm(clip);
     setTimePitchBusy(true);
     try {
       const file = await extractRegionWav(clip);
@@ -1389,6 +1411,8 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       const { peaks, duration } = await computePeaks(blob, 240);
       updateClip(clipId, {
         audioBlob: blob, mimeType: 'audio/wav', offsetIntoSource: 0, durationSec: duration, peaks,
+        // The readout follows the stretch: a 120 clip at 1.05x plays at 126.
+        bpm: known ? known * tempo : clip.bpm,
       });
       logInfo('editor', `Time/Pitch: ${tempo.toFixed(2)}x, ${semitones >= 0 ? '+' : ''}${semitones} st -> ${duration.toFixed(2)}s`);
     } catch (e) {
@@ -1396,7 +1420,56 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     } finally {
       setTimePitchBusy(false);
     }
-  }, [extractRegionWav, updateClip]);
+  }, [clipKnownBpm, extractRegionWav, updateClip]);
+
+  /** Beat match, the way a deck's SYNC works: every clip in `ids` is stretched
+   *  to `targetBpm` (pitch kept), its first analysed beat is put on the grid,
+   *  and the project tempo becomes the target so the grid agrees. One backend
+   *  render per clip, in turn. MIDI clips and clips with no known tempo are
+   *  skipped and counted in the log line. */
+  const beatMatchClips = useCallback(async (ids: string[], targetBpm: number) => {
+    if (!(targetBpm > 0)) return;
+    const live = useEditorStore.getState();
+    const subjects = ids
+      .map((id) => live.clips.find((c) => c.id === id))
+      .filter((c): c is AudioClip => !!c && c.sourceKind !== 'piano-roll');
+    if (subjects.length === 0) return;
+    const plan = beatMatchPlan(subjects.map((c) => ({ id: c.id, bpm: clipKnownBpm(c) })), targetBpm);
+    const tempoById = new Map(plan.map((step) => [step.id, step.tempo]));
+    if (Math.abs(targetBpm - live.bpm) > 0.01) setBpm(targetBpm);
+    const beatLen = 60 / targetBpm;
+    let stretched = 0;
+    let aligned = 0;
+    let unknown = 0;
+    for (const clip of subjects) {
+      const known = clipKnownBpm(clip);
+      if (known === null) {
+        unknown += 1;
+        continue;
+      }
+      const tempo = tempoById.get(clip.id) ?? 1;
+      // The beat list describes the library source. A clip whose audio a
+      // stretch already rendered has lost that mapping, so it gets the tempo only.
+      const beats = !clip.bpm && clip.libraryEntryId ? useDjAnalysisStore.getState().byId[clip.libraryEntryId]?.data?.beats : null;
+      const first = firstBeatInClip(beats, clip.offsetIntoSource, clip.durationSec, tempo);
+      if (tempo !== 1) {
+        await applyTimePitch(clip.id, tempo, 0);
+        stretched += 1;
+      }
+      const now = useEditorStore.getState().clips.find((c) => c.id === clip.id);
+      if (!now) continue;
+      const patch: Partial<AudioClip> = {};
+      const start = alignedStart(now.startSec, first, beatLen);
+      if (Math.abs(start - now.startSec) > 1e-6) {
+        patch.startSec = start;
+        aligned += 1;
+      }
+      if (!now.bpm) patch.bpm = known * tempo;
+      if (Object.keys(patch).length > 0) updateClip(clip.id, patch);
+    }
+    const skipped = unknown > 0 ? `, ${unknown} skipped (no tempo known; analyse them in the library first)` : '';
+    logInfo('editor', `Beat match to ${Math.round(targetBpm)} bpm: ${stretched} stretched, ${aligned} moved onto the grid${skipped}`);
+  }, [applyTimePitch, clipKnownBpm, setBpm, updateClip]);
 
   const [selectedClipIds, setSelectedClipIds] = useState<string[]>([]);
   const [selectedTrackIds, setSelectedTrackIds] = useState<string[]>([]);
@@ -2390,7 +2463,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         const cursorX = localCursorX + el.scrollLeft;
         const oldZoom = useEditorStore.getState().zoom;
         const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
-        const newZoom = Math.max(5, Math.min(400, oldZoom * factor));
+        const newZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, oldZoom * factor));
         useEditorStore.getState().setZoom(newZoom);
         // Keep the cursor on the same time after zoom.
         const ratio = newZoom / oldZoom;
@@ -3072,14 +3145,23 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     const clip = clips.find((c) => c.id === op.clipId);
     if (!clip) return;
     if (op.kind === 'move') {
-      // Vertical track shift.
-      const trackDelta = Math.round(dySec / trackH);
+      // The lane under the pointer decides the vertical move, so a clip goes to
+      // any lane in one drag. A gap between two lanes, above the first or
+      // below the last is a new lane, made when the pointer lets go.
+      const rect = timelineRef.current?.getBoundingClientRect();
+      const yPx = rect ? viewportPxToLocal(e.clientY - rect.top) : op.initialTrackIndex * trackH + trackH / 2;
+      const lane = laneTargetAtY(yPx, tracks.length, trackH);
+      showLaneInsert(lane.kind === 'insert' ? lane.index : null);
+      const trackDelta = lane.kind === 'lane' ? lane.index - op.initialTrackIndex : 0;
       const moveTargets = op.initialClips?.length ? op.initialClips : [{ id: op.clipId, startSec: op.initialStartSec, trackIndex: op.initialTrackIndex }];
       moveTargets.forEach((target) => {
         const newStart = Math.max(0, snapSec(target.startSec + dxSec));
+        if (lane.kind === 'insert') {
+          updateClip(target.id, { startSec: newStart });
+          return;
+        }
         const targetIdx = Math.max(0, Math.min(tracks.length - 1, target.trackIndex + trackDelta));
-        const newTrackId = tracks[targetIdx].id;
-        updateClip(target.id, { startSec: newStart, trackId: newTrackId });
+        updateClip(target.id, { startSec: newStart, trackId: tracks[targetIdx].id });
       });
     } else if (op.kind === 'resize-right') {
       const newDur = Math.max(0.05, op.initialDurationSec + dxSec);
@@ -3109,6 +3191,20 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     }
     if (opRef.current) {
       (e.target as Element).releasePointerCapture?.(e.pointerId);
+      const insertAt = laneInsertRef.current;
+      if (op?.kind === 'move' && insertAt !== null) {
+        // Let go in a gap: the lane is made there and the dragged clips move
+        // onto it, keeping their spread over the lanes that follow it.
+        const newId = insertTrack(insertAt);
+        const live = useEditorStore.getState().tracks;
+        const newIdx = live.findIndex((t) => t.id === newId);
+        const moveTargets = op.initialClips?.length ? op.initialClips : [{ id: op.clipId, startSec: op.initialStartSec, trackIndex: op.initialTrackIndex }];
+        moveTargets.forEach((target) => {
+          const idx = Math.max(0, Math.min(live.length - 1, newIdx + (target.trackIndex - op.initialTrackIndex)));
+          updateClip(target.id, { trackId: live[idx].id });
+        });
+      }
+      showLaneInsert(null);
       opRef.current = null;
     }
   };
@@ -3118,7 +3214,17 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     if (dropHasLibraryOrFiles(e.dataTransfer)) {
       e.preventDefault();
       e.dataTransfer.dropEffect = 'copy';
+      const rect = timelineRef.current?.getBoundingClientRect();
+      if (rect) {
+        const lane = laneTargetAtY(viewportPxToLocal(e.clientY - rect.top), tracks.length, trackH);
+        showLaneInsert(lane.kind === 'insert' ? lane.index : null);
+      }
     }
+  };
+  const onTimelineDragLeave = (e: React.DragEvent) => {
+    // Moving over a child fires this too; only leaving the timeline counts.
+    if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+    showLaneInsert(null);
   };
 
   /** Fetch, decode and place ANY audio source as a clip on `targetTrack` — the
@@ -3200,8 +3306,9 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     // target lane, so an unscaled value dropped clips onto the wrong track.
     const xPx = viewportPxToLocal(e.clientX - rect.left);
     const yPx = viewportPxToLocal(e.clientY - rect.top);
-    const droppedBelowAllTracks = yPx >= tracks.length * trackH;
-    const startSec = droppedBelowAllTracks ? 0 : snapSec(pxToSec(xPx));
+    const lane = laneTargetAtY(yPx, tracks.length, trackH);
+    showLaneInsert(null);
+    const startSec = snapSec(pxToSec(xPx));
 
     // A desktop drop imports its audio files to the library first, so both
     // paths continue from library entries.
@@ -3216,11 +3323,12 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       return useEditorStore.getState().tracks.find((t) => t.id === newTrackId);
     };
     let targetTrack: EditorTrack | undefined;
-    if (droppedBelowAllTracks) {
-      targetTrack = newTrackFor(dropped[0]);
+    if (lane.kind === 'insert') {
+      // A gap between lanes, above the first or below the last: a lane of its own there.
+      const newTrackId = insertTrack(lane.index, { name: dropped[0].title });
+      targetTrack = useEditorStore.getState().tracks.find((t) => t.id === newTrackId);
     } else {
-      const targetTrackIdx = Math.max(0, Math.min(tracks.length - 1, Math.floor(yPx / trackH)));
-      targetTrack = tracks[targetTrackIdx];
+      targetTrack = tracks[lane.index];
     }
     if (!targetTrack) return;
     try {
@@ -3404,8 +3512,8 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     addMenu.open(e, {
       trackId: track?.id ?? null,
       trackName: track?.name ?? null,
-      // Below all lanes a drop starts at 0; match it so the two agree.
-      atSec: belowAllTracks ? 0 : Math.max(0, snapSec(contentClientXToSec(e.clientX))),
+      // Where the pointer is, which is where a drop there lands too.
+      atSec: Math.max(0, snapSec(contentClientXToSec(e.clientX))),
     });
   };
 
@@ -3797,6 +3905,27 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
               title="Project tempo — defines the snap grid (40-240)"
             />
             <button
+              type="button"
+              onClick={() => {
+                const ids = selectedClipIds.length > 0 ? selectedClipIds : selectedClipId ? [selectedClipId] : [];
+                if (ids.length === 0) return;
+                if (ids.length === 1) {
+                  void beatMatchClips(ids, projectBpm);
+                  return;
+                }
+                // The first selected clip is the master, the way a deck's SYNC follows the other deck.
+                const anchor = clips.find((c) => c.id === ids[0]);
+                const anchorBpm = anchor ? clipKnownBpm(anchor) : null;
+                void beatMatchClips(anchorBpm !== null ? ids.slice(1) : ids, anchorBpm ?? projectBpm);
+              }}
+              disabled={timePitchBusy || (selectedClipIds.length === 0 && !selectedClipId)}
+              aria-label="Beat match the selected clips"
+              title="Beat match (DJ sync): one selected clip stretches to the project tempo; with several selected, the rest stretch to the first one and the project tempo follows"
+              className="px-1.5 py-0.5 rounded text-xs font-bold uppercase tracking-wider text-purple-300 hover:text-purple-100 hover:bg-purple-500/10 disabled:opacity-40 disabled:pointer-events-none"
+            >
+              {timePitchBusy ? 'Syncing…' : 'Sync'}
+            </button>
+            <button
               onClick={tapTempo}
               aria-label="Tap tempo"
               className="px-1 py-0.5 rounded text-[8px] font-mono uppercase tracking-wider text-zinc-500 hover:text-purple-300 hover:bg-white/5"
@@ -3824,11 +3953,11 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
           </div>
 
           <div className="flex items-center gap-1">
-            <button onClick={() => setZoom(zoom - 5)} className="p-1 hover:bg-white/5 rounded text-zinc-500" title="Zoom out (-)">
+            <button onClick={() => setZoom(zoom / 1.25)} className="p-1 hover:bg-white/5 rounded text-zinc-500" title="Zoom out (-)">
               <ZoomOut className="w-3 h-3" />
             </button>
             <span className="text-[9px] font-mono text-zinc-400 w-14 text-center">{zoom.toFixed(2)}px/s</span>
-            <button onClick={() => setZoom(zoom + 5)} className="p-1 hover:bg-white/5 rounded text-zinc-500" title="Zoom in (+)">
+            <button onClick={() => setZoom(zoom * 1.25)} className="p-1 hover:bg-white/5 rounded text-zinc-500" title="Zoom in (+)">
               <ZoomIn className="w-3 h-3" />
             </button>
             <button
@@ -4700,6 +4829,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             onMouseDown={onTimelineClick}
             onContextMenu={onLanesContextMenu}
             onDragOver={onTimelineDragOver}
+            onDragLeave={onTimelineDragLeave}
             onDrop={onTimelineDrop}
           >
             {tracks.map((track, ti) => (
@@ -4727,6 +4857,10 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
               let keyText: string | null = null;
               if (clip.sourceKind === 'piano-roll') {
                 if (clip.sourceBpm) bpmText = String(Math.round(clip.sourceBpm));
+              } else if (clip.bpm) {
+                bpmText = String(Math.round(clip.bpm));
+                const d = clip.libraryEntryId ? djAnalysisById[clip.libraryEntryId]?.data : undefined;
+                if (d?.key) keyText = `${d.key}${(d.scale ?? '').toLowerCase().startsWith('min') ? 'm' : ''}`;
               } else if (clip.libraryEntryId) {
                 const d = djAnalysisById[clip.libraryEntryId]?.data;
                 if (d?.bpm) bpmText = String(Math.round(d.bpm));
@@ -4964,6 +5098,19 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             >
               Drop here to create a new track
             </div>
+
+            {/* The gap a drag is aimed at: a line where the new lane will go. */}
+            {laneInsert !== null && (
+              <div
+                className="absolute left-0 right-0 z-40 pointer-events-none"
+                style={{ top: laneInsert * trackH - 1, height: 2 }}
+              >
+                <div className="w-full h-0.5 bg-purple-400 shadow-[0_0_8px_rgba(192,132,252,0.9)]" />
+                <span className="absolute left-2 -top-5 text-xs font-bold uppercase tracking-wider text-purple-200 bg-black/80 px-1.5 py-0.5 rounded">
+                  New lane here
+                </span>
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -5121,6 +5268,32 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
           }
         }
         if (clip && !clip.sourcePianoRoll) {
+          const subjectIds = selectedClipIdSet.has(payload.clipId) && selectedClipIds.length > 1 ? selectedClipIds : [payload.clipId];
+          const others = subjectIds.filter((id) => id !== payload.clipId);
+          const anchorBpm = clipKnownBpm(clip);
+          const noTempo = 'No tempo is known for this clip. Analyse it in the library first.';
+          items.push({
+            type: 'item',
+            label: `Beat match to project (${Math.round(projectBpm)} bpm)`,
+            icon: <Gauge className="w-3 h-3" />,
+            hint: 'sync',
+            disabled: timePitchBusy || anchorBpm === null,
+            title: anchorBpm === null ? noTempo : `Stretch to ${Math.round(projectBpm)} bpm and put the first beat on the grid`,
+            onSelect: () => void beatMatchClips(subjectIds, projectBpm),
+          });
+          if (others.length > 0) {
+            items.push({
+              type: 'item',
+              label: `Beat match ${others.length} selected to this clip${anchorBpm ? ` (${Math.round(anchorBpm)} bpm)` : ''}`,
+              icon: <Gauge className="w-3 h-3" />,
+              hint: 'sync',
+              disabled: timePitchBusy || anchorBpm === null,
+              title: anchorBpm === null ? noTempo : 'This clip is the master; the others stretch to its tempo and the project tempo follows',
+              onSelect: () => {
+                if (anchorBpm !== null) void beatMatchClips(others, anchorBpm);
+              },
+            });
+          }
           items.push({
             type: 'item',
             label: 'Time / Pitch…',

@@ -46,6 +46,21 @@ assert.equal(cockpitAction({ type: 'sway/set-audio-source' }), null);
 // ── scene requests ───────────────────────────────────────────────────────────
 assert.deepEqual(cockpitAction({ type: 'sway/request-scenes' }), { kind: 'request-scenes' });
 assert.deepEqual(cockpitAction({ type: 'sway/choose-scene-file' }), { kind: 'choose-scene-file' });
+
+// ── a track's right-click ────────────────────────────────────────────────────
+assert.deepEqual(cockpitAction({ type: 'sway/track-menu', trackId: 't1', name: 'Drums', empty: true, x: 40, y: 200 }), {
+  kind: 'track-menu',
+  trackId: 't1',
+  name: 'Drums',
+  empty: true,
+  x: 40,
+  y: 200,
+});
+// A blank name gets a stand-in; a missing point or track is no request.
+assert.equal(cockpitAction({ type: 'sway/track-menu', trackId: 't1', name: ' ', x: 1, y: 2 })?.kind, 'track-menu');
+assert.equal((cockpitAction({ type: 'sway/track-menu', trackId: 't1', name: ' ', x: 1, y: 2 }) as { name: string }).name, 'this track');
+assert.equal(cockpitAction({ type: 'sway/track-menu', trackId: 't1', x: '1', y: 2 }), null);
+assert.equal(cockpitAction({ type: 'sway/track-menu', name: 'Drums', x: 1, y: 2 }), null);
 assert.deepEqual(cockpitAction({ type: 'sway/open-scene', name: 'Club' }), {
   kind: 'open-scene',
   name: 'Club',
