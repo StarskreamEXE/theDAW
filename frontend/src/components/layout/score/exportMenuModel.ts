@@ -134,7 +134,7 @@ function partTitle(id: SheetExportFormat, part: ExportMenuPart): string {
 }
 
 const XML_TITLE = 'MusicXML — the sheet itself';
-const XML_SHEET_TITLE = 'MusicXML sheet made from this MIDI (the MAKE SHEET conversion)';
+const XML_SHEET_TITLE = 'MusicXML sheet made from this MIDI (MAKE with Exact picked)';
 const PACK_ENGRAVER_NOTE =
   'a PDF engraved on download by the headless OSMD renderer, or MuseScore when it is missing (the source alone with neither); a big score takes a few seconds';
 const PACK_TITLE = `MusicXML + ${PACK_ENGRAVER_NOTE}`;

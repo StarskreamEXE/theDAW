@@ -17,19 +17,47 @@ Every symbolic file a track produces is a *notation artifact* with a kind: `midi
 panel lists them; click one to preview it (MusicXML renders as sheet music,
 alphaTex renders as tablature) or use DOWNLOAD to save it. Artifacts are stored
 per track under `data/generations/<entry_id>/notation/` and tracked in the
-library database, with lineage relations back to their source.
+library database, with lineage relations back to their source. The list sits
+under the maker, headed **Made**.
 
 A track needs a MIDI first. Right-click the track and choose **Convert to MIDI**
 (audio → MIDI via Basic Pitch, or the piano-specialized engine for piano stems).
-Once a MIDI artifact exists, the Score buttons become active.
+Once a MIDI artifact exists, every way of writing it becomes available.
 
-## Making sheet music (MusicXML)
+## Making notation (the maker)
 
-In the Score panel, **MAKE SHEET** converts the first MIDI artifact to MusicXML
-using music21 (it quantizes the rhythm, splits parts, and infers a time
-signature). The result renders in the browser as standard notation via
-OpenSheetMusicDisplay. MusicXML is the canonical interchange format, so it also
-feeds tabs, arrangements, and exports.
+The top of the Score panel's left rail is one maker for every kind of notation.
+Pick an **Instrument**, pick how to **Write as**, and press **MAKE**:
+
+| Instrument | Write as |
+|---|---|
+| **Piano** | **Grand** (a two-staff grand staff split at middle C), **Lead** (the melody with chord symbols), **Exact**, **Chords** |
+| **Voice** | **Melody** (one staff, quantized), **Lead**, **Exact** |
+| **Guitar** | **Tab**, **Chords**, **Melody**, **Exact** |
+| **Bass** | **Tab**, **Exact** |
+| **Ukulele** | **Tab**, **Chords** |
+| **Drums** | **Exact** (a drum-kit MIDI becomes a percussion staff) |
+| **Band** | **Score** (one staff per stem, on one beat grid) |
+
+**Exact** writes the MIDI out as MusicXML with music21 exactly as it was
+transcribed (it quantizes the rhythm, splits parts, and infers a time
+signature). **Chords** builds the chord track for the CHORDS view: from the lead
+sheet when one exists, else estimated from the audio, so it is the one way that
+needs no MIDI.
+
+**From** picks the MIDI to read. It starts on the instrument's own stem (the
+bass MIDI for Bass, the vocals MIDI for Voice, the piano MIDI for Piano, the
+guitar MIDI for Guitar and Ukulele), falling back to the full-mix MIDI, and can
+be changed. **Band** reads every stem. When MAKE cannot run, the reason is
+printed under it.
+
+Every result renders in the browser: MusicXML as standard notation via
+OpenSheetMusicDisplay, tabs via alphaTab. MusicXML is the canonical interchange
+format, so it also feeds exports.
+
+The **«** key in the rail's header collapses the rail to a thin strip, leaving
+the score the whole width; **»** opens it again. The choice is remembered.
+
 
 ## Exporting scores (the EXPORT menu)
 
@@ -71,10 +99,10 @@ named after its part) and can be downloaded.
 
 ## Guitar and bass tabs
 
-The **Tabs** section of the Score panel turns a MIDI into tablature. Choose the
-instrument (Guitar or Bass), a tuning (standard, drop D, 7-string, 4- or 5-string
-bass), a capo fret, and a difficulty (Easy / Medium / Hard, which caps how high
-and wide the fretting goes). Press **MAKE TABS**.
+Pick **Guitar**, **Bass** or **Ukulele** and **Tab**. The maker then asks for a
+**Tuning** (only that instrument's: standard, drop D or 7-string guitar; 4- or
+5-string bass; standard ukulele), a **Level** (Easy / Medium / Hard, which caps
+how high and wide the fretting goes) and a **Capo** fret. Press **MAKE**.
 
 Because the same pitch can be played at several string/fret positions, the
 arranger chooses positions with a dynamic-programming pass that minimizes hand
@@ -89,7 +117,7 @@ overlap, and always writes an explicit tempo. Without those three, a tab drifted
 progressively out of sync with the audio it came from.
 
 > **Re-run older tabs.** Tab artifacts generated before this change lack the rests
-> and the tempo directive, so they still drift. Press **MAKE TABS** again to
+> and the tempo directive, so they still drift. Make the tab again to
 > regenerate one.
 
 ## Following along while it plays
@@ -185,16 +213,17 @@ degrades to a static tab rather than breaking.
 
 ## Arrangements (lead sheet, piano reduction, band score)
 
-The **Arrange** section produces a playable MusicXML arrangement from a track's
-MIDI(s). Pick a style and press **ARRANGE**:
+Four of the maker's ways are rule-based arrangements, saved as MusicXML
+artifacts and rendered in the same sheet-music viewer:
 
-- **lead-sheet** — the melody (skyline) with chord symbols above it.
-- **piano-reduction** — a two-staff grand staff, split at middle C.
-- **simplified** — a single-staff melody only, quantized.
-- **band-score** — one staff per separated stem, combined into a full score.
+- **Lead** — the melody (skyline) with chord symbols above it (`lead-sheet`).
+- **Grand** — a two-staff grand staff, split at middle C (`piano-reduction`).
+- **Melody** — a single-staff melody only, quantized (`simplified`).
+- **Score** on **Band** — one staff per separated stem, combined into a full
+  score (`band-score`).
 
-Arrangements render in the same in-browser sheet-music viewer as MAKE SHEET and
-are saved as MusicXML artifacts.
+In the **STRIP** view every part's name is pinned to the left edge, level with
+its staves, so a band score stays readable while it scrolls.
 
 ## Prompt inference from audio
 

@@ -1,5 +1,5 @@
 import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronLeft, ChevronRight, Download, FileMusic, Guitar, LayoutGrid, Loader2, Minus, Music2, Music4, Plus, RefreshCw } from 'lucide-react';
+import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Download, Loader2, Minus, Plus, RefreshCw } from 'lucide-react';
 import { useLibraryStore, type LibraryEntry } from '../../state/libraryStore';
 import { usePlayerStore } from '../../state/playerStore';
 import { logError, logInfo } from '../../state/logStore';
@@ -15,15 +15,11 @@ import {
 } from './scoreTimeMap';
 import { readSoundingTempi } from './soundingTempo';
 import {
-  convertMidiToMusicXml,
   exportArtifact,
   getNotationCapabilities,
   listNotationArtifacts,
   fetchArtifactText,
   invalidateArtifactText,
-  makeArrangement,
-  makeChordTrack,
-  makeTabs,
   type NotationArtifact,
   type NotationCapabilities,
 } from '../../lib/notationClient';
@@ -49,6 +45,8 @@ import {
   type ExternalMediaOutput,
 } from './score/scoreShared';
 import { fitZoomToPage, type FitReport } from './score/scoreFit';
+import { NotationMaker } from './score/NotationMaker';
+import { stemOf } from './score/notationMakerModel';
 
 // The zoom a score fitted to per (artifact, page width): a re-open renders
 // once at that zoom instead of measuring-and-fitting again. Bounded.
@@ -150,16 +148,16 @@ const LazyFallback: React.FC = () => (
   <div className="h-full grid place-items-center text-[10px] font-mono text-zinc-500">Loading…</div>
 );
 
-const DEFAULT_TUNINGS = [
-  'guitar-standard',
-  'guitar-drop-d',
-  'guitar-7-string',
-  'bass-standard',
-  'bass-5-string',
-  'ukulele-standard',
-];
+/** Where the rail's collapsed state is remembered, per viewer. */
+const RAIL_COLLAPSED_KEY = 'score.railCollapsed.v1';
 
-const DEFAULT_STYLES = ['lead-sheet', 'piano-reduction', 'simplified', 'band-score'];
+const readRailCollapsed = (): boolean => {
+  try {
+    return localStorage.getItem(RAIL_COLLAPSED_KEY) === '1';
+  } catch {
+    return false;
+  }
+};
 
 export const ScoreView: React.FC = () => {
   const selectedEntryId = useLibraryStore((s) => s.selectedEntryId);
@@ -171,17 +169,21 @@ export const ScoreView: React.FC = () => {
   const [artifacts, setArtifacts] = useState<NotationArtifact[]>([]);
   const [selectedArtifactId, setSelectedArtifactId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const [converting, setConverting] = useState(false);
   const [caps, setCaps] = useState<NotationCapabilities | null>(null);
   const [exporting, setExporting] = useState<string | null>(null);
-  const [makingTabs, setMakingTabs] = useState(false);
-  const [tabInstrument, setTabInstrument] = useState('guitar');
-  const [tabTuning, setTabTuning] = useState('guitar-standard');
-  const [tabCapo, setTabCapo] = useState(0);
-  const [tabDifficulty, setTabDifficulty] = useState('medium');
-  const [arrangeStyle, setArrangeStyle] = useState('piano-reduction');
-  const [arranging, setArranging] = useState(false);
-  const [makingChords, setMakingChords] = useState(false);
+  // The left rail (maker + made list) folds to a thin strip so the score can
+  // take the whole width.
+  const [railCollapsed, setRailCollapsed] = useState(readRailCollapsed);
+  const toggleRail = () => {
+    setRailCollapsed((was) => {
+      try {
+        localStorage.setItem(RAIL_COLLAPSED_KEY, was ? '0' : '1');
+      } catch {
+        /* private mode: the state still holds for this session */
+      }
+      return !was;
+    });
+  };
   // Beat Saber export popover: open flag, and the part names it offers (learnt
   // from a loaded view or fetched from the sheet's part-list; null = all).
   const [bsOpen, setBsOpen] = useState(false);
@@ -211,10 +213,7 @@ export const ScoreView: React.FC = () => {
   // sheet preview reads it directly when rendering.
 
   const selectedArtifact = artifacts.find((artifact) => artifact.id === selectedArtifactId) ?? null;
-  const musicXmlArtifacts = artifacts.filter((artifact) => artifact.kind === 'musicxml');
   const midiArtifacts = artifacts.filter((artifact) => artifact.kind === 'midi');
-  const tabTunings = caps?.tab_tunings ?? DEFAULT_TUNINGS;
-  const arrangementStyles = caps?.arrangement_styles ?? DEFAULT_STYLES;
   // What the EXPORT menu offers, and why an entry is disabled, is decided in
   // score/exportMenuModel.ts from caps.formats; nothing about exports is guessed here.
   // Which play-along views the selected artifact supports. A Beat Saber pack
@@ -287,34 +286,6 @@ export const ScoreView: React.FC = () => {
     return () => { cancelled = true; };
   }, []);
 
-  const makeSheetFromFirstMidi = async () => {
-    if (!selectedEntryId) return;
-    const firstMidi = midiArtifacts[0];
-    if (!firstMidi) {
-      logError('score', 'No MIDI artifact found yet. Run Convert to MIDI first.');
-      return;
-    }
-    const legacyMidiId = (() => {
-      try {
-        const meta = JSON.parse(firstMidi.metadata_json || '{}') as { legacy_midi_id?: string };
-        return meta.legacy_midi_id || firstMidi.source_ref || firstMidi.id.replace(/__artifact_midi$/, '');
-      } catch {
-        return firstMidi.source_ref || firstMidi.id.replace(/__artifact_midi$/, '');
-      }
-    })();
-    setConverting(true);
-    try {
-      const artifact = await convertMidiToMusicXml(selectedEntryId, legacyMidiId);
-      logInfo('score', `Created MusicXML score from ${legacyMidiId}`);
-      await loadArtifacts();
-      if (artifact?.id) setSelectedArtifactId(artifact.id);
-    } catch (e) {
-      logError('score', `Sheet conversion failed: ${e instanceof Error ? e.message : String(e)}`);
-    } finally {
-      setConverting(false);
-    }
-  };
-
   // Any part, any format: options.parts scopes every export-route format to
   // one part (the backend filters the sheet with stage_parts, then converts);
   // null exports the whole sheet. A MIDI artifact exports the same way (the
@@ -342,77 +313,15 @@ export const ScoreView: React.FC = () => {
     }
   };
 
-  const makeTabsFromFirstMidi = async () => {
-    if (!selectedEntryId) return;
-    const firstMidi = midiArtifacts[0];
-    if (!firstMidi) {
-      logError('score', 'No MIDI artifact found yet. Run Convert to MIDI first.');
-      return;
-    }
-    setMakingTabs(true);
-    try {
-      const artifact = await makeTabs(selectedEntryId, {
-        source_artifact_id: firstMidi.id,
-        instrument: tabInstrument,
-        tuning_name: tabTuning,
-        capo: tabCapo,
-        difficulty: tabDifficulty,
-      });
-      logInfo('score', `Arranged ${tabInstrument} tab (${tabTuning}) from ${firstMidi.id}`);
-      await loadArtifacts();
-      if (artifact?.id) setSelectedArtifactId(artifact.id);
-    } catch (e) {
-      logError('score', `Tab generation failed: ${e instanceof Error ? e.message : String(e)}`);
-    } finally {
-      setMakingTabs(false);
-    }
-  };
-
-  const onInstrumentChange = (value: string) => {
-    setTabInstrument(value);
-    setTabTuning(value === 'bass' ? 'bass-standard' : value === 'ukulele' ? 'ukulele-standard' : 'guitar-standard');
-  };
-
-  const makeArrangementFromMidis = async () => {
-    if (!selectedEntryId) return;
-    if (midiArtifacts.length === 0) {
-      logError('score', 'No MIDI artifact found yet. Run Convert to MIDI first.');
-      return;
-    }
-    setArranging(true);
-    try {
-      const req = arrangeStyle === 'band-score'
-        ? { style: arrangeStyle, source_artifact_ids: midiArtifacts.map((m) => m.id) }
-        : { style: arrangeStyle, source_artifact_id: midiArtifacts[0].id };
-      const artifact = await makeArrangement(selectedEntryId, req);
-      logInfo('score', `Arranged ${arrangeStyle} from ${midiArtifacts.length} MIDI artifact(s)`);
-      await loadArtifacts();
-      if (artifact?.id) setSelectedArtifactId(artifact.id);
-    } catch (e) {
-      logError('score', `Arrangement failed: ${e instanceof Error ? e.message : String(e)}`);
-    } finally {
-      setArranging(false);
-    }
-  };
-
   // ---- Play-along integration ---------------------------------------------
 
-  const makeChordsFromEntry = async () => {
-    if (!selectedEntryId) return;
-    setMakingChords(true);
-    try {
-      const artifact = await makeChordTrack(selectedEntryId, { source: 'auto' });
-      logInfo('score', 'Built the chord track (from the lead sheet when one exists, else estimated from the audio)');
-      await loadArtifacts();
-      if (artifact?.id) {
-        setSelectedArtifactId(artifact.id);
-        setMode('chords');
-      }
-    } catch (e) {
-      logError('score', `Chord track failed: ${e instanceof Error ? e.message : String(e)}`);
-    } finally {
-      setMakingChords(false);
-    }
+  /** The maker made something: list it, open it, and open a chord track in
+   *  the CHORDS view. */
+  const onMade = async (artifact: NotationArtifact | null, way: string) => {
+    await loadArtifacts();
+    if (!artifact?.id) return;
+    setSelectedArtifactId(artifact.id);
+    if (way === 'chords') setMode('chords');
   };
 
   /** Write the INSTRUMENT preset into an artifact's part visibility, learning
@@ -634,180 +543,95 @@ export const ScoreView: React.FC = () => {
 
   return (
     <div className="h-full min-h-0 flex bg-[#07050a] text-zinc-200">
-      <div className="w-64 shrink-0 border-r border-white/5 flex flex-col min-h-0 bg-black/30">
-        <div className="p-2 border-b border-white/5 flex items-center gap-2">
-          <FileMusic className="w-4 h-4 text-emerald-300" />
-          <div className="min-w-0">
-            <div className="text-[10px] font-black uppercase tracking-widest text-emerald-200">Score</div>
-            <div className="text-[8px] font-mono text-zinc-500 truncate">{entry?.title ?? 'Select a library track'}</div>
-          </div>
+      {railCollapsed && (
+        <div className="w-10 shrink-0 border-r border-white/10 flex flex-col items-center gap-3 py-1.5 bg-black/30">
           <button
-            className="ml-auto p-1 rounded border border-white/10 text-zinc-400 hover:text-zinc-100"
+            type="button"
+            className="h-7 w-7 shrink-0 rounded border border-white/10 flex items-center justify-center text-zinc-400 transition-colors hover:border-[rgb(var(--et-accent)/0.5)] hover:text-zinc-100 outline-none focus-visible:ring-1 focus-visible:ring-[rgb(var(--et-accent)/0.6)]"
+            onClick={toggleRail}
+            aria-expanded={false}
+            aria-controls="score-notation-rail"
+            aria-label="Show the notation rail"
+            title="Show the notation rail"
+          >
+            <ChevronsRight className="size-3.5" aria-hidden="true" />
+          </button>
+          <span className="font-display text-xs font-bold uppercase text-zinc-500 [writing-mode:vertical-rl] select-none" aria-hidden="true">
+            Notation
+          </span>
+        </div>
+      )}
+      <div
+        id="score-notation-rail"
+        hidden={railCollapsed}
+        className="w-72 shrink-0 border-r border-white/10 flex flex-col min-h-0 bg-black/30"
+      >
+        <div className="h-10 shrink-0 border-b border-white/10 flex items-center gap-2 px-3">
+          <button
+            type="button"
+            className="h-7 w-7 -ml-1 shrink-0 rounded border border-white/10 flex items-center justify-center text-zinc-400 transition-colors hover:border-[rgb(var(--et-accent)/0.5)] hover:text-zinc-100 outline-none focus-visible:ring-1 focus-visible:ring-[rgb(var(--et-accent)/0.6)]"
+            onClick={toggleRail}
+            aria-expanded={!railCollapsed}
+            aria-controls="score-notation-rail"
+            aria-label="Hide the notation rail"
+            title="Hide the notation rail"
+          >
+            <ChevronsLeft className="size-3.5" aria-hidden="true" />
+          </button>
+          <span className="font-display text-xs font-bold uppercase text-zinc-300">Notation</span>
+          <span className="min-w-0 flex-1 truncate text-xs font-bold text-zinc-500" title={entry?.title}>
+            {entry?.title ?? 'Select a library track'}
+          </span>
+          <button
+            type="button"
+            className="h-7 w-7 shrink-0 rounded border border-white/10 flex items-center justify-center text-zinc-400 transition-colors hover:border-[rgb(var(--et-accent)/0.5)] hover:text-zinc-100 disabled:opacity-40 outline-none focus-visible:ring-1 focus-visible:ring-[rgb(var(--et-accent)/0.6)]"
             onClick={() => void loadArtifacts()}
             disabled={!selectedEntryId || loading}
-            title="Refresh notation artifacts"
+            aria-label="Refresh notation"
+            title="Refresh notation"
           >
-            {loading ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+            {loading ? <Loader2 className="size-3.5 animate-spin" aria-hidden="true" /> : <RefreshCw className="size-3.5" aria-hidden="true" />}
           </button>
         </div>
 
-        <div className="p-2 border-b border-white/5 flex gap-1">
-          <button
-            className="btn-ghost text-[8px] py-1 flex-1 flex items-center justify-center gap-1 disabled:opacity-40"
-            onClick={() => void makeSheetFromFirstMidi()}
-            disabled={!selectedEntryId || converting || midiArtifacts.length === 0}
-            title={midiArtifacts.length === 0 ? 'Run Convert to MIDI first' : 'Convert the first MIDI artifact to MusicXML'}
-          >
-            {converting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Music2 className="w-3 h-3 text-emerald-300" />}
-            MAKE SHEET
-          </button>
-        </div>
+        <NotationMaker
+          entryId={selectedEntryId}
+          midis={midiArtifacts}
+          caps={caps}
+          onMade={(artifact, way) => void onMade(artifact, way)}
+        />
 
-        <div className="p-2 border-b border-white/5 space-y-1.5">
-          <div className="flex items-center gap-1">
-            <Guitar className="w-3 h-3 text-pink-300" />
-            <span className="text-[8px] font-black uppercase tracking-widest text-pink-200">Tabs</span>
-          </div>
-          <div className="grid grid-cols-2 gap-1">
-            <select
-              id="score-tab-instrument"
-              name="score-tab-instrument"
-              aria-label="Tab instrument"
-              className="form-select text-[8px] px-1 py-1"
-              value={tabInstrument}
-              onChange={(e) => onInstrumentChange(e.target.value)}
-            >
-              <option value="guitar">Guitar</option>
-              <option value="bass">Bass</option>
-              <option value="ukulele">Ukulele</option>
-            </select>
-            <select
-              id="score-tab-difficulty"
-              name="score-tab-difficulty"
-              aria-label="Tab difficulty"
-              className="form-select text-[8px] px-1 py-1"
-              value={tabDifficulty}
-              onChange={(e) => setTabDifficulty(e.target.value)}
-            >
-              <option value="easy">Easy</option>
-              <option value="medium">Medium</option>
-              <option value="hard">Hard</option>
-            </select>
-          </div>
-          <div className="grid grid-cols-2 gap-1">
-            <select
-              id="score-tab-tuning"
-              name="score-tab-tuning"
-              aria-label="Tab tuning"
-              className="form-select text-[8px] px-1 py-1"
-              value={tabTuning}
-              onChange={(e) => setTabTuning(e.target.value)}
-            >
-              {tabTunings.map((tuning) => (
-                <option key={tuning} value={tuning}>{tuning}</option>
-              ))}
-            </select>
-            <div className="flex items-center gap-1">
-              <label htmlFor="score-tab-capo" className="text-[8px] font-mono text-zinc-500 shrink-0">Capo</label>
-              <input
-                id="score-tab-capo"
-                name="score-tab-capo"
-                type="number"
-                min={0}
-                max={12}
-                aria-label="Capo fret"
-                className="w-full form-select text-[8px] px-1 py-1"
-                value={tabCapo}
-                onChange={(e) => setTabCapo(Math.max(0, Math.min(12, Number(e.target.value) || 0)))}
-              />
-            </div>
-          </div>
-          <button
-            className="btn-ghost text-[8px] py-1 w-full flex items-center justify-center gap-1 disabled:opacity-40"
-            onClick={() => void makeTabsFromFirstMidi()}
-            disabled={!selectedEntryId || makingTabs || midiArtifacts.length === 0}
-            title={midiArtifacts.length === 0 ? 'Run Convert to MIDI first' : 'Arrange the first MIDI artifact into tablature'}
-          >
-            {makingTabs ? <Loader2 className="w-3 h-3 animate-spin" /> : <Guitar className="w-3 h-3 text-pink-300" />}
-            MAKE TABS
-          </button>
-        </div>
-
-        <div className="p-2 border-b border-white/5 space-y-1.5">
-          <div className="flex items-center gap-1">
-            <LayoutGrid className="w-3 h-3 text-sky-300" />
-            <span className="text-[8px] font-black uppercase tracking-widest text-sky-200">Arrange</span>
-          </div>
-          <select
-            id="score-arrange-style"
-            name="score-arrange-style"
-            aria-label="Arrangement style"
-            className="w-full form-select text-[8px] px-1 py-1"
-            value={arrangeStyle}
-            onChange={(e) => setArrangeStyle(e.target.value)}
-          >
-            {arrangementStyles.map((style) => (
-              <option key={style} value={style}>{style}</option>
-            ))}
-          </select>
-          <button
-            className="btn-ghost text-[8px] py-1 w-full flex items-center justify-center gap-1 disabled:opacity-40"
-            onClick={() => void makeArrangementFromMidis()}
-            disabled={!selectedEntryId || arranging || midiArtifacts.length === 0}
-            title={midiArtifacts.length === 0
-              ? 'Run Convert to MIDI first'
-              : (arrangeStyle === 'band-score'
-                ? 'Arrange the MIDI stems into a band score (a full-mix stem and pitched drum transcriptions are left out; a drum-kit MIDI becomes a percussion staff)'
-                : 'Arrange the first MIDI artifact')}
-          >
-            {arranging ? <Loader2 className="w-3 h-3 animate-spin" /> : <LayoutGrid className="w-3 h-3 text-sky-300" />}
-            ARRANGE
-          </button>
-        </div>
-
-        <div className="p-2 border-b border-white/5 space-y-1.5">
-          <div className="flex items-center gap-1">
-            <Music4 className="w-3 h-3 text-amber-300" />
-            <span className="text-[8px] font-black uppercase tracking-widest text-amber-200">Play along</span>
-          </div>
-          <button
-            className="btn-ghost text-[8px] py-1 w-full flex items-center justify-center gap-1 disabled:opacity-40"
-            onClick={() => void makeChordsFromEntry()}
-            disabled={!selectedEntryId || makingChords}
-            title="Derive a chord track for the CHORDS view: from the lead sheet when one exists, else estimated from the audio"
-          >
-            {makingChords ? <Loader2 className="w-3 h-3 animate-spin" /> : <Music4 className="w-3 h-3 text-amber-300" />}
-            MAKE CHORDS
-          </button>
-        </div>
-
-        <div className="flex-1 min-h-0 overflow-y-auto p-2 space-y-1">
+        <div className="flex-1 min-h-0 overflow-y-auto p-3 flex flex-col gap-1 text-xs font-bold">
+          {artifacts.length > 0 && <span className="pb-1 font-display uppercase text-zinc-500">Made</span>}
           {artifacts.map((artifact) => {
             const active = artifact.id === selectedArtifactId;
             return (
               <button
                 key={artifact.id}
+                type="button"
                 onClick={() => setSelectedArtifactId(artifact.id)}
-                className={`w-full text-left rounded border px-2 py-1.5 transition-colors ${
+                aria-current={active ? 'true' : undefined}
+                className={`w-full text-left rounded border px-2.5 py-1.5 transition-colors ${
                   active
-                    ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-100'
-                    : 'border-white/5 bg-black/20 text-zinc-400 hover:text-zinc-100 hover:border-white/15'
+                    ? 'border-[rgb(var(--et-accent)/0.55)] bg-[rgb(var(--et-accent)/0.15)] et-accent-legend'
+                    : 'border-white/10 text-zinc-300 hover:border-white/25 hover:text-zinc-100'
                 }`}
               >
-                <div className="text-[9px] font-black uppercase tracking-widest">
+                <div className="truncate">
                   {describeArtifact(artifact)}
+                  {artifact.kind === 'midi' ? ` · ${stemOf(artifact)}` : ''}
                 </div>
-                <div className="text-[8px] font-mono truncate opacity-70">
+                <div className="truncate font-semibold text-zinc-500">
                   {artifact.kind}
                   {artifact.engine ? ` · ${artifact.engine}` : ''}
                 </div>
               </button>
             );
           })}
-          {!loading && artifacts.length === 0 && (
-            <div className="text-[9px] font-mono text-zinc-600 leading-relaxed p-3 border border-dashed border-white/10 rounded">
-              No notation artifacts yet. Right-click a track → Convert to MIDI, then use MAKE SHEET.
-            </div>
+          {!loading && selectedEntryId && artifacts.length === 0 && (
+            <p className="rounded border border-dashed border-white/10 p-3 leading-5 text-zinc-500">
+              Nothing made yet. Chords work from the audio alone; everything else needs the track converted to MIDI first (right-click it in the library).
+            </p>
           )}
         </div>
       </div>

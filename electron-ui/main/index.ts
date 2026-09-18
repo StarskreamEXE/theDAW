@@ -41,6 +41,11 @@ function getRepoRoot(): string {
 
 const repoRoot = getRepoRoot()
 
+// theDAW's icon for every window's title bar and taskbar button. A packaged
+// build has it baked into theDAW.exe, which Windows uses; the dev shell runs
+// electron.exe, whose own icon showed until the window was handed this file.
+const WINDOW_ICON = app.isPackaged ? undefined : path.join(__dirname, '..', '..', 'resources', 'icon.png')
+
 // ---------------------------------------------------------------------------
 // Logging
 // ---------------------------------------------------------------------------
@@ -606,6 +611,7 @@ function createWindow(): void {
     minWidth: 960,
     minHeight: 640,
     title: 'theDAW',
+    icon: WINDOW_ICON,
     // Open windowed at the default size (reverted from forced fullscreen).
     fullscreen: false,
     // Paint solid black immediately so there's no white window flash before
@@ -648,8 +654,8 @@ function createWindow(): void {
     // that is the only channel available from inside the click handler — and
     // the call HAS to stay in the gesture or the pop-out is blocked.
     const bounds = requestedDisplayBounds(frameName, features)
-    if (bounds) return { action: 'allow', overrideBrowserWindowOptions: bounds }
-    return { action: 'allow' }
+    if (bounds) return { action: 'allow', overrideBrowserWindowOptions: { ...bounds, icon: WINDOW_ICON } }
+    return { action: 'allow', overrideBrowserWindowOptions: { icon: WINDOW_ICON } }
   })
   mainWindow.webContents.on('will-navigate', (event, url) => {
     if (isExternal(url)) {
