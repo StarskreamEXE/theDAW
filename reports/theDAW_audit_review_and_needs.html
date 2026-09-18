@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>theDAW — 70-Feature Audit Review + Actual Needs</title>
+<style>
+  :root{--bg:#09080d;--panel:#100e16;--panel2:#15111e;--line:#2b2338;--text:#f1edf6;--muted:#a49aac;
+    --purple:#b46cff;--green:#69e6ab;--amber:#f2c36f;--red:#ff7b8e}
+  *{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(circle at 50% -15%,#211330 0,#09080d 34%);color:var(--text);
+    font:14px/1.5 Inter,system-ui,-apple-system,Segoe UI,sans-serif}
+  .wrap{max-width:1000px;margin:0 auto;padding:30px 22px 90px}
+  h1{margin:0 0 6px;font-size:24px}
+  .sub{color:var(--muted);font-size:12.5px}
+  h2{font-size:16px;margin:26px 0 4px;border-bottom:1px solid var(--line);padding-bottom:5px}
+  .kpi{display:flex;gap:9px;flex-wrap:wrap;margin:14px 0}
+  .kpi div{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:7px 12px;font-size:12px}
+  .kpi b{font-size:17px;display:block}
+  .g{color:var(--green)} .a{color:var(--amber)} .r{color:var(--red)} .p{color:var(--purple)}
+  table{width:100%;border-collapse:collapse;margin:8px 0;font-size:12.5px}
+  th,td{text-align:left;padding:6px 9px;border-bottom:1px solid #241c2e;vertical-align:top}
+  th{color:var(--muted);font-size:10.5px;letter-spacing:.06em;text-transform:uppercase}
+  code,.mono{font-family:ui-monospace,Consolas,monospace;font-size:11.5px;color:#d8c6ee}
+  .badge{font-size:9px;font-weight:900;padding:2px 6px;border-radius:99px;white-space:nowrap}
+  .ok{background:var(--green);color:#042719}.part{background:var(--amber);color:#2b1c00}.miss{background:var(--red);color:#33060d}
+  .card{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:11px;padding:13px 16px;margin:11px 0}
+  .scope{border-left:3px solid var(--red)}
+  p{margin:7px 0;color:#d4cdda}
+  ul{margin:6px 0;padding-left:20px} li{margin:4px 0}
+  .foot{color:var(--muted);font-size:11px;margin-top:26px;border-top:1px solid var(--line);padding-top:12px}
+  a{color:#c991ff}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>◆ theDAW — Audit Review, Corrected State &amp; Actual Needs</h1>
+  <div class="sub">A 4-sonnet read-only review of <span class="mono">theDAW_70_feature_audit_with_OSS_references.html</span>, re-verified against the <b>current working tree</b> (the audit ran against <span class="mono">danieljtrujillo/theDAW · main</span> and predates our local work). Plus the scout-team clone of all 7 referenced OSS projects. 2026-09-15 (rev 2 — scope-corrected).</div>
+
+  <div class="card scope">
+    <p style="margin:0"><strong>Scope rule (what counts as "the DAW").</strong> Only the DAW's own surfaces count: EDIT/arrangement, the mixer, the piano roll, the session grid, and the DJ engine. Two adjacent subsystems live in the same repo but are <b>not</b> the DAW and are <b>excluded</b> from every verdict below: <b>Chimera</b> (<span class="mono">backend/modules/chimera/</span>, the auto-mashup renderer — its internal <code>duck()</code> / <code>stretch.py</code> are Chimera's own DSP), and <b>dawimport</b> (<span class="mono">backend/modules/dawimport/ableton.py</span>, a parser that <i>reads</i> <code>.als</code> files — parsing another DAW's warp/take/comp data on import is not theDAW implementing them). Rev 1 of this report let three verdicts lean on those; they are corrected here.</p>
+  </div>
+
+  <h2>1 · The verdict: the audit badly understated theDAW</h2>
+  <p>The audit reported <b>29 covered / 14 partial / 27 not-evidenced</b>. Re-checked against the real tree by four independent sonnet auditors, spot-verified by me, and scoped to the DAW proper, the true state is:</p>
+  <div class="kpi">
+    <div><b class="g">44</b>actually COVERED <span class="mono">(was 29)</span></div>
+    <div><b class="a">15</b>partial / scoped <span class="mono">(was 14)</span></div>
+    <div><b class="r">11</b>truly ABSENT <span class="mono">(was 27)</span></div>
+    <div><b>70</b>accounted for</div>
+  </div>
+  <p>So <b>only 11 of 70 DAW primitives are genuinely missing.</b> The audit listed 27 as "not evidenced" — but 13 of those already exist and 3 exist partially; its recursive scan simply didn't reach the files. Most of theDAW's real capability lives in <code>WaveformEditor.tsx</code>, <code>djEngine.ts</code>, <code>editorStore.ts</code>, and <code>lib/</code> (<code>editorAutosave.ts</code>, <code>notechart.ts</code>, <code>rackEffects.ts</code>), which the audit under-scanned.</p>
+
+  <h3 style="color:var(--muted);font-size:11px;letter-spacing:.1em">HOW THE VERDICTS MOVED</h3>
+  <table>
+    <tr><th>Audit bucket</th><th>Sonnet re-check (DAW-scoped)</th></tr>
+    <tr><td>COVERED (29)</td><td><span class="g">27 confirmed</span>; <span class="r">2 overstated</span> — #36 MIDI-note "lane" field and #37 piano-roll <code>RollMeter/PolyLane/pickupSteps</code> don't exist (data-model overclaim → now partial)</td></tr>
+    <tr><td>PARTIAL (14)</td><td><span class="g">4 were actually fully covered</span> (#06 loop transport, #12 clip trim, #41 MIDI-learn, #52 offline render); 10 genuinely partial; 0 overstated</td></tr>
+    <tr><td>NOT EVIDENCED (27)</td><td><span class="g">13 exist now</span>, <span class="a">3 partial</span> (#17, #27, #62), <span class="r">11 still absent</span></td></tr>
+  </table>
+
+  <h2>2 · Our actual needs — the 11 that don't exist in the DAW</h2>
+  <p>Features with <b>zero native implementation</b> on any DAW surface (I re-grepped each one myself; the apparent hits were the latency-calibrator click, music21 tempo marks, case-insensitive "MPE" noise, the whisper venv, Chimera, and the Ableton importer — none are DAW features). Ranked by value-for-effort for theDAW's actual use (DJ + song production + assistant orb):</p>
+  <table>
+    <tr><th>#</th><th>Feature</th><th></th><th>Why / effort</th><th>Best OSS reference (cloned)</th></tr>
+    <tr><td>08</td><td><b>Metronome / click track</b></td><td><span class="badge miss">BUILD</span></td><td>Cheap, high value for recording. Proposed <code>Metronome.ts</code> is ~4 lines of scheduled oscillator clicks. <b>Quick win.</b></td><td><span class="mono">ACE-Step-DAW/src/engine</span> (React/WebAudio count-in)</td></tr>
+    <tr><td>70</td><td><b>Render queue</b></td><td><span class="badge miss">BUILD</span></td><td>Ties directly to existing freeze/<code>commitEdit</code> bounce. Multi-job queue w/ progress/cancel. Medium.</td><td><span class="mono">ACE-Step-DAW</span> export/service; Tracktion <span class="mono">EditRenderJob</span></td></tr>
+    <tr><td>24</td><td><b>Sends / returns (aux buses)</b></td><td><span class="badge miss">BUILD</span></td><td>Real mixing capability; only master bus exists today. Medium-large.</td><td><span class="mono">stargate/src/sgui/widgets/routing_matrix.py</span></td></tr>
+    <tr><td>64</td><td><b>Sidechain routing</b></td><td><span class="badge miss">BUILD</span></td><td>No per-channel sidechain input in the interactive mixer. Naturally built with #24 (same routing model).</td><td><span class="mono">stargate</span> routing matrix; Tracktion rack patching</td></tr>
+    <tr><td>61</td><td><b>Follow actions</b></td><td><span class="badge miss">BUILD</span></td><td>We now HAVE clip-launch/scenes (#60, <code>DawSessionGrid.tsx</code>) — follow-actions is the natural next layer on it. Medium.</td><td>Tracktion clip-launching subsystem</td></tr>
+    <tr><td>07</td><td><b>Punch in/out</b></td><td><span class="badge miss">BUILD</span></td><td>Recording feature; pairs with audio-record wiring (#43 partial). Small once record path exists.</td><td><span class="mono">ardour/libs/ardour/session.cc</span></td></tr>
+    <tr><td>45</td><td><b>Take lanes</b></td><td><span class="badge miss">BUILD</span></td><td>No native alternate-take structure in EDIT. Prerequisite for comping. Larger; recording-centric.</td><td>Tracktion edit/recording model; <span class="mono">ardour/libs/ardour</span> playlist</td></tr>
+    <tr><td>46</td><td><b>Comping</b></td><td><span class="badge miss">BUILD</span></td><td>Take-lane splice-to-comp workflow; depends on #45. Larger.</td><td><span class="mono">ardour/libs/ardour</span> playlist/region</td></tr>
+    <tr><td>18</td><td><b>Warp markers</b></td><td><span class="badge miss">BUILD</span></td><td>No native source-time↔project-beat warp model or edit UI in EDIT. Pairs with EDIT time-stretch (#19 partial). Medium-large.</td><td>Tracktion <span class="mono">model/clips/</span> Warp Time</td></tr>
+    <tr><td>42</td><td><b>MPE</b></td><td><span class="badge miss">BUILD</span></td><td>Niche — only if you use MPE controllers. Pitch-bend lanes already exist to build on.</td><td>Tracktion MIDI note-expression model</td></tr>
+    <tr><td>66</td><td><b>Disk streaming</b></td><td><span class="badge miss">BUILD</span></td><td>Big native/worker effort (ring buffer + worker thread). Browser AudioBuffer caching works for now — <b>lowest priority.</b></td><td><span class="mono">ardour/libs/ardour</span> disk subsystem</td></tr>
+  </table>
+
+  <h2>3 · Partial / scoped — exists but not on the main surface (15)</h2>
+  <p>These work on a DAW surface, but are confined to one subsystem or missing one piece. Secondary needs — "promote/generalize," not "build from scratch."</p>
+  <table>
+    <tr><th>#</th><th>Feature</th><th>What exists / what's missing</th></tr>
+    <tr><td>02</td><td>Master musical clock</td><td>bpm read ad-hoc per clip; no central <code>MusicalClock</code>/tempo-map class</td></tr>
+    <tr><td>04</td><td>Tempo map</td><td><span class="g">exists</span> in <code>lib/notechart.ts</code> (<code>TempoEntry[]</code>, beats↔seconds) — just not wired into EDIT transport</td></tr>
+    <tr><td>05</td><td>EDIT time-signatures</td><td>piano-roll has meterMap; EDIT still assumes 4/4 (comment says so)</td></tr>
+    <tr><td>13</td><td>Slip editing</td><td>trim path touches <code>offsetIntoSource</code>; no dedicated fixed-window slip gesture</td></tr>
+    <tr><td>17</td><td>Crossfades</td><td>DJ crossfader is complete (<code>djEngine.ts setCrossfade</code>, equal-power); arrangement clip-edge crossfade uses granular bleed instead</td></tr>
+    <tr><td>19</td><td>EDIT time-stretch</td><td>stretch engine wired to DJ decks, not to clip edges in EDIT</td></tr>
+    <tr><td>23</td><td>Submix buses</td><td>master bus only; SLIDE bridge ≠ routable submix</td></tr>
+    <tr><td>27</td><td>Plugin delay comp</td><td>real delay-comp in DJ engine (A/B deck); no general per-channel PDC</td></tr>
+    <tr><td>29</td><td>Live VST3 host</td><td>file-based backend VST processing; no realtime browser-graph host</td></tr>
+    <tr><td>36/37</td><td>MIDI note fields / polymeter</td><td>models exist but without the audit's claimed <code>lane</code>/<code>RollMeter</code> fields</td></tr>
+    <tr><td>40</td><td>MIDI-record pipeline</td><td><code>placeRecording()</code> fed by vocal→MIDI, not Web-MIDI note-on/off pairing</td></tr>
+    <tr><td>43</td><td>Audio recording</td><td><code>MicRecorder</code> standalone; not wired to armed tracks / transport capture</td></tr>
+    <tr><td>44</td><td>Input monitoring</td><td>global device enum only; no per-track monitor mode</td></tr>
+    <tr><td>54</td><td>Bounce</td><td>per-track freeze + project mixdown exist; no unified selection→dest command</td></tr>
+    <tr><td>62</td><td>Macro controls</td><td>Character-FX macro knobs only; no project-wide macro system</td></tr>
+  </table>
+  <p class="sub">Also confirmed newly-present on DAW surfaces (audit missed): #04 tempo map, #15 duplicate clip, #34 automation touch/latch, #38 MIDI quantize, #39 groove/swing, #47 undo/redo, #49 clipboard, #56 autosave, #57 crash recovery, #60 clip launching, #63 modulators/LFO, #67 resampling (DJ engine / signalsmith), #69 latency calibration.</p>
+
+  <h2>4 · Scout team — all 7 referenced projects retrieved</h2>
+  <p>Shallow (depth-1) clones in <span class="mono">oss-refs/</span> (gitignored). Every reference in the audit is a <b>real repo</b>; every cited path our needs map to was confirmed present.</p>
+  <table>
+    <tr><th>Repo</th><th>Size</th><th>Lang</th><th>Most useful to us for</th></tr>
+    <tr><td><span class="mono">ace-step/ACE-Step-DAW</span></td><td>21M</td><td>React/TS + WebAudio</td><td><b>Closest to our stack.</b> Metronome/count-in, recording, render/export service → #08, #43, #70</td></tr>
+    <tr><td><span class="mono">stargatedaw/stargate</span></td><td>63M</td><td>Python/Qt</td><td><code>routing_matrix.py</code> → sends/returns + sidechain design (#24, #64)</td></tr>
+    <tr><td><span class="mono">Tracktion/tracktion_engine</span></td><td>111M</td><td>C++/JUCE</td><td>Architecture reference: follow-actions, take/comp model, warp, MPE, PDC, tempo model (#61, #45, #46, #18, #42, #27)</td></tr>
+    <tr><td><span class="mono">Ardour/ardour</span></td><td>161M</td><td>C++</td><td>Mature disk streaming, punch, playlist/region comping (#66, #07, #46)</td></tr>
+    <tr><td><span class="mono">LMMS/lmms</span></td><td>79M</td><td>C++/Qt</td><td>Piano-roll + controller-rack UI patterns (note: cited path is <code>src/gui/ControllerRackView.cpp</code>, not <code>widgets/</code>)</td></tr>
+    <tr><td><span class="mono">glenwrhodes/OpenDaw</span></td><td>7.7M</td><td>C++/Qt</td><td><code>IMPLEMENTATION_GUIDE.md</code> — concrete Tracktion transport/automation usage</td></tr>
+    <tr><td><span class="mono">anthony-liddle/soundscape</span></td><td>2.2M</td><td>TypeScript</td><td>TS undo/redo + WebAudio LFO patterns (we already have both; still a clean TS reference)</td></tr>
+  </table>
+
+  <h2>5 · Audit-integrity fixes to note</h2>
+  <ul>
+    <li><b>2 overstated "COVERED":</b> #36, #37 cite data-model fields that don't exist in <code>pianoRollStore.ts</code>.</li>
+    <li><b>"Proposed / not repo code" mislabels:</b> #06, #12, #13, #15, #41 point their proposed target at <code>editorStore.ts</code>/<code>controllerMapStore.ts</code> — files that already exist and are cited elsewhere as real evidence.</li>
+    <li><b>1 wrong OSS path:</b> LMMS #41 → <code>src/gui/ControllerRackView.cpp</code> (no <code>widgets/</code>).</li>
+    <li>Count integrity is otherwise sound (70/70, no dupes/gaps); proposed-snippet math (equal-power crossfade, quantize, PDC, loop-wrap) checked clean.</li>
+  </ul>
+
+  <div class="foot">
+    Method: 4 independent read-only sonnet auditors (covered / partial / not-evidenced / integrity), each re-verified against the current working tree; the 11 "absent" features independently re-grepped by the lead; verdicts scoped to DAW surfaces only (Chimera and dawimport excluded); 7 OSS repos shallow-cloned and cited paths confirmed. No files modified. Clones in <span class="mono">oss-refs/</span> (gitignored).
+  </div>
+</div>
+</body>
+</html>

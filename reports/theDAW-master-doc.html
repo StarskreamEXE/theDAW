@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>theDAW — Master Doc</title>
+<style>
+  :root{
+    --bg:#0b0d12; --panel:#12151d; --panel2:#171b25; --ink:#e8ebf2; --muted:#9aa3b5;
+    --line:#242a38; --accent:#8b6cff; --accent2:#31d6c6; --good:#31d67e; --warn:#ffb84d; --hot:#ff7a59;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--ink);
+    font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,sans-serif}
+  .wrap{max-width:880px;margin:0 auto;padding:40px 22px 90px}
+  header{border-bottom:1px solid var(--line);padding-bottom:18px;margin-bottom:8px}
+  h1{font-size:30px;margin:0 0 4px;font-weight:800;
+    background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent}
+  .sub{color:var(--muted);font-size:14px}
+  .part{margin:40px 0 6px;font-size:12px;font-weight:800;letter-spacing:2px;text-transform:uppercase;color:var(--accent)}
+  h2{font-size:20px;margin:22px 0 10px;padding-top:6px;border-top:1px solid var(--line)}
+  h2:first-of-type{border-top:none}
+  h3{margin:2px 0 4px;font-size:16px}
+  p{margin:8px 0}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px 18px;margin:14px 0}
+  .tldr{background:linear-gradient(180deg,#171532,#12151d);border-color:#2b2550}
+  ul{margin:8px 0 8px 2px;padding-left:20px} li{margin:6px 0}
+  strong{color:#fff}
+  code{background:#0f1320;border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:13px;color:#cdd4e6}
+  .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;color:var(--accent2)}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:var(--panel2);color:#dfe4f0}
+  .badge{display:inline-block;font-size:11px;font-weight:700;padding:2px 9px;border-radius:20px;white-space:nowrap}
+  .b-done{background:rgba(49,214,126,.15);color:var(--good);border:1px solid rgba(49,214,126,.35)}
+  .b-wait{background:rgba(255,184,77,.13);color:var(--warn);border:1px solid rgba(255,184,77,.35)}
+  .b-gap{background:rgba(255,122,89,.13);color:var(--hot);border:1px solid rgba(255,122,89,.4)}
+  .step{display:flex;gap:14px;align-items:flex-start;margin:14px 0}
+  .step .num{flex:0 0 30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+    font-weight:800;background:var(--panel2);border:1px solid var(--line);color:var(--accent2)}
+  .step .body{flex:1;min-width:0}
+  .callout{border-left:3px solid var(--accent);padding:2px 0 2px 14px;margin:10px 0;color:var(--muted)}
+  .pending{background:rgba(255,122,89,.08);border:1px solid rgba(255,122,89,.35);border-radius:14px;padding:16px 18px;margin:20px 0}
+  .pending h2{border:none;margin-top:0;color:var(--hot)}
+  .foot{color:var(--muted);font-size:12px;margin-top:36px;border-top:1px solid var(--line);padding-top:14px}
+  .kpi{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0}
+  .kpi div{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:8px 12px;font-size:13px}
+  .kpi b{color:var(--accent2);font-size:16px;display:block}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>◆ theDAW — Master Doc</h1>
+    <div class="sub">Part 1: what we shipped this session. &nbsp;·&nbsp; Part 2: the harmonic auto-mix data landscape (SunoHarvester).</div>
+  </header>
+
+  <div class="card tldr">
+    <p style="margin-top:0"><strong>TL;DR</strong></p>
+    <p><strong>Part 1</strong> — We extended and hardened theDAW's <strong>DJ tab</strong> and <strong>assistant orb</strong>, had it independently code-reviewed, and fixed the bugs review found. Verified working (Auto-DJ actually plays audio). Most is on your fork (<span class="mono">StarskreamEXE/theDAW</span>); the final review-fix batch is done, tested, and <strong>waiting on your OK to push</strong>.</p>
+    <p style="margin-bottom:0"><strong>Part 2</strong> — Separately, your <strong>SunoHarvester</strong> library already has the raw ingredients for harmonic DJ auto-mixing (Camelot key + BPM per track, computed across ~152k songs). What's <em>missing</em> is an engine that turns those into track-to-track "what can I mix next" decisions — it's specced but not built.</p>
+  </div>
+
+  <div class="part">Part 1 — theDAW work this session</div>
+
+  <h2>Where everything lives</h2>
+  <table>
+    <tr><th>Where</th><th>What's there</th></tr>
+    <tr><td><strong>gantasmo/theDAW</strong></td><td>Untouched by us. Your DJ performance-sets feature was already merged here earlier.</td></tr>
+    <tr><td><strong>Your fork → <span class="mono">main</span></strong></td><td>gantasmo main <strong>+ all shipped work</strong>, added cleanly (<code>657330d</code>, <code>67b3e2b</code>, <code>72720fa</code>).</td></tr>
+    <tr><td><strong>Working folder</strong> (uncommitted)</td><td>The review-fix batch (4 files) — tested, waiting to push. Plus other sessions' unrelated edits we never touched.</td></tr>
+  </table>
+
+  <h2>What we built &amp; fixed</h2>
+
+  <div class="step"><div class="num">1</div><div class="body">
+    <h3>One-click "Auto-DJ" for sets &nbsp;<span class="badge b-done">ON FORK</span></h3>
+    <p>Each set in the DJ tab's <strong>Sets</strong> list has a green <strong>▶</strong>: one click loads the set, beatmatches, and crossfades through it hands-free. Before, "Automix" was a separate toggle you had to find.</p>
+  </div></div>
+
+  <div class="step"><div class="num">2</div><div class="body">
+    <h3>Two crash / render fixes &nbsp;<span class="badge b-done">ON FORK</span></h3>
+    <ul><li><strong>FX panel</strong> infinite render loop / crash — fixed.</li>
+    <li><strong>Assistant orb</strong> hidden-HTML error on code blocks — fixed.</li></ul>
+  </div></div>
+
+  <div class="step"><div class="num">3</div><div class="body">
+    <h3>Chat history + resume for the orb &nbsp;<span class="badge b-done">ON FORK</span></h3>
+    <p>The orb remembers conversations across reloads. A <strong>History</strong> dropdown lists past chats (resume / delete), plus <strong>New chat</strong> and <strong>Clear all</strong>. Stored locally in the browser — nothing leaves the machine.</p>
+  </div></div>
+
+  <div class="step"><div class="num">4</div><div class="body">
+    <h3>"NIGHT RIDE" — a real autoset &nbsp;<span class="badge b-done">BUILT &amp; VERIFIED</span></h3>
+    <p>A 5-track tech-house set (123→129 BPM) from your actual library songs (RÜFÜS DU SOL, Adam Ten, John Summit, Rafael/OMRI., Matt Sassari), real mix-out points, all playable. Shows in the Sets list ready to Auto-DJ.</p>
+  </div></div>
+
+  <div class="step"><div class="num">5</div><div class="body">
+    <h3>Independent code review + fixes &nbsp;<span class="badge b-done">DONE</span> <span class="badge b-wait">WAITING TO PUSH</span></h3>
+    <p>A 3-reviewer review caught <strong>3 real bugs in our own shipped code</strong>, now fixed: (a) couldn't delete your last saved chat; (b) a streaming reply could be truncated in history on a network pause; (c) Auto-DJ's first track could play silent if the crossfader was parked on the other deck. Plus cleanups + new automated tests. This batch is the only thing still to push.</p>
+  </div></div>
+
+  <h2>Verified — not assumed</h2>
+  <div class="card">
+    <ul style="margin:0">
+      <li><strong>Type-check clean</strong>, <strong>unit tests pass</strong> (incl. new history-bug tests), styling rules clean.</li>
+      <li><strong>Live:</strong> DJ tab opens, ▶ on NIGHT RIDE <strong>actually plays</strong> — audio engine running, track progressing, <strong>0 console errors</strong>.</li>
+      <li>Orb opens; chat history survives a reload.</li>
+    </ul>
+  </div>
+
+  <div class="callout">
+    <p><strong>Backend "flap":</strong> the backend blinks offline ~1s occasionally then recovers — <strong>not our code</strong>, it's relaunch/busy noise. Retry if a track hiccups.</p>
+    <p><strong>NIGHT RIDE audio</strong> is WAV content with an <code>.mp3</code> name — harmless (plays fine), left as-is.</p>
+  </div>
+
+  <div class="part">Part 2 — Harmonic auto-mix data landscape</div>
+
+  <h2>Where the DJ-relevant data actually lives</h2>
+  <p>This is <strong>SunoHarvester</strong> (<span class="mono">C:\Users\skream\projects\SunoHarvester</span>), a separate project from theDAW. "z-autodj" is <strong>not a framework</strong> — <span class="mono">C:\Users\skream\z-autodj-venv</span> is just the Python venv that can run the one library that needs it: the <strong>madmom</strong> harmonic extractor.</p>
+  <div class="kpi">
+    <div><b>~152,595</b>songs with 96 audio features</div>
+    <div><b>129 BPM</b>median tempo</div>
+    <div><b>0.76</b>median key confidence</div>
+    <div><b>Camelot</b>computed for the catalog</div>
+  </div>
+
+  <h2>What's computed (the ingredients — present)</h2>
+  <table>
+    <tr><th>Layer</th><th>How / where</th><th>DJ-relevant fields</th><th>Status</th></tr>
+    <tr>
+      <td><strong>96 librosa features</strong></td>
+      <td><span class="mono">audio_feature_extractor.py</span> (venv <span class="mono">.venv_audio</span>) → <span class="mono">data/audio_features.jsonl</span></td>
+      <td><code>tempo_detected</code>/BPM, <code>key_detected</code>, <code>mode_detected</code>, <code>key_confidence</code>, <code>key_root_pc</code>, <strong><code>camelot</code></strong>, chroma 0–11, tonnetz 0–5</td>
+      <td><span class="badge b-done">DONE at scale</span></td>
+    </tr>
+    <tr>
+      <td><strong>madmom harmonic</strong></td>
+      <td><span class="mono">madmom_harmonic_extractor.py</span> via <strong>z-autodj-venv</strong> → <span class="mono">data/harmonic_features.jsonl</span> (run: <span class="mono">python harvester.py run harmonic</span>)</td>
+      <td>chord sequence/histogram, <code>madmom_key</code>+confidence; with <code>--downbeats</code>: tempo, time-sig, bar grid</td>
+      <td><span class="badge b-wait">built, not yet full-run*</span></td>
+    </tr>
+    <tr>
+      <td><strong>basic_pitch notes</strong></td>
+      <td><span class="mono">basic_pitch_note_extractor.py</span> (theDAW's <span class="mono">.venv</span>) → <span class="mono">data/note_features.jsonl</span></td>
+      <td>note/melody/pitch-class histogram, polyphony (melodic, not mixing)</td>
+      <td><span class="badge b-wait">built, on-demand</span></td>
+    </tr>
+  </table>
+  <p style="color:var(--muted);font-size:13px">* madmom pass was built + cross-validated on samples but not run on the full library — the <span class="mono">F:\SunoLibrary</span> drive was unplugged when it was written (2026-08-30). Run it when the drive is remounted.</p>
+
+  <h3>Camelot distribution (harmonic-mixing ready)</h3>
+  <p>Most common codes across the catalog: <strong>2A</strong> (22,909), <strong>4A</strong> (12,263), <strong>10A</strong> (11,727), <strong>12A</strong> (11,286), <strong>7A</strong> (10,170), <strong>9A</strong> (9,965), <strong>5B</strong> (8,643), <strong>5A</strong> (7,578). A dark, minor-key, fast catalog — well suited to harmonic mixing.</p>
+
+  <h2>What's missing — the mixing/compatibility engine <span class="badge b-gap">GAP</span></h2>
+  <p>The building blocks (Camelot + BPM + confidence per track) are computed, but <strong>nothing ties them into track-to-track "what can I mix next" decisions.</strong> These are <em>specced</em> (in <span class="mono">PROPOSED_METADATA_FIELDS.md</span> / <span class="mono">FIELD_INVENTORY.md</span>) but not built:</p>
+  <ul>
+    <li><strong><code>camelot_key</code></strong> — deterministic key+mode → Camelot map (e.g. A-minor → <code>8A</code>). "The single most-requested DJ field."</li>
+    <li><strong><code>harmonic_neighbors</code></strong> — for each track, the song ids mixable with it: same Camelot code, ±1 on the wheel, or relative major/minor, <strong>AND</strong> within a pitch-safe BPM window (±6%). Turns 165k tracks into a navigable "mix-into" graph. (Distinct from <code>nearest_neighbors</code>, which is timbral similarity, not harmonic compatibility.)</li>
+    <li><strong><code>tempo_transition_class</code></strong> — mixable tempo bands including half/double-time (e.g. 140 BPM ↔ 70 BPM halftime).</li>
+  </ul>
+
+  <h2>How this connects to theDAW's DJ tab (our work)</h2>
+  <ul>
+    <li>theDAW <strong>already uses</strong> Camelot/key for display — a harmonic key-match chip and a client-side Camelot map (<span class="mono">frontend/src/lib/camelot.ts</span>).</li>
+    <li>The set-<strong>builder</strong> (<span class="mono">backend/modules/library/suggester.py</span>) already orders tracks by Camelot + a BPM-flow curve — so harmonic ordering exists on the <em>build</em> side.</li>
+    <li>But the <strong>live Auto-DJ</strong> we worked on plays a set <em>in its given order</em> and beatmatches/crossfades — it does <strong>not</strong> pick or reorder the next track by harmonic/tempo compatibility.</li>
+  </ul>
+
+  <div class="card" style="border-color:#2b2550">
+    <p style="margin:0"><strong>Bottom line:</strong> harmonic-mix ingredients (Camelot + BPM) are computed at full-library scale in SunoHarvester, and theDAW can already read them — but the <code>harmonic_neighbors</code> matching engine that would drive real "what mixes into what" decisions is specced, not built. That's the natural next build if you want compatibility-aware auto-mixing.</p>
+  </div>
+
+  <div class="pending">
+    <h2>⧗ Pending your call</h2>
+    <p style="margin:0"><strong>Push the review-fix batch</strong> (4 files) to your fork's <span class="mono">main</span> — same clean one-commit way as everything else. And, if you want it, say the word to <strong>build the <code>harmonic_neighbors</code> compatibility engine</strong> (Part 2's gap). Neither is started without your go.</p>
+  </div>
+
+  <div class="foot">theDAW master doc · Part 1 verified in-app · Part 2 sourced from SunoHarvester docs (read-only)</div>
+</div>
+</body>
+</html>

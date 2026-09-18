@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>theDAW — Report Index</title>
+<style>
+  :root{--bg:#09080d;--panel:#100e16;--panel2:#15111e;--line:#2b2338;--text:#f1edf6;--muted:#a49aac;
+    --purple:#b46cff;--green:#69e6ab;--amber:#f2c36f;--red:#ff7b8e;--cyan:#6ad3ff}
+  *{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(circle at 50% -15%,#211330 0,#09080d 34%);color:var(--text);
+    font:14px/1.55 Inter,system-ui,-apple-system,Segoe UI,sans-serif}
+  .wrap{max-width:900px;margin:0 auto;padding:30px 22px 80px}
+  h1{margin:0 0 6px;font-size:24px}
+  .sub{color:var(--muted);font-size:12.5px}
+  h2{font-size:15px;margin:26px 0 6px;border-bottom:1px solid var(--line);padding-bottom:5px}
+  a{color:#c991ff;text-decoration:none}a:hover{text-decoration:underline}
+  .card{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);
+    border-radius:11px;padding:13px 16px;margin:10px 0}
+  .card h3{margin:0 0 4px;font-size:14px}
+  .card .meta{color:var(--muted);font-size:11px;font-family:ui-monospace,Consolas,monospace;margin-bottom:6px}
+  .card p{margin:5px 0;color:#d4cdda;font-size:12.5px}
+  .live{border-left:3px solid var(--green)}
+  .super{border-left:3px solid #4a4458;opacity:.72}
+  .plan{border-left:3px solid var(--cyan)}
+  .kpi{display:flex;gap:9px;flex-wrap:wrap;margin:12px 0}
+  .kpi div{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:7px 12px;font-size:12px}
+  .kpi b{font-size:17px;display:block}
+  .g{color:var(--green)}.a{color:var(--amber)}.r{color:var(--red)}.c{color:var(--cyan)}
+  code{font-family:ui-monospace,Consolas,monospace;font-size:11.5px;color:#d8c6ee;background:#0c0a12;padding:0 4px;border-radius:3px}
+  .tag{font-size:8.5px;font-weight:900;padding:2px 7px;border-radius:99px;letter-spacing:.05em;margin-left:6px;vertical-align:middle}
+  .t-live{background:var(--green);color:#042719}.t-sup{background:#4a4458;color:#cfc6dd}.t-plan{background:var(--cyan);color:#062733}
+  ul{margin:5px 0;padding-left:20px}li{margin:3px 0;font-size:12.5px;color:#d4cdda}
+  .foot{color:var(--muted);font-size:11px;margin-top:26px;border-top:1px solid var(--line);padding-top:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>◆ theDAW — Report Index</h1>
+  <div class="sub">Everything produced in this session, what each covers, and which are superseded. Generated 2026-09-15.</div>
+
+  <div class="kpi">
+    <div><b class="g">35</b>covered <span class="sub">post-catchup</span></div>
+    <div><b class="a">20</b>partial</div>
+    <div><b class="r">15</b>truly absent</div>
+    <div><b>19</b>defects found</div>
+    <div><b class="c">104</b>commits behind daniel</div>
+  </div>
+
+  <h2>Current — read these</h2>
+
+  <div class="card live">
+    <h3><a href="theDAW_70_theirs_vs_ours.html">70 Features: Their Code vs Ours</a><span class="tag t-live">CURRENT</span></h3>
+    <div class="meta">theDAW_70_theirs_vs_ours.html · rev 2</div>
+    <p>The main deliverable. All 70 DAW features with <b>our</b> implementation (file:line) beside <b>their</b> real implementation in the seven cloned OSS DAWs (file:line), the concrete gap, and the single best file to port from. Includes the 19 defects the comparison surfaced and a 12-step port plan.</p>
+    <p><b>rev 2 correction:</b> four claims rev 1 called "fabricated" are real in <code>danieljtrujillo/main</code> — the audit's stated baseline. See the banner at the top of that report.</p>
+  </div>
+
+  <div class="card plan">
+    <h3><a href="../docs/design/feature-gap-plan.md">Feature-gap plan</a><span class="tag t-plan">PLAN</span></h3>
+    <div class="meta">docs/design/feature-gap-plan.md</div>
+    <p>The executable plan: catch up to daniel first (§1, with the 18-file collision hazard and the exact isolated-worktree procedure), 19 ranked defects (§2), the 12-step port plan in dependency order with the source file for each (§3), a sequencing graph (§4), and rules for anyone executing it (§5) — including the list of audit snippets that must <i>not</i> be written because they're weaker than what we ship.</p>
+  </div>
+
+  <div class="card live">
+    <h3><a href="theDAW-in-progress.html">In Progress — this machine</a><span class="tag t-live">CURRENT</span></h3>
+    <div class="meta">theDAW-in-progress.html</div>
+    <p>Every uncommitted change in the local checkout: +2,091/−211 across 33 tracked files, 37 new files, 12 workstreams, from the live <code>git diff</code> with real line counts. Workstream 1 (our DJ Auto-DJ + orb chat-history) is the only one committed — fully pushed to your fork @ <code>ffc22d1</code>. The other 11 are other sessions' uncommitted work.</p>
+  </div>
+
+  <div class="card live">
+    <h3><a href="theDAW_70_feature_audit_with_OSS_references.html">70-Feature Source Audit</a><span class="tag t-live">SOURCE</span></h3>
+    <div class="meta">theDAW_70_feature_audit_with_OSS_references.html · not ours — the input</div>
+    <p>The original audit this work reviewed. Baseline <code>danieljtrujillo/theDAW · main</code>. Verdict after review: <b>accurate for the tree it audited.</b> Its real weaknesses are vague OSS paths, one wrong path (LMMS <code>ControllerRackView.cpp</code> is not under <code>widgets/</code>), five "PROPOSED — NOT REPO CODE" targets that point at files which already exist, and ~12 proposed snippets that are weaker than code we already ship.</p>
+  </div>
+
+  <h2>Superseded</h2>
+
+  <div class="card super">
+    <h3><a href="theDAW_audit_review_and_needs.html">Audit Review &amp; Actual Needs</a><span class="tag t-sup">SUPERSEDED</span></h3>
+    <div class="meta">theDAW_audit_review_and_needs.html → by theDAW_70_theirs_vs_ours.html</div>
+    <p>First pass: 4 sonnet auditors checked the audit against our tree only, without reading the OSS code. Reached 44/15/11 and wrongly counted Chimera and the Ableton importer as DAW coverage. Kept for the audit-integrity findings; the tallies are wrong.</p>
+  </div>
+
+  <div class="card super">
+    <h3><a href="theDAW-work-report.html">Work Report — by agent</a><span class="tag t-sup">SUPERSEDED</span></h3>
+    <div class="meta">theDAW-work-report.html</div>
+    <p>Split of DJ/orb work between this session and the other agent. Folded into the in-progress report.</p>
+  </div>
+
+  <div class="card super">
+    <h3><a href="theDAW-master-doc.html">Master Doc</a><span class="tag t-sup">SUPERSEDED</span></h3>
+    <div class="meta">theDAW-master-doc.html</div>
+    <p>DJ performance-set architecture and Z-AutoDJ bridge overview.</p>
+  </div>
+
+  <div class="card super">
+    <h3><a href="theDAW-session-report.html">Session Report</a><span class="tag t-sup">SUPERSEDED</span></h3>
+    <div class="meta">theDAW-session-report.html · .md</div>
+    <p>The original DJ Auto-DJ + orb chat-history session summary.</p>
+  </div>
+
+  <h2>Method</h2>
+  <ul>
+    <li><b>Reference corpus:</b> 7 OSS DAWs shallow-cloned into <code>oss-refs/</code> (gitignored, ~445 MB) — Tracktion Engine, Ardour, LMMS, OpenDaw, ACE-Step-DAW, Soundscape, Stargate. Every audit reference is a real repo.</li>
+    <li><b>Agents:</b> 4 sonnet auditors (first pass) + 11 read-only Opus investigators (7 domain passes, 4 THEIRS deep-reads). ~60 OSS source files read line-by-line.</li>
+    <li><b>Lead verification:</b> the 15 absent features re-grepped by hand; #32 and #67 THEIRS claims re-opened directly; the daniel-baseline correction verified against <code>danieljtrujillo/main:frontend/src/state/pianoRollStore.ts</code>.</li>
+    <li><b>Scope:</b> DAW surfaces only. Chimera, dawimport, VST-Foundry, Suno and venvs never counted as coverage.</li>
+    <li><b>Writes:</b> none. No theDAW source file was modified by this analysis.</li>
+  </ul>
+
+  <div class="foot">theDAW · report index · all paths relative to <code>C:\Users\skream\projects\theDAW\reports\</code></div>
+</div>
+</body>
+</html>
