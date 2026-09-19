@@ -20,7 +20,9 @@ import asyncio
 import errno
 import logging
 import os
+import socket
 import subprocess
+import sys
 from typing import Awaitable, Callable, Optional
 
 from backend.core.adb import resolve_adb_path
@@ -67,6 +69,10 @@ class _State:
     started: bool = False
     starting: bool = False
     port_in_use: bool = False
+    # The port the listener is really bound to on this machine. Differs from
+    # _port() (the one the headset dials) when another program already serves
+    # that port number here; ``adb reverse`` maps one onto the other.
+    host_port: Optional[int] = None
 
 
 _s = _State()
@@ -158,13 +164,78 @@ async def _handle_quest(
 # ---- lifecycle ---------------------------------------------------------------
 
 
-def _run_adb_reverse(port: int) -> bool:
+# Entry points that mean "the process holding the port is another theDAW backend".
+_THEDAW_ENTRY_POINTS = (
+    "backend.run",
+    "backend._supervisor",
+    "backend._devstack",
+    "backend.server",
+)
+
+
+def _port_holders(port: int) -> tuple[bool, bool]:
+    """``(another theDAW holds it, another program holds it)`` for ``port``, on ANY
+    local address. Both False when the port is free or the table is unreadable."""
+    from backend.ports import holders
+
+    thedaw = foreign = False
+    for holder in holders([port]):
+        if holder.pid == os.getpid():
+            continue
+        if any(entry in holder.cmdline for entry in _THEDAW_ENTRY_POINTS):
+            thedaw = True
+        else:
+            foreign = True
+    return thedaw, foreign
+
+
+def _port_number_is_free(port: int) -> bool:
+    """Nobody listens on this port NUMBER, on any IPv4 address.
+
+    Windows lets ``127.0.0.1:P`` be bound while another program holds
+    ``0.0.0.0:P`` — no EADDRINUSE, with or without SO_EXCLUSIVEADDRUSE — and
+    then hands every loopback connection to the more specific bind. That is how
+    this bridge once took the localhost traffic of a server that was already
+    listening on 8765 on all interfaces: its clients reached our raw TCP
+    listener and saw their own server as dead. So the wildcard address is
+    probed as well as ours; a bind to an address somebody holds does fail.
+    """
+    for host in ("0.0.0.0", "127.0.0.1"):
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            if sys.platform == "win32":
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            probe.bind((host, port))
+        except OSError:
+            return False
+        finally:
+            probe.close()
+    return True
+
+
+def _bind_listener(port: int) -> socket.socket:
+    """A bound socket on 127.0.0.1:``port`` (0 = any free port). Exclusive on
+    Windows, so no later program can bind the same address over it."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if sys.platform == "win32":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        sock.bind(("127.0.0.1", port))
+    except OSError:
+        sock.close()
+        raise
+    return sock
+
+
+def _run_adb_reverse(port: int, host_port: Optional[int] = None) -> bool:
+    """Map the headset's ``port`` onto this machine's ``host_port`` (same number
+    when omitted)."""
     adb = _adb_path()
     if not adb:
         return False
     try:
         subprocess.run(
-            [adb, "reverse", f"tcp:{port}", f"tcp:{port}"],
+            [adb, "reverse", f"tcp:{port}", f"tcp:{host_port or port}"],
             capture_output=True,
             timeout=10,
             check=True,
@@ -182,7 +253,9 @@ async def reattach_adb() -> bool:
     port AND the backend HTTP port (control-bus relay) in one pass; only the
     MIDI port decides the reported ok state, matching what this bridge owns."""
     loop = asyncio.get_running_loop()
-    _s.adb_reverse_ok = await loop.run_in_executor(None, _run_adb_reverse, _port())
+    _s.adb_reverse_ok = await loop.run_in_executor(
+        None, _run_adb_reverse, _port(), _s.host_port
+    )
     await loop.run_in_executor(None, _run_adb_reverse, _http_port())
     return _s.adb_reverse_ok
 
@@ -194,32 +267,52 @@ async def ensure_started() -> None:
     _s.starting = True
     try:
         port = _port()
+        thedaw_holds, foreign_holds = _port_holders(port)
+        if thedaw_holds:
+            # A second theDAW instance or a --reload leftover already owns the
+            # listener. Treat it as started so we don't re-attempt the bind (and
+            # re-log) on every WebSocket connect; the existing listener relays
+            # the headset.
+            await reattach_adb()
+            _s.started = True
+            _s.port_in_use = True
+            log.info(
+                "questmidi: port %d already in use — an existing bridge "
+                "owns it; not starting a second listener",
+                port,
+            )
+            return
+        listener: Optional[socket.socket] = None
+        if not foreign_holds and _port_number_is_free(port):
+            try:
+                listener = _bind_listener(port)
+            except OSError as e:
+                if e.errno not in (errno.EADDRINUSE, errno.EACCES, 10048, 10013):
+                    raise
+        if listener is None:
+            # Another program serves this port number. Never sit beside it: take
+            # any free port here and let adb map the headset's port onto it.
+            listener = _bind_listener(0)
+        _s.host_port = listener.getsockname()[1]
+        _s.server = await asyncio.start_server(_handle_quest, sock=listener)
         await reattach_adb()
-        try:
-            _s.server = await asyncio.start_server(_handle_quest, "127.0.0.1", port)
-        except OSError as e:
-            # EADDRINUSE (WSAEADDRINUSE 10048 on Windows): the port is already
-            # bound — almost always a second theDAW instance or a --reload
-            # leftover that still owns the listener. Treat it as started so we
-            # don't re-attempt the bind (and re-log) on every WebSocket connect;
-            # the existing listener relays the headset.
-            if e.errno in (errno.EADDRINUSE, 10048):
-                _s.started = True
-                _s.port_in_use = True
-                log.info(
-                    "questmidi: port %d already in use — an existing bridge "
-                    "owns it; not starting a second listener",
-                    port,
-                )
-                return
-            raise
         _s.started = True
         _s.port_in_use = False
-        log.info(
-            "questmidi: listening on 127.0.0.1:%d (adb reverse %s)",
-            port,
-            "ok" if _s.adb_reverse_ok else "not set",
-        )
+        if _s.host_port != port:
+            log.info(
+                "questmidi: port %d belongs to another program — listening on "
+                "127.0.0.1:%d instead; the headset still dials %d (adb reverse %s)",
+                port,
+                _s.host_port,
+                port,
+                "ok" if _s.adb_reverse_ok else "not set",
+            )
+        else:
+            log.info(
+                "questmidi: listening on 127.0.0.1:%d (adb reverse %s)",
+                port,
+                "ok" if _s.adb_reverse_ok else "not set",
+            )
     except Exception as e:  # noqa: BLE001
         log.warning("questmidi: failed to start: %s", e)
     finally:
@@ -235,6 +328,7 @@ async def stop() -> None:
             pass
     _s.server = None
     _s.started = False
+    _s.host_port = None
     if _s.quest_writer is not None:
         try:
             _s.quest_writer.close()
@@ -248,6 +342,7 @@ def status() -> dict:
     return {
         "started": _s.started,
         "port": _port(),
+        "host_port": _s.host_port,
         "port_in_use": _s.port_in_use,
         "adb_path": _adb_path(),
         "adb_reverse_ok": _s.adb_reverse_ok,
