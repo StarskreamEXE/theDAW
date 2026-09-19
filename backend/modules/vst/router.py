@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -38,7 +39,7 @@ from backend.modules.vst.host import (
     process_with_plugin,
     list_builtin_effects,
 )
-from backend.modules.vst.live_host import HostLocator
+from backend.modules.vst.live_host import HostLocator, _os_reason
 from backend.lib import paths
 from backend.lib.launch_token import child_env
 
@@ -317,6 +318,70 @@ RENDER_EXIT_MEANINGS: dict[int, str] = {
 #: request open forever.
 RENDER_TIMEOUT_SECONDS = 300.0
 
+#: After a timed-out render is killed, how long to wait for it to actually
+#: exit before giving up on reading its pipes. Bounded on purpose: the
+#: unbounded wait ``subprocess.run`` performs after a post-timeout kill is
+#: exactly what could stall the request (review R5 nit #10).
+RENDER_KILL_WAIT_SECONDS = 5.0
+
+#: Bytes read per chunk while streaming an upload past its cap check.
+_UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
+
+#: Default cap on a thedaw render's uploaded audio; override with
+#: THEDAW_VST_RENDER_MAX_BYTES (review R5 item #7 — uploads had no cap at all).
+_DEFAULT_RENDER_MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+
+#: raw_state is a small serialized preset, not a rendered file; a caller
+#: sending more than this is misusing the field, not tuning ops, so there is
+#: no env override.
+_RENDER_MAX_RAW_STATE_CHARS = 64 * 1024 * 1024
+
+
+class _UploadTooLarge(Exception):
+    """Raised internally when a capped upload read exceeds its byte limit."""
+
+
+def _render_max_upload_bytes() -> int:
+    """``THEDAW_VST_RENDER_MAX_BYTES``, or the 2 GiB default if unset/invalid."""
+    raw = os.environ.get("THEDAW_VST_RENDER_MAX_BYTES", "")
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    return value if value > 0 else _DEFAULT_RENDER_MAX_UPLOAD_BYTES
+
+
+async def _read_upload_capped(upload: UploadFile, max_bytes: int) -> bytes:
+    """Read ``upload`` in chunks, never buffering past ``max_bytes``.
+
+    Stops at the first chunk that pushes the running total over the cap, so
+    an oversized upload cannot hold the request (or its memory) open for the
+    full transfer (review R5 item #7).
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await upload.read(_UPLOAD_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise _UploadTooLarge(total)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _strip_render_paths(text: str, paths_used: list[Path]) -> str:
+    """Reduce any of this render's own temp-file paths to just their name.
+
+    The host only ever learns these paths because they were put on its argv;
+    if it echoes one back in a warning, the client should see the file name,
+    never the server's directory layout (review R5 item #11).
+    """
+    for path in paths_used:
+        text = text.replace(str(path), path.name)
+    return text
+
 
 def _render_log_tail(stderr: str, limit: int = 600) -> str:
     lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
@@ -354,10 +419,12 @@ def _render_with_thedaw_host(
 ) -> bytes:
     """Render ``audio_bytes`` through ``thedaw-vst-host --render``.
 
-    Returns the rendered WAV bytes. Every failure raises ``HTTPException``;
-    there is deliberately no pedalboard fallback — a caller that asked for our
-    host and silently got a different renderer would be shipping audio it never
-    heard.
+    Synchronous end to end (spawn, wait, cleanup): the caller offloads this
+    whole call with ``asyncio.to_thread`` so the up-to-``RENDER_TIMEOUT_SECONDS``
+    wait never blocks the event loop. Returns the rendered WAV bytes. Every
+    failure raises ``HTTPException``; there is deliberately no pedalboard
+    fallback — a caller that asked for our host and silently got a different
+    renderer would be shipping audio it never heard.
 
     Raises:
         HTTPException: 503 when the host binary is absent (with the locator's
@@ -374,11 +441,15 @@ def _render_with_thedaw_host(
         work = Path(tempfile.mkdtemp(prefix="render-", dir=str(_RENDER_DIR)))
     except OSError as e:
         raise HTTPException(
-            status_code=500, detail=f"Could not create the render directory: {e}"
+            status_code=500,
+            detail=f"Could not create the render directory: {_os_reason(e)}",
         )
 
     in_path = work / "in.wav"
     out_path = work / "out.wav"
+    #: Every path the host was handed on its argv — the only paths it could
+    #: possibly echo back in a warning (see ``_strip_render_paths``).
+    temp_paths = [in_path, out_path]
     try:
         try:
             in_path.write_bytes(audio_bytes)
@@ -400,27 +471,50 @@ def _render_with_thedaw_host(
             if state_blob:
                 state_path = work / "state.bin"
                 state_path.write_bytes(state_blob)
+                temp_paths.append(state_path)
                 cmd += ["--state-file", str(state_path)]
             if param_map:
                 params_path = work / "params.json"
                 params_path.write_text(json.dumps(param_map), encoding="utf-8")
+                temp_paths.append(params_path)
                 cmd += ["--params-json", str(params_path)]
         except OSError as e:
             raise HTTPException(
-                status_code=500, detail=f"Could not stage the render input: {e}"
+                status_code=500,
+                detail=f"Could not stage the render input: {_os_reason(e)}",
             )
 
         try:
-            done = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
                 cwd=str(paths.PROJECT_ROOT),
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=RENDER_TIMEOUT_SECONDS,
                 creationflags=_NO_WINDOW,
                 env=child_env(),
             )
+        except OSError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Could not start the VST host: {_os_reason(e)}",
+            )
+
+        try:
+            stdout, stderr = proc.communicate(timeout=RENDER_TIMEOUT_SECONDS)
+            returncode = proc.returncode
         except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                # A bounded wait, never the unbounded one subprocess.run does
+                # after a post-timeout kill (review R5 nit #10). If the host
+                # still won't die, stop waiting rather than stall the request.
+                proc.communicate(timeout=RENDER_KILL_WAIT_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
             raise HTTPException(
                 status_code=502,
                 detail=(
@@ -428,13 +522,9 @@ def _render_with_thedaw_host(
                     f"{RENDER_TIMEOUT_SECONDS:.0f}s and was stopped."
                 ),
             )
-        except OSError as e:
-            raise HTTPException(
-                status_code=502, detail=f"Could not start the VST host: {e}"
-            )
 
-        if done.returncode != 0:
-            code = int(done.returncode)
+        if returncode != 0:
+            code = int(returncode)
             meaning = RENDER_EXIT_MEANINGS.get(
                 code, f"the host exited with code {code}"
             )
@@ -442,7 +532,7 @@ def _render_with_thedaw_host(
                 status_code=502,
                 detail=(
                     f"The VST host could not render this file (exit code {code}): "
-                    f"{meaning}. " + _render_log_tail(done.stderr)
+                    f"{meaning}. " + _render_log_tail(stderr)
                 ),
             )
 
@@ -453,10 +543,12 @@ def _render_with_thedaw_host(
                 status_code=502,
                 detail=(
                     f"The VST host reported success but its output could not be "
-                    f"read ({e}). " + _render_log_tail(done.stderr)
+                    f"read ({_os_reason(e)}). " + _render_log_tail(stderr)
                 ),
             )
-        warnings.extend(_render_report_warnings(done.stdout))
+        warnings.extend(
+            _strip_render_paths(w, temp_paths) for w in _render_report_warnings(stdout)
+        )
         return rendered
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -502,6 +594,14 @@ async def process_file(
         host_warnings: list[str] = []
         state_blob: bytes | None = None
         if raw_state:
+            if len(raw_state) > _RENDER_MAX_RAW_STATE_CHARS:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"raw_state exceeds the {_RENDER_MAX_RAW_STATE_CHARS} "
+                        "byte limit for a thedaw render."
+                    ),
+                )
             try:
                 state_blob = base64.b64decode(raw_state, validate=True)
             except (binascii.Error, ValueError) as e:
@@ -520,14 +620,31 @@ async def process_file(
                 f"params was not valid JSON ({e}); no parameters applied"
             )
             host_params = {}
+        max_upload_bytes = _render_max_upload_bytes()
         try:
-            uploaded = await audio.read()
+            uploaded = await _read_upload_capped(audio, max_upload_bytes)
+        except _UploadTooLarge:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"The uploaded audio exceeds the {max_upload_bytes} byte "
+                    "limit for a thedaw render."
+                ),
+            )
         except Exception as e:
             raise HTTPException(
                 status_code=400, detail=f"Could not read uploaded audio: {e}"
             )
-        rendered = _render_with_thedaw_host(
-            plugin_path, plugin_name, uploaded, state_blob, host_params, host_warnings
+        # Only the spawn+wait needs a thread — everything else here is small,
+        # local file I/O that would not meaningfully block the event loop.
+        rendered = await asyncio.to_thread(
+            _render_with_thedaw_host,
+            plugin_path,
+            plugin_name,
+            uploaded,
+            state_blob,
+            host_params,
+            host_warnings,
         )
         host_headers: dict[str, str] = {}
         if host_warnings:

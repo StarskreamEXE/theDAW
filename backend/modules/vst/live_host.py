@@ -28,10 +28,30 @@ section: the cap check, the per-chain-entry idempotency check, the ``Popen``
 and the wait for the host's ``listening`` line. Releasing it between the check
 and the insert is exactly how you get two hosts for one chain entry (or
 ``max_sessions + 1`` of them): both callers pass the check, both spawn, and the
-loser's process leaks untracked. Nothing else blocks while holding it — the
-``DELETE`` path pops the session under the lock and does its waiting outside,
-and the stdout pump threads never take the lock at all (they own only their own
-session's log handle), so a wedged host cannot deadlock the manager.
+loser's process leaks untracked. A plugin swap holds it too, not only a fresh
+spawn: stopping the superseded host and waiting for it to exit (bounded by
+``shutdown_timeout``) happens under the same lock as the new host's spawn,
+because the stop and the respawn are one operation — see ``create()``. The
+``DELETE`` path is the one that does NOT do this: it pops the session under
+the lock and waits on the process outside it, and the stdout pump threads
+never take the lock at all (they own only their own session's log handle), so
+a wedged host cannot deadlock the manager. The periodic reaper below takes the
+lock on every tick too, but only to poll already-exited processes and prune
+expired ones — it never waits on one.
+
+Reaping
+-------
+A crashed session is only noticed, and a dead one only forgotten, when
+something calls ``reap()`` — so a manager backing a quiet chain would sit on a
+crashed host and an undeletable directory forever without a background sweep.
+The sweep is a daemon ``threading.Timer`` that the first session to exist
+starts lazily; it reschedules itself every ``reap_interval`` seconds for as
+long as any session — alive, or dead within ``DEAD_SESSION_TTL`` — remains,
+and stops itself once the manager is empty rather than ticking forever.
+``kill_all`` also cancels it directly, so no timer outlives the sessions it
+watches. A session directory ``shutil.rmtree`` could not fully clear (a file
+still open on Windows, say) is retried on the next sweep instead of being
+abandoned.
 
 Pipes
 -----
@@ -40,6 +60,15 @@ process, not just until the ``listening`` line: a host that keeps logging into
 a pipe nobody reads blocks in ``write()`` once the OS buffer fills (~64 KiB),
 which looks exactly like a hung plugin. Everything the pump reads is appended
 to the session log. ``stderr`` is handed the log file directly.
+
+Logs
+----
+Three writers into one file is a Windows hazard, so a session has two log
+files, not one: the pump above and the redirected ``stderr`` both append to
+``<session>/host.log``, while the host's OWN ``--log`` output — its native
+diagnostics, not the wire protocol carried on stdout — goes to the separate
+``<session>/host-native.log``. ``LiveSession.log_tail()`` reads both and
+reports the native lines first.
 
 Privacy
 -------
@@ -100,6 +129,8 @@ MAX_SESSIONS_ENV_VAR = "THEDAW_VST_LIVE_MAX_SESSIONS"
 DEFAULT_MAX_SESSIONS = 24
 DEFAULT_SPAWN_TIMEOUT = 30.0
 DEFAULT_SHUTDOWN_TIMEOUT = 5.0
+#: How often the background sweep calls ``reap()`` while any session exists.
+DEFAULT_REAP_INTERVAL = 60.0
 #: How long a dead session stays queryable so the frontend can pull its last
 #: state and log tail back out and recover the sound.
 DEAD_SESSION_TTL = 600.0
@@ -485,6 +516,7 @@ class LiveSession:
     channels: int
     dir: Path
     log_path: Path
+    native_log_path: Path
     state_path: Path
     argv: list[str]
     proc: subprocess.Popen
@@ -512,7 +544,17 @@ class LiveSession:
         return Path(self.plugin_path).name
 
     def log_tail(self, limit: int = LOG_TAIL_LINES) -> list[str]:
-        return _tail_lines(self.log_path, limit)
+        """The tail of both this session's log files, the host's own first.
+
+        The host's ``--log`` output (its native diagnostics) and this
+        backend's capture of its stdout/stderr are two separate files — see
+        the module docstring's "Logs" section — so this reads both, each
+        independently capped at ``limit`` so a chatty pump can never crowd
+        the host's own diagnostics out entirely.
+        """
+        return _tail_lines(self.native_log_path, limit) + _tail_lines(
+            self.log_path, limit
+        )
 
     def to_dict(self, log_tail_lines: int = LOG_TAIL_LINES) -> dict[str, Any]:
         """The session as the API reports it. Never carries ``raw_state``."""
@@ -595,6 +637,7 @@ class LiveSessionManager:
         max_sessions: Optional[int] = None,
         spawn_timeout: float = DEFAULT_SPAWN_TIMEOUT,
         shutdown_timeout: float = DEFAULT_SHUTDOWN_TIMEOUT,
+        reap_interval: float = DEFAULT_REAP_INTERVAL,
     ) -> None:
         self.locator = locator or HostLocator()
         # Sibling of the editor path's data_path("vst_presets").
@@ -607,9 +650,16 @@ class LiveSessionManager:
         )
         self.spawn_timeout = float(spawn_timeout)
         self.shutdown_timeout = float(shutdown_timeout)
+        self.reap_interval = float(reap_interval)
         # THE manager lock. See the module docstring for why it spans the spawn.
         self._lock = threading.RLock()
         self._sessions: dict[str, LiveSession] = {}
+        # Directories a sweep's ``shutil.rmtree`` could not fully clear, so the
+        # next sweep retries them instead of leaving them behind forever.
+        self._pending_removal: set[Path] = set()
+        # The lazily started periodic sweep — see the module docstring's
+        # "Reaping" section.
+        self._reap_timer: Optional[threading.Timer] = None
 
     # -- queries ---------------------------------------------------------
 
@@ -653,6 +703,9 @@ class LiveSessionManager:
             raise LiveHostError(400, "chain_entry_id is required")
         plugin = _validate_plugin(plugin_path)
         _validate_audio(sample_rate, block_size, channels)
+        # "" and omitted both mean "no name" — normalised once, here, so the
+        # swap comparison below and the spawn argv both see the same value.
+        plugin_name = (plugin_name or "").strip() or None
         state_bytes = _decode_raw_state(raw_state)
 
         host = self.locator.resolve()
@@ -724,6 +777,7 @@ class LiveSessionManager:
         session_id = uuid.uuid4().hex[:16]
         session_dir = self.root / session_id
         log_path = session_dir / "host.log"
+        native_log_path = session_dir / "host-native.log"
         state_path = session_dir / "state.bin"
         try:
             session_dir.mkdir(parents=True, exist_ok=True)
@@ -762,8 +816,11 @@ class LiveSessionManager:
             # that never reaches the lifespan shutdown hook.
             "--parent-pid",
             str(os.getpid()),
+            # The host's OWN log, not the wire protocol on stdout: a separate
+            # file from host.log (stdout pump + stderr) so the two never share
+            # one file — see the module docstring's "Logs" section.
             "--log",
-            str(log_path),
+            str(native_log_path),
         ]
 
         started_at = time.time()
@@ -791,7 +848,8 @@ class LiveSessionManager:
             # directory that still holds an open file.
             _close_quietly(log_handle)
             self._archive_log(session_id, log_path)
-            _remove_tree(session_dir)
+            if not _remove_tree(session_dir):
+                self._note_removal_failure(session_dir)
             raise LiveHostError(
                 503, f"Could not start the live VST host: {_os_reason(exc)}"
             ) from exc
@@ -814,7 +872,8 @@ class LiveSessionManager:
         if failure is not None:
             _close_quietly(proc.stdin)
             self._archive_log(session_id, log_path)
-            _remove_tree(session_dir)
+            if not _remove_tree(session_dir):
+                self._note_removal_failure(session_dir)
             raise failure
 
         session = LiveSession(
@@ -827,6 +886,7 @@ class LiveSessionManager:
             channels=channels,
             dir=session_dir,
             log_path=log_path,
+            native_log_path=native_log_path,
             state_path=state_path,
             argv=argv,
             proc=proc,
@@ -835,6 +895,7 @@ class LiveSessionManager:
             protocol=box.get("protocol", PROTOCOL),
         )
         self._sessions[session_id] = session
+        self._ensure_reap_timer_locked()
         log.info(
             "vst.live: session %s up on port %s (pid %s) for chain entry %s",
             session_id,
@@ -931,7 +992,8 @@ class LiveSessionManager:
             "log_tail": session.log_tail(),
         }
         self._archive_log(session.session_id, session.log_path)
-        _remove_tree(session.dir)
+        if not _remove_tree(session.dir):
+            self._note_removal_failure(session.dir)
         return result
 
     def kill_all(self) -> None:
@@ -944,6 +1006,7 @@ class LiveSessionManager:
         with self._lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
+            self._cancel_reap_timer_locked()
         if not sessions:
             return
         for session in sessions:
@@ -976,6 +1039,7 @@ class LiveSessionManager:
             self._reap_locked()
 
     def _reap_locked(self) -> None:
+        self._retry_pending_removals_locked()
         now = time.time()
         for session in list(self._sessions.values()):
             if session.alive:
@@ -1001,7 +1065,53 @@ class LiveSessionManager:
             ):
                 self._sessions.pop(session.session_id, None)
                 self._archive_log(session.session_id, session.log_path)
-                _remove_tree(session.dir)
+                if not _remove_tree(session.dir):
+                    self._note_removal_failure(session.dir)
+
+    def _retry_pending_removals_locked(self) -> None:
+        """Directories a previous sweep could not clear get another try here."""
+        if not self._pending_removal:
+            return
+        for directory in list(self._pending_removal):
+            if _remove_tree(directory):
+                self._pending_removal.discard(directory)
+
+    def _note_removal_failure(self, directory: Path) -> None:
+        """Track a directory ``_remove_tree`` could not fully clear so the
+        next sweep retries it instead of it being left behind forever.
+        """
+        with self._lock:
+            self._pending_removal.add(directory)
+
+    # -- periodic sweep ----------------------------------------------------
+
+    def _ensure_reap_timer_locked(self) -> None:
+        """Lazily start the sweep the first time a session exists."""
+        if self._reap_timer is None:
+            self._start_reap_timer_locked()
+
+    def _start_reap_timer_locked(self) -> None:
+        timer = threading.Timer(self.reap_interval, self._reap_tick)
+        timer.daemon = True
+        self._reap_timer = timer
+        timer.start()
+
+    def _cancel_reap_timer_locked(self) -> None:
+        if self._reap_timer is not None:
+            self._reap_timer.cancel()
+            self._reap_timer = None
+
+    def _reap_tick(self) -> None:
+        """One sweep. Reschedules itself, or stops once nothing remains."""
+        with self._lock:
+            try:
+                self._reap_locked()
+            except Exception:  # noqa: BLE001 — a background sweep must never die
+                log.debug("vst.live: periodic reap failed", exc_info=True)
+            if self._sessions:
+                self._start_reap_timer_locked()
+            else:
+                self._reap_timer = None
 
     # -- logs ------------------------------------------------------------
 
@@ -1045,11 +1155,13 @@ def _request_shutdown(proc: subprocess.Popen) -> None:
         pass
 
 
-def _remove_tree(directory: Path) -> None:
+def _remove_tree(directory: Path) -> bool:
+    """Best-effort removal. Returns whether ``directory`` is actually gone."""
     try:
         shutil.rmtree(directory, ignore_errors=True)
     except OSError:
         pass
+    return not directory.exists()
 
 
 def _log_suffix(log_path: Path) -> str:

@@ -65,6 +65,17 @@ def _allow_list() -> list[str]:
     return [entry for entry in raw.split(os.pathsep) if entry.strip()]
 
 
+def _run_probe_raw(probe: Path, *args: str) -> subprocess.CompletedProcess:
+    """Run the probe and return the raw ``CompletedProcess`` (stdout, stderr, exit code)."""
+    return subprocess.run(
+        [str(probe), *args],
+        capture_output=True,
+        text=True,
+        timeout=PROBE_TIMEOUT_SECONDS,
+        cwd=str(REPO_ROOT),
+    )
+
+
 def _run_probe(probe: Path, *args: str) -> tuple[int, dict]:
     """Run the probe and return ``(exit code, parsed report)``.
 
@@ -72,13 +83,7 @@ def _run_probe(probe: Path, *args: str) -> tuple[int, dict]:
     teardown notice), so the report is the FIRST line and anything after it is
     the plugin's noise, not ours.
     """
-    completed = subprocess.run(
-        [str(probe), *args],
-        capture_output=True,
-        text=True,
-        timeout=PROBE_TIMEOUT_SECONDS,
-        cwd=str(REPO_ROOT),
-    )
+    completed = _run_probe_raw(probe, *args)
     first_line = completed.stdout.strip().splitlines()
     if not first_line:
         return completed.returncode, {}
@@ -401,3 +406,140 @@ def test_probe_selftest_pins_the_codec_to_the_same_vectors(probe: Path):
     assert code == 0, report
     assert report.get("ok") is True, report.get("error")
     assert report.get("selftest") == "state_codec"
+
+
+# --------------------------------------------------------------------------------------
+# --set-param argument validation.
+#
+# These are pure argument-shape checks: they fail during parsing, before any plugin path is
+# even required, so they run wherever the probe binary is built -- no THEDAW_TEST_VST3 needed.
+# --------------------------------------------------------------------------------------
+
+
+def test_set_param_needs_a_value(probe: Path):
+    completed = _run_probe_raw(probe, "--set-param")
+    assert completed.returncode == 2, completed.stdout
+    assert "--set-param" in completed.stderr
+
+
+def test_set_param_rejects_a_pair_with_no_equals_sign(probe: Path):
+    completed = _run_probe_raw(probe, "--set-param", "3")
+    assert completed.returncode == 2, completed.stdout
+    assert completed.stderr.strip()
+
+
+def test_set_param_rejects_a_pair_with_two_equals_signs(probe: Path):
+    completed = _run_probe_raw(probe, "--set-param", "3=0.5=0.2")
+    assert completed.returncode == 2, completed.stdout
+    assert completed.stderr.strip()
+
+
+def test_set_param_rejects_a_non_numeric_index_or_id(probe: Path):
+    completed = _run_probe_raw(probe, "--set-param", "abc=0.5")
+    assert completed.returncode == 2, completed.stdout
+    assert completed.stderr.strip()
+
+
+def test_set_param_rejects_a_negative_index_or_id(probe: Path):
+    completed = _run_probe_raw(probe, "--set-param", "-1=0.5")
+    assert completed.returncode == 2, completed.stdout
+    assert completed.stderr.strip()
+
+
+def test_set_param_rejects_a_non_numeric_value(probe: Path):
+    completed = _run_probe_raw(probe, "--set-param", "0=abc")
+    assert completed.returncode == 2, completed.stdout
+    assert completed.stderr.strip()
+
+
+def test_set_param_rejects_a_value_with_trailing_garbage(probe: Path):
+    """A partially-numeric value must not be silently truncated and accepted.
+
+    ``std::stod`` happily parses the numeric prefix of "0.5abc" and reports how much
+    of the string it consumed; a parser that only checks *that something* was
+    consumed (rather than the *whole* value part) accepts this pair. Asserting the
+    "--set-param" message specifically (not just any exit-2 stderr) is what catches
+    that: on the bug, parsing wrongly succeeds and the run instead dies later on a
+    missing --list/--load/--selftest, which is also exit 2 but names none of them.
+    """
+    completed = _run_probe_raw(probe, "--set-param", "0=0.5abc")
+    assert completed.returncode == 2, completed.stdout
+    assert "--set-param" in completed.stderr, completed.stderr
+
+
+def test_set_param_rejects_a_value_above_one(probe: Path):
+    completed = _run_probe_raw(probe, "--set-param", "0=1.5")
+    assert completed.returncode == 2, completed.stdout
+    assert completed.stderr.strip()
+
+
+def test_set_param_rejects_a_negative_value(probe: Path):
+    completed = _run_probe_raw(probe, "--set-param", "0=-0.1")
+    assert completed.returncode == 2, completed.stdout
+    assert completed.stderr.strip()
+
+
+# --------------------------------------------------------------------------------------
+# --set-param against a real plugin: needs THEDAW_TEST_VST3, same as the rest of the file.
+# --------------------------------------------------------------------------------------
+
+
+def test_set_param_rejects_an_unknown_id_or_index(probe: Path, plugin_path: str):
+    completed = _run_probe_raw(
+        probe, "--load", plugin_path, "--set-param", "999999999=0.5"
+    )
+    assert completed.returncode == 2, completed.stdout
+    assert completed.stderr.strip()
+
+
+def test_set_param_applied_value_survives_a_state_round_trip(
+    probe: Path, plugin_path: str, tmp_path: Path
+):
+    """The whole point of --set-param: prove a state captured with a non-default value
+
+    restores that value, not the plugin's default. Picks a continuous automatable parameter
+    so the target value is not quantised away by a stepped/boolean control.
+    """
+    code, report = _run_probe(probe, "--load", plugin_path)
+    assert code == 0, report
+    candidates = [p for p in report["params"] if p["automatable"] and not p["discrete"]]
+    if not candidates:
+        pytest.skip(
+            "plugin exposes no continuous automatable parameter to test against"
+        )
+    target = candidates[0]
+    # Clearly away from the default so the round trip cannot pass by accident.
+    new_value = 0.15 if abs(target["default"] - 0.15) > 0.05 else 0.85
+
+    captured = tmp_path / "set_param_state.bin"
+    code, report = _run_probe(
+        probe,
+        "--load",
+        plugin_path,
+        "--set-param",
+        f"{target['index']}={new_value}",
+        "--state-out",
+        str(captured),
+    )
+    assert code == 0, report
+    applied = report["applied_params"]
+    assert len(applied) == 1
+    assert applied[0]["index"] == target["index"]
+    assert applied[0]["id"] == target["id"]
+    assert applied[0]["requested"] == pytest.approx(new_value, abs=1e-3)
+    assert applied[0]["readback"] == pytest.approx(new_value, abs=1e-3)
+    # The dump in the SAME run already reflects the applied value, not the default.
+    dumped = next(p for p in report["params"] if p["index"] == target["index"])
+    assert dumped["value"] == pytest.approx(new_value, abs=1e-3)
+
+    restored_code, restored_report = _run_probe(
+        probe, "--load", plugin_path, "--state-in", str(captured)
+    )
+    assert restored_code == 0, restored_report
+    assert restored_report["state_in"]["applied"] is True, restored_report["state_in"][
+        "error"
+    ]
+    restored_param = next(
+        p for p in restored_report["params"] if p["index"] == target["index"]
+    )
+    assert restored_param["value"] == pytest.approx(new_value, abs=1e-3)

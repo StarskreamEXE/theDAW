@@ -95,6 +95,11 @@ if [ -d "VST-Foundry-UI/VST-UI-FOUNDRY" ] && [ ! -d "VST-Foundry-UI/VST-UI-FOUND
   (cd VST-Foundry-UI/VST-UI-FOUNDRY && npm install) || die "VST Foundry npm install failed — see the error above."
 fi
 
+# The native VST host (native/vst-host) is Windows-only — it's C++17 built
+# with MSVC against Win32 APIs. The status line below is advisory only: it
+# never builds, downloads, or exits, so Linux/macOS launches continue normally.
+say "live VST host: not available on this platform"
+
 # -- Kill any stale listeners on our ports -----------------------------------
 for port in 5173 8600 5187 5188 5472; do
   if command -v fuser >/dev/null 2>&1; then

@@ -16,6 +16,7 @@ import { vstEntryName } from '../../state/vstEditorStore';
 import { entryLatencySec, useVstLiveStore, type VstLiveEntryState } from '../../state/vstLiveStore';
 import { vstSessions } from '../../lib/vstLive/sessionRegistry';
 import type { ChainEntry } from '../../state/effectChainStore';
+import { liveBadge } from './fxRackBadge';
 
 /** Reconnect an entry's live plugin host now instead of waiting out the
  *  client's backoff. The session object is the rack's to reach: it is keyed by
@@ -80,6 +81,11 @@ interface FxRackProps {
 interface VstBadge {
   text: string;
   title: string;
+  /** Full-sentence explanation for assistive tech. Rendered as a visually
+   *  hidden sibling of the pill, not as `aria-label` on it: the pill is a
+   *  plain <span>, whose implicit ARIA role is `generic`, and `aria-label` is
+   *  prohibited on `generic` (axe-core aria-prohibited-attr). */
+  label: string;
   /** Tailwind classes for the pill. */
   tone: string;
 }
@@ -90,7 +96,15 @@ export function vstLiveBadge(
   host: { available: boolean | null; reason: string },
 ): VstBadge {
   const status = live?.status ?? 'off';
-  if (status === 'live' && live?.stateOrigin === 'state-rejected') {
+  const usingDefaults = status === 'live' && live?.stateOrigin === 'state-rejected';
+  // The pill's short text (and a generic `label` sentence for assistive tech)
+  // live in fxRackBadge.ts so the pill can't regress back into a whole
+  // sentence; `title` below stays the rich, entry-specific explanation for the
+  // mouse. `label` is carried on `VstBadge` and rendered as a visually hidden
+  // sibling at the call site, so shortening the pill never costs assistive
+  // tech the story the old long pill text used to carry.
+  const { text, label } = liveBadge(status, usingDefaults);
+  if (usingDefaults) {
     // The plugin IS processing — but at its factory defaults, because the HOST
     // reported that it could not restore this entry's saved state. Every saved
     // state is sent, whichever editor wrote it, so this is a real failure of
@@ -101,8 +115,9 @@ export function vstLiveBadge(
     // honest offer is: re-dial it live, or leave it for the render.
     const why = live?.stateReason ?? 'the plugin refused the saved state';
     return {
-      text: `LIVE · saved settings could not be loaded — ${why}`,
+      text,
       title: `${why} — open the GUI and re-dial, or keep the saved settings for render only`,
+      label,
       tone: 'border-amber-400/40 bg-amber-400/10 text-amber-300',
     };
   }
@@ -110,10 +125,11 @@ export function vstLiveBadge(
     const ms = entryLatencySec(live) * 1000;
     const clamped = live?.clamped ? ' · latency exceeds compensation' : '';
     return {
-      text: `LIVE · ${ms.toFixed(1)} ms`,
+      text: `${text} · ${ms.toFixed(1)} ms`,
       title:
         `${live?.plugin?.name ?? 'plugin'} is processing this signal live — ` +
         `${ms.toFixed(1)} ms of latency, compensated by the mixer${clamped}`,
+      label,
       tone: live?.clamped
         ? 'border-amber-400/40 bg-amber-400/10 text-amber-300'
         : 'border-teal-400/40 bg-teal-400/10 text-teal-300',
@@ -121,24 +137,27 @@ export function vstLiveBadge(
   }
   if (status === 'starting') {
     return {
-      text: 'starting…',
+      text,
       title: 'opening the plugin host — the signal passes through untouched until it is ready',
+      label,
       tone: 'border-sky-400/30 bg-sky-400/10 text-sky-300/80',
     };
   }
   if (status === 'error') {
     const why = live?.reason ?? 'the plugin host stopped';
     return {
-      text: 'error',
+      text,
       title: `${why} — the signal passes through untouched; reconnecting`,
+      label,
       tone: 'border-red-400/40 bg-red-400/10 text-red-300',
     };
   }
   // 'off' and 'unavailable' are the same thing to a listener: the plugin only
   // prints at freeze/bounce. The reason differs, so the title does.
   return {
-    text: 'render-only',
+    text,
     title: `${live?.reason ?? host.reason} — this plugin applies at freeze/bounce, not live`,
+    label,
     tone: 'border-amber-400/30 bg-amber-400/10 text-amber-300/70',
   };
 }
@@ -286,8 +305,12 @@ export function FxRack({
               {/* What this plugin is doing to the signal RIGHT NOW: processing
                   it live (with the latency the mixer is compensating), opening,
                   failed, or render-only. Plain text, not a control, so there is
-                  nothing to label and no wrapping <label>. The retry beside it
-                  IS a control and carries its own accessible name. */}
+                  no wrapping <label> — but a <span> is role="generic", and
+                  aria-label is prohibited on generic (axe-core
+                  aria-prohibited-attr), so the full sentence for assistive
+                  tech renders as a sr-only sibling instead; `title` still
+                  carries it for the mouse. The retry beside it IS a control
+                  and carries its own accessible name. */}
               {entry.effect === 'vst3' && (() => {
                 const live = vstLive[entry.id];
                 const badge = vstLiveBadge(live, vstStatus);
@@ -299,6 +322,7 @@ export function FxRack({
                     >
                       {badge.text}
                     </span>
+                    <span className="sr-only">{badge.label}</span>
                     {(live?.xruns ?? 0) > 0 && (
                       <span
                         title={`${live?.xruns} audio block${live?.xruns === 1 ? '' : 's'} arrived too late to play and were dropped — the plugin is not keeping up`}

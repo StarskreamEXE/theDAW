@@ -26,6 +26,7 @@
  * seconds. Nothing here is in milliseconds — the UI does that conversion.
  */
 import { create } from 'zustand';
+import { subscribeWithSelector } from 'zustand/middleware';
 
 /** What a `vst3` entry's live session is doing. */
 export type VstLiveStatus =
@@ -171,71 +172,75 @@ const patch = (
   [entryId]: { ...(entries[entryId] ?? EMPTY), ...next },
 });
 
-export const useVstLiveStore = create<VstLiveState>()((set) => ({
-  entries: {},
-  host: { available: null },
+// `subscribeWithSelector` is what lets a consumer (vstLiveNode) subscribe to
+// one entry's status instead of waking up for every entry in the store.
+export const useVstLiveStore = create<VstLiveState>()(
+  subscribeWithSelector((set) => ({
+    entries: {},
+    host: { available: null },
 
-  setHost: (host) => set({ host: { ...host, reason: host.available ? undefined : host.reason } }),
+    setHost: (host) => set({ host: { ...host, reason: host.available ? undefined : host.reason } }),
 
-  setStatus: (entryId, status, reason) =>
-    set((s) => ({
-      entries: patch(s.entries, entryId, {
-        status,
-        reason: status === 'error' || status === 'unavailable' ? reason : undefined,
+    setStatus: (entryId, status, reason) =>
+      set((s) => ({
+        entries: patch(s.entries, entryId, {
+          status,
+          reason: status === 'error' || status === 'unavailable' ? reason : undefined,
+        }),
+      })),
+
+    setReady: (entryId, ready) =>
+      set((s) => ({
+        entries: patch(s.entries, entryId, {
+          status: 'live',
+          reason: undefined,
+          plugin: ready.plugin,
+          pluginLatencySamples: nonNegative(ready.pluginLatencySamples, 'pluginLatencySamples'),
+          bridgeLatencySamples: nonNegative(ready.bridgeLatencySamples, 'bridgeLatencySamples'),
+          sampleRate: nonNegative(ready.sampleRate, 'sampleRate'),
+          hasEditor: ready.hasEditor,
+        }),
+      })),
+
+    setLatency: (entryId, pluginLatencySamples) =>
+      set((s) => ({
+        entries: patch(s.entries, entryId, {
+          pluginLatencySamples: nonNegative(pluginLatencySamples, 'pluginLatencySamples'),
+        }),
+      })),
+
+    addXruns: (entryId, count) =>
+      set((s) => ({
+        entries: patch(s.entries, entryId, {
+          xruns: (s.entries[entryId]?.xruns ?? 0) + nonNegative(count, 'xruns'),
+        }),
+      })),
+
+    setEditorOpen: (entryId, open) => set((s) => ({ entries: patch(s.entries, entryId, { editorOpen: open }) })),
+
+    setStateOrigin: (entryId, origin, reason) =>
+      set((s) => ({
+        // A reason only ever belongs to a rejection: going back to `live` drops
+        // it, so a stale explanation can never outlive the gap it explained.
+        entries: patch(s.entries, entryId, {
+          stateOrigin: origin,
+          stateReason: origin === 'state-rejected' ? reason : undefined,
+        }),
+      })),
+
+    setClamped: (entryId, clamped) => set((s) => ({ entries: patch(s.entries, entryId, { clamped }) })),
+
+    clearEntry: (entryId) =>
+      set((s) => {
+        if (!(entryId in s.entries)) return s;
+        const next = { ...s.entries };
+        delete next[entryId];
+        return { entries: next };
       }),
-    })),
 
-  setReady: (entryId, ready) =>
-    set((s) => ({
-      entries: patch(s.entries, entryId, {
-        status: 'live',
-        reason: undefined,
-        plugin: ready.plugin,
-        pluginLatencySamples: nonNegative(ready.pluginLatencySamples, 'pluginLatencySamples'),
-        bridgeLatencySamples: nonNegative(ready.bridgeLatencySamples, 'bridgeLatencySamples'),
-        sampleRate: nonNegative(ready.sampleRate, 'sampleRate'),
-        hasEditor: ready.hasEditor,
-      }),
-    })),
-
-  setLatency: (entryId, pluginLatencySamples) =>
-    set((s) => ({
-      entries: patch(s.entries, entryId, {
-        pluginLatencySamples: nonNegative(pluginLatencySamples, 'pluginLatencySamples'),
-      }),
-    })),
-
-  addXruns: (entryId, count) =>
-    set((s) => ({
-      entries: patch(s.entries, entryId, {
-        xruns: (s.entries[entryId]?.xruns ?? 0) + nonNegative(count, 'xruns'),
-      }),
-    })),
-
-  setEditorOpen: (entryId, open) => set((s) => ({ entries: patch(s.entries, entryId, { editorOpen: open }) })),
-
-  setStateOrigin: (entryId, origin, reason) =>
-    set((s) => ({
-      // A reason only ever belongs to a rejection: going back to `live` drops
-      // it, so a stale explanation can never outlive the gap it explained.
-      entries: patch(s.entries, entryId, {
-        stateOrigin: origin,
-        stateReason: origin === 'state-rejected' ? reason : undefined,
-      }),
-    })),
-
-  setClamped: (entryId, clamped) => set((s) => ({ entries: patch(s.entries, entryId, { clamped }) })),
-
-  clearEntry: (entryId) =>
-    set((s) => {
-      if (!(entryId in s.entries)) return s;
-      const next = { ...s.entries };
-      delete next[entryId];
-      return { entries: next };
-    }),
-
-  clearAll: () => set({ entries: {} }),
-}));
+    clearAll: () => set({ entries: {} }),
+  })),
+);
 
 /** One entry's record, or the neutral `off` record for an id with no session. */
 export function vstLiveStatusOf(entryId: string): VstLiveEntryState {

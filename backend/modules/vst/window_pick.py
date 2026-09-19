@@ -29,6 +29,12 @@ WS_EX_TOOLWINDOW = 0x00000080
 # message-only leftover — never a plugin editor.
 MIN_EDGE = 80
 
+# Win32 parks a MINIMIZED window's rect at (-32000, -32000, -31840, -31840) —
+# 160x160, well past MIN_EDGE — while IsWindowVisible() still reports TRUE. A
+# coordinate this negative can only be that sentinel; no real monitor layout
+# reaches it.
+OFFSCREEN_SENTINEL = -30000
+
 
 @dataclass(frozen=True)
 class Candidate:
@@ -87,13 +93,21 @@ def is_owned_popup(cand: Candidate) -> bool:
     return cand.owner != 0 and bool(cand.style & WS_POPUP)
 
 
+def is_offscreen(cand: Candidate) -> bool:
+    """A minimized window still reports IsWindowVisible()==TRUE, and its rect
+    is parked at the sentinel; a legitimate secondary monitor never reaches
+    -30000."""
+    return cand.rect[0] <= OFFSCREEN_SENTINEL or cand.rect[1] <= OFFSCREEN_SENTINEL
+
+
 def is_eligible(
     cand: Candidate, our_pid: int | None = None, console_hwnd: int = 0
 ) -> bool:
     """Could this window be our plugin's editor at all?
 
-    Ours, visible, big enough, and not the console we were launched from.
-    ``our_pid=None`` skips the process check (the caller already filtered).
+    Ours, visible, big enough, not parked at the minimized sentinel, and not
+    the console we were launched from. ``our_pid=None`` skips the process
+    check (the caller already filtered).
     """
     if cand.hwnd == 0:
         return False
@@ -102,6 +116,8 @@ def is_eligible(
     if console_hwnd and cand.hwnd == console_hwnd:
         return False
     if not cand.visible:
+        return False
+    if is_offscreen(cand):
         return False
     return cand.width >= MIN_EDGE and cand.height >= MIN_EDGE
 
@@ -154,6 +170,8 @@ def format_candidate(cand: Candidate, chosen: bool) -> str:
     """
     left, top, right, bottom = cand.rect
     flags = []
+    if is_offscreen(cand):
+        flags.append("OFFSCREEN")
     if is_toolwindow(cand):
         flags.append("TOOLWINDOW")
     if is_owned_popup(cand):

@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import shutil
 import sqlite3
 import sys
@@ -395,6 +396,125 @@ def test_a_second_full_run_changes_nothing(tmp_path: Path, store: LibraryStore):
     assert second.unchanged == 25
     assert store.db.library_revision() == revision
     assert store.db.count_entries() == 25
+
+
+def test_update_merges_over_the_existing_entry_instead_of_replacing_it(
+    tmp_path: Path, store: LibraryStore
+):
+    """F2a1 / R2-1: the UPDATE branch must not rewrite metadata.json from
+    scratch. Everything the entry already has -- including fields
+    ``build_metadata`` never produces at all, like a spectrogram cache -- has
+    to survive an update byte-for-byte, and an unknown staged duration must
+    never stomp a known one, in the file or in the DB row."""
+    clip = _clip_id(90)
+    stage_root = _stage(tmp_path, [_song(clip)])
+    suno_promote.promote_stage(stage_root, store)
+
+    meta_path = store.root / clip / "metadata.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["duration"] = 183.4
+    meta["spectrogram_paths"] = {"peaks": "peaks.bin"}
+    meta["saved_at"] = "2026-02-01T00:00:00Z"
+    meta["filename"] = "handmade-name.mp3"
+    meta["file_size_bytes"] = 999999
+    meta["source_path"] = "Z:/somewhere/handmade.mp3"
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    # A truly new revision (forces the update branch) whose OWN duration
+    # is unknown -- must not overwrite the 183.4 already on the entry.
+    changed = _song(
+        clip, title="Retitled upstream", status="streaming", metadata={"style": "x"}
+    )
+    stage_root2 = _stage(tmp_path, [changed], name="cache2")
+    report = suno_promote.promote_stage(stage_root2, store)
+    assert report.updated == 1
+
+    updated = _entry_meta(store, clip)
+    assert updated["duration"] == 183.4
+    assert updated["spectrogram_paths"] == {"peaks": "peaks.bin"}
+    assert updated["saved_at"] == "2026-02-01T00:00:00Z"
+    assert updated["filename"] == "handmade-name.mp3"
+    assert updated["file_size_bytes"] == 999999
+    assert updated["source_path"] == "Z:/somewhere/handmade.mp3"
+    # Provider-owned keys were still refreshed.
+    assert updated["title"] == "Retitled upstream"
+    assert updated["style"] == "x"
+
+    row = store.db.get_entry(clip)
+    assert row["duration_sec"] == 183.4
+
+
+def test_unparsable_metadata_is_left_untouched_and_reported(
+    tmp_path: Path, store: LibraryStore
+):
+    """F2a1 / R2-1 (deferral half): a metadata.json that cannot be parsed as
+    JSON must not be overwritten by the update branch -- the song is skipped
+    and the reason lands in the report instead."""
+    clip = _clip_id(91)
+    stage_root = _stage(tmp_path, [_song(clip)])
+    suno_promote.promote_stage(stage_root, store)
+
+    meta_path = store.root / clip / "metadata.json"
+    meta_path.write_text("{not valid json", encoding="utf-8")
+    before = meta_path.read_text(encoding="utf-8")
+
+    changed = _song(clip, title="Should never land", status="streaming")
+    stage_root2 = _stage(tmp_path, [changed], name="cache2")
+    report = suno_promote.promote_stage(stage_root2, store)
+
+    assert report.updated == 0
+    assert report.failed == 1
+    assert any("not valid JSON" in message for message in report.errors)
+    assert meta_path.read_text(encoding="utf-8") == before
+
+
+def test_entry_dir_refuses_a_symlinked_entry_id_that_escapes_the_root(
+    tmp_path: Path,
+) -> None:
+    """F2a1 / R2-3: containment has to be decided on the RESOLVED path, not a
+    string prefix -- an entry id that names a symlink pointing outside the
+    library root must be refused before anything is written through it."""
+    root = (tmp_path / "library").resolve()
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = root / "escapeid"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:  # Windows without dev mode
+        pytest.skip(f"cannot create a symlink here: {exc}")
+
+    root_normcase = os.path.normcase(str(root))
+    with pytest.raises(suno_promote.PromotionRefused):
+        suno_promote._entry_dir(root, root_normcase, "escapeid")
+
+
+def test_entry_dir_refuses_a_symlinked_entry_id_that_resolves_to_the_root(
+    tmp_path: Path,
+) -> None:
+    """F2a1 rework, R1 audit finding 2: the containment check must not special
+    case ``resolved == root`` -- the library root is not inside itself, so an
+    entry id that is a symlink pointing AT the root has to be refused exactly
+    like one pointing further outside it. The old ``resolved != root`` clause
+    let this one through."""
+    root = (tmp_path / "library").resolve()
+    root.mkdir()
+    link = root / "escapeid"
+    try:
+        link.symlink_to(root, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:  # Windows without dev mode
+        pytest.skip(f"cannot create a symlink here: {exc}")
+
+    root_normcase = os.path.normcase(str(root))
+    with pytest.raises(suno_promote.PromotionRefused):
+        suno_promote._entry_dir(root, root_normcase, "escapeid")
+
+
+def test_this_file_carries_no_banned_words() -> None:
+    """F2a1 rework, R1 audit finding 1: the banned word must never reappear
+    in this file's source, comments included."""
+    source = Path(__file__).read_text(encoding="utf-8")
+    assert "genuinely" not in source.lower()
 
 
 # ---------------------------------------------------------------------------

@@ -110,8 +110,10 @@ export interface VstSessionRegistry {
   /** Project close / page unload. */
   closeAll(): void;
   /** Reconnect an errored session NOW rather than waiting out its backoff —
-   *  what the FX row's retry control does. No-op for a healthy session, or for
-   *  an entry that has none. */
+   *  what the FX row's retry control does. Also re-opens a slot whose session
+   *  never started (no host binary yet, or a refused spawn), re-probing the
+   *  host binary rather than replaying a cached answer. No-op for a healthy
+   *  session, for an open already in flight, or for an unknown entry id. */
   retry(entryId: string): void;
   get(entryId: string): VstLiveSession | undefined;
   /** Every session that currently has a live host process, so the save-time
@@ -186,6 +188,14 @@ export function createVstSessionRegistry(deps: VstSessionRegistryDeps = {}): Vst
         return { available: false, reason, transient: true };
       });
     return hostProbe;
+  };
+
+  /** Retry's escape hatch for a session-less slot: forget the cached probe so
+   *  the next `open()` asks the backend again instead of replaying a stale
+   *  answer — the user may have just started the backend or built the host
+   *  binary since the last probe landed. */
+  const resetHostProbe = (): void => {
+    hostProbe = null;
   };
 
   /**
@@ -401,9 +411,37 @@ export function createVstSessionRegistry(deps: VstSessionRegistryDeps = {}): Vst
 
     retry(entryId) {
       const slot = slots.get(entryId);
-      if (!slot?.session) return;
-      store().setStatus(entryId, 'starting');
-      slot.session.client.retryNow();
+      if (!slot) return;
+      if (slot.session) {
+        store().setStatus(entryId, 'starting');
+        slot.session.client.retryNow();
+        return;
+      }
+      // No session to reconnect: the first open never produced one (no host
+      // binary, a refused spawn, or the backend was down). Cancel any grace
+      // timer first so a shutdown queued for this slot cannot reap the retry
+      // mid-open, then re-open from scratch unless one is already running.
+      if (slot.graceHandle !== null) {
+        cancel(slot.graceHandle);
+        slot.graceHandle = null;
+      }
+      if (slot.opening) return;
+      resetHostProbe();
+      slot.opening = open(slot.entry, slot.sampleRate, slot).then((s) => {
+        slot.opening = null;
+        // A close()/closeAll() that raced this re-open wins: shut the new
+        // session down again rather than leaving it wired into a slot nobody
+        // holds any more. Identity check, not acquire's `!slots.has(entry.id)`
+        // — a has-check alone would miss the slot having been replaced by a
+        // fresh acquire() in the meantime, since the id would still be
+        // present, just pointing at a different Slot object.
+        if (slots.get(entryId) !== slot && s) {
+          s.client.close();
+          void vstLiveApi.deleteSession(s.sessionId).catch(() => {});
+          return null;
+        }
+        return s;
+      });
     },
 
     get(entryId) {

@@ -400,6 +400,103 @@ def test_a_confirm_total_mismatch_deletes_nothing(client_with_root):
     assert (store.root / "e000").is_dir()
 
 
+def test_a_row_written_during_the_filter_read_is_refused_not_substituted(
+    client_with_root, monkeypatch
+):
+    """F2b / R2 finding 2: the filter form used to re-count, confirm the count
+    matched, and only THEN re-read ids newest-first and trim to that count. A
+    row written in the gap between the count and that re-read landed at the
+    front of the newest-first list, so trimming kept it and dropped the
+    oldest row the client actually confirmed -- deleting an entry the client
+    never saw instead of the one it did.
+
+    Reproduced here by making the id-read itself the point where the "other
+    request" lands its write, which is exactly the gap the fix collapses: one
+    read, compared to ``confirm_total`` with no trimming.
+    """
+    store = _seed_via_client(client_with_root, 3)
+    real_list_entry_ids = store.db.list_entry_ids
+    injected: list[bool] = []
+
+    def racing_list_entry_ids(filters, cap, **kwargs):
+        if not injected:
+            injected.append(True)
+            _managed_entry(store, "raced_in")
+        return real_list_entry_ids(filters, cap, **kwargs)
+
+    monkeypatch.setattr(store.db, "list_entry_ids", racing_list_entry_ids)
+
+    r = client_with_root.post(
+        "/api/library/entries/bulk-delete",
+        json={"filter": {"kind": "audio"}, "confirm_total": 3},
+    )
+
+    assert r.status_code == 409
+    body = r.json()
+    assert body["total_matched"] == 4
+    assert "detail" in body
+    # NOTHING was deleted -- not the raced-in row, not any of the confirmed ones.
+    assert store.db.count_entries() == 4
+    assert store.db.get_entry("raced_in") is not None
+    assert store.db.get_entry("e000") is not None
+    assert store.db.get_entry("e001") is not None
+    assert store.db.get_entry("e002") is not None
+
+
+def test_a_confirm_total_mismatch_by_more_than_one_reports_the_real_total(
+    client_with_root,
+):
+    """R2 finding 2, round 2: ``list_entry_ids`` answers at most
+    ``confirm_total + 1`` rows, so reusing its length as the refusal's
+    ``total_matched`` is only right when the library drifted by exactly one
+    row. Seed 6, confirm 3: the capped read returns 4 ids, but the real total
+    is 6 and the response must say so -- the frontend retries the request
+    with this number (``backendLocalProvider.ts``'s ``totalMatched``) and
+    pre-fills the typed confirmation with it."""
+    store = _seed_via_client(client_with_root, 6)
+    r = client_with_root.post(
+        "/api/library/entries/bulk-delete",
+        json={"filter": {"kind": "audio"}, "confirm_total": 3},
+    )
+    assert r.status_code == 409
+    body = r.json()
+    assert body["total_matched"] == 6
+    assert "detail" in body
+    # NOTHING was deleted.
+    assert store.db.count_entries() == 6
+
+
+def test_the_filter_forms_deleted_set_is_exactly_what_was_matched(client_with_root):
+    """Equal totals: the ids actually removed are exactly the ids the filter
+    matched, not a trimmed/reordered stand-in for them."""
+    store = _seed_via_client(client_with_root, 4)
+    store.db.upsert_entry(
+        {
+            "id": "e000",
+            "kind": "audio",
+            "title": "e000",
+            "favorite": True,
+            "source": "import",
+        }
+    )
+    filters = library_router_module._entry_filters("audio", None, False, None)
+    matched_ids = store.db.list_entry_ids(filters, 10)
+    assert set(matched_ids) == {"e001", "e002", "e003"}
+
+    r = client_with_root.post(
+        "/api/library/entries/bulk-delete",
+        json={"filter": {"kind": "audio", "favorite": False}, "confirm_total": 3},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["deleted"] == 3
+    assert body["total_matched"] == 3
+
+    for entry_id in matched_ids:
+        assert store.db.get_entry(entry_id) is None
+    assert store.db.get_entry("e000") is not None
+
+
 def test_an_empty_filter_needs_the_all_guard(client_with_root):
     store = _seed_via_client(client_with_root, 3)
     refused = client_with_root.post(

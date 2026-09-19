@@ -71,6 +71,8 @@ export interface TimelinePrefsState {
   clickProfile: ClickProfile;
   gridPreset: GridPreset;
   grid: GridStyle;
+  /** Pinned master row visibility (view-only pref). */
+  showMasterTrack: boolean;
   setWheelProfile(id: WheelProfileId): void;
   setFineZoomSpeed(v: number): void;
   setCoarseZoomSpeed(v: number): void;
@@ -81,13 +83,14 @@ export interface TimelinePrefsState {
    *  'custom' when a style value actually changes (`visible` alone does not). */
   setGrid(patch: Partial<GridStyle>): void;
   setGridVisible(v: boolean): void;
+  setShowMasterTrack(v: boolean): void;
   /** Every field back to its default. */
   reset(): void;
 }
 
 type PrefsData = Pick<
   TimelinePrefsState,
-  'wheelProfile' | 'fineZoomSpeed' | 'coarseZoomSpeed' | 'clickProfile' | 'gridPreset' | 'grid'
+  'wheelProfile' | 'fineZoomSpeed' | 'coarseZoomSpeed' | 'clickProfile' | 'gridPreset' | 'grid' | 'showMasterTrack'
 >;
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
@@ -111,6 +114,7 @@ function defaultData(): PrefsData {
     clickProfile: DEFAULT_CLICK_PROFILE,
     gridPreset: DEFAULT_GRID_PRESET,
     grid: { visible: true, ...GRID_PRESETS.normal },
+    showMasterTrack: true,
   };
 }
 
@@ -148,6 +152,7 @@ export function sanitizeTimelinePrefs<S extends PrefsData>(persisted: unknown, c
     clickProfile: oneOf(CLICK_PROFILES, p.clickProfile) ? p.clickProfile : d.clickProfile,
     gridPreset: oneOf(ALL_PRESETS, p.gridPreset) ? p.gridPreset : d.gridPreset,
     grid: patchGrid(d.grid, isRecord(p.grid) ? p.grid : {}),
+    showMasterTrack: typeof p.showMasterTrack === 'boolean' ? p.showMasterTrack : d.showMasterTrack,
   };
 }
 
@@ -203,6 +208,9 @@ export const useTimelinePrefs = create<TimelinePrefsState>()(
       setGridVisible: (v) => {
         if (typeof v === 'boolean') set((s) => ({ grid: { ...s.grid, visible: v } }));
       },
+      setShowMasterTrack: (v) => {
+        if (typeof v === 'boolean') set({ showMasterTrack: v });
+      },
       reset: () => set(defaultData()),
     }),
     {
@@ -216,6 +224,7 @@ export const useTimelinePrefs = create<TimelinePrefsState>()(
         clickProfile: s.clickProfile,
         gridPreset: s.gridPreset,
         grid: s.grid,
+        showMasterTrack: s.showMasterTrack,
       }),
       merge: (persisted, current) => sanitizeTimelinePrefs(persisted, current),
       migrate: (persisted) => sanitizeTimelinePrefs(persisted, defaultData()),

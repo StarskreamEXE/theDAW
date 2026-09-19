@@ -41,6 +41,7 @@ import {
   bounceIsChunkSafe,
   chainIsChunkSafe,
   configureRenderJobs,
+  rangeJobSummary,
   resetRenderJobsClock,
   startRenderRunner,
   useRenderJobs,
@@ -51,6 +52,7 @@ import type { ChainEntry } from './effectChainStore.ts';
 import { mixdownRequest, selectionRequest, stemRequest } from '../components/audio/WaveformEditor.tsx';
 import { BOUNCE_SAMPLE_RATE, type BounceRequest, type BounceScope } from '../lib/renderCore.ts';
 import { RACK_EFFECTS, getRackEffect, type RackEffectDef } from '../lib/rackEffects.ts';
+import { rangeFromSeconds } from '../lib/render/renderRange.ts';
 
 /* ── fixtures ──────────────────────────────────────────────────────────────── */
 
@@ -543,6 +545,49 @@ async function main(): Promise<void> {
     assert.equal(j.request.scope.kind, 'track');
     assert.equal(j.startedAt, undefined);
     assert.equal(j.error, undefined);
+  }
+
+  /* ── the range rides on the job as a snapshot (F24-4) ────────────────────── */
+  {
+    reset();
+    const range = rangeFromSeconds(34, 72.5, { tailSec: 0 })!;
+    const id = useRenderJobs.getState().enqueue(seed({ range }));
+    assert.deepEqual(byId(id).range, range, 'enqueue copies the seed range onto the stored job unchanged');
+  }
+
+  {
+    reset();
+    const id = useRenderJobs.getState().enqueue(seed());
+    assert.equal(byId(id).range, undefined, 'no range means the whole timeline — nothing rode on this job');
+    assert.equal(rangeJobSummary(byId(id)), null, 'rangeJobSummary has nothing to say about a rangeless job');
+  }
+
+  {
+    const range = rangeFromSeconds(34, 72.5, { tailSec: 0 })!;
+    assert.equal(
+      rangeJobSummary({ range }),
+      '0:34.000 – 1:12.500 (38.500 s)',
+      'start and end as m:ss.mmm, kept length (incl. any tail) as fixed-3 seconds',
+    );
+  }
+
+  {
+    reset();
+    const range = rangeFromSeconds(34, 72.5, { tailSec: 0 })!;
+    const original = { ...range };
+    const id = useRenderJobs.getState().enqueue(seed({ range }));
+    // The user's selection moves on to a different span while this job waits in
+    // the queue — simulated in the sharpest way available: mutate the very
+    // `range` object `enqueue` was handed, in place, with no new object at all.
+    // If `enqueue` stored this reference verbatim instead of a value copy, this
+    // mutation would leak straight into the already-queued job.
+    range.startFrame = 0;
+    range.endFrame = 1;
+    assert.deepEqual(
+      byId(id).range,
+      original,
+      "a later selection change does not alter a queued job's range",
+    );
   }
 
   /* ── a stem result carries the whole triple renderTrackStem produces ─────── */

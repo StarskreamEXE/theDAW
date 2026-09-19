@@ -32,6 +32,7 @@ import threading
 import time
 from pathlib import Path
 
+from backend.modules.vst.embed_close import CloseSequencer, describe
 from backend.modules.vst.window_pick import (
     Candidate,
     format_candidate,
@@ -92,9 +93,47 @@ def _phys(rect: dict) -> tuple[int, int, int, int]:
     return x, y, w, h
 
 
+def run_close(ops, hwnd: int, log, *, sequencer, sleep, clock) -> str:
+    """Run a bounded "ask the plugin to close" sequence against ``hwnd``.
+
+    Loops on :meth:`CloseSequencer.step`, driving ``ops`` -- a duck-typed
+    object exposing ``post_close(hwnd) -> bool``, ``is_window(hwnd) -> bool``,
+    ``unclip(hwnd) -> None`` and ``disown(hwnd) -> None`` -- so this stays
+    ctypes-free and unit-testable against a fake.
+
+    Returns ``"closed"`` once the window is gone by itself, or ``"gave_up"``
+    once ``sequencer`` times out -- in which case the window is unclipped and
+    disowned first, handing it back to the user unpinned and reachable
+    instead of leaving a clipped orphan behind.
+    """
+    start: float | None = None
+    while True:
+        now = clock()
+        elapsed = 0.0 if start is None else now - start
+        action = sequencer.step(elapsed, ops.is_window(hwnd))
+
+        if action == "post":
+            ops.post_close(hwnd)
+            if start is None:
+                start = now
+        elif action == "wait":
+            sleep(0.1)
+        elif action == "give_up":
+            ops.unclip(hwnd)
+            ops.disown(hwnd)
+
+        log(describe(action, elapsed, sequencer.posts))
+
+        if action == "closed":
+            return "closed"
+        if action == "give_up":
+            return "gave_up"
+
+
 def _watch(parent_hwnd: int, rect_file: str | None, plugin_name: str | None) -> None:
     import ctypes
     from ctypes import wintypes
+    from types import SimpleNamespace
 
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -280,6 +319,26 @@ def _watch(parent_hwnd: int, rect_file: str | None, plugin_name: str | None) -> 
         user32.GetWindowRect(hwnd, ctypes.byref(r))
         return (r.right - r.left, r.bottom - r.top)
 
+    # A small ops object over the raw ctypes bindings above, so the bounded
+    # close policy (run_close) and the exit-time restore below stay
+    # ctypes-free and unit-testable against a fake.
+    def post_close(hwnd) -> bool:
+        return bool(user32.PostMessageW(hwnd, _WM_CLOSE, 0, 0))
+
+    def is_window(hwnd) -> bool:
+        return bool(user32.IsWindow(hwnd))
+
+    def unclip(hwnd) -> None:
+        user32.SetWindowRgn(hwnd, None, True)
+
+    def disown(hwnd) -> None:
+        set_long(hwnd, _GWLP_HWNDPARENT, 0)
+
+    ops = SimpleNamespace(
+        post_close=post_close, is_window=is_window, unclip=unclip, disown=disown
+    )
+
+    hwnd = 0
     try:
         log(
             f"watcher start; parent_hwnd={parent_hwnd} pid={our_pid} "
@@ -317,7 +376,14 @@ def _watch(parent_hwnd: int, rect_file: str | None, plugin_name: str | None) -> 
             if rect:
                 if rect.get("close"):
                     log("close requested -> WM_CLOSE")
-                    user32.PostMessageW(hwnd, _WM_CLOSE, 0, 0)
+                    run_close(
+                        ops,
+                        hwnd,
+                        log,
+                        sequencer=CloseSequencer(),
+                        sleep=time.sleep,
+                        clock=time.time,
+                    )
                     return
 
                 # The editor keeps its OWN (natural) size; publish it so the
@@ -389,6 +455,17 @@ def _watch(parent_hwnd: int, rect_file: str | None, plugin_name: str | None) -> 
 
         traceback.print_exc()
         return
+    finally:
+        if hwnd and user32.IsWindow(hwnd):
+            log(f"watcher exiting with hwnd=0x{int(hwnd):X} still alive; restoring it")
+            try:
+                ops.unclip(hwnd)
+            except Exception:
+                pass
+            try:
+                ops.disown(hwnd)
+            except Exception:
+                pass
 
 
 def start_embed_watcher(

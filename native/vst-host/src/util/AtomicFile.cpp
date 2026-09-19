@@ -38,7 +38,8 @@ bool fileExists(const std::wstring& path) {
            (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
 
-bool readFile(const std::wstring& path, std::vector<uint8_t>& out, std::string& error) {
+bool readFileLimited(const std::wstring& path, uint64_t maxBytes, std::vector<uint8_t>& out,
+                     std::string& error) {
     out.clear();
     FileHandle file(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
@@ -51,11 +52,17 @@ bool readFile(const std::wstring& path, std::vector<uint8_t>& out, std::string& 
         error = lastErrorText("cannot size file");
         return false;
     }
-    if (size.QuadPart < 0 || size.QuadPart > 64LL * 1024LL * 1024LL) {
-        error = "file is larger than the 64 MB limit";
+    if (size.QuadPart < 0) {
+        error = "file has a negative size";
         return false;
     }
-    out.resize(static_cast<size_t>(size.QuadPart));
+    const uint64_t sizeBytes = static_cast<uint64_t>(size.QuadPart);
+    if (sizeBytes > maxBytes) {
+        error = "file is " + std::to_string(sizeBytes) + " bytes; the limit here is " +
+                std::to_string(maxBytes) + " bytes";
+        return false;
+    }
+    out.resize(static_cast<size_t>(sizeBytes));
     size_t offset = 0;
     while (offset < out.size()) {
         const DWORD chunk =
@@ -70,8 +77,17 @@ bool readFile(const std::wstring& path, std::vector<uint8_t>& out, std::string& 
         if (read == 0) break;
         offset += read;
     }
-    out.resize(offset);
+    if (offset != static_cast<size_t>(sizeBytes)) {
+        error = "file ended after " + std::to_string(offset) + " of " + std::to_string(sizeBytes) +
+                " bytes";
+        out.clear();
+        return false;
+    }
     return true;
+}
+
+bool readFile(const std::wstring& path, std::vector<uint8_t>& out, std::string& error) {
+    return readFileLimited(path, kSmallFileLimitBytes, out, error);
 }
 
 bool writeFileAtomic(const std::wstring& path, const void* data, size_t size,

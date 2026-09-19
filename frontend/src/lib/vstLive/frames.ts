@@ -146,7 +146,19 @@ export function packFrame(header: VstFrameHeader, channels: readonly Float32Arra
   return buf;
 }
 
-/** Read a frame's header without touching (or requiring) its payload. */
+/**
+ * Read and VALIDATE a frame's header, without touching (or requiring) its
+ * payload. This is not a bare decode: `channels` is range-checked against the
+ * same 1..MAX_FRAME_CHANNELS contract `packFrame` enforces on the way out,
+ * because a channel count outside that range desyncs the planar payload for
+ * every reader downstream (`unpackFrame`'s length check cannot catch it —
+ * with `channels === 0` its `need` collapses to just the header size). Order
+ * matters: length, then magic, then channel range.
+ *
+ * Callers treat a throw as "bad frame, drop it" — see
+ * `bridgeClient.onBinary`, which already counts it via `stats.badFrames`
+ * rather than tearing the session down.
+ */
 export function readFrameHeader(buf: ArrayBuffer): VstFrameHeader {
   if (buf.byteLength < FRAME_HEADER_BYTES) {
     throw new RangeError(
@@ -160,9 +172,13 @@ export function readFrameHeader(buf: ArrayBuffer): VstFrameHeader {
       `vstLive/frames: bad magic 0x${magic.toString(16)} (expected 0x${FRAME_MAGIC.toString(16)})`,
     );
   }
+  const channels = dv.getUint8(5);
+  if (channels < 1 || channels > MAX_FRAME_CHANNELS) {
+    throw new RangeError(`vstLive/frames: channels must be 1..${MAX_FRAME_CHANNELS}, got ${channels}`);
+  }
   return {
     type: dv.getUint8(4),
-    channels: dv.getUint8(5),
+    channels,
     flags: dv.getUint16(6, true),
     seq: dv.getUint32(8, true),
     frames: dv.getUint32(12, true),

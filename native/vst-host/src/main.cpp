@@ -17,6 +17,7 @@
 #include "engine/Render.h"
 #include "engine/SelfTest.h"
 #include "engine/Session.h"
+#include "net/WsSelfTest.h"
 #include "plugin/IPluginInstance.h"
 #include "util/Args.h"
 #include "util/AtomicFile.h"
@@ -225,8 +226,13 @@ int main() {
         case thedaw::RunMode::Version:
             printVersion();
             return kExitOk;
-        case thedaw::RunMode::SelfTest:
-            return thedaw::runSelfTest();
+        case thedaw::RunMode::SelfTest: {
+            // Both suites always run (never short-circuited) so one report is
+            // never hidden by the other; either one failing fails the process.
+            const int engineFailures = thedaw::runSelfTest();
+            const int wsFailures = thedaw::net::runWsHardeningSelfTest();
+            return (engineFailures != 0 || wsFailures != 0) ? 1 : 0;
+        }
         default:
             break;
     }

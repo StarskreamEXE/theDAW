@@ -298,7 +298,32 @@ def test_spawn_argv_matches_the_contract(manager, plugin_file: Path) -> None:
     assert argv[argv.index("--port") + 1] == "0"
     assert argv[argv.index("--parent-pid") + 1] == str(os.getpid())
     assert argv[argv.index("--state-file") + 1] == str(session.state_path)
-    assert argv[argv.index("--log") + 1] == str(session.log_path)
+    # The host's OWN log is a separate file from host.log (stdout pump +
+    # stderr) — see the module docstring's "Logs" section.
+    assert argv[argv.index("--log") + 1] == str(session.native_log_path)
+    assert session.native_log_path != session.log_path
+    assert session.native_log_path.name == "host-native.log"
+
+
+def test_log_tail_reads_the_native_log_before_the_host_log(
+    manager, plugin_file: Path
+) -> None:
+    """The host's own ``--log`` output and the pump/stderr capture are two
+    different files; ``log_tail`` must surface the host's native lines first.
+    """
+    session = make(manager, plugin_file)
+
+    assert wait_until(
+        lambda: any("fake-host-native:" in line for line in session.log_tail(200)),
+        timeout=10,
+    ), "the fake host never wrote its native log"
+    assert session.native_log_path.is_file()
+    assert session.native_log_path != session.log_path
+
+    tail = session.log_tail(200)
+    native_index = next(i for i, line in enumerate(tail) if "fake-host-native:" in line)
+    host_index = next(i for i, line in enumerate(tail) if '"listening"' in line)
+    assert native_index < host_index, "native log lines must come first"
 
 
 def test_create_is_idempotent_per_chain_entry(manager, plugin_file: Path) -> None:
@@ -376,6 +401,23 @@ def test_the_same_plugin_and_name_stay_idempotent(manager, plugin_file: Path) ->
     )
     assert second.session_id == first.session_id
     assert second.pid == first.pid
+
+
+def test_empty_plugin_name_then_omitted_name_is_idempotent(
+    manager, plugin_file: Path
+) -> None:
+    """``""`` and omitted both mean "no name" — swapping between the two
+    spellings of "nothing" must not respawn the host.
+    """
+    first = make(manager, plugin_file, chain_entry_id="slot-1", plugin_name="")
+    assert first.plugin_name is None
+
+    second = make(manager, plugin_file, chain_entry_id="slot-1")
+
+    assert second.session_id == first.session_id
+    assert second.pid == first.pid
+    assert second.plugin_name is None
+    assert len([s for s in manager.list() if s.alive]) == 1
 
 
 def test_a_different_chain_entry_gets_its_own_process(
@@ -713,6 +755,79 @@ def test_dead_sessions_are_purged_after_their_grace_period(
     assert excinfo.value.status_code == 404
 
 
+def test_reap_timer_is_not_started_until_a_session_exists(
+    tmp_path: Path, fake_host_env: None
+) -> None:
+    mgr = lh.LiveSessionManager(root=tmp_path / "vst_live", reap_interval=0.05)
+    assert mgr._reap_timer is None
+
+
+def test_periodic_reap_purges_an_expired_session_and_then_stops_itself(
+    tmp_path: Path, plugin_file: Path, fake_host_env: None
+) -> None:
+    """The sweep must run on its own — nobody in this test calls ``reap()``
+    — and stop rescheduling once the manager is empty again.
+    """
+    mgr = lh.LiveSessionManager(root=tmp_path / "vst_live", reap_interval=0.05)
+    try:
+        session = make(mgr, plugin_file)
+        assert mgr._reap_timer is not None
+        session.proc.kill()
+        session.proc.wait(timeout=10)
+
+        # Nobody calls .reap() here: a tick of the sweep itself must notice
+        # the crash (the same object session refers to is the one the
+        # manager mutates, so this observes the sweep's own work).
+        assert wait_until(lambda: session.alive is False, timeout=5), (
+            "the periodic sweep never noticed the crashed session"
+        )
+        # Already past DEAD_SESSION_TTL, so the very next tick purges it.
+        session.ended_at = time.time() - (lh.DEAD_SESSION_TTL + 1)
+
+        assert wait_until(lambda: mgr.list() == [], timeout=5), (
+            "the periodic sweep never purged the expired session"
+        )
+        assert wait_until(lambda: mgr._reap_timer is None, timeout=5), (
+            "the sweep must stop itself once no session remains"
+        )
+    finally:
+        mgr.kill_all()
+
+
+def test_reap_retries_a_directory_it_could_not_remove(
+    manager, plugin_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory ``_remove_tree`` could not fully clear (e.g. a file still
+    open on Windows) must be retried by a later reap, not abandoned.
+    """
+    session = make(manager, plugin_file)
+    session.proc.kill()
+    session.proc.wait(timeout=10)
+    manager.reap()  # notice the crash first (mirrors the TTL-purge test above)
+    session.ended_at = time.time() - (lh.DEAD_SESSION_TTL + 1)
+
+    real_remove_tree = lh._remove_tree
+    attempts: list[Path] = []
+
+    def flaky_remove_tree(directory: Path) -> bool:
+        attempts.append(directory)
+        if len(attempts) == 1:
+            return False  # simulate a file rmtree could not clear yet
+        return real_remove_tree(directory)
+
+    monkeypatch.setattr(lh, "_remove_tree", flaky_remove_tree)
+
+    manager.reap()
+    assert session.dir in manager._pending_removal
+    assert session.dir.exists(), "must not be treated as removed after a failure"
+
+    manager.reap()
+
+    assert session.dir not in manager._pending_removal
+    assert not session.dir.exists()
+    assert len(attempts) == 2
+
+
 def test_kill_all_stops_every_session(manager, plugin_file: Path) -> None:
     pids = [
         make(manager, plugin_file, chain_entry_id=f"chain-{i}").pid for i in range(3)
@@ -757,6 +872,15 @@ def test_kill_all_is_safe_to_call_twice(manager, plugin_file: Path) -> None:
     manager.kill_all()
     manager.kill_all()
     assert manager.list() == []
+
+
+def test_kill_all_stops_the_reap_timer(manager, plugin_file: Path) -> None:
+    make(manager, plugin_file)
+    assert manager._reap_timer is not None
+
+    manager.kill_all()
+
+    assert manager._reap_timer is None
 
 
 def test_session_directory_is_removed_but_the_log_is_archived(

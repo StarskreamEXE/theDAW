@@ -12,6 +12,10 @@ reproduces exactly that surface of the contract in
   ``--plugin-name`` / ``--class-id``, ``--idle-timeout``, ``--null-plugin``,
   ``--list``, ``--selftest``, ``--version``), with argparse's exit code 2 for
   bad args;
+* ``--log <path>`` is honoured: a short native-diagnostic line is written
+  straight to that file, separately from the stderr the backend already
+  redirects into the session's OWN log — this is what proves the two are
+  different files;
 * one structured stdout line when the socket is up —
   ``{"ev":"listening","port":N,"pid":P,"protocol":1}``;
 * a real loopback WebSocket server on an OS-assigned port, so the ``ws_url``
@@ -145,6 +149,24 @@ def _read_state(path: str | None) -> bytes:
         return Path(path).read_bytes()
     except OSError:
         return b""
+
+
+def _native_log(args: argparse.Namespace, message: str) -> None:
+    """Write to the host's own ``--log`` file, like the real host does.
+
+    Kept separate from ``_log()`` (stderr, which the backend redirects into
+    ITS OWN capture file): the whole point of ``--log`` is that it is a
+    different file, so this must not also go to stderr.
+    """
+    if not args.log:
+        return
+    target = Path(args.log)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "a", encoding="utf-8") as handle:
+            handle.write(message + "\n")
+    except OSError as exc:
+        _log(f"fake-host: could not write native log {target}: {exc}")
 
 
 def _write_state_atomically(path: str | None, payload: bytes) -> None:
@@ -317,6 +339,9 @@ def main(argv: list[str] | None = None) -> int:
         "fake-host: args plugin_name=%s sample_rate=%d block_size=%d channels=%d"
         % (args.plugin_name, args.sample_rate, args.block_size, args.channels)
     )
+    # The host's OWN log — a different file from the stderr line above once
+    # the backend points --log somewhere other than its own capture file.
+    _native_log(args, f"fake-host-native: pid={os.getpid()} log={args.log}")
 
     if os.environ.get("FAKE_VST_HOST_HANG") == "1":
         # Never announce a port: this is the spawn-timeout case. Sleep in

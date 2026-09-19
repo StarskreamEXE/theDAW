@@ -32,6 +32,11 @@ constexpr int kExitPluginFailed = 4;
 constexpr int kExitBadLayout = 5;
 constexpr int kExitUnreadableInput = 7;
 
+// Mirrors Wav.cpp:18's kMaxDataBytes: the largest data payload a WAV RIFF chunk can declare.
+// Checked against the render's own output size before that buffer is allocated, so an
+// impossible render is refused in milliseconds instead of discovered after writeWavFile runs.
+constexpr std::uint64_t kMaxRenderOutputBytes = 0xFFFF0000ull;
+
 // A render is not realtime, but a plugin that has gone into an infinite loop must not hang a
 // backend request forever; the loop below gives up after this much wall clock.
 constexpr double kRenderWallClockLimitSeconds = 3600.0;
@@ -440,6 +445,28 @@ int runRender(const Options& options, MessageLoop& loop) {
     job.tailFrames =
         static_cast<int64_t>(std::llround(tailSeconds * input.sampleRate));
     job.outputFrames = static_cast<int64_t>(input.frames()) + job.tailFrames;
+
+    // A render whose output cannot fit in a WAV file must be refused now, before the output
+    // buffer is allocated or the worker thread starts — writeWavFile enforces this same ceiling
+    // (Wav.cpp:18's kMaxDataBytes) but only after the whole render has already run.
+    if (job.outputFrames >= 0) {
+        const std::uint64_t outputBytes = static_cast<std::uint64_t>(job.outputFrames) *
+                                           static_cast<std::uint64_t>(job.fileChannels) * 4ull;
+        if (outputBytes > kMaxRenderOutputBytes) {
+            const unsigned long releaseFault = util::guarded([&] { instance->release(); });
+            if (releaseFault != 0) {
+                warnings.push_back("the plugin crashed while being shut down after the render");
+            }
+            printFailure(
+                "this render would produce " +
+                util::toString(static_cast<long long>(job.outputFrames)) +
+                " frames across " + util::toString(static_cast<long long>(job.fileChannels)) +
+                " channels, which is larger than a WAV file can hold; shorten the input or "
+                "use a smaller --tail-seconds");
+            return kExitWriteFailed;
+        }
+    }
+
     job.output.assign(static_cast<size_t>(job.fileChannels),
                       std::vector<float>(static_cast<size_t>(job.outputFrames), 0.0f));
 

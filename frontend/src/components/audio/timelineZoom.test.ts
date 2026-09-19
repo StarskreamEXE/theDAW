@@ -13,6 +13,7 @@ import {
   planZoom,
   resolveAnchorSec,
   rulerBarLabels,
+  shouldRescrollAfterZoom,
   spanOfClips,
   viewportWindowSec,
   wheelDispatch,
@@ -73,6 +74,23 @@ const near = (a: number, b: number, eps = 1e-9) => assert.ok(Math.abs(a - b) <= 
   const vw = localViewportWidth({ rectWidthPx: 1020, layoutZoom: 0.85, headerColumnPx: 170 });
   const p = planZoom({ requestedZoom: 20, anchorSec: 60, totalDurationSec: 300, viewportWidth: vw, bounds: BOUNDS });
   near(p.scrollLeft, 60 * 20 - 500, 1e-6);
+}
+
+// --- Whether a zoom request should also move scrollLeft (F3 #1) -------------
+{
+  // At a bound: the clamp cannot move the zoom further, so an incidental
+  // wheel/step nudge must not yank the view back to the anchor.
+  assert.equal(shouldRescrollAfterZoom(BOUNDS.min, BOUNDS.min, false), false);
+  assert.equal(shouldRescrollAfterZoom(BOUNDS.max, BOUNDS.max, false), false);
+  // No-op off any bound: the requested zoom already equals the committed one.
+  assert.equal(shouldRescrollAfterZoom(10, 10, false), false);
+  // An explicit command (zoom to selection, zoom to fit) still moves the
+  // viewport even when the zoom itself does not change.
+  assert.equal(shouldRescrollAfterZoom(10, 10, true), true);
+  assert.equal(shouldRescrollAfterZoom(BOUNDS.max, BOUNDS.max, true), true);
+  // A real zoom change always rescrolls, explicit command or not.
+  assert.equal(shouldRescrollAfterZoom(10, 20, false), true);
+  assert.equal(shouldRescrollAfterZoom(10, 20, true), true);
 }
 
 // --- Fit helpers -------------------------------------------------------------

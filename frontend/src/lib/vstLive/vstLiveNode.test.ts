@@ -16,7 +16,7 @@
 import assert from 'node:assert/strict';
 
 import { broadcastVstTransport, createVstLiveNode } from './vstLiveNode.ts';
-import { useVstLiveStore } from '../../state/vstLiveStore.ts';
+import { useVstLiveStore, vstLiveLatencySec } from '../../state/vstLiveStore.ts';
 import type { ChainEntry } from '../../state/effectChainStore.ts';
 import type { VstLiveSession, VstSessionRegistry } from './sessionRegistry.ts';
 
@@ -44,8 +44,11 @@ class FakeParam {
 }
 
 class FakeGain {
+  static made: FakeGain[] = [];
   gain = new FakeParam();
-  constructor(readonly name: string) {}
+  constructor(readonly name: string) {
+    FakeGain.made.push(this);
+  }
   connect(dest: { name: string }): unknown {
     edges.add(`${this.name}->${dest.name}`);
     return dest;
@@ -69,6 +72,7 @@ class FakeWorklet {
   static made: FakeWorklet[] = [];
   port = new FakePort();
   name = 'WORKLET';
+  onprocessorerror: (() => void) | null = null;
   constructor(readonly options: Record<string, unknown>) {
     FakeWorklet.made.push(this);
   }
@@ -186,6 +190,7 @@ const reset = () => {
   edges.clear();
   gainSeq = 0;
   FakeWorklet.made = [];
+  FakeGain.made = [];
   useVstLiveStore.setState({ entries: {}, host: { available: null } });
 };
 
@@ -486,6 +491,172 @@ const ctxOf = () => new FakeCtx() as unknown as BaseAudioContext;
   assert.equal(FakeWorklet.made.length, 0);
   assert.deepEqual([...edges].sort(), ['G1->G2', 'G2->G3'].sort(), 'still passing audio — never silent');
   inst.dispose();
+}
+
+/* ── a processor error restores dry, never leaves the entry silently 'live' ─ */
+{
+  reset();
+  const reg = new FakeRegistry();
+  reg.give = reg.session('a');
+  const ctx = new FakeCtx();
+  const inst = createVstLiveNode(ctx as unknown as BaseAudioContext, entry('a'), deps(reg))!;
+  await new Promise((r) => setTimeout(r, 0));
+  useVstLiveStore.getState().setReady('a', {
+    plugin: READY.plugin,
+    pluginLatencySamples: READY.latency_samples,
+    bridgeLatencySamples: 512 * 3,
+    sampleRate: 48000,
+    hasEditor: true,
+  });
+  await new Promise((r) => setTimeout(r, 0));
+
+  const dryGain = FakeGain.made[1];
+  const wetGain = FakeGain.made[3];
+  assert.equal(dryGain.gain.value, 0, 'dry is ramped out once the worklet is live');
+  assert.equal(useVstLiveStore.getState().entries.a.status, 'live');
+  assert.ok(vstLiveLatencySec('a') > 0, 'a real latency is declared while live');
+
+  FakeWorklet.made[0].onprocessorerror?.();
+
+  assert.equal(
+    useVstLiveStore.getState().entries.a.status,
+    'error',
+    'a processor exception is a reported failure, not a silent one',
+  );
+  assert.ok(useVstLiveStore.getState().entries.a.reason, 'the row gets a reason');
+  assert.equal(vstLiveLatencySec('a'), 0, 'declared latency drops with the status');
+  assert.equal(dryGain.gain.value, 1, 'dry is restored so the entry keeps making sound');
+  assert.equal(wetGain.gain.value, 0, 'wet is silenced');
+  assert.equal(edges.has('G1->WORKLET'), false, 'the worklet is disconnected from the input');
+  assert.equal(edges.has('WORKLET->G4'), false, 'and from the wet gain');
+  assert.equal(edges.has('G4->G3'), false, 'wet no longer reaches the output');
+  assert.ok(edges.has('G1->G2'), 'dry stayed wired throughout — only its gain moved');
+  assert.ok(edges.has('G2->G3'), 'through to the output');
+
+  inst.dispose();
+}
+
+/* ── makeWorklet throwing corrects a 'live' status instead of leaving it ──── */
+{
+  reset();
+  const reg = new FakeRegistry();
+  reg.give = reg.session('a');
+  const ctx = new FakeCtx();
+  const throwingDeps = {
+    ...deps(reg),
+    makeWorklet: (): never => {
+      throw new Error('AudioWorkletNode constructor failed');
+    },
+  };
+  const inst = createVstLiveNode(ctx as unknown as BaseAudioContext, entry('a'), throwingDeps)!;
+  await new Promise((r) => setTimeout(r, 0));
+  useVstLiveStore.getState().setReady('a', {
+    plugin: READY.plugin,
+    pluginLatencySamples: READY.latency_samples,
+    bridgeLatencySamples: 512 * 3,
+    sampleRate: 48000,
+    hasEditor: true,
+  });
+  await new Promise((r) => setTimeout(r, 0));
+
+  assert.equal(FakeWorklet.made.length, 0, 'construction never succeeded');
+  assert.equal(
+    useVstLiveStore.getState().entries.a.status,
+    'error',
+    "a failed attach must not leave the row claiming 'live'",
+  );
+  assert.ok(useVstLiveStore.getState().entries.a.reason, 'the row gets a reason');
+  assert.equal(vstLiveLatencySec('a'), 0, 'nothing to compensate for a plugin that never reached the graph');
+  assert.deepEqual([...edges].sort(), ['G1->G2', 'G2->G3'].sort(), 'still just the dry passthrough');
+
+  inst.dispose();
+}
+
+/* ── the store subscription is scoped to this entry, not the whole store ──── */
+{
+  reset();
+  const reg = new FakeRegistry();
+  reg.give = reg.session('a');
+  const ctx = new FakeCtx();
+
+  const store = useVstLiveStore as unknown as { subscribe: (...args: unknown[]) => () => void };
+  const realSubscribe = store.subscribe.bind(useVstLiveStore);
+  let subscribeArgs: unknown[] | null = null;
+  let listenerCalls = 0;
+  store.subscribe = (...args: unknown[]) => {
+    subscribeArgs = args;
+    if (args.length >= 2 && typeof args[1] === 'function') {
+      const original = args[1] as (...a: unknown[]) => void;
+      args[1] = (...a: unknown[]) => {
+        listenerCalls += 1;
+        original(...a);
+      };
+    }
+    return realSubscribe(...args);
+  };
+
+  const inst = createVstLiveNode(ctx as unknown as BaseAudioContext, entry('a'), deps(reg))!;
+  await new Promise((r) => setTimeout(r, 0)); // acquire resolves; not yet live -> subscribes
+
+  store.subscribe = realSubscribe;
+
+  assert.ok(subscribeArgs, 'createVstLiveNode subscribed to the store');
+  assert.equal(subscribeArgs!.length, 2, 'a selector + listener pair, not a single whole-store listener');
+
+  useVstLiveStore.getState().setStatus('b', 'live');
+  useVstLiveStore.getState().setStatus('b', 'error', 'unrelated');
+  useVstLiveStore.getState().addXruns('b', 1);
+  assert.equal(listenerCalls, 0, "another entry's changes never reach this node's listener");
+
+  useVstLiveStore.getState().setStatus('a', 'starting');
+  assert.equal(listenerCalls, 1, "this entry's own status change does reach it");
+
+  inst.dispose();
+}
+
+/* ── dispose unsubscribes: the LISTENER stops firing, not just its downstream
+   effect — attachWorklet's own `disposed` guard would hide a missing
+   unsubscribe (it no-ops on a late 'live' either way), so this counts calls
+   into the listener itself, the same wrapping the scoping test above uses ─ */
+{
+  reset();
+  const reg = new FakeRegistry();
+  reg.give = reg.session('a');
+  const ctx = new FakeCtx();
+
+  const store = useVstLiveStore as unknown as { subscribe: (...args: unknown[]) => () => void };
+  const realSubscribe = store.subscribe.bind(useVstLiveStore);
+  let listenerCalls = 0;
+  store.subscribe = (...args: unknown[]) => {
+    if (args.length >= 2 && typeof args[1] === 'function') {
+      const original = args[1] as (...a: unknown[]) => void;
+      args[1] = (...a: unknown[]) => {
+        listenerCalls += 1;
+        original(...a);
+      };
+    }
+    return realSubscribe(...args);
+  };
+
+  const inst = createVstLiveNode(ctx as unknown as BaseAudioContext, entry('a'), deps(reg))!;
+  await new Promise((r) => setTimeout(r, 0)); // subscribed, not yet live
+
+  store.subscribe = realSubscribe;
+  assert.equal(listenerCalls, 0, 'no status change has happened yet');
+
+  inst.dispose();
+
+  useVstLiveStore.getState().setReady('a', {
+    plugin: READY.plugin,
+    pluginLatencySamples: READY.latency_samples,
+    bridgeLatencySamples: 512 * 3,
+    sampleRate: 48000,
+    hasEditor: true,
+  });
+  await new Promise((r) => setTimeout(r, 0));
+
+  assert.equal(listenerCalls, 0, 'dispose unsubscribed before this status change, so the listener never fires');
+  assert.equal(FakeWorklet.made.length, 0, 'and therefore nothing attaches a late-arriving live status');
 }
 
 console.log('vstLive/vstLiveNode: ok');

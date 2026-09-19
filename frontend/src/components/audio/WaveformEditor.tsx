@@ -104,8 +104,8 @@ import { TimelineGridLayer } from './TimelineGridLayer';
 import { TimelinePrefsPanel } from './TimelinePrefsPanel';
 import {
   ZOOM_FOLLOW_HOLD_MS, ZOOM_STEP_FACTOR, clipChromeLayout, createZoomCoalescer, fitProjectZoom, fitRangeZoom,
-  followHoldActive, localViewportWidth, planZoom, resolveAnchorSec, rulerBarLabels, spanOfClips, viewportWindowSec,
-  wheelDispatch, type ZoomAnchor, type ZoomCoalescer,
+  followHoldActive, localViewportWidth, planZoom, resolveAnchorSec, rulerBarLabels, shouldRescrollAfterZoom,
+  spanOfClips, viewportWindowSec, wheelDispatch, type ZoomAnchor, type ZoomCoalescer,
 } from './timelineZoom';
 import {
   buildClipHitRects, buildRangeMenu, classifyRulerPress, formatCursorTime, formatRangeReadout,
@@ -3285,7 +3285,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   /** Zoom to `nextZoom` px/s (clamped to ZOOM_MIN..ZOOM_MAX) keeping `anchor`
    *  — the edit cursor unless told otherwise, clamped into the project — at
    *  the centre of the viewport where the content allows it. */
-  const requestZoom = useCallback((nextZoom: number, anchor: ZoomAnchor = 'edit-cursor') => {
+  const requestZoom = useCallback((nextZoom: number, anchor: ZoomAnchor = 'edit-cursor', isExplicitCommand = false) => {
     if (!Number.isFinite(nextZoom) || nextZoom <= 0) return;
     const st = useEditorStore.getState();
     const el = timelineScrollRef.current;
@@ -3306,9 +3306,13 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     // anchor on the very next frame; hold it off briefly (it stays armed).
     zoomFollowHoldUntilRef.current = performance.now() + ZOOM_FOLLOW_HOLD_MS;
     if (plan.zoom === st.zoom) {
-      // Same width: nothing to wait for.
+      // Same width: nothing to wait for. A no-op or bound-clamped request —
+      // every wheel tick past ZOOM_MIN/ZOOM_MAX lands here — must not yank the
+      // view back to the anchor; only an explicit command still moves it.
       pendingZoomScrollRef.current = null;
-      writeProgrammaticScrollLeft(el, plan.scrollLeft);
+      if (shouldRescrollAfterZoom(st.zoom, plan.zoom, isExplicitCommand)) {
+        writeProgrammaticScrollLeft(el, plan.scrollLeft);
+      }
       return;
     }
     pendingZoomScrollRef.current = plan.scrollLeft;
@@ -3336,7 +3340,6 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   /** Wheel bursts: one zoom request per animation frame. */
   const zoomCoalescerRef = useRef<ZoomCoalescer | null>(null);
   const requestZoomRef = useRef(requestZoom);
-  requestZoomRef.current = requestZoom;
   if (zoomCoalescerRef.current === null) {
     zoomCoalescerRef.current = createZoomCoalescer({
       schedule: (cb) => requestAnimationFrame(cb),
@@ -3353,7 +3356,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     const el = timelineScrollRef.current;
     if (!el) return;
     const fit = fitRangeZoom(startSec, endSec, measureViewportWidth(el));
-    if (fit) requestZoom(fit.zoom, { sec: fit.centerSec });
+    if (fit) requestZoom(fit.zoom, { sec: fit.centerSec }, true);
   }, [measureViewportWidth, requestZoom]);
 
   /* ── Reveal a clip (F19) ──────────────────────────────────────────────────
@@ -3409,7 +3412,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     const el = timelineScrollRef.current;
     if (!el) return;
     const fit = fitProjectZoom(getTotalDurationSec(), measureViewportWidth(el));
-    if (fit) requestZoom(fit.zoom, { sec: fit.centerSec });
+    if (fit) requestZoom(fit.zoom, { sec: fit.centerSec }, true);
   }, [getTotalDurationSec, measureViewportWidth, requestZoom]);
 
   // --- Keyboard hotkeys ---
@@ -3618,7 +3621,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     setScrollerEl(el);
   }, []);
   const wheelHandlerRef = useRef<(e: WheelEvent) => void>(() => {});
-  wheelHandlerRef.current = (e: WheelEvent) => {
+  const wheelHandler = (e: WheelEvent) => {
     const el = timelineScrollRef.current;
     if (!el) return;
     const target = e.target instanceof Element ? e.target : null;
@@ -4572,7 +4575,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
    *  re-read and the marquee re-evaluated (refreshMarquee). Held in a ref so the
    *  rAF chain always runs the current render's closure. */
   const marqueeAutoscrollRef = useRef<() => void>(() => {});
-  marqueeAutoscrollRef.current = () => {
+  const marqueeAutoscroll = () => {
     marqueeRafRef.current = null;
     const g = marqueeRef.current;
     const el = timelineScrollRef.current;
@@ -4692,7 +4695,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
      then an active gesture is cancelled (its baseline restored); then the clip
      selection clears; then, on a later press, the time range; and only when
      nothing else is selected, the inpaint mask. */
-  timelineEscapeRef.current = () => {
+  const timelineEscape = () => {
     // Any menu, picker or panel that is open owns Escape — it is the thing the
     // user means to dismiss, and several of them close on Escape themselves.
     const menuOpen =
@@ -5284,7 +5287,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
    *  the drop target is re-read from the new scroll offset. Held in a ref so
    *  the rAF chain always runs the current render's closure. */
   const reorderAutoscrollRef = useRef<() => void>(() => {});
-  reorderAutoscrollRef.current = () => {
+  const reorderAutoscroll = () => {
     reorderRafRef.current = null;
     const s = reorderRef.current;
     const header = trackHeaderScrollRef.current;
@@ -5319,6 +5322,19 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     }
     reorderRafRef.current = requestAnimationFrame(() => reorderAutoscrollRef.current());
   };
+
+  /** Five refs whose `.current` must always be this render's closure — an rAF
+   *  loop, a native listener or a keydown handler holds a stable ref but still
+   *  needs to see the current render's props and store reads. One effect, no
+   *  dependency array, so it runs after every render exactly like the
+   *  render-phase writes it replaces. */
+  useLayoutEffect(() => {
+    requestZoomRef.current = requestZoom;
+    wheelHandlerRef.current = wheelHandler;
+    marqueeAutoscrollRef.current = marqueeAutoscroll;
+    timelineEscapeRef.current = timelineEscape;
+    reorderAutoscrollRef.current = reorderAutoscroll;
+  });
 
   const onGripPointerDown = useCallback((e: React.PointerEvent<HTMLButtonElement>, trackId: string) => {
     if (!isPrimaryGestureButton(e, IS_MAC)) return;
@@ -6811,6 +6827,8 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                       onPointerDown={(e) => handleInpaintDragStart(e, clip)}
                       onPointerMove={handleInpaintDragMove}
                       onPointerUp={handleInpaintDragEnd}
+                      onPointerCancel={handleInpaintDragEnd}
+                      onLostPointerCapture={handleInpaintDragEnd}
                     />
                   )}
                   {/* Inpaint selection overlay */}
@@ -7597,6 +7615,9 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             run: () => {
               if (clipId === undefined) return;
               if (!useEditorStore.getState().selectedClipIds.includes(clipId)) selectClipSingle(clipId);
+              // Same read openContextMenu does on a direct right-click, so
+              // "Insert stem…" is populated in the clip menu this opens too.
+              warmClipStems(clips.find((c) => c.id === clipId)?.libraryEntryId);
               clipMenu.open(new MouseEvent('contextmenu', { clientX: menuPos.x, clientY: menuPos.y }), { clipId, atSec: sec });
             },
           },

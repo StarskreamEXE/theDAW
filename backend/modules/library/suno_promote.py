@@ -647,12 +647,16 @@ def build_record(meta: dict[str, Any], api_prefix: str) -> LibraryRecord:
 
 
 def _entry_dir(root: Path, root_normcase: str, entry_id: str) -> Path:
-    """The folder for ``entry_id``, proved to be a direct child of the library.
+    """The folder for ``entry_id``, proved to be inside the library root.
 
-    ``entry_id_for`` already guarantees a name with no separator, so this is a
-    string comparison rather than a ``resolve()`` syscall per entry -- but it
-    is still checked for every folder written, because the id also arrives from
-    a staging database this process did not necessarily create.
+    ``entry_id_for`` already guarantees a name with no separator, so
+    ``root_normcase`` rejects the obviously-wrong case with a cheap string
+    comparison first -- but the string is never the authority: ``entry_id``
+    also arrives from a staging database this process did not necessarily
+    create, or names a folder the OLD importer left on disk, and either one
+    can already be a symlink whose target is nowhere near the library. Only
+    the RESOLVED path decides containment, checked immediately before every
+    write reaches it.
     """
     if (
         not entry_id
@@ -666,6 +670,9 @@ def _entry_dir(root: Path, root_normcase: str, entry_id: str) -> Path:
         raise PromotionRefused(f"refusing to write an entry named {entry_id!r}")
     target = root / entry_id
     if not os.path.normcase(str(target)).startswith(root_normcase + os.sep):
+        raise PromotionRefused(f"{target} is outside the library root {root}")
+    resolved = target.resolve()
+    if root not in resolved.parents:
         raise PromotionRefused(f"{target} is outside the library root {root}")
     return target
 
@@ -702,6 +709,24 @@ def _write_entry(entry_dir: Path, meta: dict[str, Any], *, replace: bool) -> Non
     tmp = entry_dir / "metadata.json.tmp"
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(target)
+
+
+def _existing_metadata(entry_dir: Path) -> tuple[Optional[dict[str, Any]], bool]:
+    """The entry's own ``metadata.json``, with a parse failure told apart from
+    "no file yet". ``_read_metadata`` already collapses both to ``None`` --
+    exactly right for a normal read, wrong for an update, where the two must
+    be handled differently: nothing to merge over, versus something already
+    there that an update must never destroy.
+
+    Returns ``(metadata, unreadable)``. ``unreadable`` is true only when a
+    file is present but could not be parsed as a JSON object.
+    """
+    if not (entry_dir / "metadata.json").is_file():
+        return None, False
+    parsed = _read_metadata(entry_dir)
+    if not isinstance(parsed, dict):
+        return None, True
+    return parsed, False
 
 
 # ---------------------------------------------------------------------------
@@ -1160,14 +1185,29 @@ def _promote_page(
                     other_titles=other_titles.get(asset.id, ()),
                 )
 
-            def edits_on_disk() -> UserEdits:
-                return user_edits_from(
-                    _read_metadata(entry_dir) or {},
-                    summaries.get(entry_id),
-                    namespace=asset.namespace,
+            def merged_update(old_meta: dict[str, Any]) -> dict[str, Any]:
+                """Everything the entry already has, with only the
+                provider-owned keys ``build_metadata`` produces refreshed.
+                A staged value ``build_metadata`` could not resolve this run
+                -- an unknown duration, no local audio found -- is simply
+                absent from its dict, so the merge leaves whatever the entry
+                already carries for that key exactly as it was."""
+                edits = user_edits_from(
+                    old_meta, summaries.get(entry_id), namespace=asset.namespace
                 )
+                return {**old_meta, **render(edits)}
 
-            meta = render(edits_on_disk() if is_update else None)
+            if is_update:
+                old_meta, unreadable = _existing_metadata(entry_dir)
+                if unreadable:
+                    report.note_failure(
+                        f"{asset.external_id}: existing metadata.json at "
+                        f"{entry_dir} is not valid JSON; left untouched"
+                    )
+                    continue
+                meta = merged_update(old_meta or {})
+            else:
+                meta = render(None)
             if not report.dry_run:
                 try:
                     _write_entry(entry_dir, meta, replace=is_update)
@@ -1175,8 +1215,19 @@ def _promote_page(
                     # There IS an entry here, it just had no row -- the old
                     # importer wrote folders straight to disk. Re-render it as
                     # the update it is rather than overwrite the user's copy.
+                    # Re-resolved, not reused: an unindexed folder left by the
+                    # old importer is exactly the kind of thing that could
+                    # already be a symlink.
+                    entry_dir = _entry_dir(root, root_normcase, entry_id)
+                    old_meta, unreadable = _existing_metadata(entry_dir)
+                    if unreadable:
+                        report.note_failure(
+                            f"{asset.external_id}: existing metadata.json at "
+                            f"{entry_dir} is not valid JSON; left untouched"
+                        )
+                        continue
                     is_update = True
-                    meta = render(edits_on_disk())
+                    meta = merged_update(old_meta or {})
                     _write_entry(entry_dir, meta, replace=True)
         except (PromotionRefused, OSError) as exc:
             report.note_failure(f"{asset.external_id}: {exc}")

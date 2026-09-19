@@ -266,6 +266,52 @@ export function createVstLiveNode(
     );
   };
 
+  /** Undo the crossfade so the dry path alone reaches the output, and tell
+   *  the store this entry is no longer live. Used both when a worklet never
+   *  makes it into the graph (`makeWorklet` throws) and when a live one dies
+   *  (`onprocessorerror`) — in both cases the entry must keep making sound,
+   *  and the store must stop claiming it is live, or PDC keeps compensating
+   *  for a plugin that is not (or no longer) in the path. */
+  const failLive = (reason: string): void => {
+    if (disposed) return;
+    const t = ctx.currentTime;
+    dry.gain.cancelScheduledValues(t);
+    dry.gain.setValueAtTime(dry.gain.value, t);
+    dry.gain.linearRampToValueAtTime(1, t + SWAP_RAMP_SEC);
+    if (wet) {
+      wet.gain.cancelScheduledValues(t);
+      wet.gain.setValueAtTime(wet.gain.value, t);
+      wet.gain.linearRampToValueAtTime(0, t + SWAP_RAMP_SEC);
+    }
+    liveNodes.delete(portEntry);
+    if (worklet) {
+      worklet.port.onmessage = null;
+      worklet.onprocessorerror = null;
+      try {
+        input.disconnect(worklet); // only the input->worklet edge, not input->dry
+      } catch {
+        /* already gone */
+      }
+      try {
+        worklet.disconnect();
+      } catch {
+        /* already gone */
+      }
+    }
+    try {
+      wet?.disconnect();
+    } catch {
+      /* already gone */
+    }
+    worklet = null;
+    wet = null;
+    if (session) session.audioSink = null;
+    // Not 'live' from here on, so entryLatencySamples/vstLiveLatencySec read 0
+    // for this entry — vstLiveStore's "0 unless live" rule, not a field this
+    // function has to zero itself.
+    useVstLiveStore.getState().setStatus(entry.id, 'error', reason);
+  };
+
   /** Splice the worklet between input and output with a short crossfade. */
   const attachWorklet = (s: VstLiveSession): void => {
     if (disposed || worklet) return;
@@ -284,13 +330,24 @@ export function createVstLiveNode(
       });
     } catch {
       // The module is not registered on this context (a rebuild raced the
-      // load). The dry path is still connected, so nothing goes silent; the
-      // next store tick or rebuild tries again.
+      // load), or construction otherwise failed. The dry path never left, so
+      // nothing is silent — but the status flip to 'live' is what got this
+      // call made, and the store still believes it: left alone, PDC would
+      // compensate for a plugin that never reached the graph.
+      failLive('failed to attach the live worklet');
       return;
     }
     worklet = node;
     wet = ctx.createGain();
     wet.gain.value = 0;
+    // A processor exception ends the worklet's own output, not this function
+    // — without a handler the entry would sit at dry-gain-0 with nothing
+    // feeding wet: silence disguised as 'live'. Guard against a stale event
+    // from a node that a previous failure/rebuild has already replaced.
+    node.onprocessorerror = () => {
+      if (worklet !== node) return;
+      failLive('AudioWorklet processor error');
+    };
     node.port.onmessage = (ev: MessageEvent) => {
       const data = ev.data as { type?: string } | undefined;
       if (data?.type === 'block') onBlockFromWorklet(data as never);
@@ -371,13 +428,15 @@ export function createVstLiveNode(
       attachWorklet(s);
       return;
     }
-    unsubStore = useVstLiveStore.subscribe((state) => {
-      const status = state.entries[entry.id]?.status;
-      if (status === 'live') attachWorklet(s);
-      // A session that drops tells the worklet to pass dry signal through; the
-      // client is already reconnecting underneath.
-      else if (worklet) portEntry.post({ type: 'live', live: false });
-    });
+    unsubStore = useVstLiveStore.subscribe(
+      (state) => state.entries[entry.id]?.status,
+      (status) => {
+        if (status === 'live') attachWorklet(s);
+        // A session that drops tells the worklet to pass dry signal through;
+        // the client is already reconnecting underneath.
+        else if (worklet) portEntry.post({ type: 'live', live: false });
+      },
+    );
   })();
 
   return {

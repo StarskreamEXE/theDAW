@@ -4,7 +4,7 @@ import { logError, logInfo } from './logStore';
 import { uuid } from '../orb-kit/utils';
 import { useLibraryStore } from './libraryStore';
 import { usePlayerStore } from './playerStore';
-import { useEffectChainStore, EFFECT_LABELS, MIX_RACK_IDS, type VstStateHost } from './effectChainStore';
+import { useEffectChainStore, EFFECT_LABELS, MIX_RACK_IDS, vstStateHost, type VstStateHost } from './effectChainStore';
 import { useAdvancedEditorSourceStore } from './advancedEditorStore';
 import { getRackEffect, buildEffectChain, ensureChopModule, ensureGranularModule } from '../lib/rackEffects';
 import { encodeWav } from '../lib/wavEncode';
@@ -39,11 +39,13 @@ interface StudioStoreState {
   processAudio: (payload: { effect: string; params: Record<string, number>; skipLibrary?: boolean; quiet?: boolean }) => Promise<void>;
   // VST3 chain stage: uploads the current audio + plugin path to
   // /api/vst/process-file (mirrors processAudio) and returns processed audio.
-  // `stateHost` names WHICH host captured `rawState`. A VST3 state blob is not
-  // portable between theDAW's live host and the pedalboard renderer, so the
-  // render has to go back through the one that wrote it. Omitted (or
-  // 'pedalboard') leaves the request byte-for-byte what it always was, which is
-  // what every pre-existing project and every older backend expects.
+  // `stateHost` names WHICH host captured `rawState`. Plugin state IS
+  // interchangeable between theDAW's live host and the pedalboard renderer
+  // (measured: parameters restore exactly, containers are byte-identical) —
+  // `stateHost` doesn't gate whether the state can be reused, only which
+  // renderer processes the request. Omitted (or 'pedalboard') leaves the
+  // request byte-for-byte what it always was, which is what every
+  // pre-existing project and every older backend expects.
   processVst: (payload: { pluginPath: string; pluginName: string; params: Record<string, number>; rawState?: string; stateHost?: VstStateHost; skipLibrary?: boolean; quiet?: boolean }) => Promise<void>;
   // Runs the enabled effects in useEffectChainStore in series over the
   // source in useAdvancedEditorSourceStore, then imports the final result
@@ -255,8 +257,9 @@ export const useStudioStore = create<StudioStoreState>()((set, get) => ({
     // Only the 'thedaw' case is sent: absent means the backend's existing
     // pedalboard path, which is what an old project (and an old backend) must
     // keep getting. A failure from the 'thedaw' path is reported as the backend
-    // words it and NOT retried through pedalboard — a silent fall back would
-    // render a blob that host cannot read and call it a success.
+    // words it and NOT retried through pedalboard — the entry asked for a
+    // specific renderer, and silently swapping renderers would change the
+    // rendered result, so the failure is surfaced instead of masked.
     if (stateHost === 'thedaw') form.append('state_host', 'thedaw');
 
     try {
@@ -404,6 +407,7 @@ export const useStudioStore = create<StudioStoreState>()((set, get) => ({
               pluginName: entry.vst.plugin_name,
               params: entry.params,
               rawState: entry.vst.raw_state,
+              stateHost: vstStateHost(entry.vst),
               skipLibrary: true,
               quiet: true,
             });

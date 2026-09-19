@@ -4,12 +4,20 @@
 //
 //   vst3_probe --list <path>
 //   vst3_probe --load <path> [--name N | --class-id X] [--rate 48000] [--block 512]
-//              [--channels 2] [--state-in F] [--process-seconds S] [--state-out F]
-//              [--editor-seconds S] [--host-name N] [--iid-log] [--state-before-activate]
+//              [--channels 2] [--state-in F] [--set-param I=V ...] [--process-seconds S]
+//              [--state-out F] [--editor-seconds S] [--host-name N] [--iid-log]
+//              [--state-before-activate]
 //   vst3_probe --selftest            (no plugin: pins the state container's codec)
 //
 // Exit codes match the host's: 0 clean, 2 bad arguments, 3 plugin file not found,
 // 4 plugin failed to load or initialise, 5 unsupported bus layout.
+//
+// --set-param <index-or-id>=<normalized 0..1> is repeatable and applied right after the plugin
+// is prepared: setParamNormalized() reaches the controller, flushParameters() then delivers the
+// same edit to the processor through a zero-sample process() call, exactly as the live host
+// would once audio stops flowing. Applied before the params dump and before --state-out, so both
+// reflect the requested values. A malformed pair, an out-of-range value or an id/index that does
+// not name a real parameter is rejected with exit code 2 and a one-line message on stderr.
 #include <windows.h>
 // WIN32_LEAN_AND_MEAN drops OLE from windows.h, and plugin editors need an STA.
 #include <objbase.h>
@@ -44,6 +52,15 @@ constexpr int kExitNotFound = 3;
 constexpr int kExitLoadFailed = 4;
 constexpr int kExitBadLayout = 5;
 
+// One "<index-or-id>=<value>" pair off the command line. Whether `id` names a parameter's index
+// or its VST3 ParamID can only be resolved once the plugin's parameter list exists, so that
+// happens later in runLoad(); this struct only holds what parsing itself can already validate.
+struct SetParamArg {
+    long long id = 0;      // the index-or-id token, already confirmed non-negative
+    double value = 0.0;    // requested normalized value, already confirmed within 0..1
+    std::string raw;       // original "index-or-id=value" text, for error messages
+};
+
 struct Options {
     bool list = false;
     std::string pluginPath;
@@ -57,6 +74,7 @@ struct Options {
     std::string stateIn;
     std::string stateOut;
     std::string hostName;
+    std::vector<SetParamArg> setParams;
     bool iidLog = false;
     // Capture the state before the component is activated instead of after, so the
     // state-interchange investigation can test the capture point as a hypothesis.
@@ -161,6 +179,61 @@ bool parseInt(const char* text, int& out) {
     return true;
 }
 
+// Splits and range-checks one --set-param argument. Digits-only on the left (no sign: both an
+// index and a VST3 ParamID are non-negative) and a single '=' are all this can check without a
+// loaded plugin; an id/index that does not name a real parameter is caught later in runLoad().
+bool parseSetParamArg(const std::string& text, SetParamArg& out, std::string& error) {
+    const std::size_t eq = text.find('=');
+    if (eq == std::string::npos || eq == 0 || eq + 1 >= text.size() ||
+        text.find('=', eq + 1) != std::string::npos) {
+        error = "--set-param wants <index-or-id>=<value>, got: " + text;
+        return false;
+    }
+    const std::string idPart = text.substr(0, eq);
+    const std::string valuePart = text.substr(eq + 1);
+    for (char c : idPart) {
+        if (c < '0' || c > '9') {
+            error = "--set-param id/index must be a non-negative integer: " + idPart;
+            return false;
+        }
+    }
+    long long parsedId = 0;
+    try {
+        std::size_t consumed = 0;
+        parsedId = std::stoll(idPart, &consumed);
+        if (consumed != idPart.size()) {
+            error = "--set-param id/index must be a non-negative integer: " + idPart;
+            return false;
+        }
+    } catch (...) {
+        error = "--set-param id/index is out of range: " + idPart;
+        return false;
+    }
+    // Parsed inline rather than through parseDouble(): that helper only requires that
+    // std::stod() consumed *something*, so "0.5abc" would parse as 0.5 and silently drop the
+    // trailing garbage. A --set-param value must consume the whole token.
+    double parsedValue = 0.0;
+    try {
+        std::size_t consumed = 0;
+        parsedValue = std::stod(valuePart, &consumed);
+        if (consumed != valuePart.size()) {
+            error = "--set-param value must be numeric: " + valuePart;
+            return false;
+        }
+    } catch (...) {
+        error = "--set-param value must be numeric: " + valuePart;
+        return false;
+    }
+    if (!(parsedValue >= 0.0 && parsedValue <= 1.0)) {  // catches NaN too
+        error = "--set-param value must be within 0..1: " + valuePart;
+        return false;
+    }
+    out.id = parsedId;
+    out.value = parsedValue;
+    out.raw = text;
+    return true;
+}
+
 bool parseOptions(int argc, char** argv, Options& options, std::string& error) {
     for (int i = 1; i < argc; ++i) {
         const std::string flag = argv[i];
@@ -187,6 +260,12 @@ bool parseOptions(int argc, char** argv, Options& options, std::string& error) {
             if (!needValue(options.stateIn)) return false;
         } else if (flag == "--state-out") {
             if (!needValue(options.stateOut)) return false;
+        } else if (flag == "--set-param") {
+            std::string value;
+            if (!needValue(value)) return false;
+            SetParamArg arg;
+            if (!parseSetParamArg(value, arg, error)) return false;
+            options.setParams.push_back(arg);
         } else if (flag == "--host-name") {
             if (!needValue(options.hostName)) return false;
         } else if (flag == "--iid-log") {
@@ -509,6 +588,49 @@ int runLoad(const Options& options) {
                         jsonMember("error", jsonString(applied ? std::string() : error))})));
     }
 
+    // --set-param: applied after any --state-in restore (so it can override a restored preset)
+    // and before the params dump and --state-out below, through the same controller + processor
+    // path the live host uses. setParamNormalized() reaches the controller; a VST3 plugin only
+    // reads a parameter change inside IAudioProcessor::process, so flushParameters() delivers the
+    // same edit to the processor via a zero-sample call, matching what the engine does once audio
+    // has stopped flowing.
+    std::vector<std::string> appliedParams;
+    for (const SetParamArg& arg : options.setParams) {
+        const std::vector<ParamInfo> beforeParams = plugin.params();
+        const ParamInfo* target = nullptr;
+        // "index-or-id": a value that names a real parameter position wins; otherwise it is
+        // looked up as a VST3 ParamID. Small plugins often number both the same way, so
+        // resolution order is the only thing that makes the two schemes unambiguous.
+        if (arg.id >= 0 && static_cast<std::size_t>(arg.id) < beforeParams.size()) {
+            target = &beforeParams[static_cast<std::size_t>(arg.id)];
+        } else {
+            for (const ParamInfo& candidate : beforeParams) {
+                if (candidate.id == static_cast<std::uint32_t>(arg.id)) {
+                    target = &candidate;
+                    break;
+                }
+            }
+        }
+        if (target == nullptr) {
+            const std::string message = "--set-param: unknown parameter id/index: " + arg.raw;
+            printErrorJson(message);
+            std::fprintf(stderr, "%s\n", message.c_str());
+            return kExitBadArgs;
+        }
+        const std::int32_t targetIndex = target->index;
+        const std::uint32_t targetId = target->id;
+        plugin.setParamNormalized(targetIndex, arg.value);
+        plugin.flushParameters();
+        const double readback = plugin.params()[static_cast<std::size_t>(targetIndex)].value;
+        appliedParams.push_back(jsonObject({
+            jsonMember("id", jsonInt(static_cast<long long>(targetId))),
+            jsonMember("index", jsonInt(targetIndex)),
+            jsonMember("requested", jsonNumber(arg.value)),
+            jsonMember("readback", jsonNumber(readback)),
+        }));
+    }
+    members.push_back(jsonMember("applied_params", jsonArray(appliedParams)));
+
     const std::vector<ParamInfo> parameters = plugin.params();
     members.push_back(jsonMember("param_count", jsonInt(static_cast<long long>(parameters.size()))));
     {
@@ -632,6 +754,7 @@ int main(int argc, char** argv) {
     std::string error;
     if (!parseOptions(argc, argv, options, error)) {
         printErrorJson(error);
+        std::fprintf(stderr, "%s\n", error.c_str());
         return kExitBadArgs;
     }
 

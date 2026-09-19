@@ -214,4 +214,33 @@ const PLUGIN: VstLivePlugin = {
   assert.equal(st().entries.rejected.stateReason, undefined, 'and drops the stale reason with it');
 }
 
+/* ── subscribeWithSelector: a listener only fires for the slice it watches ──
+   vstLiveNode relies on this to scope its subscription to one entry's status
+   instead of waking up for every entry in the store. */
+{
+  reset();
+  st().setStatus('a', 'starting');
+  st().setStatus('b', 'starting');
+
+  const seenA: (string | undefined)[] = [];
+  const unsub = useVstLiveStore.subscribe(
+    (s) => s.entries.a?.status,
+    (status) => seenA.push(status),
+  );
+
+  st().setStatus('b', 'live'); // unrelated entry — must not reach a selector scoped to 'a'
+  st().addXruns('b', 1);
+  assert.deepEqual(seenA, [], "another entry's changes do not invoke a selector scoped to 'a'");
+
+  st().setStatus('a', 'live');
+  assert.deepEqual(seenA, ['live'], "this entry's own change does");
+
+  st().setStatus('a', 'live'); // same value again — no change to report
+  assert.deepEqual(seenA, ['live'], 'setting the same status again is not a change');
+
+  unsub();
+  st().setStatus('a', 'error', 'x');
+  assert.deepEqual(seenA, ['live'], 'unsubscribing stops delivery');
+}
+
 console.log('vstLiveStore: ok');

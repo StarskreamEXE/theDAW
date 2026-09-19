@@ -1594,6 +1594,12 @@ function syncTrackLatency(): void {
   // Ahead of the signature gate below, which cannot see this number move; see
   // `refreshOutputLatency`.
   refreshOutputLatency(rows);
+  // Also ahead of the gate, for the same reason: a lone or already-slowest
+  // track holds `compSec` at 0 no matter how far its `latencySec` sits past
+  // `COMP_MAX_DELAY`, so the clamp verdict can flip without moving `sig` at
+  // all. Gating this call on the write-skip below reports a clamp once and
+  // then never again, and never un-reports one that clears (R1 finding 6).
+  noteCompClamp(rows, s.tracks, { graph: s.routing, buses: s.buses });
   // Skip the writes when the alignment has not moved, so a knob turn (which
   // reaches here because a declaration MAY depend on params) does not put a
   // `setTargetAtTime` on every track for numbers that are already there.
@@ -1601,7 +1607,6 @@ function syncTrackLatency(): void {
   if (sig === lastCompSig) return;
   lastCompSig = sig;
   applyCompDelays(rows, (id) => trackNodes.get(id)?.comp, ctx.currentTime);
-  noteCompClamp(rows, s.tracks, { graph: s.routing, buses: s.buses });
 }
 
 /**
@@ -1626,7 +1631,7 @@ function syncTrackLatency(): void {
  * Reads the store and writes a boolean; it does NOT touch the compensation
  * math, which stays exactly as `trackCompDelays` computed it.
  */
-function noteCompClamp(
+export function noteCompClamp(
   rows: readonly TrackCompRow[],
   tracks: readonly EditorTrack[],
   routing?: LatencyRouting,

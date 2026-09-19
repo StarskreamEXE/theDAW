@@ -26,7 +26,8 @@
  *
  * PURE: no audio context, no DOM, no allocation in `pull`. `public/vst-bridge.
  * worklet.js` runs the same algorithm by hand (a worklet cannot import app
- * source) — change both together.
+ * source) — change both together. Mirrored 1:1: `push()` <-> `pushProcessed()`,
+ * `pull()` <-> `pullProcessed()`.
  *
  * WHY TWO BLOCKS. T40a measured the native host's loopback round trip at
  * 0.12–0.15 ms average and 0.3 ms p99 per 512-frame block, against a block
@@ -86,6 +87,11 @@ export class JitterBuffer {
 
   private queue: QueuedBlock[] = [];
   private _primed = false;
+  /** True from construction, and again on every re-prime, until `pull` first
+   *  drains real audio. While true, `push` caps the queue to the nominal depth
+   *  so a late prime or a post-underrun burst cannot leave the buffer holding
+   *  more than it declared — see `push` below. */
+  private _pendingFirstDrain = true;
   private _queuedFrames = 0;
   private _underruns = 0;
   private _overflows = 0;
@@ -128,7 +134,9 @@ export class JitterBuffer {
     return this._underruns;
   }
 
-  /** Blocks dropped because the queue hit `maxBlocks`. */
+  /** Blocks dropped because the queue was too deep — either it hit
+   *  `maxBlocks`, or a late prime / re-prime left more than the nominal depth
+   *  queued before the first drain. */
   get overflows(): number {
     return this._overflows;
   }
@@ -183,6 +191,22 @@ export class JitterBuffer {
     // blockSize. Priming one block earlier would declare a delay to PDC that
     // the buffer does not actually hold.
     if (!this._primed && this.queue.length > this.bufferBlocks) this._primed = true;
+    // A late prime (pushes keep arriving before `pull` ever drains real audio)
+    // or a post-underrun burst can queue MORE than the nominal depth before
+    // draining starts. Left alone, that excess is a permanent extra delay:
+    // once push and pull settle into steady state the depth never shrinks
+    // back (see the file header). So while a drain is still pending, cap the
+    // queue back to exactly `bufferBlocks + 1` blocks, oldest first — the same
+    // policy `maxBlocks` uses above — which re-anchors the offset to the delay
+    // actually declared. (Mirrors `pushProcessed` in
+    // `public/vst-bridge.worklet.js`.)
+    if (this._pendingFirstDrain) {
+      while (this.queue.length > this.bufferBlocks + 1) {
+        const dropped = this.queue.shift();
+        if (dropped) this._queuedFrames -= dropped.channels[0].length - dropped.read;
+        this._overflows += 1;
+      }
+    }
   }
 
   /**
@@ -208,9 +232,11 @@ export class JitterBuffer {
       this.queue.length = 0;
       this._queuedFrames = 0;
       this._primed = false;
+      this._pendingFirstDrain = true;
       return silence();
     }
 
+    this._pendingFirstDrain = false;
     let written = 0;
     while (written < frames) {
       const head = this.queue[0];
@@ -234,6 +260,7 @@ export class JitterBuffer {
   reset(): void {
     this.queue.length = 0;
     this._primed = false;
+    this._pendingFirstDrain = true;
     this._queuedFrames = 0;
     this._underruns = 0;
     this._overflows = 0;

@@ -88,12 +88,12 @@ export const MIX_RACK_IDS: Set<string> = new Set(
 /**
  * Which host produced a plugin's saved `raw_state`.
  *
- * A VST3 state blob is NOT portable between theDAW's own live host and the
- * offline pedalboard renderer — measured, not assumed: iZotope Vinyl and Ozone
- * reject each other's component state outright, and AIR accepts the
- * pedalboard's blob and then ignores it. So the blob alone is not enough to
- * reproduce a sound; the entry has to remember who wrote it, and the offline
- * render has to go back through the SAME host.
+ * Plugin state IS interchangeable between theDAW's own live host and the
+ * offline pedalboard renderer — measured, not assumed: parameters restore
+ * exactly and the captured containers are byte-identical either way. So
+ * `state_host` is not a compatibility gate; it names which renderer should
+ * process the entry, and the offline render goes back through the SAME host
+ * it was captured on for that reason alone.
  *
  * `'pedalboard'` is the old editor sidecar (and the offline renderer). Every
  * project saved before this field existed was captured that way, which is why
@@ -115,8 +115,9 @@ export interface VstNode {
 }
 
 /** The host that produced this node's state, with the compatibility default.
- *  ONE definition, so no caller can decide "absent means live" by accident and
- *  hand an old sidecar blob to a host that will reject it. */
+ *  ONE definition, so no caller can silently re-home a legacy entry onto the
+ *  live renderer by guessing "absent means live" on its own — `state_host`
+ *  selects which renderer processes the entry, it does not gate reuse. */
 export const vstStateHost = (vst: VstNode | undefined): VstStateHost =>
   vst?.state_host === 'thedaw' ? 'thedaw' : 'pedalboard';
 

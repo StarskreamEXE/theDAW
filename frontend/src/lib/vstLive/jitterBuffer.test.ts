@@ -74,6 +74,33 @@ const out = (frames: number, channels = 2): Float32Array[] =>
   assert.deepEqual(Array.from(first[1]), [0.5, 0.5, 0.5, 0.5], 'every channel, planar');
 }
 
+/* ── a late prime is trimmed back to the nominal depth ─────────────────────── */
+{
+  // A host that is slow to start can deliver several blocks in a burst before
+  // anything has ever been pulled. If the extras stayed queued, the buffer
+  // would prime `bufferBlocks + 1` deep as usual but with more already behind
+  // it — and since steady-state push/pull never shrinks the depth back (see
+  // above), that excess would be a permanent extra delay never reported to PDC.
+  // Fixture values are exactly representable in float32 (see the steady-state
+  // block above for why: the buffer stores Float32Array, and 0.1-style values
+  // would come back rounded, making the assertion about IEEE-754 rather than
+  // about the buffer).
+  const jb = new JitterBuffer({ blockSize: 4, channels: 1, bufferBlocks: 2 });
+  jb.push(1, block(0.125, 4, 1));
+  jb.push(2, block(0.25, 4, 1));
+  jb.push(3, block(0.375, 4, 1)); // primes here: exactly bufferBlocks + 1 = 3
+  jb.push(4, block(0.5, 4, 1)); // burst continues after priming, before any pull
+  jb.push(5, block(0.625, 4, 1));
+  assert.equal(jb.primed, true, 'the burst still primes it');
+  assert.equal(jb.queuedBlocks, 3, 'trimmed back to exactly bufferBlocks + 1 blocks');
+  assert.equal(jb.queuedFrames, 12, 'the declared depth in frames: 4 * 3');
+  assert.equal(jb.overflows, 2, 'the 2 excess blocks are counted as dropped');
+
+  const first = out(4, 1);
+  assert.equal(jb.pull(first, 4), true);
+  assert.deepEqual(Array.from(first[0]), [0.375, 0.375, 0.375, 0.375], 'the oldest RETAINED block plays first, not seq 1 or 2');
+}
+
 /* ── steady state: a quantum smaller than a block, and the delay never drifts  */
 {
   // 8-frame blocks drained 2 frames at a time, the way a 128-frame render
@@ -150,6 +177,36 @@ const out = (frames: number, channels = 2): Float32Array[] =>
   assert.equal(jb.underruns, 1, 'recovery does not inflate the count');
 }
 
+/* ── a re-prime burst is also trimmed back to the nominal depth ────────────── */
+{
+  // Same drift risk as a late prime, but triggered by a resync after an
+  // underrun: a host catching back up can dump more than the reserve before
+  // the buffer ever resumes draining.
+  const jb = new JitterBuffer({ blockSize: 4, channels: 1, bufferBlocks: 1 });
+  jb.push(1, block(1, 4, 1));
+  jb.push(2, block(2, 4, 1));
+  assert.equal(jb.primed, true);
+  assert.equal(jb.pull(out(4, 1), 4), true, 'drains block 1, the reserve (block 2) carries the queue');
+  assert.equal(jb.pull(out(4, 1), 4), true, 'drains block 2; queue now empty');
+
+  const starved = out(4, 1);
+  assert.equal(jb.pull(starved, 4), false, 'nothing queued: an underrun');
+  assert.equal(jb.underruns, 1);
+  assert.equal(jb.primed, false);
+
+  // Catch-up burst: 3 blocks arrive before the buffer ever drains again.
+  jb.push(3, block(3, 4, 1));
+  jb.push(4, block(4, 4, 1)); // re-primes here: exactly bufferBlocks + 1 = 2
+  jb.push(5, block(5, 4, 1)); // burst continues after re-priming, before any pull
+  assert.equal(jb.primed, true, 'the reserve is back');
+  assert.equal(jb.queuedBlocks, 2, 'trimmed to bufferBlocks + 1, not left at 3');
+  assert.equal(jb.overflows, 1, 'the one excess block from the re-prime burst is counted');
+
+  const played = out(4, 1);
+  assert.equal(jb.pull(played, 4), true);
+  assert.deepEqual(Array.from(played[0]), [4, 4, 4, 4], 'the oldest RETAINED block plays; seq 3 was dropped');
+}
+
 /* ── a PARTIAL underrun is still silence for the whole quantum ─────────────── */
 {
   // Splicing half a quantum of audio onto half a quantum of silence is a click.
@@ -168,6 +225,14 @@ const out = (frames: number, channels = 2): Float32Array[] =>
 /* ── overflow: a bursty producer is bounded, oldest first ──────────────────── */
 {
   const jb = new JitterBuffer({ blockSize: 2, channels: 1, bufferBlocks: 2 });
+  // Prime and drain once first: this test is about the `maxBlocks` safety net
+  // during ACTIVE draining. A still-priming buffer now enforces the tighter
+  // nominal-depth cap instead (see "a late prime" below), so get past priming
+  // before the burst.
+  jb.push(-3, block(-3, 2, 1));
+  jb.push(-2, block(-2, 2, 1));
+  jb.push(-1, block(-1, 2, 1));
+  assert.equal(jb.pull(out(2, 1), 2), true);
   for (let i = 0; i < 100; i += 1) jb.push(i, block(i, 2, 1));
   assert.ok(jb.queuedBlocks <= jb.maxBlocks, `queue is bounded, held ${jb.queuedBlocks}`);
   assert.ok(jb.overflows > 0, 'and says so rather than growing without limit');

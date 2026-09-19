@@ -34,6 +34,7 @@ add_executable(thedaw-vst-host
     src/engine/SelfTest.cpp
     src/engine/Session.cpp
     src/net/WsFrame.cpp
+    src/net/WsSelfTest.cpp
     src/net/WsServer.cpp
     src/util/Args.cpp
     src/util/AtomicFile.cpp

@@ -554,9 +554,24 @@ def bulk_delete_entries(req: BulkDeleteRequest) -> Any:
                 '"all": true to confirm that is what you mean',
             )
         filters = _entry_filters(spec.kind or "all", spec.q, spec.favorite, spec.source)
-        total_matched = store.db.count_entries_filtered(filters)
-        if total_matched != req.confirm_total:
+        # Read the matching ids FIRST, capped at what the client confirmed.
+        # ``list_entry_ids`` answers at most ``confirm_total + 1`` of them, so
+        # a length equal to ``confirm_total`` can only mean the library still
+        # has exactly that many matches -- no second COUNT needed. Comparing
+        # lengths with no trimming is what makes the deleted set exactly the
+        # confirmed set: the previous code counted first, THEN re-read ids
+        # newest-first and trimmed to the count, so a row written in that gap
+        # landed at the front of the newest-first list and got deleted instead
+        # of the oldest row the client actually confirmed.
+        ids = store.db.list_entry_ids(filters, req.confirm_total)
+        if len(ids) != req.confirm_total:
             # NOTHING has been deleted at this point, and nothing will be.
+            # ``list_entry_ids`` saturates at ``confirm_total + 1``, so its
+            # length is not the true count once the library has drifted by
+            # more than one row -- only the refusal path pays for an exact
+            # COUNT, so the total the client is told to re-confirm against
+            # is real, not a capped stand-in for it.
+            total_matched = store.db.count_entries_filtered(filters)
             return JSONResponse(
                 status_code=409,
                 content={
@@ -567,10 +582,7 @@ def bulk_delete_entries(req: BulkDeleteRequest) -> Any:
                     "total_matched": total_matched,
                 },
             )
-        # ``list_entry_ids`` answers one past its cap, so a row written between
-        # the count and this read would otherwise delete one more entry than the
-        # user confirmed. The confirmed number is the contract; trim to it.
-        ids = store.db.list_entry_ids(filters, total_matched)[:total_matched]
+        total_matched = len(ids)
 
     result = store.delete_entries_bulk(ids)
     return {

@@ -73,6 +73,7 @@ export function TimelinePrefsPanel(p: {
   const clickProfile = useTimelinePrefs((s) => s.clickProfile);
   const gridPreset = useTimelinePrefs((s) => s.gridPreset);
   const grid = useTimelinePrefs((s) => s.grid);
+  const showMasterTrack = useTimelinePrefs((s) => s.showMasterTrack);
   const setWheelProfile = useTimelinePrefs((s) => s.setWheelProfile);
   const setFineZoomSpeed = useTimelinePrefs((s) => s.setFineZoomSpeed);
   const setCoarseZoomSpeed = useTimelinePrefs((s) => s.setCoarseZoomSpeed);
@@ -80,6 +81,7 @@ export function TimelinePrefsPanel(p: {
   const applyGridPreset = useTimelinePrefs((s) => s.applyGridPreset);
   const setGrid = useTimelinePrefs((s) => s.setGrid);
   const setGridVisible = useTimelinePrefs((s) => s.setGridVisible);
+  const setShowMasterTrack = useTimelinePrefs((s) => s.setShowMasterTrack);
   const reset = useTimelinePrefs((s) => s.reset);
 
   // The panel portals outside the Shell's `.edit-theme-scope`, so it carries
@@ -335,6 +337,29 @@ export function TimelinePrefsPanel(p: {
             );
           })}
         </fieldset>
+
+        {/* MASTER ROW */}
+        <section aria-labelledby="timeline-master-row-title" className="flex flex-col gap-2">
+          <h3 id="timeline-master-row-title" className={SECTION_TITLE}>
+            Master row
+          </h3>
+          <div className="flex items-center gap-2">
+            <input
+              id="timeline-show-master-track"
+              name="timeline-show-master-track"
+              type="checkbox"
+              checked={showMasterTrack}
+              onChange={(e) => setShowMasterTrack(e.target.checked)}
+              className="accent-[rgb(var(--et-accent))]"
+            />
+            <label htmlFor="timeline-show-master-track" className="font-bold">
+              Show master track
+            </label>
+          </div>
+          <span className={HINT}>
+            Pins the master above the tracks. It is a view of the master you already have.
+          </span>
+        </section>
 
         {/* GRID */}
         <section aria-labelledby="timeline-grid-title" className="flex flex-col gap-2">

@@ -94,6 +94,19 @@ export function planZoom(a: {
 }
 
 /**
+ * Whether a zoom request should also move scrollLeft. A request that clamped
+ * to the zoom already committed — {@link planZoom} landed on ZOOM_MIN/MAX, or
+ * simply asked for the current zoom — must not rescroll for an incidental
+ * wheel or step nudge: every wheel tick sitting at a bound would otherwise
+ * yank the view back to the anchor. An explicit navigation command (zoom to
+ * selection, zoom to fit) always rescrolls, even when the zoom itself did not
+ * move, because moving the viewport onto its target IS what it asked for.
+ */
+export function shouldRescrollAfterZoom(prevZoom: number, nextZoom: number, isExplicitCommand: boolean): boolean {
+  return isExplicitCommand || finite(prevZoom, 'prevZoom') !== finite(nextZoom, 'nextZoom');
+}
+
+/**
  * The zoom that fits [startSec, endSec] in `viewportWidth` local px with
  * `marginFrac` of the range as margin on each side, and the range's centre
  * (the anchor). Null for an empty or inverted range.

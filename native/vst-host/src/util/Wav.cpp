@@ -1,5 +1,6 @@
 #include "Wav.h"
 
+#include <cstdint>
 #include <cstring>
 #include <limits>
 
@@ -16,6 +17,9 @@ constexpr std::uint16_t kFormatExtensible = 0xFFFE;
 // WAVE files stay under 4 GiB by construction; this host refuses anything near that long before
 // it can overflow a chunk size.
 constexpr std::uint64_t kMaxDataBytes = 0xFFFF0000ull;
+// The on-disk WAV (header + data) this host will read at all; readFileLimited enforces this
+// before a single byte reaches parseWav.
+constexpr std::uint64_t kMaxWavFileBytes = 1024ull * 1024ull * 1024ull;
 constexpr int kMaxChannels = 8;
 
 std::uint16_t readLe16(const std::uint8_t* p) {
@@ -320,7 +324,7 @@ bool readWavFile(const std::string& path, WavAudio& out, std::string& error) {
         return false;
     }
     std::vector<std::uint8_t> bytes;
-    if (!readFile(wide, bytes, error)) return false;
+    if (!readFileLimited(wide, kMaxWavFileBytes, bytes, error)) return false;
     return parseWav(bytes.data(), bytes.size(), out, error);
 }
 

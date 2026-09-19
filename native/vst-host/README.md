@@ -37,6 +37,41 @@ which binary they have.
 
 MSVC settings: `/W4 /WX`, `/O2` release, static CRT (`/MT`), `UNICODE`.
 
+## How the exe gets built
+
+`thedaw-vst-host.exe` is never committed — `native/vst-host/bin/` is
+gitignored, per the Build section above — so it has to come into existence
+one of three ways, and whichever tool you're running tells you which one
+applies.
+
+### Locally
+
+Run `.\build.ps1` yourself. It needs CMake and the Visual Studio Build Tools
+(MSVC) installed; see Build, above, for the exact invocations. The result
+lands at `native/vst-host/bin/thedaw-vst-host.exe`, which is gitignored, so a
+local build is never committed.
+
+### From CI
+
+The `build-vst-host` workflow (`.github/workflows/build-vst-host.yml`) runs on
+`workflow_dispatch`, on pushes to `main` that touch `native/vst-host/**`, and
+on pull requests touching those same paths. It builds Release x64 with the
+VST3 layer and `/WX` both on, runs `--selftest`, then runs
+`tests/test_vst_host_native.py` and `tests/test_vst3_probe.py`, and uploads
+the `thedaw-vst-host-win64` artifact: the host exe, `vst3_probe.exe`, and a
+`SHA256SUMS` file. Downloading that artifact and unzipping it into `bin/` is a
+manual, user-initiated step — theDAW never downloads a binary on its own.
+
+### At launch
+
+`theDAW.bat` runs `scripts/check_vst_host.py` and prints one of its three
+status lines verbatim. If the exe is missing and CMake is on PATH, it then
+asks — via `install/setup.ps1 -VstHost` — whether to build it now. Declining,
+or the build failing, never stops theDAW from starting; live VST hosting is
+simply unavailable for that session. Set `THEDAW_SKIP_VST_HOST_BUILD=1` to
+suppress the offer outright. `theDAW.sh` only ever prints the not-available
+line; it does not offer to build.
+
 ## Running
 
 ```

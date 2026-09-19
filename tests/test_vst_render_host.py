@@ -18,7 +18,10 @@ import base64
 import io
 import json
 import os
+import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -250,4 +253,245 @@ def test_thedaw_missing_plugin_is_still_a_404_before_any_spawn(
     resp = _post(client, tmp_path / "Nope.vst3", wav_bytes, state_host="thedaw")
 
     assert resp.status_code == 404
+    assert pedalboard_spy == []
+
+
+# ---------------------------------------------------------------------------
+# F5a1: never block the event loop, bounded kill, no leaks, size caps
+# ---------------------------------------------------------------------------
+
+
+def test_thedaw_render_does_not_block_the_event_loop(
+    client, plugin_file, wav_bytes, fake_host, render_root, monkeypatch
+):
+    """The render must run off the event loop thread, so a second request is
+    served while the first is still stuck inside the (blocked) subprocess
+    call.
+
+    ``Popen`` itself is wrapped rather than making the fake host slow,
+    because ``tests/fake_vst_host.py`` has no delay hook for ``--render`` and
+    is not in this ticket's write set. Only the first ``communicate()`` call
+    blocks (on a real ``threading.Event``), so the second, concurrent render
+    proceeds against the real fake host normally.
+    """
+    real_popen = vst_router.subprocess.Popen
+    entered = threading.Event()
+    release = threading.Event()
+    call_count = {"n": 0}
+
+    class BlockingPopen:
+        def __init__(self, *args, **kwargs):
+            self._inner = real_popen(*args, **kwargs)
+
+        def communicate(self, timeout=None):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                entered.set()
+                release.wait(timeout=10)
+            return self._inner.communicate(timeout=timeout)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(vst_router.subprocess, "Popen", BlockingPopen)
+
+    with client:
+        slow_result: dict[str, object] = {}
+
+        def run_slow():
+            slow_result["resp"] = _post(
+                client, plugin_file, wav_bytes, state_host="thedaw"
+            )
+
+        slow_thread = threading.Thread(target=run_slow)
+        slow_thread.start()
+        assert entered.wait(timeout=5), "the render never reached communicate()"
+
+        fast_start = time.monotonic()
+        fast_resp = _post(client, plugin_file, wav_bytes, state_host="thedaw")
+        fast_elapsed = time.monotonic() - fast_start
+
+        release.set()
+        slow_thread.join(timeout=10)
+
+    assert fast_resp.status_code == 200, fast_resp.text
+    assert fast_elapsed < 2.0, (
+        f"the fast request waited {fast_elapsed:.3f}s behind the slow one — "
+        "the event loop was blocked"
+    )
+    assert not slow_thread.is_alive(), "the slow render never finished"
+    assert slow_result["resp"].status_code == 200, slow_result["resp"].text
+
+
+def test_thedaw_render_timeout_kills_the_child_and_returns_promptly(
+    client, plugin_file, wav_bytes, fake_host, render_root, monkeypatch, pedalboard_spy
+):
+    """A timeout must kill the child and wait for it with a BOUNDED timeout,
+    never the unbounded wait ``subprocess.run`` performs internally after a
+    kill (review R5 nit #10).
+    """
+    real_popen = vst_router.subprocess.Popen
+    kill_called = threading.Event()
+    communicate_timeouts: list[float | None] = []
+
+    class TimeoutOncePopen:
+        def __init__(self, *args, **kwargs):
+            self._inner = real_popen(*args, **kwargs)
+            self._calls = 0
+
+        def communicate(self, timeout=None):
+            communicate_timeouts.append(timeout)
+            self._calls += 1
+            if self._calls == 1:
+                raise subprocess.TimeoutExpired(cmd="thedaw-vst-host", timeout=timeout)
+            return self._inner.communicate(timeout=timeout)
+
+        def kill(self):
+            kill_called.set()
+            self._inner.kill()
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(vst_router.subprocess, "Popen", TimeoutOncePopen)
+    monkeypatch.setattr(vst_router, "RENDER_TIMEOUT_SECONDS", 0.01)
+
+    started = time.monotonic()
+    resp = _post(client, plugin_file, wav_bytes, state_host="thedaw")
+    elapsed = time.monotonic() - started
+
+    assert resp.status_code == 502
+    assert "did not finish" in resp.json()["detail"]
+    assert kill_called.is_set(), "the timed-out child was never killed"
+    assert len(communicate_timeouts) == 2, "expected one retry after the kill"
+    assert communicate_timeouts[0] == vst_router.RENDER_TIMEOUT_SECONDS
+    # The post-kill wait must be its own short, bounded timeout — never None
+    # (unbounded) and never the full render timeout again.
+    assert communicate_timeouts[1] == vst_router.RENDER_KILL_WAIT_SECONDS
+    assert communicate_timeouts[1] < 30
+    assert elapsed < 5.0, f"the request took {elapsed:.3f}s — a wait wasn't bounded"
+    assert pedalboard_spy == []
+
+
+def test_thedaw_cleans_up_temp_dir_on_timeout(
+    client, plugin_file, wav_bytes, fake_host, render_root, monkeypatch
+):
+    real_popen = vst_router.subprocess.Popen
+
+    class AlwaysTimesOutPopen:
+        def __init__(self, *args, **kwargs):
+            self._inner = real_popen(*args, **kwargs)
+
+        def communicate(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd="thedaw-vst-host", timeout=timeout)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(vst_router.subprocess, "Popen", AlwaysTimesOutPopen)
+
+    resp = _post(client, plugin_file, wav_bytes, state_host="thedaw")
+
+    assert resp.status_code == 502
+    assert list(render_root.glob("*")) == []
+
+
+def test_thedaw_cleans_up_temp_dir_on_unexpected_exception(
+    client, plugin_file, wav_bytes, fake_host, render_root, monkeypatch
+):
+    """A failure mid-stage (not a timeout, not a non-zero exit) must still
+    remove the temp render directory — the cleanup is a ``finally`` around
+    the whole render, not a happy-path-only step.
+    """
+    real_write_bytes = Path.write_bytes
+
+    def flaky_write_bytes(self: Path, data: bytes):
+        if self.name == "state.bin":
+            raise OSError("disk is full")
+        return real_write_bytes(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", flaky_write_bytes)
+
+    resp = _post(
+        client,
+        plugin_file,
+        wav_bytes,
+        state_host="thedaw",
+        raw_state=base64.b64encode(b"some state").decode("ascii"),
+    )
+
+    assert resp.status_code == 500
+    assert list(render_root.glob("*")) == []
+
+
+def test_thedaw_oserror_detail_has_no_absolute_path(
+    client, plugin_file, wav_bytes, fake_host, tmp_path, monkeypatch
+):
+    """``str(OSError)`` includes the failing path (via ``repr(filename)``,
+    which escapes Windows backslashes — a naive ``str(path) in detail`` check
+    would miss the leak); the client must only see the reason (review R5
+    item #6, ``live_host._os_reason``). The directory's distinctive name is
+    checked instead, since that substring survives any backslash escaping.
+    """
+    blocked = tmp_path / "blocked-render-dir"
+    blocked.write_bytes(b"not a directory")
+    monkeypatch.setattr(vst_router, "_RENDER_DIR", blocked)
+
+    resp = _post(client, plugin_file, wav_bytes, state_host="thedaw")
+
+    assert resp.status_code == 500
+    detail = resp.json()["detail"]
+    assert blocked.name not in detail
+    assert "WinError" not in detail
+    assert "Errno" not in detail
+
+
+def test_thedaw_scrubs_absolute_paths_from_the_warnings_header(
+    client, plugin_file, wav_bytes, fake_host, render_root, monkeypatch
+):
+    """A warning the host echoes back must not leak the server's temp-file
+    layout into ``X-Vst-Warnings`` (review R5 item #11).
+    """
+    fixed_work = render_root / "render-fixed"
+    fixed_work.mkdir(parents=True)
+
+    def fake_mkdtemp(prefix="", dir=None):
+        return str(fixed_work)
+
+    monkeypatch.setattr(vst_router.tempfile, "mkdtemp", fake_mkdtemp)
+    in_path = fixed_work / "in.wav"
+    monkeypatch.setenv(
+        "FAKE_VST_HOST_RENDER_WARNINGS",
+        json.dumps([f"clipped samples while reading {in_path}"]),
+    )
+
+    resp = _post(client, plugin_file, wav_bytes, state_host="thedaw")
+
+    assert resp.status_code == 200, resp.text
+    warnings = json.loads(resp.headers["X-Vst-Warnings"])
+    assert not any(str(in_path) in w for w in warnings)
+    assert any("in.wav" in w for w in warnings)
+
+
+def test_thedaw_rejects_an_oversized_upload(
+    client, plugin_file, wav_bytes, fake_host, render_root, monkeypatch, pedalboard_spy
+):
+    monkeypatch.setenv("THEDAW_VST_RENDER_MAX_BYTES", str(len(wav_bytes) - 1))
+
+    resp = _post(client, plugin_file, wav_bytes, state_host="thedaw")
+
+    assert resp.status_code == 413
+    assert pedalboard_spy == []
+    assert list(render_root.glob("*")) == []
+
+
+def test_thedaw_rejects_an_oversized_raw_state(
+    client, plugin_file, wav_bytes, fake_host, render_root, monkeypatch, pedalboard_spy
+):
+    monkeypatch.setattr(vst_router, "_RENDER_MAX_RAW_STATE_CHARS", 8)
+    blob = base64.b64encode(b"far more than eight base64 characters").decode("ascii")
+
+    resp = _post(client, plugin_file, wav_bytes, state_host="thedaw", raw_state=blob)
+
+    assert resp.status_code == 413
     assert pedalboard_spy == []

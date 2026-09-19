@@ -303,7 +303,10 @@ export function buildRangeMenu(a: {
   ];
   if (a.clipId !== undefined) entries.push(row('clip-actions', 'Clip actions…'));
   entries.push(
-    row('render', 'Render selection', 'Range export arrives with the render dialog (F24)'),
+    // F24-7: a range render is the full mix over the time span, not a
+    // per-track bounce, so it never depends on trackId/clipId — only on
+    // whether the range covers any time at all.
+    row('render', 'Render range…', a.range.endSec <= a.range.startSec ? 'The time range is empty' : undefined),
     // Live: the menu only exists while a range does, so `referenceForTimeSelection()`
     // always has a span to describe and the row never needs a reason.
     row('send-assistant', 'Send range to gantasmob0t'),

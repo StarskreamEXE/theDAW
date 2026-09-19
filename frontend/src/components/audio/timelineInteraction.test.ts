@@ -163,9 +163,10 @@ const rows = layoutRows([{ id: 't1', height: H }, { id: 't2', height: H }, { id:
     assert.equal(byAction.get(a)?.enabled, true, a);
     assert.equal(byAction.get(a)?.reason, undefined, a);
   }
+  // F24-7: the render row is enabled and labelled "Render range…" whenever
+  // the range covers more than zero time.
   assert.deepEqual(byAction.get('render'), {
-    action: 'render', label: 'Render selection', enabled: false,
-    reason: 'Range export arrives with the render dialog (F24)',
+    action: 'render', label: 'Render range…', enabled: true,
   });
   // Live (F17/T43): a menu only exists when a range does, so the reference it
   // would build always has a span — the row never needs a reason.
@@ -187,6 +188,19 @@ const rows = layoutRows([{ id: 't1', height: H }, { id: 't2', height: H }, { id:
   assert.deepEqual(empty.find((e) => e.action === 'split'), {
     action: 'split', label: 'Split clips at range edges', enabled: false,
     reason: 'No clip in range crosses an edge',
+  });
+}
+
+// --- Render row: zero-length range disables it (F24-7) ---------------------
+{
+  // A range render is the full mix over the time span — it never depends on
+  // the track or clip under the pointer, only on whether the range is empty.
+  const clips: RangeMenuClip[] = [{ id: 'a', trackId: 't1', startSec: 0, durationSec: 10, midi: false }];
+  const zero: TimeRange = { startSec: 3, endSec: 3, scope: { kind: 'all-tracks' } };
+  const menu = buildRangeMenu({ range: zero, clips, trackId: 't1' });
+  assert.deepEqual(menu.find((e) => e.action === 'render'), {
+    action: 'render', label: 'Render range…', enabled: false,
+    reason: 'The time range is empty',
   });
 }
 

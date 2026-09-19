@@ -20,6 +20,7 @@
  * algorithm in testable form — the two are mirrors and must be changed
  * together. A worklet module is loaded by URL into a separate global scope and
  * cannot import app source, which is why it is written twice rather than once.
+ * Mirrored 1:1: `pushProcessed()` <-> `push()`, `pullProcessed()` <-> `pull()`.
  *
  * NEVER SILENT. Three output sources, all of them audible:
  *   live + primed      -> the plugin's output
@@ -71,6 +72,11 @@ class VstBridgeProcessor extends AudioWorkletProcessor {
     this.queue = [];
     this.queuedFrames = 0;
     this.primed = false;
+    // True from construction, and again on every re-prime (see resync), until
+    // pullProcessed first drains real audio. While true, pushProcessed caps
+    // the queue to the nominal depth. (Mirrors JitterBuffer._pendingFirstDrain
+    // in lib/vstLive/jitterBuffer.ts.)
+    this.pendingFirstDrain = true;
     this.lastSeq = -1;
     this.maxBlocks = Math.max(4, this.bufferBlocks * 4);
     this.underruns = 0;
@@ -147,6 +153,7 @@ class VstBridgeProcessor extends AudioWorkletProcessor {
     this.queuedFrames = 0;
     this.primed = false;
     this.lastSeq = -1;
+    this.pendingFirstDrain = true;
   }
 
   pushProcessed(seq, channels) {
@@ -165,6 +172,19 @@ class VstBridgeProcessor extends AudioWorkletProcessor {
     // than the one declared to plugin-delay compensation. (Mirrors
     // JitterBuffer.push in lib/vstLive/jitterBuffer.ts.)
     if (!this.primed && this.queue.length > this.bufferBlocks) this.primed = true;
+    // A late prime or a post-underrun burst can queue more than the nominal
+    // depth before pullProcessed ever drains real audio; left alone that
+    // excess is a permanent extra delay (steady-state push/pull never shrinks
+    // it back). While a drain is still pending, cap back to exactly
+    // bufferBlocks + 1 blocks, oldest first — the same policy maxBlocks uses
+    // above. (Mirrors JitterBuffer.push in lib/vstLive/jitterBuffer.ts.)
+    if (this.pendingFirstDrain) {
+      while (this.queue.length > this.bufferBlocks + 1) {
+        const dropped = this.queue.shift();
+        if (dropped) this.queuedFrames -= dropped.channels[0].length - dropped.read;
+        this.overflows += 1;
+      }
+    }
   }
 
   /** Read `n` frames out of the dry delay line, `delay` frames behind write. */
@@ -194,6 +214,7 @@ class VstBridgeProcessor extends AudioWorkletProcessor {
       this.resync();
       return false;
     }
+    this.pendingFirstDrain = false;
     let written = 0;
     while (written < n) {
       const head = this.queue[0];

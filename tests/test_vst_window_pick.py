@@ -78,6 +78,31 @@ def test_exactly_80x80_is_accepted():
     assert score_candidates([small], None, our_pid=OUR_PID) is small
 
 
+def test_minimized_window_is_rejected():
+    """A minimized window's rect is parked at Win32's sentinel (-32000,-32000)
+    while IsWindowVisible() still reports True; 160x160 passes MIN_EDGE, so
+    only the offscreen check can catch it."""
+    minimized = editor(rect=(-32000, -32000, -31840, -31840))
+    assert score_candidates([minimized], None, our_pid=OUR_PID) is None
+
+
+def test_minimized_window_loses_to_the_real_editor():
+    """The sentinel is 160x160 = 25,600px2. Give the real editor a SMALLER
+    area (150x120 = 18,000px2) so a scorer missing the offscreen check would
+    still pick the sentinel by area alone — only the offscreen rejection in
+    is_eligible makes this pass."""
+    minimized = editor(hwnd=0x9200, rect=(-32000, -32000, -31840, -31840))
+    win = editor(hwnd=0x2000, w=150, h=120)
+    assert score_candidates([minimized, win], None, our_pid=OUR_PID) is win
+
+
+def test_a_window_on_a_left_hand_monitor_is_still_eligible():
+    """A legitimate secondary monitor to the left of the origin must not be
+    mistaken for the minimized sentinel."""
+    left_monitor = editor(rect=(-1920, 0, -720, 800))
+    assert score_candidates([left_monitor], None, our_pid=OUR_PID) is left_monitor
+
+
 def test_owned_popup_enumerated_first_loses_to_the_editor():
     """Z-order puts a preset browser on top; the editor must still win."""
     popup = editor(
@@ -208,3 +233,9 @@ def test_format_candidate_marks_the_rejects():
     line = format_candidate(editor(visible=False), chosen=False)
     assert "CHOSEN" not in line
     assert "visible=False" in line
+
+
+def test_format_candidate_marks_offscreen():
+    line = format_candidate(editor(rect=(-32000, -32000, -31840, -31840)), chosen=False)
+    assert "OFFSCREEN" in line
+    assert "CHOSEN" not in line

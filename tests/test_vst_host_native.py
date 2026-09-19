@@ -19,6 +19,7 @@ import statistics
 import subprocess
 import sys
 import time
+import wave
 from types import SimpleNamespace
 
 import psutil
@@ -515,6 +516,146 @@ def test_round_trip_latency_over_two_thousand_blocks(capsys):
         )
     budget_ms = BLOCK / SAMPLE_RATE * 1000.0
     assert avg < budget_ms, f"avg {avg:.3f} ms exceeds the {budget_ms:.3f} ms budget"
+
+
+# ---------------------------------------------------------------------------
+# Render
+# ---------------------------------------------------------------------------
+
+
+def test_render_reads_a_wav_larger_than_the_small_file_limit(tmp_path):
+    """A real, multi-hundred-frame WAV must render past AtomicFile's 64 MB control-plane cap."""
+    frame_count = 40_000_000  # mono 16-bit @ 48 kHz: ~76 MB, past the old 64 MB ceiling
+    wav_path = tmp_path / "large.wav"
+    with wave.open(str(wav_path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(SAMPLE_RATE)
+        wav_file.writeframes(bytes(frame_count * 2))
+
+    out_path = tmp_path / "out.wav"
+    proc = run_host(
+        [
+            "--render",
+            "--null-plugin",
+            "--in",
+            str(wav_path),
+            "--out",
+            str(out_path),
+            "--tail-seconds",
+            "0",
+        ],
+        timeout=180,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    payload = next(
+        json.loads(line)
+        for line in proc.stdout.splitlines()
+        if line.strip().startswith("{")
+    )
+    assert payload["ok"] is True
+    assert payload["frames_in"] == frame_count
+    assert out_path.exists()
+    assert out_path.stat().st_size > 0
+
+
+def test_render_refuses_an_over_limit_input(tmp_path):
+    """A file the WAV reader cannot parse must still fail cleanly with exit 7."""
+    bad_path = tmp_path / "not-a-wav.wav"
+    bad_path.write_bytes(b"NOPE" * 3)  # 12 bytes: too small to be a RIFF/WAVE file
+
+    out_path = tmp_path / "out.wav"
+    proc = run_host(
+        [
+            "--render",
+            "--null-plugin",
+            "--in",
+            str(bad_path),
+            "--out",
+            str(out_path),
+            "--tail-seconds",
+            "0",
+        ]
+    )
+    assert proc.returncode == 7, proc.stdout + proc.stderr
+    payload = next(
+        json.loads(line)
+        for line in proc.stdout.splitlines()
+        if line.strip().startswith("{")
+    )
+    assert payload["text"]
+
+
+def test_render_refuses_an_output_larger_than_a_wav(tmp_path):
+    """An output too large for a WAV must be refused before allocating, not after rendering."""
+    wav_path = tmp_path / "tiny.wav"
+    with wave.open(str(wav_path), "wb") as wav_file:
+        wav_file.setnchannels(8)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(768000)
+        wav_file.writeframes(bytes(4 * 8 * 2))
+
+    out_path = tmp_path / "out.wav"
+    start = time.perf_counter()
+    proc = run_host(
+        [
+            "--render",
+            "--null-plugin",
+            "--in",
+            str(wav_path),
+            "--out",
+            str(out_path),
+            "--tail-seconds",
+            "600",
+        ],
+        timeout=20,
+    )
+    elapsed = time.perf_counter() - start
+    assert elapsed < 20, (
+        f"the size refusal took {elapsed:.1f}s instead of failing immediately"
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    payload = next(
+        json.loads(line)
+        for line in proc.stdout.splitlines()
+        if line.strip().startswith("{")
+    )
+    assert payload["ok"] is False
+    assert "larger than a WAV file can hold" in payload["text"]
+    assert not out_path.exists()
+
+
+def test_render_still_succeeds_at_a_normal_tail(tmp_path):
+    """A tail that stays inside the WAV size ceiling must still render normally."""
+    wav_path = tmp_path / "tiny.wav"
+    with wave.open(str(wav_path), "wb") as wav_file:
+        wav_file.setnchannels(8)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(768000)
+        wav_file.writeframes(bytes(4 * 8 * 2))
+
+    out_path = tmp_path / "out.wav"
+    proc = run_host(
+        [
+            "--render",
+            "--null-plugin",
+            "--in",
+            str(wav_path),
+            "--out",
+            str(out_path),
+            "--tail-seconds",
+            "1",
+        ],
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    payload = next(
+        json.loads(line)
+        for line in proc.stdout.splitlines()
+        if line.strip().startswith("{")
+    )
+    assert payload["ok"] is True
+    assert payload["frames_out"] == 4 + 768000
 
 
 # ---------------------------------------------------------------------------

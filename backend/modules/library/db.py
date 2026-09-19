@@ -380,6 +380,12 @@ _MIGRATIONS: list[tuple[int, list[str]]] = [
 
 _FTS_COLUMNS = ("title", "prompt", "tags", "notes", "lyrics")
 
+#: ``schema_meta`` key holding the highest ``entries.rowid`` that
+#: ``_backfill_fts`` has durably indexed. Written in the same commit as the
+#: batch it covers so the backfill can resume after a crash instead of
+#: re-scanning from the top.
+FTS_BACKFILL_ROWID_KEY = "fts_backfill_rowid"
+
 #: fts5 spells "remove this rowid" as an insert whose first value is the
 #: literal string 'delete', followed by the values originally indexed.
 _FTS_DELETE_LEAD = "'delete'"

@@ -50,6 +50,8 @@ import { create } from 'zustand';
 
 import type { RackEffectDef } from '../lib/rackEffects';
 import { getRackEffect } from '../lib/rackEffects';
+import type { RenderRange } from '../lib/render/renderRange';
+import { frameToSec, keptFrameCount } from '../lib/render/renderRange';
 import type { BounceRequest } from '../lib/renderCore';
 import type { ChainEntry } from './effectChainStore';
 
@@ -93,6 +95,16 @@ export interface RenderJob {
   trackId?: string;
   /** Everything the render needs — see `lib/renderCore.BounceRequest`. */
   request: BounceRequest;
+  /**
+   * The time range this render covers (F24). Absent = the whole timeline. A
+   * SNAPSHOT: the user's selection may move while the job waits.
+   *
+   * This is a separate copy from `request.range` (`BounceRequest`, F24-2),
+   * which stays the RENDERER's copy of truth — the run function reads that
+   * one, never this one. This field exists only so the queue pill can say
+   * what a queued render covers without re-deriving it from `request`.
+   */
+  range?: RenderRange;
   status: RenderJobStatus;
   /** 0..1. Binary jobs go 0 → 1; a staged job walks `stage / total`. */
   progress: number;
@@ -124,6 +136,31 @@ export interface RenderJob {
 
 /** What `enqueue` is given: the job minus everything the queue owns. */
 export type RenderJobSeed = Omit<RenderJob, 'id' | 'status' | 'progress'>;
+
+/**
+ * What a job's `range` covers, for the queue pill ('0:34.000 – 1:12.500
+ * (38.500 s)') — built once here so the UI never re-derives frame math from
+ * `job.range` itself. `null` when the job has no range (a whole-timeline
+ * render has nothing to summarise).
+ */
+export function rangeJobSummary(job: Pick<RenderJob, 'range'>): string | null {
+  const { range } = job;
+  if (!range) return null;
+  const startSec = frameToSec(range.startFrame);
+  const keptSec = frameToSec(keptFrameCount(range));
+  const endSec = startSec + keptSec;
+  return `${formatClock(startSec)} – ${formatClock(endSec)} (${keptSec.toFixed(3)} s)`;
+}
+
+/** `m:ss.mmm`, minutes unpadded — the queue pill's clock format. */
+function formatClock(sec: number): string {
+  const totalMs = Math.round(sec * 1000);
+  const minutes = Math.floor(totalMs / 60000);
+  const msInMinute = totalMs - minutes * 60000;
+  const seconds = Math.floor(msInMinute / 1000);
+  const millis = msInMinute - seconds * 1000;
+  return `${minutes}:${String(seconds).padStart(2, '0')}.${String(millis).padStart(3, '0')}`;
+}
 
 /** How many FINISHED jobs the store keeps. Queued and running jobs are never
  *  trimmed — only settled history is, oldest first. */
@@ -206,7 +243,17 @@ export const useRenderJobs = create<RenderJobsState>((set, get) => ({
 
   enqueue: (job) => {
     const id = nextJobId();
-    const full: RenderJob = { ...job, id, status: 'queued', progress: 0 };
+    const full: RenderJob = {
+      ...job,
+      id,
+      status: 'queued',
+      progress: 0,
+      // A value copy, not the caller's own object: `range` is a SNAPSHOT (see
+      // `RenderJob.range` above) and must not move if the caller's selection —
+      // and therefore the object it built this range from — changes after
+      // enqueue but before the job is read back out of the store.
+      range: job.range ? { ...job.range } : undefined,
+    };
     set((s) => ({ jobs: trimHistory([...s.jobs, full]) }));
     return id;
   },
