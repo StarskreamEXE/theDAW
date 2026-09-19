@@ -107,6 +107,11 @@ public:
         lastParamIndex_ = index;
         lastParamValue_ = normalizedValue;
     }
+    // The probe reports edits, not the gestures that bracket them.
+    void onParamGesture(std::int32_t index, bool begin) override {
+        (void)index;
+        (void)begin;
+    }
     void onEditorResized(std::int32_t width, std::int32_t height) override {
         std::lock_guard<std::mutex> lock(mutex_);
         sizeEvents_.push_back({width, height});

@@ -495,6 +495,8 @@ def _render_with_thedaw_host(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             creationflags=_NO_WINDOW,
             env=child_env(),
         )

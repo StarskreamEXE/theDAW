@@ -514,7 +514,9 @@ def test_this_file_carries_no_banned_words() -> None:
     """F2a1 rework, R1 audit finding 1: the banned word must never reappear
     in this file's source, comments included."""
     source = Path(__file__).read_text(encoding="utf-8")
-    assert "genuinely" not in source.lower()
+    # Spelled in two halves: written out whole, this line would be the match.
+    banned = "genu" + "inely"
+    assert banned not in source.lower()
 
 
 # ---------------------------------------------------------------------------
