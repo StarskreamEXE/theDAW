@@ -50,11 +50,14 @@ export interface AuditionState {
   abSide: 'source' | 'candidate';
 }
 
+/** Resting audition state: nothing selected, nothing playing. `abSide`
+ *  starts on 'candidate' — the default is to hear the take under review;
+ *  `toggleAb` flips it to 'source' to compare against the original. */
 export const EMPTY_AUDITION: AuditionState = {
   setId: null,
   selectedId: null,
   playingId: null,
-  abSide: 'source',
+  abSide: 'candidate',
 };
 
 /** Legal lifecycle edges: pending can become ready or dismissed; ready can

@@ -618,6 +618,38 @@ def test_spawn_timeout_leaves_no_process_behind(
     assert wait_until(lambda: not lh.pid_alive(int(found.group(1))), timeout=10)
 
 
+def test_early_exit_detail_includes_the_native_log(
+    manager, plugin_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spawn failure's detail must carry the host's OWN ``--log`` output,
+    not only the pump/stderr capture — see ``LiveSession.log_tail()`` and the
+    module docstring's "Logs" section, which this failure path must mirror.
+    """
+    monkeypatch.setenv("FAKE_VST_HOST_EXIT_CODE", "4")
+    with pytest.raises(lh.LiveHostError) as excinfo:
+        make(manager, plugin_file)
+    assert excinfo.value.status_code == 502
+    assert "fake-host-native:" in excinfo.value.detail, (
+        f"native log missing from the 502 detail: {excinfo.value.detail!r}"
+    )
+
+
+def test_spawn_timeout_detail_includes_the_native_log(
+    tmp_path: Path, plugin_file: Path, fake_host_env: None, monkeypatch
+) -> None:
+    monkeypatch.setenv("FAKE_VST_HOST_HANG", "1")
+    mgr = lh.LiveSessionManager(root=tmp_path / "vst_live", spawn_timeout=1.5)
+    try:
+        with pytest.raises(lh.LiveHostError) as excinfo:
+            make(mgr, plugin_file)
+        assert excinfo.value.status_code == 504
+        assert "fake-host-native:" in excinfo.value.detail, (
+            f"native log missing from the 504 detail: {excinfo.value.detail!r}"
+        )
+    finally:
+        mgr.kill_all()
+
+
 def test_session_cap_is_enforced_with_429(
     tmp_path: Path, plugin_file: Path, fake_host_env: None
 ) -> None:
@@ -753,6 +785,23 @@ def test_dead_sessions_are_purged_after_their_grace_period(
     with pytest.raises(lh.LiveHostError) as excinfo:
         manager.get(session.session_id)
     assert excinfo.value.status_code == 404
+
+
+def test_ttl_purge_archives_the_native_log_too(manager, plugin_file: Path) -> None:
+    """The periodic sweep's TTL purge is a fourth teardown path that must
+    archive both logs, same as an explicit ``delete()``.
+    """
+    session = make(manager, plugin_file)
+    assert wait_until(lambda: session.native_log_path.is_file(), timeout=10)
+    session.proc.kill()
+    session.proc.wait(timeout=10)
+    manager.reap()
+    session.ended_at = time.time() - (lh.DEAD_SESSION_TTL + 1)
+
+    manager.reap()
+
+    archived_native = manager.archive_dir / f"{session.session_id}-native.log"
+    assert archived_native.is_file()
 
 
 def test_reap_timer_is_not_started_until_a_session_exists(
@@ -893,6 +942,25 @@ def test_session_directory_is_removed_but_the_log_is_archived(
     archived = manager.archive_dir / f"{session.session_id}.log"
     assert archived.is_file()
     assert "listening" in archived.read_text(encoding="utf-8", errors="replace")
+
+
+def test_session_directory_is_removed_but_the_native_log_is_archived_too(
+    manager, plugin_file: Path
+) -> None:
+    """The host's own ``--log`` output must survive teardown alongside the
+    pump/stderr capture — its whole purpose is to outlive the session
+    directory (see ``_archive_log``'s docstring), and before this fix it
+    was archived nowhere.
+    """
+    session = make(manager, plugin_file)
+    assert wait_until(lambda: session.native_log_path.is_file(), timeout=10)
+    manager.delete(session.session_id)
+
+    archived_native = manager.archive_dir / f"{session.session_id}-native.log"
+    assert archived_native.is_file()
+    assert "fake-host-native:" in archived_native.read_text(
+        encoding="utf-8", errors="replace"
+    )
 
 
 def test_archived_logs_are_capped_at_fifty(manager) -> None:

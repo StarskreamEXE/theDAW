@@ -7,7 +7,7 @@
 //  - frontend/src/state/editorStore.ts                 (editCursorSec vs playheadSec/isPlaying)
 //
 // Run with:  cd "C:\Users\skream\projects\_thedaw-batch11/frontend" && node qa/q01-click-cursor.qa.mjs
-import { openApp, createReport, expect, ASSETS_DIR } from './qaLib.mjs';
+import { openApp, createReport, expect, ASSETS_DIR, QA_URL } from './qaLib.mjs';
 
 const report = createReport('q01-click-cursor');
 
@@ -25,6 +25,19 @@ function parseCursorLabel(label) {
   return Number(m[1]) * 60 + Number(m[2]) + Number(m[3]) / 1000;
 }
 
+/** A y coordinate guaranteed to land on a lane row rather than the sticky
+ * ruler strip above it. Closing a right-click context menu returns focus to
+ * the lane and that focus-restore scrolls the lanes content down by exactly
+ * the ruler's height (observed: scrollTop 0 -> 24), which slides the lanes
+ * content's own boundingBox().y up underneath the ruler; a fixed
+ * `lanesBox.y + 20` offset then lands on the ruler instead of a track once
+ * that has happened. Anchoring to the ruler's bottom edge (sticky, so its
+ * boundingBox() does not move with that internal scroll) is stable across
+ * scenarios regardless of run order. */
+function laneRowY(rulerBox, lanesBox) {
+  return Math.max(lanesBox.y, rulerBox.y + rulerBox.height) + 10;
+}
+
 async function waitUntil(fn, { timeout = 5000, interval = 100 } = {}) {
   const start = Date.now();
   for (;;) {
@@ -34,11 +47,43 @@ async function waitUntil(fn, { timeout = 5000, interval = 100 } = {}) {
   }
 }
 
+/** Every run gets a throwaway profile (qaLib.mjs), so the first-run onboarding
+ * tour (frontend/src/onboarding/onboardingStore.ts shouldAutoStart) auto-opens
+ * a modal overlay on every launch and blocks every other click until closed. */
+async function dismissOnboardingTour(page) {
+  const closeBtn = page.getByRole('button', { name: /close tour/i });
+  const appeared = await closeBtn
+    .waitFor({ state: 'visible', timeout: 12000 })
+    .then(() => true)
+    .catch(() => false);
+  if (appeared) await closeBtn.click().catch(() => {});
+}
+
+/** After the first-run tour is skipped, App.tsx surfaces the HOME screen
+ * (useHomeScreenStore showAtStartup) as its own full-screen dialog. */
+async function dismissHomeScreen(page) {
+  const closeBtn = page.getByRole('button', { name: /close home screen/i });
+  const appeared = await closeBtn
+    .waitFor({ state: 'visible', timeout: 8000 })
+    .then(() => true)
+    .catch(() => false);
+  if (appeared) await closeBtn.click().catch(() => {});
+}
+
 async function run() {
   const { browser, context, page, consoleErrors } = await openApp();
   const shot = (name) => page.screenshot({ path: report.shotPath(name) }).catch(() => {});
 
   try {
+    // App.tsx plays a ~14s (up to 24s) particle-splash cinematic behind a
+    // full-screen z-200 overlay before the app is interactive; `?nocinematic`
+    // is the documented bypass ("used by the screenshot/capture harness").
+    await page.goto(`${QA_URL}${QA_URL.includes('?') ? '&' : '?'}nocinematic`, {
+      waitUntil: 'networkidle',
+      timeout: 30000,
+    });
+    await dismissOnboardingTour(page);
+    await dismissHomeScreen(page);
     await page.getByRole('button', { name: /^edit$/i }).first().click();
 
     const ruler = page.locator(RULER_SELECTOR);
@@ -64,7 +109,8 @@ async function run() {
       expect(!(await isPlayingNow()), 'transport should be stopped at the start of this scenario');
       const lanesBox = await lanes.boundingBox();
       if (!lanesBox) throw new Error('lanes container has no bounding box (no tracks?)');
-      const y = lanesBox.y + Math.min(20, lanesBox.height / 2);
+      const rulerBox = await ruler.boundingBox();
+      const y = laneRowY(rulerBox, lanesBox);
 
       const initialSec = await getCursorSec();
       const x1 = lanesBox.x + 60;
@@ -84,7 +130,8 @@ async function run() {
 
     await report.scenario('3: click vs drag decided on pointer-up at a 4px slop', async () => {
       const lanesBox = await lanes.boundingBox();
-      const y = lanesBox.y + Math.min(20, lanesBox.height / 2);
+      const rulerBox = await ruler.boundingBox();
+      const y = laneRowY(rulerBox, lanesBox);
 
       const before3 = await getCursorSec();
       const ox = lanesBox.x + 320;
@@ -110,8 +157,9 @@ async function run() {
     await report.scenario('4: right-click never moves the edit cursor', async () => {
       const before = await getCursorSec();
       const lanesBox = await lanes.boundingBox();
+      const rulerBox = await ruler.boundingBox();
       const x = lanesBox.x + 500;
-      const y = lanesBox.y + Math.min(20, lanesBox.height / 2);
+      const y = laneRowY(rulerBox, lanesBox);
       await page.mouse.click(x, y, { button: 'right' });
       await shot('04-right-click');
       const after = await getCursorSec();
@@ -136,7 +184,8 @@ async function run() {
 
     await report.scenario('2: edit cursor and playhead are separate during playback', async () => {
       const lanesBox = await lanes.boundingBox();
-      await page.mouse.click(lanesBox.x + 60, lanesBox.y + Math.min(20, lanesBox.height / 2), { button: 'right' });
+      const rulerBoxForClick = await ruler.boundingBox();
+      await page.mouse.click(lanesBox.x + 60, laneRowY(rulerBoxForClick, lanesBox), { button: 'right' });
       await shot('02a-add-menu');
       const addMenuItem = page.getByText('Audio from System', { exact: false }).first();
       await addMenuItem.waitFor({ state: 'visible', timeout: 5000 });

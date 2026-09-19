@@ -117,6 +117,56 @@ const checkedClip = (clip: DragClip): DragClip => ({
   sourceDuration: finite(clip.sourceDuration, 'clip.sourceDuration'),
 });
 
+/** `n` if it is a finite number, else `fallback`. The `typeof` guard does the
+ *  work `Number.isFinite` cannot on its own: a field a damaged clip dropped
+ *  entirely arrives here as `undefined`, not as a number to test. */
+const finiteOr = (n: number | undefined, fallback: number): number =>
+  typeof n === 'number' && Number.isFinite(n) ? n : fallback;
+
+/** `n` if it is a finite number greater than zero, else `fallback`. */
+const positiveOr = (n: number | undefined, fallback: number): number =>
+  typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : fallback;
+
+/**
+ * The BOUNDARY between a stored clip — which a damaged project file, a
+ * half-finished import, or an in-flight edit can leave with a `NaN` or a
+ * zero `sourceDuration` — and `checkedClip`'s callers above, which throw on
+ * exactly that instead. `dragClipOf` never throws: every field the trim/slip
+ * math reads is repaired instead of rejected, so a pointer handler reading a
+ * damaged clip mid-gesture degrades instead of crashing out of it.
+ *
+ * `fallbackSourceDuration` is what a caller that knows the real source length
+ * some other way (the decoded audio buffer, say) can offer in place of a
+ * `sourceDuration` that did not survive; it is sanitised the same way a
+ * stored field is, so a bad fallback cannot leak a `NaN` or a negative length
+ * back out either.
+ *
+ * Like the rest of this module, this never touches the source file — only
+ * the numbers a clip carries about it.
+ */
+export function dragClipOf(clip: Partial<DragClip>, fallbackSourceDuration = 0): DragClip {
+  return {
+    startSec: Math.max(0, finiteOr(clip.startSec, 0)),
+    durationSec: positiveOr(clip.durationSec, MIN_CLIP_SEC),
+    offsetIntoSource: Math.max(0, finiteOr(clip.offsetIntoSource, 0)),
+    sourceDuration: positiveOr(clip.sourceDuration, Math.max(0, finiteOr(fallbackSourceDuration, 0))),
+  };
+}
+
+/**
+ * The same boundary as `dragClipOf`, for a fade edit's target. A damaged
+ * `durationSec` reads as the shortest clip there is, rather than tripping
+ * `setFadeIn` / `setFadeOut`'s `finite` check; a damaged fade length reads as
+ * no fade at all rather than a negative or `NaN` one. Never throws.
+ */
+export function fadeTargetOf(clip: Partial<FadeTarget>): FadeTarget {
+  return {
+    durationSec: positiveOr(clip.durationSec, MIN_CLIP_SEC),
+    fadeInSec: positiveOr(clip.fadeInSec, 0),
+    fadeOutSec: positiveOr(clip.fadeOutSec, 0),
+  };
+}
+
 /* ── trim / slip ──────────────────────────────────────────────────────────── */
 
 /** A `clipDragMath` result, with its offset carried back to source seconds. */

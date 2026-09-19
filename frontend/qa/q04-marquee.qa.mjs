@@ -73,28 +73,75 @@ async function marqueeOverlayCount(page) {
   return page.locator(MARQUEE_OVERLAY_SEL).count()
 }
 
-/** Click "Add track", wait for a new [data-track-grip] row, return its center Y (viewport px). */
+/** Waits until a locator's bounding box stops moving (e.g. an add-track auto-scroll
+ *  settling), then returns it. Two reads `intervalMs` apart must match within 1px. */
+async function stableBox(locator, { intervalMs = 150, attempts = 15 } = {}) {
+  let last = null
+  for (let i = 0; i < attempts; i++) {
+    const box = await locator.boundingBox()
+    expect(box, 'element must have a bounding box while waiting for it to settle')
+    if (last && Math.abs(box.y - last.y) < 1 && Math.abs(box.x - last.x) < 1) return box
+    last = box
+    await locator.page().waitForTimeout(intervalMs)
+  }
+  return last
+}
+
+/** Click "Add track", wait for a new [data-track-grip] row, return its DOM index.
+ *  Deliberately does NOT resolve a Y here: the panel re-settles its scroll on every
+ *  add (confirmed by reading the same row's position before/after a LATER add-track
+ *  call and seeing it move), so a Y captured right after this call goes stale the
+ *  moment another track is added. Callers must resolve the Y via trackRowCenterY
+ *  right before they use it, once no more track-count changes are pending. */
 async function addTrackRow(page) {
   const before = await page.locator('[data-track-grip]').count()
-  await page.locator('button[aria-label="Add track"]').click()
+  await page.locator('button[aria-label="Add track"]').click({ timeout: 15000 })
   await page.waitForFunction(
     (n) => document.querySelectorAll('[data-track-grip]').length === n,
     before + 1,
-    { timeout: 5000 },
+    { timeout: 15000 },
   )
-  const box = await page.locator('[data-track-grip]').nth(before).boundingBox()
-  expect(box, 'new track header row must have a bounding box')
+  return before
+}
+
+/** Resolves a track header row's current, settled center Y (viewport px). Always call
+ *  this as late as possible -- immediately before the click that uses it -- since any
+ *  later addTrackRow() call invalidates a previously-read Y (see addTrackRow). */
+async function trackRowCenterY(page, index) {
+  const box = await stableBox(page.locator('[data-track-grip]').nth(index))
+  expect(box, `track row at index ${index} must have a bounding box`)
   return box.y + box.height / 2
 }
 
-/** Right-click empty lane space at (x,y), pick "Audio from System...", feed it a file. */
+/** True if (x,y) in viewport space currently lands on a clip, per the DOM (not a guess). */
+async function pointIsOnClip(page, x, y) {
+  return page.evaluate(
+    ({ x, y }) => !!document.elementFromPoint(x, y)?.closest('[data-clip="1"]'),
+    { x, y },
+  )
+}
+
+/** Right-click empty lane space at (x,y), pick "Audio from System...", feed it a file.
+ *  The track panel's add-track auto-scroll can leave a just-added row's settled Y
+ *  coincident with a clip placed earlier in the setup (see addTrackRow) -- rather than
+ *  silently right-clicking a clip and hanging on a menu item that will never appear,
+ *  nudge downward within the row to find genuinely empty space, or fail with a clear
+ *  diagnostic instead of a bare 15s timeout. */
 async function addAudioClipAt(page, x, y, fileName) {
   const before = await page.locator('[data-clip="1"]').count()
-  await page.mouse.click(x, y, { button: 'right' })
+  let targetY = y
+  for (let nudge = 0; nudge <= 60 && (await pointIsOnClip(page, x, targetY)); nudge += 15) {
+    targetY = y + nudge
+  }
+  expect(
+    !(await pointIsOnClip(page, x, targetY)),
+    `(${x}, ${y}) and nearby points are all covered by an existing clip -- cannot right-click empty lane space there`,
+  )
+  await page.mouse.click(x, targetY, { button: 'right' })
   const item = page.getByText(/Audio from System/i).first()
-  await item.waitFor({ state: 'visible', timeout: 5000 })
+  await item.waitFor({ state: 'visible', timeout: 15000 })
   const [chooser] = await Promise.all([
-    page.waitForEvent('filechooser', { timeout: 5000 }),
+    page.waitForEvent('filechooser', { timeout: 15000 }),
     item.click(),
   ])
   await chooser.setFiles(wav(fileName))
@@ -107,6 +154,18 @@ async function addAudioClipAt(page, x, y, fileName) {
 
 async function clickEmpty(page, x, y) {
   await page.mouse.click(x, y)
+}
+
+/** A Y (viewport px) just below the lowest currently-rendered clip -- read live off the
+ *  DOM every time rather than reusing a box captured earlier in the run, since the track
+ *  panel's settled scroll position moves whenever a track is added (see addTrackRow). */
+async function belowLowestClipY(page) {
+  const bottoms = await page
+    .locator('[data-clip="1"]')
+    .evaluateAll((els) => els.map((el) => el.getBoundingClientRect().bottom))
+  if (bottoms.length) return Math.max(...bottoms) + 40
+  const lanes = await page.locator(LANES_SEL).first().boundingBox()
+  return lanes.y + 20
 }
 
 /** Press-move-hold a marquee gesture; caller decides when to release/cancel. */
@@ -134,16 +193,41 @@ async function main() {
 
   try {
     // ---- Setup: EDIT view, two tracks with one clip each ----
-    await page.click('[data-tour="tab-edit"]')
-    await page.waitForSelector(LANES_SEL, { timeout: 10000 })
+    // A fresh QA data folder shows first-run onboarding on load: the "Welcome"
+    // feature-tour overlay, then a full-screen HOME workspace picker -- both sit
+    // above the tab bar and intercept the tab-edit click until dismissed. Skip
+    // the tour, then prefer HOME's own "Open the Edit workspace" button; fall
+    // back to the tab bar for a warm profile where HOME never appears.
+    // Both onboarding surfaces can take a long time to mount under a busy
+    // multi-agent swarm, so give each a generous budget; a warm profile that
+    // never shows them falls through to the plain tab click.
+    await page.getByText('Skip tour', { exact: true }).click({ timeout: 20000 }).catch(() => {})
+    await page.getByRole('button', { name: 'Open the Edit workspace' }).click({ timeout: 20000 }).catch(async () => {
+      // Warm profile: HOME never appeared (or "show at startup" was off) -- the tab bar is already live.
+      await page.click('[data-tour="tab-edit"]', { timeout: 20000 })
+    })
+    // Whichever path got us here, make sure no onboarding overlay is still mounted --
+    // LANES_SEL is a generic utility-class combo that can false-match a dialog's own
+    // focus-trapped scroll container while a tour/home overlay is still up.
+    await page.waitForSelector('[role="dialog"][aria-modal="true"]', { state: 'detached', timeout: 8000 }).catch(() => {})
+    await page.waitForSelector(LANES_SEL, { timeout: 15000 })
+    const tabPressed = await page.locator('[data-tour="tab-edit"]').getAttribute('aria-pressed').catch(() => null)
+    expect(tabPressed === 'true', `must land on the EDIT tab (aria-pressed=true), got ${tabPressed}`)
+    // The tab flips aria-pressed before the track panel finishes its own (async)
+    // project init -- querying [data-track-grip]/clip counts before that settles
+    // races a DOM that is still empty, so wait for a stable landmark first.
+    await page.waitForSelector('button[aria-label="Add track"]', { state: 'visible', timeout: 20000 })
     await page.keyboard.press('Escape').catch(() => {})
     lanesBox = await page.locator(LANES_SEL).first().boundingBox()
     expect(lanesBox && lanesBox.width > 200, 'lanes container must be visible with a sane width')
 
-    const rowAY = await addTrackRow(page)
-    await addAudioClipAt(page, lanesBox.x + 80, rowAY, 'tone-440-10s.wav')
-    const rowBY = await addTrackRow(page)
-    await addAudioClipAt(page, lanesBox.x + 80, rowBY, 'tone-220-6s.wav')
+    // Add BOTH tracks before resolving either row's Y (see addTrackRow/trackRowCenterY):
+    // adding track B moves track A's settled position, so a Y read between the two
+    // add-track calls would be stale by the time it is used.
+    const idxA = await addTrackRow(page)
+    const idxB = await addTrackRow(page)
+    await addAudioClipAt(page, lanesBox.x + 80, await trackRowCenterY(page, idxA), 'tone-440-10s.wav')
+    await addAudioClipAt(page, lanesBox.x + 80, await trackRowCenterY(page, idxB), 'tone-220-6s.wav')
 
     let states = await clipStates(page)
     expect(states.length === 2, `expected 2 clips after setup, got ${states.length}`)
@@ -173,7 +257,7 @@ async function main() {
   }
 
   await report.scenario('cross-track-marquee-select', async () => {
-    await clickEmpty(page, lanesBox.x + 10, boxB.y + boxB.height + 40) // clear selection
+    await clickEmpty(page, lanesBox.x + 10, await belowLowestClipY(page)) // clear selection
     let s = await clipStates(page)
     expect(!s[0].selected && !s[1].selected, 'precondition: nothing selected before drag')
 
@@ -190,7 +274,7 @@ async function main() {
   })
 
   await report.scenario('modifier-add-toggle-replace', async () => {
-    await clickEmpty(page, lanesBox.x + 10, boxB.y + boxB.height + 40)
+    await clickEmpty(page, lanesBox.x + 10, await belowLowestClipY(page))
     let s = await clipStates(page)
     expect(!s[0].selected && !s[1].selected, 'precondition: nothing selected')
 
@@ -216,7 +300,7 @@ async function main() {
   })
 
   await report.scenario('escape-cancels-restores-baseline', async () => {
-    await clickEmpty(page, lanesBox.x + 10, boxB.y + boxB.height + 40)
+    await clickEmpty(page, lanesBox.x + 10, await belowLowestClipY(page))
     // Baseline: select clip A alone via a plain click on it.
     await page.mouse.click(boxA.x + boxA.width / 2, boxA.y + boxA.height / 2)
     let s = await clipStates(page)
@@ -243,7 +327,7 @@ async function main() {
   })
 
   await report.scenario('marquee-does-not-move-edit-cursor', async () => {
-    await clickEmpty(page, lanesBox.x + 10, boxB.y + boxB.height + 40)
+    await clickEmpty(page, lanesBox.x + 10, await belowLowestClipY(page))
     const before = await editCursorLeft(page)
 
     const startX = Math.min(boxA.x, boxB.x) - 20
@@ -296,9 +380,9 @@ async function main() {
     }
 
     // Add a third track + clip near the far right (currently visible since we scrolled to max).
-    const rowCY = await addTrackRow(page)
+    const idxC = await addTrackRow(page)
     const farX = lanesBox.x + lanesBox.width - 60
-    await addAudioClipAt(page, farX, rowCY, 'noise-5s.wav')
+    await addAudioClipAt(page, farX, await trackRowCenterY(page, idxC), 'noise-5s.wav')
     await setScrollLeft(page, 0)
 
     const states0 = await clipStates(page)
@@ -306,6 +390,9 @@ async function main() {
     expect(clipC.x > lanesBox.x + lanesBox.width - 5, `clip C should start off-screen to the right, box=${JSON.stringify(clipC)}`)
 
     const scrollLeftBefore = await getScrollLeft(page)
+    // Re-resolve row C's Y fresh (placing its clip and scrolling back to 0 can also
+    // move the settled position -- see addTrackRow/trackRowCenterY).
+    const rowCY = await trackRowCenterY(page, idxC)
     // Start a marquee near the left/visible area, then hold at the right edge to autoscroll.
     await page.mouse.move(lanesBox.x + 40, rowCY)
     await page.mouse.down()
@@ -326,10 +413,14 @@ async function main() {
   })
 
   await report.scenario('clip-press-never-starts-marquee', async () => {
-    await clickEmpty(page, lanesBox.x + 10, boxB.y + boxB.height + 40)
-    await page.mouse.move(boxA.x + boxA.width / 2, boxA.y + boxA.height / 2)
+    await clickEmpty(page, lanesBox.x + 10, await belowLowestClipY(page))
+    // Re-read clip A's box live: the previous scenario added a third track, which
+    // (per addTrackRow/trackRowCenterY) moves already-placed clips' settled position.
+    const liveA = (await clipStates(page))[0]
+    expect(liveA, 'clip A must still exist to press on it')
+    await page.mouse.move(liveA.x + liveA.width / 2, liveA.y + liveA.height / 2)
     await page.mouse.down()
-    await page.mouse.move(boxA.x + boxA.width / 2 + 40, boxA.y + boxA.height / 2 + 4, { steps: 6 })
+    await page.mouse.move(liveA.x + liveA.width / 2 + 40, liveA.y + liveA.height / 2 + 4, { steps: 6 })
     const overlayDuringDrag = await marqueeOverlayCount(page)
     await page.screenshot({ path: report.shotPath('06-press-on-clip-no-marquee') })
     await page.mouse.up()

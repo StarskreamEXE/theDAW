@@ -36,15 +36,37 @@ async function waitForBootSplashGone(page) {
   }
 }
 
+/** HomeScreen.tsx (aria-labelledby="home-title") opens at startup whenever its
+ *  persisted `showAtStartup` flag is true (the default for a fresh profile,
+ *  independent of the onboarding tour) and covers the whole viewport
+ *  (`fixed inset-0 z-60`), intercepting clicks on the tab bar underneath. It
+ *  also re-opens after every reload unless "Show at startup" is unchecked —
+ *  this script reloads the page twice, so uncheck it the first time through. */
+async function dismissHomeIfPresent(page) {
+  const closeBtn = page.getByRole('button', { name: 'Close home screen' })
+  try {
+    await closeBtn.waitFor({ state: 'visible', timeout: 3000 })
+  } catch {
+    return // not shown — fine.
+  }
+  const stayAtStartup = page.locator('#home-show-at-startup')
+  if (await stayAtStartup.isChecked().catch(() => false)) {
+    await stayAtStartup.uncheck()
+  }
+  await closeBtn.click()
+  await closeBtn.waitFor({ state: 'detached', timeout: 5000 }).catch(() => {})
+}
+
 /** Switch to the EDIT tab and wait for the WaveformEditor toolbar to mount. */
 async function gotoEdit(page) {
+  await dismissHomeIfPresent(page)
   await page.getByRole('button', { name: 'Edit', exact: true }).click()
-  await page.getByRole('button', { name: 'Timeline preferences' }).waitFor({ state: 'visible', timeout: 15000 })
+  await page.getByRole('button', { name: 'Timeline preferences', exact: true }).waitFor({ state: 'visible', timeout: 15000 })
 }
 
 /** Open the Timeline preferences popover; returns its dialog locator. */
 async function openPrefs(page) {
-  const btn = page.getByRole('button', { name: 'Timeline preferences' })
+  const btn = page.getByRole('button', { name: 'Timeline preferences', exact: true })
   const expanded = await btn.getAttribute('aria-expanded')
   if (expanded === 'true') return page.getByRole('dialog', { name: 'Timeline preferences' })
   await btn.click()
@@ -140,7 +162,7 @@ async function main() {
 
     // 1. Panel opens from its button; every control has a real accessible name.
     await report.scenario('panel opens with real labels on every control', async () => {
-      const btn = page.getByRole('button', { name: 'Timeline preferences' })
+      const btn = page.getByRole('button', { name: 'Timeline preferences', exact: true })
       await expect((await btn.getAttribute('aria-expanded')) === 'false', 'trigger button should start collapsed (aria-expanded=false)')
 
       const dialog = await openPrefs(page)
@@ -175,7 +197,7 @@ async function main() {
 
       const before = await gridAlphaSum(page)
       await expect(before > 0, `expected the grid canvas to have drawn ink at the normal preset, got alpha sum ${before}`)
-      await page.locator(await gridCanvasSelector(page)).screenshot({ path: report.shotPath('02-grid-before-normal') })
+      await gridCanvas(page).screenshot({ path: report.shotPath('02-grid-before-normal') })
 
       dialog = await openPrefs(page)
       await dialog.getByRole('button', { name: 'High contrast' }).click()
@@ -184,7 +206,7 @@ async function main() {
 
       const after = await gridAlphaSum(page)
       afterHighContrastAlpha = after
-      await page.locator(await gridCanvasSelector(page)).screenshot({ path: report.shotPath('02-grid-after-high-contrast') })
+      await gridCanvas(page).screenshot({ path: report.shotPath('02-grid-after-high-contrast') })
 
       await expect(after > before * 1.3, `High contrast preset should draw noticeably more ink than Normal (before=${before}, after=${after})`)
     })
@@ -284,7 +306,7 @@ async function main() {
       await dialog.getByRole('button', { name: /Reset timeline preferences/i }).click()
       await closePrefsWithEscape(page)
 
-      const trigger = page.getByRole('button', { name: 'Timeline preferences' })
+      const trigger = page.getByRole('button', { name: 'Timeline preferences', exact: true })
       await trigger.focus()
       await page.keyboard.press('Enter')
       dialog = page.getByRole('dialog', { name: 'Timeline preferences' })
@@ -326,11 +348,6 @@ async function main() {
     report.finish()
     await browser.close()
   }
-}
-
-/** Selector string for the grid canvas (kept as a helper for element screenshots). */
-async function gridCanvasSelector(_page) {
-  return 'canvas[aria-hidden="true"]'
 }
 
 main().catch((err) => {

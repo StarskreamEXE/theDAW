@@ -1,5 +1,6 @@
 import { useLayoutEffect, useRef, type JSX } from 'react';
 import { computeCanvasBox, effectiveZoom } from '../../lib/canvasScale';
+import { gridCanvasDpr } from '../../lib/timeline/gridCanvasBudget';
 import { gridLines, type GridLevel, type GridLine } from '../../lib/timeline/gridLines';
 
 /**
@@ -72,13 +73,12 @@ export function TimelineGridLayer(p: TimelineGridLayerProps): JSX.Element | null
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const box = computeCanvasBox(
-      0,
-      0,
-      effectiveZoom(canvas),
-      typeof window === 'undefined' ? 1 : window.devicePixelRatio || 1,
-      { cssWidth: widthPx, cssHeight: heightPx },
-    );
+    const layoutZoom = effectiveZoom(canvas);
+    const rawDpr = typeof window === 'undefined' ? 1 : window.devicePixelRatio || 1;
+    // Cap the backing store: this is the largest canvas in the app (full lanes
+    // height x ~3 viewports wide), and lanes height grows with track count.
+    const maxDpr = gridCanvasDpr({ cssWidth: widthPx, cssHeight: heightPx, layoutZoom, dpr: rawDpr });
+    const box = computeCanvasBox(0, 0, layoutZoom, rawDpr, { cssWidth: widthPx, cssHeight: heightPx, maxDpr });
     if (canvas.width !== box.deviceWidth) canvas.width = box.deviceWidth;
     if (canvas.height !== box.deviceHeight) canvas.height = box.deviceHeight;
     // Draw in device pixels so every line lands on a whole or half pixel.

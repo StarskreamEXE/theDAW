@@ -380,6 +380,32 @@ export function createVstLiveNode(
     pushParams(entry.params);
   };
 
+  /** Re-arm an already-attached worklet after a drop-and-reconnect. A dropped
+   *  session leaves the worklet in the graph passing dry signal through (see
+   *  the `live: false` branch below) rather than tearing it out, so the
+   *  return to 'live' must NOT go through `attachWorklet` — its own
+   *  `if (disposed || worklet) return;` guard would make that a no-op, which
+   *  used to be exactly the bug: a reconnected host kept passing dry signal
+   *  for the life of the node, because nothing ever posted `live: true`
+   *  again. */
+  const relive = (s: VstLiveSession): void => {
+    if (disposed || !worklet) return;
+    s.audioSink = onProcessed; // the session object may have been re-created underneath
+    portEntry.post({ type: 'live', live: true });
+    portEntry.post({
+      type: 'transport',
+      playing: lastTransport.playing,
+      positionSamples: lastTransport.positionSamples,
+      tempoBpm: lastTransport.tempoBpm,
+      discontinuity: true, // the respawned plugin has never seen this stream before
+    });
+    // A respawned plugin starts from its state file, not from whatever the
+    // diff map remembers sending last time, so the map must not suppress
+    // this re-push the way it does a same-session param rebuild.
+    sentParams.clear();
+    pushParams(entry.params);
+  };
+
   const pushParams = (params: Record<string, number>): void => {
     const s = session;
     if (!s) return;
@@ -424,19 +450,38 @@ export function createVstLiveNode(
       return;
     }
     session = s;
-    if (useVstLiveStore.getState().entries[entry.id]?.status === 'live') {
-      attachWorklet(s);
-      return;
-    }
+    // Subscribe FIRST, unconditionally — sessionRegistry.acquire hands a
+    // cached session straight back on every chain rebuild (play/stop/seek)
+    // without touching the store, so finding the entry already 'live' here is
+    // the COMMON case, not an edge case. A `return` before subscribing would
+    // leave this node with no listener at all: a later error (processor
+    // crash) has nowhere to send a recovered 'live' back to, so a reconnect
+    // (bridgeClient's own backoff, or the user's retry) could never re-splice
+    // the worklet, leaving the row falsely claiming 'live' over a dry signal.
     unsubStore = useVstLiveStore.subscribe(
       (state) => state.entries[entry.id]?.status,
       (status) => {
-        if (status === 'live') attachWorklet(s);
+        if (status === 'live') {
+          // No worklet yet: the normal first go-live. A worklet already in
+          // the graph means this is a reconnect — a reconnected host used to
+          // keep passing dry signal for the life of the node, because
+          // attachWorklet's own guard made this a no-op; relive() is the
+          // branch that re-arms it instead.
+          if (!worklet) attachWorklet(s);
+          else relive(s);
+        }
         // A session that drops tells the worklet to pass dry signal through;
         // the client is already reconnecting underneath.
         else if (worklet) portEntry.post({ type: 'live', live: false });
       },
     );
+    // `subscribe` only fires on FUTURE transitions, so an entry that is
+    // already live by the time we get here needs this explicit check too;
+    // `attachWorklet`'s own `if (disposed || worklet) return;` guard makes a
+    // duplicate call from a subsequent notification a no-op.
+    if (useVstLiveStore.getState().entries[entry.id]?.status === 'live') {
+      attachWorklet(s);
+    }
   })();
 
   return {

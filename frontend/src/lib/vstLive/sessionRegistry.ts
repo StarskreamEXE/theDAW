@@ -61,6 +61,10 @@ export const VST_LIVE_BUFFER_BLOCKS = 2;
 export const VST_LIVE_CHANNELS = 2;
 /** How long a disposed instance's process is kept before it is reaped. */
 export const VST_LIVE_GRACE_MS = 10_000;
+/** Shown on the row when `isLocalPage` says this page cannot be the one
+ *  hosting the plugin. Plain enough to read on a phone screen. */
+const REMOTE_PAGE_REASON =
+  'Live plugins run only on the computer that has them. This page is open from another device, so this plugin is applied when you freeze or bounce instead.';
 
 /** A running host process and the client talking to it. */
 export interface VstLiveSession {
@@ -96,6 +100,27 @@ export interface VstSessionRegistryDeps {
   /** Where a state rescued from a shutdown goes. Defaults to the module-level
    *  sink installed by `setVstLiveStateSink`. */
   stateSink?: VstLiveStateSink;
+  /** Test seam for `isLocalPage`; defaults to `globalThis.location`. Left
+   *  undefined in both places (a test harness, a worker — nothing that HAS a
+   *  page address) means treat the page as local: only a location we can
+   *  actually read and confirm is elsewhere should refuse a session. */
+  location?: { hostname: string; protocol: string };
+}
+
+/**
+ * Can this page's own address ever be reached by the host it would talk to?
+ *
+ * The live host binds loopback only (see `native/vst-host/src/net/WsServer.cpp`)
+ * and the backend always answers a spawn with `ws://127.0.0.1:<port>` — a URL
+ * that only ever resolves to whatever machine dials it. Opened from anywhere
+ * but that machine (a phone, a second PC on the LAN), the socket can never
+ * connect, no matter how long the client backs off and retries. `app:`/`file:`
+ * cover the packaged desktop app, which has no `http(s):` origin at all but IS
+ * the machine running the host.
+ */
+export function isLocalPage(loc: { hostname: string; protocol: string }): boolean {
+  if (loc.protocol === 'app:' || loc.protocol === 'file:') return true;
+  return loc.hostname === 'localhost' || loc.hostname === '127.0.0.1' || loc.hostname === '[::1]' || loc.hostname === '::1';
 }
 
 export interface VstSessionRegistry {
@@ -103,8 +128,18 @@ export interface VstSessionRegistry {
    *  when there is nothing to host, no host binary, or the spawn failed; the
    *  reason is on the entry's row in `vstLiveStore`. */
   acquire(entry: ChainEntry, sampleRate: number): Promise<VstLiveSession | null>;
-  /** An instance was disposed: start the grace timer. */
+  /** An instance was disposed: start the grace timer (unless another node or a holder remains). */
   release(entryId: string): void;
+  /**
+   * Keep the entry's session alive for something that is NOT an audio node — the plugin's own
+   * editor window. Opens (or reuses) the session exactly like `acquire`, and while a holder
+   * remains the grace timer cannot start. This is what lets "Edit GUI" open the LIVE instance
+   * before the engine has built the chain: when the node arrives later it acquires the same
+   * session, so the window the user is turning knobs in is the plugin they hear.
+   */
+  hold(entry: ChainEntry, sampleRate: number, holder: string): Promise<VstLiveSession | null>;
+  /** Give a hold back. The grace timer starts when no holder and no node is left. */
+  unhold(entryId: string, holder: string): void;
   /** The entry is gone: shut the host down now. */
   close(entryId: string): void;
   /** Project close / page unload. */
@@ -137,6 +172,10 @@ interface Slot {
   recreating: boolean;
   entry: ChainEntry;
   sampleRate: number;
+  /** Audio nodes using the session (acquire +1, release -1). */
+  nodeRefs: number;
+  /** Non-node users, by name (the editor window). */
+  holders: Set<string>;
 }
 
 export function createVstSessionRegistry(deps: VstSessionRegistryDeps = {}): VstSessionRegistry {
@@ -149,6 +188,9 @@ export function createVstSessionRegistry(deps: VstSessionRegistryDeps = {}): Vst
   const stateSink = (entryId: string, rawState: string): void => {
     (deps.stateSink ?? moduleStateSink)?.(entryId, rawState);
   };
+  /** `undefined` here (no dep, and no ambient `location` either) is handled by
+   *  `open()` treating the page as local — see `VstSessionRegistryDeps.location`. */
+  const pageLocation = deps.location ?? globalThis.location;
 
   const slots = new Map<string, Slot>();
   /** null = not probed; a promise while the probe is in flight. */
@@ -231,7 +273,11 @@ export function createVstSessionRegistry(deps: VstSessionRegistryDeps = {}): Vst
     slot.recreating = true;
     void spawn(slot.entry, slot.sampleRate)
       .then((info) => {
-        if (!slot.session) return;
+        if (!slot.session || !slots.has(slot.entry.id)) {
+          // Torn down already: DELETE is swallowed — --parent-pid reaps the process regardless.
+          void vstLiveApi.deleteSession(info.session_id).catch(() => {});
+          return;
+        }
         slot.session.sessionId = info.session_id;
         slot.session.wsUrl = info.ws_url;
         slot.session.pid = info.pid;
@@ -274,6 +320,14 @@ export function createVstSessionRegistry(deps: VstSessionRegistryDeps = {}): Vst
   };
 
   const open = async (entry: ChainEntry, sampleRate: number, slot: Slot): Promise<VstLiveSession | null> => {
+    // Refuse before anything is spawned: a page that is not local is dialing
+    // its OWN loopback, which can never reach the host this would spawn on the
+    // machine that actually has the plugins. No probe, no POST, no retry loop —
+    // just a plain reason on the row.
+    if (pageLocation && !isLocalPage(pageLocation)) {
+      store().setStatus(entry.id, 'unavailable', REMOTE_PAGE_REASON);
+      return null;
+    }
     store().setStatus(entry.id, 'starting');
     // Every open starts from "the plugin holds what the entry holds": the saved
     // state IS sent (see `spawn`), so only the host can contradict that, and a
@@ -353,8 +407,19 @@ export function createVstSessionRegistry(deps: VstSessionRegistryDeps = {}): Vst
     return session;
   };
 
-  return {
-    acquire(entry, sampleRate) {
+  /** Start the reaper for a slot nobody uses any more. */
+  const startGrace = (entryId: string, slot: Slot): void => {
+    if (slot.graceHandle !== null) return;
+    if (slot.nodeRefs > 0 || slot.holders.size > 0) return;
+    slot.graceHandle = schedule(() => {
+      slot.graceHandle = null;
+      // A user that arrived while the timer ran cancels it in ensure(); this is the belt.
+      if (slot.nodeRefs > 0 || slot.holders.size > 0) return;
+      shutdown(entryId, slot);
+    }, graceMs);
+  };
+
+  const ensure = (entry: ChainEntry, sampleRate: number): Promise<VstLiveSession | null> => {
       // Nothing to host: an entry with no plugin path is a broken import, not a
       // reason to wake the backend up.
       if (!entry.vst?.plugin_path) return Promise.resolve(null);
@@ -371,7 +436,7 @@ export function createVstSessionRegistry(deps: VstSessionRegistryDeps = {}): Vst
         if (slot.session) return Promise.resolve(slot.session);
         if (slot.opening) return slot.opening;
       } else {
-        slot = { session: null, opening: null, graceHandle: null, recreating: false, entry, sampleRate };
+        slot = { session: null, opening: null, graceHandle: null, recreating: false, entry, sampleRate, nodeRefs: 0, holders: new Set() };
         slots.set(entry.id, slot);
       }
       const here = slot;
@@ -388,15 +453,33 @@ export function createVstSessionRegistry(deps: VstSessionRegistryDeps = {}): Vst
       });
       here.opening = opening;
       return opening;
+  };
+
+  return {
+    acquire(entry, sampleRate) {
+      const pending = ensure(entry, sampleRate);
+      const slot = slots.get(entry.id);
+      if (slot) slot.nodeRefs += 1;
+      return pending;
     },
 
     release(entryId) {
       const slot = slots.get(entryId);
-      if (!slot || slot.graceHandle !== null) return;
-      slot.graceHandle = schedule(() => {
-        slot.graceHandle = null;
-        shutdown(entryId, slot);
-      }, graceMs);
+      if (!slot) return;
+      slot.nodeRefs = Math.max(0, slot.nodeRefs - 1);
+      startGrace(entryId, slot);
+    },
+
+    hold(entry, sampleRate, holder) {
+      const pending = ensure(entry, sampleRate);
+      slots.get(entry.id)?.holders.add(holder);
+      return pending;
+    },
+
+    unhold(entryId, holder) {
+      const slot = slots.get(entryId);
+      if (!slot || !slot.holders.delete(holder)) return;
+      startGrace(entryId, slot);
     },
 
     close(entryId) {

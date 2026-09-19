@@ -195,7 +195,7 @@ void testOversizedHandshakeIsRefused() {
     SOCKET second = connectLoopback(port);
     check(second != INVALID_SOCKET, "a further client can still connect");
     if (second != INVALID_SOCKET) {
-        check(performHandshake(second), "and complete a normal handshake");
+        check(performHandshake(second, 2000), "and complete a normal handshake");
         closesocket(second);
     }
     server.stop();

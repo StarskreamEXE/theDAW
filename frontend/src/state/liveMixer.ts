@@ -100,6 +100,7 @@ import {
   type ClipTake,
   type CompRegion,
 } from '../lib/clipComp';
+import { isMidiClip } from '../lib/clipEditTarget';
 import type { ChainEntry } from './effectChainStore';
 import {
   CONN_SIDECHAIN,
@@ -1923,10 +1924,7 @@ function buildTrackNodes(tracks: EditorTrack[]): void {
   syncTrackLatency(); // align the freshly built chains before anything plays
 }
 
-/** A MIDI clip = a piano-roll clip carrying its editable notes. */
-function isMidiClip(clip: AudioClip): boolean {
-  return clip.sourceKind === 'piano-roll' && !!clip.sourcePianoRoll && clip.sourcePianoRoll.length > 0;
-}
+// A MIDI clip is whatever lib/clipEditTarget says it is — one classifier for UI and engine.
 
 /* ── Per-clip schedule math ───────────────────────────────────────────────────
    One clip becomes one or more buffer-source plays. With none of T07a's fields

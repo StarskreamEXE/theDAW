@@ -50,6 +50,7 @@ import { REVEAL_CLIP_EVENT, type RevealClipDetail } from '../audio/clipDoubleCli
 import { useAppUiStore } from '../../state/appUiStore';
 import { useLibraryStore } from '../../state/libraryStore';
 import { usePlayerStore } from '../../state/playerStore';
+import { logError } from '../../state/logStore';
 import {
   AUDIO_EDITOR_NUDGE_COARSE_SEC,
   AUDIO_EDITOR_NUDGE_SEC,
@@ -57,6 +58,8 @@ import {
   CLIP_GAIN_DB_MIN,
   clampGainDb,
   dbToGain,
+  dragClipOf,
+  fadeTargetOf,
   fitZoom,
   formatSeconds,
   gainToDb,
@@ -240,13 +243,23 @@ export const AudioEditorPanel: React.FC = () => {
   const rate = clip ? clipStretchRate(clip) : 1;
   /** The clip's own length on the timeline, in TIMELINE seconds. */
   const clipDurationSec = clip ? Math.max(0, sane(clip.durationSec)) : 0;
+  // A clip at rate `r` eats `r` SOURCE seconds per TIMELINE second, so a
+  // missing sourceDuration falls back to the timeline length converted
+  // through the rate — the raw timeline seconds undercounted a stretched clip.
   const sourceDuration = clip
-    ? Math.max(0, sane(clip.sourceDuration) > 0 ? sane(clip.sourceDuration) : clipDurationSec)
+    ? Math.max(0, sane(clip.sourceDuration) > 0 ? sane(clip.sourceDuration) : clipDurationSec * rate)
     : 0;
   /** SOURCE second the clip starts reading at. */
   const readStart = clip ? Math.max(0, sane(clip.offsetIntoSource)) : 0;
   /** SOURCE second the clip stops reading at. */
   const readEnd = clip ? readStart + Math.max(0, sane(clipSourceSpanSec(clip))) : 0;
+  // The sanitised clip every trim/slip/reset model call reads instead of the
+  // raw `clip` — see dragClipOf's doc comment for why a damaged clip degrades
+  // here rather than throwing out of a pointer handler mid-gesture.
+  const dragClip = useMemo(
+    () => (clip ? dragClipOf(clip, clipDurationSec * rate) : null),
+    [clip, clipDurationSec, rate],
+  );
 
   const win = useMemo(
     () => sourceWindow(sourceDuration, viewScrollSec, viewZoom, box.width),
@@ -297,20 +310,20 @@ export const AudioEditorPanel: React.FC = () => {
   /** Move the clip's head so it reads SOURCE second `sec`. */
   const applyTrimStartSource = useCallback(
     (sec: number, write: (u: Partial<AudioClip>) => void) => {
-      if (!clip) return;
-      const next = trimStartTo(clip, rate, clip.startSec + (sec - clip.offsetIntoSource) / rate);
+      if (!dragClip) return;
+      const next = trimStartTo(dragClip, rate, dragClip.startSec + (sec - dragClip.offsetIntoSource) / rate);
       if (next) write(next);
     },
-    [clip, rate],
+    [dragClip, rate],
   );
 
   /** Move the clip's tail so it stops reading at SOURCE second `sec`. */
   const applyTrimEndSource = useCallback(
     (sec: number, write: (u: Partial<AudioClip>) => void) => {
-      if (!clip) return;
-      write(trimEndTo(clip, rate, clip.startSec + (sec - clip.offsetIntoSource) / rate));
+      if (!dragClip) return;
+      write(trimEndTo(dragClip, rate, dragClip.startSec + (sec - dragClip.offsetIntoSource) / rate));
     },
-    [clip, rate],
+    [dragClip, rate],
   );
 
   /* ── pointer gestures on the waveform ──────────────────────────────────── */
@@ -342,7 +355,7 @@ export const AudioEditorPanel: React.FC = () => {
 
   const onGrabMove = (e: React.PointerEvent) => {
     const grab = grabRef.current;
-    if (!grab || !clip) return;
+    if (!grab || !clip || !dragClip) return;
     const sec = sourceSecAtClientX(e.clientX);
     switch (grab.kind) {
       case 'trim-start':
@@ -352,10 +365,10 @@ export const AudioEditorPanel: React.FC = () => {
         applyTrimEndSource(sec, writeDrag);
         break;
       case 'fade-in':
-        writeDrag(setFadeIn(clip, (sec - readStart) / rate));
+        writeDrag(setFadeIn(fadeTargetOf(clip), (sec - readStart) / rate));
         break;
       case 'fade-out':
-        writeDrag(setFadeOut(clip, (readEnd - sec) / rate));
+        writeDrag(setFadeOut(fadeTargetOf(clip), (readEnd - sec) / rate));
         break;
       case 'slip':
         // The SOURCE is what is drawn here and it stays still, so the bright
@@ -363,7 +376,7 @@ export const AudioEditorPanel: React.FC = () => {
         // LATER audio. (The timeline's slip handle is the same edit with the
         // opposite metaphor — there the clip box is fixed and the audio slides
         // under it.)
-        writeDrag(slipSourceTo(clip, rate, grab.offsetAtStart + (sec - grab.fromSec)));
+        writeDrag(slipSourceTo(dragClip, rate, grab.offsetAtStart + (sec - grab.fromSec)));
         break;
     }
   };
@@ -404,11 +417,17 @@ export const AudioEditorPanel: React.FC = () => {
     const player = usePlayerStore.getState();
     // Loading here is what guarantees ONE copy: playerStore drops the live
     // editor session and replaces whatever was in the transport.
-    void player.load(clip.audioBlob, { label: `${clip.label} — clip` }).then(() => {
-      player.seek(readStart);
-      player.play();
-      setAuditioning(true);
-    });
+    void player
+      .load(clip.audioBlob, { label: `${clip.label} — clip` })
+      .then(() => {
+        player.seek(readStart);
+        player.play();
+        setAuditioning(true);
+      })
+      .catch((err) => {
+        setAuditioning(false);
+        logError('editor', `Audition failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
   }, [clip, readStart]);
 
   // The region ends where the trim ends. `timeupdate` only fires a few times a
@@ -589,7 +608,7 @@ export const AudioEditorPanel: React.FC = () => {
             className="absolute inset-y-0 z-20 cursor-grab touch-none border-x-2 border-[rgb(var(--et-accent)/0.9)] focus-visible:outline focus-visible:outline-purple-400"
             style={{ left: `${startPct}%`, width: `${Math.max(0, endPct - startPct)}%` }}
             onPointerDown={beginGrab('slip')}
-            onKeyDown={nudge((d) => writeDiscrete(slipSourceTo(clip, rate, readStart + d)))}
+            onKeyDown={nudge((d) => writeDiscrete(slipSourceTo(dragClip, rate, readStart + d)))}
           >
             {/* Fade ramps, drawn where they sound. */}
             {fadeInSec > 0 && (
@@ -648,7 +667,7 @@ export const AudioEditorPanel: React.FC = () => {
             className={`${handleClass} bg-amber-300/80`}
             style={{ left: `${fadeInPct}%` }}
             onPointerDown={beginGrab('fade-in')}
-            onKeyDown={nudge((d) => writeDiscrete(setFadeIn(clip, fadeInSec + d)))}
+            onKeyDown={nudge((d) => writeDiscrete(setFadeIn(fadeTargetOf(clip), fadeInSec + d)))}
           />
           <div
             role="slider"
@@ -661,7 +680,7 @@ export const AudioEditorPanel: React.FC = () => {
             className={`${handleClass} bg-amber-300/80`}
             style={{ left: `${fadeOutPct}%` }}
             onPointerDown={beginGrab('fade-out')}
-            onKeyDown={nudge((d) => writeDiscrete(setFadeOut(clip, fadeOutSec - d)))}
+            onKeyDown={nudge((d) => writeDiscrete(setFadeOut(fadeTargetOf(clip), fadeOutSec - d)))}
           />
         </div>
       </div>
@@ -735,21 +754,21 @@ export const AudioEditorPanel: React.FC = () => {
           label="Read from"
           domain="source"
           value={readStart}
-          onCommit={(v) => writeDiscrete(slipSourceTo(clip, rate, v))}
+          onCommit={(v) => writeDiscrete(slipSourceTo(dragClip, rate, v))}
         />
         <NumField
           id={`${ids}-fade-in`}
           label="Fade in"
           domain="clip"
           value={fadeInSec}
-          onCommit={(v) => writeDiscrete(setFadeIn(clip, v))}
+          onCommit={(v) => writeDiscrete(setFadeIn(fadeTargetOf(clip), v))}
         />
         <NumField
           id={`${ids}-fade-out`}
           label="Fade out"
           domain="clip"
           value={fadeOutSec}
-          onCommit={(v) => writeDiscrete(setFadeOut(clip, v))}
+          onCommit={(v) => writeDiscrete(setFadeOut(fadeTargetOf(clip), v))}
         />
 
         {/* Clip gain sits before the track fader and the insert rack, so it is
@@ -802,7 +821,7 @@ export const AudioEditorPanel: React.FC = () => {
           type="button"
           className={BTN}
           disabled={!trimmed}
-          onClick={() => writeDiscrete(resetTrims(clip, rate))}
+          onClick={() => writeDiscrete(resetTrims(dragClip, rate))}
           title="Play the whole source again, from the same place on the timeline"
         >
           <RotateCcw aria-hidden="true" className="w-3 h-3" />

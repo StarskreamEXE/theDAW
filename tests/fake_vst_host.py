@@ -296,6 +296,13 @@ def _render(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
+    # Written before anything else, including every early-return branch below:
+    # the real host opens its --log file on startup, so a spawn that never
+    # reaches "listening" (a forced test exit, missing plugin, a hang that
+    # times out) must still leave native diagnostics behind for
+    # LiveSessionManager's failure-detail path to read (see live_host.py's
+    # ``_log_suffix``).
+    _native_log(args, f"fake-host-native: pid={os.getpid()} log={args.log}")
 
     if args.version:
         _emit({"ev": "version", "version": "fake-vst-host 1.0", "protocol": PROTOCOL})
@@ -339,9 +346,6 @@ def main(argv: list[str] | None = None) -> int:
         "fake-host: args plugin_name=%s sample_rate=%d block_size=%d channels=%d"
         % (args.plugin_name, args.sample_rate, args.block_size, args.channels)
     )
-    # The host's OWN log — a different file from the stderr line above once
-    # the backend points --log somewhere other than its own capture file.
-    _native_log(args, f"fake-host-native: pid={os.getpid()} log={args.log}")
 
     if os.environ.get("FAKE_VST_HOST_HANG") == "1":
         # Never announce a port: this is the spawn-timeout case. Sleep in

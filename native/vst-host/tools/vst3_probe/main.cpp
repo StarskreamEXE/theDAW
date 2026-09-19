@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -206,6 +207,16 @@ bool parseSetParamArg(const std::string& text, SetParamArg& out, std::string& er
             return false;
         }
     } catch (...) {
+        error = "--set-param id/index is out of range: " + idPart;
+        return false;
+    }
+    // A VST3 ParamID is uint32_t, and the fallback lookup in runLoad() narrows a
+    // not-found index candidate to static_cast<std::uint32_t>(arg.id) before comparing it
+    // against a real parameter's id. std::stoll above only rejects what does not fit in a
+    // (64-bit) long long, so anything from 2^32 up would otherwise survive parsing and then
+    // silently wrap during that narrowing cast (4294967296 -> 0, 4294967297 -> 1, ...).
+    // Reject it here, before it can alias onto an unrelated parameter.
+    if (parsedId > static_cast<long long>(std::numeric_limits<std::uint32_t>::max())) {
         error = "--set-param id/index is out of range: " + idPart;
         return false;
     }

@@ -17,13 +17,20 @@ using util::trim;
 
 const char kWebSocketGuid[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
-// Handshake read timeout: a client that connects and says nothing must not hold
-// the single client slot open.
-constexpr int kHandshakeTimeoutMs = 5000;
+// Timeout for writing the upgrade response: sending must not hang the acceptor.
+constexpr int kHandshakeSendTimeoutMs = 5000;
+// Total wall-clock budget for the whole handshake read loop (see
+// handleIncoming): a client that connects and says nothing, or dribbles bytes
+// slower than any single recv() would time out on, must not hold the single
+// client slot -- and so the acceptor thread, which serves one connection at a
+// time -- open past this.
+constexpr int kHandshakeDeadlineMs = 2000;
 // The audio thread polls the socket with this timeout, which also bounds how
 // long a park request waits and how long a queued control reply sits.
 constexpr int kAudioRecvTimeoutMs = 2;
-constexpr int kAudioSendTimeoutMs = 5000;
+// Shorter than the park timeout in Session.cpp (4000 ms): a peer that stops reading can
+// stall a send, and a stalled send must never out-wait a park or the join in stop().
+constexpr int kAudioSendTimeoutMs = 1000;
 
 bool headerListContains(const std::string& value, const char* token) {
     const std::string needle = toLowerAscii(token);
@@ -346,18 +353,38 @@ void WsServer::acceptorLoop() {
 }
 
 void WsServer::handleIncoming(SOCKET incoming) {
-    DWORD timeout = kHandshakeTimeoutMs;
-    setsockopt(incoming, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout),
-               sizeof(timeout));
-    setsockopt(incoming, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout),
-               sizeof(timeout));
+    DWORD sendTimeout = kHandshakeSendTimeoutMs;
+    setsockopt(incoming, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&sendTimeout),
+               sizeof(sendTimeout));
+
+    // A TOTAL deadline across the whole loop below, not a per-recv timeout:
+    // SO_RCVTIMEO only bounds a single recv() call, so a peer that sends a
+    // byte just before each call's timeout fires could keep resetting it and
+    // hold the acceptor (which handles one connection at a time) forever.
+    // Every iteration re-arms SO_RCVTIMEO to whatever remains of this
+    // deadline, so no single recv() can overrun it either.
+    const auto handshakeDeadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(kHandshakeDeadlineMs);
 
     std::string request;
     request.reserve(1024);
     char chunk[1024];
     bool complete = false;
-    while (request.size() <= kMaxHandshakeBytes) {
-        const int received = recv(incoming, chunk, sizeof(chunk), 0);
+    while (request.size() < kMaxHandshakeBytes) {
+        const auto remainingMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      handshakeDeadline - std::chrono::steady_clock::now())
+                                      .count();
+        if (remainingMs <= 0) break;  // total deadline exceeded
+
+        DWORD recvTimeout = static_cast<DWORD>(remainingMs);
+        setsockopt(incoming, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&recvTimeout),
+                   sizeof(recvTimeout));
+
+        // Never read past kMaxHandshakeBytes: stop at exactly the cap instead
+        // of overshooting it by up to one recv() chunk.
+        const size_t room = kMaxHandshakeBytes - request.size();
+        const int toRead = static_cast<int>(room < sizeof(chunk) ? room : sizeof(chunk));
+        const int received = recv(incoming, chunk, toRead, 0);
         if (received <= 0) break;
         request.append(chunk, static_cast<size_t>(received));
         if (request.find("\r\n\r\n") != std::string::npos) {

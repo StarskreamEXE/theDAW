@@ -128,6 +128,10 @@ class FakeRegistry implements VstSessionRegistry {
     this.acquired.push({ entryId: entry.id, sampleRate });
     return Promise.resolve(this.give);
   }
+  hold(): Promise<null> {
+    return Promise.resolve(null); // the node never holds; only the editor window does
+  }
+  unhold(): void {}
   release(entryId: string): void {
     this.released.push(entryId);
   }
@@ -657,6 +661,54 @@ const ctxOf = () => new FakeCtx() as unknown as BaseAudioContext;
 
   assert.equal(listenerCalls, 0, 'dispose unsubscribed before this status change, so the listener never fires');
   assert.equal(FakeWorklet.made.length, 0, 'and therefore nothing attaches a late-arriving live status');
+}
+
+/* ── the async open path subscribes even when the entry is ALREADY 'live' by
+   the time acquire resolves — sessionRegistry.acquire hands a cached session
+   straight back on every chain rebuild (play/stop/seek) without touching the
+   store, so this is the COMMON path, not an edge case. Skipping the subscribe
+   here would leave the node with no listener at all, so a later error -> live
+   flip (bridgeClient's own reconnect backoff, or the user's retry control)
+   could never re-splice the worklet — the entry would stay dry while the row
+   claims 'live' and PDC compensates for a plugin that is not in the path ── */
+{
+  reset();
+  const reg = new FakeRegistry();
+  reg.give = reg.session('a');
+  const ctx = new FakeCtx();
+
+  const inst = createVstLiveNode(ctx as unknown as BaseAudioContext, entry('a'), deps(reg))!;
+  // Set status to 'live' before the factory's own async chain (ensureModule
+  // then acquire) has a chance to resolve, so it finds the entry already live
+  // and takes the early branch instead of the "subscribe and wait" one.
+  useVstLiveStore.getState().setStatus('a', 'live');
+  await new Promise((r) => setTimeout(r, 0)); // ensureModule + acquire settle on the early branch
+
+  assert.equal(FakeWorklet.made.length, 1, 'the already-live entry attaches on the early branch');
+  assert.ok(edges.has('G1->WORKLET'), 'and is wired into the graph');
+
+  FakeWorklet.made[0].onprocessorerror?.(); // the worklet dies; failLive() marks the row 'error'
+  assert.equal(useVstLiveStore.getState().entries.a.status, 'error', 'the failure is recorded');
+
+  // A reconnect from OUTSIDE this node (bridgeClient's backoff, or the user's
+  // retry button) flips the row back to 'live' — only a surviving subscription
+  // catches that and re-attaches; nothing else in this module ever will.
+  useVstLiveStore.getState().setReady('a', {
+    plugin: READY.plugin,
+    pluginLatencySamples: READY.latency_samples,
+    bridgeLatencySamples: 512 * 3,
+    sampleRate: 48000,
+    hasEditor: true,
+  });
+
+  assert.equal(
+    FakeWorklet.made.length,
+    2,
+    'the early branch must still have subscribed, or nothing re-attaches after error -> live',
+  );
+  assert.ok(edges.has('G1->WORKLET'), 'the retried worklet is spliced back into the graph');
+
+  inst.dispose();
 }
 
 console.log('vstLive/vstLiveNode: ok');

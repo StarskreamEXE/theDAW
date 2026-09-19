@@ -434,6 +434,51 @@ def test_stdin_shutdown_writes_state_and_exits_zero(tmp_path):
     assert state_file.stat().st_size > 0
 
 
+@pytest.mark.parametrize("delay_sec", [0.05, 0.12, 0.2, 0.31])
+def test_shutdown_while_blocks_are_streaming_exits_zero_and_saves_state(
+    tmp_path, delay_sec
+):
+    """stop() must end and JOIN the audio thread before it touches the plugin.
+
+    The old order parked the audio thread (a handshake that can time out), then
+    closed the editor, saved state and released the plugin, and only then set the
+    stop flag -- so a plugin could be released under a thread still inside
+    process(). The shutdown lands at four different moments inside a live stream.
+    """
+    import threading
+
+    state_file = tmp_path / "busy.state"
+    with HostProcess(null_args(str(state_file))) as host:
+        client = host.connect()
+        client.hello()
+        halt = threading.Event()
+        streamed = [0]
+
+        def pump() -> None:
+            seq = 0
+            while not halt.is_set():
+                try:
+                    client.block(
+                        seq, [ramp(BLOCK, seq, 0), ramp(BLOCK, seq, 1)], collect_text=[]
+                    )
+                except Exception:  # noqa: BLE001 -- the socket closing under us is the point
+                    return
+                seq += 1
+                streamed[0] = seq
+
+        worker = threading.Thread(target=pump, daemon=True)
+        worker.start()
+        time.sleep(delay_sec)
+        host.send_stdin({"op": "shutdown"})
+        assert host.wait(timeout=20) == 0
+        halt.set()
+        worker.join(timeout=5)
+        with contextlib.suppress(Exception):
+            client.close()
+    assert streamed[0] > 0, "the shutdown must land inside a live stream"
+    assert state_file.is_file() and state_file.stat().st_size > 0
+
+
 def test_stdin_eof_shuts_the_host_down(tmp_path):
     with HostProcess(null_args(str(tmp_path / "eof.state"))) as host:
         host.close_stdin()

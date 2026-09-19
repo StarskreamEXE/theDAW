@@ -16,6 +16,7 @@ import {
   planRangeRenderJob,
   tailHint,
   type RangeRenderForm,
+  type RangeRenderPlanResult,
 } from './renderRangeDialogModel';
 import { FLYOUT_CARD } from '../audio/midiDockKit';
 
@@ -93,7 +94,10 @@ export const RenderRangeDialog: React.FC<RenderRangeDialogProps> = ({
   if (!open) return null;
 
   const plan = planRangeRenderJob(selection, form);
-  const refusalReason = plan.ok ? null : plan.reason;
+  // Non-strict tsconfig (no strictNullChecks) does not narrow a boolean
+  // discriminant through a `!plan.ok` falsy check (see
+  // renderRangeDialogModel.test.ts), so cast the same way that test does.
+  const refusalReason = plan.ok ? null : (plan as Extract<RangeRenderPlanResult, { ok: false }>).reason;
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault();

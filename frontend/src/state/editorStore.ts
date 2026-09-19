@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { logError, logInfo } from './logStore';
+import { logError, logInfo, logWarn } from './logStore';
 import type { PianoNote } from './pianoRollStore';
 import type { MeterSegment, PolyLane } from '../lib/meterMap';
 import type { LaneBend } from '../lib/pitchBend';
@@ -16,6 +16,7 @@ import {
 import { crossfadeRegions } from '../lib/crossfade';
 import { MIN_CLIP_SEC } from '../lib/clipDragMath';
 import { moveByOffset, moveIds, sameOrder } from '../lib/timeline/trackOrder';
+import { deleteFolder, folderFlagPatch, moveIntoFolder, moveOutOfFolder, newFolderFromSelection } from '../lib/timeline/folderOps';
 import type { WarpMarker } from '../lib/audioWarp';
 import type { ChainEntry, VstNode, VstStateHost } from './effectChainStore';
 import { rackEffectDefaults } from '../lib/rackEffects';
@@ -257,6 +258,13 @@ export interface EditorTrack {
    *  browser — becomes audible). The originals are stashed here for unfreeze; the
    *  live fxChain is emptied because every effect is baked into the stem. */
   frozenOriginal?: { clips: AudioClip[]; fxChain: ChainEntry[] };
+  /** Arrangement hierarchy only — which folder this track sits inside, or the
+   *  root when undefined/null. Routing (buses, sends, freeze) is unchanged. */
+  parentTrackId?: string | null;
+  /** An organisational row: holds no clips and gets no audio node. */
+  isFolder?: boolean;
+  /** Folders only — while true, this folder's descendants are hidden. */
+  collapsed?: boolean;
 }
 
 /**
@@ -624,6 +632,23 @@ interface EditorStoreState {
   ) => void;
   /** Restore a frozen track's original clips + insert chain. */
   unfreezeTrack: (trackId: string) => void;
+  /** Wrap the given tracks in a new folder (an organisational row: no clips,
+   *  no audio node) placed just before the first selected track. One undo
+   *  step. Returns the new folder's id, or null when `ids` is empty. */
+  addFolderFromSelectedTracks: (ids: readonly string[], name?: string) => string | null;
+  /** Move a track into folder `parentTrackId`, or out to the root when null.
+   *  One undo step; a move that changes nothing (already at the root) writes
+   *  nothing. A rule violation (e.g. a folder dropped into itself) is logged
+   *  as a warning and leaves the store untouched rather than throwing. */
+  setTrackParent: (trackId: string, parentTrackId: string | null) => void;
+  /** Expand/collapse a folder's children in the track list. A VIEW change,
+   *  like `updateTrack`'s non-structural writes — deliberately NOT an undo
+   *  step; do not add `beginUndoStep()` here. */
+  toggleFolderCollapsed: (folderId: string) => void;
+  /** Set mute/solo on a folder AND every non-folder track beneath it, in one
+   *  undo step. Writes the same fields `updateTrack` does — no new audio
+   *  semantics. */
+  setFolderFlags: (folderId: string, flags: { mute?: boolean; solo?: boolean }) => void;
 
   addClipToTrack: (clip: Omit<AudioClip, 'id'> & { id?: string }) => string;
   /** Patch a clip. `coalesce` folds the write into whatever undo step is
@@ -1385,6 +1410,22 @@ const reorderedTracks = (tracks: readonly EditorTrack[], order: readonly string[
   });
 };
 
+/** `tracks` with any `parentTrackId` that no longer names a track IN THIS
+ *  ARRAY reset to null (root). Defensive only — a reorder never removes a
+ *  track, so this should always be a no-op — but if it ever is not, a
+ *  dangling parent would otherwise be a silently-broken folder. Returns the
+ *  same array reference when nothing needs resetting. */
+const withValidParents = (tracks: readonly EditorTrack[]): EditorTrack[] => {
+  const ids = new Set(tracks.map((t) => t.id));
+  let changed = false;
+  const next = tracks.map((t) => {
+    if (t.parentTrackId == null || ids.has(t.parentTrackId)) return t;
+    changed = true;
+    return { ...t, parentTrackId: null };
+  });
+  return changed ? next : (tracks as EditorTrack[]);
+};
+
 type WorkspaceSelection =Pick<EditorStoreState, 'selectedClipIds' | 'selectedTrackIds' | 'timeSelection'>;
 
 /** The workspace selections pruned to the clips and tracks that exist. Used by
@@ -1511,8 +1552,10 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       return {
         tracks: [...s.tracks.slice(0, at), track, ...s.tracks.slice(at)],
         // A new track is routed to the master from the moment it exists, so it
-        // is audible without the routing picker ever being opened.
-        routing: ensureTrackNode(s.routing, id, track.name),
+        // is audible without the routing picker ever being opened. A folder is
+        // an organisational row only — it holds no clips and gets no audio
+        // node, so routing is left untouched for it.
+        routing: track.isFolder ? s.routing : ensureTrackNode(s.routing, id, track.name),
       };
     });
     logInfo('editor', `Added track: ${id}`);
@@ -1521,7 +1564,21 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
 
   removeTrack: (id) => {
     set((s) => {
-      const tracks = s.tracks.filter((t) => t.id !== id);
+      const target = s.tracks.find((t) => t.id === id);
+      const hasChildren = s.tracks.some((t) => t.parentTrackId === id);
+      // A removed row's children are re-parented, never deleted. A folder's
+      // children move up via `deleteFolder`, exactly as documented there. A
+      // non-folder should never have children — `assertTree` requires every
+      // parent to be an existing folder — but if one somehow does, the same
+      // "adopt, don't delete" fallback runs here instead of leaving a
+      // dangling `parentTrackId` behind.
+      const tracks = target?.isFolder
+        ? deleteFolder(s.tracks, id)
+        : hasChildren
+          ? s.tracks
+              .filter((t) => t.id !== id)
+              .map((t) => (t.parentTrackId === id ? { ...t, parentTrackId: target?.parentTrackId ?? null } : t))
+          : s.tracks.filter((t) => t.id !== id);
       const clips = s.clips.filter((c) => c.trackId !== id);
       return {
         tracks,
@@ -1599,6 +1656,70 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       };
     });
     logInfo('editor', `Unfroze track ${trackId}: restored clips + FX`);
+  },
+
+  addFolderFromSelectedTracks: (ids, name) => {
+    if (ids.length === 0) return null;
+    const { tracks } = get();
+    const folderId = `track-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const folderCount = tracks.filter((t) => t.isFolder).length;
+    const folder: EditorTrack = {
+      ...makeTrack(tracks.length, { id: folderId }),
+      name: name && name.trim() ? name.trim() : `Folder ${folderCount + 1}`,
+      isFolder: true,
+      collapsed: false,
+      parentTrackId: null,
+    };
+    const next = newFolderFromSelection(tracks, ids, folder);
+    beginUndoStep();
+    set({ tracks: next }); // a folder is organisational only: no routing node
+    logInfo('editor', `Added folder: ${folderId}`);
+    return folderId;
+  },
+
+  setTrackParent: (trackId, parentTrackId) => {
+    const { tracks } = get();
+    try {
+      const next = parentTrackId === null ? moveOutOfFolder(tracks, trackId) : moveIntoFolder(tracks, trackId, parentTrackId);
+      if (next === tracks) return; // already at the target: no edit, no step
+      beginUndoStep();
+      set({ tracks: next });
+    } catch (err) {
+      // A folder-hierarchy rule violation (e.g. a folder dropped into itself)
+      // is a normal drag-and-drop outcome, not a caller bug: warn and leave
+      // the store untouched rather than throwing through the UI.
+      logWarn('editor', err instanceof Error ? err.message : String(err));
+    }
+  },
+
+  // A VIEW change, exactly like `updateTrack`'s non-structural writes: no
+  // `beginUndoStep()`. `.map()` always returns a new `tracks` array, so the
+  // history subscriber (which records on reference INEQUALITY, not on
+  // `beginUndoStep`) would push a step anyway unless the write runs under
+  // `historyApplying` — the same bypass `applyClipRender` and undo/redo use.
+  // Do not "fix" this into an undo step — collapsing a folder to see the mix
+  // better must never eat into undo history.
+  toggleFolderCollapsed: (folderId) => {
+    const target = get().tracks.find((t) => t.id === folderId);
+    if (!target) return;
+    historyApplying = true;
+    set((s) => ({
+      tracks: s.tracks.map((t) => (t.id === folderId ? { ...t, collapsed: !t.collapsed } : t)),
+    }));
+    historyApplying = false;
+  },
+
+  setFolderFlags: (folderId, flags) => {
+    const patches = folderFlagPatch(get().tracks, folderId, flags);
+    const patchById = new Map(patches.map((p) => [p.id, p]));
+    beginUndoStep();
+    set((s) => ({
+      tracks: s.tracks.map((t) => {
+        if (t.id === folderId) return { ...t, ...flags };
+        const patch = patchById.get(t.id);
+        return patch ? { ...t, ...patch } : t;
+      }),
+    }));
   },
 
   toggleSolo: (id) => {
@@ -2070,14 +2191,14 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     const next = reorderedTracks(tracks, moveIds(tracks.map((t) => t.id), ids, beforeId));
     if (!next) return; // an unchanged order is no edit: no step, no write
     beginUndoStep(); // a move is one discrete edit, however soon after the last
-    set({ tracks: next }); // routing is keyed by id, so it stays as it is
+    set({ tracks: withValidParents(next) }); // routing is keyed by id, so it stays as it is
   },
   moveTracksByOffset: (ids, offset) => {
     const { tracks } = get();
     const next = reorderedTracks(tracks, moveByOffset(tracks.map((t) => t.id), ids, offset));
     if (!next) return;
     beginUndoStep();
-    set({ tracks: next });
+    set({ tracks: withValidParents(next) });
   },
 
   // ── Routing + buses ────────────────────────────────────────────────────────

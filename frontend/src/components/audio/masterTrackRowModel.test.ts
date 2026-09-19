@@ -8,6 +8,7 @@ import {
   masterAutomationLanes,
   masterFxButtonLabel,
   masterFxCount,
+  masterLaneLabel,
   masterVolumeAria,
   meterFillPercent,
 } from './masterTrackRowModel';
@@ -56,6 +57,13 @@ assert.deepEqual(
   ['2', '4'],
 );
 assert.deepEqual(masterAutomationLanes(undefined), []);
+
+// --- masterLaneLabel ------------------------------------------------------------------
+
+// masterLaneLabel formats the effect param name, or 'parameter' when absent
+assert.equal(masterLaneLabel({ paramKey: 'cutoff' }), 'master effect cutoff');
+assert.equal(masterLaneLabel({}), 'master effect parameter');
+assert.equal(masterLaneLabel({ paramKey: undefined }), 'master effect parameter');
 
 // --- meterFillPercent ----------------------------------------------------------------
 

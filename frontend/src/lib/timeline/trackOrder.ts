@@ -253,7 +253,9 @@ export function flattenVisible<T extends TreeTrack>(
  * before sibling `beforeId` in the destination (undefined = append). Child
  * ids and order are preserved. Rejects cycles (a folder into itself or a
  * descendant), non-folder parents, unknown ids and anchors that are not
- * destination siblings. Returns a new array in depth-first order.
+ * destination siblings. Returns a new array in depth-first order — even a
+ * drop that changes nothing still returns the list in depth-first order,
+ * never the input array.
  */
 export function moveSubtree<T extends TreeTrack>(
   tracks: readonly T[],
@@ -264,7 +266,9 @@ export function moveSubtree<T extends TreeTrack>(
   const map = assertTree(tracks);
   const dragged = map.get(dragId);
   if (!dragged) throw new Error('Dragged track does not exist');
-  if (beforeId === dragId && newParentId === dragged.parentId) return [...tracks];
+  if (beforeId === dragId && newParentId === dragged.parentId) {
+    return preOrder(childrenByParent(tracks)).map((item) => item.track);
+  }
   const changed: T = { ...dragged, parentId: newParentId };
   const proposed = tracks.map((t) => (t.id === dragId ? changed : t));
   assertTree(proposed);

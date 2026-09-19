@@ -22,9 +22,25 @@ const IGNORED_CONSOLE = [
   /Download the React DevTools/,
 ]
 
-export async function openApp({ width = 1600, height = 900 } = {}) {
-  const browser = await chromium.launch({ headless: true, channel: 'chrome' })
+export async function openApp({ width = 1600, height = 900, launchArgs = [] } = {}) {
+  // Audio has to start without a click inside a headless run, or the transport
+  // and every AudioWorklet (metering, the live VST bridge) would stay suspended.
+  const browser = await chromium.launch({
+    headless: true,
+    channel: 'chrome',
+    args: ['--autoplay-policy=no-user-gesture-required', ...launchArgs],
+  })
   const context = await browser.newContext({ viewport: { width, height } })
+  // A plugin editor is a NATIVE window on the desktop of whoever is sitting at this machine.
+  // Every QA run switches them off inside the app before the first script runs, so adding or
+  // opening a plugin in a test can never put a window on the screen.
+  await context.addInitScript(() => {
+    try {
+      localStorage.setItem('thedaw.vst.noEditorWindows', '1')
+    } catch {
+      /* storage unavailable: the app then behaves normally, so tests must not open editors */
+    }
+  })
   const page = await context.newPage()
   const consoleErrors = []
   page.on('console', (m) => {

@@ -12,8 +12,36 @@ import { openApp, createReport, expect, ASSETS_DIR } from './qaLib.mjs'
 
 const AREA = 'q03-time-range'
 const RULER_SELECTOR = 'div.cursor-col-resize'
-const RANGE_HIGHLIGHT_SELECTOR = 'div[aria-hidden="true"][class*="border-sky-300"]'
+// The ruler-band chip only (bg-sky-400/30, no "/50" suffix): the lanes area
+// paints its OWN highlight rect(s) (bg-sky-400/10) which also contain the
+// substring "border-sky-300", so a selector on that substring alone matches
+// 2+ elements and trips Playwright's strict mode on .boundingBox(). This one
+// is unique (single element) and is the one carrying the mm:ss readout <span>.
+const RANGE_HIGHLIGHT_SELECTOR = 'div[aria-hidden="true"][class*="bg-sky-400/30"]'
 const CLIP_SELECTOR = '[data-clip="1"]'
+
+/** First-run onboarding tour ("Welcome to theDAW") steals pointer events from
+ *  the whole page via a fixed inset-0 overlay. It shows a few seconds after
+ *  load on a fresh (empty) QA data folder. Esc leaves it for good
+ *  (OnboardingTour.tsx's key handler calls dismiss()); harmless no-op if it
+ *  never appeared. */
+async function dismissWelcomeTourIfPresent(page, timeoutMs = 20000) {
+  const dlg = page.locator('[role="dialog"][aria-modal="true"]')
+  const deadline = Date.now() + timeoutMs
+  let sawIt = false
+  while (Date.now() < deadline) {
+    if (await dlg.count() > 0 && (await dlg.isVisible().catch(() => false))) {
+      sawIt = true
+      await page.keyboard.press('Escape')
+      await page.waitForTimeout(200)
+      continue
+    }
+    if (sawIt) return // was visible, now isn't - dismissed
+    await page.waitForTimeout(300)
+  }
+  if (!sawIt) return // never showed up in the window (e.g. tour already marked seen)
+  throw new Error('welcome tour dialog would not dismiss (Escape) within timeout')
+}
 
 async function getRulerBox(page) {
   const box = await page.evaluate((sel) => {
@@ -127,9 +155,13 @@ async function main() {
   const bugs = []
 
   try {
+    await dismissWelcomeTourIfPresent(page)
+
     // --- Get into EDIT (WaveformEditor mounts the ruler / lanes / range menu) ---
     await page.locator('button[data-tour="tab-edit"]').click()
-    await getRulerBox(page) // throws (and fails fast) if EDIT never mounted the ruler
+    // WaveformEditor is a lazy chunk - give it real time to mount rather than
+    // failing on the first immediate check.
+    await page.waitForSelector(RULER_SELECTOR, { state: 'visible', timeout: 10000 })
     await page.waitForTimeout(200)
 
     const ruler = await getRulerBox(page)
@@ -226,7 +258,9 @@ async function main() {
       const h = await getHighlight(page)
       expect(h !== null, 'setup: expected the new range to be drawn')
       const clsAfter = await page.locator(CLIP_SELECTOR).nth(1).getAttribute('class')
-      expect(!clsAfter?.includes('border-white'), 'drawing a new time range should clear the existing clip selection')
+      const stillSelected = clsAfter?.includes('border-white')
+      if (stillSelected) await page.screenshot({ path: report.shotPath('5b-range-and-clip-both-highlighted'), fullPage: false })
+      expect(!stillSelected, 'drawing a new time range should clear the existing clip selection')
     })
 
     // ---------------------------------------------------------------------
@@ -246,7 +280,15 @@ async function main() {
       const split = byLabel('Split clips at range edges')
       const copy = byLabel('Copy range to inpaint')
       const clipActions = byLabel('Clip actions')
-      const render = byLabel('Render selection')
+      // F24-7 wired the model (buildRangeMenu): a non-empty range labels this
+      // row "Render range..." and enables it (disabled only when the range is
+      // zero-length, which this UI range is not). F24-8 (wiring the row's
+      // CLICK to the render popover + queue) is a separate, still-open ticket
+      // per orchestration/tasks/daw/F24-8.md - at commit 60d4a44,
+      // WaveformEditor.tsx's action map still has `render: { run: () => undefined }`.
+      // So: enabled + correctly labelled is the CORRECT current state; a
+      // silent no-op on click is the EXPECTED gap, not a new bug.
+      const render = byLabel('Render range')
       const send = byLabel('Send range to gantasmob0t')
       const clear = byLabel('Clear range')
 
@@ -257,8 +299,7 @@ async function main() {
       expect(!!copy && copy.disabled, `"Copy range to inpaint" should be disabled on this (clipless) lane, got ${JSON.stringify(copy)}`)
       expect(!!copy && copy.text.includes('No audio clip on this track is under the range'), `copy-to-inpaint disabled reason not visible/correct: ${JSON.stringify(copy)}`)
       expect(!clipActions, '"Clip actions..." should be absent when no clip is under the pointer')
-      expect(!!render && render.disabled, `"Render selection" should always be disabled, got ${JSON.stringify(render)}`)
-      expect(!!render && render.text.includes('Range export arrives with the render dialog (F24)'), `render disabled reason not visible/correct: ${JSON.stringify(render)}`)
+      expect(!!render && !render.disabled, `"Render range..." should be enabled for a non-empty range (F24-7), got ${JSON.stringify(render)}`)
       expect(!!send && !send.disabled, `"Send range to gantasmob0t" should be enabled, got ${JSON.stringify(send)}`)
       expect(!!clear && !clear.disabled, `"Clear range" should be enabled, got ${JSON.stringify(clear)}`)
 
@@ -267,6 +308,25 @@ async function main() {
       await page.waitForTimeout(100)
       const after = await getHighlight(page)
       expect(after !== null, 'opening (and closing) the range menu must not clear the range (T44 rule 5)')
+    })
+
+    // ---------------------------------------------------------------------
+    await report.scenario('6b-render-range-click-is-known-noop-F24-8', async () => {
+      // Clicking the enabled-but-not-yet-wired "Render range..." row must at
+      // least fail SAFE: menu closes, no console error, range untouched, no
+      // new render job UI appears. (F24-8 not yet applied at this commit.)
+      const before = await getHighlight(page)
+      expect(before !== null, 'setup: expected the range to still be present')
+      const errsBefore = consoleErrors.length
+      await page.mouse.click(rangeMidX, boxB.y + boxB.height / 2, { button: 'right' })
+      const menu = page.locator('[role="menu"]')
+      await menu.waitFor({ state: 'visible', timeout: 3000 })
+      await menu.getByRole('menuitem', { name: /^Render range/ }).click()
+      await page.waitForTimeout(150)
+      expect(await menu.count() === 0 || !(await menu.isVisible()), 'the menu should close after selecting "Render range..."')
+      const after = await getHighlight(page)
+      expect(after !== null, 'the (known no-op) Render range click must not clear the time range')
+      expect(consoleErrors.length === errsBefore, `Render range click threw new console error(s): ${JSON.stringify(consoleErrors.slice(errsBefore))}`)
     })
 
     // ---------------------------------------------------------------------

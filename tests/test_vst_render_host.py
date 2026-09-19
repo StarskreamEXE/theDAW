@@ -14,6 +14,7 @@ different audio.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -29,6 +30,7 @@ import pytest
 import soundfile as sf
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -495,3 +497,100 @@ def test_thedaw_rejects_an_oversized_raw_state(
 
     assert resp.status_code == 413
     assert pedalboard_spy == []
+
+
+# ---------------------------------------------------------------------------
+# F5a1 audit follow-up: stderr must be scrubbed too, the upload must stream
+# to disk instead of being buffered whole, and its OSError path must use
+# _os_reason like every other one in this branch
+# ---------------------------------------------------------------------------
+
+
+def test_thedaw_scrubs_absolute_paths_from_a_non_zero_exit_error(
+    client, plugin_file, wav_bytes, fake_host, render_root, monkeypatch, pedalboard_spy
+):
+    """The warnings header is scrubbed (review R5 item #11), but the host's
+    stderr used to reach the client verbatim in the non-zero-exit 502 detail
+    — and stderr is exactly where the host logs a complaint about the
+    absolute ``--in`` path it was launched with.
+    """
+    fixed_work = render_root / "render-fixed"
+    fixed_work.mkdir(parents=True)
+
+    def fake_mkdtemp(prefix="", dir=None):
+        return str(fixed_work)
+
+    monkeypatch.setattr(vst_router.tempfile, "mkdtemp", fake_mkdtemp)
+    in_path = fixed_work / "in.wav"
+    monkeypatch.setenv("FAKE_VST_HOST_EXIT_CODE", "7")
+    monkeypatch.setenv(
+        "FAKE_VST_HOST_EXIT_MESSAGE", f"fake-host: could not read {in_path}"
+    )
+
+    resp = _post(client, plugin_file, wav_bytes, state_host="thedaw")
+
+    assert resp.status_code == 502
+    detail = resp.json()["detail"]
+    assert str(in_path) not in detail
+    assert "in.wav" in detail
+    assert pedalboard_spy == []
+
+
+def test_read_upload_capped_writes_accepted_chunks_before_raising(
+    tmp_path, monkeypatch
+):
+    """The pre-fix implementation capped the READ but still built one whole
+    ``bytes`` object in memory before anything touched disk (review R5 item
+    #7's actual defect). This proves the fix: the chunk that fit under the
+    cap is already sitting on disk by the time ``_UploadTooLarge`` is raised
+    for the chunk that doesn't, so nothing extra is held in memory only to be
+    thrown away.
+    """
+    monkeypatch.setattr(vst_router, "_UPLOAD_READ_CHUNK_BYTES", 10)
+    dest = tmp_path / "in.wav"
+    chunk_a = b"a" * 10
+    chunk_b = b"b" * 10
+
+    class _FakeUpload:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self._chunks = list(chunks)
+
+        async def read(self, size: int) -> bytes:
+            return self._chunks.pop(0) if self._chunks else b""
+
+    upload = _FakeUpload([chunk_a, chunk_b])
+
+    with pytest.raises(vst_router._UploadTooLarge):
+        asyncio.run(vst_router._read_upload_capped(upload, max_bytes=15, dest=dest))
+
+    assert dest.read_bytes() == chunk_a
+
+
+def test_thedaw_oserror_while_reading_the_upload_uses_os_reason(
+    client, plugin_file, wav_bytes, fake_host, render_root, monkeypatch, pedalboard_spy
+):
+    """Every other OSError site in the thedaw branch was routed through
+    ``_os_reason`` (review R5 item #6); the upload-read failure path was the
+    one the earlier sweep missed and still leaked raw ``str(OSError)`` —
+    errno and filename included.
+
+    Patches Starlette's own ``UploadFile`` (not ``fastapi.UploadFile``): the
+    object FastAPI hands the route is the one Starlette's multipart parser
+    built — ``fastapi.UploadFile._validate`` only casts it for typing, it
+    never constructs one — so that is the class whose ``read`` actually runs.
+    """
+
+    async def broken_read(self, size: int = -1) -> bytes:
+        raise OSError(9, "fake I/O failure", "in.wav")
+
+    monkeypatch.setattr(StarletteUploadFile, "read", broken_read)
+
+    resp = _post(client, plugin_file, wav_bytes, state_host="thedaw")
+
+    assert resp.status_code == 400
+    detail = resp.json()["detail"]
+    assert "fake I/O failure" in detail
+    assert "Errno" not in detail
+    assert "in.wav" not in detail
+    assert pedalboard_spy == []
+    assert list(render_root.glob("*")) == []

@@ -32,6 +32,13 @@ export const CLIP_EDGE_ZONE_PX = 6;
 export const RULER_BAR_LABEL_MIN_PX = 24;
 /** Follow-playhead paging holds off this long (ms) after the last zoom. */
 export const ZOOM_FOLLOW_HOLD_MS = 400;
+/**
+ * {@link viewportWindowSec} snaps its window to multiples of this fraction of
+ * a viewport, so the guaranteed off-screen margin is never less than half a
+ * viewport on each side and a redraw happens at most once per half viewport
+ * of scrolling.
+ */
+export const GRID_WINDOW_STRIDE_FRAC = 0.5;
 
 function finite(v: number, name: string): number {
   if (!Number.isFinite(v)) throw new RangeError(`${name} must be finite, got ${v}`);
@@ -246,7 +253,14 @@ export function followHoldActive(nowMs: number, holdUntilMs: number): boolean {
 /**
  * The seconds window the grid and ruler labels draw: the visible range
  * extended by one viewport on each side, clamped to [0, content end] where the
- * content end is {@link contentWidthPx} / zoom.
+ * content end is {@link contentWidthPx} / zoom. The window always covers
+ * `[scrollLeft, scrollLeft + viewportWidth]` converted to seconds (clamped to
+ * the content).
+ *
+ * Both bounds snap outward to multiples of {@link GRID_WINDOW_STRIDE_FRAC} of
+ * a viewport (in seconds), so the same `startSec`/`endSec` come back until the
+ * viewport actually crosses a stride boundary: the grid redraws at most once
+ * per half viewport of scrolling instead of on every scroll pixel.
  */
 export function viewportWindowSec(
   scrollLeft: number,
@@ -258,8 +272,16 @@ export function viewportWindowSec(
   finite(viewportWidth, 'viewportWidth');
   if (!(finite(zoom, 'zoom') > 0)) throw new RangeError('zoom must be > 0');
   const contentEndSec = contentWidthPx(Math.max(0, totalDurationSec), zoom) / zoom;
-  const startSec = clamp((scrollLeft - viewportWidth) / zoom, 0, contentEndSec);
-  const endSec = clamp((scrollLeft + 2 * viewportWidth) / zoom, startSec, contentEndSec);
+  // The 1e-6 floor keeps a zero-width viewport from producing a zero stride
+  // and a division by zero below.
+  const strideSec = Math.max((viewportWidth * GRID_WINDOW_STRIDE_FRAC) / zoom, 1e-6);
+  const rawStart = (scrollLeft - viewportWidth) / zoom;
+  const rawEnd = (scrollLeft + 2 * viewportWidth) / zoom;
+  // Snap outward so the window can only ever grow relative to the raw bounds.
+  const snappedStart = Math.floor(rawStart / strideSec) * strideSec;
+  const snappedEnd = Math.ceil(rawEnd / strideSec) * strideSec;
+  const startSec = clamp(snappedStart, 0, contentEndSec);
+  const endSec = clamp(snappedEnd, startSec, contentEndSec);
   return { startSec, endSec };
 }
 

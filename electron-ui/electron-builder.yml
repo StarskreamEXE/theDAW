@@ -207,6 +207,16 @@ win:
     - nsis
   # artifactName keeps the installer name stable for release uploads.
   artifactName: theDAW-Setup-${version}.${ext}
+  # Live VST host exe (+ vst3_probe.exe), staged by scripts/stage-vst-host.mjs
+  # from native/vst-host/bin into build-resources/vst-host. Lands at
+  # resources/vst-host in the installed app; main/index.ts's buildBackendEnv()
+  # points THEDAW_VST_HOST at it when present. Windows-only: the native host is
+  # a Windows exe and macOS has no equivalent build yet. The staging dir is
+  # gitignored + regenerated, and staging still runs (leaving only a README)
+  # when the host hasn't been built, so packaging never fails on a missing path.
+  extraResources:
+    - from: build-resources/vst-host
+      to: vst-host
 
 nsis:
   # Per-user install (no elevation). Lands under %LOCALAPPDATA%\Programs\theDAW,

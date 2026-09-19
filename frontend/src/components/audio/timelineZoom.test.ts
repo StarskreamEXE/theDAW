@@ -256,4 +256,46 @@ const near = (a: number, b: number, eps = 1e-9) => assert.ok(Math.abs(a - b) <= 
   assert.equal(clipChromeLayout(5000, 100, 0, 1000), null);
 }
 
+// --- Grid window quantisation: stride-snapped so small scrolls don't redraw -
+{
+  // REGRESSION: a small scroll returns the identical window. (Base scrollLeft
+  // 50, not 0: at scrollLeft 0 the raw end lands exactly on a stride
+  // boundary, an unavoidable cusp of any pure snap-to-grid function, not a
+  // regression in its own right.)
+  assert.deepEqual(viewportWindowSec(50, 1000, 100, 300), viewportWindowSec(51, 1000, 100, 300));
+  assert.deepEqual(viewportWindowSec(50, 1000, 100, 300), viewportWindowSec(110, 1000, 100, 300));
+}
+{
+  // A scroll of a whole viewport does move the window.
+  assert.ok(viewportWindowSec(0, 1000, 100, 300).endSec < viewportWindowSec(1000, 1000, 100, 300).endSec);
+}
+{
+  // The window always covers the visible range, whatever the scroll position.
+  const contentEnd = Math.max(300 * 100, 1000) / 100;
+  for (const scrollLeft of [0, 137, 999, 5000, 29000]) {
+    const w = viewportWindowSec(scrollLeft, 1000, 100, 300);
+    assert.ok(w.startSec <= Math.min(scrollLeft / 100, contentEnd));
+    assert.ok(w.endSec >= Math.min((scrollLeft + 1000) / 100, contentEnd));
+  }
+}
+{
+  // Clamped to the content and never inverted.
+  assert.deepEqual(viewportWindowSec(1e6, 1000, 100, 300), { startSec: 300, endSec: 300 });
+  for (const scrollLeft of [0, 137, 999, 5000, 29000, 1e6]) {
+    const w = viewportWindowSec(scrollLeft, 1000, 100, 300);
+    assert.ok(w.endSec >= w.startSec);
+    assert.ok(Number.isFinite(w.startSec) && w.startSec >= 0);
+    assert.ok(Number.isFinite(w.endSec) && w.endSec >= 0);
+  }
+}
+{
+  // A zero-width viewport does not produce NaN.
+  const w = viewportWindowSec(0, 0, 100, 300);
+  assert.ok(Number.isFinite(w.startSec) && Number.isFinite(w.endSec) && w.endSec >= w.startSec);
+}
+{
+  // Guards intact.
+  assert.throws(() => viewportWindowSec(0, 100, 0, 300), RangeError);
+}
+
 console.log('timelineZoom: ok');

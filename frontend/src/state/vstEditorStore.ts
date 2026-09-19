@@ -54,7 +54,12 @@ interface VstEditorState {
   mode: VstEditorMode | null;
   /** Open (or re-open) a VST entry's native GUI. sinkRawState receives the
    *  captured base64 plugin state once the editor commits it. */
-  open: (entry: ChainEntry, sinkRawState: (entryId: string, rawState: string) => void) => void;
+  open: (
+    entry: ChainEntry,
+    sinkRawState: (entryId: string, rawState: string) => void,
+    /** Internal: skip the live-first branch (the fallback after the live host turned out to be unavailable). */
+    opts?: { offlineOnly?: boolean },
+  ) => void;
   /** Remember `mode` for the session's plugin and relaunch the editor in it.
    *  A LIVE session relaunches straight through openLiveEditor, which closes
    *  the outgoing one itself. Otherwise the relaunch goes through close() +
@@ -141,6 +146,59 @@ export function __setLiveSessionLookupForTest(
 ): void {
   liveSessionLookup = lookup ?? ((entryId) => vstSessions.get(entryId));
 }
+
+/** How long a COLD start may take before 'Edit GUI' gives up: the host process has to spawn and
+ *  the plugin has to load (a mastering suite takes several seconds), unlike the warm case above. */
+export const LIVE_COLD_START_WAIT_MS = 30000;
+
+/** The registry surface open() needs to START a live session for the editor window. */
+export interface LiveSessionHolder {
+  /** false = the host is known to be missing here; null = not probed yet; true = available. */
+  hostAvailable: () => boolean | null;
+  hold: (entry: ChainEntry) => Promise<VstLiveSession | null>;
+  unhold: (entryId: string) => void;
+}
+const EDITOR_HOLDER = 'editor';
+const realLiveHolder: LiveSessionHolder = {
+  hostAvailable: () => vstSessions.hostAvailable(),
+  // The engine's own context: the node that arrives later asks for the same rate, so the
+  // session the editor started is the one it reuses (a second rate would mean a second plugin).
+  // playerStore is imported lazily: it reads Vite's import.meta.env at module scope, which does
+  // not exist under the plain-tsx test runner, and nothing but this real path needs it.
+  hold: async (entry) => {
+    const { getEngineCtx } = await import('./playerStore');
+    return vstSessions.hold(entry, getEngineCtx().sampleRate, EDITOR_HOLDER);
+  },
+  unhold: (entryId) => vstSessions.unhold(entryId, EDITOR_HOLDER),
+};
+let liveHolder: LiveSessionHolder = realLiveHolder;
+/** Install a fake holder (`null` restores the real registry). */
+export function __setLiveHolderForTest(holder: LiveSessionHolder | null): void {
+  liveHolder = holder ?? realLiveHolder;
+}
+
+/** The entry whose session the editor is holding, so it is given back exactly once. */
+let heldEntryId: string | null = null;
+const releaseHold = (): void => {
+  if (heldEntryId === null) return;
+  const id = heldEntryId;
+  heldEntryId = null;
+  liveHolder.unhold(id);
+};
+
+/**
+ * Automated browser tests drive the real app, and a plugin's editor is a NATIVE window on the
+ * user's desktop. With this switch set, open() does nothing at all, so a test can add plugins
+ * and play them without a single window appearing. Off unless someone sets the key.
+ */
+export const NO_EDITOR_WINDOWS_KEY = 'thedaw.vst.noEditorWindows';
+const editorWindowsSuppressed = (): boolean => {
+  try {
+    return globalThis.localStorage?.getItem(NO_EDITOR_WINDOWS_KEY) === '1';
+  } catch {
+    return false;
+  }
+};
 
 /** The in-flight "wait for `starting` to become `live`" started by open(), if
  *  any: stops its vstLiveStore subscription and cancels its timer. Replaced
@@ -555,7 +613,12 @@ async function openLiveEditor(
  * open() (this entry retried, or a different one opened) and close() both
  * retire whatever `activeLiveWaitStop` points at before doing anything else.
  */
-function waitForLiveThenOpen(entry: ChainEntry, set: SetState, get: GetState): void {
+function waitForLiveThenOpen(
+  entry: ChainEntry,
+  set: SetState,
+  get: GetState,
+  opts: { timeoutMs?: number; onUnavailable?: () => void; onGiveUp?: () => void } = {},
+): void {
   if (!entry.vst) return;
   activeLiveWaitStop?.(); // a superseding open() retires whatever was waiting before
   const path = entry.vst.plugin_path;
@@ -576,6 +639,7 @@ function waitForLiveThenOpen(entry: ChainEntry, set: SetState, get: GetState): v
   };
   const fail = (reason: string): void => {
     stop();
+    opts.onGiveUp?.();
     const msg = `${name} ${reason}`;
     useStatusBarStore.getState().setText(`VST GUI FAILED: ${msg}`);
     // Only this wait's own entry — a superseding open() already overwrote it.
@@ -591,11 +655,20 @@ function waitForLiveThenOpen(entry: ChainEntry, set: SetState, get: GetState): v
         else if (get().entryId === entry.id) set({ error: `${name} started but its session vanished.` });
         return;
       }
+      // No live host on this machine after all: the caller falls back to the offline copy.
+      if (status === 'unavailable' && opts.onUnavailable) {
+        stop();
+        opts.onUnavailable();
+        return;
+      }
       // 'off' / 'error' / 'unavailable': the spawn will not become live.
       if (status !== 'starting') fail(`failed to start${status ? ` (${status})` : ''}.`);
     },
   );
-  handle = liveWaitClock.schedule(() => fail('is still starting — try again in a moment.'), LIVE_STARTING_WAIT_MS);
+  handle = liveWaitClock.schedule(
+    () => fail('is still starting — try again in a moment.'),
+    opts.timeoutMs ?? LIVE_STARTING_WAIT_MS,
+  );
   activeLiveWaitStop = stop;
 }
 
@@ -607,9 +680,22 @@ export const useVstEditorStore = create<VstEditorState>()((set, get) => ({
   ownerTab: null,
   mode: null,
 
-  open: (entry, sinkRawState) => {
+  open: (entry, sinkRawState, opts) => {
     if (!entry.vst) return;
-    if (get().entryId === entry.id) return; // already open for this entry
+    if (editorWindowsSuppressed()) {
+      useStatusBarStore.getState().setText('VST GUI: plugin windows are switched off (test mode).');
+      return;
+    }
+    if (get().entryId === entry.id && !opts?.offlineOnly) return; // already open for this entry
+    // A different entry takes over: whatever session the editor was holding goes back.
+    if (heldEntryId !== null && heldEntryId !== entry.id) releaseHold();
+    // A superseding open() -- this is a DIFFERENT entry than whatever was
+    // open (or waiting) before -- must retire any wait already in flight,
+    // whichever of the three branches below it takes. Before this, only
+    // waitForLiveThenOpen's own entry point and close() retired it, so the
+    // 'live' branch and the offline fall-through both left a stale wait
+    // running for the entry being superseded (R1 rework finding).
+    activeLiveWaitStop?.();
     // A live session owns this plugin: its editor is the one that changes what
     // is being heard, so the sidecar path below is not even considered.
     const session = liveSessionLookup(entry.id);
@@ -618,13 +704,63 @@ export const useVstEditorStore = create<VstEditorState>()((set, get) => ({
       void openLiveEditor(entry, session, set, get);
       return;
     }
-    // The session exists but hello/ready has not landed yet: opening the
-    // offline sidecar here would spin up a SECOND copy of the plugin and, the
-    // moment its editor captured a state, stamp a `pedalboard` origin onto an
-    // entry a live host is about to own. Wait the spawn out instead of
-    // falling through to the sidecar path below (F1b3 / R1 finding 7).
-    if (session && liveStatus === 'starting') {
+    // A live spawn is under way for this entry: sessionRegistry.open() sets
+    // status to 'starting' as the FIRST thing it does, well before the
+    // session object itself exists (the HTTP probe, the spawn POST, and the
+    // WS connect all still have to happen), so `session` above is commonly
+    // still undefined here -- check liveStatus alone, not `session &&
+    // liveStatus === 'starting'` (that guard stayed false for the entire
+    // spawn phase and fell through to the offline branch anyway, F1b3 / R1
+    // finding 7 rework). Opening the offline sidecar now would spin up a
+    // SECOND copy of the plugin and, the moment its editor captured a state,
+    // stamp a `pedalboard` origin onto an entry a live host is about to own.
+    // Wait the spawn out instead of falling through to the sidecar path
+    // below -- waitForLiveThenOpen looks the session up itself once status
+    // turns 'live'.
+    if (liveStatus === 'starting') {
       waitForLiveThenOpen(entry, set, get);
+      return;
+    }
+    // No live session yet -- usually just because the engine has not built this chain (a plugin
+    // added with the transport stopped). With a live host on this machine the live instance is
+    // THE instance: start it and open ITS window, so the knobs the user turns are the plugin
+    // they hear. The node that arrives later reuses the same session. Only a machine without
+    // the host (or a page open from another device) falls through to the offline copy below.
+    if (!opts?.offlineOnly && liveHolder.hostAvailable() !== false) {
+      heldEntryId = entry.id;
+      const fallBackToOffline = (): void => {
+        releaseHold();
+        useStatusBarStore
+          .getState()
+          .setText('Live plugin host unavailable - editing a separate copy; changes apply when you close the window.');
+        get().open(entry, sinkRawState, { offlineOnly: true });
+      };
+      waitForLiveThenOpen(entry, set, get, {
+        timeoutMs: LIVE_COLD_START_WAIT_MS,
+        onUnavailable: fallBackToOffline,
+        onGiveUp: releaseHold,
+      });
+      void liveHolder
+        .hold(entry)
+        .then((held) => {
+          // The store row is what the wait above listens to. A null WITHOUT a row change (an
+          // entry the registry refuses outright) would leave it waiting out the whole timeout.
+          if (held || heldEntryId !== entry.id) return;
+          const status = useVstLiveStore.getState().entries[entry.id]?.status;
+          if (status === 'live' || status === 'starting') return;
+          activeLiveWaitStop?.();
+          if (status === 'error') {
+            releaseHold();
+            if (get().entryId === entry.id) set({ error: `${vstEntryName(entry.vst?.plugin_name, entry.vst?.plugin_path ?? '')} failed to start live.` });
+            return;
+          }
+          fallBackToOffline();
+        })
+        .catch(() => {
+          if (heldEntryId !== entry.id) return;
+          activeLiveWaitStop?.();
+          fallBackToOffline();
+        });
       return;
     }
     const path = entry.vst.plugin_path;
@@ -770,14 +906,22 @@ export const useVstEditorStore = create<VstEditorState>()((set, get) => ({
     // A pending "waiting for `starting`" (see waitForLiveThenOpen) must not
     // outlive an explicit close: without this it could still pop the live
     // editor open, or report a timeout error, after the user closed it.
+    // Still waiting for a live session: nothing offline was ever opened for it.
+    const wasLiveWait = activeLiveWaitStop !== null;
     activeLiveWaitStop?.();
+    // The window is going away: the session goes back to whoever else uses it (a node keeps it
+    // alive; nobody -> the registry's grace period, then the host exits).
+    releaseHold();
     if (liveEditor) {
       closeLiveEditor();
       set({ entryId: null, pluginPath: null, pluginName: null, error: null, ownerTab: null, mode: null });
       return;
     }
     const { pluginPath } = get();
-    if (pluginPath) void vstApi.editorRect(pluginPath, { x: 0, y: 0, w: 0, h: 0, dpr: 1, close: true });
+    // Fire-and-forget: a backend that is down must not become an unhandled rejection here.
+    if (pluginPath && !wasLiveWait) {
+      void vstApi.editorRect(pluginPath, { x: 0, y: 0, w: 0, h: 0, dpr: 1, close: true }).catch(() => {});
+    }
     // The session's poll loop keeps running on purpose: the sidecar writes the
     // final raw_state when the native window actually closes, and that
     // commit-on-close capture must still reach the owning entry.

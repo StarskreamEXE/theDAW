@@ -3,3 +3,8 @@
 # The sibling staging dirs (resources/tools, resources/vj-dist, resources/foundry-app)
 # are ignored from the repo-root .gitignore; this entry belongs beside them.
 resources/notation-renderer/
+
+# Staged live-VST host exe (+ vst3_probe.exe), regenerated at package time by
+# scripts/stage-vst-host.mjs from native/vst-host/bin. See electron-builder.yml
+# (win.extraResources) for where it lands in the packaged app.
+build-resources/vst-host/

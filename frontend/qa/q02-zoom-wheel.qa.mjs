@@ -1,7 +1,7 @@
 // QA area q02-zoom-wheel: zoom + mouse wheel behaviour in the EDIT timeline.
 // Run with: cd "C:\Users\skream\projects\_thedaw-batch11/frontend" && node qa/q02-zoom-wheel.qa.mjs
 //
-// Reads (pinned commit 32f4531): components/audio/timelineZoom.ts,
+// Reads (pinned commit 60d4a44): components/audio/timelineZoom.ts,
 // lib/timeline/viewport.ts, state/timelinePrefsStore.ts, state/editorStore.ts
 // (ZOOM_MIN=0.25, ZOOM_MAX=400, TRACK_HEIGHT_MIN=56, TRACK_HEIGHT_MAX=260,
 // default zoom=30), components/audio/WaveformEditor.tsx (requestZoom,
@@ -49,16 +49,35 @@ async function main() {
   const shot = (name) => page.screenshot({ path: report.shotPath(name) }).catch(() => {})
 
   try {
-    // Dismiss any onboarding/tour overlay, best-effort, never fatal.
+    // Dismiss the first-run "Welcome to theDAW" tour overlay. On a fresh QA
+    // data folder it does not appear immediately: it shows up somewhere
+    // between ~6s and ~10s after load (after the boot splash finishes), so a
+    // one-shot check at t=0 misses it and it then pops up mid-click on the
+    // Edit tab and blocks for the rest of that click's timeout. Wait for the
+    // close button across that whole window instead of a fixed short probe.
     try {
-      const dismiss = page.getByRole('button', { name: /skip|close|got it|dismiss/i }).first()
-      if (await dismiss.isVisible({ timeout: 1500 })) await dismiss.click()
+      const dismiss = page.getByRole('button', { name: /close tour|skip|got it|dismiss/i }).first()
+      await dismiss.waitFor({ state: 'visible', timeout: 16000 })
+      await dismiss.click()
+      await sleep(200)
     } catch {
-      /* no overlay: fine */
+      /* no overlay this run: fine */
     }
 
     // --- Navigate to EDIT ---
-    await page.getByRole('button', { name: 'Edit', exact: true }).click()
+    // A fresh QA data folder has no project yet, so the app opens on the
+    // modal HOME screen (role="dialog", aria-labelledby="home-title") which
+    // covers the top tab bar until dismissed. Its own "Open the Edit
+    // workspace" tile dismisses Home and switches workspace in one action;
+    // fall back to the top-bar Edit tab if Home did not appear this run.
+    const homeEditTile = page.getByRole('button', { name: 'Open the Edit workspace' })
+    try {
+      await homeEditTile.waitFor({ state: 'visible', timeout: 5000 })
+      await homeEditTile.click()
+    } catch {
+      await page.getByRole('button', { name: 'Edit', exact: true }).click()
+    }
+    await sleep(150)
     const scroller = page.locator('[class*="07050a"]').first()
     await scroller.waitFor({ state: 'visible', timeout: 10000 })
     const ruler = scroller.locator(':scope > div').nth(0)
@@ -329,7 +348,11 @@ async function main() {
 
     // --- 7. Alternative wheel profile (REAPER) switches the bindings ---
     await report.scenario('reaper-wheel-profile-switches-bindings', async () => {
-      await heightSlider.fill('150')
+      // The slider is step=4 from min=56 (56, 60, 64, ...): 150 is not on that
+      // grid, so the browser's range-input validity check rejects it and
+      // Playwright's fill() throws "Malformed value". 156 (56 + 4*25) is a
+      // real reachable mid-range value.
+      await heightSlider.fill('156')
       await sleep(100)
       await page.getByRole('button', { name: 'Timeline preferences' }).click()
       await page.getByRole('radio', { name: /reaper/i }).check()

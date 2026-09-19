@@ -467,6 +467,22 @@ def test_set_param_rejects_a_value_with_trailing_garbage(probe: Path):
     assert "--set-param" in completed.stderr, completed.stderr
 
 
+def test_set_param_rejects_an_id_above_the_paramid_range(probe: Path):
+    """An id/index that overflows uint32_t must not be silently truncated.
+
+    VST3 ParamIDs are uint32_t, and the fallback lookup narrows the candidate id with
+    ``static_cast<std::uint32_t>(arg.id)`` before comparing it against a real parameter's id.
+    Without an explicit range check right after parsing, 4294967296 (2**32) truncates to 0,
+    4294967297 to 1, and so on -- so a value one past the valid range would silently alias onto
+    parameter id 0 instead of being rejected. Asserting the "--set-param" message specifically
+    is what catches that: on the bug this pair parses successfully and the run instead dies
+    later on a missing --list/--load/--selftest, which is also exit 2 but names neither.
+    """
+    completed = _run_probe_raw(probe, "--set-param", "4294967296=0.5")
+    assert completed.returncode == 2, completed.stdout
+    assert "--set-param" in completed.stderr, completed.stderr
+
+
 def test_set_param_rejects_a_value_above_one(probe: Path):
     completed = _run_probe_raw(probe, "--set-param", "0=1.5")
     assert completed.returncode == 2, completed.stdout

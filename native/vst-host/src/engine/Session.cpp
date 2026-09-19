@@ -15,6 +15,10 @@ namespace {
 
 constexpr size_t kControlSlotReserve = 4096;
 constexpr int kParkTimeoutMs = 4000;
+// Connection markers in the control queue (never valid JSON, never accepted from the wire).
+constexpr char kConnectionMarkerPrefix = '\x01';
+constexpr const char* kMarkerConnected = "connected";
+constexpr const char* kMarkerGone = "gone";
 constexpr int kParamEchoIntervalMs = 33;  // <= 30 Hz per parameter
 constexpr int kXrunIntervalMs = 1000;
 // How long the audio thread waits for the next audio_in block before it delivers queued
@@ -211,12 +215,18 @@ void Session::stop() {
     if (stopped_) return;
     stopped_ = true;
 
-    // Graceful order: park audio -> close the editor -> capture state -> write
-    // the state file -> release the plugin. Parking happens before `stopping_`
-    // is set, otherwise the audio thread would leave its loop without ever
-    // answering the park handshake.
-    const bool wasParked = parkAudio();
+    // Order matters. The audio thread is the only caller of process(), so it is ended and
+    // JOINED first; only then is the plugin touched. A park is not enough here: a park can
+    // time out (a peer that stops reading stalls send()), and releasing the plugin under a
+    // thread that may still be inside process() is a use-after-free. The join is bounded by
+    // the socket timeouts (recv 2 ms, send kAudioSendTimeoutMs) and by the 100 ms park wait.
+    stopping_.store(true, std::memory_order_release);
+    if (stopEvent_ != nullptr) SetEvent(stopEvent_);
+    resumeAudio();  // no-op unless an operation in flight had it parked
+    if (audioThread_.joinable()) audioThread_.join();
 
+    // Nothing can be inside process() from here on: close the editor -> capture state ->
+    // write the state file -> release the plugin.
     if (plugin_ != nullptr) {
         IPluginInstance* instance = plugin_.get();
         if (editorOpen_) {
@@ -226,12 +236,6 @@ void Session::stop() {
         writeStateFile();
         util::guarded([instance] { instance->release(); });
     }
-
-    stopping_.store(true, std::memory_order_release);
-    if (stopEvent_ != nullptr) SetEvent(stopEvent_);
-    if (wasParked) resumeAudio();
-
-    if (audioThread_.joinable()) audioThread_.join();
 
     const SOCKET socket = clientSocket_.exchange(INVALID_SOCKET);
     if (socket != INVALID_SOCKET) server_.releaseClient(socket);
@@ -257,7 +261,11 @@ void Session::acceptorConnectedTrampoline(void* context) {
 }
 
 void Session::clientConnectedTrampoline(void* context) {
-    static_cast<Session*>(context)->onClientConnected();
+    // Only the idle clock. The per-connection reset is NOT done here: this task is posted by
+    // the acceptor thread and can run after the audio thread has already delivered the new
+    // connection's `hello`, which would wipe helloSeen_/ready_ for good. The reset rides the
+    // control queue instead (see queueConnectionMarker).
+    static_cast<Session*>(context)->lastActivityMs_ = nowMs();
 }
 
 void Session::onClientConnected() {
@@ -289,7 +297,19 @@ void Session::drainControlQueue() {
         // while the handler still reads it.
         const std::string text = *slot;
         incoming_.commitRead();
+        if (!text.empty() && text[0] == kConnectionMarkerPrefix) {
+            handleConnectionMarker(text);
+            continue;
+        }
         handleControlText(text);
+    }
+}
+
+void Session::handleConnectionMarker(const std::string& text) {
+    if (text.compare(1, std::string::npos, kMarkerConnected) == 0) {
+        onClientConnected();
+    } else if (text.compare(1, std::string::npos, kMarkerGone) == 0) {
+        onClientGone();
     }
 }
 
@@ -316,10 +336,20 @@ void Session::tick() {
 
     const ULONGLONG now = nowMs();
 
-    // xrun: coalesced to at most one event per second and only when nonzero.
-    const uint32_t late = lateBlocks_.exchange(0, std::memory_order_relaxed);
-    const uint32_t worst = maxProcessMicros_.exchange(0, std::memory_order_relaxed);
-    if (late > 0 && now - lastXrunReportMs_ >= kXrunIntervalMs) {
+    // Work a timed-out park had to put off.
+    if (restartRetryPending_) onRestartRequired();
+    if (latencyRetryPending_) applyLatency(latencyRetrySamples_);
+
+    // xrun: at most one event per second and only when nonzero. The counters are taken (and
+    // zeroed) only when a report is due, so everything between two reports is in the report --
+    // taking them on every tick threw away all but the last tick's worth.
+    uint32_t late = 0;
+    uint32_t worst = 0;
+    if (now - lastXrunReportMs_ >= kXrunIntervalMs) {
+        late = lateBlocks_.exchange(0, std::memory_order_relaxed);
+        worst = maxProcessMicros_.exchange(0, std::memory_order_relaxed);
+    }
+    if (late > 0) {
         lastXrunReportMs_ = now;
         json::Writer writer;
         writer.beginObject()
@@ -465,12 +495,19 @@ void Session::handleOp(const json::Value& message, const std::string& op) {
             sendError("set_state: decoded state is empty", false);
             return;
         }
-        const bool parkedHere = parkAudio();
         std::string stateError;
         bool ok = false;
-        const unsigned long fault = util::guarded(
-            [&] { ok = instance->setState(blob.data(), blob.size(), stateError); });
-        if (parkedHere) resumeAudio();
+        unsigned long fault = 0;
+        {
+            ParkGuard park(*this);
+            if (!park.quiet()) {
+                sendError("set_state: the plugin is busy (audio did not pause in time); try again",
+                          false);
+                return;
+            }
+            fault = util::guarded(
+                [&] { ok = instance->setState(blob.data(), blob.size(), stateError); });
+        }
         if (fault != 0) {
             reportPluginFault("the plugin faulted while restoring state");
             return;
@@ -724,12 +761,18 @@ bool Session::captureState(std::vector<uint8_t>& out, std::string& error) {
         error = "no plugin instance";
         return false;
     }
-    const bool parkedHere = parkAudio();
     bool ok = false;
     std::string stateError;
-    const unsigned long fault =
-        util::guarded([&] { ok = instance->getState(out, stateError); });
-    if (parkedHere) resumeAudio();
+    unsigned long fault = 0;
+    {
+        ParkGuard park(*this);
+        if (!park.quiet()) {
+            error = "the plugin is busy (audio did not pause in time); try again";
+            out.clear();
+            return false;
+        }
+        fault = util::guarded([&] { ok = instance->getState(out, stateError); });
+    }
     if (fault != 0) {
         error = "the plugin faulted while saving state";
         out.clear();
@@ -798,13 +841,20 @@ void Session::applyLatency(int32_t latencySamples) {
     const int32_t latency = std::max(latencySamples, 0);
     // The delay line is read by the audio thread every block, so every change
     // to it -- length or buffer -- happens with audio parked.
-    const bool parkedHere = parkAudio();
+    ParkGuard park(*this);
+    if (!park.quiet()) {
+        // The delay line belongs to the audio thread until a park succeeds; tick() retries.
+        latencyRetryPending_ = true;
+        latencyRetrySamples_ = latency;
+        util::log::write("latency change deferred: audio did not pause in time");
+        return;
+    }
+    latencyRetryPending_ = false;
     prepared_.latencySamples = latency;
     if (!bypassDelay_.setDelay(latency)) {
         bypassDelay_.prepare(kMaxWireChannels, latency + 4096, options_.blockSize);
         bypassDelay_.setDelay(latency);
     }
-    if (parkedHere) resumeAudio();
 }
 
 void Session::onLatencyChanged(int32_t latencySamples) {
@@ -842,15 +892,24 @@ void Session::onWarning(const std::string& text) {
 void Session::onRestartRequired() {
     IPluginInstance* instance = plugin_.get();
     if (instance == nullptr) return;
-    const bool parkedHere = parkAudio();
     PrepareResult result;
-    const unsigned long fault = util::guarded([&] { result = instance->reprepare(); });
-    if (fault == 0 && result.ok) {
-        prepared_ = result;
-        prepared_.channelsIn = std::clamp(prepared_.channelsIn, 1, kMaxWireChannels);
-        prepared_.channelsOut = std::clamp(prepared_.channelsOut, 1, kMaxWireChannels);
+    unsigned long fault = 0;
+    {
+        ParkGuard park(*this);
+        if (!park.quiet()) {
+            // Re-preparing under a running process() would tear the plugin apart; tick() retries.
+            restartRetryPending_ = true;
+            util::log::write("plugin restart deferred: audio did not pause in time");
+            return;
+        }
+        restartRetryPending_ = false;
+        fault = util::guarded([&] { result = instance->reprepare(); });
+        if (fault == 0 && result.ok) {
+            prepared_ = result;
+            prepared_.channelsIn = std::clamp(prepared_.channelsIn, 1, kMaxWireChannels);
+            prepared_.channelsOut = std::clamp(prepared_.channelsOut, 1, kMaxWireChannels);
+        }
     }
-    if (parkedHere) resumeAudio();
 
     if (fault != 0) {
         reportPluginFault("the plugin faulted while restarting");
@@ -894,6 +953,19 @@ bool Session::parkAudio() {
     const ULONGLONG waited = nowMs() - started;
     if (waited > 5) util::log::writef("audio parked after %llu ms", waited);
     return true;
+}
+
+Session::ParkGuard::ParkGuard(Session& session) : session_(session) {
+    if (session_.parked_ || !session_.audioThread_.joinable()) {
+        quiet_ = true;  // an outer guard holds the park, or there is no audio thread
+        return;
+    }
+    parkedHere_ = session_.parkAudio();
+    quiet_ = parkedHere_;
+}
+
+Session::ParkGuard::~ParkGuard() {
+    if (parkedHere_) session_.resumeAudio();
 }
 
 void Session::resumeAudio() {
@@ -952,8 +1024,19 @@ void Session::dropClient() {
         stale->clear();
         outgoing_.commitRead();
     }
-    pushNotice(AudioNoticeCode::ClientGone);
+    // In order with the connection's messages; the notice is only the fallback for a full queue.
+    if (!queueConnectionMarker(kMarkerGone)) pushNotice(AudioNoticeCode::ClientGone);
     util::log::audioNote("client dropped");
+}
+
+bool Session::queueConnectionMarker(const char* marker) {
+    std::string* slot = incoming_.writeSlot();
+    if (slot == nullptr) return false;
+    slot->assign(1, kConnectionMarkerPrefix);
+    slot->append(marker);
+    incoming_.commitWrite();
+    SetEvent(controlEvent_);
+    return true;
 }
 
 bool Session::handleSocketMessage(const net::FrameReader::Message& message) {
@@ -962,6 +1045,11 @@ bool Session::handleSocketMessage(const net::FrameReader::Message& message) {
             handleAudioBlock(message.data, message.size);
             return true;
         case net::Opcode::Text: {
+            // The marker prefix is ours alone; control text is JSON and never starts with it.
+            if (message.size > 0 && static_cast<char>(message.data[0]) == kConnectionMarkerPrefix) {
+                util::log::audioNote("control text with a reserved prefix ignored");
+                return true;
+            }
             std::string* slot = incoming_.writeSlot();
             if (slot == nullptr) {
                 util::log::audioNote("control queue full; message dropped");
@@ -1200,6 +1288,13 @@ void Session::audioLoop() {
         if (socket == INVALID_SOCKET) {
             const SOCKET taken = server_.takeClient();
             if (taken != INVALID_SOCKET) {
+                // The marker goes in before the socket is adopted, so it precedes every
+                // message this connection can produce.
+                if (!queueConnectionMarker(kMarkerConnected)) {
+                    util::log::audioNote("control queue full; new client refused");
+                    server_.releaseClient(taken);
+                    continue;
+                }
                 reader_.reset();
                 bypassGain_ = 0.0f;
                 bypassDelay_.clear();

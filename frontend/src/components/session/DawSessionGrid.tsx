@@ -25,6 +25,8 @@ import { usePerformRoutingStore, ctrlMatches } from '../../state/performRouting'
 import { registerPerformChainPush } from '../../state/performRailStore';
 import { logError } from '../../state/logStore';
 import { dawDeviceToChainEntry } from '../../lib/dawEffectMap';
+import { ccModFxRoute } from './ccModFxRouteModel';
+import { pushLiveParam } from '../../lib/vstLive/liveParamSink';
 import {
   buildEffectChain,
   ensureChopModule,
@@ -1213,11 +1215,17 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
         const track = tracksRef.current[cm.trackIndex];
         if (!track || cm.deviceIndex == null || !cm.paramKey) return;
         const chain = ensureTrackChain(cm.trackIndex, track);
-        const lo = cm.min ?? 0;
-        const hi = cm.max ?? 1;
-        chain.handle?.updateParams(`perform-${cm.trackIndex}-${cm.deviceIndex}`, {
-          [cm.paramKey]: lo + value01 * (hi - lo),
-        });
+        const route = ccModFxRoute(cm, value01);
+        if (!route) return;
+        const { entryId, paramKey, normalized, scaled } = route;
+        // The plugin gets the value at about 60 Hz; the store gets ONE write
+        // at gesture end, so undo has one step per knob sweep either way.
+        if (
+          pushLiveParam(entryId, paramKey, normalized, (v) => chain.handle?.updateParams(entryId, { [paramKey]: v }))
+        ) {
+          return;
+        }
+        chain.handle?.updateParams(entryId, { [paramKey]: scaled });
         return;
       }
       const cur = mixRef.current.get(cm.trackIndex) ?? { vol: 1, mute: false };

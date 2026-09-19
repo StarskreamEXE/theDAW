@@ -6,7 +6,7 @@
 // Targets the already-running isolated QA instance (frontend :5183, backend
 // :8611 by default via qaLib.mjs). Never touches :5173 / :8600.
 
-import { openApp, createReport, expect } from './qaLib.mjs'
+import { openApp, createReport, expect, QA_URL } from './qaLib.mjs'
 
 const BACKEND_URL = process.env.QA_BACKEND || 'http://127.0.0.1:8611'
 
@@ -49,23 +49,82 @@ async function visibleElementCount(page) {
   })
 }
 
+/** Three first-run overlays stand between a fresh QA profile (this instance's
+ *  data folder is empty every run) and the tab bar -- and unlike a typical
+ *  "seen once" onboarding flag, the HOME screen reopens after EVERY reload,
+ *  not just first boot: HomeScreen.tsx's `useHomeScreenStore` only persists
+ *  `showAtStartup` (default true), while `open` always resets to false on
+ *  each fresh app load and App.tsx re-arms it whenever `showAtStartup` is
+ *  true (Shell.tsx: "Auto-opened by App on returning launches" -- by design,
+ *  not a bug).
+ *   1. `#boot-splash` -- a raw DOM node (main.tsx, pre-React) hosting the
+ *      ~14-24s boot cinematic (App.tsx `cinematicDone`); navigating with
+ *      `?nocinematic` (documented there as "used by the screenshot/capture
+ *      harness") skips it outright instead of racing its timing.
+ *   2. The onboarding tour ("N CHAPTERS" welcome dialog, role="dialog"
+ *      aria-modal, onboarding/OnboardingTour.tsx) -- closes on Escape; once
+ *      skipped it persists `seen: true` and does not return this run.
+ *   3. The full-screen HOME screen (role="dialog" aria-modal, aria-labelledby
+ *      "home-title", components/home/HomeScreen.tsx) -- also closes on
+ *      Escape, but (per above) returns after every reload.
+ *  (NOT `#footer-audio-out`, an unrelated role="dialog" popover that is
+ *  `hidden` by default -- matching on aria-modal="true" keeps the Escape loop
+ *  from spinning on that one forever.) Call this after every navigation AND
+ *  every reload in this script, not just once at boot. */
+async function dismissStartupOverlays(page) {
+  for (let i = 0; i < 4; i++) {
+    const modal = page.locator('[role="dialog"][aria-modal="true"]')
+    if ((await modal.count()) === 0) break
+    await page.keyboard.press('Escape')
+    await page.waitForTimeout(300)
+  }
+  // Defense in depth, in case a variant does not close on Escape: the home
+  // screen's own explicit close control.
+  const closeBtn = page.locator('[aria-label="Close home screen"]')
+  try {
+    if ((await closeBtn.count()) > 0 && (await closeBtn.first().isVisible())) {
+      await closeBtn.first().click({ timeout: 3000 })
+      await page.waitForTimeout(300)
+    }
+  } catch {
+    // not fatal -- the tab bar may still be reachable
+  }
+}
+
 const report = createReport('q10-boot-nav')
 const { browser, page, consoleErrors } = await openApp({ width: 1600, height: 900 })
 
 try {
+  // App.tsx's boot sequence holds on a ~14-24s cinematic splash (particle
+  // logo -> wordmark -> credit) before the tab bar mounts, independent of
+  // backend-readiness / API calls. It is intentionally bypassable via
+  // `?nocinematic`, documented in App.tsx as "used by the screenshot/capture
+  // harness" -- i.e. exactly this kind of script. Navigate once so every
+  // later page.reload() in this file keeps the same URL and never re-plays
+  // the splash (nocinematic does not affect the API calls / console-error
+  // checks below, only the cosmetic overlay).
+  const bootUrl = `${QA_URL}${QA_URL.includes('?') ? '&' : '?'}nocinematic`
+  await page.goto(bootUrl, { waitUntil: 'networkidle', timeout: 60000 })
+  await dismissStartupOverlays(page)
+  await page.waitForSelector('[data-tour="tab-make"]', { timeout: 15000 })
+
   // ---- Scenario 1: boot with no uncaught error / no unexpected 4xx-5xx ----
   const bootApiCalls = []
   page.on('response', (res) => {
     const u = res.url()
     if (u.includes('/api/')) bootApiCalls.push({ status: res.status(), url: u })
+    if (res.status() >= 400) console.log(`DIAG failed resource ${res.status()}: ${u}`)
   })
 
   await report.scenario('1-boot-no-errors', async () => {
-    // openApp() already did one navigation before this listener was attached;
-    // reload() is a full boot from the browser's point of view and gives us
-    // complete request/console capture.
+    // The navigation above happened before this listener was attached;
+    // reload() is a full boot from the browser's point of view (same URL, so
+    // it keeps the nocinematic hook) and gives complete request/console
+    // capture. It re-arms the tour/home overlays by design (see
+    // dismissStartupOverlays above), so dismiss them again before asserting.
     await page.reload({ waitUntil: 'networkidle', timeout: 60000 })
     await page.waitForTimeout(1500)
+    await dismissStartupOverlays(page)
     await page.screenshot({ path: report.shotPath('01-boot'), fullPage: true })
 
     const failed = bootApiCalls.filter((c) => c.status >= 400)
@@ -82,27 +141,37 @@ try {
   })
 
   // ---- Scenario 2: switch through every top-bar view and back ----
+  // Collect-and-continue rather than fail-fast: a single bad tab must not
+  // hide whether every OTHER tab (the actual scope: "EVERY top-bar view")
+  // is clean, so one run gives full 13-tab coverage instead of stopping at
+  // the first failure.
   await report.scenario('2-nav-all-views-and-back', async () => {
+    const failures = []
     for (const id of ON_SCREEN_TABS) {
       const before = consoleErrors.length
-      const tab = page.locator(`[data-tour="tab-${id}"]`)
-      expect(await tab.count() === 1, `no tab button found for [data-tour="tab-${id}"]`)
-      await tab.click()
-      await page.waitForTimeout(600)
-      const box = await page.locator('main').boundingBox()
-      expect(!!box && box.width > 100 && box.height > 100, `<main> has degenerate size after switching to ${id}`)
-      const visible = await visibleElementCount(page)
-      expect(visible > 10, `view "${id}" looks blank: only ${visible} elements with non-zero size under <main>`)
-      await page.screenshot({ path: report.shotPath(`02-view-${id}`) })
-      if (consoleErrors.length > before) {
-        throw new Error(`uncaught error switching to "${id}": ${consoleErrors.slice(before).join(' | ')}`)
+      try {
+        const tab = page.locator(`[data-tour="tab-${id}"]`)
+        expect(await tab.count() === 1, `no tab button found for [data-tour="tab-${id}"]`)
+        await tab.click()
+        await page.waitForTimeout(600)
+        const box = await page.locator('main').boundingBox()
+        expect(!!box && box.width > 100 && box.height > 100, `<main> has degenerate size after switching to ${id}`)
+        const visible = await visibleElementCount(page)
+        expect(visible > 10, `view "${id}" looks blank: only ${visible} elements with non-zero size under <main>`)
+        await page.screenshot({ path: report.shotPath(`02-view-${id}`) })
+        if (consoleErrors.length > before) {
+          throw new Error(`uncaught error switching to "${id}": ${consoleErrors.slice(before).join(' | ')}`)
+        }
+      } catch (e) {
+        failures.push(`[${id}] ${String((e && e.message) || e).slice(0, 200)}`)
       }
     }
     // ...and back to the default view.
     await page.locator('[data-tour="tab-make"]').click()
     await page.waitForTimeout(400)
     const pressed = await page.locator('[data-tour="tab-make"]').getAttribute('aria-pressed')
-    expect(pressed === 'true', `returning to MAKE did not mark it active (aria-pressed="${pressed}")`)
+    if (pressed !== 'true') failures.push(`returning to MAKE did not mark it active (aria-pressed="${pressed}")`)
+    if (failures.length) throw new Error(failures.join(' ;; '))
   })
 
   // ---- Scenario 3: Help/diagnostics build ids ----
@@ -139,22 +208,30 @@ try {
   })
 
   // ---- Scenario 4: reloading on each view restores that view ----
+  // Same collect-and-continue reasoning as Scenario 2.
   await report.scenario('4-reload-restores-view', async () => {
+    const failures = []
     for (const id of ON_SCREEN_TABS) {
-      await page.locator(`[data-tour="tab-${id}"]`).click()
-      await page.waitForTimeout(500)
-      const before = consoleErrors.length
-      await page.reload({ waitUntil: 'networkidle', timeout: 60000 })
-      await page.waitForTimeout(800)
-      if (consoleErrors.length > before) {
-        throw new Error(`uncaught error reloading on "${id}": ${consoleErrors.slice(before).join(' | ')}`)
+      try {
+        await page.locator(`[data-tour="tab-${id}"]`).click()
+        await page.waitForTimeout(500)
+        const before = consoleErrors.length
+        await page.reload({ waitUntil: 'networkidle', timeout: 60000 })
+        await page.waitForTimeout(800)
+        await dismissStartupOverlays(page)
+        if (consoleErrors.length > before) {
+          throw new Error(`uncaught error reloading on "${id}": ${consoleErrors.slice(before).join(' | ')}`)
+        }
+        const pressed = await page.locator(`[data-tour="tab-${id}"]`).getAttribute('aria-pressed')
+        expect(pressed === 'true', `reload did not restore view "${id}" (aria-pressed="${pressed}")`)
+        const visible = await visibleElementCount(page)
+        expect(visible > 10, `view "${id}" looks blank after reload: only ${visible} visible elements`)
+        await page.screenshot({ path: report.shotPath(`04-reload-${id}`) })
+      } catch (e) {
+        failures.push(`[${id}] ${String((e && e.message) || e).slice(0, 200)}`)
       }
-      const pressed = await page.locator(`[data-tour="tab-${id}"]`).getAttribute('aria-pressed')
-      expect(pressed === 'true', `reload did not restore view "${id}" (aria-pressed="${pressed}")`)
-      const visible = await visibleElementCount(page)
-      expect(visible > 10, `view "${id}" looks blank after reload: only ${visible} visible elements`)
-      await page.screenshot({ path: report.shotPath(`04-reload-${id}`) })
     }
+    if (failures.length) throw new Error(failures.join(' ;; '))
   })
 
   // ---- Scenario 5: resize 1280x720 / 1920x1080, no overlap/unreachable controls in EDIT ----

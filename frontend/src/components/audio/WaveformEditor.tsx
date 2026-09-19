@@ -114,6 +114,7 @@ import {
 } from './timelineInteraction';
 import { alignedStart, beatMatchPlan, firstBeatInClip } from '../../lib/beatMatch';
 import { ContextMenu, useContextMenu, type ContextMenuItem, type ContextMenuPosition } from '../ui/ContextMenu';
+import { RenderRangeDialog } from '../render/RenderRangeDialog';
 import { SurfacePlayKey } from '../ui/SurfacePlayKey';
 import { StemsRunModal, type StemsRunOptions } from '../library/StemsRunModal';
 import { EffectWindowsHost, FxChainList, openEffectWindow, type EffectWindowOrigin, type FxScope } from './EffectWindows';
@@ -3704,6 +3705,10 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
    *  `trackId` / `clipId` are what was under the pointer, for the rows that
    *  need a lane or a clip. */
   const rangeMenu = useContextMenu<{ range: TimeRange; trackId: string | null; clipId?: string; sec: number }>();
+  // The range the 'Render range…' row was chosen for, captured at menu time, plus where the
+  // menu stood so the popover opens beside it. Opening it never touches the time selection,
+  // the edit cursor or the playhead.
+  const [rangeRender, setRangeRender] = useState<{ startSec: number; endSec: number; x: number; y: number } | null>(null);
   const addInputUid = useId().replace(/[^a-zA-Z0-9_-]/g, '');
   const addAudioInputId = `editor-add-audio-${addInputUid}`;
   const addMidiInputId = `editor-add-midi-${addInputUid}`;
@@ -7621,7 +7626,9 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
               clipMenu.open(new MouseEvent('contextmenu', { clientX: menuPos.x, clientY: menuPos.y }), { clipId, atSec: sec });
             },
           },
-          render: { run: () => undefined },
+          render: {
+            run: () => setRangeRender({ startSec: range.startSec, endSec: range.endSec, x: menuPos.x, y: menuPos.y }),
+          },
           'send-assistant': {
             icon: <Bot className="w-3 h-3" />,
             // The store's time selection, not this menu's copy of it: the
@@ -7654,6 +7661,19 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
           />
         );
       })()}
+
+      {/* A bounded FULL-MIX render: the same request COMMIT EDIT queues (same scope, same
+          fidelity), only with frame bounds, so the file lands exactly where a mixdown lands. */}
+      <RenderRangeDialog
+        open={rangeRender !== null}
+        selection={rangeRender}
+        anchor={rangeRender ?? undefined}
+        onCancel={() => setRangeRender(null)}
+        onConfirm={({ title, range }) => {
+          enqueueBounce({ kind: 'mixdown', label: title, request: { ...mixdownRequest(), range }, range });
+          setRangeRender(null);
+        }}
+      />
 
       {addMenu.position && addMenu.payload && (() => {
         const target = addMenu.payload;

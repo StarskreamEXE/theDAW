@@ -92,6 +92,19 @@
  * A freeze STEM is one path, so its trim was always exact; the stem scope
  * builds no comp delay and is untouched by this.
  *
+ * SINCE F24 a MASTER bounce can be asked for a `range`: a window of the
+ * timeline, preroll thrown away and a tail kept (`BounceRequest.range`,
+ * `render/renderRangePlan.planRangeRender`). It reproduces a full render of
+ * those same frames — clips, native/rack automation, takes/comps, sends and
+ * latency compensation all behave exactly as they do today — with TWO KNOWN
+ * LIMITS this ticket does not fix and does not paper over, both already true
+ * of a full render and simply not made worse:
+ *   - PER-SEND latency compensation, per "WHAT IS STILL OUTSIDE THE NUMBER"
+ *     above — a range render inherits the same lack, not a new one.
+ *   - MASTER-RACK and SEND automation timing is not re-aligned to the range's
+ *     shifted origin — only native track volume/pan and per-track rack lanes
+ *     are (`scheduleParamLane`, `applyFxAt` in `renderBounce`).
+ *
  * SINCE T46C a COMPED clip prints what it previews, and it does so without a
  * line of scheduling maths living here. The comp model is `lib/clipComp`'s and
  * the segment walk is `scheduleClipSources`'s — the same function the live
@@ -158,6 +171,8 @@ import {
   SPATIAL_TELEPORT, buildEffectChain, chainLatencySec, ensureChopModule, teleportXYZ,
   type ChainHandle,
 } from './rackEffects';
+import type { RenderRange } from './render/renderRange';
+import { planRangeRender, sliceRangeBuffer } from './render/renderRangePlan';
 import { encodeWav } from './wavEncode';
 
 /** The rate every offline bounce pins. Decoded buffers are cached per rate
@@ -204,8 +219,27 @@ export interface BounceRequest {
    *  `encodeBounce`; the render itself is float either way. */
   float32: boolean;
   /** Extra seconds past the clip extent, for tails to decay into. No call site
-   *  sets it today, so it is 0 and the render length is unchanged. */
+   *  sets it today, so it is 0 and the render length is unchanged. IGNORED
+   *  when `range` is present — see `range` below. */
   tailSec?: number;
+  /**
+   * Render only these frames (F24). Absent = the whole timeline, exactly the
+   * behaviour every existing call site keeps. When present, the offline
+   * context starts at `startFrame - prerollFrames` (clamped at the project
+   * start), the preroll is rendered and thrown away, and exactly
+   * `keptFrameCount(range)` frames come back — see
+   * `render/renderRangePlan.planRangeRender` / `sliceRangeBuffer`, and
+   * `renderBounce`'s use of them.
+   *
+   * A DIFFERENT knob from `tailSec` above, not a redundant one: with a range
+   * present, `range.tailFrames` decides the tail and `tailSec` is ignored.
+   *
+   * KNOWN LIMITS, not fixed here (see the module header): PER-SEND latency
+   * compensation is exactly as un-compensated as it is in a full render, and
+   * MASTER-RACK / SEND automation timing is not re-aligned to the range's
+   * shifted origin.
+   */
+  range?: RenderRange;
 }
 
 /** An `AudioContext` used only to decode (and then closed). */
@@ -302,7 +336,15 @@ export function renderExtentSec(clips: AudioClip[], scope: BounceScope): number 
  * Write a lane onto a native AudioParam — the SAME event list live playback
  * puts on that param (`liveMixer.laneEnvelopeEvents`), with the offline
  * pinning: the render starts at t = 0 and the context clock IS the timeline, so
- * `fromSec` / `startCtxTime` / `startOffset` / `now` are all 0.
+ * `startCtxTime` / `now` are always 0, and `fromSec` / `startOffset` are too
+ * UNLESS this is a range render (F24): `renderOriginSec` is then
+ * `plan.renderStartSec`, the timeline position context-time 0 actually is, and
+ * `fromSec` and `startOffset` both take that value — the same pin
+ * `laneEnvelopeEvents` documents for a live resume, just resuming at the
+ * render's own origin instead of wherever the transport last was. Passing
+ * `fromSec` alone and leaving `startOffset` at 0 would leave the two clocks
+ * mismatched by `renderOriginSec` for every future breakpoint, so they always
+ * move together.
  *
  * This used to be a hand-written loop here — a `setValueAtTime` for the first
  * value, a hold to its breakpoint, then one `linearRampToValueAtTime` per later
@@ -326,11 +368,20 @@ export function renderExtentSec(clips: AudioClip[], scope: BounceScope): number 
  * lead cannot push anything off the front of the file. `trimLeadingSec` then
  * takes the SAME lead off the whole render, which is why this is not double
  * compensation: the audio and the envelope move together and land together.
+ * A range render's anchor is at `renderOriginSec` instead of 0 for the same
+ * reason `deps.scheduleSources`' clip clock is (see `renderBounce`): the
+ * value the param starts THIS render holding is whatever a full render would
+ * have it holding at the render's own origin, not at timeline 0.
  */
 const scheduleParamLane = (
   param: AudioParam, lane: AutomationLane, clampFn: (v: number) => number, delaySec = 0,
+  renderOriginSec = 0,
 ): void => {
-  applyEnvelopeEvents(param, laneEnvelopeEvents(lane, 0, 0, 0, 0, delaySec), clampFn);
+  applyEnvelopeEvents(
+    param,
+    laneEnvelopeEvents(lane, renderOriginSec, 0, renderOriginSec, 0, delaySec),
+    clampFn,
+  );
 };
 
 interface TrackNodes {
@@ -507,9 +558,27 @@ export async function renderBounce(req: BounceRequest, deps: RenderDeps): Promis
   const { scope } = req;
   const sr = req.sampleRate;
   const scoped = clipsInScope(deps.clips, scope);
-  const lengthSec = renderExtentSec(deps.clips, scope) + Math.max(0, req.tailSec ?? 0);
-  /** The length the FILE is, and the bounce's contract — see `trimLeadingSec`. */
+  // `range.tailFrames`, not `tailSec`, decides the tail once a range is
+  // present (F24) — the two are different knobs (see `BounceRequest.range`),
+  // and adding both would double the tail a `planRangeRender` already sized.
+  const lengthSec = renderExtentSec(deps.clips, scope)
+    + (req.range ? 0 : Math.max(0, req.tailSec ?? 0));
+  /** The length the FILE is, and the bounce's contract — see `trimLeadingSec`.
+   *  Superseded by `plan.contextFrames` / `plan.keepFrames` below when a
+   *  range is present; kept as-is so the rangeless path is untouched. */
   const outLength = Math.ceil(lengthSec * sr);
+  /**
+   * The F24 frame plan for a windowed render, or null for the whole timeline.
+   * Pure frame arithmetic (`render/renderRangePlan`), fixed before any node
+   * exists — everything below that schedules a time shifts it by
+   * `renderOriginSec` so that context-time 0 is `plan.renderStartSec` on the
+   * timeline instead of timeline 0.
+   */
+  const plan = req.range ? planRangeRender(req.range, sr) : null;
+  /** The timeline position context-time 0 actually is: 0 for a whole-timeline
+   *  render, `plan.renderStartSec` for a range. The one number every clip,
+   *  automation and suspend time below is shifted by. */
+  const renderOriginSec = plan?.renderStartSec ?? 0;
 
   // ── Which tracks, and which of their entries ─────────────────────────────
   // Ahead of the context because the context's LENGTH depends on their chains.
@@ -571,7 +640,11 @@ export async function renderBounce(req: BounceRequest, deps: RenderDeps): Promis
 
   const makeContext = deps.makeContext
     ?? ((channels, length, rate) => new OfflineAudioContext(channels, length, rate));
-  const ctx = makeContext(BOUNCE_CHANNELS, outLength + Math.ceil(padSec * sr), sr);
+  // `plan.contextFrames` in place of `outLength` for a range (F24): the
+  // preroll + kept window + tail, not the whole timeline. `padSec` is added
+  // exactly as it is for a full render — it is measured over the same
+  // `trackUniverse` either way.
+  const ctx = makeContext(BOUNCE_CHANNELS, (plan?.contextFrames ?? outLength) + Math.ceil(padSec * sr), sr);
 
   // ── Decode ───────────────────────────────────────────────────────────────
   const makeDecodeContext = deps.makeDecodeContext
@@ -792,14 +865,14 @@ export async function renderBounce(req: BounceRequest, deps: RenderDeps): Promis
     let panner: StereoPannerNode | null = null;
     if (req.includeTrackMix) {
       const volLane = lanes.find((l) => l.target.kind === 'trackVolume' && l.target.trackId === trk.id);
-      if (volLane) scheduleParamLane(gain.gain, volLane, (v) => Math.max(0, v));
+      if (volLane) scheduleParamLane(gain.gain, volLane, (v) => Math.max(0, v), 0, renderOriginSec);
       else gain.gain.value = trk.volume;
 
       panner = ctx.createStereoPanner();
       const panLane = lanes.find((l) => l.target.kind === 'trackPan' && l.target.trackId === trk.id);
       // The one lane on this strip that is NOT written on the clip scheduler's
       // clock: the panner is downstream of the inserts (see `panLeadSec`).
-      if (panLane) scheduleParamLane(panner.pan, panLane, clampPan, panLeadSec(trk));
+      if (panLane) scheduleParamLane(panner.pan, panLane, clampPan, panLeadSec(trk), renderOriginSec);
       else panner.pan.value = clampPan(trk.pan);
     }
 
@@ -974,12 +1047,18 @@ export async function renderBounce(req: BounceRequest, deps: RenderDeps): Promis
     if (!buf) continue;
     const destination = perClipMix ? makeClipMix(trk) : trackNodeById.get(trk.id)?.gain;
     if (!destination) continue;
-    // `nowSec` = `fromSec` = 0: the offline context renders from the top, so a
-    // clip's timeline time IS its context time. The clip's own gain rides the
-    // fade envelope (`clipPeakGain`, NOT the track volume); the track fader is
-    // a node of its own, so per-track inserts process the post-fade signal.
+    // `nowSec` = 0: the offline context always renders from its own top.
+    // `fromSec` = `renderOriginSec` — 0 for a whole-timeline render (a clip's
+    // timeline time IS its context time), or `plan.renderStartSec` for a
+    // range (F24): the SAME "resume playback at this timeline position" seam
+    // the live engine uses (`liveMixer.scheduleClipSources`'s `into` and
+    // `clipStartCtx`), so a clip that started before the render's own origin
+    // still plays into it, clamped to start at context time 0, exactly as a
+    // clip straddling a live seek does. The clip's own gain rides the fade
+    // envelope (`clipPeakGain`, NOT the track volume); the track fader is a
+    // node of its own, so per-track inserts process the post-fade signal.
     // `sourceFor` is `buf` itself for every clip that is not comped.
-    deps.scheduleSources(ctx, clip, sourceFor(clip, buf), destination, 0, 0);
+    deps.scheduleSources(ctx, clip, sourceFor(clip, buf), destination, 0, renderOriginSec);
   }
 
   // ── Spatializer teleport ─────────────────────────────────────────────────
@@ -1018,7 +1097,16 @@ export async function renderBounce(req: BounceRequest, deps: RenderDeps): Promis
           for (const chunk of chunks) {
             if (chunk.tSec < offset || chunk.tSec >= offset + cdur) continue;
             const pos = teleportXYZ(idx, chunk.loudness, chunk.brightness, spread);
-            events.push({ when: c.startSec + (chunk.tSec - offset), x: pos.x, y: pos.y, z: pos.z });
+            // Shifted by `renderOriginSec` (F24, 0 outside a range render) so
+            // an onset's timeline position lands at the matching context
+            // time. A shifted time before context-time 0 (an onset in the
+            // discarded preroll or earlier) is not filtered out here:
+            // `scheduleTeleport` already clamps every `when` to its own
+            // `t0`, the same clamp `deps.scheduleSources` applies to a
+            // clip's start.
+            events.push({
+              when: c.startSec + (chunk.tSec - offset) - renderOriginSec, x: pos.x, y: pos.y, z: pos.z,
+            });
             idx += 1;
           }
         }
@@ -1093,7 +1181,12 @@ export async function renderBounce(req: BounceRequest, deps: RenderDeps): Promis
         tgt.handle.updateParams(tgt.entryId, merged);
       }
     };
-    applyFxAt(0); // initial state at the top of the render
+    // The top of THIS render, timeline-wise: 0 for a whole-timeline render,
+    // `renderOriginSec` for a range (F24) — `applyFxAt` reads its lanes in
+    // timeline seconds (see above), so the initial state has to be sampled at
+    // wherever this render's context-time 0 actually falls on that timeline,
+    // exactly like the clip and native-lane scheduling above it.
+    applyFxAt(renderOriginSec);
     // Union of breakpoint times, quantised to the render quantum, in (0, length).
     //
     // SHIFTED BY THE SAME PREFIX, and that half is not optional: a breakpoint
@@ -1116,7 +1209,19 @@ export async function renderBounce(req: BounceRequest, deps: RenderDeps): Promis
     }
     for (const tq of [...times].sort((a, b) => a - b)) {
       if (tq <= 0 || tq >= lengthSec) continue;
-      ctx.suspend(tq).then(() => { applyFxAt(tq); ctx.resume(); }).catch(() => {});
+      // `tq` stays a TIMELINE position for `applyFxAt` (it reads lanes in
+      // timeline seconds), but `ctx.suspend` takes a CONTEXT time, which is
+      // `tq - renderOriginSec` (0 outside a range render, so unchanged
+      // there). A step whose shifted time falls before this render's own
+      // start (still in the discarded preroll, or earlier) or at/after this
+      // context's own end (past this render's window, only reachable with a
+      // range shorter than the full timeline) is dropped rather than handed
+      // to `ctx.suspend`, which rejects for either — the same boundary
+      // `fxLaneSampleTime`'s own clamp enforces for a read, just applied here
+      // to the schedule instead.
+      const suspendAt = tq - renderOriginSec;
+      if (suspendAt < 0 || suspendAt >= ctx.length / sr) continue;
+      ctx.suspend(suspendAt).then(() => { applyFxAt(tq); ctx.resume(); }).catch(() => {});
     }
   }
 
@@ -1125,10 +1230,16 @@ export async function renderBounce(req: BounceRequest, deps: RenderDeps): Promis
   const trimSec = req.includeFx ? renderLatencySec(compRows) : 0;
 
   try {
-    // `outLength`, not the context's: the render ran `padSec` past the window
-    // so that the last `maxSec` of the music would exist to be pulled into
-    // place, and that overshoot is dropped here rather than shipped.
-    return trimLeadingSec(await ctx.startRendering(), trimSec, outLength);
+    // `outLength` (or `plan.contextFrames` for a range), not the context's:
+    // the render ran `padSec` past the window so that the last `maxSec` of
+    // the music would exist to be pulled into place, and that overshoot is
+    // dropped here rather than shipped.
+    const rendered = trimLeadingSec(await ctx.startRendering(), trimSec, plan?.contextFrames ?? outLength);
+    // F24: cut the preroll off the front and the tail down to exactly
+    // `plan.keepFrames`, so a range render's contract is the buffer LENGTH,
+    // the same way `outLength` is the whole-timeline render's. Absent a
+    // range this is a no-op pass-through — `plan` is null.
+    return plan ? sliceRangeBuffer(rendered, plan) : rendered;
   } finally {
     // `renderTrackStem` disposed its chain and the other two leaked theirs.
     // Disposal happens after the render has finished, so it cannot change a

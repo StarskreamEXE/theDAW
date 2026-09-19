@@ -217,8 +217,14 @@ FrameReader::Status FrameReader::next(Message& out) {
 
         const size_t frameSize = header.headerSize + static_cast<size_t>(header.payloadLength);
         if (available < frameSize) {
-            // Make sure the rest of this frame can land in the buffer.
-            if (!ensureSpace(frameSize)) {
+            // Ask for exactly what is still missing from THIS frame. ensureSpace
+            // wants "bytes of free space beyond end_", so passing frameSize
+            // itself here would demand room for frameSize MORE bytes on top of
+            // the `available` already buffered -- comparing the cumulative
+            // buffer end against the ceiling instead of this frame's actual
+            // size, and spuriously closing a legitimate maximum-size message
+            // with 1009 once available + frameSize crossed kMaxMessageBytes.
+            if (!ensureSpace(frameSize - available)) {
                 error_ = "frame larger than the 8 MB limit";
                 closeCode_ = kCloseTooBig;
                 return Status::MessageTooBig;

@@ -848,6 +848,7 @@ class LiveSessionManager:
             # directory that still holds an open file.
             _close_quietly(log_handle)
             self._archive_log(session_id, log_path)
+            self._archive_log(session_id, native_log_path, suffix="-native")
             if not _remove_tree(session_dir):
                 self._note_removal_failure(session_dir)
             raise LiveHostError(
@@ -868,10 +869,13 @@ class LiveSessionManager:
         )
         pump.start()
 
-        failure = self._await_listening(proc, pump, ready, box, log_path)
+        failure = self._await_listening(
+            proc, pump, ready, box, log_path, native_log_path
+        )
         if failure is not None:
             _close_quietly(proc.stdin)
             self._archive_log(session_id, log_path)
+            self._archive_log(session_id, native_log_path, suffix="-native")
             if not _remove_tree(session_dir):
                 self._note_removal_failure(session_dir)
             raise failure
@@ -912,11 +916,15 @@ class LiveSessionManager:
         ready: threading.Event,
         box: dict[str, int],
         log_path: Path,
+        native_log_path: Path,
     ) -> Optional[LiveHostError]:
         """Wait for the host's ``listening`` line. Returns the error, if any.
 
         Returning rather than raising keeps the caller's cleanup (archive the
-        log, drop the directory, close the pipes) in exactly one place.
+        log, drop the directory, close the pipes) in exactly one place. Both
+        ``log_path`` (the pump/stderr capture) and ``native_log_path`` (the
+        host's own ``--log`` output) are threaded through to every failure
+        detail below, mirroring ``LiveSession.log_tail()``.
         """
         deadline = time.monotonic() + self.spawn_timeout
         while True:
@@ -929,11 +937,16 @@ class LiveSessionManager:
                 pump.join(timeout=1.0)
                 if ready.is_set():
                     break
-                return LiveHostError(502, _early_exit_detail(code, log_path))
+                return LiveHostError(
+                    502, _early_exit_detail(code, log_path, native_log_path)
+                )
             if time.monotonic() >= deadline:
                 _terminate(proc, 5.0)
                 pump.join(timeout=1.0)
-                return LiveHostError(504, _timeout_detail(self.spawn_timeout, log_path))
+                return LiveHostError(
+                    504,
+                    _timeout_detail(self.spawn_timeout, log_path, native_log_path),
+                )
 
         port = box.get("port") or 0
         if not 0 < port < 65536:
@@ -942,7 +955,7 @@ class LiveSessionManager:
             return LiveHostError(
                 502,
                 "The live VST host announced an unusable port "
-                f"({port}). " + _log_suffix(log_path),
+                f"({port}). " + _log_suffix(log_path, native_log_path),
             )
         return None
 
@@ -992,6 +1005,7 @@ class LiveSessionManager:
             "log_tail": session.log_tail(),
         }
         self._archive_log(session.session_id, session.log_path)
+        self._archive_log(session.session_id, session.native_log_path, suffix="-native")
         if not _remove_tree(session.dir):
             self._note_removal_failure(session.dir)
         return result
@@ -1065,6 +1079,9 @@ class LiveSessionManager:
             ):
                 self._sessions.pop(session.session_id, None)
                 self._archive_log(session.session_id, session.log_path)
+                self._archive_log(
+                    session.session_id, session.native_log_path, suffix="-native"
+                )
                 if not _remove_tree(session.dir):
                     self._note_removal_failure(session.dir)
 
@@ -1115,13 +1132,19 @@ class LiveSessionManager:
 
     # -- logs ------------------------------------------------------------
 
-    def _archive_log(self, session_id: str, log_path: Path) -> None:
-        """Keep a finished session's log after its directory goes away."""
+    def _archive_log(self, session_id: str, log_path: Path, suffix: str = "") -> None:
+        """Keep a finished session's log after its directory goes away.
+
+        ``suffix`` gives the host's native ``--log`` output (``"-native"``)
+        its own archive name so it lands alongside, rather than colliding
+        with, the pump/stderr capture (``suffix=""``) — see the module
+        docstring's "Logs" section. Every call site archives both files.
+        """
         if not log_path.is_file():
             return
         try:
             self.archive_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(log_path, self.archive_dir / f"{session_id}.log")
+            shutil.copyfile(log_path, self.archive_dir / f"{session_id}{suffix}.log")
         except OSError:
             log.debug("vst.live: could not archive %s", log_path, exc_info=True)
             return
@@ -1164,23 +1187,29 @@ def _remove_tree(directory: Path) -> bool:
     return not directory.exists()
 
 
-def _log_suffix(log_path: Path) -> str:
-    tail = _tail_lines(log_path)
+def _log_suffix(log_path: Path, native_log_path: Path) -> str:
+    """Both logs' tails, the host's own native diagnostics first.
+
+    Mirrors ``LiveSession.log_tail()`` (see the module docstring's "Logs"
+    section) so a spawn failure surfaces the host's own ``--log`` output too,
+    not only the pump/stderr capture.
+    """
+    tail = _tail_lines(native_log_path) + _tail_lines(log_path)
     return ("Log tail: " + " | ".join(tail)) if tail else "The host logged nothing."
 
 
-def _early_exit_detail(code: int, log_path: Path) -> str:
+def _early_exit_detail(code: int, log_path: Path, native_log_path: Path) -> str:
     meaning = EXIT_CODE_MEANINGS.get(code, f"the host exited with code {code}")
     return (
         f"The live VST host stopped before it was ready (exit code {code}): "
-        f"{meaning}. " + _log_suffix(log_path)
+        f"{meaning}. " + _log_suffix(log_path, native_log_path)
     )
 
 
-def _timeout_detail(timeout: float, log_path: Path) -> str:
+def _timeout_detail(timeout: float, log_path: Path, native_log_path: Path) -> str:
     return (
         f"The live VST host did not report a port within {timeout:.0f}s and was "
-        "stopped. " + _log_suffix(log_path)
+        "stopped. " + _log_suffix(log_path, native_log_path)
     )
 
 

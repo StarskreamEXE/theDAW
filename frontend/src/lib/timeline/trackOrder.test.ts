@@ -194,4 +194,42 @@ assert.throws(() => moveSubtree(tree, 'top', 'a1'), /Parent/);
 assert.throws(() => moveSubtree(tree, 'nope', null), Error);
 assert.throws(() => moveSubtree(tree, 'top', null, 'a1'), /anchor/);
 
+// RS7-4: moveSubtree's no-op path must return depth-first order, not just
+// echo the caller's array order. Child 'A' is listed after root sibling 'B'.
+const rs74Tracks: TreeTrack[] = [
+  { id: 'F', parentId: null, kind: 'folder' },
+  { id: 'B', parentId: null, kind: 'audio' },
+  { id: 'A', parentId: 'F', kind: 'audio' },
+];
+const rs74TracksCopy = rs74Tracks.map((t) => ({ ...t }));
+
+// REGRESSION: a no-op drop returns depth-first order, not input order.
+assert.deepEqual(
+  moveSubtree(rs74Tracks, 'A', 'F', 'A').map((t) => t.id),
+  ['F', 'A', 'B'],
+);
+assert.deepEqual(
+  moveSubtree(rs74Tracks, 'A', 'F', 'A').map((t) => t.id),
+  moveSubtree(rs74Tracks, 'A', 'F').map((t) => t.id),
+);
+
+// A no-op drop never returns the input array itself, and never mutates it.
+assert.notEqual(moveSubtree(rs74Tracks, 'A', 'F', 'A'), rs74Tracks);
+assert.deepEqual(rs74Tracks, rs74TracksCopy);
+
+// A no-op drop on an already depth-first list is identity.
+const rs74PreOrdered: TreeTrack[] = [
+  { id: 'F', parentId: null, kind: 'folder' },
+  { id: 'A', parentId: 'F', kind: 'audio' },
+  { id: 'B', parentId: null, kind: 'audio' },
+];
+assert.deepEqual(
+  moveSubtree(rs74PreOrdered, 'A', 'F', 'A').map((t) => t.id),
+  ['F', 'A', 'B'],
+);
+
+// An invalid tree still throws on a no-op drop.
+const rs74Dup: TreeTrack[] = [...rs74Tracks, { id: 'A', parentId: null, kind: 'audio' }];
+assert.throws(() => moveSubtree(rs74Dup, 'A', 'F', 'A'), /Duplicate track ID/);
+
 console.log('trackOrder: ok');

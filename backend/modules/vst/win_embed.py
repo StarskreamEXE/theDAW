@@ -50,6 +50,43 @@ _SWP_NOZORDER = 0x0004
 _SWP_SHOWWINDOW = 0x0040
 
 
+def _apply_dpi_awareness(user32, shcore) -> str:
+    """Try PER_MONITOR_AWARE_V2, fall back to PER_MONITOR_DPI_AWARE, and report
+    which mode (if any) ended up active.
+
+    ``user32``/``shcore`` are duck-typed DLL handles exposing
+    ``SetProcessDpiAwarenessContext``/``SetProcessDpiAwareness`` respectively,
+    so this stays testable against fakes instead of real Win32 calls; either
+    may be ``None`` (its DLL failed to load), in which case that stage is
+    skipped. Returns ``"per-monitor-v2"``, ``"per-monitor"`` or
+    ``"unchanged"`` -- never raises.
+    """
+    import ctypes
+
+    if user32 is not None:
+        try:
+            # PER_MONITOR_AWARE_V2 = -4 (Win10 1703+). A FALSY return means
+            # the call failed -- fall through to the shcore fallback instead
+            # of assuming success.
+            if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+                return "per-monitor-v2"
+        except Exception:
+            pass
+
+    if shcore is not None:
+        try:
+            # PER_MONITOR_DPI_AWARE = 2. S_OK (0) is success; E_ACCESSDENIED
+            # (-2147024891) means some other code already set an awareness
+            # mode for this process, which counts as success too.
+            hresult = shcore.SetProcessDpiAwareness(2)
+            if hresult == 0 or hresult == -2147024891:
+                return "per-monitor"
+        except Exception:
+            pass
+
+    return "unchanged"
+
+
 def enable_dpi_awareness() -> None:
     """Make this process per-monitor DPI aware so MoveWindow uses physical px
     (matching the CSS-px * devicePixelRatio rect the frontend reports). Call once
@@ -60,15 +97,19 @@ def enable_dpi_awareness() -> None:
     import ctypes
 
     try:
-        # PER_MONITOR_AWARE_V2 = -4 (Win10 1703+).
-        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
-        return
+        user32 = ctypes.windll.user32
     except Exception:
-        pass
+        user32 = None
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_DPI_AWARE
+        shcore = ctypes.windll.shcore
     except Exception:
-        pass
+        shcore = None
+
+    mode = _apply_dpi_awareness(user32, shcore)
+    msg = f"[win_embed] dpi awareness: {mode}"
+    if mode == "unchanged":
+        msg += " -- editor placement may be wrong on a HiDPI display"
+    print(msg, file=sys.stderr, flush=True)
 
 
 def _load_rect(rect_file: str | None) -> dict | None:

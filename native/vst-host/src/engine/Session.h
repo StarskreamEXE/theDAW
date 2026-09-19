@@ -94,6 +94,8 @@ private:
     void tick();
     void onClientConnected();
     void onClientGone();
+    // Connection markers arrive through `incoming_`, in order with the connection's own text.
+    void handleConnectionMarker(const std::string& text);
 
     void handleControlText(const std::string& text);
     void handleOp(const json::Value& message, const std::string& op);
@@ -117,8 +119,32 @@ private:
     bool parkAudio();
     void resumeAudio();
 
+    // Every message-thread operation that touches the plugin or the bypass delay goes through
+    // this guard. `quiet()` is the only thing that says the audio thread cannot be inside
+    // process(): it is true when this guard parked the thread, when an outer guard already had,
+    // or when there is no audio thread at all (before start(), after the join in stop()). It is
+    // FALSE when the park timed out -- the caller must then leave the plugin alone.
+    class ParkGuard {
+       public:
+        explicit ParkGuard(Session& session);
+        ~ParkGuard();
+        ParkGuard(const ParkGuard&) = delete;
+        ParkGuard& operator=(const ParkGuard&) = delete;
+        bool quiet() const { return quiet_; }
+
+       private:
+        Session& session_;
+        bool parkedHere_ = false;
+        bool quiet_ = false;
+    };
+
     // ---- audio thread ----
     void audioLoop();
+    // Queues a connection marker into `incoming_`. The message thread must reset its
+    // per-connection state (hello/ready) BEFORE it sees that connection's first message and
+    // AFTER the previous connection's last one; only a marker in the same queue guarantees
+    // that order. False when the queue is full.
+    bool queueConnectionMarker(const char* marker);
     // A queued set_param only reaches a VST3 plugin inside a process call. When the client has
     // stopped sending audio (a knob move with the transport stopped), nothing would deliver it,
     // so after ~20 ms without an audio_in block the audio thread makes the zero-sample call
@@ -170,6 +196,12 @@ private:
     ULONGLONG lastXrunReportMs_ = 0;
     bool editorOpen_ = false;
     bool stopped_ = false;  // message thread only; makes stop() idempotent
+
+    // Work that needed the audio thread parked but could not get it (the park timed out).
+    // tick() retries; nothing touches the plugin or the delay line until a park succeeds.
+    bool latencyRetryPending_ = false;
+    int32_t latencyRetrySamples_ = 0;
+    bool restartRetryPending_ = false;
 
     // Set by the message thread when it hands a set_param to the plugin, cleared by the audio
     // thread when it flushes. Losing a set edit is not possible: the flag is cleared before the

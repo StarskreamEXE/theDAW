@@ -10,6 +10,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -351,24 +352,29 @@ def _render_max_upload_bytes() -> int:
     return value if value > 0 else _DEFAULT_RENDER_MAX_UPLOAD_BYTES
 
 
-async def _read_upload_capped(upload: UploadFile, max_bytes: int) -> bytes:
-    """Read ``upload`` in chunks, never buffering past ``max_bytes``.
+async def _read_upload_capped(upload: UploadFile, max_bytes: int, dest: Path) -> None:
+    """Stream ``upload`` straight to ``dest`` in chunks, capped at ``max_bytes``.
 
-    Stops at the first chunk that pushes the running total over the cap, so
-    an oversized upload cannot hold the request (or its memory) open for the
-    full transfer (review R5 item #7).
+    Each chunk is written to disk as it arrives instead of being accumulated
+    into one big ``bytes`` object, so this process never buffers the whole
+    upload in memory (review R5 item #7). Note this does not shorten the wire
+    transfer itself — Starlette's multipart parser has already read and
+    spooled the full request body before this handler ever runs — it only
+    keeps OUR copy of it from doubling the memory footprint on its way to
+    ``dest``. Stops at the first chunk that would push the running total over
+    the cap, raising ``_UploadTooLarge`` before that chunk is written; ``dest``
+    is left holding whatever was accepted so far, for the caller to remove.
     """
-    chunks: list[bytes] = []
     total = 0
-    while True:
-        chunk = await upload.read(_UPLOAD_READ_CHUNK_BYTES)
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > max_bytes:
-            raise _UploadTooLarge(total)
-        chunks.append(chunk)
-    return b"".join(chunks)
+    with dest.open("wb") as f:
+        while True:
+            chunk = await upload.read(_UPLOAD_READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise _UploadTooLarge(total)
+            f.write(chunk)
 
 
 def _strip_render_paths(text: str, paths_used: list[Path]) -> str:
@@ -410,16 +416,24 @@ def _render_report_warnings(stdout: str) -> list[str]:
 
 
 def _render_with_thedaw_host(
+    work: Path,
+    in_path: Path,
     plugin_path: str,
     plugin_name: str,
-    audio_bytes: bytes,
     state_blob: bytes | None,
     param_map: dict,
     warnings: list[str],
 ) -> bytes:
-    """Render ``audio_bytes`` through ``thedaw-vst-host --render``.
+    """Render the audio already staged at ``in_path`` through
+    ``thedaw-vst-host --render``.
 
-    Synchronous end to end (spawn, wait, cleanup): the caller offloads this
+    ``work`` is a directory the caller already created and already staged
+    ``in_path`` under, and the caller owns removing it — in a ``finally`` that
+    also covers the upload read that staged ``in_path``, not just this call
+    (review R5 item #7). This function only adds the render's other files
+    under ``work`` and reads the output back.
+
+    Synchronous end to end (spawn, wait, read-back): the caller offloads this
     whole call with ``asyncio.to_thread`` so the up-to-``RENDER_TIMEOUT_SECONDS``
     wait never blocks the event loop. Returns the rendered WAV bytes. Every
     failure raises ``HTTPException``; there is deliberately no pedalboard
@@ -436,122 +450,110 @@ def _render_with_thedaw_host(
     if host is None:
         raise HTTPException(status_code=503, detail=locator.describe()["reason"])
 
+    out_path = work / "out.wav"
+    #: Every path the host was handed on its argv — the only paths it could
+    #: possibly echo back in a warning or a log line (see
+    #: ``_strip_render_paths``); applied to BOTH the warnings header and any
+    #: stderr tail that reaches an error detail (review R5 item #11).
+    temp_paths = [in_path, out_path]
     try:
-        _RENDER_DIR.mkdir(parents=True, exist_ok=True)
-        work = Path(tempfile.mkdtemp(prefix="render-", dir=str(_RENDER_DIR)))
+        cmd = locator.launch_prefix(host) + [
+            "--render",
+            "--plugin",
+            plugin_path,
+            "--in",
+            str(in_path),
+            "--out",
+            str(out_path),
+            "--block-size",
+            "1024",
+            "--tail-seconds",
+            "auto",
+        ]
+        if plugin_name:
+            cmd += ["--plugin-name", plugin_name]
+        if state_blob:
+            state_path = work / "state.bin"
+            state_path.write_bytes(state_blob)
+            temp_paths.append(state_path)
+            cmd += ["--state-file", str(state_path)]
+        if param_map:
+            params_path = work / "params.json"
+            params_path.write_text(json.dumps(param_map), encoding="utf-8")
+            temp_paths.append(params_path)
+            cmd += ["--params-json", str(params_path)]
     except OSError as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Could not create the render directory: {_os_reason(e)}",
+            detail=f"Could not stage the render input: {_os_reason(e)}",
         )
 
-    in_path = work / "in.wav"
-    out_path = work / "out.wav"
-    #: Every path the host was handed on its argv — the only paths it could
-    #: possibly echo back in a warning (see ``_strip_render_paths``).
-    temp_paths = [in_path, out_path]
     try:
-        try:
-            in_path.write_bytes(audio_bytes)
-            cmd = locator.launch_prefix(host) + [
-                "--render",
-                "--plugin",
-                plugin_path,
-                "--in",
-                str(in_path),
-                "--out",
-                str(out_path),
-                "--block-size",
-                "1024",
-                "--tail-seconds",
-                "auto",
-            ]
-            if plugin_name:
-                cmd += ["--plugin-name", plugin_name]
-            if state_blob:
-                state_path = work / "state.bin"
-                state_path.write_bytes(state_blob)
-                temp_paths.append(state_path)
-                cmd += ["--state-file", str(state_path)]
-            if param_map:
-                params_path = work / "params.json"
-                params_path.write_text(json.dumps(param_map), encoding="utf-8")
-                temp_paths.append(params_path)
-                cmd += ["--params-json", str(params_path)]
-        except OSError as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Could not stage the render input: {_os_reason(e)}",
-            )
-
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(paths.PROJECT_ROOT),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                creationflags=_NO_WINDOW,
-                env=child_env(),
-            )
-        except OSError as e:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Could not start the VST host: {_os_reason(e)}",
-            )
-
-        try:
-            stdout, stderr = proc.communicate(timeout=RENDER_TIMEOUT_SECONDS)
-            returncode = proc.returncode
-        except subprocess.TimeoutExpired:
-            try:
-                proc.kill()
-            except OSError:
-                pass
-            try:
-                # A bounded wait, never the unbounded one subprocess.run does
-                # after a post-timeout kill (review R5 nit #10). If the host
-                # still won't die, stop waiting rather than stall the request.
-                proc.communicate(timeout=RENDER_KILL_WAIT_SECONDS)
-            except subprocess.TimeoutExpired:
-                pass
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    f"The VST host did not finish the render within "
-                    f"{RENDER_TIMEOUT_SECONDS:.0f}s and was stopped."
-                ),
-            )
-
-        if returncode != 0:
-            code = int(returncode)
-            meaning = RENDER_EXIT_MEANINGS.get(
-                code, f"the host exited with code {code}"
-            )
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    f"The VST host could not render this file (exit code {code}): "
-                    f"{meaning}. " + _render_log_tail(stderr)
-                ),
-            )
-
-        try:
-            rendered = out_path.read_bytes()
-        except OSError as e:
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    f"The VST host reported success but its output could not be "
-                    f"read ({_os_reason(e)}). " + _render_log_tail(stderr)
-                ),
-            )
-        warnings.extend(
-            _strip_render_paths(w, temp_paths) for w in _render_report_warnings(stdout)
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(paths.PROJECT_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            creationflags=_NO_WINDOW,
+            env=child_env(),
         )
-        return rendered
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+    except OSError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not start the VST host: {_os_reason(e)}",
+        )
+
+    try:
+        stdout, stderr = proc.communicate(timeout=RENDER_TIMEOUT_SECONDS)
+        returncode = proc.returncode
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            # A bounded wait, never the unbounded one subprocess.run does
+            # after a post-timeout kill (review R5 nit #10). If the host
+            # still won't die, stop waiting rather than stall the request.
+            proc.communicate(timeout=RENDER_KILL_WAIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"The VST host did not finish the render within "
+                f"{RENDER_TIMEOUT_SECONDS:.0f}s and was stopped."
+            ),
+        )
+
+    if returncode != 0:
+        code = int(returncode)
+        meaning = RENDER_EXIT_MEANINGS.get(code, f"the host exited with code {code}")
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"The VST host could not render this file (exit code {code}): "
+                f"{meaning}. "
+                + _strip_render_paths(_render_log_tail(stderr), temp_paths)
+            ),
+        )
+
+    try:
+        rendered = out_path.read_bytes()
+    except OSError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"The VST host reported success but its output could not be "
+                f"read ({_os_reason(e)}). "
+                + _strip_render_paths(_render_log_tail(stderr), temp_paths)
+            ),
+        )
+    warnings.extend(
+        _strip_render_paths(w, temp_paths) for w in _render_report_warnings(stdout)
+    )
+    return rendered
 
 
 @router.post("/process-file")
@@ -620,32 +622,55 @@ async def process_file(
                 f"params was not valid JSON ({e}); no parameters applied"
             )
             host_params = {}
+        try:
+            _RENDER_DIR.mkdir(parents=True, exist_ok=True)
+            work = Path(tempfile.mkdtemp(prefix="render-", dir=str(_RENDER_DIR)))
+        except OSError as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Could not create the render directory: {_os_reason(e)}",
+            )
+
+        in_path = work / "in.wav"
         max_upload_bytes = _render_max_upload_bytes()
         try:
-            uploaded = await _read_upload_capped(audio, max_upload_bytes)
-        except _UploadTooLarge:
-            raise HTTPException(
-                status_code=413,
-                detail=(
-                    f"The uploaded audio exceeds the {max_upload_bytes} byte "
-                    "limit for a thedaw render."
-                ),
+            try:
+                await _read_upload_capped(audio, max_upload_bytes, in_path)
+            except _UploadTooLarge:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"The uploaded audio exceeds the {max_upload_bytes} byte "
+                        "limit for a thedaw render."
+                    ),
+                )
+            except OSError as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Could not read uploaded audio: {_os_reason(e)}",
+                )
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400, detail=f"Could not read uploaded audio: {e}"
+                )
+            # Only the spawn+wait needs a thread — everything else here is
+            # small, local file I/O that would not meaningfully block the
+            # event loop.
+            rendered = await asyncio.to_thread(
+                _render_with_thedaw_host,
+                work,
+                in_path,
+                plugin_path,
+                plugin_name,
+                state_blob,
+                host_params,
+                host_warnings,
             )
-        except Exception as e:
-            raise HTTPException(
-                status_code=400, detail=f"Could not read uploaded audio: {e}"
-            )
-        # Only the spawn+wait needs a thread — everything else here is small,
-        # local file I/O that would not meaningfully block the event loop.
-        rendered = await asyncio.to_thread(
-            _render_with_thedaw_host,
-            plugin_path,
-            plugin_name,
-            uploaded,
-            state_blob,
-            host_params,
-            host_warnings,
-        )
+        finally:
+            # Covers the upload read above as well as the render below — a
+            # cap that rejects the upload must not leave a partial file
+            # behind any more than a failed render would (review R5 item #7).
+            shutil.rmtree(work, ignore_errors=True)
         host_headers: dict[str, str] = {}
         if host_warnings:
             host_headers["X-Vst-Warnings"] = json.dumps(
@@ -792,7 +817,11 @@ def open_editor(req: EditorRequest):
     # Also on disk, so an editor that outlives a server restart is still
     # recognized as running rather than reported dead.
     _pid_path(req.plugin_path).write_text(str(proc.pid), encoding="utf-8")
-    return {"status": "launched", "preset_path": str(out), "log_path": str(log_path)}
+    # No directory, no extension: the app only ever polls /editor-result with
+    # the plugin_path it already has, so this key never needs to round-trip
+    # back to the client. Returning the real on-disk path here would leak the
+    # server's filesystem layout (and Windows profile name) to the browser.
+    return {"status": "launched", "preset_key": out.stem}
 
 
 @router.post("/editor-rect")
@@ -887,6 +916,30 @@ def _read_json(path: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _scrub_paths(text: str) -> str:
+    """Replace this server's home directory and repo root with placeholders.
+
+    A sidecar log tail can echo either one (a traceback frame, a printed
+    argv) and that tail can reach an HTTP error detail; neither the user's
+    Windows profile name nor the repo's on-disk location belongs in a
+    client-visible response. The repo root is replaced before the home
+    directory on purpose — it is a home-relative path, so scrubbing the home
+    directory first would leave the (now shorter) repo root unmatched.
+    """
+    if not text:
+        return text
+    repo_root = str(Path(__file__).resolve().parents[3])
+    home = str(Path.home())
+    for needle, placeholder in ((repo_root, "<repo>"), (home, "~")):
+        if not needle:
+            continue
+        if sys.platform == "win32":
+            text = re.sub(re.escape(needle), placeholder, text, flags=re.IGNORECASE)
+        else:
+            text = text.replace(needle, placeholder)
+    return text
+
+
 def _editor_failure_detail(preset_out: Path) -> str:
     """Explain a dead sidecar using the tail of the log it wrote, when there is one."""
     base = "Editor process exited before the plugin state was captured."
@@ -895,6 +948,7 @@ def _editor_failure_detail(preset_out: Path) -> str:
         tail = log_path.read_text(encoding="utf-8", errors="replace").strip()[-400:]
     except OSError:
         tail = ""
+    tail = _scrub_paths(tail)
     return f"{base} {tail}" if tail else base
 
 

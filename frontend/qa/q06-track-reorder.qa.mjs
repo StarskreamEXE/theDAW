@@ -27,10 +27,13 @@ async function focusGripByClick(page, id) {
   await page.mouse.up();
 }
 
-/** Drag `dragId`'s grip until the pointer sits in the upper/lower half of `targetId`'s row. */
+/** Drag `dragId`'s grip until the pointer sits in the upper/lower half of `targetId`'s row.
+ *  The target box MUST be the whole row (`rowLocator`), not the grip itself: the grip is a
+ *  small (h-4) handle docked near the top of the row's first flex line, so a grip-sized box
+ *  never reaches the row's true lower half for anything but the shortest possible trackH. */
 async function dragToHalf(page, dragId, targetId, half) {
   const dragBox = await page.locator(gripSel(dragId)).boundingBox();
-  const targetBox = await page.locator(gripSel(targetId)).boundingBox();
+  const targetBox = await rowLocator(page, targetId).boundingBox();
   const startX = dragBox.x + dragBox.width / 2;
   const startY = dragBox.y + dragBox.height / 2;
   await page.mouse.move(startX, startY);
@@ -49,11 +52,19 @@ async function main() {
     // Fresh QA data dir -> shouldAutoStart() is true -> the first-run tour
     // would overlay the whole app. Seed its persisted "seen" flag (the app's
     // own localStorage key, `thedaw-onboarding`) and reload once, same as a
-    // returning user, so it never appears and steals clicks.
+    // returning user, so it never appears and steals clicks. A fresh data dir
+    // also defaults `thedaw-home-screen-v1`'s `showAtStartup` to true (see
+    // HomeScreen.tsx), which pops a full-screen HOME overlay (role="dialog",
+    // z-60) right after boot and swallows the very first click — seed it off
+    // too, exactly like a returning user who turned "show at startup" off.
     await page.context().addInitScript(() => {
       localStorage.setItem(
         'thedaw-onboarding',
         JSON.stringify({ state: { seen: true, neverShow: true, completedChapters: [] }, version: 0 }),
+      );
+      localStorage.setItem(
+        'thedaw-home-screen-v1',
+        JSON.stringify({ state: { showAtStartup: false }, version: 0 }),
       );
     });
     await page.reload({ waitUntil: 'networkidle' });

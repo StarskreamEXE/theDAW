@@ -278,7 +278,25 @@ function buildBaseEnv(): NodeJS.ProcessEnv {
 // its own children with child_env (backend/lib/launch_token.py), which leaves
 // the token out.
 function buildBackendEnv(): NodeJS.ProcessEnv {
-  return { ...buildBaseEnv(), THEDAW_LAUNCH_TOKEN: LAUNCH_TOKEN }
+  const env: NodeJS.ProcessEnv = { ...buildBaseEnv(), THEDAW_LAUNCH_TOKEN: LAUNCH_TOKEN }
+  // Live VST host: a packaged build may ship the exe under resourcesPath (see
+  // electron-builder.yml's win.extraResources, staged by
+  // scripts/stage-vst-host.mjs). Point the backend's HostLocator at it unless
+  // the user (or a wrapping launcher) already set THEDAW_VST_HOST -- checked
+  // case-insensitively like the PATH lookup above, since Windows env names
+  // aren't case-sensitive. Only set it when the exe is actually there: the
+  // native host doesn't ship on every platform/build, and HostLocator treats
+  // an explicit env var as an unconditional path, not a hint.
+  if (app.isPackaged) {
+    const hasVstHostEnv = Object.keys(env).some((k) => k.toUpperCase() === 'THEDAW_VST_HOST')
+    if (!hasVstHostEnv) {
+      const vstHostExe = path.join(process.resourcesPath, 'vst-host', 'thedaw-vst-host.exe')
+      if (fs.existsSync(vstHostExe)) {
+        env.THEDAW_VST_HOST = vstHostExe
+      }
+    }
+  }
+  return env
 }
 
 function coreImportsOk(py: string): Promise<boolean> {

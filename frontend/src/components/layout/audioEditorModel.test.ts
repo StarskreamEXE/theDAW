@@ -17,6 +17,8 @@ import {
   CLIP_GAIN_DB_MIN,
   clampGainDb,
   dbToGain,
+  dragClipOf,
+  fadeTargetOf,
   fitZoom,
   formatSeconds,
   gainToDb,
@@ -188,6 +190,64 @@ const near = (a: number, b: number, eps = 1e-9, what = 'value'): void =>
     assert.throws(() => setFadeOut(clip, bad), RangeError);
     assert.throws(() => setFadeIn({ durationSec: bad }, 1), RangeError);
   }
+}
+
+/* ============================== DAMAGED CLIPS ============================== */
+{
+  // A clip carrying a field that did not survive a project load — or one
+  // still mid-gesture — should never make it as far as `checkedClip`'s throw.
+  assert.deepEqual(
+    dragClipOf({ ...CLIP, sourceDuration: Number.NaN }, 7),
+    { ...CLIP, sourceDuration: 7 },
+    'dragClipOf replaces a NaN sourceDuration with the fallback',
+  );
+
+  assert.deepEqual(
+    dragClipOf({ ...CLIP, sourceDuration: 0 }, 7),
+    { ...CLIP, sourceDuration: 7 },
+    'dragClipOf uses the fallback when sourceDuration is 0',
+  );
+
+  assert.deepEqual(
+    dragClipOf({ ...CLIP, startSec: -5, offsetIntoSource: -2 }),
+    { ...CLIP, startSec: 0, offsetIntoSource: 0 },
+    'dragClipOf holds startSec and offsetIntoSource at or above zero',
+  );
+
+  assert.equal(
+    dragClipOf({ ...CLIP, durationSec: Number.NaN }).durationSec,
+    MIN_CLIP_SEC,
+    'dragClipOf gives a NaN durationSec the minimum clip length',
+  );
+
+  // Every field wrong at once: no field's fallback may lean on another's.
+  const allNaN = {
+    startSec: Number.NaN,
+    durationSec: Number.NaN,
+    offsetIntoSource: Number.NaN,
+    sourceDuration: Number.NaN,
+  };
+  assert.doesNotThrow(() => dragClipOf(allNaN), 'dragClipOf never throws on an all-NaN clip');
+  assert.deepEqual(
+    dragClipOf(allNaN),
+    { startSec: 0, durationSec: MIN_CLIP_SEC, offsetIntoSource: 0, sourceDuration: 0 },
+    'an all-NaN clip with no fallback sanitises to the safe defaults',
+  );
+
+  // The whole point of the fallback: a clip that lost its own sourceDuration
+  // still restores the REAL source length, not the bare minimum clip length.
+  const zeroSource = { startSec: 4, durationSec: 4, offsetIntoSource: 2, sourceDuration: 0 };
+  assert.deepEqual(
+    resetTrims(dragClipOf(zeroSource, 4), 1),
+    { startSec: 4, durationSec: 4, offsetIntoSource: 0 },
+    'resetTrims on dragClipOf(zero-source clip, 4) restores 4 seconds, not MIN_CLIP_SEC',
+  );
+
+  assert.deepEqual(
+    fadeTargetOf({ durationSec: Number.NaN, fadeInSec: Number.NaN, fadeOutSec: -3 }),
+    { durationSec: MIN_CLIP_SEC, fadeInSec: 0, fadeOutSec: 0 },
+    'fadeTargetOf drops NaN and negative fades to zero',
+  );
 }
 
 /* ==================================== GAIN ================================ */

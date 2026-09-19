@@ -59,6 +59,16 @@ export function masterAutomationLanes<L extends { target: { kind: string } }>(
 }
 
 /**
+ * Display text for one master automation sub-lane. A lane has no name of its
+ * own — only its target — so this mirrors the (unexported) `laneName` in
+ * `AutomationLane.tsx` for the `'masterFx'` case, scoped to master since
+ * `masterAutomationLanes` has already filtered to that kind.
+ */
+export function masterLaneLabel(target: { paramKey?: string }): string {
+  return `master effect ${target.paramKey ?? 'parameter'}`;
+}
+
+/**
  * Meter fill percent for an already-converted dBFS reading: 0 at or below
  * `floorDb`, 100 at 0 dBFS, linear in dB in between, clamped to [0, 100] and
  * rounded to one decimal. `stripMeters.sampleStripLevels()` reports LINEAR

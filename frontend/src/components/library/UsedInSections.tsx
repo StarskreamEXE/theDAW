@@ -15,7 +15,7 @@
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Loader2 } from 'lucide-react';
-import { fetchUsedIn, fetchSources, createStaleGuard } from '../../lib/lineage/usedInApi';
+import { fetchUsedIn, fetchSources, createStaleGuard, type LineageFetchResult } from '../../lib/lineage/usedInApi';
 import {
   projectRows,
   renderRows,
@@ -43,6 +43,16 @@ const RETRY_BUTTON =
   'rounded border border-white/10 px-2 py-1 text-xs font-bold text-zinc-200 hover:bg-white/5 focus-visible:outline focus-visible:outline-purple-400';
 
 type UsedInSectionsStatus = 'idle' | 'loading' | 'ready' | 'error';
+
+/**
+ * Explicit `ok: false` guard for `LineageFetchResult`. Written as a named
+ * predicate (rather than an inline `!result.ok` check) because that inline
+ * form does not narrow the property access reliably through the
+ * `Promise.all` tuple destructure this component reads it from below.
+ */
+function isFetchFailure<T>(result: LineageFetchResult<T>): result is { ok: false; error: string } {
+  return result.ok === false;
+}
 
 const ProjectRowItem: React.FC<{ row: UsedInProjectRow }> = ({ row }) => (
   // A project has no entry of its own to open — nothing here is a button.
@@ -113,17 +123,28 @@ export const UsedInSections: React.FC<{
     const token = staleGuardRef.current.begin();
     setStatus('loading');
     setErrorText('');
-    void Promise.all([fetchUsedIn(id), fetchSources(id)]).then(([usedInResult, sourcesResult]) => {
+    void Promise.all([fetchUsedIn(id), fetchSources(id)]).then((results) => {
       if (cancelledRef.current || !staleGuardRef.current.isCurrent(token)) return;
-      if (!usedInResult.ok || !sourcesResult.ok) {
-        let message = '';
-        if (!usedInResult.ok) message = usedInResult.error;
-        else if (!sourcesResult.ok) message = sourcesResult.error;
+      // Rebind through an explicit annotation: the tuple element's inferred
+      // type is `Awaited<...>` over the Promise.all mapped type, which
+      // TypeScript's narrowing does not see through — an explicitly typed
+      // local makes each `.ok` check narrow normally below.
+      const usedInResult: LineageFetchResult<LineageUsedIn> = results[0];
+      const sourcesResult: LineageFetchResult<LineageSources> = results[1];
+      if (isFetchFailure(usedInResult)) {
         setUsedIn(null);
         setSources(null);
-        setErrorText(message);
+        setErrorText(usedInResult.error);
         setStatus('error');
-        logError('library', `UsedInSections could not load lineage for entry ${id}: ${message}`);
+        logError('library', `UsedInSections could not load lineage for entry ${id}: ${usedInResult.error}`);
+        return;
+      }
+      if (isFetchFailure(sourcesResult)) {
+        setUsedIn(null);
+        setSources(null);
+        setErrorText(sourcesResult.error);
+        setStatus('error');
+        logError('library', `UsedInSections could not load lineage for entry ${id}: ${sourcesResult.error}`);
         return;
       }
       setUsedIn(usedInResult.data);
