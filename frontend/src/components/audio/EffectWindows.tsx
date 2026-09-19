@@ -30,6 +30,7 @@ import {
   SlidersHorizontal, X,
 } from 'lucide-react';
 import { VstLiveRowBadge } from './VstLiveRowBadge';
+import { VstParamPanel } from './VstParamPanel';
 import { FxRack } from './FxRack';
 import { EffectControls } from './effects/EffectControls';
 import { schemaForRackEffect } from './effects/effectSchema';
@@ -496,17 +497,31 @@ const EffectWindowCard: React.FC<{
             />
           </div>
         ) : (
-          <div className="p-4 flex flex-col items-center gap-2 text-center">
-            <Plug className="w-5 h-5 text-teal-300/60" />
-            <span className="font-sans text-xs font-bold text-zinc-400">
-              {entry.vst?.raw_state ? 'Custom settings saved.' : 'Native editor closed.'}
-            </span>
-            <button
-              onClick={() => host.openVst(win.scope, entry)}
-              className="px-3 py-1.5 rounded border border-teal-500/40 bg-teal-500/15 text-teal-200 hover:bg-teal-500/25 font-display text-xs font-bold uppercase tracking-wider"
-            >
-              Open plugin GUI
-            </button>
+          /* The plugin's own window is closed (or cannot open here): its parameters are still one
+             panel away — every one the plugin declares, with the plugin's own words for each value. */
+          <div className="p-2 flex flex-col gap-2 min-h-0 overflow-hidden">
+            <div className="flex items-center gap-2 rounded border border-teal-500/20 bg-teal-500/5 px-2 py-1.5">
+              <Plug className="w-4 h-4 text-teal-300/70 shrink-0" />
+              <span className="font-sans text-xs font-bold text-zinc-400 flex-1 min-w-0 truncate">
+                {entry.vst?.raw_state ? 'Custom settings saved.' : 'Native editor closed.'}
+              </span>
+              <button
+                onClick={() => host.openVst(win.scope, entry)}
+                className="shrink-0 px-2 py-1 rounded border border-teal-500/40 bg-teal-500/15 text-teal-200 hover:bg-teal-500/25 font-display text-xs font-bold uppercase tracking-wider"
+              >
+                Open plugin GUI
+              </button>
+            </div>
+            {win.scope.kind !== 'masterVst' && (
+              <VstParamPanel
+                entry={entry}
+                idPrefix={`fxwin-${entry.id}`}
+                display={host.displayParams(paramScope, entry.id)}
+                onWrite={(p) => host.writeParams(paramScope, entry.id, p)}
+                onGestureStart={() => host.gestureStart(paramScope, entry.id)}
+                onGestureEnd={() => host.gestureEnd(paramScope, entry.id)}
+              />
+            )}
           </div>
         )
       ) : kind === 'gan' ? (

@@ -559,6 +559,44 @@ const pcm = (frames = 4) => [new Float32Array(frames), new Float32Array(frames)]
   c2.sendAudio(inHeader(1), pcm()); // must not throw after close
 }
 
+/* ── parameters: the plugin's own words for a value, and the gestures of its own window ── */
+{
+  const seen: unknown[] = [];
+  const { client, sock } = makeClient({
+    onParam: (index, value, text) => seen.push(['param', index, value, text]),
+    onParamText: (index, value, text) => seen.push(['text', index, value, text]),
+    onParamGesture: (index, begin) => seen.push(['gesture', index, begin]),
+  });
+  client.connect();
+  const s = sock();
+  s.open();
+  s.say(READY);
+  const from = s.ops().length;
+
+  client.paramText(3, 0.25);
+  client.paramText(3, 7); // clamped, never sent raw
+  client.paramText(-1, 0.5); // not a parameter: nothing goes out
+  client.paramText(3, Number.NaN);
+  assert.deepEqual(s.ops().slice(from), [
+    { op: 'param_text', index: 3, value: 0.25 },
+    { op: 'param_text', index: 3, value: 1 },
+  ]);
+
+  s.say({ ev: 'param_gesture', index: 3, begin: true });
+  s.say({ ev: 'param', index: 3, value: 0.5, text: '-6.0 dB' });
+  s.say({ ev: 'param', index: 3, value: 0.6 }); // a host built before `text` existed
+  s.say({ ev: 'param_gesture', index: 3, begin: false });
+  s.say({ ev: 'param_text', index: 3, value: 0.25, text: '-12.0 dB' });
+  assert.deepEqual(seen, [
+    ['gesture', 3, true],
+    ['param', 3, 0.5, '-6.0 dB'],
+    ['param', 3, 0.6, undefined],
+    ['gesture', 3, false],
+    ['text', 3, 0.25, '-12.0 dB'],
+  ]);
+  client.close();
+}
+
 /* ── the "no plugin windows" switch withholds open_editor and nothing else ─── */
 {
   const mem = new Map<string, string>();

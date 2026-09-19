@@ -150,7 +150,13 @@ export class VstBridgeWorkerClient implements VstBridgeClientLike {
         h.onLatency?.(msg.latencySamples);
         return;
       case 'param':
-        h.onParam?.(msg.index, msg.value);
+        h.onParam?.(msg.index, msg.value, msg.text);
+        break;
+      case 'param_text':
+        h.onParamText?.(msg.index, msg.value, msg.text);
+        break;
+      case 'param_gesture':
+        h.onParamGesture?.(msg.index, msg.begin);
         return;
       case 'params':
         h.onParams?.(msg.list);
@@ -304,6 +310,10 @@ export class VstBridgeWorkerClient implements VstBridgeClientLike {
 
   bypass(on: boolean): void {
     this.op('bypass', [on]);
+  }
+
+  paramText(index: number, value: number): void {
+    this.op('paramText', [index, value]);
   }
 
   ping(): void {

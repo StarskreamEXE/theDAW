@@ -139,6 +139,9 @@ class FakeClient implements VstBridgeClientLike {
   getParams(): void {
     this.note('getParams');
   }
+  paramText(index: number, value: number): void {
+    this.note('paramText', index, value);
+  }
   setState(stateB64: string): void {
     this.note('setState', stateB64);
   }
@@ -284,6 +287,7 @@ function worker() {
   const client = w.init();
   w.entry.handle({ cmd: 'op', name: 'setParam', args: [3, 0.25] });
   w.entry.handle({ cmd: 'op', name: 'getParams', args: [] });
+  w.entry.handle({ cmd: 'op', name: 'paramText', args: [3, 0.75] });
   w.entry.handle({ cmd: 'op', name: 'setState', args: ['c2F2ZWQ='] });
   w.entry.handle({ cmd: 'op', name: 'getState', args: [] });
   w.entry.handle({ cmd: 'op', name: 'openEditor', args: [{ title: 'Pro-Q 4' }] });
@@ -294,6 +298,7 @@ function worker() {
   assert.deepEqual(client.calls, [
     { name: 'setParam', args: [3, 0.25] },
     { name: 'getParams', args: [] },
+    { name: 'paramText', args: [3, 0.75] },
     { name: 'setState', args: ['c2F2ZWQ='] },
     { name: 'getState', args: [] },
     { name: 'openEditor', args: [{ title: 'Pro-Q 4' }] },
@@ -319,7 +324,9 @@ function worker() {
   const h = client.opts.handlers;
   h.onStatus?.('starting');
   h.onLatency?.(2048);
-  h.onParam?.(4, 0.5);
+  h.onParam?.(4, 0.5, '-6.0 dB');
+  h.onParamText?.(4, 0.25, '-12.0 dB');
+  h.onParamGesture?.(4, true);
   h.onParams?.([]);
   h.onState?.('c2F2ZWQ=');
   h.onEditor?.({ open: true, w: 800, h: 600 });
@@ -330,7 +337,9 @@ function worker() {
   assert.deepEqual(w.posted, [
     { ev: 'status', status: 'starting', reason: undefined },
     { ev: 'latency', latencySamples: 2048 },
-    { ev: 'param', index: 4, value: 0.5 },
+    { ev: 'param', index: 4, value: 0.5, text: '-6.0 dB' },
+    { ev: 'param_text', index: 4, value: 0.25, text: '-12.0 dB' },
+    { ev: 'param_gesture', index: 4, begin: true },
     { ev: 'params', list: [] },
     { ev: 'state', stateB64: 'c2F2ZWQ=' },
     { ev: 'editor', open: true, w: 800, h: 600 },

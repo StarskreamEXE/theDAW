@@ -30,6 +30,7 @@ import {
   type VstLiveSessionInfo,
 } from '../vstClient';
 import { useVstLiveStore } from '../../state/vstLiveStore';
+import { useVstParamStore } from '../../state/vstParamStore';
 import type { VstBridgeClientLike, VstBridgeClientOptions } from './bridgeClient';
 import { createDefaultBridgeClient } from './bridgeWorkerClient';
 import type { VstFrame } from './frames';
@@ -89,6 +90,8 @@ export interface VstLiveSession {
   stateSink?: ((stateB64: string) => void) | null;
   /** Where a parameter the user moved IN THE PLUGIN'S OWN EDITOR goes. */
   paramSink?: ((index: number, value: number) => void) | null;
+  /** The user grabbed (`begin`) or let go of a control in the plugin's own editor. */
+  gestureSink?: ((index: number, begin: boolean) => void) | null;
   /** A parameter has been pushed to this plugin since its state was last
    *  captured, so the entry's stored `raw_state` is behind what is sounding.
    *  The save-time capture pass asks exactly these sessions (plus the ones with
@@ -318,6 +321,7 @@ export function createVstSessionRegistry(deps: VstSessionRegistryDeps = {}): Vst
     slot.opening = null;
     slots.delete(entryId);
     store().clearEntry(entryId);
+    useVstParamStore.getState().clear(entryId);
     if (!session) return;
     session.client.close();
     // The DELETE is what makes the host write its state file, AND its response
@@ -412,7 +416,15 @@ export function createVstSessionRegistry(deps: VstSessionRegistryDeps = {}): Vst
         },
         onAudio: (frame) => session.audioSink?.(frame),
         onState: (stateB64) => session.stateSink?.(stateB64),
-        onParam: (index, value) => session.paramSink?.(index, value),
+        // The plugin's own parameter list and its words for each value feed the in-app parameter
+        // panel; a value the user moved in the plugin's OWN window still goes to `paramSink`.
+        onParams: (list) => useVstParamStore.getState().setList(entry.id, list),
+        onParam: (index, value, text) => {
+          useVstParamStore.getState().setValue(entry.id, index, value, text);
+          session.paramSink?.(index, value);
+        },
+        onParamText: (index, value, text) => useVstParamStore.getState().setText(entry.id, index, value, text),
+        onParamGesture: (index, begin) => session.gestureSink?.(index, begin),
         onLatency: (samples) => store().setLatency(entry.id, samples),
         onXrun: (late) => store().addXruns(entry.id, late),
         onEditor: (e) => store().setEditorOpen(entry.id, e.open),

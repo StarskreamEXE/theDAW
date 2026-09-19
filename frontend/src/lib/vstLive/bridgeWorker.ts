@@ -55,6 +55,7 @@ export interface BridgeAudioPort {
 export type BridgeWorkerOp =
   | 'setParam'
   | 'getParams'
+  | 'paramText'
   | 'setState'
   | 'getState'
   | 'openEditor'
@@ -89,7 +90,9 @@ export type BridgeWorkerEvent =
   | { ev: 'status'; status: 'starting' | 'live' | 'error' | 'off'; reason?: string }
   | { ev: 'ready'; ready: VstReadyEvent }
   | { ev: 'latency'; latencySamples: number }
-  | { ev: 'param'; index: number; value: number }
+  | { ev: 'param'; index: number; value: number; text?: string }
+  | { ev: 'param_text'; index: number; value: number; text: string }
+  | { ev: 'param_gesture'; index: number; begin: boolean }
   | { ev: 'params'; list: VstParamDescriptor[] }
   | { ev: 'state'; stateB64: string }
   | { ev: 'editor'; open: boolean; w: number; h: number }
@@ -283,6 +286,9 @@ export function createBridgeWorker(deps: BridgeWorkerDeps): BridgeWorkerHandler 
       case 'bypass':
         c.bypass(Boolean(args[0]));
         break;
+      case 'paramText':
+        c.paramText(Number(args[0]), Number(args[1]));
+        break;
       case 'ping':
         c.ping();
         break;
@@ -314,7 +320,9 @@ export function createBridgeWorker(deps: BridgeWorkerDeps): BridgeWorkerHandler 
         onReady: (ready) => emit({ ev: 'ready', ready }),
         onAudio: (frame) => sendProcessed(frame),
         onLatency: (latencySamples) => emit({ ev: 'latency', latencySamples }),
-        onParam: (index, value) => emit({ ev: 'param', index, value }),
+        onParam: (index, value, text) => emit({ ev: 'param', index, value, text }),
+        onParamText: (index, value, text) => emit({ ev: 'param_text', index, value, text }),
+        onParamGesture: (index, begin) => emit({ ev: 'param_gesture', index, begin }),
         onParams: (list) => emit({ ev: 'params', list }),
         onState: (stateB64) => emit({ ev: 'state', stateB64 }),
         onEditor: (e) => emit({ ev: 'editor', open: e.open, w: e.w, h: e.h }),

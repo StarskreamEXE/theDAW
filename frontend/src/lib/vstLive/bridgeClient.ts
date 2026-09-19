@@ -61,6 +61,14 @@ export interface VstParamDescriptor {
   automatable: boolean;
   discrete: boolean;
   boolean: boolean;
+  /** The list holds EVERY parameter the plugin declares; these say what each is for. All
+   *  optional: a host built before them sends none. */
+  hidden?: boolean;
+  read_only?: boolean;
+  bypass?: boolean;
+  program_change?: boolean;
+  /** The plugin's own words for `value` ("-6.0 dB"). */
+  text?: string;
 }
 
 /** The plugin identity block inside `ready`. */
@@ -97,7 +105,12 @@ export interface VstBridgeHandlers {
   /** One processed block, already ordered and de-duplicated. */
   onAudio?: (frame: VstFrame) => void;
   onLatency?: (latencySamples: number) => void;
-  onParam?: (index: number, value: number) => void;
+  /** `text` is the plugin's own display string for the new value, when the host sent one. */
+  onParam?: (index: number, value: number, text?: string) => void;
+  /** The answer to `paramText()`: the plugin's words for `value` of parameter `index`. */
+  onParamText?: (index: number, value: number, text: string) => void;
+  /** The user grabbed (`begin`) or let go of a control in the plugin's own window. */
+  onParamGesture?: (index: number, begin: boolean) => void;
   onParams?: (list: VstParamDescriptor[]) => void;
   onState?: (stateB64: string) => void;
   onEditor?: (e: { open: boolean; w: number; h: number }) => void;
@@ -190,6 +203,8 @@ export interface VstBridgeClientLike {
   sendAudio(header: VstFrameHeader, channels: readonly Float32Array[]): void;
   setParam(index: number, value: number): void;
   getParams(): void;
+  /** Ask for the plugin's display string for a value WITHOUT moving the parameter. */
+  paramText(index: number, value: number): void;
   setState(stateB64: string): void;
   getState(): void;
   openEditor(o?: VstEditorOpenOptions): void;
@@ -405,7 +420,13 @@ export class VstBridgeClient implements VstBridgeClientLike {
         h.onParams?.((msg.list ?? []) as VstParamDescriptor[]);
         return;
       case 'param':
-        h.onParam?.(Number(msg.index), Number(msg.value));
+        h.onParam?.(Number(msg.index), Number(msg.value), typeof msg.text === 'string' ? msg.text : undefined);
+        break;
+      case 'param_text':
+        h.onParamText?.(Number(msg.index), Number(msg.value), typeof msg.text === 'string' ? msg.text : '');
+        break;
+      case 'param_gesture':
+        h.onParamGesture?.(Number(msg.index), msg.begin === true);
         return;
       case 'state':
         this.lastStateB64 = String(msg.state_b64 ?? '');
@@ -520,6 +541,11 @@ export class VstBridgeClient implements VstBridgeClientLike {
 
   getParams(): void {
     this.op({ op: 'get_params' });
+  }
+
+  paramText(index: number, value: number): void {
+    if (!Number.isInteger(index) || index < 0 || !Number.isFinite(value)) return;
+    this.op({ op: 'param_text', index, value: Math.max(0, Math.min(1, value)) });
   }
 
   /** Restore the plugin from a base64 state container (the same blob the
