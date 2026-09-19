@@ -10,7 +10,15 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { vstSessions } from '../../lib/vstLive/sessionRegistry';
 import type { ChainEntry } from '../../state/effectChainStore';
 import { useVstLiveStore } from '../../state/vstLiveStore';
-import { useVstParamStore, visibleVstParams, vstParamKey, type VstParamView } from '../../state/vstParamStore';
+import {
+  isVstChoiceParam,
+  useVstParamStore,
+  visibleVstParams,
+  vstParamKey,
+  vstStepValue,
+  vstTextKey,
+  type VstParamView,
+} from '../../state/vstParamStore';
 
 /** Rows drawn before the user asks for the rest: a mastering suite declares hundreds. */
 const INITIAL_ROWS = 60;
@@ -39,6 +47,7 @@ interface ParamClient {
 export const VstParamPanel: React.FC<VstParamPanelProps> = ({ entry, idPrefix, display, onWrite, onGestureStart, onGestureEnd }) => {
   const status = useVstLiveStore((s) => s.entries[entry.id]?.status ?? 'off');
   const list = useVstParamStore((s) => s.lists[entry.id]) ?? EMPTY;
+  const texts = useVstParamStore((s) => s.texts[entry.id]);
   const [filter, setFilter] = useState('');
   const [showAll, setShowAll] = useState(false);
   const lastTextAt = useRef(new Map<number, number>());
@@ -61,6 +70,23 @@ export const VstParamPanel: React.FC<VstParamPanelProps> = ({ entry, idPrefix, d
   }, [entry.id, status]);
 
   const visible = useMemo(() => visibleVstParams(list), [list]);
+
+  // A program list, a mode, a filter type: ask the plugin ONCE for the name of every position, so
+  // the row can be a list of its own names.
+  const askedChoices = useRef(new Set<number>());
+  useEffect(() => {
+    if (status !== 'live') {
+      askedChoices.current.clear();
+      return;
+    }
+    const client = vstSessions.get(entry.id)?.client as ParamClient | undefined;
+    if (!client?.paramText) return;
+    for (const p of visible) {
+      if (!isVstChoiceParam(p) || askedChoices.current.has(p.index)) continue;
+      askedChoices.current.add(p.index);
+      for (let i = 0; i <= p.steps; i += 1) client.paramText(p.index, vstStepValue(p, i));
+    }
+  }, [entry.id, status, visible]);
   const needle = filter.trim().toLowerCase();
   const matching = useMemo(
     () => (needle ? visible.filter((p) => p.name.toLowerCase().includes(needle)) : visible),
@@ -131,6 +157,33 @@ export const VstParamPanel: React.FC<VstParamPanelProps> = ({ entry, idPrefix, d
           const id = `${idPrefix}-p${p.index}`;
           const value = valueOf(p);
           const shown = p.text || `${Math.round(value * 100)}%`;
+          if (isVstChoiceParam(p)) {
+            const names = texts?.[p.index];
+            const position = Math.round(value * p.steps);
+            return (
+              <li key={p.index} className="grid grid-cols-[minmax(0,7rem)_minmax(0,1fr)] items-center gap-2">
+                <label htmlFor={id} className="truncate font-sans text-[11px] text-zinc-300" title={p.name}>{p.name}</label>
+                <select
+                  id={id}
+                  name={id}
+                  value={position}
+                  disabled={p.readOnly}
+                  onChange={(e) => {
+                    onGestureStart();
+                    write(p, vstStepValue(p, Number(e.target.value)));
+                    onGestureEnd();
+                  }}
+                  className="w-full rounded border border-white/10 bg-black/40 px-1 py-0.5 font-sans text-[11px] text-zinc-200 focus:border-teal-500/50 focus:outline-hidden disabled:opacity-50"
+                >
+                  {Array.from({ length: p.steps + 1 }, (_, i) => (
+                    <option key={i} value={i}>
+                      {names?.[vstTextKey(vstStepValue(p, i))] || (i === position && p.text ? p.text : `${i + 1}`)}
+                    </option>
+                  ))}
+                </select>
+              </li>
+            );
+          }
           if (p.boolean) {
             return (
               <li key={p.index} className="flex items-center gap-2">

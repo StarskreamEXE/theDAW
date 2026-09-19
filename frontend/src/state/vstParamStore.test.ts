@@ -5,7 +5,16 @@
  */
 import assert from 'node:assert/strict';
 
-import { paramFromWire, useVstParamStore, visibleVstParams, vstParamKey, type VstParamWire } from './vstParamStore.ts';
+import {
+  isVstChoiceParam,
+  paramFromWire,
+  useVstParamStore,
+  visibleVstParams,
+  vstParamKey,
+  vstStepValue,
+  vstTextKey,
+  type VstParamWire,
+} from './vstParamStore.ts';
 
 const wire = (index: number, over: Partial<VstParamWire> = {}): VstParamWire => ({
   index,
@@ -63,6 +72,31 @@ const st = () => useVstParamStore.getState();
   assert.equal(st().lists.e1[0].text, '-12.0 dB', 'the answer for 0.3 is dropped: the value is 0.8 now');
   st().setText('e1', 0, 0.8, '-1.9 dB');
   assert.equal(st().lists.e1[0].text, '-1.9 dB');
+}
+
+/* ── a program list or a mode is a LIST of the plugin's own names; a slider's texts are not hoarded ── */
+{
+  st().setList('e2', [
+    wire(0, { steps: 3, discrete: true, text: 'Hall' }), // four named positions
+    wire(1, { steps: 1, boolean: true, discrete: true }), // two positions = a switch, not a list
+    wire(2), // continuous
+    wire(3, { steps: 12, program_change: true }),
+    wire(4, { steps: 4000, discrete: true }), // stepped, but far too many to list
+  ]);
+  const list = st().lists.e2;
+  assert.deepEqual(list.map(isVstChoiceParam), [true, false, false, true, false]);
+  assert.deepEqual([0, 1, 2, 3].map((i) => vstStepValue(list[0], i)), [0, 1 / 3, 2 / 3, 1]);
+
+  st().setText('e2', 0, 1 / 3, 'Room');
+  st().setText('e2', 0, 1, 'Plate');
+  assert.equal(st().texts.e2[0][vstTextKey(1 / 3)], 'Room');
+  assert.equal(st().texts.e2[0][vstTextKey(1)], 'Plate');
+  assert.equal(st().lists.e2[0].text, 'Hall', 'naming OTHER positions never relabels the current one');
+
+  for (let i = 0; i < 50; i += 1) st().setText('e2', 2, i / 50, `${i} %`);
+  assert.equal(st().texts.e2[2], undefined, 'a continuous slider passing fifty values leaves nothing behind');
+  st().clear('e2');
+  assert.equal(st().texts.e2, undefined);
 }
 
 /* ── clear ── */

@@ -24,7 +24,7 @@ import { useVstEditorPrefs, type VstEditorMode } from './vstEditorPrefsStore';
 import { vstApi, getNativeWindowHandle, setLiveEditorRectRouter } from '../lib/vstClient';
 import { setVstLiveStateSink, vstSessions, type VstLiveSession } from '../lib/vstLive/sessionRegistry';
 import { useVstLiveStore } from './vstLiveStore';
-import { useEditorStore } from './editorStore';
+import { beginUndoStep, useEditorStore } from './editorStore';
 import { useEffectChainStore } from './effectChainStore';
 import type { ChainEntry } from './effectChainStore';
 
@@ -539,6 +539,12 @@ async function openLiveEditor(
   // itself and does that; the caller's `sinkRawState` is the SIDECAR's sink and
   // has no way to name a host, which is exactly why it is not used here.
   session.stateSink = (stateB64) => sinkLiveRawState(entry.id, stateB64);
+  // A knob grabbed in the plugin's own window starts a NEW undo step, exactly as a press on one of
+  // the app's own sliders does: without the cut, a drag that begins within the coalescing window of
+  // some other edit is folded into it, and one Ctrl+Z takes both back.
+  session.gestureSink = (_index, begin) => {
+    if (begin) beginUndoStep();
+  };
   session.paramSink = (index, value) => {
     rec.pendingParams.set(index, value);
     if (rec.paramTimer) return;

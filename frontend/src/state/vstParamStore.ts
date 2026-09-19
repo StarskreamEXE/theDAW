@@ -77,12 +77,28 @@ export const paramFromWire = (w: VstParamWire): VstParamView => ({
 /** The `ChainEntry.params` key a plugin parameter is stored under. */
 export const vstParamKey = (index: number): string => `p${index}`;
 
+/** The key a value's display string is cached under. */
+export const vstTextKey = (value: number): string => value.toFixed(6);
+
+/**
+ * A stepped parameter the panel shows as a LIST of the plugin's own names (a program, a mode, a
+ * filter type) instead of a slider with positions nobody can read. Two positions is a switch.
+ */
+export const isVstChoiceParam = (p: VstParamView): boolean =>
+  !p.boolean && p.steps >= 2 && p.steps <= 127 && (p.programChange || p.discrete);
+
+/** The normalized value of position `i` of a stepped parameter. */
+export const vstStepValue = (p: VstParamView, i: number): number => (p.steps > 0 ? i / p.steps : 0);
+
 /** What a parameter panel lists: everything the plugin wants a user to see. */
 export const visibleVstParams = (list: readonly VstParamView[]): VstParamView[] => list.filter((p) => !p.hidden);
 
 interface VstParamState {
   /** Keyed by chain entry id. Absent = the plugin has not been asked yet. */
   lists: Record<string, VstParamView[]>;
+  /** Every display string the plugin has given, by entry, parameter index and value key: the
+   *  names of a program list or a mode switch are asked for once and read from here. */
+  texts: Record<string, Record<number, Record<string, string>>>;
   setList: (entryId: string, list: VstParamWire[]) => void;
   /** One value moved (the plugin's editor, automation read back, a program change). */
   setValue: (entryId: string, index: number, value: number, text?: string) => void;
@@ -110,6 +126,7 @@ const patchParam = (
 
 export const useVstParamStore = create<VstParamState>()((set) => ({
   lists: {},
+  texts: {},
   setList: (entryId, list) => set((s) => ({ lists: { ...s.lists, [entryId]: list.map(paramFromWire) } })),
   setValue: (entryId, index, value, text) =>
     set((s) => ({
@@ -119,15 +136,25 @@ export const useVstParamStore = create<VstParamState>()((set) => ({
     })),
   setText: (entryId, index, value, text) =>
     set((s) => ({
+      // Kept only for a LIST parameter (a few named positions). A continuous slider asks for the
+      // text of every value it passes, and remembering all of those would grow without bound.
+      texts: s.lists[entryId]?.some((p) => p.index === index && isVstChoiceParam(p))
+        ? {
+            ...s.texts,
+            [entryId]: { ...s.texts[entryId], [index]: { ...s.texts[entryId]?.[index], [vstTextKey(value)]: text } },
+          }
+        : s.texts,
       // Only while the parameter still holds the value the text was asked for: a slow answer must
       // not label a newer value with an older string.
       lists: patchParam(s.lists, entryId, index, (p) => (Math.abs(p.value - value) > 1e-6 || p.text === text ? p : { ...p, text })),
     })),
   clear: (entryId) =>
     set((s) => {
-      if (!(entryId in s.lists)) return s;
+      if (!(entryId in s.lists) && !(entryId in s.texts)) return s;
       const lists = { ...s.lists };
+      const texts = { ...s.texts };
       delete lists[entryId];
-      return { lists };
+      delete texts[entryId];
+      return { lists, texts };
     }),
 }));
