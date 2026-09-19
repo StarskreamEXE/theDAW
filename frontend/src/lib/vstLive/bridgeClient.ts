@@ -167,6 +167,9 @@ export class VstBridgeClient {
   private pending: string[] = [];
   /** Highest audio_out seq delivered, so a repeat cannot be played twice. */
   private lastOutSeq = -1;
+  /** The sequence number the next outgoing block carries. Owned HERE, by the socket, and only
+   *  ever counts up: see `sendAudio`. */
+  private nextInSeq = 0;
   /** The most recent plugin state the client knows, replayed on a reconnect. */
   private lastStateB64: string | null = null;
   private pingSentAt: number | null = null;
@@ -429,7 +432,21 @@ export class VstBridgeClient {
    * that arrived late would be audio the user already heard.
    */
   sendAudio(header: VstFrameHeader, channels: readonly Float32Array[]): void {
-    if (!this._ready || !this.raw(packFrame(header, channels))) this.stats.droppedIn += 1;
+    if (!this._ready) {
+      this.stats.droppedIn += 1;
+      return;
+    }
+    // The block is numbered by the SOCKET, not by whoever produced it. The producer is an audio
+    // worklet, and the engine builds a new one on every Play, every seek while playing and every
+    // loop wrap — each counting from 0 again — while this client (and its `lastOutSeq`) lives as
+    // long as the session. The host echoes the number it was sent, so after the first rebuild
+    // every processed block came back numbered BELOW the last one delivered and was thrown away as
+    // a straggler: the plugin dropped out of the path, the track played dry, and the row went on
+    // saying LIVE, until the new worklet had counted past the old one's total.
+    const seq = this.nextInSeq;
+    this.nextInSeq = seq >= 0xffffffff ? 0 : seq + 1;
+    if (seq === 0) this.lastOutSeq = -1; // first block, or the u32 wrapped: the echo starts over too
+    if (!this.raw(packFrame({ ...header, seq }, channels))) this.stats.droppedIn += 1;
   }
 
   /** Set one parameter by index. `value` is NORMALIZED (0..1), per the contract. */

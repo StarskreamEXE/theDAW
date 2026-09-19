@@ -115,8 +115,33 @@ export function broadcastVstTransport(info: VstTransportInfo): void {
 /* ── the factory ───────────────────────────────────────────────────────────── */
 
 /** Seams for tests; the app passes none. */
+/**
+ * How long a disposed live node waits for the rebuild that usually follows it (ms).
+ *
+ * The engine rebuilds every FX chain on Play, on every seek while playing and on every loop wrap:
+ * dispose, then create again for the same entry a few milliseconds later. A new bridge worklet
+ * starts unprimed, so each of those used to let the DRY signal through for the 50-100 ms it takes
+ * to refill the play-out buffer before the plugin ramped back in: an audible blip at every loop
+ * point. A parked node keeps its worklet, its primed buffer and its claim on the session, and the
+ * next `createVstLiveNode` for the same entry and context simply hands it back.
+ */
+export const VST_NODE_PARK_MS = 1500;
+
+interface ParkedNode {
+  ctx: BaseAudioContext;
+  registry: VstSessionRegistry;
+  /** The session the node is wired to; a revive is only valid while the registry still has it. */
+  session: VstLiveSession;
+  revive: (entry: ChainEntry) => RackEffectInstance;
+  destroy: () => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+const parkedNodes = new Map<string, ParkedNode>();
+
 export interface VstLiveNodeDeps {
   registry?: VstSessionRegistry;
+  /** Override {@link VST_NODE_PARK_MS}; 0 tears a disposed node down at once. */
+  parkMs?: number;
   ensureModule?: (ctx: BaseAudioContext) => Promise<void>;
   makeWorklet?: (
     ctx: BaseAudioContext,
@@ -205,6 +230,18 @@ export function createVstLiveNode(
   if (isOffline(ctx)) return passthrough(ctx);
 
   const registry = deps.registry ?? vstSessions;
+  const parkMs = deps.parkMs ?? VST_NODE_PARK_MS;
+  const waiting = parkedNodes.get(entry.id);
+  if (waiting) {
+    parkedNodes.delete(entry.id);
+    clearTimeout(waiting.timer);
+    // Same context, same registry, and the session it is wired to is still the entry's session
+    // (a project close in between takes the sessions away): pick it up where it left off.
+    if (waiting.ctx === ctx && waiting.registry === registry && registry.get(entry.id) === waiting.session) {
+      return waiting.revive(entry);
+    }
+    waiting.destroy();
+  }
   const ensureModule = deps.ensureModule ?? ensureVstBridgeModule;
   const makeWorklet =
     deps.makeWorklet ??
@@ -217,6 +254,8 @@ export function createVstLiveNode(
   dry.connect(output);
 
   let disposed = false;
+  /** The entry as the chain last handed it over: a revive brings a newer object with the same id. */
+  let currentEntry = entry;
   let session: VstLiveSession | null = null;
   let worklet: AudioWorkletNode | null = null;
   let wet: GainNode | null = null;
@@ -386,7 +425,7 @@ export function createVstLiveNode(
     s.audioSink = onProcessed;
     // Whatever the entry already holds has to reach a plugin that just started
     // from its state file; the diff map is empty, so this pushes everything.
-    pushParams(entry.params);
+    pushParams(currentEntry.params);
   };
 
   /** Re-arm an already-attached worklet after a drop-and-reconnect. A dropped
@@ -412,7 +451,7 @@ export function createVstLiveNode(
     // diff map remembers sending last time, so the map must not suppress
     // this re-push the way it does a same-session param rebuild.
     sentParams.clear();
-    pushParams(entry.params);
+    pushParams(currentEntry.params);
   };
 
   const pushParams = (params: Record<string, number>): void => {
@@ -493,37 +532,87 @@ export function createVstLiveNode(
     }
   })();
 
-  return {
-    input,
-    output,
-    setParams: (p) => pushParams(p),
-    dispose: () => {
-      if (disposed) return;
-      disposed = true;
-      unsubStore?.();
-      unsubStore = null;
-      liveNodes.delete(portEntry);
-      if (session) session.audioSink = null;
-      try {
-        if (worklet) {
-          worklet.port.onmessage = null;
-          worklet.disconnect();
-        }
-        wet?.disconnect();
-        input.disconnect();
-        dry.disconnect();
-        output.disconnect();
-      } catch {
-        /* already gone */
+  /** Tear everything down and give the session claim back. */
+  const destroy = (): void => {
+    if (disposed) return;
+    disposed = true;
+    unsubStore?.();
+    unsubStore = null;
+    liveNodes.delete(portEntry);
+    if (session) session.audioSink = null;
+    try {
+      if (worklet) {
+        worklet.port.onmessage = null;
+        worklet.disconnect();
       }
-      worklet = null;
-      wet = null;
-      // The PROCESS is not killed here: a rebuild (play / stop / seek) disposes
-      // every instance and re-makes it milliseconds later, and respawning a
-      // plugin host on every transport press would be unusable. The registry's
-      // grace timer decides whether this was a rebuild or a real removal.
-      if (session) registry.release(entry.id);
-      session = null;
-    },
+      wet?.disconnect();
+      input.disconnect();
+      dry.disconnect();
+      output.disconnect();
+    } catch {
+      /* already gone */
+    }
+    worklet = null;
+    wet = null;
+    // The PROCESS is not killed here: a rebuild (play / stop / seek) disposes
+    // every instance and re-makes it milliseconds later, and respawning a
+    // plugin host on every transport press would be unusable. The registry's
+    // grace timer decides whether this was a rebuild or a real removal.
+    if (session) registry.release(entry.id);
+    session = null;
   };
+
+  /** One handle per owner: the chain that disposes it must not be able to reach a node that has
+   *  since been handed to the next chain. */
+  const makeHandle = (): RackEffectInstance => {
+    let released = false;
+    return {
+      input,
+      output,
+      setParams: (p) => {
+        if (!released) pushParams(p);
+      },
+      dispose: () => {
+        if (released) return;
+        released = true;
+        // Only a node that is actually carrying the plugin is worth keeping: one still waiting
+        // for its host has no primed buffer to lose.
+        if (disposed || parkMs <= 0 || !worklet || !session) {
+          destroy();
+          return;
+        }
+        // The chain has already cut its own edges; this one is the node's own way out. The
+        // INTERNAL graph (input -> worklet -> wet -> output) stays exactly as it is.
+        try {
+          output.disconnect();
+        } catch {
+          /* already gone */
+        }
+        const older = parkedNodes.get(entry.id); // never two parked nodes for one entry
+        if (older) {
+          clearTimeout(older.timer);
+          parkedNodes.delete(entry.id);
+          older.destroy();
+        }
+        const parked: ParkedNode = {
+          ctx,
+          registry,
+          session,
+          revive: (next) => {
+            currentEntry = next;
+            pushParams(next.params); // only values that actually moved reach the plugin
+            return makeHandle();
+          },
+          destroy,
+          timer: setTimeout(() => {
+            if (parkedNodes.get(entry.id) === parked) parkedNodes.delete(entry.id);
+            destroy();
+          }, parkMs),
+        };
+        parkedNodes.set(entry.id, parked);
+      },
+    };
+  };
+
+  return makeHandle();
 }

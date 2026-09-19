@@ -290,22 +290,33 @@ const pcm = (frames = 4) => [new Float32Array(frames), new Float32Array(frames)]
 
   s.open();
   s.say(READY);
-  client.sendAudio(inHeader(1), pcm());
-  client.sendAudio(inHeader(2), pcm());
-  assert.deepEqual(s.frames().map((h) => h.seq), [1, 2]);
+  // The SOCKET numbers the blocks (0, 1, 2 ...), whatever number the producer put in the header.
+  client.sendAudio(inHeader(41), pcm());
+  client.sendAudio(inHeader(42), pcm());
+  assert.deepEqual(s.frames().map((h) => h.seq), [0, 1]);
   assert.deepEqual(s.frames().map((h) => h.type), [FRAME_TYPE_AUDIO_IN, FRAME_TYPE_AUDIO_IN]);
 
+  s.sendFrame(outHeader(0), pcm()); // the host echoes the number it was sent
   s.sendFrame(outHeader(1), pcm());
-  s.sendFrame(outHeader(2), pcm());
-  assert.deepEqual(log.audio, [1, 2]);
+  assert.deepEqual(log.audio, [0, 1]);
 
-  s.sendFrame(outHeader(2), pcm()); // duplicate
-  s.sendFrame(outHeader(1), pcm()); // straggler
-  assert.deepEqual(log.audio, [1, 2], 'neither reaches the play-out buffer');
+  s.sendFrame(outHeader(1), pcm()); // duplicate
+  s.sendFrame(outHeader(0), pcm()); // straggler
+  assert.deepEqual(log.audio, [0, 1], 'neither reaches the play-out buffer');
   assert.equal(client.stats.outOfOrder, 2);
 
+  // A REBUILT producer: the engine makes a new audio worklet on every Play, every seek while
+  // playing and every loop wrap, and each one counts from 0 again. Its blocks used to go out with
+  // those low numbers, come back echoed, and be thrown away as stragglers — the plugin fell out of
+  // the path and the track played dry while the row said LIVE. Numbered by the socket, they simply
+  // carry on from where the stream was.
+  client.sendAudio(inHeader(0), pcm());
+  client.sendAudio(inHeader(1), pcm());
+  assert.deepEqual(s.frames().map((h) => h.seq), [0, 1, 2, 3], 'the numbering never goes back');
+  s.sendFrame(outHeader(2), pcm());
   s.sendFrame(outHeader(3), pcm());
-  assert.deepEqual(log.audio, [1, 2, 3], 'and the stream carries on');
+  assert.deepEqual(log.audio, [0, 1, 2, 3], 'so the rebuilt producer is heard at once');
+  assert.equal(client.stats.outOfOrder, 2, 'and nothing of it is counted as out of order');
 
   // A frame the host had no business sending is refused without killing the
   // connection: one bad message must not take the session down.

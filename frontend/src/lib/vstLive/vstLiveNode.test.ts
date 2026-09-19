@@ -185,6 +185,7 @@ const READY = {
 function deps(reg: FakeRegistry) {
   return {
     registry: reg as VstSessionRegistry,
+    parkMs: 0, // these cases pin the teardown itself; parking has its own cases
     ensureModule: async () => {},
     makeWorklet: (_ctx: unknown, _name: string, options: Record<string, unknown>) =>
       new FakeWorklet(options) as never,
