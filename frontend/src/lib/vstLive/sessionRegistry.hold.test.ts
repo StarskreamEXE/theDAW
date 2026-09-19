@@ -172,4 +172,35 @@ function setup(graceMs = 10000) {
   assert.equal(backend.deleted.length, 1);
 }
 
+/* ── forget(): the entry left the project — a node of the last graph cannot keep its host alive ── */
+{
+  const { backend, clock, registry } = setup(10000);
+  await registry.hold(entry('f'), 44100, 'project');
+  await registry.hold(entry('f'), 44100, 'editor');
+  await registry.acquire(entry('f'), 44100); // the node built by the last Play; the transport is stopped now
+  registry.forget('f');
+  clock.advance(9999);
+  assert.equal(backend.deleted.length, 0, 'the grace period still applies: an undo can get the same plugin back');
+  clock.advance(2);
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(backend.deleted.length, 1, 'no Play was needed: the host of a removed plugin is shut down');
+  registry.release('f'); // the stale node is disposed at the next Play: nothing left to release, no throw
+  registry.forget('f'); // unknown by now: no throw
+}
+
+/* ── forget() then an undo inside the grace period: the very same session comes back ── */
+{
+  const { backend, clock, registry } = setup(10000);
+  const first = await registry.hold(entry('g'), 44100, 'project');
+  await registry.acquire(entry('g'), 44100);
+  registry.forget('g');
+  clock.advance(5000);
+  const again = await registry.hold(entry('g'), 44100, 'project'); // undo: the entry is back in the rack
+  assert.equal(again, first, 'the running plugin is reused, settings and all');
+  registry.release('g'); // the stale node goes at the next Play; its count was already dropped
+  clock.advance(60000);
+  assert.equal(backend.deleted.length, 0, 'the project holds it again: no reaper');
+  assert.equal(backend.creates, 1, 'and nothing was respawned');
+}
+
 console.log('vstLive/sessionRegistry.hold: ok');

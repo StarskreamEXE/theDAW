@@ -119,6 +119,7 @@ class FakeRegistry implements VstSessionRegistry {
     return Promise.resolve(null); // the node never holds; only the editor window does
   }
   unhold(): void {}
+  forget(): void {}
   release(entryId: string): void {
     this.released.push(entryId);
   }

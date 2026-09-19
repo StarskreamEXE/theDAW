@@ -206,7 +206,8 @@ async function main() {
     await report.scenario('add-plugin-goes-live-within-10s', async () => {
       const before = await apiGet('/api/vst/live/sessions')
       expect(before.status === 200, `GET /api/vst/live/sessions returned HTTP ${before.status}`)
-      const beforeCount = before.body?.sessions?.length ?? 0
+      // The list keeps records of sessions that have ended, so "new" is decided by id, never by count.
+      const knownIds = new Set((before.body?.sessions ?? []).map((s) => s.session_id))
       const beforeProcCount = hostProcCount()
 
       // This QA backend's project is shared with every other area's script
@@ -263,39 +264,15 @@ async function main() {
       // for its editor window. Windows are switched off for QA (qaLib), so none
       // appears; scenario 2 checks WHICH editor the app reached for.
 
-      // Backend truth: exactly one new session, exactly one new host process.
-      // NOTE: sessionRegistry.acquire() only runs when buildEffectChain
-      // actually builds the chain, which vstLiveNode.ts says happens "on
-      // every play / stop / seek" — so if the session never appears merely
-      // from adding the entry, press Play (scenario 2's action) to force a
-      // build, and record that the "within ~10s of adding" wording did not
-      // hold as stated.
-      let sessions = null
-      let neededPlayToGoLive = false
-      const deadline1 = Date.now() + 6000
-      while (Date.now() < deadline1) {
-        const r = await apiGet('/api/vst/live/sessions')
-        if ((r.body?.sessions?.length ?? 0) > beforeCount) { sessions = r.body.sessions; break }
-        await page.waitForTimeout(300)
+      // Backend truth: exactly one new session, exactly one new host process — from ADDING the
+      // plugin, with the transport stopped: the project hosts its plugins, it does not wait for Play.
+      let mine = null
+      const deadline1 = Date.now() + 10000
+      while (Date.now() < deadline1 && !mine) {
+        mine = (await aliveSessions()).find((s) => !knownIds.has(s.session_id)) ?? null
+        if (!mine) await page.waitForTimeout(300)
       }
-      if (!sessions) {
-        neededPlayToGoLive = true
-        await safeClick(page.getByRole('button', { name: 'Play the arrangement' }))
-        const deadline2 = Date.now() + 10000
-        while (Date.now() < deadline2) {
-          const r = await apiGet('/api/vst/live/sessions')
-          if ((r.body?.sessions?.length ?? 0) > beforeCount) { sessions = r.body.sessions; break }
-          await page.waitForTimeout(300)
-        }
-      }
-      expect(
-        !!sessions,
-        `no new session appeared under GET /api/vst/live/sessions within 6s of adding the plugin, or within 10s more after pressing Play (had ${beforeCount} before)`,
-      )
-      if (neededPlayToGoLive) {
-        console.log('  FINDING: the entry did NOT go live merely from being added — a session only appeared after pressing Play (buildEffectChain only runs on play/stop/seek, per vstLiveNode.ts). This contradicts the "within about 10s" of adding wording taken alone.')
-      }
-      const mine = sessions[sessions.length - 1]
+      expect(!!mine, 'no new live session within 10s of adding the plugin (transport stopped)')
       sessionId = mine.session_id
       hostPid = mine.pid
       createdSessionIds.add(sessionId)
@@ -349,8 +326,15 @@ async function main() {
         await safeClick(editorClose.first())
         await page.waitForTimeout(500)
       }
+      // ...and with the transport STOPPED there is no audio node yet: the project itself has to
+      // keep the plugin hosted past the registry's 10 s grace period, or the first Play would
+      // have to spawn it again and open dry.
+      await page.waitForTimeout(12500)
       const s = await apiGet(`/api/vst/live/session/${sessionId}`)
-      expect(s.status === 200 && s.body?.alive === true, `session ${sessionId} is no longer alive after the window request/close: ${JSON.stringify(s.body)}`)
+      expect(
+        s.status === 200 && s.body?.alive === true && s.body?.pid === hostPid,
+        `session ${sessionId} (pid ${hostPid}) did not survive 12 s with its window closed and the transport stopped: ${JSON.stringify(s.body)}`,
+      )
     })
 
     // ── Scenario 2: press play, prove blocks flow through the plugin ──────
@@ -545,26 +529,16 @@ async function main() {
       while (Date.now() < deadline && (await pidAlive(oldPid))) await page.waitForTimeout(300)
       expect(!(await pidAlive(oldPid)), `the refreshed page left its host process running (pid ${oldPid}, session ${oldSessionId})`)
 
-      // The restored plugin is the same chain entry, hosted again.
+      // The restored plugin is the same chain entry, hosted again — BEFORE Play: a project that
+      // only spawns its plugins on the first Play opens dry until they have loaded.
       let again = null
-      let neededPlay = false
-      deadline = Date.now() + 10000
+      deadline = Date.now() + 15000
       while (Date.now() < deadline && !again) {
         again = (await aliveSessions()).find((s) => s.chain_entry_id === liveEntryId && s.session_id !== oldSessionId) ?? null
         if (!again) await page.waitForTimeout(300)
       }
-      if (!again) {
-        neededPlay = true
-        await safeClick(page.getByRole('button', { name: 'Play the arrangement' }))
-        deadline = Date.now() + 15000
-        while (Date.now() < deadline && !again) {
-          again = (await aliveSessions()).find((s) => s.chain_entry_id === liveEntryId && s.session_id !== oldSessionId) ?? null
-          if (!again) await page.waitForTimeout(300)
-        }
-      }
-      expect(!!again, `after refresh + Restore the plugin (entry ${liveEntryId}) was never hosted again`)
+      expect(!!again, `15 s after refresh + Restore the plugin (entry ${liveEntryId}) is not hosted — it would only start on Play`)
       createdSessionIds.add(again.session_id)
-      if (neededPlay) console.log('  NOTE: the restored plugin only went live once Play was pressed')
 
       trackName = await firstTrackName(page)
       await safeClick(page.getByRole('button', { name: `Track ${trackName} insert FX` }))
@@ -580,6 +554,11 @@ async function main() {
     // Close only the sessions THIS run opened — never touch a session another
     // concurrent QA area's script might be holding on the shared backend.
     try {
+      // Leave the app FIRST: that is the page's own cleanup (pagehide -> keepalive DELETE). A
+      // DELETE from out here while the app is still open would be answered by the registry
+      // re-creating the session it thinks has crashed — and that one would be orphaned.
+      await page.goto('about:blank').catch(() => {})
+      await page.waitForTimeout(1500)
       for (const id of createdSessionIds) {
         const s = await apiGet(`/api/vst/live/session/${id}`)
         if (s.status === 200 && s.body?.alive) await apiDelete(`/api/vst/live/session/${id}`).catch(() => {})

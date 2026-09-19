@@ -83,6 +83,7 @@ import {
 } from '../lib/rackEffects';
 import { broadcastVstTransport } from '../lib/vstLive/vstLiveNode';
 import { hookVstSessionUnload, vstSessions } from '../lib/vstLive/sessionRegistry';
+import { createProjectSessions } from '../lib/vstLive/projectSessions';
 import { entryLatencySamples, useVstLiveStore, type VstLiveEntryState } from './vstLiveStore';
 import { sliceChunks, type AudioChunk } from '../lib/audioAnalysis';
 import {
@@ -3432,6 +3433,24 @@ export function reactivate(): void {
   usePlayerStore.setState({ currentEntryId: EDITOR_ENTRY_ID, currentLabel: 'Editor Timeline' });
 }
 
+/**
+ * The Edit project's hosted plugins, held for as long as they sit in a rack — see
+ * lib/vstLive/projectSessions.ts. The graph below is only built on Play; without this a plugin
+ * was spawned BY the first Play (the song opened dry until it had loaded) and a plugin removed
+ * with the transport stopped kept its host process until the next Play.
+ */
+const projectSessions = createProjectSessions({
+  registry: vstSessions,
+  entries: () => {
+    const ed = useEditorStore.getState();
+    const out: ChainEntry[] = [...ed.masterVstChain];
+    for (const t of ed.tracks) if (t.fxChain) out.push(...t.fxChain);
+    return out;
+  },
+  sampleRate: () => getEngineCtx().sampleRate,
+});
+let unsubProjectSessions: (() => void) | null = null;
+
 /** Register this module as playerStore's live transport so the footer's normal
  *  transport buttons drive it. Call on editor mount. Returns an unregister. */
 export function attach(): () => void {
@@ -3439,6 +3458,16 @@ export function attach(): () => void {
   // will peek back, so eviction can only take clips nothing is playing.
   enableDecodeBudget();
   setLiveTransport({ play, pause, stop, seek });
+  // Hosts can be running before the first Play now, so the page-unload cleanup cannot wait for it.
+  hookVstSessionUnload();
+  if (!unsubProjectSessions) {
+    // Gated on the rack-bearing slices BY REFERENCE, like the live-edit subscription in start():
+    // the 60 Hz playhead tick leaves both untouched.
+    unsubProjectSessions = useEditorStore.subscribe((state, prev) => {
+      if (state.tracks !== prev.tracks || state.masterVstChain !== prev.masterVstChain) projectSessions.reconcile();
+    });
+  }
+  projectSessions.reconcile();
   return () => {
     dispose();
   };
@@ -3467,6 +3496,8 @@ export function dispose(): void {
   // contract, and `dispose()` is the only place that knows it happened. The
   // instances above have already called `release()`, but that only arms a
   // 10 s grace timer meant for a rebuild; nothing is coming back here.
+  if (unsubProjectSessions) { unsubProjectSessions(); unsubProjectSessions = null; }
+  projectSessions.reset(); // closeAll takes the sessions; the next attach() holds them afresh
   vstSessions.closeAll();
   broadcastVstTransport({ playing: false, positionSamples: 0, tempoBpm: 0, discontinuity: true });
   // Cleared, not re-seeded: the next start() builds a fresh graph and calls

@@ -140,6 +140,15 @@ export interface VstSessionRegistry {
   hold(entry: ChainEntry, sampleRate: number, holder: string): Promise<VstLiveSession | null>;
   /** Give a hold back. The grace timer starts when no holder and no node is left. */
   unhold(entryId: string, holder: string): void;
+  /**
+   * The entry LEFT THE PROJECT: drop every claim on its session — holders and nodes alike — and
+   * start the grace timer. The engine only rebuilds its graph on Play, so with the transport
+   * stopped a removed plugin's node (and through it the host process) used to stay claimed until
+   * the next Play; whoever watches the project's racks says so here instead. The grace period
+   * still applies, so an undo inside it gets the very same running plugin back (`hold`/`acquire`
+   * cancel the timer). A node that is disposed later releases a count that is already zero.
+   */
+  forget(entryId: string): void;
   /** The entry is gone: shut the host down now. */
   close(entryId: string): void;
   /** Project close / page unload. */
@@ -479,6 +488,14 @@ export function createVstSessionRegistry(deps: VstSessionRegistryDeps = {}): Vst
     unhold(entryId, holder) {
       const slot = slots.get(entryId);
       if (!slot || !slot.holders.delete(holder)) return;
+      startGrace(entryId, slot);
+    },
+
+    forget(entryId) {
+      const slot = slots.get(entryId);
+      if (!slot) return;
+      slot.nodeRefs = 0;
+      slot.holders.clear();
       startGrace(entryId, slot);
     },
 
