@@ -1292,6 +1292,8 @@ const EDIT_SHORTCUTS: Array<{ group: string; keys: Array<[string, string]> }> = 
       ['S', 'Split selection at playhead'],
       ['Del', 'Delete selected clips'],
       ['Ctrl+D', 'Duplicate'],
+      ['F2', 'Name and colour of the selected clip'],
+      ['Esc (while dragging)', 'Cancel the clip move / trim and put it back'],
       ['Ctrl+C / X / V', 'Copy / cut / paste at the edit cursor'],
       ['Ctrl+A', 'Select all clips'],
       ['Ctrl+Z / Ctrl+Shift+Z', 'Undo / redo'],
@@ -2327,6 +2329,25 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       if (attached) { window.removeEventListener('mousedown', onDown); window.removeEventListener('keydown', onKey); }
     };
   }, [gainPanel]);
+
+  // Clip name + colour popover (clip menu -> "Name and colour…"). A commit is one undo step.
+  const [clipNamePanel, setClipNamePanel] = useState<{ clipId: string; x: number; y: number } | null>(null);
+  const clipNamePanelRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!clipNamePanel) return;
+    const onDown = (e: MouseEvent) => {
+      if (clipNamePanelRef.current?.contains(e.target as Node)) return;
+      setClipNamePanel(null);
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setClipNamePanel(null); };
+    let attached = false;
+    const attach = () => { attached = true; window.addEventListener('mousedown', onDown); window.addEventListener('keydown', onKey); };
+    const timer = window.setTimeout(attach, 0);
+    return () => {
+      window.clearTimeout(timer);
+      if (attached) { window.removeEventListener('mousedown', onDown); window.removeEventListener('keydown', onKey); }
+    };
+  }, [clipNamePanel]);
 
   // Render the clip's current region (offset..offset+duration) to a WAV File so the
   // backend stretches only what the clip actually plays, not the whole source.
@@ -3547,6 +3568,23 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
           setShowShortcuts((v) => !v);
           return;
         }
+        // F2 = name and colour of the selected clip (REAPER's item-properties key).
+        if (e.key === 'F2') {
+          const st = useEditorStore.getState();
+          const clipId = st.selectedClipId ?? st.selectedClipIds[0];
+          if (!clipId || !containerRef.current?.offsetParent) return;
+          e.preventDefault();
+          const el = Array.from(document.querySelectorAll<HTMLElement>('[data-clip="1"][data-clip-id]')).find(
+            (n) => n.dataset.clipId === clipId,
+          );
+          const r = el?.getBoundingClientRect();
+          setClipNamePanel({
+            clipId,
+            x: Math.round(r ? Math.max(8, r.left) : window.innerWidth / 2 - 144),
+            y: Math.round(r ? r.bottom + 4 : 160),
+          });
+          return;
+        }
         if (e.key === 'Escape') {
           if (showShortcutsRef.current) {
             setShowShortcuts(false);
@@ -4717,7 +4755,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     const menuOpen =
       !!(
         clipMenu.position || trackMenu.position || addMenu.position || rangeMenu.position || addPicker ||
-        gainPanel || timePitchPanel || instrPanel || stemsModal || inpaintPanel || prefsAnchor
+        gainPanel || clipNamePanel || timePitchPanel || instrPanel || stemsModal || inpaintPanel || prefsAnchor
       ) ||
       document.querySelector('[role="menu"], [role="dialog"][aria-modal="true"]') !== null;
     // Every timeline gesture, not just the two this ticket added: a clip drag,
@@ -6328,6 +6366,78 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         );
       })()}
 
+      {clipNamePanel && (() => {
+        const clip = clips.find((c) => c.id === clipNamePanel.clipId);
+        if (!clip) return null;
+        // The whole selection takes the colour when the clip is part of it (the way a colour set
+        // on one selected item applies to all of them in REAPER); the name is this clip's alone.
+        const targets = selectedClipIds.includes(clip.id) && selectedClipIds.length > 1 ? selectedClipIds : [clip.id];
+        const trackColor = tracks.find((t) => t.id === clip.trackId)?.color ?? clip.color;
+        const paint = (color: string) => {
+          beginUndoStep();
+          targets.forEach((id) => updateClip(id, { color }, { coalesce: true }));
+        };
+        return (
+          <PopoverPortal
+            x={clipNamePanel.x}
+            y={clipNamePanel.y}
+            innerRef={clipNamePanelRef}
+            className="fixed z-50 w-72 hardware-card bg-black/90 border border-purple-500/30 rounded-lg shadow-2xl shadow-purple-900/40 p-3 flex flex-col gap-2"
+          >
+            <form
+              className="flex flex-col gap-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                const next = String(new FormData(e.currentTarget).get('clip-name') ?? '').trim();
+                if (next && next !== clip.label) {
+                  beginUndoStep();
+                  updateClip(clip.id, { label: next });
+                }
+                setClipNamePanel(null);
+              }}
+            >
+              <label htmlFor="editor-clip-name" className="text-[10px] font-mono uppercase tracking-wider text-zinc-400">Clip name</label>
+              <input
+                id="editor-clip-name"
+                name="clip-name"
+                type="text"
+                defaultValue={clip.label}
+                autoFocus
+                onFocus={(e) => e.currentTarget.select()}
+                className="w-full rounded border border-white/10 bg-black/40 px-2 py-1 font-sans text-xs text-zinc-100 focus:border-purple-400/60 focus:outline-hidden"
+              />
+              <div className="flex items-center gap-2">
+                <label htmlFor="editor-clip-color" className="text-[10px] font-mono uppercase tracking-wider text-zinc-400">
+                  Colour{targets.length > 1 ? ` (${targets.length} clips)` : ''}
+                </label>
+                <input
+                  id="editor-clip-color"
+                  name="clip-color"
+                  type="color"
+                  value={/^#[0-9a-fA-F]{6}$/.test(clip.color) ? clip.color : '#a855f7'}
+                  onChange={(e) => paint(e.target.value)}
+                  className="h-6 w-10 cursor-pointer rounded border border-white/10 bg-transparent p-0"
+                />
+                <button
+                  type="button"
+                  onClick={() => paint(trackColor)}
+                  className="rounded border border-white/10 px-2 py-1 font-display text-[10px] font-bold uppercase tracking-wider text-zinc-400 hover:bg-white/5 hover:text-white"
+                  title="Use the track's colour again"
+                >
+                  Track colour
+                </button>
+                <button
+                  type="submit"
+                  className="ml-auto rounded border border-purple-500/40 bg-purple-500/15 px-2 py-1 font-display text-[10px] font-bold uppercase tracking-wider text-purple-200 hover:bg-purple-500/25"
+                >
+                  Done
+                </button>
+              </div>
+            </form>
+          </PopoverPortal>
+        );
+      })()}
+
       {/* Body: track headers + scrollable timeline */}
       <div className="flex-1 min-h-0 flex overflow-hidden">
         {/* Track headers (sticky, not scrolled) */}
@@ -6734,6 +6844,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                 <div
                   key={clip.id}
                   data-clip="1"
+                  data-clip-id={clip.id}
                   onPointerDown={(e) => onClipPointerDown(e, clip.id, 'move')}
                   onClick={(e) => onClipClick(e, clip.id)}
                   onDoubleClick={() => onClipDoubleClick(clip)}
@@ -7207,6 +7318,15 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         });
         items.push({ type: 'separator' });
         if (clip) {
+          items.push({
+            type: 'item',
+            label: 'Name and colour…',
+            hint: 'F2',
+            onSelect: () => {
+              const pos = clipMenu.position;
+              setClipNamePanel({ clipId: payload.clipId, x: pos?.x ?? 240, y: pos?.y ?? 200 });
+            },
+          });
           const clipDb = 20 * Math.log10(clipPeakGain(clip));
           items.push({
             type: 'item',
