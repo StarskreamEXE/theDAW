@@ -61,6 +61,14 @@ class FakeRegistry {
     const client = { ready: true, blockSize: 512, sendAudio: () => {}, setParam: (i: number, v: number) => this.sent.push([i, v]), close: () => {} };
     return { entryId, sessionId: `s-${entryId}`, wsUrl: 'ws://x', pid: 1, client: client as never, stateDirty: false };
   }
+  /** A session whose client can take a MessagePort — a worker-backed one. */
+  portSession(entryId: string): VstLiveSession {
+    const session = this.session(entryId);
+    const client = session.client as unknown as { ports: unknown[]; attachAudioPort: (p: unknown) => void };
+    client.ports = [];
+    client.attachAudioPort = (port: unknown) => client.ports.push(port);
+    return session;
+  }
   acquire(e: ChainEntry): Promise<VstLiveSession | null> { this.acquired.push(e.id); return Promise.resolve(this.give); }
   release(id: string): void { this.released.push(id); }
   get(): VstLiveSession | undefined { return this.give ?? undefined; }
@@ -192,6 +200,38 @@ async function liveNode(id: string, s: ReturnType<typeof setup>, params: Record<
   assert.deepEqual(s.reg.released, ['e']);
   other.dispose();
   await tick(250);
+}
+
+/* ── a revived node keeps the audio channel it already had ── */
+{
+  // The point of parking is that the rebuild costs nothing: the same worklet,
+  // the same primed buffer, and now the same channel to the bridge worker. A
+  // revive that opened a SECOND channel would close the port the worklet is
+  // posting to — the worklet would fall back to the main thread's port, which
+  // no longer forwards blocks, and the plugin would drop out of the path.
+  const s = setup(50);
+  s.reg.give = s.reg.portSession('p');
+  const inst = createVstLiveNode(s.ctx, entry('p'), s.deps)!;
+  await tick();
+  ready('p');
+  await tick();
+  const client = s.reg.give.client as unknown as { ports: unknown[] };
+  const port = FakeWorklet.made[0].port;
+  const handovers = () => port.posted.filter((m) => (m as { type?: string })?.type === 'audio-port').length;
+  assert.equal(handovers(), 1, 'setup: the worklet was handed one end of a channel');
+  assert.equal(client.ports.length, 1, 'setup: the client holds the other');
+  assert.equal(s.reg.give.audioSink ?? null, null, 'setup: no processed frame comes back through main');
+
+  inst.dispose(); // Play / seek / loop wrap
+  const again = createVstLiveNode(s.ctx, entry('p'), s.deps)!;
+  assert.equal(again.input, inst.input, 'the same node comes back');
+  assert.equal(FakeWorklet.made.length, 1, 'with the same worklet');
+  assert.equal(handovers(), 1, 'and the same channel: no second handover');
+  assert.equal(client.ports.length, 1);
+  assert.equal(s.reg.give.audioSink ?? null, null, 'audio still never touches the main thread');
+
+  again.dispose();
+  await tick(80);
 }
 
 console.log('vstLive/vstLiveNode.park: ok');

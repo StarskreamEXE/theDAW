@@ -40,6 +40,15 @@
  *                    {type:'transport', playing, positionSamples, tempoBpm,
  *                     discontinuity}
  *                    {type:'live', live:boolean}
+ *                    {type:'audio-port', port:MessagePort}
+ *
+ * `audio-port` is how the audio leaves the main thread. The node hands over one
+ * end of a channel whose other end belongs to the bridge WORKER, and from then
+ * on blocks go there and processed blocks come back from there — the main
+ * thread is not in the path at all, so a layout or a React render cannot stall
+ * it. `this.port` stays for stats (and for the runtime that has no worker),
+ * and `processed` is accepted on either port because a handover can land
+ * between two blocks.
  *
  * No AudioParams: every control travels over the WebSocket to the host, not
  * through the audio graph.
@@ -81,6 +90,8 @@ class VstBridgeProcessor extends AudioWorkletProcessor {
     this.maxBlocks = Math.max(4, this.bufferBlocks * 4);
     this.underruns = 0;
     this.overflows = 0;
+    /** Processed blocks accepted into the play-out queue: the proof that the plugin is IN the path. */
+    this.processedBlocks = 0;
 
     // ── dry delay line, long enough for the delay plus a block of slack ──
     this.ringLen = this.delayFrames + this.blockSize * 2 + RAMP_FRAMES;
@@ -109,6 +120,10 @@ class VstBridgeProcessor extends AudioWorkletProcessor {
     this.statsTick = 0;
     this.lastStats = '';
 
+    /** The bridge worker's channel, once the node has handed it over. Until
+     *  then (and without a worker at all) blocks go out on `this.port`. */
+    this.audioPort = null;
+
     this.port.onmessage = (ev) => this.onMessage(ev.data);
   }
 
@@ -122,6 +137,10 @@ class VstBridgeProcessor extends AudioWorkletProcessor {
     if (!msg) return;
     if (msg.type === 'processed') {
       this.pushProcessed(msg.seq, msg.channels);
+      return;
+    }
+    if (msg.type === 'audio-port') {
+      this.setAudioPort(msg.port || null);
       return;
     }
     if (msg.type === 'transport') {
@@ -147,6 +166,32 @@ class VstBridgeProcessor extends AudioWorkletProcessor {
     }
   }
 
+  /**
+   * Take (or drop) the channel to the bridge worker.
+   *
+   * A reconnect that re-created the session hands over a NEW channel, so the
+   * previous one is closed rather than left holding a reference to a worker
+   * nobody talks to any more.
+   */
+  setAudioPort(port) {
+    const previous = this.audioPort;
+    this.audioPort = port;
+    if (previous && previous !== port) {
+      previous.onmessage = null;
+      try {
+        previous.close();
+      } catch {
+        /* already gone */
+      }
+    }
+    if (port) {
+      port.onmessage = (ev) => this.onMessage(ev.data);
+      // Assigning onmessage already starts the port; this is belt for a runtime
+      // that only delivers after an explicit start().
+      if (typeof port.start === 'function') port.start();
+    }
+  }
+
   /** Drop the play-out queue and re-prime. Mirrors JitterBuffer's resync. */
   resync() {
     this.queue.length = 0;
@@ -160,6 +205,7 @@ class VstBridgeProcessor extends AudioWorkletProcessor {
     if (!channels || channels.length === 0) return;
     if (this.lastSeq >= 0 && seq <= this.lastSeq) return; // duplicate or straggler
     this.lastSeq = seq;
+    this.processedBlocks += 1;
     if (this.queue.length >= this.maxBlocks) {
       const dropped = this.queue.shift();
       if (dropped) this.queuedFrames -= dropped.channels[0].length - dropped.read;
@@ -300,10 +346,15 @@ class VstBridgeProcessor extends AudioWorkletProcessor {
     this.statsTick += 1;
     if (this.statsTick >= STATS_EVERY) {
       this.statsTick = 0;
-      const sig = this.underruns + ':' + this.overflows;
+      const sig = this.underruns + ':' + this.overflows + ':' + this.processedBlocks;
       if (sig !== this.lastStats) {
         this.lastStats = sig;
-        this.port.postMessage({ type: 'stats', underruns: this.underruns, overflows: this.overflows });
+        this.port.postMessage({
+          type: 'stats',
+          underruns: this.underruns,
+          overflows: this.overflows,
+          processed: this.processedBlocks,
+        });
       }
     }
     // True: this node holds a delay line and a play-out queue, so it still has
@@ -325,7 +376,11 @@ class VstBridgeProcessor extends AudioWorkletProcessor {
     const channels = this.accum;
     const transfer = [];
     for (let c = 0; c < channels.length; c += 1) transfer.push(channels[c].buffer);
-    this.port.postMessage(
+    // The worker's channel when there is one, so the block never reaches the
+    // main thread; `this.port` only while the handover is still in flight or
+    // the runtime has no worker at all.
+    const out = this.audioPort || this.port;
+    out.postMessage(
       {
         type: 'block',
         seq: this.seq,

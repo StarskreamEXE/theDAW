@@ -30,7 +30,8 @@ import {
   type VstLiveSessionInfo,
 } from '../vstClient';
 import { useVstLiveStore } from '../../state/vstLiveStore';
-import { VstBridgeClient, type VstBridgeClientOptions } from './bridgeClient';
+import type { VstBridgeClientLike, VstBridgeClientOptions } from './bridgeClient';
+import { createDefaultBridgeClient } from './bridgeWorkerClient';
 import type { VstFrame } from './frames';
 import type { ChainEntry } from '../../state/effectChainStore';
 
@@ -72,10 +73,16 @@ export interface VstLiveSession {
   sessionId: string;
   wsUrl: string;
   pid: number;
-  client: VstBridgeClient;
-  /** Where processed blocks go. Set by the live node when its worklet exists,
-   *  and cleared when the node is disposed — a session outlives its node, so
-   *  the sink cannot be fixed at construction. */
+  /** The worker-backed client wherever the runtime can run one, the
+   *  main-thread client otherwise — see `createDefaultBridgeClient`. Nothing
+   *  above here may care which: audio is the only difference, and audio does
+   *  not come through this object either way. */
+  client: VstBridgeClientLike;
+  /** Where processed blocks go ON THE FALLBACK PATH. Set by the live node when
+   *  its worklet exists, and cleared when the node is disposed — a session
+   *  outlives its node, so the sink cannot be fixed at construction. Left null
+   *  with a worker-backed client: those blocks go straight from the worker to
+   *  the worklet over a MessageChannel and never reach this thread. */
   audioSink?: ((frame: VstFrame) => void) | null;
   /** Where a captured plugin state goes. Set by `vstEditorStore` while an
    *  editor is open on this session, for the same reason as `audioSink`. */
@@ -96,7 +103,7 @@ export interface VstSessionRegistryDeps {
   cancel?: (handle: number) => void;
   graceMs?: number;
   /** Test seam: build the bridge client for a session. */
-  makeClient?: (opts: VstBridgeClientOptions) => VstBridgeClient;
+  makeClient?: (opts: VstBridgeClientOptions) => VstBridgeClientLike;
   /** Where a state rescued from a shutdown goes. Defaults to the module-level
    *  sink installed by `setVstLiveStateSink`. */
   stateSink?: VstLiveStateSink;
@@ -191,7 +198,7 @@ export function createVstSessionRegistry(deps: VstSessionRegistryDeps = {}): Vst
   const schedule = deps.schedule ?? ((fn, ms) => globalThis.setTimeout(fn, ms) as unknown as number);
   const cancel = deps.cancel ?? ((h) => globalThis.clearTimeout(h as unknown as number));
   const graceMs = deps.graceMs ?? VST_LIVE_GRACE_MS;
-  const makeClient = deps.makeClient ?? ((opts) => new VstBridgeClient(opts));
+  const makeClient = deps.makeClient ?? ((opts: VstBridgeClientOptions) => createDefaultBridgeClient(opts));
   /** Resolved per call, not captured: the app installs its sink after this
    *  module is imported, and a registry built first must still find it. */
   const stateSink = (entryId: string, rawState: string): void => {
@@ -363,7 +370,7 @@ export function createVstSessionRegistry(deps: VstSessionRegistryDeps = {}): Vst
       sessionId: info.session_id,
       wsUrl: info.ws_url,
       pid: info.pid,
-      client: null as unknown as VstBridgeClient,
+      client: null as unknown as VstBridgeClientLike,
       audioSink: null,
       stateDirty: false,
     };

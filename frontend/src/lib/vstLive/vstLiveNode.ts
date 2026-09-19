@@ -29,13 +29,8 @@
  * Units: `positionSamples` is sample frames on the project timeline;
  * `tempoBpm` is beats per minute; `SWAP_RAMP_SEC` is seconds.
  */
-import {
-  FRAME_TYPE_AUDIO_IN,
-  FLAG_DISCONTINUITY,
-  FLAG_PLAYING,
-  type VstFrame,
-  type VstFrameHeader,
-} from './frames';
+import { headerFromBlock, type VstBlockMessage, type VstFrame } from './frames';
+import type { VstBridgeClientLike } from './bridgeClient';
 import {
   VST_LIVE_BLOCK_SIZE,
   VST_LIVE_BUFFER_BLOCKS,
@@ -264,6 +259,12 @@ export function createVstLiveNode(
    *  a burst of `set_param` for values the plugin already holds. */
   const sentParams = new Map<number, number>();
   let seq = 0;
+  /** True while blocks travel worklet -> bridge worker over a MessageChannel,
+   *  with this thread out of the audio path entirely. */
+  let audioOnPort = false;
+  /** The client that holds the other end of that channel. A reconnect onto a
+   *  NEW client object needs a new channel; the same client does not. */
+  let audioPortClient: VstBridgeClientLike | null = null;
 
   const portEntry = {
     post: (msg: Record<string, unknown>) => {
@@ -271,31 +272,42 @@ export function createVstLiveNode(
     },
   };
 
-  /** Send one accumulated block to the host. */
-  const onBlockFromWorklet = (data: {
-    seq: number;
-    frames: number;
-    playing: boolean;
-    discontinuity: boolean;
-    positionSamples: number;
-    tempoBpm: number;
-    channels: Float32Array[];
-  }): void => {
+  /**
+   * Send one accumulated block to the host, THROUGH THIS THREAD.
+   *
+   * Only the fallback path uses this: a runtime with no `Worker` (or no
+   * `MessageChannel`) keeps the bridge where it always was. Everywhere else the
+   * worklet posts its blocks straight to the bridge worker over a channel this
+   * node never listens on — see `attachAudioPort`.
+   */
+  const onBlockFromWorklet = (data: VstBlockMessage): void => {
     const s = session;
     if (!s || disposed) return;
-    const header: VstFrameHeader = {
-      type: FRAME_TYPE_AUDIO_IN,
-      channels: data.channels.length,
-      flags: (data.playing ? FLAG_PLAYING : 0) | (data.discontinuity ? FLAG_DISCONTINUITY : 0),
-      seq: data.seq,
-      frames: data.frames,
-      positionSamples: data.positionSamples,
-      tempoBpm: data.tempoBpm,
-    };
-    s.client.sendAudio(header, data.channels);
+    s.client.sendAudio(headerFromBlock(data), data.channels);
   };
 
-  /** Hand a processed block back to the play-out buffer. */
+  /**
+   * Give the worklet and the client the two ends of one MessageChannel, so a
+   * block goes worklet -> worker -> host and back without this thread being
+   * asked for anything. False when the client cannot take a port (the
+   * main-thread client), which leaves the old path in place.
+   *
+   * The handover is posted the moment the node exists, before it is connected
+   * or told it is live: until it lands the worklet falls back to posting blocks
+   * here, and this node no longer forwards those.
+   */
+  const attachAudioPort = (s: VstLiveSession, node: AudioWorkletNode): boolean => {
+    const attach = s.client.attachAudioPort;
+    if (!attach || typeof MessageChannel === 'undefined') return false;
+    const channel = new MessageChannel();
+    node.port.postMessage({ type: 'audio-port', port: channel.port1 }, [channel.port1]);
+    attach.call(s.client, channel.port2);
+    audioPortClient = s.client;
+    return true;
+  };
+
+  /** Hand a processed block back to the play-out buffer. FALLBACK PATH ONLY:
+   *  with a channel in place the worker posts this to the worklet itself. */
   const onProcessed = (frame: VstFrame): void => {
     if (disposed || !worklet) return;
     const channels = frame.channels;
@@ -387,6 +399,9 @@ export function createVstLiveNode(
       if (worklet !== node) return;
       failLive('AudioWorklet processor error');
     };
+    // Before anything is connected, so the window in which the worklet still
+    // has to fall back to `node.port` for a block is as short as it can be.
+    audioOnPort = attachAudioPort(s, node);
     // The worklet counts the dropouts the listener actually HEARS: a quantum it had to fill with
     // silence because no processed block had arrived in time (`underruns`, cumulative). Those are
     // what a main-thread stall causes, and they used to be posted here and ignored — the row's
@@ -394,8 +409,13 @@ export function createVstLiveNode(
     let reportedUnderruns = 0;
     node.port.onmessage = (ev: MessageEvent) => {
       const data = ev.data as { type?: string; underruns?: number } | undefined;
-      if (data?.type === 'block') onBlockFromWorklet(data as never);
-      else if (data?.type === 'stats' && typeof data.underruns === 'number' && data.underruns > reportedUnderruns) {
+      // A block reaching THIS port while the channel is up is one the worklet
+      // posted before the handover landed. Forwarding it would put audio back
+      // on the main thread, which is the whole thing this avoids; the worklet
+      // re-primes without it.
+      if (data?.type === 'block') {
+        if (!audioOnPort) onBlockFromWorklet(data as unknown as VstBlockMessage);
+      } else if (data?.type === 'stats' && typeof data.underruns === 'number' && data.underruns > reportedUnderruns) {
         useVstLiveStore.getState().addXruns(entry.id, data.underruns - reportedUnderruns);
         reportedUnderruns = data.underruns;
       }
@@ -422,7 +442,7 @@ export function createVstLiveNode(
       tempoBpm: lastTransport.tempoBpm,
       discontinuity: true, // the plugin has never seen this stream before
     });
-    s.audioSink = onProcessed;
+    if (!audioOnPort) s.audioSink = onProcessed;
     // Whatever the entry already holds has to reach a plugin that just started
     // from its state file; the diff map is empty, so this pushes everything.
     pushParams(currentEntry.params);
@@ -438,7 +458,12 @@ export function createVstLiveNode(
    *  again. */
   const relive = (s: VstLiveSession): void => {
     if (disposed || !worklet) return;
-    s.audioSink = onProcessed; // the session object may have been re-created underneath
+    // The session object — and with it the client — may have been re-created
+    // underneath. A NEW client holds no end of the old channel, so it needs a
+    // fresh one; the same client's channel is still wired and re-opening it
+    // would strand the port the worklet is already posting to.
+    if (!audioOnPort || s.client !== audioPortClient) audioOnPort = attachAudioPort(s, worklet);
+    if (!audioOnPort) s.audioSink = onProcessed;
     portEntry.post({ type: 'live', live: true });
     portEntry.post({
       type: 'transport',

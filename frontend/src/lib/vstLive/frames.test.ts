@@ -15,6 +15,7 @@ import {
   FRAME_MAGIC,
   FRAME_TYPE_AUDIO_IN,
   FRAME_TYPE_AUDIO_OUT,
+  headerFromBlock,
   packFrame,
   readFrameHeader,
   unpackFrame,
@@ -193,6 +194,42 @@ const header = (over: Partial<VstFrameHeader> = {}): VstFrameHeader => ({
   const dirty = Float32Array.from([Number.NaN, Number.POSITIVE_INFINITY, 0.5, -0.5]);
   const out = unpackFrame(packFrame(header({ channels: 1, frames: 4 }), [dirty]));
   assert.deepEqual(Array.from(out.channels[0]), [0, 0, 0.5, -0.5], 'NaN and Inf are written as 0');
+}
+
+/* ── headerFromBlock: the worklet's block message becomes an audio_in header ─ */
+{
+  // The mapping used to live inside vstLiveNode, on the MAIN thread. It is here
+  // now because the dedicated bridge worker builds the same header from the
+  // same message without main ever seeing the block, and the two must agree
+  // byte for byte — one function, used by both.
+  const block = {
+    seq: 7,
+    frames: 4,
+    playing: true,
+    discontinuity: true,
+    positionSamples: 96000.5,
+    tempoBpm: 128,
+    channels: [Float32Array.from([1, 2, 3, 4]), Float32Array.from([5, 6, 7, 8])],
+  };
+
+  const h = headerFromBlock(block);
+  assert.equal(h.type, FRAME_TYPE_AUDIO_IN, 'a block from the worklet is always client -> host');
+  assert.equal(h.channels, 2, 'the channel count is the buffers themselves, not a field of the message');
+  assert.equal(h.flags, FLAG_PLAYING | FLAG_DISCONTINUITY);
+  assert.equal(h.seq, 7);
+  assert.equal(h.frames, 4);
+  assert.equal(h.positionSamples, 96000.5);
+  assert.equal(h.tempoBpm, 128);
+
+  assert.equal(headerFromBlock({ ...block, playing: false, discontinuity: false }).flags, 0, 'no flag when neither holds');
+  assert.equal(headerFromBlock({ ...block, playing: true, discontinuity: false }).flags, FLAG_PLAYING);
+  assert.equal(headerFromBlock({ ...block, playing: false, discontinuity: true }).flags, FLAG_DISCONTINUITY);
+  assert.equal(headerFromBlock({ ...block, channels: [Float32Array.from([1, 2, 3, 4])] }).channels, 1, 'a mono block declares one channel');
+
+  // The header it builds has to be one `packFrame` accepts and the wire
+  // preserves: it is fed straight to the client's sendAudio.
+  const round = readFrameHeader(packFrame(h, block.channels));
+  assert.deepEqual(round, { ...h, seq: 7 }, 'it survives the wire format unchanged');
 }
 
 console.log('vstLive/frames: ok');

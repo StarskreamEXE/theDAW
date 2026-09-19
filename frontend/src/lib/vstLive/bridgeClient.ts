@@ -144,10 +144,68 @@ export interface VstBridgeStats {
   reconnects: number;
 }
 
+/** What `openEditor` accepts. All values are PHYSICAL px. */
+export interface VstEditorOpenOptions {
+  parentHwnd?: string;
+  x?: number;
+  y?: number;
+  w?: number;
+  h?: number;
+  title?: string;
+}
+
+/** Where an embedded editor sits. All values are PHYSICAL px. */
+export interface VstEditorRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/**
+ * One live host session, as everything above the transport sees it.
+ *
+ * There are two implementations and the app must not care which it holds:
+ * `VstBridgeClient` (this file — the socket lives on the calling thread) and
+ * `VstBridgeWorkerClient` (`bridgeWorkerClient.ts` — the socket lives in a
+ * dedicated Worker and audio never touches the main thread). A runtime with no
+ * `Worker` gets the first one and behaves exactly as it always did, so the
+ * registry, the node and the editor store are all written against this.
+ *
+ * `attachAudioPort` is the one member that is NOT common: only the worker
+ * client can take a `MessagePort` straight from the worklet, and a caller that
+ * finds it missing keeps the main-thread path it has always used.
+ */
+export interface VstBridgeClientLike {
+  readonly ready: boolean;
+  readonly blockSize: number;
+  readonly sampleRate: number;
+  readonly channelsOut: number;
+  readonly pluginLatencySamples: number;
+  readonly hasEditor: boolean;
+  readonly stats: VstBridgeStats;
+  connect(): void;
+  close(): void;
+  retryNow(): void;
+  sendAudio(header: VstFrameHeader, channels: readonly Float32Array[]): void;
+  setParam(index: number, value: number): void;
+  getParams(): void;
+  setState(stateB64: string): void;
+  getState(): void;
+  openEditor(o?: VstEditorOpenOptions): void;
+  editorRect(rect: VstEditorRect): void;
+  closeEditor(): void;
+  bypass(on: boolean): void;
+  ping(): void;
+  /** Take the worklet's end of a `MessageChannel` and carry audio over it
+   *  instead of through the caller's thread. Absent on the main-thread client. */
+  attachAudioPort?(port: MessagePort): void;
+}
+
 const defaultSocketFactory: BridgeSocketFactory = (url) =>
   new WebSocket(url) as unknown as BridgeSocketLike;
 
-export class VstBridgeClient {
+export class VstBridgeClient implements VstBridgeClientLike {
   private readonly opts: VstBridgeClientOptions;
   private readonly makeSocket: BridgeSocketFactory;
   private readonly schedule: (fn: () => void, ms: number) => number;
@@ -475,7 +533,7 @@ export class VstBridgeClient {
     this.op({ op: 'get_state' });
   }
 
-  openEditor(o: { parentHwnd?: string; x?: number; y?: number; w?: number; h?: number; title?: string } = {}): void {
+  openEditor(o: VstEditorOpenOptions = {}): void {
     // The one place a LIVE plugin window can be asked for (see editorWindowSwitch.ts).
     if (editorWindowsSuppressed()) {
       console.info(LIVE_EDITOR_SUPPRESSED_LOG);
@@ -492,7 +550,7 @@ export class VstBridgeClient {
   }
 
   /** Move or clip an embedded editor. All values are PHYSICAL px. */
-  editorRect(rect: { x: number; y: number; w: number; h: number }): void {
+  editorRect(rect: VstEditorRect): void {
     this.op({ op: 'editor_rect', ...rect });
   }
 

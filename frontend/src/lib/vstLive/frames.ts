@@ -72,6 +72,43 @@ export interface VstFrame {
   channels: Float32Array[];
 }
 
+/**
+ * One accumulated block as `public/vst-bridge.worklet.js` posts it (`type:
+ * 'block'`), minus the tag itself.
+ */
+export interface VstBlockMessage {
+  seq: number;
+  frames: number;
+  playing: boolean;
+  discontinuity: boolean;
+  positionSamples: number;
+  tempoBpm: number;
+  channels: Float32Array[];
+}
+
+/**
+ * Build the `audio_in` header for one block the worklet posted.
+ *
+ * It lives here rather than next to a caller because there are two callers now:
+ * the bridge WORKER, which is where a live block goes, and `vstLiveNode`'s
+ * main-thread fallback for a runtime with no `Worker`. The two paths must put
+ * the same bytes on the wire or a plugin would behave differently depending on
+ * which one carried it, so the mapping is written once.
+ */
+export function headerFromBlock(block: VstBlockMessage): VstFrameHeader {
+  return {
+    type: FRAME_TYPE_AUDIO_IN,
+    // The buffers are the truth about how many channels this block has; the
+    // message carries no count of its own.
+    channels: block.channels.length,
+    flags: (block.playing ? FLAG_PLAYING : 0) | (block.discontinuity ? FLAG_DISCONTINUITY : 0),
+    seq: block.seq,
+    frames: block.frames,
+    positionSamples: block.positionSamples,
+    tempoBpm: block.tempoBpm,
+  };
+}
+
 const u32 = (v: number, field: string): number => {
   if (!Number.isInteger(v) || v < 0 || v > 0xffffffff) {
     throw new RangeError(`vstLive/frames: ${field} must be a u32, got ${v}`);

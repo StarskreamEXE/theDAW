@@ -16,6 +16,7 @@
 import assert from 'node:assert/strict';
 
 import { broadcastVstTransport, createVstLiveNode } from './vstLiveNode.ts';
+import { FLAG_PLAYING, FRAME_TYPE_AUDIO_IN, type VstFrameHeader } from './frames.ts';
 import { useVstLiveStore, vstLiveLatencySec } from '../../state/vstLiveStore.ts';
 import type { ChainEntry } from '../../state/effectChainStore.ts';
 import type { VstLiveSession, VstSessionRegistry } from './sessionRegistry.ts';
@@ -61,9 +62,12 @@ class FakeGain {
 
 class FakePort {
   posted: unknown[] = [];
+  /** Index-aligned with `posted`: what each postMessage handed over. */
+  transfers: (unknown[] | undefined)[] = [];
   onmessage: ((ev: { data: unknown }) => void) | null = null;
-  postMessage(msg: unknown): void {
+  postMessage(msg: unknown, transfer?: unknown[]): void {
     this.posted.push(msg);
+    this.transfers.push(transfer);
   }
   close(): void {}
 }
@@ -124,6 +128,15 @@ class FakeRegistry implements VstSessionRegistry {
       stateDirty: false,
     };
   }
+  /** A session whose client can take a MessagePort — a worker-backed one. */
+  portSession(entryId: string): VstLiveSession {
+    const session = this.session(entryId);
+    (session.client as unknown as PortClient).ports = [];
+    (session.client as unknown as PortClient).attachAudioPort = function (port: unknown) {
+      this.ports.push(port);
+    };
+    return session;
+  }
   acquire(entry: ChainEntry, sampleRate: number): Promise<VstLiveSession | null> {
     this.acquired.push({ entryId: entry.id, sampleRate });
     return Promise.resolve(this.give);
@@ -157,6 +170,12 @@ class FakeRegistry implements VstSessionRegistry {
     this.paramsChanged.push(entryId);
     if (this.give) this.give.stateDirty = true;
   }
+}
+
+/** The shape `portSession` bolts onto a fake client. */
+interface PortClient {
+  ports: unknown[];
+  attachAudioPort?: (port: unknown) => void;
 }
 
 const entry = (id: string, over: Partial<ChainEntry> = {}): ChainEntry => ({
@@ -719,6 +738,170 @@ const ctxOf = () => new FakeCtx() as unknown as BaseAudioContext;
     'the early branch must still have subscribed, or nothing re-attaches after error -> live',
   );
   assert.ok(edges.has('G1->WORKLET'), 'the retried worklet is spliced back into the graph');
+
+  inst.dispose();
+}
+
+/* ── a worker-backed client: audio never touches the main thread ──────────── */
+{
+  // The measured cost of the old path was about six audible dry blips a second
+  // per plugin, because a main-thread stall of 50-120 ms is longer than the
+  // worklet's whole play-out reserve. So the node's job here is to get out of
+  // the way: hand the worklet one end of a MessageChannel, the client the
+  // other, and route nothing itself.
+  reset();
+  const reg = new FakeRegistry();
+  const session = reg.portSession('a');
+  reg.give = session;
+  const inst = createVstLiveNode(ctxOf(), entry('a'), deps(reg))!;
+  await new Promise((r) => setTimeout(r, 0));
+  useVstLiveStore.getState().setReady('a', {
+    plugin: READY.plugin,
+    pluginLatencySamples: READY.latency_samples,
+    bridgeLatencySamples: 512 * 3,
+    sampleRate: 48000,
+    hasEditor: true,
+  });
+  await new Promise((r) => setTimeout(r, 0));
+
+  const client = session.client as unknown as PortClient;
+  const port = FakeWorklet.made[0].port;
+  const handoverAt = port.posted.findIndex((m) => (m as { type?: string })?.type === 'audio-port');
+  assert.ok(handoverAt >= 0, 'the worklet is given one end of a channel');
+  const handover = port.posted[handoverAt] as { type: string; port: unknown };
+  assert.deepEqual(port.transfers[handoverAt], [handover.port], 'transferred, so this thread keeps no end of it');
+  assert.equal(client.ports.length, 1, 'and the client is given the other');
+  assert.notEqual(client.ports[0], handover.port, 'the two ends are different ports');
+  assert.equal(
+    port.posted.findIndex((m) => (m as { type?: string })?.type === 'live'),
+    handoverAt + 1,
+    'the channel is in place before the worklet is told it is live',
+  );
+
+  assert.equal(session.audioSink ?? null, null, 'nothing on the session can carry a processed frame to main');
+
+  // The node's own port carries stats and nothing else now.
+  const sentBefore = reg.sent.length;
+  port.onmessage?.({
+    data: {
+      type: 'block',
+      seq: 0,
+      frames: 4,
+      playing: true,
+      discontinuity: false,
+      positionSamples: 0,
+      tempoBpm: 0,
+      channels: [new Float32Array(4), new Float32Array(4)],
+    },
+  });
+  assert.equal(reg.sent.length, sentBefore, 'a block that somehow arrives on it is NOT forwarded from main');
+
+  port.onmessage?.({ data: { type: 'stats', underruns: 2, overflows: 0 } });
+  assert.equal(useVstLiveStore.getState().entries.a?.xruns, 2, 'the dropout count still reaches the row');
+
+  inst.dispose();
+}
+
+/* ── a reconnect re-attaches only when the client object really changed ────── */
+{
+  reset();
+  const reg = new FakeRegistry();
+  const session = reg.portSession('a');
+  reg.give = session;
+  const inst = createVstLiveNode(ctxOf(), entry('a'), deps(reg))!;
+  await new Promise((r) => setTimeout(r, 0));
+  const goLive = () =>
+    useVstLiveStore.getState().setReady('a', {
+      plugin: READY.plugin,
+      pluginLatencySamples: READY.latency_samples,
+      bridgeLatencySamples: 512 * 3,
+      sampleRate: 48000,
+      hasEditor: true,
+    });
+  goLive();
+  await new Promise((r) => setTimeout(r, 0));
+  const port = FakeWorklet.made[0].port;
+  const first = session.client as unknown as PortClient;
+  const handovers = () => port.posted.filter((m) => (m as { type?: string })?.type === 'audio-port').length;
+  assert.equal(handovers(), 1);
+
+  useVstLiveStore.getState().setStatus('a', 'error', 'host socket closed');
+  await new Promise((r) => setTimeout(r, 0));
+  goLive();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(handovers(), 1, 'the same client still holds a working port: opening a second channel would strand the first');
+  assert.equal(first.ports.length, 1);
+
+  // A session re-created underneath brings a NEW client, and the port the old
+  // one held went with it — without a fresh channel the plugin would sit there
+  // looking live with no audio reaching it.
+  const replacement = reg.portSession('a');
+  (session as unknown as { client: unknown }).client = replacement.client;
+  useVstLiveStore.getState().setStatus('a', 'error', 'host socket closed');
+  await new Promise((r) => setTimeout(r, 0));
+  goLive();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(handovers(), 2, 'the new client is handed a channel of its own');
+  assert.equal((replacement.client as unknown as PortClient).ports.length, 1);
+  assert.equal(session.audioSink ?? null, null, 'and audio still never comes back through main');
+
+  inst.dispose();
+}
+
+/* ── no audio port: the main-thread path, exactly as it always was ────────── */
+{
+  reset();
+  const reg = new FakeRegistry();
+  const session = reg.session('a'); // a plain client: no attachAudioPort
+  reg.give = session;
+  const inst = createVstLiveNode(ctxOf(), entry('a'), deps(reg))!;
+  await new Promise((r) => setTimeout(r, 0));
+  useVstLiveStore.getState().setReady('a', {
+    plugin: READY.plugin,
+    pluginLatencySamples: READY.latency_samples,
+    bridgeLatencySamples: 512 * 3,
+    sampleRate: 48000,
+    hasEditor: true,
+  });
+  await new Promise((r) => setTimeout(r, 0));
+
+  const port = FakeWorklet.made[0].port;
+  assert.equal(
+    port.posted.some((m) => (m as { type?: string })?.type === 'audio-port'),
+    false,
+    'a client that cannot take a port is never offered one',
+  );
+  assert.equal(typeof session.audioSink, 'function', 'the processed sink is on the session, as it was');
+
+  const channels = [Float32Array.from([1, 2, 3, 4]), Float32Array.from([5, 6, 7, 8])];
+  port.onmessage?.({
+    data: {
+      type: 'block',
+      seq: 5,
+      frames: 4,
+      playing: true,
+      discontinuity: false,
+      positionSamples: 4096,
+      tempoBpm: 120,
+      channels,
+    },
+  });
+  assert.equal(reg.sent.length, 1, 'the block goes out through the main thread, the way it used to');
+  assert.deepEqual((reg.sent[0] as { h: VstFrameHeader }).h, {
+    type: FRAME_TYPE_AUDIO_IN,
+    channels: 2,
+    flags: FLAG_PLAYING,
+    seq: 5,
+    frames: 4,
+    positionSamples: 4096,
+    tempoBpm: 120,
+  });
+
+  session.audioSink?.({
+    header: { type: 1, channels: 2, flags: 0, seq: 5, frames: 4, positionSamples: 0, tempoBpm: 0 },
+    channels,
+  });
+  assert.deepEqual(port.posted.at(-1), { type: 'processed', seq: 5, frames: 4, channels }, 'and comes back the same way');
 
   inst.dispose();
 }
