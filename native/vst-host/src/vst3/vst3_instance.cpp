@@ -180,7 +180,7 @@ bool Vst3Instance::initialize(const ClassDescription& description, std::string& 
             }
         }
 
-        Steinberg::IPlugView* probe = controller_->createView(Steinberg::Vst::ViewType::kEditor);
+        Steinberg::IPlugView* probe = tryCreatingView(controller_.get());
         if (probe != nullptr) {
             hasEditor_ = true;
             probe->release();
@@ -317,6 +317,7 @@ void Vst3Instance::allocateProcessBuffers() {
     const std::size_t frames = static_cast<std::size_t>(std::max(1, config_.maxBlockSize));
 
     silenceBuffer_.assign(frames, 0.0f);
+    discardBuffer_.assign(frames, 0.0f);
     scratchBuffers_.clear();
     inputChannelPointers_.assign(inputBuses_.size(), {});
     outputChannelPointers_.assign(outputBuses_.size(), {});
@@ -947,7 +948,9 @@ void Vst3Instance::process(const float* const* in, float* const* out, std::int32
             float* destination = (out != nullptr && static_cast<std::int32_t>(ch) < channelsOut_)
                                      ? out[ch]
                                      : nullptr;
-            mainOut[ch] = destination != nullptr ? destination : silenceBuffer_.data();
+            // Never the silence buffer: a plugin WRITES here, and the inputs of every inactive
+            // bus read that buffer as silence (JUCE's buffer mapper gives each its own backing).
+            mainOut[ch] = destination != nullptr ? destination : discardBuffer_.data();
         }
         outputBusBuffers_.front().silenceFlags = 0;
     }
@@ -957,13 +960,18 @@ void Vst3Instance::process(const float* const* in, float* const* out, std::int32
     drainEditsIntoInputChanges();
     outputChanges_.clear();
 
-    processContext_.state = 0;
+    // Filled the way JUCE's VST3 host fills it (toProcessContext): the whole struct is zeroed
+    // every block and only what the host really knows is flagged valid.
+    //  - NO continuous-time claim. This host used to copy the project position into
+    //    continousTimeSamples and flag it valid, so a counter plugins treat as monotonic jumped
+    //    backwards on every seek and loop wrap. JUCE leaves it unset; so do we.
+    //  - Time signature and the last bar start go with the musical position. theDAW has one
+    //    tempo and one meter (4/4) for the whole project, so both follow from the tempo; without
+    //    them a tempo-synced plugin (delay, arpeggiator, LFO) cannot find the bar.
+    processContext_ = Steinberg::Vst::ProcessContext{};
     processContext_.sampleRate = config_.sampleRate;
     processContext_.projectTimeSamples =
         static_cast<Steinberg::Vst::TSamples>(transport.positionSamples);
-    processContext_.continousTimeSamples =
-        static_cast<Steinberg::Vst::TSamples>(transport.positionSamples);
-    processContext_.state |= Steinberg::Vst::ProcessContext::kContTimeValid;
     if (transport.playing) processContext_.state |= Steinberg::Vst::ProcessContext::kPlaying;
     if (transport.tempoBpm > 0.0) {
         processContext_.tempo = transport.tempoBpm;
@@ -971,9 +979,16 @@ void Vst3Instance::process(const float* const* in, float* const* out, std::int32
         // Only claim a musical position when there is a tempo to derive it from; a made-up
         // projectTimeMusic makes tempo-synced plugins drift.
         if (config_.sampleRate > 0.0) {
-            processContext_.projectTimeMusic =
+            const double ppq =
                 (transport.positionSamples / config_.sampleRate) * (transport.tempoBpm / 60.0);
+            processContext_.projectTimeMusic = ppq;
             processContext_.state |= Steinberg::Vst::ProcessContext::kProjectTimeMusicValid;
+            constexpr double kQuartersPerBar = 4.0;  // 4/4
+            processContext_.timeSigNumerator = 4;
+            processContext_.timeSigDenominator = 4;
+            processContext_.state |= Steinberg::Vst::ProcessContext::kTimeSigValid;
+            processContext_.barPositionMusic = std::floor(ppq / kQuartersPerBar) * kQuartersPerBar;
+            processContext_.state |= Steinberg::Vst::ProcessContext::kBarPositionValid;
         }
     }
 
@@ -1045,14 +1060,13 @@ void Vst3Instance::flushParameters() {
 }
 
 void Vst3Instance::resetDsp() {
-    if (!processingOn_.load(std::memory_order_acquire) || !processor_) return;
-    // setProcessing is the one call the VST3 ABI documents as legal from the processing thread
-    // and names buffer flushing as its purpose ("this could be used to reset some buffers (like
-    // Delay line or Reverb)", ivstaudioprocessor.h). setActive cycling would also flush, but it
-    // is UI-thread only and allocates in most plugins, so it cannot live here — a transport
-    // discontinuity that needed that is an onRestartRequired, not a reset.
-    processor_->setProcessing(false);
-    processor_->setProcessing(true);
+    // Deliberately nothing. The engine calls this on the AUDIO thread for every start, seek and
+    // loop wrap, and it used to cycle setProcessing(false/true) right here. JUCE's VST3 host
+    // never does that: its reset() is an explicit message-thread operation (setProcessing and
+    // setActive cycled under the process lock), and a transport jump is not one — the plugin
+    // learns about the jump from the process context, and its tails ring across a loop point
+    // exactly as they do in REAPER. Cycling from the audio thread was a realtime hazard too:
+    // plenty of plugins allocate and free inside setProcessing.
 }
 
 }  // namespace thedaw::vst3

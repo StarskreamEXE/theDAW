@@ -278,8 +278,10 @@ Steinberg::tresult PLUGIN_API ComponentHandler::requestOpenEditor(Steinberg::FID
     return Steinberg::kResultFalse;
 }
 
-Steinberg::tresult PLUGIN_API ComponentHandler::startGroupEdit() { return Steinberg::kResultOk; }
+// kResultFalse, as JUCE answers: this host does not group edits, and saying it does lets a plugin
+// skip the per-parameter beginEdit/endEdit it would otherwise send.
+Steinberg::tresult PLUGIN_API ComponentHandler::startGroupEdit() { return Steinberg::kResultFalse; }
 
-Steinberg::tresult PLUGIN_API ComponentHandler::finishGroupEdit() { return Steinberg::kResultOk; }
+Steinberg::tresult PLUGIN_API ComponentHandler::finishGroupEdit() { return Steinberg::kResultFalse; }
 
 }  // namespace thedaw::vst3

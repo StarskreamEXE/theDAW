@@ -162,6 +162,7 @@ private:
     std::vector<std::vector<float*>> inputChannelPointers_;
     std::vector<std::vector<float*>> outputChannelPointers_;
     std::vector<float> silenceBuffer_;
+    std::vector<float> discardBuffer_;  // where output the engine has no channel for goes; never read
     std::vector<std::vector<float>> scratchBuffers_;
 
     ParameterChanges inputChanges_;

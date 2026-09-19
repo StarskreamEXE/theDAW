@@ -27,6 +27,11 @@
 namespace thedaw::vst3 {
 
 // Implemented by the plugin instance. Always called on the message thread.
+// The plugin's editor view, asked for the three ways JUCE's VST3 host asks (tryCreatingView):
+// createView("editor"), then createView(nullptr), then the controller itself as an IPlugView.
+// Some plugins only answer the second or third. Returns an owning pointer (ref-count 1) or null.
+Steinberg::IPlugView* tryCreatingView(Steinberg::Vst::IEditController* controller);
+
 class EditorHost {
 public:
     virtual ~EditorHost() = default;

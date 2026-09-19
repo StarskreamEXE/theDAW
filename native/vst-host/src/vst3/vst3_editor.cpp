@@ -40,6 +40,19 @@ float scaleForWindow(HWND hwnd) {
 
 }  // namespace
 
+Steinberg::IPlugView* tryCreatingView(Steinberg::Vst::IEditController* controller) {
+    if (controller == nullptr) return nullptr;
+    Steinberg::IPlugView* view = controller->createView(Steinberg::Vst::ViewType::kEditor);
+    if (view == nullptr) view = controller->createView(nullptr);
+    if (view == nullptr) {
+        void* asView = nullptr;
+        if (controller->queryInterface(Steinberg::IPlugView::iid, &asView) == Steinberg::kResultOk) {
+            view = static_cast<Steinberg::IPlugView*>(asView);
+        }
+    }
+    return view;
+}
+
 EditorWindow::~EditorWindow() { close(); }
 
 bool EditorWindow::ensureWindowClass(std::string& error) {
@@ -112,6 +125,22 @@ long long __stdcall EditorWindow::windowProc(void* hwndRaw, unsigned int message
                 return 0;
             }
             break;
+        // What JUCE's VST3 editor window forwards to the view: the wheel and focus. (Keys are left
+        // to the plugin's own child window, as JUCE leaves them.) JUCE scales a wheel notch the same
+        // way before handing it over: half the raw delta, over 256.
+        case WM_MOUSEWHEEL:
+            if (self != nullptr && self->view_) {
+                const float distance =
+                    0.5f * static_cast<float>(GET_WHEEL_DELTA_WPARAM(wParam)) / 256.0f;
+                if (self->view_->onWheel(distance) == Steinberg::kResultTrue) return 0;
+            }
+            break;
+        case WM_SETFOCUS:
+            if (self != nullptr && self->view_) self->view_->onFocus(true);
+            break;
+        case WM_KILLFOCUS:
+            if (self != nullptr && self->view_) self->view_->onFocus(false);
+            break;
         case WM_ERASEBKGND:
             return 1;  // the plugin owns every pixel; erasing first only causes flicker
         default: break;
@@ -130,8 +159,7 @@ bool EditorWindow::open(Steinberg::Vst::IEditController* controller, std::uint64
     if (!ensureWindowClass(error)) return false;
 
     controller_ = ComPtr<Steinberg::Vst::IEditController>(controller);
-    view_ = ComPtr<Steinberg::IPlugView>::adopt(
-        controller_->createView(Steinberg::Vst::ViewType::kEditor));
+    view_ = ComPtr<Steinberg::IPlugView>::adopt(tryCreatingView(controller_.get()));
     if (!view_) {
         error = "the plugin did not supply an editor view";
         return false;
