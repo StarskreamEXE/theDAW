@@ -91,6 +91,14 @@ function log(msg: string): void {
 let backendProcess: ChildProcess | null = null
 let weSpawnedBackend = false
 let isQuitting = false
+// A backend that dies under a running window is brought back (see the exit
+// handler in spawnBackend). Bounded, so a backend that cannot start is not
+// respawned forever: at most this many times inside the window.
+const BACKEND_RESPAWN_MAX = 5
+const BACKEND_RESPAWN_WINDOW_MS = 10 * 60_000
+// backend/run.py: another instance already owns the port. Respawning cannot help.
+const BACKEND_PORT_IN_USE_EXIT_CODE = 90
+let backendRespawnTimes: number[] = []
 // First-run `uv sync` child; tracked so before-quit can kill it (an orphaned
 // sync keeps downloading and holds the venv lock against the next launch).
 let uvSyncProcess: ChildProcess | null = null
@@ -506,6 +514,33 @@ function spawnBackend(): void {
     log(msg)
     sendLoadingLog(msg, 'err')
     backendProcess = null
+
+    // The window used to stay up over a dead backend, every /api call answering
+    // 500 until the whole app was restarted. Bring the backend back instead —
+    // except after a deliberate stop (code 0: the in-app Shutdown button), when
+    // another instance owns the port, or while quitting (every intentional kill
+    // sets isQuitting first).
+    if (isQuitting || !weSpawnedBackend) return
+    if (code === 0 || code === BACKEND_PORT_IN_USE_EXIT_CODE) return
+    const now = Date.now()
+    backendRespawnTimes = backendRespawnTimes.filter((t) => now - t < BACKEND_RESPAWN_WINDOW_MS)
+    if (backendRespawnTimes.length >= BACKEND_RESPAWN_MAX) {
+      const giveUp = `Backend died ${BACKEND_RESPAWN_MAX} times in ten minutes — not restarting it again.`
+      log(giveUp)
+      sendLoadingLog(giveUp, 'err')
+      return
+    }
+    backendRespawnTimes.push(now)
+    const delayMs = 1000 * backendRespawnTimes.length
+    const again = `Restarting the backend in ${delayMs} ms (attempt ${backendRespawnTimes.length}/${BACKEND_RESPAWN_MAX})...`
+    log(again)
+    sendLoadingLog(again, '')
+    setTimeout(() => {
+      if (isQuitting || backendProcess) return
+      void isBackendRunning().then((up) => {
+        if (!up && !isQuitting && !backendProcess) spawnBackend()
+      })
+    }, delayMs)
   })
 
   backendProcess.on('error', (err) => {
