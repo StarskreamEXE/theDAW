@@ -716,6 +716,39 @@ function createWindow(): void {
       void shell.openExternal(url)
     }
   })
+  // The renderer guards an unsaved arrangement with a `beforeunload` veto
+  // (Shell.tsx). A browser turns that into its "Leave site?" prompt; Electron
+  // shows nothing and silently cancels the close, so a window holding unsaved
+  // work could not be closed at all — not by the X, not by Alt+F4, not by Quit.
+  // Ask here instead. preventDefault() on THIS event means "ignore the page's
+  // veto", i.e. let the window close.
+  mainWindow.webContents.on('will-prevent-unload', (event) => {
+    const win = mainWindow
+    const choice = win
+      ? dialog.showMessageBoxSync(win, {
+          type: 'question',
+          buttons: ['Close anyway', 'Keep editing'],
+          defaultId: 1,
+          cancelId: 1,
+          title: 'theDAW',
+          message: 'This project has unsaved changes.',
+          detail: 'Closing now discards everything since the last save. The autosave keeps a recovery copy.',
+          noLink: true,
+        })
+      : 0
+    if (choice === 0) {
+      event.preventDefault()
+      return
+    }
+    // The user stays, so a quit that was under way is over: the window lives
+    // on, and it needs its backend (and the auto-restart) back.
+    isQuitting = false
+    if (weSpawnedBackend && !backendProcess) {
+      void isBackendRunning().then((up) => {
+        if (!up && !isQuitting && !backendProcess) spawnBackend()
+      })
+    }
+  })
 
   // Load the React renderer IMMEDIATELY (no separate spinner page). The renderer
   // shows the boot cinematic and polls /api/health on its own, holding until the
@@ -1398,7 +1431,7 @@ app.on('window-all-closed', () => {
   app.quit()
 })
 
-app.on('before-quit', (event) => {
+app.on('before-quit', () => {
   if (isQuitting) return
   isQuitting = true
   // Kill an in-flight first-run sync so it doesn't outlive the app holding
@@ -1410,6 +1443,16 @@ app.on('before-quit', (event) => {
       // already gone
     }
   }
+})
+
+// The backend goes down here, not in before-quit: before-quit fires BEFORE the
+// windows are asked to close, and a window can still refuse (unsaved changes ->
+// "Keep editing"). Killing the backend first left that window open over a dead
+// backend. will-quit only fires once every window has really closed.
+let backendStoppedForQuit = false
+app.on('will-quit', (event) => {
+  if (backendStoppedForQuit) return
+  backendStoppedForQuit = true
   if (weSpawnedBackend && backendProcess) {
     event.preventDefault()
     killBackend().finally(() => {
