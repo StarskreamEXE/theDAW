@@ -65,6 +65,7 @@ import {
 } from '../../state/recordingStore';
 import { ContextMenu, menuAnchorFromEvent, type ContextMenuPosition } from '../ui/ContextMenu';
 import { postStatus } from '../../state/statusNoticeStore';
+import { keyBelongsToFocusedControl } from '../../lib/keyTargets';
 
 /**
  * What each repeat state is called, in the tooltip and for a screen reader.
@@ -837,8 +838,7 @@ export const PlayerFooter: React.FC = () => {
       // LOCK on — where `key` is 'R' and `shiftKey` is false. It is not dead
       // code; dropping it would silently lose the shortcut for those users.
       if (e.key !== 'r' && e.key !== 'R') return;
-      const t = e.target as HTMLElement | null;
-      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+      if (keyBelongsToFocusedControl(e)) return; // an "r" typed into a field; a focused fader does not count
       e.preventDefault();
       // Unconditional, unlike the key itself: with nothing armed the store
       // raises `nothing-armed` and the bubble says so, which beats a shortcut

@@ -43,6 +43,23 @@ async function dropFileOnto(page, locator, filePath, mimeType, clientX, clientY)
   await locator.dispatchEvent('drop', { dataTransfer, clientX, clientY })
 }
 
+/** A DataTransfer holding one real file, built in the page. */
+async function fileTransfer(page, filePath, mimeType) {
+  const base64 = readFileSync(filePath).toString('base64')
+  const name = filePath.split(/[\\/]/).pop()
+  return page.evaluateHandle(
+    ({ base64, name, type }) => {
+      const bin = atob(base64)
+      const arr = new Uint8Array(bin.length)
+      for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i)
+      const dt = new DataTransfer()
+      dt.items.add(new File([arr], name, { type }))
+      return dt
+    },
+    { base64, name, type: mimeType },
+  )
+}
+
 async function main() {
   const { page, consoleErrors } = await openApp({ width: 1600, height: 900 })
   const report = createReport('q02-zoom-wheel')
@@ -78,7 +95,9 @@ async function main() {
       await page.getByRole('button', { name: 'Edit', exact: true }).click()
     }
     await sleep(150)
-    const scroller = page.locator('[class*="07050a"]').first()
+    // The timeline's own scroll container (WaveformEditor: overflow-x-auto overflow-y-auto bg-[#07050a]).
+    // The colour alone also matches a non-scrolling wrapper, whose scrollWidth never changes.
+    const scroller = page.locator('div[class*="overflow-x-auto"][class*="07050a"]').first()
     await scroller.waitFor({ state: 'visible', timeout: 10000 })
     const ruler = scroller.locator(':scope > div').nth(0)
     const lanes = scroller.locator(':scope > div').nth(1)
@@ -101,6 +120,11 @@ async function main() {
       const box = await cursorMarker().boundingBox()
       return box ? box.x + box.width / 2 : null
     }
+    /** Screen x of the middle of the timeline's visible width. */
+    const viewportCentreX = async () => {
+      const box = await scroller.boundingBox()
+      return box.x + box.width / 2
+    }
     const wheelAt = async (dx, dy, mods = []) => {
       const box = await scroller.boundingBox()
       await page.mouse.move(box.x + box.width / 2, box.y + Math.min(box.height - 10, 150))
@@ -122,13 +146,24 @@ async function main() {
         ['click-120bpm-16s.wav', 'audio/wav'],
         ['noise-5s.wav', 'audio/wav'],
       ]
-      for (const [fname, mime] of files) {
-        const before = await lanes.locator('> *').count()
+      // One file per lane, dropped INSIDE the lane where a real pointer would be (the old setup
+      // dispatched the drop at a point outside the lanes element and counted its direct
+      // children, which never changes: the app placed nothing there and the check could not
+      // have seen it if it had). Success is the number of clips on the timeline.
+      const nameInputs = page.locator('input[aria-label^="Track "][aria-label$=" name"]')
+      const clipCount = () => page.locator('[data-clip="1"]').count()
+      for (const [i, [fname, mime]] of files.entries()) {
+        const before = await clipCount()
         const box = await lanes.boundingBox()
-        const y = Math.max(10, box.height + 5)
-        await dropFileOnto(page, lanes, `${ASSETS_DIR}/${fname}`, mime, box.x + 60, box.y + y)
-        const grew = await waitForCondition(async () => (await lanes.locator('> *').count()) > before, 10000)
-        expect(grew, `dropping ${fname} should add a track/clip to the timeline (child count stayed ${before})`)
+        const row = await nameInputs.nth(i).boundingBox()
+        expect(row, `track row ${i + 1} must exist to drop ${fname} on`)
+        const x = Math.max(box.x + 60, row.x + row.width + 300) // well inside the lane, clear of the track header column
+        const y = row.y + row.height / 2
+        const under = await page.evaluateHandle(([px, py]) => document.elementFromPoint(px, py), [x, y])
+        await under.asElement().dispatchEvent('dragover', { dataTransfer: await fileTransfer(page, `${ASSETS_DIR}/${fname}`, mime), clientX: x, clientY: y, bubbles: true })
+        await under.asElement().dispatchEvent('drop', { dataTransfer: await fileTransfer(page, `${ASSETS_DIR}/${fname}`, mime), clientX: x, clientY: y, bubbles: true })
+        const grew = await waitForCondition(async () => (await clipCount()) > before, 15000)
+        expect(grew, `dropping ${fname} on lane ${i + 1} should place a clip (clip count stayed ${before})`)
         await sleep(250)
       }
       await shot('01-four-clips-imported')
@@ -170,13 +205,14 @@ async function main() {
 
     // --- 1. Plain wheel zooms TIME, anchored on the edit cursor ---
     await report.scenario('plain-wheel-zooms-time-anchored-on-edit-cursor', async () => {
+      // The built rule (components/audio/timelineZoom.ts, planZoom): a zoom CENTRES the edit
+      // cursor in the viewport, wherever the pointer is - it does not pin it to its old screen x.
       const m0 = await metrics()
-      const x0 = await cursorScreenX()
       await wheelAt(0, -150)
       const m1 = await metrics()
       const x1 = await cursorScreenX()
       expect(m1.scrollWidth !== m0.scrollWidth, `plain wheel should change TIME zoom (scrollWidth stayed ${m0.scrollWidth})`)
-      expectClose(x1, x0, 2, 'edit cursor should stay at the same screen x after a plain wheel zoom')
+      expectClose(x1, await viewportCentreX(), 3, 'a plain wheel zoom should centre the edit cursor in the timeline viewport')
     })
 
     // --- 2. Ctrl+wheel = fine zoom (smaller step than plain wheel) ---
@@ -278,19 +314,16 @@ async function main() {
       await page.mouse.click(rBox.x + rBox.width * 0.35, rBox.y + rBox.height / 2)
       await sleep(100)
 
-      const x0 = await cursorScreenX()
+      // Same anchor as the wheel: the edit cursor, centred.
       await zoomInBtn.click()
       await sleep(120)
-      const x1 = await cursorScreenX()
-      expectClose(x1, x0, 2, 'the toolbar zoom-in button should keep the edit cursor at the same screen x')
+      expectClose(await cursorScreenX(), await viewportCentreX(), 3, 'the toolbar zoom-in button should centre the edit cursor')
 
-      const x2 = await cursorScreenX()
       const box = await scroller.boundingBox()
-      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
+      await page.mouse.move(box.x + box.width * 0.8, box.y + box.height / 2) // pointer far from the cursor: it must not matter
       await page.keyboard.press('+')
       await sleep(120)
-      const x3 = await cursorScreenX()
-      expectClose(x3, x2, 2, 'the "+" zoom key should keep the edit cursor at the same screen x')
+      expectClose(await cursorScreenX(), await viewportCentreX(), 3, 'the "+" zoom key should centre the edit cursor')
     })
 
     // --- 6. The page itself never scrolls or browser-zooms over the timeline ---

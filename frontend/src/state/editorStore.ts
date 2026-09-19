@@ -1596,6 +1596,12 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   },
 
   updateTrack: (id, updates) => {
+    // A write that changes nothing is not an edit (see `updateClip`): a fader held for longer
+    // than the coalescing window and then released reports the same value again, and that
+    // identical write used to be stored as an empty undo step.
+    const strip = get().tracks.find((t) => t.id === id);
+    if (!strip) return;
+    if (!(Object.keys(updates) as (keyof EditorTrack)[]).some((k) => !Object.is(strip[k], updates[k]))) return;
     // A fader/pan ride is keyed by the control, so its frames fold together and
     // nothing else folds into them. A rename or a mute is anonymous.
     const params = stripGestureParams(updates);
@@ -1769,6 +1775,15 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   },
 
   updateClip: (id, updates, opts) => {
+    // A write that changes nothing is not an edit. A slider reports its value on press AND again
+    // on release (`input`, then `change`); the second, identical write used to swap in a new
+    // `clips` array, which the recorder took for a document change and stored as an EMPTY undo
+    // step — so the first Ctrl+Z after a click on the clip gain slider appeared to do nothing.
+    // Checked before the key is set, so a skipped write cannot leave its key for the next one.
+    const target = get().clips.find((c) => c.id === id);
+    if (!target) return;
+    const changes = (Object.keys(updates) as (keyof AudioClip)[]).some((k) => !Object.is(target[k], updates[k]));
+    if (!changes) return;
     // Every clip gesture — move, trim, fade drag, stretch — is keyed by the clip
     // it is moving, so one drag is one step and the next clip's drag is another.
     // `coalesce` is the `stretchClipToFit` exception: the caller has already cut
@@ -2239,6 +2254,9 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     // No `beginUndoStep()`: this is the bus's `updateTrack`, and a fader ride
     // that opened a step per pointer move would make undo unusable. Keyed like a
     // track strip: a fader ride by the control, a rename anonymous.
+    // A write that changes nothing is not an edit (see `updateClip`).
+    const busStrip = get().buses.find((b) => b.id === id);
+    if (busStrip && !(Object.keys(updates) as (keyof typeof updates)[]).some((k) => !Object.is(busStrip[k], updates[k]))) return;
     const params = stripGestureParams(updates);
     coalesceAs(params ? `bus:${id}:${params.join('+')}` : null);
     return set((s) => {

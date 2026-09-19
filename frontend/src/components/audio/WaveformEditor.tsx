@@ -85,6 +85,7 @@ import { KnownFilesMenu } from '../ui/KnownFilesMenu';
 import { registerEditorPlayback, unregisterEditorPlayback } from '../../state/editorPlaybackBridge';
 import { publishSelectedTracks } from '../../state/editorSelectionBridge';
 import * as liveMixer from '../../state/liveMixer';
+import { keyBelongsToFocusedControl } from '../../lib/keyTargets';
 import { useDjAnalysisStore } from '../../state/djAnalysisStore';
 import { laneTargetAtY } from './laneTarget';
 import {
@@ -2547,8 +2548,9 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       const k = e.key.toLowerCase();
       if (k !== 'z' && k !== 'y') return;
       if (!containerRef.current?.offsetParent) return; // EDIT tab hidden -> ignore
-      const tgt = e.target as HTMLElement | null;
-      if (tgt?.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"]')) return;
+      // A text field keeps its own undo; a fader (which holds focus after a ride) has none,
+      // so Ctrl+Z right after moving one is the app's undo (lib/keyTargets.ts).
+      if (keyBelongsToFocusedControl(e)) return;
       e.preventDefault();
       if (k === 'y' || e.shiftKey) redo();
       else undo();
@@ -3433,11 +3435,11 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       // Escape, for one). Listener order between two window handlers depends on
       // which effect re-registered last, so the flag is what decides, not luck.
       if (e.defaultPrevented) return;
-      const t = e.target as HTMLElement | null;
-      // SELECT is in the exclusion list because the bare-letter hotkeys below
-      // (s / m / l / f) would otherwise steal type-to-jump inside a dropdown such
-      // as the snap-division picker.
-      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+      // Keys the focused control uses itself stay with it: everything in a text field, and
+      // type-to-jump in a dropdown such as the snap-division picker (the bare-letter hotkeys
+      // below - s / m / l / f - would otherwise steal it). A fader only keeps the keys that
+      // move it, so Space and the hotkeys still work right after a fader ride.
+      if (keyBelongsToFocusedControl(e)) return;
       // Alt+Shift+Arrow moves the selected TRACKS one row (F01) — the same edit
       // the header grip's Alt+Arrow makes, reachable without focusing a grip.
       // Alt alone belongs to the lane keys, so the Shift is what distinguishes
@@ -3913,6 +3915,11 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     // a context menu: it must not capture the pointer, mask anything, or later
     // read as a clip-body click.
     if (!isPrimaryGestureButton(e, IS_MAC)) return;
+    // A press on the waveform selects the clip, exactly as a press on its title bar does (and as
+    // REAPER does for a media item: click = select item + move edit cursor, Ctrl toggles, Shift
+    // takes the range). Before this only the title bar selected, so clicking clip B's waveform and
+    // pressing Delete removed whatever had been selected before.
+    selectClipWithModifiers(clip.id, e);
     e.currentTarget.setPointerCapture(e.pointerId);
     const anchorSec = timelineClientXToSec(e.clientX);
     inpaintDragRef.current = { clipId: clip.id, anchorSec, originX: e.clientX, originY: e.clientY };
@@ -5200,6 +5207,8 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const barLabels = gridWindow
     ? rulerBarLabels({ startSec: gridWindow.startSec, endSec: gridWindow.endSec, bpm: projectBpm, zoom })
     : [];
+  /** Is this clip's action menu the one on screen? (`aria-expanded` for its trigger buttons.) */
+  const clipMenuOpenFor = (clipId: string): boolean => clipMenu.position !== null && clipMenu.payload?.clipId === clipId;
   /** Open a clip's menu under one of its header buttons (compact / handle chrome). */
   const openClipMenuFrom = (el: HTMLElement, clipId: string) => {
     if (!selectedClipIds.includes(clipId)) selectClipSingle(clipId);
@@ -6352,6 +6361,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                         : 'bg-white/15 hover:bg-purple-400/70 cursor-grab'
                     }`}
                   />
+                  <label htmlFor={`editor-track-name-${t.id}`} className="sr-only">{`Track ${t.name} name`}</label>
                   <input
                     id={`editor-track-name-${t.id}`}
                     name={`editor-track-name-${t.id}`}
@@ -6787,6 +6797,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                           }}
                           aria-label={`More actions for clip ${clip.label}`}
                           aria-haspopup="menu"
+                          aria-expanded={clipMenuOpenFor(clip.id)}
                           title={`${clip.label} — clip actions`}
                           className="px-0.5 h-3.5 rounded-sm shrink-0 flex items-center bg-black/40 text-zinc-300 border border-white/10 hover:text-white"
                         ><Ellipsis className="w-2.5 h-2.5" /></button>
@@ -6806,6 +6817,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                       }}
                       aria-label={`${clip.label} — clip actions`}
                       aria-haspopup="menu"
+                      aria-expanded={clipMenuOpenFor(clip.id)}
                       title={clip.label}
                       className="absolute top-0 h-3.5 w-1.5 rounded-sm bg-white/25 hover:bg-white/60"
                       style={{ left: chrome.leftInClip }}

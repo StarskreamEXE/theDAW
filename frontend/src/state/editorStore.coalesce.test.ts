@@ -243,4 +243,52 @@ const reset = (over: Record<string, unknown> = {}): void => {
   assert.equal(steps(), 2, 'beginUndoStep still cuts a burst that shares a key');
 }
 
+// ── A write that changes nothing is not an undo step ─────────────────────────
+// A slider reports its value on press (`input`) and again on release (`change`).
+// The clip drawer cuts the burst on focus, which lands BETWEEN the two, so the
+// identical second write used to record an empty step: the first Ctrl+Z after a
+// click on the gain slider undid nothing.
+{
+  reset();
+  beginUndoStep('clip:c1'); // pointer-down on the slider
+  st().updateClip('c1', { gain: 1.23 }); // `input`
+  beginUndoStep('clip:c1'); // focus arrives
+  st().updateClip('c1', { gain: 1.23 }); // `change` on release: the same value again
+  assert.equal(steps(), 1, 'press + release on a slider is ONE undo step');
+  st().undo();
+  assert.equal(st().clips[0].gain, 1, 'and one undo puts the gain back');
+
+  const before = st().clips;
+  st().updateClip('c1', { gain: 1, muted: false }); // every field already holds this value
+  assert.equal(st().clips, before, 'a no-op write does not even swap the clips array');
+  st().updateClip('nope', { gain: 0.5 }); // unknown clip: nothing to change, nothing recorded
+  assert.equal(steps(), 0);
+
+  // A skipped write must not leave its key behind for the next, unrelated write.
+  st().updateClip('c1', { gain: 1 }); // no-op, keyed clip:c1 if it leaked
+  st().updateTrack('t1', { volume: 0.5 });
+  st().updateClip('c1', { startSec: 2 });
+  assert.equal(steps(), 2, 'the fader ride and the clip move after a no-op are still two steps');
+}
+
+// ── …and the same for a track or bus fader held, then released ───────────────
+{
+  reset({ buses: [{ id: 'b1', name: 'Drums', fxChain: [], volume: 0.8, mute: false }] });
+  beginUndoStep();
+  st().updateTrack('t1', { volume: 0.5 }); // press
+  beginUndoStep(); // stands in for the 300 ms window running out while the fader is held
+  st().updateTrack('t1', { volume: 0.5 }); // release reports the same value
+  assert.equal(steps(), 1, 'a held track fader is one step, not a ride plus an empty one');
+  const tracksBefore = st().tracks;
+  st().updateTrack('t1', { volume: 0.5, pan: 0 });
+  assert.equal(st().tracks, tracksBefore, 'a no-op strip write leaves the tracks array alone');
+
+  st().updateBus('b1', { volume: 0.4 });
+  beginUndoStep();
+  st().updateBus('b1', { volume: 0.4 });
+  assert.equal(steps(), 2, 'the bus fader likewise: one step for its ride, none for the repeat');
+  st().undo();
+  assert.equal(st().buses[0].volume, 0.8, 'one undo puts the bus fader back');
+}
+
 console.log('editorStore.coalesce.test.ts: all assertions passed');

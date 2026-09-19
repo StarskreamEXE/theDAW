@@ -156,6 +156,30 @@ async function clickEmpty(page, x, y) {
   await page.mouse.click(x, y)
 }
 
+/** Click a spot that is provably EMPTY LANE: inside the lanes element, with no clip under it.
+ *  ("40 px below the lowest clip" used to be the spot, and with the clips on the bottom rows
+ *  that is the transport bar, not the timeline - the selection was never cleared and every
+ *  precondition after it failed.) Rows are scanned top-down, right-to-left. */
+async function clickEmptyLane(page) {
+  const spot = await page.evaluate((lanesSel) => {
+    const lanes = document.querySelector(lanesSel)
+    if (!lanes) return null
+    const r = lanes.getBoundingClientRect()
+    const bottom = Math.min(r.bottom, window.innerHeight) - 6
+    for (let y = r.top + 12; y < bottom; y += 16) {
+      for (let x = Math.min(r.right, window.innerWidth) - 24; x > r.left + 8; x -= 48) {
+        const el = document.elementFromPoint(x, y)
+        if (!el || !lanes.contains(el)) continue
+        if (el.closest('[data-clip="1"]') || el.closest('button, input, select, [role="slider"]')) continue
+        return { x, y }
+      }
+    }
+    return null
+  }, LANES_SEL)
+  if (!spot) throw new Error('no empty lane space on screen to click')
+  await page.mouse.click(spot.x, spot.y)
+}
+
 /** A Y (viewport px) just below the lowest currently-rendered clip -- read live off the
  *  DOM every time rather than reusing a box captured earlier in the run, since the track
  *  panel's settled scroll position moves whenever a track is added (see addTrackRow). */
@@ -190,6 +214,25 @@ async function main() {
   let boxA = null
   let boxB = null
   let lanesBox = null
+  /** Re-read the two clips and the lanes box from the LIVE page, once the layout has stopped
+   *  moving. The boxes captured during setup go stale: the track panel scrolls itself after a
+   *  track is added and again when a selection changes, and a gesture aimed at a stale box
+   *  lands on the wrong clip (or on no clip). Called at the top of every scenario. */
+  const refreshBoxes = async () => {
+    let prev = null
+    for (let i = 0; i < 20; i++) {
+      const now = await clipStates(page)
+      const sig = JSON.stringify(now.map((c) => [Math.round(c.x), Math.round(c.y)]))
+      if (now.length === 2 && sig === prev) {
+        ;[boxA, boxB] = now
+        lanesBox = await page.locator(LANES_SEL).first().boundingBox()
+        return
+      }
+      prev = sig
+      await page.waitForTimeout(150)
+    }
+    throw new Error('the two clips never settled on screen')
+  }
 
   try {
     // ---- Setup: EDIT view, two tracks with one clip each ----
@@ -257,7 +300,8 @@ async function main() {
   }
 
   await report.scenario('cross-track-marquee-select', async () => {
-    await clickEmpty(page, lanesBox.x + 10, await belowLowestClipY(page)) // clear selection
+    await refreshBoxes()
+    await clickEmptyLane(page) // clear selection
     let s = await clipStates(page)
     expect(!s[0].selected && !s[1].selected, 'precondition: nothing selected before drag')
 
@@ -274,7 +318,8 @@ async function main() {
   })
 
   await report.scenario('modifier-add-toggle-replace', async () => {
-    await clickEmpty(page, lanesBox.x + 10, await belowLowestClipY(page))
+    await refreshBoxes()
+    await clickEmptyLane(page)
     let s = await clipStates(page)
     expect(!s[0].selected && !s[1].selected, 'precondition: nothing selected')
 
@@ -300,9 +345,12 @@ async function main() {
   })
 
   await report.scenario('escape-cancels-restores-baseline', async () => {
-    await clickEmpty(page, lanesBox.x + 10, await belowLowestClipY(page))
-    // Baseline: select clip A alone via a plain click on it.
-    await page.mouse.click(boxA.x + boxA.width / 2, boxA.y + boxA.height / 2)
+    await refreshBoxes()
+    await clickEmptyLane(page)
+    // Baseline: select clip A alone via a plain click on its TITLE BAR (the top 14 px). A click on
+    // the waveform body places the edit cursor and does not select - see the lead's note in
+    // orchestration/plans/P-20260918-daw-vst-timeline-plan.md (open behaviour question).
+    await page.mouse.click(boxA.x + 40, boxA.y + 7)
     let s = await clipStates(page)
     expect(s[0].selected && !s[1].selected, `baseline should be A only, got ${JSON.stringify(s)}`)
 
@@ -327,7 +375,8 @@ async function main() {
   })
 
   await report.scenario('marquee-does-not-move-edit-cursor', async () => {
-    await clickEmpty(page, lanesBox.x + 10, await belowLowestClipY(page))
+    await refreshBoxes()
+    await clickEmptyLane(page)
     const before = await editCursorLeft(page)
 
     const startX = Math.min(boxA.x, boxB.x) - 20
@@ -356,6 +405,7 @@ async function main() {
   })
 
   await report.scenario('autoscroll-grows-selection', async () => {
+    await refreshBoxes()
     // Try to force horizontal overflow by zooming in with ctrl+wheel over the lanes.
     const widthBefore = await laneWidthPx(page)
     await page.mouse.move(lanesBox.x + lanesBox.width / 2, lanesBox.y + 40)
@@ -397,7 +447,11 @@ async function main() {
     await page.mouse.move(lanesBox.x + 40, rowCY)
     await page.mouse.down()
     await page.mouse.move(lanesBox.x + 60, rowCY - 4)
-    const edgeX = lanesBox.x + lanesBox.width - 2
+    // The right edge of what is VISIBLE: the scroll container's box, not the lanes content
+    // (which is as wide as the zoomed arrangement - a pointer sent there is off the window
+    // and the page never receives the move).
+    const vpBox = await page.locator('div[class*="overflow-x-auto"][class*="07050a"]').first().boundingBox()
+    const edgeX = Math.min(vpBox.x + vpBox.width, page.viewportSize().width) - 3
     await page.mouse.move(edgeX, rowCY, { steps: 5 })
     await page.waitForTimeout(900) // let the rAF autoscroll loop run
     const scrollLeftAfter = await getScrollLeft(page)
@@ -413,7 +467,8 @@ async function main() {
   })
 
   await report.scenario('clip-press-never-starts-marquee', async () => {
-    await clickEmpty(page, lanesBox.x + 10, await belowLowestClipY(page))
+    await refreshBoxes()
+    await clickEmptyLane(page)
     // Re-read clip A's box live: the previous scenario added a third track, which
     // (per addTrackRow/trackRowCenterY) moves already-placed clips' settled position.
     const liveA = (await clipStates(page))[0]

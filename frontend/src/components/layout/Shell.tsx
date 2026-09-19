@@ -37,6 +37,7 @@ import { setXrHostPosture, onXrPeersChanged, kickXrPeer, type XrPeer } from '../
 import { useEditThemeStore } from '../../state/editThemeStore';
 import { resolveEditThemeVars } from '../../lib/editThemes';
 import { useLayoutZoom, FOOTER_H } from '../../lib/layoutScale';
+import { keyBelongsToFocusedControl } from '../../lib/keyTargets';
 
 const RIGHT_RAIL_MIN = 280;
 const RIGHT_RAIL_MAX = 640;
@@ -110,8 +111,9 @@ export const Shell: React.FC = () => {
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== 's') return;
-      const t = e.target as HTMLElement | null;
-      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      // Not while typing. A focused fader is not typing: bailing out there let Ctrl+S fall
+      // through to the browser's own "save page" dialog.
+      if (keyBelongsToFocusedControl(e)) return;
       e.preventDefault();
       openProject('save');
     };
