@@ -4137,14 +4137,18 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       showLaneInsert(lane.kind === 'insert' ? lane.index : null);
       const trackDelta = lane.kind === 'lane' ? lane.index - op.initialTrackIndex : 0;
       const moveTargets = op.initialClips?.length ? op.initialClips : [{ id: op.clipId, startSec: op.initialStartSec, trackIndex: op.initialTrackIndex }];
+      // `coalesce`: the pointer-down cut ONE undo step for the whole drag, and a drag of several
+      // selected clips writes each of them on every frame. Keyed per clip, those writes never
+      // folded together — two clips dragged for 60 frames left 120 undo steps, each taking one
+      // clip back by one frame.
       moveTargets.forEach((target) => {
         const newStart = Math.max(0, snapSec(target.startSec + dxSec));
         if (lane.kind === 'insert') {
-          updateClip(target.id, { startSec: newStart });
+          updateClip(target.id, { startSec: newStart }, { coalesce: true });
           return;
         }
         const targetIdx = Math.max(0, Math.min(tracks.length - 1, target.trackIndex + trackDelta));
-        updateClip(target.id, { startSec: newStart, trackId: tracks[targetIdx].id });
+        updateClip(target.id, { startSec: newStart, trackId: tracks[targetIdx].id }, { coalesce: true });
       });
       return;
     }
@@ -4776,8 +4780,12 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       if (clipOp) {
         opRef.current = null;
         showLaneInsert(null);
-        const wrote = clipOp.undoDepthAtStart !== undefined && useEditorStore.getState()._undo.length > clipOp.undoDepthAtStart;
-        if (wrote) undo();
+        // Usually one step; a drag the user paused in for longer than the coalescing window has
+        // left more than one, and all of them are this drag.
+        const depth = clipOp.undoDepthAtStart;
+        if (depth !== undefined) {
+          for (let guard = 0; guard < 64 && useEditorStore.getState()._undo.length > depth; guard += 1) undo();
+        }
       }
       const press = rulerPressRef.current;
       if (press) {

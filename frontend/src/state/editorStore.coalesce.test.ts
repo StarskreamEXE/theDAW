@@ -291,4 +291,27 @@ const reset = (over: Record<string, unknown> = {}): void => {
   assert.equal(st().buses[0].volume, 0.8, 'one undo puts the bus fader back');
 }
 
+// ── One drag of SEVERAL clips is one undo step ───────────────────────────────
+// The timeline writes every selected clip on every frame of a drag. Keyed per clip those writes
+// never folded (the key changes on every call), so two clips dragged for 60 frames left 120 undo
+// steps. The drag says `coalesce`, which joins the step its pointer-down opened whatever the key.
+{
+  reset();
+  beginUndoStep(); // pointer-down
+  for (let frame = 1; frame <= 5; frame += 1) {
+    st().updateClip('c1', { startSec: frame }, { coalesce: true });
+    st().updateClip('c2', { startSec: frame + 20 }, { coalesce: true });
+  }
+  assert.equal(steps(), 1, 'a two-clip drag is ONE undo step');
+  st().undo();
+  assert.deepEqual(st().clips.map((c) => c.startSec), [0, 0], 'and one undo puts BOTH clips back');
+
+  // Without the flag the same writes are what they always were: separate gestures.
+  reset();
+  beginUndoStep();
+  st().updateClip('c1', { startSec: 1 });
+  st().updateClip('c2', { startSec: 21 });
+  assert.equal(steps(), 2, 'two clips edited one after the other stay two steps');
+}
+
 console.log('editorStore.coalesce.test.ts: all assertions passed');
