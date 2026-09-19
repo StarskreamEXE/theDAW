@@ -71,6 +71,13 @@ public:
     void onLatencyChanged(int32_t latencySamples) override;
     void onParamEdited(int32_t index, double normalizedValue) override;
     void onParamGesture(int32_t index, bool begin) override;
+
+    // What the client was last told (or itself set) per parameter index; empty until it asks for
+    // the list. A sweep after a host-side edit reports only what differs from this.
+    std::vector<double> clientKnownParams_;
+    bool paramSweepPending_ = false;
+    unsigned long long paramSweepAtMs_ = 0;
+    void sweepParamsForClient();
     void onEditorResized(int32_t width, int32_t height) override;
     void onEditorClosed() override;
     void onWarning(const std::string& text) override;

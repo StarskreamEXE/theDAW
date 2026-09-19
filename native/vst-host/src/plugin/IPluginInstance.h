@@ -107,6 +107,9 @@ public:
     virtual PrepareResult reprepare() = 0;
     virtual void release() = 0;  // stop processing, deactivate; audio parked
     virtual std::vector<ParamInfo> params() = 0;
+    // Just the current normalized values, in params() order, without names or display strings:
+    // cheap enough to call after every edit on a plugin with thousands of parameters.
+    virtual void paramValues(std::vector<double>& out) = 0;
     // The plugin's own display string for `normalizedValue` of parameter `index` (what a generic
     // parameter UI shows while a slider moves). Empty when the plugin has nothing to say.
     virtual std::string paramText(int32_t index, double normalizedValue) = 0;

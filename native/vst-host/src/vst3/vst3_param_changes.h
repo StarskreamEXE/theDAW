@@ -27,6 +27,10 @@ namespace thedaw::vst3 {
 struct ParamEdit {
     Steinberg::Vst::ParamID id = 0;
     double value = 0.0;  // normalized 0..1
+    // The HOST set this value (a set_param from the app). It still has to reach the controller so
+    // an open editor follows, but it is not news to the app and must not be reported back to it:
+    // an echo of its own edit arrives late, and a slider being dragged jumps back to it.
+    bool fromHost = false;
 };
 
 // Bounded MPSC ring. Producers claim a slot with one fetch_add and publish it by bumping that

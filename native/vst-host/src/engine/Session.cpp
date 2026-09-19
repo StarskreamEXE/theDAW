@@ -336,6 +336,11 @@ void Session::tick() {
 
     const ULONGLONG now = nowMs();
 
+    if (paramSweepPending_ && now >= paramSweepAtMs_) {
+        paramSweepPending_ = false;
+        sweepParamsForClient();
+    }
+
     // Work a timed-out park had to put off.
     if (restartRetryPending_) onRestartRequired();
     if (latencyRetryPending_) applyLatency(latencyRetrySamples_);
@@ -496,6 +501,15 @@ void Session::handleOp(const json::Value& message, const std::string& op) {
         }
         const double value = std::clamp(valueValue->number, 0.0, 1.0);
         util::guarded([&] { instance->setParamNormalized(index, value); });
+        if (index >= 0 && static_cast<size_t>(index) < clientKnownParams_.size()) {
+            clientKnownParams_[static_cast<size_t>(index)] = value;
+        }
+        // A program change or a macro moves OTHER parameters inside the plugin, and plugins are
+        // not obliged to announce those one by one. Look once the dust has settled.
+        if (!clientKnownParams_.empty()) {
+            paramSweepPending_ = true;
+            paramSweepAtMs_ = nowMs() + 120;
+        }
         // The edit is in the plugin's queue now; a VST3 plugin only reads that queue inside a
         // process call. Arm the audio thread's flush so the change lands even if the client
         // never sends another audio block.
@@ -676,6 +690,8 @@ void Session::sendParams() {
         reportPluginFault("the plugin faulted while listing parameters");
         return;
     }
+    clientKnownParams_.assign(list.size(), 0.0);
+    for (size_t i = 0; i < list.size(); ++i) clientKnownParams_[i] = list[i].value;
     json::Writer writer;
     writer.beginObject().strField("ev", "params").key("list").beginArray();
     for (const ParamInfo& info : list) {
@@ -773,6 +789,9 @@ void Session::flushParamEchoes(bool force) {
         }
         echo.pending = false;
         echo.lastSentMs = now;
+        if (entry.first >= 0 && static_cast<size_t>(entry.first) < clientKnownParams_.size()) {
+            clientKnownParams_[static_cast<size_t>(entry.first)] = echo.value;
+        }
         // With the plugin's own words for the value, so a parameter UI never formats one itself.
         std::string text;
         if (IPluginInstance* instance = plugin_.get()) {
@@ -912,6 +931,26 @@ void Session::onParamEdited(int32_t index, double normalizedValue) {
     echo.value = normalizedValue;
     echo.pending = true;
     flushParamEchoes(false);
+}
+
+void Session::sweepParamsForClient() {
+    IPluginInstance* instance = plugin_.get();
+    if (instance == nullptr || clientKnownParams_.empty()) return;
+    std::vector<double> values;
+    const unsigned long fault = util::guarded([&] { instance->paramValues(values); });
+    if (fault != 0) return;
+    const size_t count = std::min(values.size(), clientKnownParams_.size());
+    bool any = false;
+    for (size_t i = 0; i < count; ++i) {
+        const double difference = values[i] - clientKnownParams_[i];
+        if (difference > 1e-9 || difference < -1e-9) {
+            ParamEcho& echo = paramEchoes_[static_cast<int32_t>(i)];
+            echo.value = values[i];
+            echo.pending = true;
+            any = true;
+        }
+    }
+    if (any) flushParamEchoes(true);
 }
 
 void Session::onParamGesture(int32_t index, bool begin) {

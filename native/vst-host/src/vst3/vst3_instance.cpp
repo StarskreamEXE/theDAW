@@ -604,6 +604,16 @@ std::vector<ParamInfo> Vst3Instance::params() {
     return paramCache_;
 }
 
+void Vst3Instance::paramValues(std::vector<double>& out) {
+    out.resize(paramIds_.size());
+    for (std::size_t i = 0; i < paramIds_.size(); ++i) {
+        if (controller_ && paramIds_[i] != Steinberg::Vst::kNoParamId) {
+            paramCache_[i].value = controller_->getParamNormalized(paramIds_[i]);
+        }
+        out[i] = paramCache_[i].value;
+    }
+}
+
 std::string Vst3Instance::paramText(std::int32_t index, double normalizedValue) {
     if (!controller_ || index < 0 || static_cast<std::size_t>(index) >= paramIds_.size()) return {};
     if (paramIds_[static_cast<std::size_t>(index)] == Steinberg::Vst::kNoParamId) return {};
@@ -643,6 +653,7 @@ void Vst3Instance::setParamNormalized(std::int32_t index, double value) {
     ParamEdit mirror;
     mirror.id = id;
     mirror.value = value;
+    mirror.fromHost = true;
     toMessageThread_.push(mirror);
     if (isMessageThread()) {
         serviceOnMessageThread();
@@ -767,7 +778,8 @@ void Vst3Instance::serviceOnMessageThread() {
         if (controller_) controller_->setParamNormalized(edit.id, edit.value);
         if (paramCache_[static_cast<std::size_t>(index)].value != edit.value) {
             paramCache_[static_cast<std::size_t>(index)].value = edit.value;
-            if (events_ != nullptr) events_->onParamEdited(index, edit.value);
+            // Reported only when the PLUGIN moved it; the app already knows what it set itself.
+            if (!edit.fromHost && events_ != nullptr) events_->onParamEdited(index, edit.value);
         }
     }
 

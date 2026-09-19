@@ -98,6 +98,11 @@ public:
         return out;
     }
 
+    void paramValues(std::vector<double>& out) override {
+        out.resize(kParamCount);
+        for (int32_t i = 0; i < kParamCount; ++i) out[static_cast<size_t>(i)] = values_[i].load(std::memory_order_relaxed);
+    }
+
     std::string paramText(int32_t index, double normalizedValue) override {
         if (index < 0 || index >= kParamCount) return {};
         char buffer[32];

@@ -1019,6 +1019,52 @@ def test_real_plugin_parameters_come_with_display_text(real_session):
 
 
 @requires_real_plugin
+def test_real_plugin_program_change_reports_the_parameters_it_moved():
+    """Choosing a factory program moves other parameters; the client has to hear about them."""
+    with real_host() as (_host, client, _ready):
+        params = client.get_params()
+        program = next(
+            (p for p in params if p["program_change"] and p["steps"] >= 1), None
+        )
+        if program is None:
+            pytest.skip("this plugin has no program-change parameter")
+        before = {p["index"]: p["value"] for p in params}
+        target = 1.0 / program["steps"]  # the second program
+        client.control("set_param", index=program["index"], value=target)
+
+        moved: dict[int, float] = {}
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                msg = client.recv(timeout=max(0.05, deadline - time.monotonic()))
+            except TimeoutError:
+                break
+            if isinstance(msg, bytes):
+                continue
+            event = json.loads(msg)
+            if event.get("ev") == "param":
+                moved[event["index"]] = event["value"]
+                assert "text" in event
+
+        assert program["index"] not in moved, (
+            "the parameter the client set itself is not echoed back"
+        )
+        after = {p["index"]: p["value"] for p in client.get_params()}
+        changed = {
+            i
+            for i in after
+            if i != program["index"] and abs(after[i] - before[i]) > 1e-9
+        }
+        if not changed:
+            pytest.skip("the second program has the same values as the first")
+        assert changed <= set(moved), (
+            f"parameters {sorted(changed - set(moved))} moved without a param event"
+        )
+        for index in changed:
+            assert moved[index] == pytest.approx(after[index])
+
+
+@requires_real_plugin
 def test_real_plugin_set_param_is_visible_in_get_params():
     with real_host() as (_host, client, _ready):
         target = first_continuous_automatable(client.get_params())
