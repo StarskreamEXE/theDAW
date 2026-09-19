@@ -1219,6 +1219,9 @@ interface PointerOp {
   initialTrackIndex: number;
   initialClips?: Array<{ id: string; startSec: number; trackIndex: number }>;
   dragItems?: AudioDragItem[];
+  /** Undo depth when the press went down. The whole drag is ONE undo step, so a deeper stack
+   *  means the drag has written something — which is exactly what Escape has to take back. */
+  undoDepthAtStart?: number;
 }
 
 const CTRL_DRAG_MOVE_THRESHOLD_PX = 4;
@@ -4043,6 +4046,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       initialOffsetIntoSource: clip.offsetIntoSource,
       initialTrackIndex: trackIndex,
       initialClips,
+      undoDepthAtStart: useEditorStore.getState()._undo.length,
     };
     (e.target as Element).setPointerCapture?.(e.pointerId);
   };
@@ -4726,6 +4730,17 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     if (menuOpen) return;
     if (gestureActive) {
       cancelMarquee();
+      // Escape during a clip move / trim / slip / stretch puts the clip back (REAPER cancels a
+      // drag the same way). The drag is one undo step, opened at pointer-down, so taking it back
+      // is one undo — and only when the drag actually wrote something: a press still inside the
+      // click band has no step of its own, and undoing there would take back an earlier edit.
+      const clipOp = opRef.current;
+      if (clipOp) {
+        opRef.current = null;
+        showLaneInsert(null);
+        const wrote = clipOp.undoDepthAtStart !== undefined && useEditorStore.getState()._undo.length > clipOp.undoDepthAtStart;
+        if (wrote) undo();
+      }
       const press = rulerPressRef.current;
       if (press) {
         rulerPressRef.current = null;
