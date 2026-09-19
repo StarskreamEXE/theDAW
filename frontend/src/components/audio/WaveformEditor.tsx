@@ -1305,7 +1305,7 @@ const EDIT_SHORTCUTS: Array<{ group: string; keys: Array<[string, string]> }> = 
       ['Drag a clip edge', 'Trim'],
       ['Alt + drag a clip', 'Slip the audio inside it'],
       ['Shift + drag a clip edge', 'Stretch to fit — no re-render'],
-      ['Ctrl + drag a clip', 'Drag it out to another surface'],
+      ['Ctrl + drag a clip', 'Copy it (drag it out of the timeline to take it to another surface)'],
     ],
   },
   {
@@ -4099,11 +4099,62 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
 
     if (op.kind === 'ctrl-drag-pending') {
       const dist = Math.hypot(dxPx, dySec);
-      if (dist >= CTRL_DRAG_MOVE_THRESHOLD_PX && op.dragItems && op.dragItems.length > 0) {
-        useExternalDragStore.getState().begin(op.dragItems);
+      if (dist < CTRL_DRAG_MOVE_THRESHOLD_PX) return;
+      // Ctrl+drag COPIES (REAPER: media item, Ctrl + left drag = copy item). The copies are made
+      // where the originals are and the drag carries on as a plain move of the COPIES, so snapping,
+      // lane changes and the new-lane gap all work as they do for a move. The whole thing is one
+      // undo step: the copies are added inside the step the first move frame then joins.
+      const st = useEditorStore.getState();
+      const ids = st.selectedClipIds.includes(op.clipId) ? st.selectedClipIds : [op.clipId];
+      const sources = st.clips.filter((c) => ids.includes(c.id));
+      if (sources.length === 0) {
         opRef.current = null;
+        return;
       }
+      const undoDepthAtStart = st._undo.length;
+      beginUndoStep();
+      // `id` is dropped: addClipToTrack honours an incoming id, and a copy that kept its source's
+      // id would be the same clip twice.
+      const copies = sources.map(({ id: sourceId, ...clip }) => ({ sourceId, clip, id: addClipToTrack({ ...clip }) }));
+      const anchor = copies.find((c) => c.sourceId === op.clipId) ?? copies[0];
+      const liveTracks = useEditorStore.getState().tracks;
+      setSelectedClipIds(copies.map((c) => c.id));
+      setSelectedTrackIds([]);
+      setSelected(anchor.id);
+      opRef.current = {
+        ...op,
+        kind: 'move',
+        clipId: anchor.id,
+        initialClips: copies.map((c) => ({
+          id: c.id,
+          startSec: c.clip.startSec,
+          trackIndex: Math.max(0, liveTracks.findIndex((t) => t.id === c.clip.trackId)),
+        })),
+        undoDepthAtStart,
+      };
       return;
+    }
+
+    // A copy-drag that LEAVES the timeline becomes the drag to another surface it has always been
+    // (the library, another tab's drop zone): the copies are taken back and the app-level drag
+    // starts with the ORIGINAL clips' audio.
+    if (op.kind === 'move' && op.dragItems && op.dragItems.length > 0) {
+      const box = timelineScrollRef.current?.getBoundingClientRect();
+      const margin = 24;
+      if (
+        box &&
+        (e.clientX < box.left - margin || e.clientX > box.right + margin ||
+          e.clientY < box.top - margin || e.clientY > box.bottom + margin)
+      ) {
+        const depth = op.undoDepthAtStart;
+        if (depth !== undefined) {
+          for (let guard = 0; guard < 64 && useEditorStore.getState()._undo.length > depth; guard += 1) undo();
+        }
+        opRef.current = null;
+        showLaneInsert(null);
+        useExternalDragStore.getState().begin(op.dragItems);
+        return;
+      }
     }
 
     /* F18 — the click band. Below CLIP_CLICK_SLOP_PX of pointer travel this
