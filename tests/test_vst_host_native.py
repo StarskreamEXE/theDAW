@@ -250,6 +250,44 @@ def test_set_param_updates_params_without_emitting_a_param_event():
         assert after[0]["value"] == pytest.approx(before[0]["value"])
 
 
+def test_params_carry_flags_and_the_plugins_own_text():
+    with HostProcess(null_args()) as host, host.connect() as client:
+        client.hello()
+        params = client.get_params()
+        for p in params:
+            for field in ("hidden", "read_only", "bypass", "program_change", "text"):
+                assert field in p, f"params entry is missing {field!r}: {p!r}"
+            assert p["hidden"] is False
+        # the text is the plugin's words for the CURRENT value
+        client.control("set_param", index=0, value=0.25)
+        assert client.get_params()[0]["text"] == "0.25"
+
+
+def test_param_text_formats_any_value_without_moving_the_parameter():
+    with HostProcess(null_args()) as host, host.connect() as client:
+        client.hello()
+        before = client.get_params()[1]["value"]
+        reply = client.param_text(1, 0.5)
+        assert reply["index"] == 1
+        assert reply["value"] == pytest.approx(0.5)
+        assert reply["text"] == "0.50"
+        assert client.get_params()[1]["value"] == pytest.approx(before), (
+            "asking for text must not set the value"
+        )
+        # out of range is clamped, an unknown index answers with empty text rather than an error
+        assert client.param_text(1, 7.0)["text"] == "1.00"
+        assert client.param_text(99, 0.5)["text"] == ""
+
+
+def test_param_text_without_arguments_is_a_survivable_error():
+    with HostProcess(null_args()) as host, host.connect() as client:
+        client.hello()
+        client.control("param_text", index=0)
+        error = client.recv_event("error")
+        assert error["fatal"] is False
+        assert client.ping(3.0)["t"] == 3.0
+
+
 def test_set_param_by_name():
     with HostProcess(null_args()) as host, host.connect() as client:
         client.hello()
@@ -961,6 +999,23 @@ def test_real_plugin_exposes_parameters(real_session):
     params = real_session.client.get_params()
     assert len(params) > 0
     assert first_automatable(params) is not None, "no automatable parameter"
+
+
+@requires_real_plugin
+def test_real_plugin_parameters_come_with_display_text(real_session):
+    params = real_session.client.get_params()
+    assert [p["index"] for p in params] == list(range(len(params))), (
+        "index is the controller's own position"
+    )
+    visible = [p for p in params if not p["hidden"]]
+    assert visible, "every parameter is hidden"
+    assert any(p["text"] for p in visible), "no visible parameter has display text"
+    target = first_continuous_automatable(params)
+    low = real_session.client.param_text(target["index"], 0.0)["text"]
+    high = real_session.client.param_text(target["index"], 1.0)["text"]
+    assert low and high and low != high, (
+        f"text does not follow the value: {low!r} / {high!r}"
+    )
 
 
 @requires_real_plugin

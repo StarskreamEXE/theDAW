@@ -39,6 +39,15 @@ struct ParamInfo {
     bool automatable = true;
     bool discrete = false;
     bool boolean_ = false;
+    // The list holds EVERY parameter the plugin's controller declares, in the controller's own
+    // order (what JUCE's VST3 host does), so `index` is the index any other host would use.
+    // What a parameter is for is said by these flags; a UI hides `hidden` ones, it does not
+    // get a shorter list.
+    bool hidden = false;         // the plugin's own book-keeping (kIsHidden)
+    bool readOnly = false;       // a meter or a display value (kIsReadOnly)
+    bool isBypass = false;       // the plugin's own bypass switch (kIsBypass)
+    bool isProgramChange = false;  // selects a program of the plugin's program list
+    std::string text;            // the plugin's words for `value`, e.g. "-6.0 dB"; may be empty
 };
 
 struct TransportInfo {
@@ -95,6 +104,9 @@ public:
     virtual PrepareResult reprepare() = 0;
     virtual void release() = 0;  // stop processing, deactivate; audio parked
     virtual std::vector<ParamInfo> params() = 0;
+    // The plugin's own display string for `normalizedValue` of parameter `index` (what a generic
+    // parameter UI shows while a slider moves). Empty when the plugin has nothing to say.
+    virtual std::string paramText(int32_t index, double normalizedValue) = 0;
     // Full state (component + controller) in the container format pedalboard's `raw_state` uses.
     // Audio must be parked for both.
     virtual bool getState(std::vector<uint8_t>& out, std::string& error) = 0;

@@ -561,10 +561,11 @@ void Vst3Instance::refreshParameterCache() {
 
     for (Steinberg::int32 i = 0; i < count; ++i) {
         Steinberg::Vst::ParameterInfo raw{};
-        if (controller_->getParameterInfo(i, raw) != Steinberg::kResultOk) continue;
-        // Hidden parameters are the plugin's own book-keeping; showing them in a chain UI is
-        // noise and automating them is undefined.
-        if ((raw.flags & Steinberg::Vst::ParameterInfo::kIsHidden) != 0) continue;
+        // A parameter the controller will not describe still takes its slot: the list mirrors the
+        // controller index for index (JUCE's VST3 host keeps every parameter), so `index` means
+        // the same thing here as in any other host and never shifts when a flag changes.
+        const bool described = controller_->getParameterInfo(i, raw) == Steinberg::kResultOk;
+        if (!described) raw.id = Steinberg::Vst::kNoParamId;  // a slot, not something to write to
 
         ParamInfo info;
         info.index = static_cast<std::int32_t>(paramCache_.size());
@@ -579,6 +580,11 @@ void Vst3Instance::refreshParameterCache() {
         info.discrete = raw.stepCount > 0 ||
                         (raw.flags & Steinberg::Vst::ParameterInfo::kIsList) != 0;
         info.boolean_ = raw.stepCount == 1;
+        info.hidden = !described || (raw.flags & Steinberg::Vst::ParameterInfo::kIsHidden) != 0;
+        info.readOnly = (raw.flags & Steinberg::Vst::ParameterInfo::kIsReadOnly) != 0;
+        info.isBypass = (raw.flags & Steinberg::Vst::ParameterInfo::kIsBypass) != 0;
+        info.isProgramChange = (raw.flags & Steinberg::Vst::ParameterInfo::kIsProgramChange) != 0;
+        if (info.hidden) info.automatable = false;  // automating book-keeping is undefined
         paramCache_.push_back(std::move(info));
         paramIds_.push_back(raw.id);
     }
@@ -588,10 +594,26 @@ std::vector<ParamInfo> Vst3Instance::params() {
     if (controller_) {
         // Values move under us (automation, presets, the editor); names and flags do not.
         for (std::size_t i = 0; i < paramCache_.size(); ++i) {
+            if (paramIds_[i] == Steinberg::Vst::kNoParamId) continue;
             paramCache_[i].value = controller_->getParamNormalized(paramIds_[i]);
+            paramCache_[i].text = paramCache_[i].hidden
+                                      ? std::string()
+                                      : paramText(static_cast<std::int32_t>(i), paramCache_[i].value);
         }
     }
     return paramCache_;
+}
+
+std::string Vst3Instance::paramText(std::int32_t index, double normalizedValue) {
+    if (!controller_ || index < 0 || static_cast<std::size_t>(index) >= paramIds_.size()) return {};
+    if (paramIds_[static_cast<std::size_t>(index)] == Steinberg::Vst::kNoParamId) return {};
+    const double value = normalizedValue < 0.0 ? 0.0 : (normalizedValue > 1.0 ? 1.0 : normalizedValue);
+    Steinberg::Vst::String128 text{};
+    if (controller_->getParamStringByValue(paramIds_[static_cast<std::size_t>(index)], value, text) !=
+        Steinberg::kResultOk) {
+        return {};
+    }
+    return fromVstString(text, sizeof(text) / sizeof(text[0]));
 }
 
 std::int32_t Vst3Instance::indexForParamId(Steinberg::Vst::ParamID id) const {
@@ -611,6 +633,7 @@ void Vst3Instance::pushEditToProcessor(Steinberg::Vst::ParamID id, double value)
 void Vst3Instance::setParamNormalized(std::int32_t index, double value) {
     if (index < 0 || static_cast<std::size_t>(index) >= paramIds_.size()) return;
     const Steinberg::Vst::ParamID id = paramIds_[static_cast<std::size_t>(index)];
+    if (id == Steinberg::Vst::kNoParamId) return;  // a slot the controller would not describe
 
     // The processor is the thing making sound, so it hears about this through the block's
     // parameter changes; the controller has to be told separately or an open editor will not

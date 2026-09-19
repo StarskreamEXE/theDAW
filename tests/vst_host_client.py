@@ -369,6 +369,11 @@ class HostClient:
         self.control("get_params")
         return self.recv_event("params", allow=UNSOLICITED)["list"]
 
+    def param_text(self, index: int, value: float) -> dict[str, Any]:
+        """The plugin's own display string for `value` of parameter `index`."""
+        self.control("param_text", index=index, value=value)
+        return self.recv_event("param_text", allow=UNSOLICITED)
+
     def get_state(self) -> str:
         self.control("get_state")
         return self.recv_event("state", allow=UNSOLICITED)["state_b64"]

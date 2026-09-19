@@ -53,6 +53,7 @@ public:
     PrepareResult reprepare() override;
     void release() override;
     std::vector<ParamInfo> params() override;
+    std::string paramText(std::int32_t index, double normalizedValue) override;
     bool getState(std::vector<std::uint8_t>& out, std::string& error) override;
     bool setState(const std::uint8_t* data, std::size_t size, std::string& error) override;
     // Truthful per instance: we can only claim one blob serves both the live host and the

@@ -438,6 +438,34 @@ void Session::handleOp(const json::Value& message, const std::string& op) {
         return;
     }
 
+    if (op == "param_text") {
+        // The plugin's own words for a value, for a parameter UI that is dragging a slider.
+        const json::Value* indexValue = message.find("index");
+        const json::Value* valueValue = message.find("value");
+        if (indexValue == nullptr || !indexValue->isNumber() || valueValue == nullptr ||
+            !valueValue->isNumber()) {
+            sendError("param_text needs a numeric \"index\" and \"value\"", false);
+            return;
+        }
+        const int32_t index = static_cast<int32_t>(indexValue->number);
+        const double value = std::clamp(valueValue->number, 0.0, 1.0);
+        std::string text;
+        const unsigned long fault = util::guarded([&] { text = instance->paramText(index, value); });
+        if (fault != 0) {
+            reportPluginFault("the plugin faulted while formatting a parameter value");
+            return;
+        }
+        json::Writer writer;
+        writer.beginObject()
+            .strField("ev", "param_text")
+            .intField("index", index)
+            .numField("value", value)
+            .strField("text", text)
+            .endObject();
+        sendText(writer.take());
+        return;
+    }
+
     if (op == "set_param") {
         const json::Value* indexValue = message.find("index");
         const json::Value* nameValue = message.find("name");
@@ -661,6 +689,11 @@ void Session::sendParams() {
             .boolField("automatable", info.automatable)
             .boolField("discrete", info.discrete)
             .boolField("boolean", info.boolean_)
+            .boolField("hidden", info.hidden)
+            .boolField("read_only", info.readOnly)
+            .boolField("bypass", info.isBypass)
+            .boolField("program_change", info.isProgramChange)
+            .strField("text", info.text)
             .endObject();
     }
     writer.endArray().endObject();
@@ -740,11 +773,17 @@ void Session::flushParamEchoes(bool force) {
         }
         echo.pending = false;
         echo.lastSentMs = now;
+        // With the plugin's own words for the value, so a parameter UI never formats one itself.
+        std::string text;
+        if (IPluginInstance* instance = plugin_.get()) {
+            util::guarded([&] { text = instance->paramText(entry.first, echo.value); });
+        }
         json::Writer writer;
         writer.beginObject()
             .strField("ev", "param")
             .intField("index", entry.first)
             .numField("value", echo.value)
+            .strField("text", text)
             .endObject();
         sendText(writer.take());
     }

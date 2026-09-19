@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 
 #include "../plugin/IPluginInstance.h"
@@ -91,9 +92,17 @@ public:
             info.automatable = true;
             info.discrete = false;
             info.boolean_ = false;
+            info.text = paramText(i, info.value);
             out.push_back(std::move(info));
         }
         return out;
+    }
+
+    std::string paramText(int32_t index, double normalizedValue) override {
+        if (index < 0 || index >= kParamCount) return {};
+        char buffer[32];
+        std::snprintf(buffer, sizeof(buffer), "%.2f", normalizedValue);
+        return buffer;
     }
 
     bool getState(std::vector<uint8_t>& out, std::string& error) override {
