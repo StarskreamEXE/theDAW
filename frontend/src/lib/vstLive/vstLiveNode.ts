@@ -348,9 +348,18 @@ export function createVstLiveNode(
       if (worklet !== node) return;
       failLive('AudioWorklet processor error');
     };
+    // The worklet counts the dropouts the listener actually HEARS: a quantum it had to fill with
+    // silence because no processed block had arrived in time (`underruns`, cumulative). Those are
+    // what a main-thread stall causes, and they used to be posted here and ignored — the row's
+    // dropout count only showed the host's own late blocks, so a glitching plugin looked clean.
+    let reportedUnderruns = 0;
     node.port.onmessage = (ev: MessageEvent) => {
-      const data = ev.data as { type?: string } | undefined;
+      const data = ev.data as { type?: string; underruns?: number } | undefined;
       if (data?.type === 'block') onBlockFromWorklet(data as never);
+      else if (data?.type === 'stats' && typeof data.underruns === 'number' && data.underruns > reportedUnderruns) {
+        useVstLiveStore.getState().addXruns(entry.id, data.underruns - reportedUnderruns);
+        reportedUnderruns = data.underruns;
+      }
     };
     input.connect(node);
     node.connect(wet);

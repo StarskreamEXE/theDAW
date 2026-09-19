@@ -302,6 +302,16 @@ const ctxOf = () => new FakeCtx() as unknown as BaseAudioContext;
   assert.ok(edges.has('G4->G3'), 'and on to the output');
   assert.ok(edges.has('G1->G2'), 'the dry path is still connected during the crossfade');
 
+  // The worklet reports the dropouts the listener HEARS (quanta it had to silence), cumulatively.
+  // They land on the row's dropout count as deltas, so a repeat of the same total adds nothing.
+  const port = (FakeWorklet.made[0] as unknown as { port: FakePort }).port;
+  port.onmessage?.({ data: { type: 'stats', underruns: 3, overflows: 0 } });
+  assert.equal(useVstLiveStore.getState().entries.a?.xruns, 3, 'three silenced quanta are three dropouts on the row');
+  port.onmessage?.({ data: { type: 'stats', underruns: 3, overflows: 1 } });
+  assert.equal(useVstLiveStore.getState().entries.a?.xruns, 3, 'the same cumulative total is not counted twice');
+  port.onmessage?.({ data: { type: 'stats', underruns: 5, overflows: 1 } });
+  assert.equal(useVstLiveStore.getState().entries.a?.xruns, 5);
+
   inst.dispose();
   assert.deepEqual(reg.released, ['a'], 'dispose starts the grace timer instead of killing the plugin');
   assert.deepEqual([...edges], [], 'and tears the graph down');
