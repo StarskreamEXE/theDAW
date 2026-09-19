@@ -750,7 +750,7 @@ export const LibraryPicker: React.FC<LibraryPickerProps> = ({
       >
         {error && (
           <div className="m-1 px-2 py-2 rounded border border-red-500/40 bg-red-500/10 text-[9px] text-red-200 flex flex-col gap-1.5">
-            <span className="break-words">Could not load {TAB_LABEL[tab]}: {error}</span>
+            <span className="wrap-break-word">Could not load {TAB_LABEL[tab]}: {error}</span>
             <button
               type="button"
               onClick={() => refresh(tab, true)}

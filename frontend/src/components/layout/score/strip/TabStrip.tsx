@@ -212,7 +212,7 @@ export const TabStrip: React.FC<TabStripProps> = ({ artifact, entry }) => {
       <div className="relative flex-1 min-h-0">
         <div
           ref={scrollRef}
-          className="h-full overflow-x-auto overflow-y-auto bg-white text-black flex flex-col [justify-content:safe_center]"
+          className="h-full overflow-x-auto overflow-y-auto bg-white text-black flex flex-col justify-center-safe"
           role="region"
           aria-label="Tab strip"
         >

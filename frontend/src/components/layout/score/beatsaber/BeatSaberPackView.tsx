@@ -77,7 +77,7 @@ export const BeatSaberPackView: React.FC<BeatSaberPackViewProps> = ({ artifact, 
           <dt className="text-zinc-500">FORMAT</dt>
           <dd>{meta.version ? `v${meta.version}${meta.version === 2 ? ' (widest tool support)' : ''}` : 'unknown'}</dd>
           <dt className="text-zinc-500">PARTS</dt>
-          <dd className="break-words">{meta.parts.length > 0 ? meta.parts.join(', ') : 'every pitched part'}</dd>
+          <dd className="wrap-break-word">{meta.parts.length > 0 ? meta.parts.join(', ') : 'every pitched part'}</dd>
           <dt className="text-zinc-500">AUDIO</dt>
           <dd>
             {meta.songOgg ? (

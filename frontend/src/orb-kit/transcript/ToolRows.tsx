@@ -68,12 +68,12 @@ export function PlainToolRow({ tool }: { tool: ToolCallEntry }) {
             {/* Always rendered, toggled with `hidden`: aria-controls must point at
                 an element that EXISTS, or assistive tech resolves it to nothing. */}
             <div id={bodyId} hidden={!open} className="border-t border-white/5 bg-black/20">
-                <pre className="p-2.5 m-0 text-zinc-400 max-h-40 overflow-auto whitespace-pre-wrap break-words select-all">
+                <pre className="p-2.5 m-0 text-zinc-400 max-h-40 overflow-auto whitespace-pre-wrap wrap-break-word select-all">
                     {prettyInput}
                 </pre>
                 {resultText && (
                     <pre
-                        className={`p-2.5 m-0 max-h-48 overflow-auto whitespace-pre-wrap break-words select-all border-t border-white/5 ${
+                        className={`p-2.5 m-0 max-h-48 overflow-auto whitespace-pre-wrap wrap-break-word select-all border-t border-white/5 ${
                             tool.isError ? 'text-red-300' : 'text-emerald-200/80'
                         }`}
                     >
@@ -148,7 +148,7 @@ export function DiffToolRow({ tool }: { tool: ToolCallEntry }) {
                         {shown.map((row, index) => (
                             <div
                                 key={index}
-                                className={`px-2.5 whitespace-pre-wrap break-words ${
+                                className={`px-2.5 whitespace-pre-wrap wrap-break-word ${
                                     row.type === 'add'
                                         ? 'bg-emerald-500/10 text-emerald-300'
                                         : row.type === 'del'
@@ -168,7 +168,7 @@ export function DiffToolRow({ tool }: { tool: ToolCallEntry }) {
                             </div>
                         )}
                         {tool.isError && tool.result && (
-                            <pre className="p-2.5 m-0 text-red-300 max-h-40 overflow-auto whitespace-pre-wrap break-words border-t border-white/5">
+                            <pre className="p-2.5 m-0 text-red-300 max-h-40 overflow-auto whitespace-pre-wrap wrap-break-word border-t border-white/5">
                                 {tool.result}
                             </pre>
                         )}

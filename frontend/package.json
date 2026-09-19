@@ -12,7 +12,7 @@
     "build:orb": "vite build --config vite.orb.config.ts",
     "preview": "vite preview",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit",
+    "lint": "tsc --noEmit && node scripts/check-canonical-classes.mjs",
     "lint:scripts": "tsc --noEmit -p scripts/tsconfig.json",
     "screenshots": "tsx ../scripts/screenshots/capture.ts",
     "docs:coverage": "tsx ../scripts/screenshots/featureCoverage.ts",
@@ -29,7 +29,9 @@
     "test:orb": "tsx src/orb-kit/actionHandlers.test.ts && tsx src/orb-kit/appContext.test.ts && tsx src/orb-kit/assistantEvents.test.ts && tsx src/orb-kit/promptEnhancer.test.ts",
     "test:generate": "tsx src/state/generateStore.test.ts && tsx src/state/spectrogramRequest.test.ts",
     "test:import-audio": "tsx src/lib/importAudioFiles.test.ts",
-    "test:library-drop": "tsx src/lib/libraryDrop.test.ts"
+    "test:library-drop": "tsx src/lib/libraryDrop.test.ts",
+    "lint:classes": "node scripts/check-canonical-classes.mjs",
+    "fix:classes": "node scripts/check-canonical-classes.mjs --fix"
   },
   "allowScripts": [
     "@google/genai",

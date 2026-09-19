@@ -134,7 +134,7 @@ export function AgentToolCard({ tool }: { tool: ToolCallEntry }) {
                         )}
                         {tool.result && (
                             <div
-                                className={`px-2 py-1.5 rounded text-[10px] whitespace-pre-wrap break-words ${
+                                className={`px-2 py-1.5 rounded text-[10px] whitespace-pre-wrap wrap-break-word ${
                                     tool.isError ? 'text-red-300 bg-red-500/10' : 'text-zinc-400 bg-white/5'
                                 }`}
                             >

@@ -616,7 +616,7 @@ export const CORNER_CHEVRON_VIEWBOX = '1.5 4.5 18 18';
  * corner's well, so it stays near the centre line the rail's other glyphs share.
  * Pass on the lucide icon.
  */
-export const CORNER_CLEAR_GLYPH = '-translate-x-0.5 translate-y-0.25';
+export const CORNER_CLEAR_GLYPH = '-translate-x-0.5 translate-y-px';
 
 /** Remembered on/off preference; storage can be blocked, so every access is guarded. */
 export function useStoredToggle(key: string, initial: boolean): [boolean, (next: boolean) => void] {

@@ -710,7 +710,7 @@ export const FxChainList: React.FC<FxChainListProps> = ({
         // does not show, and a cut-off list then reads as the whole chain.
         <div
           ref={rowsRef}
-          className={`flex flex-col gap-1 ${scrollRows ? 'min-h-7 overflow-y-auto pr-0.5 [scrollbar-width:thin] [scrollbar-color:rgba(168,85,247,0.8)_rgba(255,255,255,0.08)]' : ''}`}
+          className={`flex flex-col gap-1 ${scrollRows ? 'min-h-7 overflow-y-auto pr-0.5 scrollbar-thin [scrollbar-color:rgba(168,85,247,0.8)_rgba(255,255,255,0.08)]' : ''}`}
         >
           {chain.map((entry, i) => {
             const kind = entryKind(entry);
