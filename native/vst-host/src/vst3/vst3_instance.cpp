@@ -237,22 +237,52 @@ bool Vst3Instance::negotiateBuses(std::vector<std::string>& warnings, std::strin
 
     const Steinberg::Vst::SpeakerArrangement wanted = arrangementForChannels(config_.requestedChannels);
 
-    // Ask for the requested layout on the main bus of each direction and nothing at all on the
-    // rest: an aux/sidechain input a live chain never feeds should not cost the plugin anything.
-    std::vector<Steinberg::Vst::SpeakerArrangement> inputArrangements(
-        static_cast<std::size_t>(std::max(0, inputBusCount)), 0);
-    std::vector<Steinberg::Vst::SpeakerArrangement> outputArrangements(
-        static_cast<std::size_t>(outputBusCount), 0);
+    // The way JUCE's VST3 host negotiates (prepareToPlay / syncBusLayouts):
+    //  - EVERY bus is handed a real arrangement. The main bus of each direction gets the layout
+    //    the engine wants; every other bus keeps the one the plugin already has for it. This host
+    //    used to pass 0 for those, and a plugin that validates the whole array refuses a 0 on a
+    //    bus it declares as stereo — taking the main bus request down with it.
+    //  - setBusArrangements never sees a null pointer: some plugins crash on one.
+    //  - What the plugin ends up with is read back and compared with what was asked.
+    auto currentArrangements = [&](Steinberg::Vst::BusDirection direction, std::int32_t count) {
+        std::vector<Steinberg::Vst::SpeakerArrangement> out(static_cast<std::size_t>(std::max(0, count)), 0);
+        for (std::int32_t i = 0; i < count; ++i) {
+            Steinberg::Vst::SpeakerArrangement current = 0;
+            if (processor_->getBusArrangement(direction, i, current) == Steinberg::kResultOk) {
+                out[static_cast<std::size_t>(i)] = current;
+            }
+        }
+        return out;
+    };
+    auto apply = [&](std::vector<Steinberg::Vst::SpeakerArrangement>& ins,
+                     std::vector<Steinberg::Vst::SpeakerArrangement>& outs) {
+        Steinberg::Vst::SpeakerArrangement none = 0;
+        return processor_->setBusArrangements(ins.empty() ? &none : ins.data(),
+                                              static_cast<Steinberg::int32>(ins.size()),
+                                              outs.empty() ? &none : outs.data(),
+                                              static_cast<Steinberg::int32>(outs.size()));
+    };
+
+    std::vector<Steinberg::Vst::SpeakerArrangement> inputArrangements =
+        currentArrangements(Steinberg::Vst::kInput, inputBusCount);
+    std::vector<Steinberg::Vst::SpeakerArrangement> outputArrangements =
+        currentArrangements(Steinberg::Vst::kOutput, outputBusCount);
     if (!inputArrangements.empty()) inputArrangements[0] = wanted;
     outputArrangements[0] = wanted;
 
-    const Steinberg::tresult negotiated = processor_->setBusArrangements(
-        inputArrangements.empty() ? nullptr : inputArrangements.data(), inputBusCount,
-        outputArrangements.data(), outputBusCount);
-
-    if (negotiated != Steinberg::kResultOk) {
-        // Refused. Take whatever the plugin already prefers rather than guessing again — the
-        // engine is told the real channel counts and adapts.
+    const Steinberg::tresult negotiated = apply(inputArrangements, outputArrangements);
+    const bool took = negotiated == Steinberg::kResultOk &&
+                      currentArrangements(Steinberg::Vst::kInput, inputBusCount) == inputArrangements &&
+                      currentArrangements(Steinberg::Vst::kOutput, outputBusCount) == outputArrangements;
+    if (!took) {
+        // Refused, or accepted and then not applied. Confirm the layout the plugin itself reports
+        // — explicitly, because some plugins will not activate until ONE setBusArrangements call
+        // has succeeded — and let the engine adapt to the real channel counts.
+        std::vector<Steinberg::Vst::SpeakerArrangement> ownIn =
+            currentArrangements(Steinberg::Vst::kInput, inputBusCount);
+        std::vector<Steinberg::Vst::SpeakerArrangement> ownOut =
+            currentArrangements(Steinberg::Vst::kOutput, outputBusCount);
+        apply(ownIn, ownOut);
         warnings.push_back("this plugin would not take a " +
                            std::to_string(config_.requestedChannels) +
                            "-channel layout; using its own preferred bus layout instead");
@@ -271,9 +301,10 @@ bool Vst3Instance::negotiateBuses(std::vector<std::string>& warnings, std::strin
             const std::int32_t fromArrangement = channelsInArrangement(actual);
             if (fromArrangement > 0) plan.channels = fromArrangement;
         }
-        // Only bus 0 carries the chain signal. Everything else is deactivated; a plugin that
-        // insists on keeping it alive still gets silence, never uninitialised memory.
-        plan.active = index == 0;
+        // Bus 0 carries the chain signal. Any other bus follows the plugin's own default, as it
+        // does in JUCE (BusInfo::kDefaultActive): an aux bus the plugin expects to be on is on,
+        // fed silence on the way in and drained into scratch on the way out.
+        plan.active = index == 0 || (busInfo.flags & Steinberg::Vst::BusInfo::kDefaultActive) != 0;
         return plan;
     };
 
@@ -292,11 +323,12 @@ bool Vst3Instance::negotiateBuses(std::vector<std::string>& warnings, std::strin
     // plugins skip their own parameter smoothing.
     const std::int32_t eventIn = component_->getBusCount(Steinberg::Vst::kEvent, Steinberg::Vst::kInput);
     const std::int32_t eventOut = component_->getBusCount(Steinberg::Vst::kEvent, Steinberg::Vst::kOutput);
+    // ALL of them, both directions (JUCE: setStateForAllMidiBuses), and off again at teardown.
     for (std::int32_t i = 0; i < eventIn; ++i) {
-        component_->activateBus(Steinberg::Vst::kEvent, Steinberg::Vst::kInput, i, i == 0);
+        component_->activateBus(Steinberg::Vst::kEvent, Steinberg::Vst::kInput, i, true);
     }
     for (std::int32_t i = 0; i < eventOut; ++i) {
-        component_->activateBus(Steinberg::Vst::kEvent, Steinberg::Vst::kOutput, i, i == 0);
+        component_->activateBus(Steinberg::Vst::kEvent, Steinberg::Vst::kOutput, i, true);
     }
 
     channelsIn_ = inputBuses_.empty() ? 0 : inputBuses_.front().channels;
@@ -499,6 +531,15 @@ void Vst3Instance::tearDownProcessing() {
     }
     if (active_.exchange(false, std::memory_order_acq_rel) && component_) {
         component_->setActive(false);
+        // The mirror of the activation in negotiateBuses (JUCE's deactivate() does the same).
+        const std::int32_t eventIn = component_->getBusCount(Steinberg::Vst::kEvent, Steinberg::Vst::kInput);
+        const std::int32_t eventOut = component_->getBusCount(Steinberg::Vst::kEvent, Steinberg::Vst::kOutput);
+        for (std::int32_t i = 0; i < eventIn; ++i) {
+            component_->activateBus(Steinberg::Vst::kEvent, Steinberg::Vst::kInput, i, false);
+        }
+        for (std::int32_t i = 0; i < eventOut; ++i) {
+            component_->activateBus(Steinberg::Vst::kEvent, Steinberg::Vst::kOutput, i, false);
+        }
     }
     prepared_ = false;
 }
