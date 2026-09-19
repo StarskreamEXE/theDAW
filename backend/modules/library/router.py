@@ -30,6 +30,7 @@ the player to scrub) and there's no in-memory copy of large files.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -620,6 +621,79 @@ def get_entry_audio_path(entry_id: str) -> dict[str, Any]:
     return {"id": entry_id, "path": str(audio_path.resolve())}
 
 
+# Containers Chromium's media stack has no demuxer for. An <audio> pointed at
+# one fails with DEMUXER_ERROR_COULD_NOT_OPEN and the UI reports "no supported
+# sources" — verified on Chrome 152, where canPlayType('audio/aiff') is "".
+# AIFF is the one that bites here (a whole DJ performance-set library is .aiff),
+# but the rule is the check, not the list.
+_BROWSER_UNPLAYABLE_SUFFIXES = frozenset({".aiff", ".aif", ".aifc", ".wma", ".ape"})
+# Remuxed copies live beside the entry, in their own folder so they can never be
+# mistaken for the source and never match AUDIO_EXTS scans of the entry dir.
+_PLAYABLE_CACHE_DIRNAME = "_playable"
+
+
+def _playable_audio(audio_path: Path, entry_dir: Optional[Path]) -> tuple[Path, str]:
+    """``(path, media_type)`` the browser can actually open.
+
+    libsndfile reads AIFF natively, so the fix is a remux to WAV — both are
+    PCM, so only the header and the byte order change. Nothing is re-encoded
+    and no bit depth is lost; the source's own subtype is carried over.
+
+    Cached next to the entry, so a file costs this once rather than once per
+    play, and re-done if the source is ever replaced. Any failure falls back
+    to serving the original: a file the browser refuses is no worse than one
+    that 500s, and the log says which happened.
+    """
+    guessed = mimetypes.guess_type(str(audio_path))[0] or "audio/wav"
+    if audio_path.suffix.lower() not in _BROWSER_UNPLAYABLE_SUFFIXES:
+        return audio_path, guessed
+
+    cache_dir = (entry_dir or audio_path.parent) / _PLAYABLE_CACHE_DIRNAME
+    cached = cache_dir / f"{audio_path.stem}.wav"
+    try:
+        if cached.is_file() and cached.stat().st_mtime >= audio_path.stat().st_mtime:
+            return cached, "audio/wav"
+    except OSError:
+        pass
+
+    try:
+        import soundfile as sf
+
+        from backend.lib.audio_io import load_audio_array, save_audio
+
+        # Keep 24-bit masters 24-bit; only bump 8/16-bit sources to PCM_16.
+        try:
+            src_subtype = str(sf.info(str(audio_path)).subtype or "")
+        except Exception:  # noqa: BLE001 — the read below is the real gate
+            src_subtype = ""
+        subtype = (
+            "PCM_24"
+            if any(w in src_subtype for w in ("24", "32", "FLOAT"))
+            else "PCM_16"
+        )
+
+        data, sr = load_audio_array(audio_path)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        # Write to a sibling then rename: a half-written file is never served.
+        staging = cached.with_suffix(".wav.part")
+        save_audio(staging, data, sr, format="wav", subtype=subtype)
+        staging.replace(cached)
+        log.info(
+            "library: remuxed %s -> %s (%s) for browser playback",
+            audio_path.name,
+            cached.name,
+            subtype,
+        )
+        return cached, "audio/wav"
+    except Exception as exc:  # noqa: BLE001 — fall back to the original, never 500
+        log.warning(
+            "library: could not remux %s for playback (%s); serving original",
+            audio_path.name,
+            exc,
+        )
+        return audio_path, guessed
+
+
 @router.get("/audio/{entry_id}")
 async def stream_audio(entry_id: str) -> Response:
     # CHANGED: support CDN-backed entries — if no local file exists but
@@ -627,11 +701,15 @@ async def stream_audio(entry_id: str) -> Response:
     store = get_store()
     audio_path = store.get_audio_path(entry_id)
     if audio_path is not None and audio_path.is_file():
-        mime, _ = mimetypes.guess_type(str(audio_path))
+        # Decoding a long AIFF is seconds of blocking work; off the event loop
+        # it goes, or every other request on the server stalls behind it.
+        served, media_type = await asyncio.to_thread(
+            _playable_audio, audio_path, store._dir_for(entry_id)
+        )
         return FileResponse(
-            path=str(audio_path),
-            media_type=mime or "audio/wav",
-            filename=audio_path.name,
+            path=str(served),
+            media_type=media_type,
+            filename=served.name,
         )
     # No local file — check for a CDN URL in metadata.
     # CHANGED: on first CDN fetch, persist the MP3 locally so subsequent

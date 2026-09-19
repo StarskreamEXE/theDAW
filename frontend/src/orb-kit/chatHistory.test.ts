@@ -48,26 +48,28 @@ import {
     setActiveId,
     deriveTitle,
     clearAllConversations,
+    conversationNeedsWrite,
     type StoredConversation,
 } from './chatHistory.ts';
+import type { ChatMessage } from './stream/types.ts';
 
 /** Mirrors the (unexported) key in chatHistory.ts — lets a test read raw. */
 const CONV_KEY = 'thedaw:orb:conversations:v1';
 
+function msg(id: string, role: 'user' | 'assistant', text: string): ChatMessage {
+    return { id, role, text, timestamp: 1_700_000_000_000 };
+}
+
 function conv(id: string, firstUser: string, updatedAt: number): StoredConversation {
     return {
         id,
-        title: deriveTitle([
-            { id: 'u', role: 'user', content: firstUser, timestamp: new Date() } as never,
-        ]),
-        messages: [
-            { id: 'u', role: 'user', content: firstUser, timestamp: new Date() } as never,
-            { id: 'a', role: 'assistant', content: 'ok', timestamp: new Date() } as never,
-        ],
+        title: deriveTitle([msg('u', 'user', firstUser)]),
+        messages: [msg('u', 'user', firstUser), msg('a', 'assistant', 'ok')],
         provider: 'claude',
         model: 'claude-opus-4-6',
         claudeMode: 'interactive',
         sessionId: `sess-${id}`,
+        claudeSessionId: `cli-${id}`,
         createdAt: updatedAt,
         updatedAt,
     };
@@ -82,9 +84,11 @@ function rawStored(): unknown {
 localStorage.clear();
 
 // deriveTitle: first user line, trimmed
-assert.equal(deriveTitle([{ id: '1', role: 'user', content: 'Make a beat', timestamp: new Date() } as never]), 'Make a beat');
+assert.equal(deriveTitle([msg('1', 'user', 'Make a beat')]), 'Make a beat');
 assert.equal(deriveTitle([]), 'New chat');
-assert.ok(deriveTitle([{ id: '1', role: 'user', content: 'x'.repeat(80), timestamp: new Date() } as never]).endsWith('…'));
+assert.ok(deriveTitle([msg('1', 'user', 'x'.repeat(80))]).endsWith('…'));
+// A tool-only assistant turn has empty text; it must not become the title.
+assert.equal(deriveTitle([msg('1', 'assistant', ''), msg('2', 'user', 'Real prompt')]), 'Real prompt');
 
 // empty to start
 assert.deepEqual(loadConversations(), []);
@@ -97,9 +101,12 @@ assert.equal(all.length, 2);
 assert.equal(all[0].id, 'b', 'newest updatedAt sorts first');
 assert.equal(all[1].id, 'a');
 assert.equal(all[0].sessionId, 'sess-b');
+assert.equal(all[0].claudeSessionId, 'cli-b', 'the CLI resume id round-trips alongside the conversation id');
+assert.equal(all[0].claudeMode, 'interactive', 'the Claude mode is restored with the chat that ran in it');
 
-// messages revive to Date instances
-assert.ok(all[0].messages[0].timestamp instanceof Date, 'timestamp revived to Date');
+// timestamps are epoch millis on the wire and in memory — no Date revival
+assert.equal(typeof all[0].messages[0].timestamp, 'number', 'timestamp stays a number');
+assert.equal(all[0].messages[0].text, 'second chat');
 
 // replace by id (not duplicate)
 upsertConversation(conv('a', 'first chat edited', 3000));
@@ -231,9 +238,10 @@ localStorage.setItem(
             id: 'x',
             title: 'corrupt',
             messages: [
-                { id: 'm', role: 'user', content: 42, timestamp: 'not-a-date' },
+                { id: 'm', role: 'user', text: 42, timestamp: 'not-a-date' },
                 null,
-                { id: 'n', role: 'assistant', content: 'ok' },
+                { id: 'n', role: 'assistant', text: 'ok' },
+                { id: 'o', role: 'wat', text: 'odd role' },
             ],
             provider: 'claude',
             model: 'claude-opus-4-6',
@@ -245,12 +253,143 @@ localStorage.setItem(
     ]),
 );
 const revived = loadConversations()[0].messages;
-assert.equal(revived.length, 2, 'null messages are dropped');
-assert.equal(typeof revived[0].content, 'string', 'non-string content is coerced');
-assert.equal(revived[0].content, '42');
-assert.ok(revived[0].timestamp instanceof Date);
-assert.ok(!Number.isNaN(revived[0].timestamp.getTime()), 'an unparseable timestamp is not Invalid Date');
-assert.ok(!Number.isNaN(revived[1].timestamp.getTime()), 'a missing timestamp is not Invalid Date');
+assert.equal(revived.length, 3, 'null messages are dropped');
+assert.equal(typeof revived[0].text, 'string', 'non-string text is coerced');
+assert.equal(revived[0].text, '42');
+assert.equal(typeof revived[0].timestamp, 'number');
+assert.ok(Number.isFinite(revived[0].timestamp), 'an unparseable timestamp is not NaN');
+assert.ok(Number.isFinite(revived[1].timestamp), 'a missing timestamp is not NaN');
+assert.equal(revived[2].role, 'assistant', 'an unknown role falls back to assistant, never renders as the user');
+
+// --- transcripts written by the OLD panel shape still load ---------------
+// The pre-port panel stored `content` and an ISO-string Date. Those chats are
+// on real machines right now; losing them on upgrade is not acceptable.
+localStorage.clear();
+localStorage.setItem(
+    CONV_KEY,
+    JSON.stringify([
+        {
+            id: 'legacy',
+            title: 'legacy chat',
+            messages: [
+                { id: 'u', role: 'user', content: 'old prompt', timestamp: '2026-01-02T03:04:05.000Z' },
+                { id: 'a', role: 'assistant', content: 'old reply', timestamp: '2026-01-02T03:04:06.000Z' },
+            ],
+            provider: 'claude',
+            model: 'claude-opus-4-6',
+            claudeMode: 'interactive',
+            sessionId: 'sess-legacy',
+            createdAt: 1,
+            updatedAt: 1,
+        },
+    ]),
+);
+const legacy = loadConversations()[0].messages;
+assert.equal(legacy.length, 2);
+assert.equal(legacy[0].text, 'old prompt', 'legacy `content` migrates to `text`');
+assert.equal(legacy[1].text, 'old reply');
+assert.equal(legacy[0].timestamp, Date.parse('2026-01-02T03:04:05.000Z'), 'an ISO timestamp becomes epoch millis');
+
+// --- tool calls and turn meta survive a round-trip ------------------------
+// A tool-only turn is ALL tools and no prose. If toolCalls/meta were dropped
+// on persist, reloading would show a blank row with nothing in it.
+localStorage.clear();
+BUDGET = Infinity;
+const toolTurn: ChatMessage = {
+    id: 't',
+    role: 'assistant',
+    text: '',
+    thinking: 'considering',
+    toolCalls: [{ toolId: 'tc1', name: 'Read', inputJson: '{"file_path":"a.ts"}', status: 'success', result: 'ok' }],
+    meta: { inTokens: 10, outTokens: 3, costUsd: 0.01, durationMs: 1234 },
+    pendingActions: [{ type: 'generate', payload: {}, callId: 'dead-call', description: 'Generate audio' }],
+    timestamp: 1_700_000_000_000,
+};
+upsertConversation({ ...conv('tools', 'run a tool', 7000), messages: [msg('u', 'user', 'run a tool'), toolTurn] });
+const storedTurn = getConversation('tools')!.messages[1];
+assert.equal(storedTurn.text, '');
+assert.equal(storedTurn.thinking, 'considering');
+assert.equal(storedTurn.toolCalls?.length, 1, 'tool calls persist');
+assert.equal(storedTurn.toolCalls?.[0].name, 'Read');
+assert.equal(storedTurn.meta?.inTokens, 10, 'turn meta persists');
+assert.equal(storedTurn.toolCalls?.[0].status, 'success', 'a finished tool keeps its status');
+
+// --- a tool still 'executing' when the tab closed never finishes -----------
+// Nothing will ever deliver its tool_result, so restoring it as 'executing'
+// leaves a spinner turning forever in a transcript that is not streaming.
+localStorage.clear();
+BUDGET = Infinity;
+upsertConversation({
+    ...conv('interrupted', 'run a tool', 8000),
+    messages: [
+        msg('u', 'user', 'run a tool'),
+        {
+            id: 'a',
+            role: 'assistant',
+            text: '',
+            toolCalls: [
+                { toolId: 'live', name: 'Bash', inputJson: '{}', status: 'executing' },
+                {
+                    toolId: 'agent',
+                    name: 'Task',
+                    inputJson: '{}',
+                    status: 'executing',
+                    subCalls: [{ toolId: 'sub', name: 'Read', inputJson: '{}', status: 'executing' }],
+                },
+            ],
+            timestamp: 1_700_000_000_000,
+        },
+    ],
+});
+const interrupted = getConversation('interrupted')!.messages[1].toolCalls!;
+assert.equal(interrupted[0].status, 'error', 'an unfinished tool revives as an error, not a live spinner');
+assert.equal(interrupted[0].isError, true);
+assert.equal(interrupted[0].result, 'Interrupted before completion');
+assert.equal(interrupted[1].status, 'error', 'the same holds for a sub-agent card');
+assert.equal(interrupted[1].subCalls?.[0].status, 'error', 'and for its nested calls');
+assert.equal(interrupted[1].subCalls?.[0].result, 'Interrupted before completion');
+assert.equal(
+    storedTurn.pendingActions,
+    undefined,
+    'a parked T2 action is NOT persisted — its relay callId is dead after a reload',
+);
+
+// --- conversationNeedsWrite: the no-op guard -----------------------------
+const base = conv('guard', 'hello', 1000);
+assert.equal(conversationNeedsWrite(null, []), false, 'an empty transcript is never written');
+assert.equal(conversationNeedsWrite(base, []), false);
+assert.equal(conversationNeedsWrite(null, base.messages), true, 'a brand new conversation is written');
+assert.equal(conversationNeedsWrite(base, base.messages), false, 'an identical snapshot is a no-op');
+assert.equal(
+    conversationNeedsWrite(base, [...base.messages, msg('c', 'user', 'more')]),
+    true,
+    'an appended message is written',
+);
+assert.equal(
+    conversationNeedsWrite(base, [base.messages[0], { ...base.messages[1], text: 'changed' }]),
+    true,
+    'edited text on the last message is written',
+);
+assert.equal(
+    conversationNeedsWrite(base, [base.messages[0], { ...base.messages[1], isError: true }]),
+    true,
+    'the error flag turning on is written',
+);
+// Text is not the whole message any more: a tool-only turn holds its content
+// in toolCalls/meta, so comparing prose alone would call it unchanged.
+assert.equal(
+    conversationNeedsWrite(base, [
+        base.messages[0],
+        { ...base.messages[1], toolCalls: [{ toolId: 'x', name: 'Read', inputJson: '{}', status: 'success' }] },
+    ]),
+    true,
+    'tool activity added to the last turn is written',
+);
+assert.equal(
+    conversationNeedsWrite(base, [base.messages[0], { ...base.messages[1], meta: { inTokens: 1 } }]),
+    true,
+    'turn meta arriving is written',
+);
 
 localStorage.clear();
 BUDGET = Infinity;

@@ -25,7 +25,7 @@ import { useBottomPanelStore } from './state/bottomPanelStore';
 import { useAssistantActivityStore } from './state/assistantActivityStore';
 import { ASSISTANT_FOCUS_EVENT } from './state/assistantReferenceStore';
 import { logInfo, logWarn, useLogStore, type LogLevel } from './state/logStore';
-import { handletheDAWAction } from './orb-kit/actionHandlers';
+import { handletheDAWActionResult } from './orb-kit/actionHandlers';
 import { useStatusBarStore } from './state/statusBarStore';
 import { useLibraryStore } from './state/libraryStore';
 import { useModuleStore } from './state/moduleStore';
@@ -594,11 +594,15 @@ export default function App() {
     };
   }, []);
 
-  // Returns the result so the panel can print what actually happened. It used
-  // to log the message and swallow it, leaving the panel free to claim
-  // "Executed action: X" for a miss.
-  const handleAssistantAction = useCallback((action: { type: string; payload?: any }) => {
-    const result = handletheDAWAction(action);
+  // The host hook for a DAW action. It dispatches through the RESULT form so
+  // this log says what actually happened: the plain dispatcher answers with the
+  // message alone, which used to let a miss read as "Executed action: X".
+  // Awaited because the editor tools answer only once their audio re-render is
+  // done — without the await this logs "[object Promise]". The result is
+  // returned for hosts that read it; the assistant panel runs its own dispatch
+  // (calling this prop for a result would execute every action twice).
+  const handleAssistantAction = useCallback(async (action: { type: string; payload?: any }) => {
+    const result = await handletheDAWActionResult(action);
     logInfo('assistant', `Action: ${action.type} → ${result.ok ? 'ok' : 'FAILED'}: ${result.message}`);
     return result;
   }, []);

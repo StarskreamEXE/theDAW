@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 
-import { handletheDAWAction, handletheDAWActionMessage } from './actionHandlers.ts';
+import { handletheDAWActionMessage, handletheDAWActionResult } from './actionHandlers.ts';
 import { useEditorStore, type AudioClip, type EditorTrack } from '../state/editorStore.ts';
 
-// Every action now answers with {ok, message}. The panel prints that verbatim,
+// Every action answers with {ok, message} through handletheDAWActionResult (the editor tools
+// that run through the assistant's tool table answer asynchronously, hence the awaits).
+// The panel prints that verbatim,
 // so a branch that refused to act MUST say ok:false — the old code discarded
 // the string and claimed "Executed action: X" for a miss just as loudly as for
 // a hit.
@@ -61,14 +63,14 @@ const failures: Array<[string, Record<string, unknown> | undefined]> = [
 ];
 
 for (const [type, payload] of failures) {
-  const result = handletheDAWAction({ type, payload });
+  const result = await handletheDAWActionResult({ type, payload });
   assert.equal(result.ok, false, `${type} ${JSON.stringify(payload)} must report ok:false`);
   assert.ok(result.message.length > 0, `${type} must say why it failed`);
 }
 
 // A miss names what it could not find AND what is actually there, so the model
 // can retry against a real id instead of guessing again.
-const clipMiss = handletheDAWAction({ type: 'editor_remove_clip', payload: { clip_id: 'zz' } });
+const clipMiss = await handletheDAWActionResult({ type: 'editor_remove_clip', payload: { clip_id: 'zz' } });
 assert.match(clipMiss.message, /No clip "zz"\. Clips: C1 \(c1\)/);
 assert.ok(useEditorStore.getState().clips.some((c) => c.id === 'c1'), 'a failed remove removed nothing');
 
@@ -91,7 +93,7 @@ const successes: Array<[string, Record<string, unknown> | undefined]> = [
 ];
 
 for (const [type, payload] of successes) {
-  const result = handletheDAWAction({ type, payload });
+  const result = await handletheDAWActionResult({ type, payload });
   assert.equal(result.ok, true, `${type} ${JSON.stringify(payload)} must report ok:true`);
   assert.ok(result.message.length > 0, `${type} must say what it did`);
 }
@@ -101,9 +103,9 @@ assert.equal(useEditorStore.getState().bpm, 128, 'a success actually changed the
 // ── The string wrapper useOrbChat keeps using ─────────────────────────────
 fresh();
 assert.equal(
-  handletheDAWActionMessage({ type: 'editor_set_bpm', payload: { bpm: 90 } }),
-  handletheDAWAction({ type: 'editor_set_bpm', payload: { bpm: 90 } }).message,
+  await handletheDAWActionMessage({ type: 'editor_set_bpm', payload: { bpm: 90 } }),
+  (await handletheDAWActionResult({ type: 'editor_set_bpm', payload: { bpm: 90 } })).message,
 );
-assert.equal(typeof handletheDAWActionMessage({ type: 'not_a_real_action' }), 'string');
+assert.equal(typeof (await handletheDAWActionMessage({ type: 'not_a_real_action' })), 'string');
 
 console.log('actionHandlerResult: ok');

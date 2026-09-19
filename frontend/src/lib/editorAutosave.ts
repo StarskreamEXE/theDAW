@@ -2,7 +2,7 @@
  * EDIT autosave + crash recovery on a content-addressed OPFS asset layer.
  *
  * The arrangement's JSON side (tracks, clips minus bytes, FX chains,
- * automation, markers, bpm, loop) is written to
+ * automation, markers, bpm, meter, loop) is written to
  * `thedaw-editor-autosave/manifest.json` in the Origin Private File System,
  * debounced behind the editor store's own document-change signal. Clip audio —
  * the part a refresh used to destroy, since clips hold in-memory Blobs — is
@@ -56,6 +56,7 @@ import {
   type ClipTake,
   type EditorBus,
   type EditorTrack,
+  type TimeSignature,
 } from '../state/editorStore';
 import type { RoutingGraph } from '../state/routingGraph';
 import { captureLiveVstStates } from '../state/vstEditorStore';
@@ -98,6 +99,9 @@ interface AutosaveManifest {
   version: 1;
   savedAt: string;
   bpm: number;
+  /** Project meter. Optional on READ only: manifests written before the field
+   *  existed have none, and those documents are 4/4 by definition. */
+  timeSignature?: TimeSignature;
   tracks: SerializedTrack[];
   clips: SerializedClip[];
   masterFxChain: unknown[];
@@ -491,6 +495,7 @@ async function buildManifest(assets: FileSystemDirectoryHandle): Promise<Autosav
     version: 1,
     savedAt: new Date().toISOString(),
     bpm: s.bpm,
+    timeSignature: s.timeSignature,
     tracks,
     clips,
     masterFxChain: s.masterFxChain as unknown[],
@@ -717,10 +722,16 @@ async function restoreFromAutosave(): Promise<void> {
   // routing/buses go through loadProject rather than the setState below, so the
   // ONE migration path handles them: a manifest written before routing existed
   // passes `undefined` here and is migrated exactly like an old `.tasmo`.
+  //
+  // The meter is passed the same way, and for the mirror-image reason: a
+  // manifest with no meter predates the field, such a document is 4/4, and
+  // saying so explicitly beats letting it inherit whatever meter the session
+  // being replaced happened to hold.
   store.loadProject({
     tracks,
     clips,
     bpm: manifest.bpm,
+    timeSignature: manifest.timeSignature ?? { num: 4, den: 4 },
     routing: manifest.routing,
     buses: manifest.buses,
   });
@@ -807,6 +818,7 @@ export function initEditorAutosave(): void {
       state.automationLanes === prev.automationLanes &&
       state.markers === prev.markers &&
       state.bpm === prev.bpm &&
+      state.timeSignature === prev.timeSignature &&
       state.loopEnabled === prev.loopEnabled &&
       state.loopStart === prev.loopStart &&
       state.loopEnd === prev.loopEnd &&

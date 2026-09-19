@@ -24,6 +24,7 @@ import {
   holdsAfterRelease, modeAfterStop, recordsWhileHeld, sampleCurve, upsertAutomationPoint,
   writeSpan, writesUntouched, type AutomationMode,
 } from '../lib/automationModes';
+import { validTimeSignature } from '../lib/timeSignatureIO';
 import {
   MASTER_ID,
   addBus as graphAddBus,
@@ -337,6 +338,19 @@ export interface AutomationLane {
   enabled: boolean;
 }
 
+/** Bars-per-what. `num` beats of a `den`-th note each. Document state: it
+ *  decides where a bar line falls, so `seekBar`, bar-relative clip nudges and
+ *  anything else that counts bars read it instead of assuming 4/4. */
+export interface TimeSignature {
+  num: number;
+  den: number;
+}
+
+/** A meter the editor can actually bar out, or null. Defined in the
+ *  dependency-free `lib/timeSignatureIO` (the persistence paths share it) and
+ *  re-exported here for the store's existing importers. */
+export { validTimeSignature };
+
 /** A named position flag on the timeline (Phase F). */
 export interface TimelineMarker {
   id: string;
@@ -552,6 +566,8 @@ interface EditorStoreState {
   isPlaying: boolean;
   snap: SnapDivision;
   bpm: number;              // for snap math
+  /** Project meter. Document state, so it rides undo alongside bpm. */
+  timeSignature: TimeSignature;
   inpaintSelection: InpaintSelection | null;
   /* ── Workspace selection (batch 11) ───────────────────────────────────────
      Held here rather than in WaveformEditor's local state because EDIT is
@@ -562,7 +578,10 @@ interface EditorStoreState {
   timeSelection: EditorTimeRange | null;
   /** The edit cursor, timeline seconds, >= 0. Independent of the playhead. */
   editCursorSec: number;
-  /** Multi-selected clip ids. `selectedClipId` stays the single focused clip. */
+  /** Multi-selected clip ids. `selectedClipId` stays the single focused clip
+   *  (the marquee's anchor), which is why `setSelectedClipIds` leaves it alone.
+   *  `setSelectedClips` is the one setter that writes BOTH — the assistant's
+   *  `editor_select_clips` and the canvas share it so they cannot drift. */
   selectedClipIds: string[];
   /** Multi-selected track ids. */
   selectedTrackIds: string[];
@@ -615,6 +634,9 @@ interface EditorStoreState {
      *  belonging to neither is pruned (see `migrateRouting`). */
     routing?: RoutingGraph;
     buses?: EditorBus[];
+    /** The project's meter. Absent (or unusable) leaves the session's alone,
+     *  exactly as `bpm` does. */
+    timeSignature?: TimeSignature;
   }) => void;
   addTrack: (overrides?: Partial<EditorTrack>) => string;
   /** A new lane at `index` (0 = above every lane, `tracks.length` = below
@@ -623,6 +645,14 @@ interface EditorStoreState {
   insertTrack: (index: number, overrides?: Partial<EditorTrack>) => string;
   removeTrack: (id: string) => void;
   updateTrack: (id: string, updates: Partial<EditorTrack>) => void;
+  /** Put `orderedIds` at the top in the order given; every track not named keeps
+   *  its relative position after them. Unknown ids are ignored, so a partial or
+   *  stale list can reorder but never drop a track. */
+  reorderTracks: (orderedIds: string[]) => void;
+  /** Copy a track and its clips (fresh clip ids, audio shared by reference) in
+   *  directly under the original. Returns the new track id, or null if there is
+   *  no such track. A frozen track copies as its printed stem. */
+  duplicateTrack: (id: string) => string | null;
   toggleSolo: (id: string) => void;
   /** Freeze a track: replace its clips with one printed stem and empty its
    *  fxChain (effects + VST baked in), stashing the originals for unfreeze. */
@@ -745,6 +775,9 @@ interface EditorStoreState {
   keepActiveTakeOnly: (clipId: string) => void;
 
   setSelected: (id: string | null) => void;
+  /** Replace the multi-clip selection. Order is kept, duplicates collapse, and
+   *  `selectedClipId` follows the first entry. */
+  setSelectedClips: (ids: string[]) => void;
   setTool: (t: ToolMode) => void;
   setZoom: (z: number) => void;
   setTrackHeight: (h: number) => void;
@@ -753,6 +786,9 @@ interface EditorStoreState {
   setPlaying: (p: boolean) => void;
   setSnap: (s: SnapDivision) => void;
   setBpm: (b: number) => void;
+  /** Set the project meter. A meter the editor cannot bar out is refused (no-op)
+   *  rather than clamped — see {@link validTimeSignature}. */
+  setTimeSignature: (num: number, den: number) => void;
   setInpaintSelection: (sel: InpaintSelection | null) => void;
   clearInpaintSelection: () => void;
   /** Store a time selection. Stores null when either bound is non-finite,
@@ -938,6 +974,33 @@ interface EditorStoreState {
   undo: () => void;
   redo: () => void;
 
+  /** Named checkpoints of the same document slices undo tracks, kept OUTSIDE
+   *  undo history (like the loop region): a snapshot is the bookmark you take
+   *  before trying something, and spending an undo step to take one would
+   *  defeat the point. Cleared by `loadProject` — they reference the tracks and
+   *  clips of the project they were taken in. */
+  snapshots: Record<string, EditorHistorySnapshot>;
+  /** Save (or overwrite) a named checkpoint of the current document. */
+  takeSnapshot: (name: string) => void;
+  /** Put a named checkpoint back. Returns false when there is no such name.
+   *  The restore itself IS an edit, so it can be undone. */
+  restoreSnapshot: (name: string) => boolean;
+  listSnapshots: () => string[];
+
+  /** Undo groups: make a run of writes exactly ONE undo step, whatever the
+   *  timing. The group's first document change always opens a fresh step (so an
+   *  edit made just before it — inside HISTORY_COALESCE_MS — is never folded
+   *  into it), every later change inside the group folds into that step however
+   *  long after it lands, and closing the group forces a boundary again so the
+   *  next edit starts its own step. Groups nest; only the outermost counts.
+   *  Anything that writes the document while a group is open joins it, so open
+   *  one around a commit, not around a long await the user can edit through. */
+  beginUndoGroup: () => void;
+  endUndoGroup: () => void;
+  /** `beginUndoGroup` / `endUndoGroup` around `fn`, closed even if it throws.
+   *  An async `fn` keeps the group open until its promise settles. */
+  undoGroup: <T>(fn: () => T) => T;
+
   /** True when the document has changed since the last save (or since a load).
    *  Drives the unsaved-changes guard and the modified indicator. Set by the same
    *  subscription that records undo history, so it tracks exactly the slices that
@@ -978,7 +1041,7 @@ interface EditorStoreState {
  *  so they belong here. The loop region deliberately does NOT — it is transport
  *  state, and DAWs that put it in the undo stack make undo unusable during a
  *  loop-edit session. */
-interface EditorHistorySnapshot {
+export interface EditorHistorySnapshot {
   tracks: EditorTrack[];
   clips: AudioClip[];
   masterFxChain: ChainEntry[];
@@ -990,6 +1053,7 @@ interface EditorHistorySnapshot {
   automationLanes: AutomationLane[];
   markers: TimelineMarker[];
   bpm: number;
+  timeSignature: TimeSignature;
   /** Routing is document state: undoing a "route drums into the drum bus" must
    *  take the edge back, and it must take the bus strip back with it — hence
    *  both slices, restored together. */
@@ -1279,6 +1343,8 @@ const HISTORY_LIMIT = 100;
 const HISTORY_COALESCE_MS = 300; // changes closer than this fold into one undo step
 let historyApplying = false;     // true while undo/redo writes, so it doesn't self-record
 let lastDocChangeAt = -Infinity;
+let undoGroupDepth = 0;          // >0 while an undo group is open (nesting count)
+let undoGroupCaptured = false;   // the open group has already recorded its undo point
 
 /* ── The coalesce KEY ────────────────────────────────────────────────────────
  * The window alone used to decide, so ANY two document writes that landed
@@ -1368,6 +1434,7 @@ const docSnapshot = (s: EditorStoreState): EditorHistorySnapshot => ({
   automationLanes: s.automationLanes,
   markers: s.markers,
   bpm: s.bpm,
+  timeSignature: s.timeSignature,
   routing: s.routing,
   buses: s.buses,
 });
@@ -1468,6 +1535,7 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   isPlaying: false,
   snap: '1/16',
   bpm: 120,
+  timeSignature: { num: 4, den: 4 },
   inpaintSelection: null,
   timeSelection: null,
   editCursorSec: 0,
@@ -1486,9 +1554,10 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   markers: [],
   _undo: [],
   _redo: [],
+  snapshots: {},
   dirty: false,
 
-  loadProject: ({ tracks, clips, bpm, routing, buses }) => {
+  loadProject: ({ tracks, clips, bpm, routing, buses, timeSignature }) => {
     // Suppress undo recording for the bulk swap, then start the loaded project as
     // a fresh document (empty undo/redo) so the user can't undo back into the
     // previous session's tracks.
@@ -1522,6 +1591,9 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       scrollSec: 0,
       isPlaying: false,
       bpm: bpm && Number.isFinite(bpm) ? Math.max(40, Math.min(240, bpm)) : get().bpm,
+      // Same rule as bpm: a project that carries a meter sets it, one that does
+      // not leaves the session's alone rather than silently forcing 4/4.
+      timeSignature: (timeSignature && validTimeSignature(timeSignature.num, timeSignature.den)) || get().timeSignature,
       markers: [],
       automationLanes: [],
       // A record pass cannot survive the document it was writing into.
@@ -1531,6 +1603,9 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       loopEnd: 0,
       _undo: [],
       _redo: [],
+      // Named checkpoints reference the outgoing project's tracks and clips —
+      // the same reason markers and lanes are cleared here.
+      snapshots: {},
       // A freshly loaded project is by definition unmodified.
       dirty: false,
     });
@@ -1589,6 +1664,9 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
         // cannot resolve.
         routing: graphRemoveNode(s.routing, id),
         selectedClipId: s.clips.some((c) => c.id === s.selectedClipId && c.trackId === id) ? null : s.selectedClipId,
+        // `pruneSelections` drops every selected clip id that no longer names a
+        // clip — which is exactly the ids of the removed track's clips — plus
+        // the track's own id and any time selection scoped to it.
         ...pruneSelections(s, clips, tracks),
       };
     });
@@ -1609,6 +1687,60 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     set((s) => ({
       tracks: s.tracks.map((t) => (t.id === id ? { ...t, ...updates } : t)),
     }));
+  },
+
+  // Same undo contract as `moveTracks`, which is the pointer-driven version of
+  // this: ONE step per call, and an order that does not actually change writes
+  // nothing at all (no step, no new `tracks` array for the mixer to re-wire).
+  reorderTracks: (orderedIds) => {
+    const { tracks } = get();
+    const front = keepKnown(orderedIds, new Set(tracks.map((t) => t.id)));
+    if (front.length === 0) return; // nothing nameable in the list: not an edit
+    const moved = new Set(front);
+    const next = reorderedTracks(tracks, [...front, ...tracks.map((t) => t.id).filter((tid) => !moved.has(tid))]);
+    if (!next) return;
+    beginUndoStep();
+    set({ tracks: withValidParents(next) }); // routing is keyed by id, so it stays as it is
+  },
+
+  duplicateTrack: (id) => {
+    const source = get().tracks.find((t) => t.id === id);
+    if (!source) return null;
+    const newTrackId = `track-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    beginUndoStep(); // a duplicate is one discrete structural edit, like addBus
+    set((s) => {
+      const index = s.tracks.findIndex((t) => t.id === id);
+      const copy: EditorTrack = {
+        ...source,
+        id: newTrackId,
+        name: `${source.name} copy`,
+        nameAutoGenerated: false,
+        // Solo is exclusive (toggleSolo clears every other track), so a copy that
+        // inherited it would claim a solo the original still holds. The freeze
+        // stash is dropped too: unfreezing the copy would restore clips whose
+        // ids belong to the original's track.
+        solo: false,
+        frozenOriginal: undefined,
+        fxChain: source.fxChain ? source.fxChain.map((e) => ({ ...e })) : undefined,
+      };
+      const tracks = [...s.tracks];
+      tracks.splice(index + 1, 0, copy);
+      // New clip records with new ids; the audio Blob and cached peaks are shared
+      // by reference because the media is byte-identical.
+      const copies = s.clips
+        .filter((c) => c.trackId === id)
+        .map((c) => ({ ...c, id: uid(), trackId: newTrackId }));
+      return {
+        tracks,
+        clips: [...s.clips, ...copies],
+        // The copy is routed to the master from the moment it exists, exactly as
+        // `insertTrack` does it — a track missing from the graph is a silent
+        // track. A folder row holds no clips and gets no audio node.
+        routing: copy.isFolder ? s.routing : ensureTrackNode(s.routing, newTrackId, copy.name),
+      };
+    });
+    logInfo('editor', `Duplicated track ${id} -> ${newTrackId}`);
+    return newTrackId;
   },
 
   freezeTrack: (trackId, stem) => {
@@ -1639,6 +1771,8 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
             : t,
         ),
         selectedClipId: null,
+        // The track's own clips are gone (replaced by the stem), so pruning
+        // drops exactly their ids from the multi-selection.
         ...pruneSelections(s, clips, s.tracks),
       };
     });
@@ -1767,6 +1901,9 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       return {
         tracks,
         clips: [...s.clips, full],
+        // Focus only. The multi-selection is workspace state with its own
+        // writers (`setSelectedClipIds` / `setSelectedClips`) — a paste that
+        // adds five clips selects all five once, not the last one five times.
         selectedClipId: id,
       };
     });
@@ -1874,6 +2011,9 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       ...clampClipFades({ durationSec: rightDur, fadeInSec: 0, fadeOutSec: clip.fadeOutSec }),
     }, rightTakes, compParts.right);
     set((s) => ({
+      // Focus follows the new right half; the multi-selection is left alone so
+      // a range command that cuts N selected clips still has N selected after
+      // (the left halves keep their ids — see `WaveformEditor`'s split menu).
       clips: s.clips.flatMap((c) => (c.id === id ? [left, right] : [c])),
       selectedClipId: newId,
     }));
@@ -2161,7 +2301,17 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     });
   },
 
+  // `selectedClipId` is the FOCUS (the marquee's anchor), not a one-element
+  // view of `selectedClipIds`: the timeline sets the set first and then names
+  // the anchor inside it, so narrowing the set here would collapse every
+  // marquee to one clip. `setSelectedClips` is the setter that writes both.
   setSelected: (id) => set({ selectedClipId: id }),
+
+  setSelectedClips: (ids) =>
+    set(() => {
+      const unique = ids.filter((id, i) => id && ids.indexOf(id) === i);
+      return { selectedClipIds: unique, selectedClipId: unique[0] ?? null };
+    }),
   setTool: (t) => set({ tool: t }),
   setZoom: (z) => set({ zoom: Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, z)) }),
   setTrackHeight: (h) => set({ trackHeight: Math.max(TRACK_HEIGHT_MIN, Math.min(TRACK_HEIGHT_MAX, Math.round(h))) }),
@@ -2172,6 +2322,17 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   // The tempo field is a continuous control (a spinner held down, a typed edit
   // one digit at a time), so its writes share one key and fold into one step.
   setBpm: (b) => { coalesceAs('bpm'); set({ bpm: Math.max(40, Math.min(240, b)) }); },
+  setTimeSignature: (num, den) => {
+    const next = validTimeSignature(num, den);
+    // A refused meter and a meter that is already set are both non-edits, and a
+    // non-edit never writes (see `updateClip`): `validTimeSignature` hands back
+    // a FRESH object every time, so writing it unconditionally would store an
+    // empty undo step for re-picking the meter the song already has.
+    const cur = get().timeSignature;
+    if (!next || (next.num === cur.num && next.den === cur.den)) return;
+    beginUndoStep(); // a meter change is one discrete edit, like a menu action
+    set({ timeSignature: next });
+  },
   setInpaintSelection: (sel) => set({ inpaintSelection: sel }),
   clearInpaintSelection: () => set({ inpaintSelection: null }),
 
@@ -2848,6 +3009,7 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       automationLanes: prev.automationLanes,
       markers: prev.markers,
       bpm: prev.bpm,
+      timeSignature: prev.timeSignature,
       routing: prev.routing,
       buses: prev.buses,
       // The restored document may lack clips/tracks the selections name.
@@ -2877,6 +3039,7 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       automationLanes: next.automationLanes,
       markers: next.markers,
       bpm: next.bpm,
+      timeSignature: next.timeSignature,
       routing: next.routing,
       buses: next.buses,
       ...pruneSelections(s, next.clips, next.tracks),
@@ -2886,6 +3049,86 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     });
     historyApplying = false;
     beginUndoStep();
+  },
+
+  takeSnapshot: (name) => {
+    const key = String(name ?? '').trim();
+    if (!key) return;
+    // Snapshots are NOT a tracked slice, so this write cannot trip the history
+    // subscription — taking a bookmark never costs an undo step.
+    set((s) => ({ snapshots: { ...s.snapshots, [key]: docSnapshot(s) } }));
+    logInfo('editor', `Snapshot "${key}" taken`);
+  },
+
+  restoreSnapshot: (name) => {
+    const key = String(name ?? '').trim();
+    const snap = get().snapshots[key];
+    if (!snap) return false;
+    // Deliberately NOT under historyApplying: putting a checkpoint back is an
+    // edit to the document, and the user must be able to undo out of it. One
+    // `set` for the whole document, so it is ONE undo step.
+    //
+    // Every slice `docSnapshot` records is put back — the master VST rack, the
+    // routing graph and the bus strips included. Restoring a subset would leave
+    // the document half in the checkpoint and half in the present: sends
+    // pointing at buses the snapshot never had, a master rack from a different
+    // take.
+    beginUndoStep();
+    set((s) => ({
+      tracks: snap.tracks,
+      clips: snap.clips,
+      masterFxChain: snap.masterFxChain,
+      masterVstChain: snap.masterVstChain,
+      automationLanes: snap.automationLanes,
+      markers: snap.markers,
+      bpm: snap.bpm,
+      timeSignature: snap.timeSignature,
+      routing: snap.routing,
+      buses: snap.buses,
+      selectedClipId: null,
+      // The checkpoint's document may lack clips/tracks the selections name.
+      ...pruneSelections(s, snap.clips, snap.tracks),
+    }));
+    logInfo('editor', `Restored snapshot "${key}"`);
+    return true;
+  },
+
+  listSnapshots: () => Object.keys(get().snapshots),
+
+  beginUndoGroup: () => {
+    if (undoGroupDepth === 0) undoGroupCaptured = false;
+    undoGroupDepth += 1;
+  },
+
+  endUndoGroup: () => {
+    if (undoGroupDepth === 0) return; // unmatched end: never drive the depth negative
+    undoGroupDepth -= 1;
+    if (undoGroupDepth === 0) {
+      undoGroupCaptured = false;
+      // Boundary after the group: the next edit starts its own step instead of
+      // coalescing into the group's. `beginUndoStep` is the boundary — it also
+      // drops any coalesce key the group's last action left behind, so the next
+      // write cannot inherit a gesture that ended inside the group.
+      beginUndoStep();
+    }
+  },
+
+  undoGroup: (fn) => {
+    const { beginUndoGroup, endUndoGroup } = get();
+    beginUndoGroup();
+    let result: ReturnType<typeof fn>;
+    try {
+      result = fn();
+    } catch (e) {
+      endUndoGroup();
+      throw e;
+    }
+    const thenable = result as unknown as PromiseLike<unknown> | null;
+    if (thenable && typeof thenable.then === 'function') {
+      return Promise.resolve(thenable).finally(endUndoGroup) as unknown as typeof result;
+    }
+    endUndoGroup();
+    return result;
   },
 
   markSaved: () => set({ dirty: false }),
@@ -3036,14 +3279,22 @@ useEditorStore.subscribe((state, prev) => {
     state.automationLanes === prev.automationLanes &&
     state.markers === prev.markers &&
     state.bpm === prev.bpm &&
+    state.timeSignature === prev.timeSignature &&
     state.routing === prev.routing &&
     state.buses === prev.buses
   ) return;
   const now = performance.now();
   // Same window as ever, plus the key: a write folds into the open step only when
   // it is the same gesture — or when the caller said outright that it is.
-  const coalesce = now - lastDocChangeAt < HISTORY_COALESCE_MS && (continues || key === lastCoalesceKey);
+  let coalesce = now - lastDocChangeAt < HISTORY_COALESCE_MS && (continues || key === lastCoalesceKey);
   lastDocChangeAt = now;
+  // Inside an undo group, neither the timing nor the key matters: the group's
+  // first change always opens a new step and every later one folds into it,
+  // however far apart and whatever gesture each belongs to (see beginUndoGroup).
+  if (undoGroupDepth > 0) {
+    coalesce = undoGroupCaptured;
+    undoGroupCaptured = true;
+  }
   if (!coalesce) lastCoalesceKey = key;
   // The same slices that constitute an undo step constitute "the project", so
   // this is also where the document becomes dirty. Skip the write entirely when

@@ -29,7 +29,8 @@ def test_bridge_moves_aside_when_another_program_serves_its_port(monkeypatch):
         try:
             status = bridge.status()
             assert status["started"] is True
-            assert status["port"] == port, "the headset still dials the configured port"
+            assert status["port"] == port, "the configured host port is still reported"
+            assert status["device_port"] == 8765, "the headset still dials its own port"
             assert status["host_port"] not in (None, port), (
                 "listening beside the other program"
             )

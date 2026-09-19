@@ -9,17 +9,73 @@ import {
 } from '../state/assistantReferenceStore';
 import { FEATURES } from '../onboarding/featureRegistry';
 
-type EditorSummary = {
+export type EditorClipKind = 'midi' | 'audio';
+export type EditorTrackKind = 'midi' | 'audio' | 'mixed' | 'empty';
+
+export type EditorSummary = {
     trackCount: number;
     clipCount: number;
+    /** Clips whose sourceKind is 'piano-roll' — editable MIDI, pre-rendered to audio for playback. */
+    midiClipCount: number;
+    audioClipCount: number;
     bpm: number;
+    /** Project meter. Bars — and therefore editor_seek_bar — are counted from it. */
+    timeSignature: { num: number; den: number };
+    /** Grid division clip edits snap to ('off' | '1/4' | '1/8' | '1/16' | …). */
+    snap: string;
+    /** Active edit tool ('move' | 'cut' | 'split'). */
+    tool: string;
     playheadSec: number;
     isPlaying: boolean;
     selectedClipId: string | null;
+    /** The full multi-clip selection. Tools that act on "the selection"
+     *  (editor_loop_selection) read this, not selectedClipId. */
+    selectedClipIds: string[];
+    /** Names editor_restore will accept, so the model never guesses one. */
+    snapshotNames: string[];
     loop: { enabled: boolean; startSec: number; endSec: number } | null;
-    tracks: Array<{ id: string; name: string; volume: number; pan: number; mute: boolean; solo: boolean; clipCount: number }>;
-    clips: Array<{ id: string; label: string; trackId: string; startSec: number; durationSec: number; muted: boolean }>;
+    markers: Array<{ id: string; sec: number; label: string }>;
+    tracks: Array<{
+        id: string;
+        name: string;
+        /** 'midi' when every clip is piano-roll, 'audio' when every clip is audio, 'mixed', or 'empty'. */
+        kind: EditorTrackKind;
+        volume: number;
+        pan: number;
+        mute: boolean;
+        solo: boolean;
+        armed: boolean;
+        frozen: boolean;
+        /** Default GM program (0-127) for MIDI clips on this track; null = global default. */
+        instrumentProgram: number | null;
+        /** Insert FX chain, in order (effect ids / labels). */
+        fxChain: string[];
+        clipCount: number;
+    }>;
+    clips: Array<{
+        id: string;
+        label: string;
+        trackId: string;
+        /** 'midi' = piano-roll clip with an editable note list; 'audio' = waveform. */
+        kind: EditorClipKind;
+        startSec: number;
+        durationSec: number;
+        muted: boolean;
+        gain: number;
+        fadeInSec: number;
+        fadeOutSec: number;
+        /** MIDI only: GM program (0-127) the clip plays through; null for audio. */
+        instrumentProgram: number | null;
+        /** MIDI only: number of notes in the piano-roll source; null for audio. */
+        noteCount: number | null;
+        /** MIDI only: BPM the notes were authored at; null for audio. */
+        sourceBpm: number | null;
+    }>;
     clipsTruncated: boolean;
+    automationLaneCount: number;
+    /** Master insert FX chain, in order. */
+    masterFxChain: string[];
+    dirty: boolean;
 };
 
 type RuntimeContext = {
@@ -70,6 +126,7 @@ export function formattheDAWAppContext(context: RuntimeContext): string {
             'If the user asks to improve the prompt, propose a better prompt and emit set_prompt or improve_prompt if they ask you to apply it.',
             'If the user asks to change settings, emit concrete app actions; do not merely describe the settings.',
             'If a requested UI operation has no available action, explain the limitation and give the closest available action.',
+            'editorState below is the live EDIT arrangement. Every clip has kind "midi" (piano-roll clip with an editable note list, noteCount, instrumentProgram) or "audio". Every track has kind midi/audio/mixed/empty. Never assume a track is audio — read kind.',
         ],
         currentUI: context.ui,
         locatableFeatures: context.locatableFeatures,
@@ -86,6 +143,96 @@ export function formattheDAWAppContext(context: RuntimeContext): string {
     return `<current_app_context>\n${JSON.stringify(payload, null, 2)}\n</current_app_context>`;
 }
 
+type EditorStoreSnapshot = ReturnType<typeof useEditorStore.getState>;
+
+const round2 = (n: number) => Math.round(n * 100) / 100;
+
+const chainLabels = (chain: EditorStoreSnapshot['masterFxChain'] | undefined): string[] =>
+    (chain ?? []).map((e) => (e.enabled ? '' : '(bypassed) ') + (e.label ?? e.effect));
+
+/**
+ * The editor state the assistant sees. One summarizer feeds BOTH the
+ * `editorState` block of the app context and the `editor_get_state` action, so
+ * the two can never disagree. Every clip carries `kind` — a MIDI clip in this
+ * store is an AudioClip with sourceKind 'piano-roll' and mimeType 'audio/wav'
+ * (it is pre-rendered for playback), so without `kind` the model has no way to
+ * tell MIDI from audio and reports every track as audio.
+ */
+export function summarizeEditor(editor: EditorStoreSnapshot): EditorSummary {
+    // Bounded so a huge arrangement cannot blow the prompt.
+    const CLIP_CAP = 48;
+    const TRACK_CAP = 24;
+    const clipKind = (c: EditorStoreSnapshot['clips'][number]): EditorClipKind =>
+        c.sourceKind === 'piano-roll' ? 'midi' : 'audio';
+    const midiClipCount = editor.clips.filter((c) => clipKind(c) === 'midi').length;
+    return {
+        trackCount: editor.tracks.length,
+        clipCount: editor.clips.length,
+        midiClipCount,
+        audioClipCount: editor.clips.length - midiClipCount,
+        bpm: editor.bpm,
+        timeSignature: {
+            num: editor.timeSignature?.num ?? 4,
+            den: editor.timeSignature?.den ?? 4,
+        },
+        snap: editor.snap,
+        tool: editor.tool,
+        playheadSec: round2(editor.playheadSec),
+        isPlaying: editor.isPlaying,
+        selectedClipId: editor.selectedClipId,
+        selectedClipIds: (editor.selectedClipIds ?? []).slice(),
+        // `listSnapshots` is an action on the store, not a field — read through
+        // it rather than over `snapshots`, so the ordering stays the store's.
+        snapshotNames: typeof editor.listSnapshots === 'function' ? editor.listSnapshots() : [],
+        loop: editor.loopEnabled
+            ? { enabled: true, startSec: editor.loopStart, endSec: editor.loopEnd }
+            : null,
+        markers: editor.markers.map((m) => ({ id: m.id, sec: round2(m.t), label: m.label })),
+        tracks: editor.tracks.slice(0, TRACK_CAP).map((t) => {
+            const own = editor.clips.filter((c) => c.trackId === t.id);
+            const midi = own.filter((c) => clipKind(c) === 'midi').length;
+            const kind: EditorTrackKind =
+                own.length === 0 ? 'empty' : midi === own.length ? 'midi' : midi === 0 ? 'audio' : 'mixed';
+            return {
+                id: t.id,
+                name: t.name,
+                kind,
+                volume: t.volume,
+                pan: t.pan,
+                mute: t.mute,
+                solo: t.solo,
+                armed: !!t.armed,
+                frozen: !!t.frozenOriginal,
+                instrumentProgram: t.instrumentProgram ?? null,
+                fxChain: chainLabels(t.fxChain),
+                clipCount: own.length,
+            };
+        }),
+        clips: editor.clips.slice(0, CLIP_CAP).map((c) => {
+            const kind = clipKind(c);
+            return {
+                id: c.id,
+                label: c.label,
+                trackId: c.trackId,
+                kind,
+                startSec: round2(c.startSec),
+                durationSec: round2(c.durationSec),
+                muted: !!c.muted,
+                gain: c.gain ?? 1,
+                fadeInSec: c.fadeInSec ?? 0,
+                fadeOutSec: c.fadeOutSec ?? 0,
+                instrumentProgram: kind === 'midi' ? (c.instrumentProgram ?? null) : null,
+                noteCount: kind === 'midi' ? (c.sourcePianoRoll?.length ?? 0) : null,
+                sourceBpm: kind === 'midi' ? (c.sourceBpm ?? null) : null,
+            };
+        }),
+        clipsTruncated: editor.clips.length > CLIP_CAP,
+        automationLaneCount: editor.automationLanes.length,
+        masterFxChain: chainLabels(editor.masterFxChain),
+        dirty: editor.dirty,
+    };
+}
+
 export function buildtheDAWAppContext(options: {
     selectedProvider: string;
     selectedModel: string;
@@ -100,39 +247,7 @@ export function buildtheDAWAppContext(options: {
     const generation = useGenerateStore.getState();
     const editor = useEditorStore.getState();
 
-    // Bounded arrangement summary so the model can act on real tracks / clips
-    // / playhead / selection instead of being architecturally blind to EDIT.
-    const CLIP_CAP = 48;
-    const TRACK_CAP = 24;
-    const editorSummary: EditorSummary = {
-        trackCount: editor.tracks.length,
-        clipCount: editor.clips.length,
-        bpm: editor.bpm,
-        playheadSec: Math.round(editor.playheadSec * 100) / 100,
-        isPlaying: editor.isPlaying,
-        selectedClipId: editor.selectedClipId,
-        loop: editor.loopEnabled
-            ? { enabled: true, startSec: editor.loopStart, endSec: editor.loopEnd }
-            : null,
-        tracks: editor.tracks.slice(0, TRACK_CAP).map((t) => ({
-            id: t.id,
-            name: t.name,
-            volume: t.volume,
-            pan: t.pan,
-            mute: t.mute,
-            solo: t.solo,
-            clipCount: editor.clips.filter((c) => c.trackId === t.id).length,
-        })),
-        clips: editor.clips.slice(0, CLIP_CAP).map((c) => ({
-            id: c.id,
-            label: c.label,
-            trackId: c.trackId,
-            startSec: Math.round(c.startSec * 100) / 100,
-            durationSec: Math.round(c.durationSec * 100) / 100,
-            muted: !!c.muted,
-        })),
-        clipsTruncated: editor.clips.length > CLIP_CAP,
-    };
+    const editorSummary = summarizeEditor(editor);
 
     return formattheDAWAppContext({
         ui: {

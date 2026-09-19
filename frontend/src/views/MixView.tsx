@@ -35,6 +35,7 @@ import {
   useMixLiveRackStore, LEVEL_TAKING_RACK_IDS,
 } from '../state/mixLiveRack';
 import { registerAresBridge, ARES_XY_PAD_FALLBACK_ID } from '../lib/aresBridge';
+import { usePowerModeBridge } from '../features/power-mode/usePowerModeBridge';
 import { RACK_EFFECTS, getRackEffect } from '../lib/rackEffects';
 import type { WidgetRegistry } from '../components/surface/widgetTypes';
 import type { SurfaceLayout } from '../state/surfaceLayoutStore';
@@ -1343,6 +1344,7 @@ export const MixView: React.FC = () => {
     findEntry: () => useEffectChainStore.getState().chain.find((e) => e.effect === 'ares') ?? null,
     updateParams: (id, params) => useEffectChainStore.getState().updateParams(id, params),
   }), []);
+  usePowerModeBridge();
 
   // While Ares is open, feed the live master output level into its .gan so its
   // level meter reflects the real signal (pushed down through the runtime relay).

@@ -661,6 +661,11 @@ export interface FxChainListProps {
   scrollRows?: boolean;
 }
 
+// The "no chain yet" case takes the one shared NO_ENTRIES reference through
+// `chainInState` above — a fresh `[]` per read makes useSyncExternalStore see a
+// new snapshot every render ("getSnapshot should be cached" → infinite
+// re-render loop), so both lists subscribe through that single helper.
+
 export const FxChainList: React.FC<FxChainListProps> = ({
   scope,
   onOpenEntry,

@@ -18,7 +18,10 @@ from backend.modules.library.router import get_store as get_library_store
 
 from .arrangers.score_arrange import STYLES as ARRANGEMENT_STYLES
 from .engine import (
+    _scored_name,
+    _song_slug,
     capabilities,
+    drop_superseded_recovery_rows,
     convert_score,
     midi_to_arrangement,
     midi_to_musicxml,
@@ -26,6 +29,7 @@ from .engine import (
     part_names,
     register_existing_midis,
     register_on_disk_artifacts,
+    sheet_output_path,
     stage_parts,
 )
 
@@ -58,25 +62,9 @@ _CHORDTRACK_METHODS = ("auto", "harmony", "chroma")
 _CHORDTRACK_RESOLUTIONS = ("beat", "bar")
 
 
-def _song_slug(title: str, fallback: str = "score") -> str:
-    """Filesystem-safe, readable slug of a song title for score filenames."""
-    cleaned = "".join(c if (c.isalnum() or c in " -_") else "_" for c in (title or ""))
-    cleaned = "_".join(cleaned.split())  # collapse whitespace runs to one "_"
-    cleaned = cleaned.strip("_-")
-    return cleaned[:60] or fallback
-
-
 def _entry_title(store: Any, entry_id: str) -> str:
     entry = store.get_entry(entry_id)
     return str(getattr(entry, "title", "") or "") if entry is not None else ""
-
-
-def _scored_name(slug: str, base: str) -> str:
-    """Prefix ``base`` with the song slug unless it already leads with it,
-    so the file (and its download name) carries the originating song."""
-    if slug and not base.lower().startswith(slug.lower()):
-        return f"{slug}__{base}"
-    return base
 
 
 def _parts_option(options: Optional[dict[str, Any]]) -> list[int]:
@@ -204,7 +192,17 @@ def list_artifacts(entry_id: str, kind: Optional[str] = None) -> dict[str, Any]:
                     len(recovered),
                     entry_id,
                 )
-    artifacts = store.db.list_notation_artifacts(entry_id, kind=kind)
+    # One canonical artifact per file: a legacy library can still hold a
+    # filename-derived ``recovered-from-disk`` row beside the real row for the
+    # same file until the consolidator retires it. Both rows are kept in the DB;
+    # only the shadowed one is withheld from the response. Coverage is computed
+    # over the entry's WHOLE listing so a ``kind`` filter cannot hide the real
+    # row that shadows a recovery row.
+    artifacts = drop_superseded_recovery_rows(
+        store.db.list_notation_artifacts(entry_id)
+    )
+    if kind:
+        artifacts = [a for a in artifacts if a.get("kind") == kind]
     return {"entry_id": entry_id, "artifacts": artifacts, "count": len(artifacts)}
 
 
@@ -258,7 +256,6 @@ def convert_midi_artifact(entry_id: str, midi_id: str) -> dict[str, Any]:
     if entry is None:
         raise HTTPException(404, f"entry {entry_id!r} not found")
     title = str(getattr(entry, "title", "") or "")
-    slug = _song_slug(title)
     midi_row = None
     for row in store.db.list_midis(entry_id):
         if row.get("id") == midi_id:
@@ -269,7 +266,11 @@ def convert_midi_artifact(entry_id: str, midi_id: str) -> dict[str, Any]:
     entry_dir = store._dir_for(entry_id)  # noqa: SLF001 - existing module convention
     if entry_dir is None:
         raise HTTPException(500, f"entry directory missing for {entry_id!r}")
-    output = entry_dir / "notation" / _scored_name(slug, f"{midi_id}.musicxml")
+    # engine.sheet_output_path is the single naming authority for this sheet
+    # (the notation backfill writes the same artifact id through it too). It only
+    # returns None when the entry has no directory, which is already a 500 above.
+    output = sheet_output_path(store, entry_id, midi_id)
+    assert output is not None  # entry_dir checked non-None directly above
     result = midi_to_musicxml(
         store.db,
         entry_id=entry_id,
@@ -413,7 +414,11 @@ def _find_lead_sheet(
                 404, f"artifact file missing on disk: {artifact.get('path')}"
             )
         return artifact
-    candidates = store.db.list_notation_artifacts(entry_id, kind="musicxml")
+    # Same one-canonical-artifact-per-file rule the listing route applies, so a
+    # shadowed recovered-from-disk row is never chosen as a chord-track source.
+    candidates = drop_superseded_recovery_rows(
+        store.db.list_notation_artifacts(entry_id, kind="musicxml")
+    )
     for artifact in reversed(candidates):  # list is oldest-first
         if _artifact_metadata(artifact).get("style") != "lead-sheet":
             continue

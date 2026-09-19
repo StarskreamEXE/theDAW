@@ -1,5 +1,6 @@
-import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronLeft, ChevronRight, Download, Loader2, Minus, Plus, RefreshCw } from 'lucide-react';
+import React, { useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { ChevronLeft, ChevronRight, Download, Expand, Loader2, Minus, Plus, RefreshCw, Shrink } from 'lucide-react';
 import { useLibraryStore, type LibraryEntry } from '../../state/libraryStore';
 import { usePlayerStore } from '../../state/playerStore';
 import { logError, logInfo } from '../../state/logStore';
@@ -157,6 +158,77 @@ export const ScoreView: React.FC = () => {
     [entries, selectedEntryId],
   );
   const [artifacts, setArtifacts] = useState<NotationArtifact[]>([]);
+  // Focus mode: pop the whole Score panel to a fullscreen overlay and hide the
+  // artifact sidebar, so the follow-along (strip/highway/chords) is large and
+  // isolated instead of a tiny afterthought. Additive; default off.
+  const [focused, setFocused] = useState(false);
+  useEffect(() => {
+    if (!focused) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setFocused(false); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [focused]);
+  // The panel lives inside the bottom dock, whose row is `relative z-30`
+  // (Shell.tsx) — a stacking context. An in-tree `z-50` overlay is therefore
+  // ordered WITHIN z-30 and paints UNDER the app header (z-40) and the library
+  // edge tab (z-50), which keep intercepting clicks. Raising the child z-index
+  // cannot beat a sibling context, so in Focus mode we escape the context by
+  // portalling the panel to <body>. To keep the toggle from reloading the score,
+  // the portal target is a STABLE host node that we REPARENT NATIVELY
+  // (Node.appendChild moves a subtree without recreating it): React keeps
+  // rendering into the same host element across the toggle, so the heavy
+  // alphaTab/OSMD children are never unmounted/remounted. <body> has no
+  // transform ancestor, so the fixed overlay is not re-contained.
+  //
+  // The host is held in a LAZY REF, not useMemo: useMemo is a performance hint
+  // that React may drop, and a new container would remount the whole
+  // alphaTab/OSMD subtree AND orphan the superseded host (with stale DOM)
+  // inside the anchor. A ref guarantees one identity for the component's life,
+  // and because refs survive StrictMode's double render the node is created
+  // exactly once.
+  const hostRef = useRef<HTMLDivElement | null>(null);
+  if (!hostRef.current && typeof document !== 'undefined') {
+    hostRef.current = document.createElement('div');
+  }
+  const overlayHost = hostRef.current;
+  const focusAnchorRef = useRef<HTMLDivElement | null>(null);
+  const focusToggleRef = useRef<HTMLButtonElement | null>(null);
+  // Only pull focus back on a real exit, never on the initial mount.
+  const wasFocusedRef = useRef(false);
+  useLayoutEffect(() => {
+    const host = overlayHost;
+    if (!host) return;
+    if (focused) {
+      // `z-60` is the repo's existing fullscreen-overlay step (HomeScreen.tsx,
+      // Shell.tsx), so reuse it rather than a one-off literal. It clears the
+      // header (z-40) and the edge tab (z-50). Where z ties (a z-50 modal or
+      // any other equal-z sibling), the body-APPENDED host wins on DOM order,
+      // since equal-z siblings paint in tree order. The tall modals
+      // (z-200/z-300) still draw above this.
+      //
+      // The transport footer is also z-50, so z alone would cover it. Instead we
+      // clear it GEOMETRICALLY: the footer is `fixed bottom-0 … h-16`
+      // (PlayerFooter.tsx), so `bottom-16` matches its height token exactly and
+      // leaves it visible — a follow-along you cannot play/pause/scrub is broken.
+      host.className = 'fixed inset-x-0 top-0 bottom-16 z-60';
+      if (host.parentNode !== document.body) document.body.appendChild(host);
+      // Keep the keyboard inside the overlay (Escape still exits: the handler
+      // is bound to window, and focus inside the host bubbles there).
+      host.tabIndex = -1;
+      host.focus();
+      wasFocusedRef.current = true;
+    } else {
+      // Reparent back into the in-flow anchor so default rendering is unchanged.
+      host.className = 'h-full';
+      const anchor = focusAnchorRef.current;
+      if (anchor && host.parentNode !== anchor) anchor.appendChild(host);
+      if (wasFocusedRef.current) {
+        wasFocusedRef.current = false;
+        focusToggleRef.current?.focus();
+      }
+    }
+  }, [focused, overlayHost]);
+  useEffect(() => () => { overlayHost?.remove(); }, [overlayHost]);
   const [selectedArtifactId, setSelectedArtifactId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [caps, setCaps] = useState<NotationCapabilities | null>(null);
@@ -518,82 +590,89 @@ export const ScoreView: React.FC = () => {
     }
   };
 
-  return (
-    <div className="h-full min-h-0 flex bg-[#07050a] text-zinc-200">
+  // `root` rather than a direct return: focus mode portals this same element
+  // into the body-level host (see the wrapper return at the end).
+  const root = (
+    <div className="h-full w-full min-h-0 flex bg-[#07050a] text-zinc-200">
       {/* The left rail (maker + made list) folds to a thin strip so the score
-          can take the whole width. */}
-      <CollapsibleRail
-        id="score-notation-rail"
-        side="left"
-        name="Notation"
-        label="the notation rail"
-        storageKey="score.railCollapsed.v1"
-        className="w-72 shrink-0 border-r border-white/10 flex flex-col min-h-0 bg-black/30"
-      >
-        {(foldKey) => (
-          <>
-            <div className="h-10 shrink-0 border-b border-white/10 flex items-center gap-2 px-3">
-              <span className="font-display text-xs font-bold uppercase text-zinc-300">Notation</span>
-              <span className="min-w-0 flex-1 truncate text-xs font-bold text-zinc-500" title={entry?.title}>
-                {entry?.title ?? 'Select a library track'}
-              </span>
-              <button
-                type="button"
-                className="h-7 w-7 shrink-0 rounded border border-white/10 flex items-center justify-center text-zinc-400 transition-colors hover:border-[rgb(var(--et-accent)/0.5)] hover:text-zinc-100 disabled:opacity-40 outline-none focus-visible:ring-1 focus-visible:ring-[rgb(var(--et-accent)/0.6)]"
-                onClick={() => void loadArtifacts()}
-                disabled={!selectedEntryId || loading}
-                aria-label="Refresh notation"
-                title="Refresh notation"
-              >
-                {loading ? <Loader2 className="size-3.5 animate-spin" aria-hidden="true" /> : <RefreshCw className="size-3.5" aria-hidden="true" />}
-              </button>
-              {/* At the rail's inner edge, beside the score. */}
-              <span className="-mr-1 flex">{foldKey}</span>
-            </div>
+          can take the whole width. Focus hides it outright — `hidden` rather
+          than unmounting, so the rail (and the maker's in-progress state)
+          survives the toggle; `contents` leaves the rail and its folded strip
+          as direct flex items of the row when it is shown. */}
+      <div className={focused ? 'hidden' : 'contents'}>
+        <CollapsibleRail
+          id="score-notation-rail"
+          side="left"
+          name="Notation"
+          label="the notation rail"
+          storageKey="score.railCollapsed.v1"
+          className="w-72 shrink-0 border-r border-white/10 flex flex-col min-h-0 bg-black/30"
+        >
+          {(foldKey) => (
+            <>
+              <div className="h-10 shrink-0 border-b border-white/10 flex items-center gap-2 px-3">
+                <span className="font-display text-xs font-bold uppercase text-zinc-300">Notation</span>
+                <span className="min-w-0 flex-1 truncate text-xs font-bold text-zinc-500" title={entry?.title}>
+                  {entry?.title ?? 'Select a library track'}
+                </span>
+                <button
+                  type="button"
+                  className="h-7 w-7 shrink-0 rounded border border-white/10 flex items-center justify-center text-zinc-400 transition-colors hover:border-[rgb(var(--et-accent)/0.5)] hover:text-zinc-100 disabled:opacity-40 outline-none focus-visible:ring-1 focus-visible:ring-[rgb(var(--et-accent)/0.6)]"
+                  onClick={() => void loadArtifacts()}
+                  disabled={!selectedEntryId || loading}
+                  aria-label="Refresh notation"
+                  title="Refresh notation"
+                >
+                  {loading ? <Loader2 className="size-3.5 animate-spin" aria-hidden="true" /> : <RefreshCw className="size-3.5" aria-hidden="true" />}
+                </button>
+                {/* At the rail's inner edge, beside the score. */}
+                <span className="-mr-1 flex">{foldKey}</span>
+              </div>
 
-            <NotationMaker
-              entryId={selectedEntryId}
-              midis={midiArtifacts}
-              caps={caps}
-              onMade={(artifact, way) => void onMade(artifact, way)}
-            />
+              <NotationMaker
+                entryId={selectedEntryId}
+                midis={midiArtifacts}
+                caps={caps}
+                onMade={(artifact, way) => void onMade(artifact, way)}
+              />
 
-            <div className="flex-1 min-h-0 overflow-y-auto p-3 flex flex-col gap-1 text-xs font-bold">
-              {artifacts.length > 0 && <span className="pb-1 font-display uppercase text-zinc-500">Made</span>}
-              {artifacts.map((artifact) => {
-                const active = artifact.id === selectedArtifactId;
-                return (
-                  <button
-                    key={artifact.id}
-                    type="button"
-                    onClick={() => setSelectedArtifactId(artifact.id)}
-                    aria-current={active ? 'true' : undefined}
-                    className={`w-full text-left rounded border px-2.5 py-1.5 transition-colors ${
-                      active
-                        ? 'border-[rgb(var(--et-accent)/0.55)] bg-[rgb(var(--et-accent)/0.15)] et-accent-legend'
-                        : 'border-white/10 text-zinc-300 hover:border-white/25 hover:text-zinc-100'
-                    }`}
-                  >
-                    <div className="truncate">
-                      {describeArtifact(artifact)}
-                      {artifact.kind === 'midi' ? ` · ${stemOf(artifact)}` : ''}
-                    </div>
-                    <div className="truncate font-semibold text-zinc-500">
-                      {artifact.kind}
-                      {artifact.engine ? ` · ${artifact.engine}` : ''}
-                    </div>
-                  </button>
-                );
-              })}
-              {!loading && selectedEntryId && artifacts.length === 0 && (
-                <p className="rounded border border-dashed border-white/10 p-3 leading-5 text-zinc-500">
-                  Nothing made yet. Chords work from the audio alone; everything else needs the track converted to MIDI first (right-click it in the library).
-                </p>
-              )}
-            </div>
-          </>
-        )}
-      </CollapsibleRail>
+              <div className="flex-1 min-h-0 overflow-y-auto p-3 flex flex-col gap-1 text-xs font-bold">
+                {artifacts.length > 0 && <span className="pb-1 font-display uppercase text-zinc-500">Made</span>}
+                {artifacts.map((artifact) => {
+                  const active = artifact.id === selectedArtifactId;
+                  return (
+                    <button
+                      key={artifact.id}
+                      type="button"
+                      onClick={() => setSelectedArtifactId(artifact.id)}
+                      aria-current={active ? 'true' : undefined}
+                      className={`w-full text-left rounded border px-2.5 py-1.5 transition-colors ${
+                        active
+                          ? 'border-[rgb(var(--et-accent)/0.55)] bg-[rgb(var(--et-accent)/0.15)] et-accent-legend'
+                          : 'border-white/10 text-zinc-300 hover:border-white/25 hover:text-zinc-100'
+                      }`}
+                    >
+                      <div className="truncate">
+                        {describeArtifact(artifact)}
+                        {artifact.kind === 'midi' ? ` · ${stemOf(artifact)}` : ''}
+                      </div>
+                      <div className="truncate font-semibold text-zinc-500">
+                        {artifact.kind}
+                        {artifact.engine ? ` · ${artifact.engine}` : ''}
+                      </div>
+                    </button>
+                  );
+                })}
+                {!loading && selectedEntryId && artifacts.length === 0 && (
+                  <p className="rounded border border-dashed border-white/10 p-3 leading-5 text-zinc-500">
+                    Nothing made yet. Chords work from the audio alone; everything else needs the track converted to MIDI first (right-click it in the library).
+                  </p>
+                )}
+              </div>
+            </>
+          )}
+        </CollapsibleRail>
+      </div>
 
       <div className="flex-1 min-w-0 min-h-0 flex flex-col">
         <div className="h-8 shrink-0 border-b border-white/5 bg-black/30 flex items-center gap-2 px-2">
@@ -632,6 +711,17 @@ export const ScoreView: React.FC = () => {
           {selectedArtifact && allowed.length > 0 && (
             <ModeSwitch allowed={allowed} value={effectiveMode} onChange={setMode} hint={modeHint} />
           )}
+          <button
+            type="button"
+            ref={focusToggleRef}
+            onClick={() => setFocused((v) => !v)}
+            className="shrink-0 rounded border border-white/10 bg-black/30 p-1 text-zinc-400 hover:text-emerald-200 hover:border-emerald-500/40 transition-colors"
+            title={focused ? 'Exit focus (Esc): restore the panel' : 'Focus: enlarge the follow-along to fullscreen and hide the sidebar'}
+            aria-label={focused ? 'Exit score focus' : 'Focus score (fullscreen)'}
+            aria-pressed={focused}
+          >
+            {focused ? <Shrink className="w-3 h-3" /> : <Expand className="w-3 h-3" />}
+          </button>
           <label htmlFor="score-instrument" className="sr-only">Instrument preset</label>
           <select
             id="score-instrument"
@@ -680,6 +770,17 @@ export const ScoreView: React.FC = () => {
           {renderPreview()}
         </div>
       </div>
+    </div>
+  );
+
+  // Focus escapes the dock's stacking context by portalling `root` into a
+  // body-level host; unfocused, the host is reparented into this in-flow
+  // anchor (display:contents adds no box) so default rendering is unchanged.
+  // `root` keeps a stable identity across the toggle, so its subtree
+  // (alphaTab/OSMD) is never remounted.
+  return (
+    <div ref={focusAnchorRef} className="contents">
+      {overlayHost ? createPortal(root, overlayHost) : root}
     </div>
   );
 };

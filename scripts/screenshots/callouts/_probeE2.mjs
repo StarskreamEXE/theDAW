@@ -1,0 +1,12 @@
+import { open, settle, tab, ROOT } from './lib.mjs';
+import { writeFileSync } from 'node:fs';
+const P = ROOT + '/docs/guides/screenshots/callouts/_probeE/';
+const { browser, page } = await open();
+await tab(page, 'Foundry'); await page.waitForTimeout(5000);
+const fr = page.frameLocator('iframe[title="VST Foundry"]');
+await fr.getByTitle('Toggle between editing and interacting with your UI').evaluate(e=>e.click());
+await page.waitForTimeout(2500);
+await page.screenshot({ path: P + 'F2.png' });
+const f = page.frames()[1];
+writeFileSync(P+'F2.txt', await f.evaluate(() => [...document.querySelectorAll('button,input,select,[title],[aria-label],h2,h3')].filter(e=>{const r=e.getBoundingClientRect();return r.width>0}).map(e=>{const r=e.getBoundingClientRect();return `${e.tagName} t=${e.title||''} a=${e.getAttribute('aria-label')||''} txt=${(e.textContent||'').trim().slice(0,30)} @${r.x|0},${r.y|0} ${r.width|0}x${r.height|0}`}).join('\n')));
+await browser.close();

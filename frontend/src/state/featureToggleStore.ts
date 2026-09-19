@@ -106,6 +106,14 @@ export interface IoSettings {
   overrides: Record<string, DeviceRef>;
 }
 
+/** Local model discovery. `extra_folders` are additional directories theDAW
+ *  scans for model checkpoints, on top of its built-in locations. Absolute or
+ *  project-relative paths; order is preserved; no fixed count. Replaced
+ *  wholesale by a patch (like `io`), never element-merged. */
+export interface ModelsSettings {
+  extra_folders: string[];
+}
+
 export interface FeatureSettings {
   schema_version: number;
   app: AppSettings;
@@ -116,6 +124,7 @@ export interface FeatureSettings {
   vj: VjSettings;
   notation: NotationSettings;
   io: IoSettings;
+  models: ModelsSettings;
 }
 
 export const DEFAULT_FEATURE_SETTINGS: FeatureSettings = {
@@ -161,6 +170,9 @@ export const DEFAULT_FEATURE_SETTINGS: FeatureSettings = {
     visual_display: { id: '', label: '' },
     overrides: {},
   },
+  models: {
+    extra_folders: [],
+  },
 };
 
 interface FeatureToggleState {
@@ -189,8 +201,12 @@ type DeepPartial<T> = {
  * slot and drop the label. Writers send complete slot objects; the io store's
  * helpers are what build them.
  */
-export type FeatureSettingsPatch = DeepPartial<Omit<FeatureSettings, 'io'>> & {
+export type FeatureSettingsPatch = DeepPartial<Omit<FeatureSettings, 'io' | 'models'>> & {
   io?: Partial<IoSettings>;
+  // `models.extra_folders` is a list assigned wholesale, so it is kept out of
+  // DeepPartial (which would fragment the array into partial index keys) and
+  // sent as a complete array, mirroring the backend's replace semantics.
+  models?: Partial<ModelsSettings>;
 };
 
 function mergeSettings(base: FeatureSettings, patch: FeatureSettingsPatch): FeatureSettings {
@@ -207,6 +223,9 @@ function mergeSettings(base: FeatureSettings, patch: FeatureSettingsPatch): Feat
     // semantics. Deep-merging here would make a deleted per-surface override
     // resurrect itself on the next patch.
     io: { ...DEFAULT_FEATURE_SETTINGS.io, ...(base.io ?? {}), ...(patch.io ?? {}) },
+    // Wholesale replace, and tolerant of the key being absent from the server
+    // payload (older backend / T01 not yet merged) — falls back to [].
+    models: { ...DEFAULT_FEATURE_SETTINGS.models, ...(base.models ?? {}), ...(patch.models ?? {}) },
   };
   if (patch.schema_version != null) next.schema_version = patch.schema_version;
   return next;

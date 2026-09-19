@@ -45,9 +45,29 @@ MidiHint = Literal["auto", "piano", "generic", "drums"]
 DRUM_ENGINE = "drum_onsets"
 
 
+@contextlib.contextmanager
+def _quiet_basic_pitch_import():
+    """Mute basic-pitch's import-time backend warnings.
+
+    It emits a root-logger WARNING for every backend it cannot find --
+    CoreML, TFLite, TensorFlow -- and then uses whichever it has. theDAW
+    pins it to ONNX deliberately (the TensorFlow chain is overridden out of
+    the lock), so all three always fire on every import and all three are
+    noise telling the user to install things that would break resolution.
+    """
+    root = logging.getLogger()
+    previous = root.level
+    root.setLevel(max(previous, logging.ERROR))
+    try:
+        yield
+    finally:
+        root.setLevel(previous)
+
+
 def _basic_pitch_available() -> bool:
     try:
-        importlib.import_module("basic_pitch")
+        with _quiet_basic_pitch_import():
+            importlib.import_module("basic_pitch")
         return True
     except ImportError:
         return False
@@ -202,9 +222,11 @@ def convert_to_midi(
     this transparently runs ``pip install basic-pitch`` and retries. Set
     ``auto_install=False`` to keep the historical fail-fast behavior.
 
-    ``bpm`` / ``beats`` (seconds) are the entry's analysis-row tempo map;
-    only the drum engine uses them (tempo track + 1/16 quantisation of
-    on-grid hits). The pitched engines ignore them.
+    ``bpm`` / ``beats`` (seconds) are the entry's analysis-row tempo map.
+    The drum engine uses both (tempo track + 1/16 quantisation of on-grid
+    hits). The pitched engines ignore ``beats``, but ``bpm`` is stamped into
+    their output afterwards so every file carries the song's real tempo
+    instead of a 120 BPM placeholder.
 
     Returns a result dict — never raises. On success:
       {"ok": True, "engine": ..., "engine_version": ..., "notes_count": int}
@@ -258,8 +280,15 @@ def convert_to_midi(
 
     try:
         if engine == "basic_pitch":
-            return _run_basic_pitch(p, output_path)
-        return _run_piano_transcription(p, output_path)
+            result = _run_basic_pitch(p, output_path)
+        else:
+            result = _run_piano_transcription(p, output_path)
+        # Neither pitched engine knows the song's tempo, so both stamp a stock
+        # 120 BPM. Replace it with the entry's real tempo, rescaling ticks so
+        # no note moves. Never fatal: a placeholder tempo beats no MIDI.
+        if result.get("ok") and bpm and _stamp_tempo(output_path, float(bpm)):
+            result["tempo_bpm"] = float(bpm)
+        return result
     except Exception as e:
         log.warning("midi.engine: %s conversion failed for %s: %s", engine, p.name, e)
         return {"ok": False, "engine": engine, "error": repr(e)}
@@ -345,8 +374,9 @@ def _load_basic_pitch_model():
     # is busy. The opening line keeps the LOG showing a live conversion.
     log.info("midi.engine: loading basic-pitch for the first conversion")
     started = time.perf_counter()
-    from basic_pitch import ICASSP_2022_MODEL_PATH  # type: ignore[import]
-    from basic_pitch.inference import Model  # type: ignore[import]
+    with _quiet_basic_pitch_import():
+        from basic_pitch import ICASSP_2022_MODEL_PATH  # type: ignore[import]
+        from basic_pitch.inference import Model  # type: ignore[import]
 
     model = Model(ICASSP_2022_MODEL_PATH)
     providers = onnx_providers()
@@ -367,10 +397,10 @@ def _load_basic_pitch_model():
     _basic_pitch_model = model
     _basic_pitch_providers = providers
     # basic-pitch's import logs a WARNING for each backend it probes and does
-    # not find (CoreML, TFLite, TensorFlow); theDAW runs its ONNX model.
+    # not find (CoreML, TFLite, TensorFlow); theDAW runs its ONNX model, so
+    # _quiet_basic_pitch_import above mutes them and this line is the record.
     log.info(
-        "midi.engine: basic-pitch ONNX model on %s, loaded in %.0f s; the "
-        "CoreML/TFLite/TensorFlow notices above name backends theDAW does not use",
+        "midi.engine: basic-pitch ONNX model on %s, loaded in %.0f s",
         providers[0],
         time.perf_counter() - started,
     )
@@ -574,6 +604,67 @@ def _run_piano_transcription(audio_path: Path, output_path: Path) -> dict:
         "notes_count": notes_count,
         "device": device,
     }
+
+
+def _stamp_tempo(midi_path: Path, bpm: float) -> bool:
+    """Rewrite ``midi_path``'s tempo to ``bpm`` without moving a single note.
+
+    The pitched engines emit note times in seconds under a stock 120 BPM
+    header. The notes are right in wall-clock time, but every bar line is
+    wrong, so the file fights quantisation and bar-snap against the song it
+    came from.
+
+    Changing the tempo alone WOULD move every note, because ticks are
+    beat-relative: at 99 BPM a beat is longer, so the same tick lands later.
+    Each event's absolute tick is therefore rescaled by ``old_us / new_us``
+    first; the two changes cancel exactly and the audible timing is
+    unchanged. Absolute positions are scaled rather than deltas so rounding
+    error stays under one tick per event instead of accumulating down the
+    track.
+
+    Returns True when the file was rewritten. Never raises — a file that
+    keeps its placeholder tempo is still a usable file.
+    """
+    try:
+        import mido  # type: ignore[import]
+    except ImportError:
+        return False
+    if not midi_path.is_file() or bpm <= 0:
+        return False
+    try:
+        mid = mido.MidiFile(str(midi_path))
+        if not mid.tracks:
+            return False
+        tempos = {m.tempo for tr in mid.tracks for m in tr if m.type == "set_tempo"}
+        # Two or more distinct tempos is a real tempo map — the drum engine
+        # writes those. Flattening it to one value would be destructive.
+        if len(tempos) > 1:
+            return False
+        old_us = tempos.pop() if tempos else 500_000  # MIDI default = 120 BPM
+        new_us = int(round(60_000_000.0 / bpm))
+        if new_us <= 0 or new_us == old_us:
+            return False
+        scale = old_us / new_us
+        for track in mid.tracks:
+            absolute: list[tuple[int, object]] = []
+            clock = 0
+            for msg in track:
+                clock += msg.time
+                if msg.type != "set_tempo":
+                    absolute.append((clock, msg))
+            track.clear()
+            previous = 0
+            for when, msg in absolute:
+                scaled = int(round(when * scale))
+                msg.time = scaled - previous  # type: ignore[attr-defined]
+                previous = scaled
+                track.append(msg)
+        mid.tracks[0].insert(0, mido.MetaMessage("set_tempo", tempo=new_us, time=0))
+        mid.save(str(midi_path))
+        return True
+    except Exception as e:
+        log.debug("midi.engine: tempo stamp failed for %s: %s", midi_path.name, e)
+        return False
 
 
 def _count_midi_notes(midi_path: Path) -> int:

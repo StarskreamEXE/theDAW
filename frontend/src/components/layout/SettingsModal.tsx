@@ -5,8 +5,8 @@ import { useOnboardingStore } from '../../onboarding/onboardingStore';
  *
  * The body is a CSS multi-column layout (1 / 2 / 3 columns at <lg / lg / 2xl)
  * so the browser balances the sections' heights across columns; each section
- * is `break-inside-avoid` so it never splits. Reading order: Models,
- * Autoprocesses, Layout, Inputs & outputs, Modules, Storage. At 1366x768 it degrades to two
+ * is `break-inside-avoid` so it never splits. Reading order: Models, Model
+ * folders, Autoprocesses, Layout, Inputs & outputs, Modules, Storage. At 1366x768 it degrades to two
  * balanced columns (and the body scrolls if it must). Every section lives in
  * ./settings/*; this file is the shell: backdrop, header (launch mode, artist,
  * restart, shutdown, close), the column body, and the sponsor footer.
@@ -15,6 +15,7 @@ import React, { useEffect, useState } from 'react';
 import { ExternalLink, Globe, Heart, Monitor, Settings, UserCircle, X } from 'lucide-react';
 import { useFeatureToggleStore } from '../../state/featureToggleStore';
 import { ModelsSection } from './settings/ModelsSection';
+import { ModelFoldersSection } from './settings/ModelFoldersSection';
 import { StorageSection } from './settings/StorageSection';
 import { AutoprocessSection } from './settings/AutoprocessSection';
 import { ModulesSection } from './settings/ModulesSection';
@@ -204,6 +205,7 @@ export const SettingsModal: React.FC<{ open: boolean; onClose: () => void }> = (
         <div className="flex-1 min-h-0 overflow-y-auto px-3 py-2">
           <div className="columns-1 lg:columns-2 2xl:columns-3 gap-3">
             <div className="break-inside-avoid mb-3"><ModelsSection /></div>
+            <div className="break-inside-avoid mb-3"><ModelFoldersSection /></div>
             <div className="break-inside-avoid mb-3"><AutoprocessSection /></div>
             <div className="break-inside-avoid mb-3"><LayoutSection /></div>
             <div className="break-inside-avoid mb-3"><IoSection /></div>

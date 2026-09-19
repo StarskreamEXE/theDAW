@@ -33,6 +33,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 
 from backend.admin_routes import router as admin_router
 from backend.lib.audio_io import load_audio, load_audio_array, save_audio, save_subtype
+from backend.assistant_routes import mcp_relay_router
 from backend.assistant_routes import router as assistant_router
 from backend.modules.loader import load_modules
 from backend.lib import paths
@@ -75,6 +76,64 @@ pipeline: Any = None
 sample_rate = 44100
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MODULES_DIR = Path(__file__).parent / "modules"
+
+#: Stamped on the console handler this module installs, so a second call finds
+#: its own handler instead of adding another one.
+CONSOLE_LOG_MARKER = "_thedaw_console_handler"
+
+#: Chatty third parties stay at WARNING while the app's own modules log at INFO
+#: (same list as ``backend/run.py``).
+_NOISY_LOGGERS = ("httpx", "httpcore", "urllib3", "numba", "filelock")
+
+
+def _configure_console_logging() -> None:
+    """Put the app's own log lines on stderr, where every launcher captures them.
+
+    ``backend/run.py`` does this for the ``theDAW.bat`` / Electron path, but it
+    is only reached when the process STARTS there. Launched the documented dev
+    way — ``uvicorn backend.server:app`` — nothing configures the root logger:
+    uvicorn's dictConfig names only its own loggers, and the one handler root
+    does get (``log_ring``) writes to the LOG panel's ring buffer, not to a
+    stream. So every ``logger.info`` in ``backend/`` went nowhere, including
+    the ``[claude_session]`` spawned/respawned/torn-down lines that are the
+    only record of a persistent ``claude`` child being created or killed.
+
+    Idempotent, and yields to whoever already owns the console: if ``run.py``
+    (or a host process) put a stderr/stdout handler on root, this adds nothing,
+    so no line is ever printed twice.
+    """
+    root = logging.getLogger()
+    for handler in root.handlers:
+        if getattr(handler, CONSOLE_LOG_MARKER, False):
+            return
+        # Not `isinstance` alone: pytest's LogCaptureHandler is a StreamHandler
+        # over a StringIO, and yielding to it would silence the console under
+        # the test runner (and only there).
+        if isinstance(handler, logging.StreamHandler) and getattr(
+            handler, "stream", None
+        ) in (sys.stderr, sys.stdout):
+            return
+    level_name = os.getenv("THEDAW_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    if not isinstance(level, int):
+        level = logging.INFO
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    setattr(handler, CONSOLE_LOG_MARKER, True)
+    root.addHandler(handler)
+    if root.level == logging.NOTSET or root.level > level:
+        root.setLevel(level)
+    for noisy in _NOISY_LOGGERS:
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+# BEFORE modules load, so module-load lines (and failures) are on the console;
+# the lifespan re-runs it in case uvicorn's logging setup replaced root handlers
+# in between.
+try:
+    _configure_console_logging()
+except Exception:  # noqa: BLE001 — logging must never block boot
+    pass
 
 # Install the LOG-panel ring handler BEFORE modules load, so module-load
 # lines (and failures) are captured; the lifespan re-attaches it in case
@@ -919,6 +978,14 @@ def _generate_spectrograms(waveform: torch.Tensor, sr: int) -> dict[str, str]:
 async def _on_startup():
     startup_t0 = time.perf_counter()
 
+    # Re-run the console handler install: uvicorn's logging setup runs between
+    # this module's import and the lifespan, and a dictConfig there can drop
+    # root handlers. Idempotent — no second handler, no doubled lines.
+    try:
+        _configure_console_logging()
+    except Exception:
+        pass
+
     # Attach the in-memory log ring so the LOG panel (VERBOSE mode) can stream
     # real backend activity. Runs after uvicorn's logging setup and re-attaches
     # if that dropped the handler. Cheap and torch-free.
@@ -1008,6 +1075,17 @@ async def _on_shutdown() -> None:
     except Exception:
         # Shutdown is best-effort; never block process exit.
         pass
+    try:
+        # Every live conversation holds a persistent `claude` child, and each of
+        # those holds a stdio MCP child of its own. Nothing else reaps them, so
+        # without this a restart orphans the whole tree until the machine does.
+        from backend.modules.assistant.claude_session import kill_all
+
+        await kill_all()
+    except Exception:
+        # Still best-effort, but never silent: a failed reap leaves the claude
+        # tree orphaned, and this line is the only trace of why.
+        logger.warning("shutdown: claude_session.kill_all failed", exc_info=True)
     try:
         from backend.core.teardown import stop_all_sidecars
 
@@ -2456,6 +2534,9 @@ async def get_log(since: int = 0, limit: int = 1000):
 
 
 app.include_router(assistant_router)
+# Claude Code MCP relay (/api/mcp-relay/call|result|tools): the stdio MCP
+# child POSTs tool calls here and the browser POSTs their results back.
+app.include_router(mcp_relay_router)
 app.include_router(admin_router)
 
 
@@ -2505,7 +2586,10 @@ def _serve_static_build(
     # The builds keep fixed file names (embed.bundle.js, styles.css), so a
     # response without Cache-Control lets the browser reuse an old copy on its
     # own heuristic for hours after a new build is staged. no-cache makes every
-    # load revalidate, and a matching ETag answers 304 without the body.
+    # load revalidate, and a matching ETag answers 304 without the body. That
+    # covers index.html too, which names the bundle a rebuild replaces: a cached
+    # entry page pinned the tab (and Electron's persistent cache) to a build
+    # that no longer existed.
     response = FileResponse(
         target, stat_result=target.stat(), headers={"Cache-Control": "no-cache"}
     )

@@ -16,6 +16,7 @@ import type {
 import type { StorageProvider } from './storageProvider';
 import { fetchBlobWithRetry } from './fetchRetry';
 import type { LibraryFacetField, LibraryFacetValue, LibraryFacets } from './libraryFacets';
+import { stripSourceId } from './displayName';
 
 export type {
   LibraryFacetField,
@@ -68,7 +69,10 @@ interface ServerRecord {
 
 const toEntry = (r: ServerRecord): LibraryEntry => ({
   id: r.id,
-  title: r.title,
+  // Strip the importer's source id ONCE, here at the read boundary, so
+  // every panel that renders a title gets a clean one. `audioFilename`
+  // below stays raw: it resolves files and backs the Filename row.
+  title: stripSourceId(r.title),
   prompt: r.prompt,
   negativePrompt: r.negative_prompt,
   model: r.model,

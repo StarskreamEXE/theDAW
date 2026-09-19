@@ -184,7 +184,13 @@ def _tracked_backend_sources() -> list[str]:
         text=True,
         check=True,
     ).stdout.splitlines()
-    return [rel for rel in tracked if rel.endswith(".py")]
+    # backend/deprecated/ is an archive of retired code that nothing imports; it
+    # is kept as it was, not maintained.
+    return [
+        rel
+        for rel in tracked
+        if rel.endswith(".py") and not rel.startswith("backend/deprecated/")
+    ]
 
 
 def test_every_backend_spawn_names_its_environment() -> None:

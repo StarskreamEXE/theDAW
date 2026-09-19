@@ -85,6 +85,7 @@ def backfill_scores(store: Any) -> dict[str, int]:
             clean_title,
             midi_to_musicxml,
             register_existing_midis,
+            sheet_output_path,
         )
     except Exception:
         return res
@@ -100,7 +101,17 @@ def backfill_scores(store: Any) -> dict[str, int]:
         if not eid:
             continue
         res["scanned"] += 1
-        title = clean_title(str(entry.get("title") or ""))
+        # Read the title from the entry RECORD, the same source
+        # engine.sheet_output_path derives the filename from and the /from-midi
+        # route engraves with. Using the entries-table value here instead made
+        # this writer stamp different content than that route for the same
+        # artifact id, so _needs_fix saw a "wrong" title and regenerated the
+        # sheet on every launch.
+        record = store.get_entry(eid)
+        record_title = (
+            str(getattr(record, "title", "") or "") if record is not None else ""
+        )
+        title = clean_title(record_title)
         try:
             register_existing_midis(store.db, eid)
         except Exception:
@@ -141,7 +152,13 @@ def backfill_scores(store: Any) -> dict[str, int]:
                 res["errors"] += 1
                 continue
             midi_id = str(target.get("id") or "")
-            out = entry_dir / "notation" / f"{midi_id}.musicxml"
+            # The one path both writers of this sheet agree on (see
+            # engine.sheet_output_path): same filename spelling AND the same
+            # title source as the /from-midi route, so they cannot ping-pong.
+            out = sheet_output_path(store, eid, midi_id)
+            if out is None:
+                res["errors"] += 1
+                continue
             try:
                 result = midi_to_musicxml(
                     store.db,
@@ -150,7 +167,9 @@ def backfill_scores(store: Any) -> dict[str, int]:
                     output_path=out,
                     source_ref=midi_id,
                     artifact_id=f"{midi_id}__musicxml",
-                    title=title,
+                    # RAW record title, like /from-midi: the engraver cleans it
+                    # itself, so passing the pre-cleaned value would diverge.
+                    title=record_title,
                 )
                 if result.get("ok"):
                     res["generated" if not has_sheet else "fixed"] += 1

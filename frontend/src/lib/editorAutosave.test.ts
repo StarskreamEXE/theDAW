@@ -1,7 +1,7 @@
-// Autosave durability: an atomic manifest, and one writer per origin (T57).
+// Autosave durability, one writer per origin (T57), and the project meter.
 //
-// The autosave is what recovers a crashed session, so the two failure modes
-// pinned here are the ones that lose work rather than merely annoy:
+// The autosave is what recovers a crashed session, so the failure modes pinned
+// here are the ones that lose work rather than merely annoy:
 //
 //   1. A TORN MANIFEST. `manifest.json` used to be written in place. A crash
 //      partway through left a truncated file that `JSON.parse` rejects — and
@@ -15,6 +15,12 @@
 //      startup document would overwrite the first tab's arrangement. The
 //      driver now holds `navigator.locks` `thedaw-editor-autosave`; the tab
 //      that does not get it is RECOVERY-ONLY and writes nothing at all.
+//   3. A LOST METER. `timeSignature` is document state (it rides undo alongside
+//      bpm), so a meter the user — or the assistant, via
+//      `editor_set_time_signature` — sets has to survive a crash-recovery
+//      restore exactly as the tempo does. It did not: the manifest never wrote
+//      the field and the restore called `loadProject` without it, so a 7/8
+//      session came back in whatever meter the fresh session happened to hold.
 //
 // Each phase gets its own copy of the module (query-suffixed dynamic import)
 // because ownership and the `started` guard are module state, and its own fake
@@ -22,9 +28,15 @@
 // drivers stay subscribed to the shared editor store, so every phase drains
 // their pending debounce into a scratch root before asserting on its own.
 //
+// The meter phase runs FIRST and against its own harness (an immediate
+// `window.setTimeout`, so it pins the real debounced save path rather than the
+// explicit flush the durability phases use). Running it first is what keeps it
+// honest: no other driver exists yet to write into the root it inspects. It
+// drains itself on the way out so its debounce cannot land in phase 1's root.
+//
 // Run: npx tsx src/lib/editorAutosave.test.ts
 import assert from 'node:assert/strict';
-import { useEditorStore, type EditorTrack } from '../state/editorStore.ts';
+import { useEditorStore, type AudioClip, type EditorTrack } from '../state/editorStore.ts';
 import { isComped } from './clipComp.ts';
 
 const flush = async (n = 8): Promise<void> => {
@@ -248,6 +260,209 @@ async function drain(mods: AutosaveModule[]): Promise<void> {
   installGlobals(new FakeDir(true), 'grant');
   for (const m of mods) m.flushPendingAutosave();
   await flush(12);
+}
+
+/* ── Phase 0: the project meter round-trips ──────────────────────────────────
+   Its own in-memory OPFS and an immediate `window.setTimeout`, so what is
+   pinned is the actual debounced save/restore path rather than a
+   re-implementation of it — and rather than the explicit `flushPendingAutosave`
+   every later phase uses. */
+
+class MeterFakeWritable {
+  private chunks: Array<Uint8Array> = [];
+  constructor(private readonly onClose: (bytes: Uint8Array) => void) {}
+  async write(data: string | Blob | ArrayBuffer | Uint8Array): Promise<void> {
+    if (typeof data === 'string') {
+      this.chunks.push(new TextEncoder().encode(data));
+    } else if (data instanceof Uint8Array) {
+      this.chunks.push(data);
+    } else if (data instanceof ArrayBuffer) {
+      this.chunks.push(new Uint8Array(data));
+    } else {
+      this.chunks.push(new Uint8Array(await data.arrayBuffer()));
+    }
+  }
+  async close(): Promise<void> {
+    const total = this.chunks.reduce((n, c) => n + c.byteLength, 0);
+    const out = new Uint8Array(total);
+    let at = 0;
+    for (const c of this.chunks) {
+      out.set(c, at);
+      at += c.byteLength;
+    }
+    this.onClose(out);
+  }
+}
+
+class MeterFakeFileHandle {
+  bytes = new Uint8Array();
+  async getFile(): Promise<{ text(): Promise<string>; arrayBuffer(): Promise<ArrayBuffer> }> {
+    const bytes = this.bytes;
+    return {
+      text: async () => new TextDecoder().decode(bytes),
+      arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer,
+    };
+  }
+  async createWritable(): Promise<MeterFakeWritable> {
+    return new MeterFakeWritable((bytes) => {
+      this.bytes = bytes;
+    });
+  }
+}
+
+class MeterFakeDir {
+  files = new Map<string, MeterFakeFileHandle>();
+  dirs = new Map<string, MeterFakeDir>();
+  async getDirectoryHandle(name: string, opts?: { create?: boolean }): Promise<MeterFakeDir> {
+    let d = this.dirs.get(name);
+    if (!d) {
+      if (!opts?.create) throw new Error(`NotFoundError: ${name}`);
+      d = new MeterFakeDir();
+      this.dirs.set(name, d);
+    }
+    return d;
+  }
+  async getFileHandle(name: string, opts?: { create?: boolean }): Promise<MeterFakeFileHandle> {
+    let f = this.files.get(name);
+    if (!f) {
+      if (!opts?.create) throw new Error(`NotFoundError: ${name}`);
+      f = new MeterFakeFileHandle();
+      this.files.set(name, f);
+    }
+    return f;
+  }
+  async removeEntry(name: string, opts?: { recursive?: boolean }): Promise<void> {
+    void opts;
+    this.files.delete(name);
+    this.dirs.delete(name);
+  }
+  async *keys(): AsyncIterable<string> {
+    for (const k of this.files.keys()) yield k;
+    for (const k of this.dirs.keys()) yield k;
+  }
+}
+
+const meterOpfsRoot = new MeterFakeDir();
+
+/** The module's own OPFS layout (module-private constants there). */
+const AUTOSAVE_DIR_NAME = 'thedaw-editor-autosave';
+const AUTOSAVE_MANIFEST_NAME = 'manifest.json';
+
+const meterTrack = (id: string): EditorTrack => ({
+  id,
+  name: id,
+  nameAutoGenerated: false,
+  volume: 0.8,
+  pan: 0,
+  mute: false,
+  solo: false,
+  color: '#8b5cf6',
+});
+
+const meterClip = (id: string, trackId: string): AudioClip => ({
+  id,
+  trackId,
+  label: id,
+  audioBlob: new Blob(['pcm'], { type: 'audio/wav' }),
+  mimeType: 'audio/wav',
+  sourceDuration: 4,
+  offsetIntoSource: 0,
+  durationSec: 4,
+  startSec: 0,
+  color: '#8b5cf6',
+});
+
+const tick = (ms = 20) => new Promise((r) => setTimeout(r, ms));
+
+async function meterManifestHandle(): Promise<MeterFakeFileHandle> {
+  const dir = await meterOpfsRoot.getDirectoryHandle(AUTOSAVE_DIR_NAME, { create: true });
+  return dir.getFileHandle(AUTOSAVE_MANIFEST_NAME, { create: true });
+}
+
+const readMeterManifestJson = async (): Promise<Record<string, unknown>> =>
+  JSON.parse(new TextDecoder().decode((await meterManifestHandle()).bytes)) as Record<string, unknown>;
+
+async function writeMeterManifest(bytes: Uint8Array): Promise<void> {
+  const w = await (await meterManifestHandle()).createWritable();
+  await w.write(bytes);
+  await w.close();
+}
+
+/** The 7/8 manifest the first block writes, reused by the legacy block. */
+let meterSaved = new Uint8Array();
+
+async function theMeterSurvivesASaveAndRestoreRoundTrip(): Promise<void> {
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    writable: true,
+    value: { storage: { getDirectory: async () => meterOpfsRoot } },
+  });
+
+  // The save driver debounces through `window.setTimeout`; fire on the next tick
+  // so the suite pins the save path itself, not the 2s debounce.
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    writable: true,
+    value: {
+      setTimeout: (fn: () => void) => setTimeout(fn, 0) as unknown as number,
+      clearTimeout: (id: number) => clearTimeout(id as unknown as NodeJS.Timeout),
+      // The driver arms its unload flush here; the durability harness stubs the
+      // same method for the same reason.
+      addEventListener: () => undefined,
+    },
+  });
+
+  const meter = await loadAutosave('meter');
+  meter.initEditorAutosave();
+  await tick(); // let the "no manifest yet" probe resume saving
+
+  useEditorStore.getState().loadProject({
+    tracks: [meterTrack('t1')],
+    clips: [meterClip('c1', 't1')],
+    bpm: 132,
+    timeSignature: { num: 7, den: 8 },
+  });
+
+  // Wait for the debounced save to land the manifest.
+  for (let i = 0; i < 60 && (await meterManifestHandle()).bytes.byteLength === 0; i += 1) await tick(10);
+  const manifest = await readMeterManifestJson();
+  assert.deepEqual(
+    manifest.timeSignature,
+    { num: 7, den: 8 },
+    'the autosave manifest must carry the project meter',
+  );
+
+  // Keep the 7/8 document on disk, then land the session in a different meter
+  // (the clip stays, so the asset GC keeps its bytes) and restore.
+  meterSaved = (await meterManifestHandle()).bytes;
+  useEditorStore.getState().setTimeSignature(3, 4);
+  await tick(60);
+  await writeMeterManifest(meterSaved);
+
+  await meter.useAutosaveRecoveryStore.getState().restore();
+  assert.deepEqual(
+    useEditorStore.getState().timeSignature,
+    { num: 7, den: 8 },
+    'a restored autosave must bring its own meter back',
+  );
+
+  /* ── a legacy manifest (no meter) restores as 4/4 ───────────────────────── */
+  await tick(60); // let the restore's own autosave land before overwriting it
+  const legacy = JSON.parse(new TextDecoder().decode(meterSaved)) as Record<string, unknown>;
+  delete legacy.timeSignature;
+  await writeMeterManifest(new TextEncoder().encode(JSON.stringify(legacy)));
+
+  await meter.useAutosaveRecoveryStore.getState().restore();
+  assert.deepEqual(
+    useEditorStore.getState().timeSignature,
+    { num: 4, den: 4 },
+    'a document written before the field existed is 4/4, not whatever the session held',
+  );
+
+  // This driver stays subscribed to the shared store for the rest of the run,
+  // so its pending debounce goes somewhere harmless before phase 1 seeds a root
+  // and starts asserting on the bytes in it.
+  await drain([meter]);
 }
 
 /* ── Phase 1: the owner tab ─────────────────────────────────────────────── */
@@ -677,6 +892,7 @@ async function takesAndTheCompSurviveASaveAndRestore(): Promise<void> {
   await drain([mod]);
 }
 
+await theMeterSurvivesASaveAndRestoreRoundTrip();
 await aLeftoverTmpThatParsesIsPromotedOnTheNextStart();
 await aTornTmpIsSetAsideAndTheCommittedManifestSurvives();
 await aSaveStagesThenPromotesAndNeverWritesTheManifestInPlace();
@@ -689,4 +905,4 @@ await anObserverIsPromotedWhenTheLockIsReleased();
 await withoutWebLocksNothingChanges();
 await takesAndTheCompSurviveASaveAndRestore();
 
-console.log('editorAutosave: ok');
+console.log('editorAutosave: ok (durability, ownership, takes, meter round-trip)');

@@ -20,6 +20,7 @@ import {
   type EditorBus,
   type EditorTrack,
   type TimelineMarker,
+  type TimeSignature,
 } from '../state/editorStore';
 import {
   addBus as graphAddBus,
@@ -63,6 +64,7 @@ import { logError, logInfo, logWarn } from '../state/logStore';
 import { useSwayImportStore, startSwayImportDriver } from '../state/swayImportStore';
 import { usePerformRoutingStore } from '../state/performRouting';
 import { tasmoLoadedToDawProject } from './tasmoToSession';
+import { meterFromTasmo } from './timeSignatureIO';
 
 const TRACK_COLORS = ['#8b5cf6', '#a855f7', '#ec4899', '#06b6d4', '#10b981', '#facc15', '#f97316', '#ef4444'];
 
@@ -1001,9 +1003,19 @@ export async function loadProjectIntoEditor(
 
   // routing/buses go through loadProject's payload rather than a setState, so a
   // file written before they existed takes the ONE migration path there (see
-  // `migrateRouting`), exactly like a pre-routing autosave manifest.
+  // `migrateRouting`), exactly like a pre-routing autosave manifest. The meter
+  // rides the same payload: `meterFromTasmo` answers 4/4 for a file saved before
+  // `time_signature` existed, so a legacy project opens in the meter it was
+  // written in rather than the one the outgoing session happened to hold.
   const { routing, buses } = tasmoToRouting(routedTracks, project.buses);
-  useEditorStore.getState().loadProject({ tracks: outTracks, clips: outClips, bpm, routing, buses });
+  useEditorStore.getState().loadProject({
+    tracks: outTracks,
+    clips: outClips,
+    bpm,
+    timeSignature: meterFromTasmo(project.time_signature),
+    routing,
+    buses,
+  });
 
   // Markers and the loop region, which loadProject has just cleared. Restored
   // here rather than at either call site so BOTH ways into the editor (Open a
@@ -1173,6 +1185,9 @@ export interface CapturedSession extends CapturedDocument {
   tracks: TasmoTrackInput[];
   files: Array<{ name: string; blob: Blob }>;
   bpm: number;
+  /** Project meter, saved alongside the tempo so a non-4/4 session reopens in
+   *  the meter it was written in. */
+  timeSignature: TimeSignature;
   clipCount: number;
 }
 
@@ -1285,6 +1300,7 @@ export function captureEditorSession(): CapturedSession {
     tracks,
     files,
     bpm: editor.bpm,
+    timeSignature: editor.timeSignature,
     clipCount,
     // The tracks above ARE the editor's, so no lane can name one the payload
     // lacks — the filter is left off.

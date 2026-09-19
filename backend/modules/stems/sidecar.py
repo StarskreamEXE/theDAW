@@ -47,13 +47,25 @@ from backend.lib.launch_token import child_env
 log = logging.getLogger(__name__)
 
 
-# Packages the sidecar genuinely needs to separate stems. demucs imports but
+# Packages the sidecar really needs to serve a separation. demucs imports but
 # is useless without torch/torchaudio; torchcrepe drives the crepe pitch path.
 # The historical probe only checked demucs, so a venv with demucs present but
 # torch/torchcrepe missing spawned anyway — then run_backend.py tried to self-
 # install them and blew the entire 300s readiness window. We now gate on ALL of
 # these being importable before spawning.
-_CRITICAL_PACKAGES: tuple[str, ...] = ("demucs", "torch", "torchaudio", "torchcrepe")
+#
+# fastapi/uvicorn belong here too. Without them the sidecar dies before it ever
+# binds a port, which is indistinguishable from a hang: probe() reported
+# ok=True for a venv that could never serve, and the only symptom the user got
+# was an opaque 300s port-file timeout.
+_CRITICAL_PACKAGES: tuple[str, ...] = (
+    "demucs",
+    "torch",
+    "torchaudio",
+    "torchcrepe",
+    "fastapi",
+    "uvicorn",
+)
 
 
 def _probe_packages(python_exe: Path) -> dict:
@@ -323,6 +335,45 @@ def probe(cfg: Optional[SidecarConfig] = None) -> dict:
     return out
 
 
+def _terminate_tree(proc: subprocess.Popen) -> None:
+    """Kill the launcher AND everything it spawned.
+
+    run_backend.py is only a launcher: it execs uvicorn as a *child*, so
+    terminating the Popen we hold leaves uvicorn running and still holding the
+    port. The next ensure_running() then finds that port occupied, connects to
+    the orphan, and serves stale code forever — a restart that silently does
+    nothing. Kill the tree instead.
+    """
+    if proc.poll() is not None:
+        return
+    if sys.platform == "win32":
+        # taskkill /T walks the child chain; Popen.terminate does not.
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=30,
+                env=child_env(),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    else:
+        import signal
+
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+    try:
+        proc.wait(timeout=10.0)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+            proc.wait(timeout=5.0)
+        except OSError:
+            pass
+
+
 class StemsSidecar:
     """Lifecycle wrapper around the integration-package's FastAPI server.
 
@@ -446,12 +497,20 @@ class StemsSidecar:
         try:
             stdout_fp = open(self._stdout_log, "wb")
             stderr_fp = open(self._stderr_log, "wb")
+            # Own process group/session: lets _terminate_tree reap the
+            # uvicorn child along with the launcher on both platforms.
+            group_kwargs = (
+                {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+                if sys.platform == "win32"
+                else {"start_new_session": True}
+            )
             self._process = subprocess.Popen(
                 cmd,
                 cwd=str(self.cfg.package_path),
                 stdout=stdout_fp,
                 stderr=stderr_fp,
                 env=child_env(),
+                **group_kwargs,
             )
         except OSError as e:
             raise RuntimeError(f"failed to spawn stems sidecar: {e}") from e
@@ -524,12 +583,7 @@ class StemsSidecar:
     def stop(self) -> None:
         if self._process is not None:
             try:
-                self._process.terminate()
-                try:
-                    self._process.wait(timeout=10.0)
-                except subprocess.TimeoutExpired:
-                    self._process.kill()
-                    self._process.wait(timeout=5.0)
+                _terminate_tree(self._process)
             except OSError:
                 pass
             finally:

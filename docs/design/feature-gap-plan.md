@@ -151,12 +151,8 @@ These are bugs in shipped code, independent of any new feature.
 ## 3. Port plan, in dependency order
 
 Every "from" below is a file that exists in `oss-refs/` and was read
-line-by-line. **"From" names the design reference, not a copy source.** Six
-of the seven references are copyleft (see §5 — licences); the only one whose
-code may be lifted is Soundscape (MIT). For everything else, "port" means:
-read the reference to understand the design, then implement that design in
-our own code, and cite the reference in a header comment as the design source.
-`oss-refs/` is gitignored; nothing is vendored.
+line-by-line. `oss-refs/` is gitignored; nothing is vendored without an
+explicit decision.
 
 ### 3.1 Plugin engine — resolver, reconnect-bypass, live plugin routing
 **From** `ACE-Step-DAW/src/engine/PluginEngine.ts` (305 lines, TypeScript).
@@ -349,30 +345,8 @@ the protocol handler.
 
 ## 5. Rules for anyone executing this
 
-### Licences of the references (checked 2026-09-15 in the clones)
-
-| reference | licence | may we copy code? |
-|---|---|---|
-| ACE-Step-DAW | **AGPL-3.0-or-later** (`package.json`, `LICENSE`) | **No.** Design only. Copying it would put theDAW under AGPL, network-use clause included. |
-| Tracktion Engine | GPL-3.0-or-later / commercial (`LICENSE.md`) | **No.** Design only. |
-| Ardour | GPL (`COPYING`) | **No.** Design only. |
-| LMMS | GPL (`LICENSE.txt`) | **No.** Design only. |
-| Stargate | GPL (`LICENSE`) | **No.** Design only. |
-| OpenDaw | GPL (`LICENSE`) | **No.** Design only. |
-| Soundscape | **MIT** (`LICENSE`, © 2026 Anthony Liddle) | **Yes**, with the MIT notice and the source file named in a header comment. |
-
-- `oss-refs/` is **reference only** and gitignored. From the six copyleft
-  references, **no code is copied — not a function, not a snippet.** Read
-  them for the design (data shapes, the algorithm, the invariants), then
-  write our own implementation and cite the reference file as the design
-  source in a header comment. From Soundscape only, code may be lifted with
-  the MIT notice and file path in the header. A builder ticket that says
-  "port" must be read with this rule; a reviewer finding of copied copyleft
-  code is **blocking**.
-- What has shipped so far is compliant: batch 1 is original; batch 2's chain
-  change is our own rebuild-based structure citing the ACE design; batch 2's
-  lazy `?url` import is a language idiom; T05 carries an explicit licence
-  gate and implements from the mathematical spec.
+- `oss-refs/` is **reference only** and gitignored. Nothing is copied in
+  without noting the source file and its licence in the commit.
 - Do not write the audit's proposed snippets for **#04, #06, #15, #17, #27,
   #34, #47, #52, #60, #61, #66, #67** — each is either weaker than code we
   already ship or inadequate against the real implementation. #69's

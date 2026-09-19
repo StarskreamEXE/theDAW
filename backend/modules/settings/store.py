@@ -24,7 +24,7 @@ from backend.lib import paths
 log = logging.getLogger(__name__)
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -148,7 +148,39 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         # `overrides` (and for every slot above), never a fragment.
         "overrides": {},
     },
+    "models": {
+        # Extra folders (absolute paths) the app scans for ML models, on top
+        # of its built-in locations. Unlimited length; the user adds as many
+        # as they like in Settings. This store only owns persistence + hygiene
+        # (str-only, stripped, de-duped) — a consumer that scans checks that a
+        # folder actually exists. See _normalize_extra_folders / patch().
+        "extra_folders": [],
+    },
 }
+
+
+def _normalize_extra_folders(value: Any) -> list[str]:
+    """Clean a ``models.extra_folders`` payload: keep only non-empty string
+    items, strip surrounding whitespace, drop blanks, and de-duplicate while
+    preserving first-seen order. No cap on length.
+
+    Self-guarding: any non-list input (a hand-edited string, null, an object)
+    normalises to [], so a second caller can never trigger a TypeError inside
+    the store lock.
+    """
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        folder = item.strip()
+        if not folder or folder in seen:
+            continue
+        seen.add(folder)
+        out.append(folder)
+    return out
 
 
 def default_settings_path() -> Path:
@@ -227,6 +259,19 @@ def _merge_defaults(payload: dict[str, Any]) -> dict[str, Any]:
         # per-surface overrides). New section, already filled from
         # DEFAULT_SETTINGS above; this branch re-persists the bumped schema.
         merged.setdefault("io", deepcopy(DEFAULT_SETTINGS["io"]))
+    if old_version < 9:
+        # Migration v8 → v9: add the `models` section (extra_folders). New
+        # section, already filled from DEFAULT_SETTINGS above; this branch
+        # re-persists the bumped schema with the field present.
+        merged.setdefault("models", deepcopy(DEFAULT_SETTINGS["models"]))
+
+    # Hygiene lives in the store, not only on the PATCH path: a hand-edited,
+    # restored, or externally written settings.json gets the same str-only /
+    # stripped / de-duped treatment on load. Additive — only blanks, dupes,
+    # and non-str items are dropped; a non-list normalises to [].
+    merged["models"]["extra_folders"] = _normalize_extra_folders(
+        merged["models"].get("extra_folders")
+    )
 
     merged["schema_version"] = SCHEMA_VERSION
     return merged
@@ -300,6 +345,13 @@ class SettingsStore:
                 for k, v in value.items():
                     if k not in allowed_keys:
                         continue
+                    if section == "models" and k == "extra_folders":
+                        # List-valued key: sanitise it (str-only, stripped,
+                        # de-duped, no cap). A non-list is malformed and is
+                        # ignored so it can't wipe the existing list.
+                        if not isinstance(v, list):
+                            continue
+                        v = _normalize_extra_folders(v)
                     target[k] = v
             self._cache["schema_version"] = SCHEMA_VERSION
             self._write(self._cache)

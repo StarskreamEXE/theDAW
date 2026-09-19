@@ -5,6 +5,7 @@ import { useStatusBarStore } from '../state/statusBarStore';
 import { logError, logInfo } from '../state/logStore';
 import { renderNotesToBlob, type RenderNote } from './midiSynth';
 import type { PianoNote } from '../state/pianoRollStore';
+import { validTimeSignature } from './timeSignatureIO';
 
 const DEFAULT_CLIP_SECONDS = 4;
 
@@ -99,6 +100,12 @@ const loadClipAudio = async (clip: DawClip, project: DawProject): Promise<{
 export async function importDawProjectToEditor(project: DawProject): Promise<number> {
   const editor = useEditorStore.getState();
   editor.setBpm(project.tempo);
+  // The source DAW's meter comes across with its tempo. This is a merge into
+  // the open session, not a document load, so an unreported or unusable pair
+  // leaves the session's meter alone instead of forcing 4/4.
+  const pair = project.time_signature;
+  const meter = Array.isArray(pair) && pair.length >= 2 ? validTimeSignature(pair[0], pair[1]) : null;
+  if (meter) editor.setTimeSignature(meter.num, meter.den);
 
   const playableTracks = project.tracks.filter((track) => track.type === 'audio' || track.type === 'midi');
   const hasArrangement = playableTracks.some((track) => track.clips.some(isArrangementClip));
