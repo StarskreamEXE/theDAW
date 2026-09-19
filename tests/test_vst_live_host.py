@@ -297,6 +297,8 @@ def test_spawn_argv_matches_the_contract(manager, plugin_file: Path) -> None:
     assert argv[argv.index("--channels") + 1] == "2"
     assert argv[argv.index("--port") + 1] == "0"
     assert argv[argv.index("--parent-pid") + 1] == str(os.getpid())
+    # An orphaned host (its browser tab died) must exit on its own.
+    assert argv[argv.index("--idle-timeout") + 1] == "120"
     assert argv[argv.index("--state-file") + 1] == str(session.state_path)
     # The host's OWN log is a separate file from host.log (stdout pump +
     # stderr) — see the module docstring's "Logs" section.
@@ -1116,3 +1118,24 @@ def test_fake_host_exits_3_when_the_plugin_is_missing(tmp_path: Path) -> None:
         timeout=60,
     )
     assert done.returncode == 3
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("", 120),
+        ("0", 0),
+        ("45", 45),
+        ("86400", 86400),
+        ("86401", 120),
+        ("-5", 120),
+        ("soon", 120),
+    ],
+)
+def test_idle_timeout_env_override_is_bounded(
+    monkeypatch, raw: str, expected: int
+) -> None:
+    from backend.modules.vst import live_host
+
+    monkeypatch.setenv("THEDAW_VST_LIVE_IDLE_SEC", raw)
+    assert live_host._idle_timeout_sec() == expected

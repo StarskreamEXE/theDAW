@@ -29,6 +29,7 @@ import {
   Blocks, ChevronDown, ChevronUp, Eye, EyeOff, Loader2, Plug, Plus, RefreshCw,
   SlidersHorizontal, X,
 } from 'lucide-react';
+import { VstLiveRowBadge } from './VstLiveRowBadge';
 import { FxRack } from './FxRack';
 import { EffectControls } from './effects/EffectControls';
 import { schemaForRackEffect } from './effects/effectSchema';
@@ -728,6 +729,10 @@ export const FxChainList: React.FC<FxChainListProps> = ({
                     {kind === 'vst' ? 'VST' : kind === 'gan' ? 'GAN' : 'FX'}
                   </span>
                 </button>
+                {/* A hosted plugin says what it is doing right now: LIVE + latency, starting, a dead
+                    host with a retry, or render-only. Outside the row-body button: the retry is a
+                    control of its own and a button cannot hold another. */}
+                <VstLiveRowBadge entry={entry} label={effectEntryLabel(entry)} />
                 <button
                   onClick={() => reorderEntry(scope, i, i - 1)}
                   disabled={i === 0}

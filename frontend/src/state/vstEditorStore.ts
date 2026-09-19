@@ -186,19 +186,10 @@ const releaseHold = (): void => {
   liveHolder.unhold(id);
 };
 
-/**
- * Automated browser tests drive the real app, and a plugin's editor is a NATIVE window on the
- * user's desktop. With this switch set, open() does nothing at all, so a test can add plugins
- * and play them without a single window appearing. Off unless someone sets the key.
- */
-export const NO_EDITOR_WINDOWS_KEY = 'thedaw.vst.noEditorWindows';
-const editorWindowsSuppressed = (): boolean => {
-  try {
-    return globalThis.localStorage?.getItem(NO_EDITOR_WINDOWS_KEY) === '1';
-  } catch {
-    return false;
-  }
-};
+// The "no plugin windows" test switch is enforced BELOW this store, at the two calls that can put
+// a window on the screen (lib/vstLive/editorWindowSwitch.ts). open() itself runs unchanged under
+// test, which is what lets a browser test prove the app reaches for the LIVE editor.
+export { NO_EDITOR_WINDOWS_KEY } from '../lib/vstLive/editorWindowSwitch';
 
 /** The in-flight "wait for `starting` to become `live`" started by open(), if
  *  any: stops its vstLiveStore subscription and cancels its timer. Replaced
@@ -682,10 +673,6 @@ export const useVstEditorStore = create<VstEditorState>()((set, get) => ({
 
   open: (entry, sinkRawState, opts) => {
     if (!entry.vst) return;
-    if (editorWindowsSuppressed()) {
-      useStatusBarStore.getState().setText('VST GUI: plugin windows are switched off (test mode).');
-      return;
-    }
     if (get().entryId === entry.id && !opts?.offlineOnly) return; // already open for this entry
     // A different entry takes over: whatever session the editor was holding goes back.
     if (heldEntryId !== null && heldEntryId !== entry.id) releaseHold();
@@ -936,4 +923,28 @@ useAppUiStore.subscribe((state, prevState) => {
   if (state.centerTab === prevState.centerTab) return;
   const s = useVstEditorStore.getState();
   if (s.entryId && s.ownerTab && state.centerTab !== s.ownerTab) s.close();
+});
+
+/** Is this chain entry still in the project: the mix chain, a track's rack, or the master VST chain? */
+function chainEntryExists(entryId: string): boolean {
+  if (useEffectChainStore.getState().chain.some((e) => e.id === entryId)) return true;
+  const ed = useEditorStore.getState();
+  if (ed.masterVstChain.some((e) => e.id === entryId)) return true;
+  return ed.tracks.some((t) => (t.fxChain ?? []).some((e) => e.id === entryId));
+}
+
+// A plugin leaves the project by many roads: its row's remove button (Edit or Mix), its track being
+// deleted, an undo of the add, a project load. Only one of them knew to close the plugin's window —
+// and the window HOLDS the live session, so every other road left a host process and a native
+// window outliving the plugin they belong to. Watching the chains themselves covers every road.
+const closeEditorOfRemovedEntry = (): void => {
+  const s = useVstEditorStore.getState();
+  if (s.entryId !== null && !chainEntryExists(s.entryId)) s.close();
+};
+useEffectChainStore.subscribe((state, prevState) => {
+  if (state.chain !== prevState.chain) closeEditorOfRemovedEntry();
+});
+useEditorStore.subscribe((state, prevState) => {
+  if (state.tracks === prevState.tracks && state.masterVstChain === prevState.masterVstChain) return;
+  closeEditorOfRemovedEntry();
 });

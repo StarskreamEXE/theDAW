@@ -171,6 +171,23 @@ def default_host_path() -> Path:
     return paths.PROJECT_ROOT / "native" / "vst-host" / "bin" / _HOST_BINARY
 
 
+def _idle_timeout_sec() -> int:
+    """Seconds a host may sit with no client before it exits (0 = never).
+
+    ``THEDAW_VST_LIVE_IDLE_SEC`` overrides the default of two minutes; a value
+    that does not parse, or is out of the host's accepted range, is ignored.
+    """
+    raw = os.environ.get("THEDAW_VST_LIVE_IDLE_SEC", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = -1
+        if 0 <= value <= 86400:
+            return value
+    return 120
+
+
 class LiveHostError(RuntimeError):
     """A failure with the HTTP status the route should answer with."""
 
@@ -816,6 +833,13 @@ class LiveSessionManager:
             # that never reaches the lifespan shutdown hook.
             "--parent-pid",
             str(os.getpid()),
+            # A host nobody is connected to exits by itself: a browser tab that crashed or was
+            # killed never sends the DELETE its unload handler would have, and without this the
+            # plugin process lived until the backend stopped. The host keeps running while a
+            # client is connected or its editor window is open, however long that is, and it
+            # writes its state file on the way out, so a later reconnect restores the settings.
+            "--idle-timeout",
+            str(_idle_timeout_sec()),
             # The host's OWN log, not the wire protocol on stdout: a separate
             # file from host.log (stdout pump + stderr) so the two never share
             # one file — see the module docstring's "Logs" section.

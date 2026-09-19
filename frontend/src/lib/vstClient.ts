@@ -4,6 +4,7 @@
 // studioStore (mirroring /api/studio/process), so no other client calls are
 // needed here.
 import { delJson, getJson, postJson } from './apiJson';
+import { editorWindowsSuppressed, OFFLINE_EDITOR_SUPPRESSED_LOG } from './vstLive/editorWindowSwitch';
 
 export interface Vst3PluginInfo {
   /** The bundle/file stem. Always present, because it costs nothing to read —
@@ -99,13 +100,20 @@ export const vstApi = {
     pluginPath: string,
     rawState?: string | null,
     embed?: { parentHwnd: string; rect: VstEmbedRect },
-  ) =>
-    postJson<{ status: string; preset_path: string }>('/api/vst/open-editor', {
+  ) => {
+    // The one place an OFFLINE plugin window can be asked for (see editorWindowSwitch.ts).
+    // Rejecting, not resolving: the caller must not record an editor that never opened.
+    if (editorWindowsSuppressed()) {
+      console.info(OFFLINE_EDITOR_SUPPRESSED_LOG);
+      return Promise.reject(new Error('plugin windows are switched off (test mode)'));
+    }
+    return postJson<{ status: string; preset_path: string }>('/api/vst/open-editor', {
       plugin_path: pluginPath,
       raw_state: rawState ?? null,
       parent_hwnd: embed?.parentHwnd ?? null,
       rect: embed?.rect ?? null,
-    }),
+    });
+  },
   // Push a live embed-rect update (viewport + scroll offset), or close the
   // embedded editor (close=true). sx/sy let an oversized editor pan as the host
   // scrolls. All values are physical px.

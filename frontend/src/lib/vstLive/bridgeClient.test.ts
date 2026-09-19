@@ -18,6 +18,8 @@
  */
 import assert from 'node:assert/strict';
 
+import { LIVE_EDITOR_SUPPRESSED_LOG, NO_EDITOR_WINDOWS_KEY } from './editorWindowSwitch.ts';
+
 import {
   FRAME_TYPE_AUDIO_IN,
   FRAME_TYPE_AUDIO_OUT,
@@ -544,6 +546,47 @@ const pcm = (frames = 4) => [new Float32Array(frames), new Float32Array(frames)]
   c2.close(); // idempotent
   assert.equal(c2.ready, false);
   c2.sendAudio(inHeader(1), pcm()); // must not throw after close
+}
+
+/* ── the "no plugin windows" switch withholds open_editor and nothing else ─── */
+{
+  const mem = new Map<string, string>();
+  const g = globalThis as unknown as { localStorage?: unknown };
+  const previous = g.localStorage;
+  g.localStorage = {
+    getItem: (k: string) => mem.get(k) ?? null,
+    setItem: (k: string, v: string) => void mem.set(k, v),
+    removeItem: (k: string) => void mem.delete(k),
+  };
+  const infos: string[] = [];
+  const realInfo = console.info;
+  console.info = (...a: unknown[]) => void infos.push(a.map(String).join(' '));
+  try {
+    const { client, sock } = makeClient();
+    client.connect();
+    const s = sock();
+    s.open();
+    s.say(READY);
+    const from = s.ops().length;
+
+    mem.set(NO_EDITOR_WINDOWS_KEY, '1');
+    client.openEditor({ title: 'Pro-Q 4' });
+    client.getState();
+    client.closeEditor();
+    assert.deepEqual(
+      s.ops().slice(from),
+      [{ op: 'get_state' }, { op: 'close_editor' }],
+      'the window request never reaches the host; every other op still does',
+    );
+    assert.deepEqual(infos, [LIVE_EDITOR_SUPPRESSED_LOG], 'one line says a LIVE editor was withheld');
+
+    mem.delete(NO_EDITOR_WINDOWS_KEY);
+    client.openEditor({ title: 'Pro-Q 4' });
+    assert.deepEqual(s.ops().slice(from + 2), [{ op: 'open_editor', title: 'Pro-Q 4' }], 'off again: the op is sent');
+  } finally {
+    console.info = realInfo;
+    g.localStorage = previous;
+  }
 }
 
 console.log('vstLive/bridgeClient: ok');

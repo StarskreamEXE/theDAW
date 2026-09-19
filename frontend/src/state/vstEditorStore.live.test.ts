@@ -100,6 +100,7 @@ const {
 } = await import('./vstEditorStore.ts');
 const { useVstLiveStore } = await import('./vstLiveStore.ts');
 const { useVstEditorPrefs } = await import('./vstEditorPrefsStore.ts');
+const { useEditorStore } = await import('./editorStore.ts');
 
 /* ── fakes ─────────────────────────────────────────────────────────────────── */
 
@@ -494,7 +495,7 @@ const failIfCalled = () => assert.fail('the OFFLINE sidecar sink must never be c
   assert.deepEqual(unheld, [idA, idB]);
 }
 
-/* ── the test switch: with it set, open() opens nothing at all ── */
+/* ── the test switch lives BELOW the store: the offline window request is withheld, nothing is recorded ── */
 {
   const mem = new Map<string, string>();
   (globalThis as unknown as { localStorage: unknown }).localStorage = {
@@ -503,22 +504,41 @@ const failIfCalled = () => assert.fail('the OFFLINE sidecar sink must never be c
     removeItem: (k: string) => void mem.delete(k),
   };
   mem.set(NO_EDITOR_WINDOWS_KEY, '1');
-  let holds = 0;
   __setLiveHolderForTest({
-    hostAvailable: () => true,
-    hold: async () => {
-      holds += 1;
-      return null;
-    },
+    hostAvailable: () => false, // no live host here: open() takes the offline path
+    hold: () => assert.fail('a machine without the host must never try to start a live session'),
     unhold: () => {},
   });
   const before = fetchCalls;
   store().open(chainEntry('e-suppressed', 'C:/VST3/Eta.vst3'), failIfCalled);
   await flush();
-  assert.equal(holds, 0, 'no live session is started for a window that will not open');
-  assert.equal(fetchCalls, before, 'no offline editor either');
-  assert.equal(store().entryId, null);
+  assert.equal(fetchCalls, before, 'the open-editor POST is never made while the switch is set');
+  assert.equal(store().entryId, null, 'an editor that never opened is not recorded as open');
   mem.delete(NO_EDITOR_WINDOWS_KEY);
+}
+
+/* ── the plugin leaves the project while its window is open -> the window closes, whatever removed it ── */
+{
+  const id = 'e-removed';
+  const entry = chainEntry(id, 'C:/VST3/Theta.vst3');
+  useEditorStore.setState({ tracks: [{ id: 't-removed', fxChain: [entry] }] as never });
+  const session = fakeSession(id);
+  liveSessions.set(id, session as never);
+  useVstLiveStore.getState().setStatus(id, 'live');
+  store().open(entry, failIfCalled);
+  await flush();
+  assert.equal(store().entryId, id, 'setup: the live editor is open');
+
+  // An unrelated edit to the tracks leaves it alone.
+  useEditorStore.setState({ tracks: [{ id: 't-removed', fxChain: [entry], name: 'renamed' }] as never });
+  assert.equal(store().entryId, id, 'an edit that keeps the plugin keeps its window');
+
+  // A track delete, an undo of the add, a remove from the Mix view: the chain no longer has it.
+  useEditorStore.setState({ tracks: [{ id: 't-removed', fxChain: [] }] as never });
+  assert.equal(store().entryId, null, 'the window of a plugin that left the project is closed');
+  assert.ok(session.calls.some((c) => c.startsWith('closeEditor')), 'the host is told to close its window');
+  liveSessions.delete(id);
+  useEditorStore.setState({ tracks: [] as never });
 }
 
 __setLiveHolderForTest(null);

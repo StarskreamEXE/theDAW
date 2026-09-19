@@ -23,6 +23,7 @@
  * Units: `*Samples` are sample frames; `rttMs` / `maxProcessMs` are
  * milliseconds; backoff options are milliseconds.
  */
+import { editorWindowsSuppressed, LIVE_EDITOR_SUPPRESSED_LOG } from './editorWindowSwitch';
 import {
   FRAME_TYPE_AUDIO_OUT,
   packFrame,
@@ -458,6 +459,11 @@ export class VstBridgeClient {
   }
 
   openEditor(o: { parentHwnd?: string; x?: number; y?: number; w?: number; h?: number; title?: string } = {}): void {
+    // The one place a LIVE plugin window can be asked for (see editorWindowSwitch.ts).
+    if (editorWindowsSuppressed()) {
+      console.info(LIVE_EDITOR_SUPPRESSED_LOG);
+      return;
+    }
     const body: Record<string, unknown> = { op: 'open_editor' };
     if (o.parentHwnd !== undefined) body.parent_hwnd = o.parentHwnd;
     if (o.x !== undefined) body.x = o.x;

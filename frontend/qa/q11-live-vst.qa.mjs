@@ -3,39 +3,31 @@
 // Run with:
 //   cd "C:\Users\skream\projects\_thedaw-batch11\frontend" && node qa/q11-live-vst.qa.mjs
 //
-// Reads (at commit 60d4a44):
-//   frontend/src/components/audio/FxRack.tsx (vstLiveBadge)
-//   frontend/src/components/audio/fxRackBadge.ts (liveBadge — exact pill text)
-//   frontend/src/components/audio/EffectWindows.tsx (FxChainList — what EDIT's
-//     track FX rack popover actually renders; it does NOT use <FxRack>, only
-//     the non-vst/non-gan branch of the per-entry window does)
-//   frontend/src/lib/vstLive/sessionRegistry.ts, vstLiveNode.ts
-//   frontend/src/state/vstLiveStore.ts
-//   frontend/src/lib/rackEffects.ts (vst3 branch)
-//   backend/modules/vst/router.py (/live/*), docs/design/vst-live-protocol.md
+// What the app under test is expected to do (the code these checks follow):
+//   - EDIT's track FX list (`FxChainList`, components/audio/EffectWindows.tsx)
+//     shows each hosted plugin's state through `VstLiveRowBadge`: the pill text
+//     is one of 'LIVE · <n> ms' / 'LIVE · DEFAULTS' / 'starting…' / 'error' /
+//     'render-only' (components/audio/fxRackBadge.ts), and an error row offers
+//     a retry button.
+//   - A session nobody uses is shut down after a 10 s grace period
+//     (`VST_LIVE_GRACE_MS`, lib/vstLive/sessionRegistry.ts) — that grace is what
+//     lets a graph rebuild, or an undo of a remove, get the SAME running plugin
+//     back. So "remove closes the host" is checked over 16 s, not instantly.
+//   - A dead host is re-created automatically (`recreate` in the registry); the
+//     row goes 'error' and comes back to LIVE without the user doing anything.
+//   - Adding a plugin opens its window, and with a live host on the machine that
+//     window must belong to the LIVE instance. qaLib switches plugin windows off
+//     for every run, and the app then logs which editor it WOULD have opened
+//     (lib/vstLive/editorWindowSwitch.ts) — that log line is the evidence here.
+//     No window ever appears on the desktop.
 //
-// Key finding from reading the code (verified empirically below): the track
-// FX rack popover opened from EDIT is built from `FxChainList`
-// (components/audio/EffectWindows.tsx), which renders only a bypass dot, the
-// entry name, a kind tag ('VST'/'GAN'/'FX') and reorder/remove buttons — it
-// never imports vstLiveStore/vstLiveBadge/liveBadge. The LIVE/starting/
-// error/render-only pill and the "X.X ms of latency" text exist only inside
-// `<FxRack>` (components/audio/FxRack.tsx), which is used by the MIX/DRAW
-// per-track racks and the master bus, NOT by EDIT's per-track FX rack. So the
-// literal "rack row shows the LIVE state" expectation is checked against the
-// actual EDIT surface, not assumed.
+// "Blocks flowing" is proven from the wire: the binary WebSocket traffic
+// between the browser and the native host (docs/design/vst-live-protocol.md),
+// seen through Playwright's page.on('websocket').
 //
-// No window debug handle exists anywhere in the app (grepped for
-// `window.__`/`globalThis.__`), and the backend's LiveSessionInfo has no
-// block/frame counters or xrun counts (only alive/pid/port/started_at/
-// log_tail — grepped backend/modules/vst/router.py). So "blocks flowing" is
-// proven by observing the actual binary WebSocket traffic between the
-// browser and the native host (the wire protocol in
-// docs/design/vst-live-protocol.md) via Playwright's page.on('websocket'),
-// which is stronger evidence than a UI counter would be.
-//
-// RULES for this dispatch forbid saving a project to disk from the app, so
-// scenario 6 (save/reload persistence) is `blocked`, not skipped silently.
+// Persistence is checked through the app's own crash-recovery autosave (OPFS,
+// inside the browser profile): refresh the page, restore, and the plugin has to
+// come back live. Nothing is saved to disk.
 
 import { openApp, createReport, expect, ASSETS_DIR } from './qaLib.mjs'
 import { execSync } from 'node:child_process'
@@ -171,10 +163,32 @@ async function main() {
       lastCreateSessionBody = await res.json().catch(() => null)
     }
   })
+  // Plugin windows are switched off for QA; the app logs which editor it would
+  // have opened instead (lib/vstLive/editorWindowSwitch.ts).
+  const withheld = { live: 0, offline: 0 }
+  page.on('console', (m) => {
+    const text = m.text()
+    if (text.includes('[vstLive] open_editor withheld')) withheld.live += 1
+    if (text.includes('[vst] offline editor withheld')) withheld.offline += 1
+  })
+  let offlineEditorPosts = 0
+  page.on('request', (req) => {
+    if (req.method() === 'POST' && /\/api\/vst\/open-editor$/.test(req.url())) offlineEditorPosts += 1
+  })
+
+  /** The live pill(s) the page shows right now, e.g. ['LIVE · 46.4 ms']. */
+  const readPills = () =>
+    page.evaluate(() =>
+      Array.from(document.querySelectorAll('span[title]'))
+        .map((el) => (el.textContent || '').trim())
+        .filter((t) => /^(LIVE|starting|error|render-only)/.test(t)),
+    )
+  const aliveSessions = async () => ((await apiGet('/api/vst/live/sessions')).body?.sessions ?? []).filter((s) => s.alive)
 
   let trackName = null
   let sessionId = null
   let hostPid = null
+  let liveEntryId = null // chain entry id of the plugin scenarios 5 and 6 work on
   // Only ever close sessions THIS run opened — the backend is shared with
   // other areas' concurrent scripts, so a blanket "delete every session" in
   // cleanup would be able to kill another agent's live plugin out from under
@@ -245,16 +259,9 @@ async function main() {
       await safeClick(pluginBtn.first())
       await page.screenshot({ path: report.shotPath('01b-plugin-added') })
 
-      // FxChainList's onAddVst is `addAndEditTrackVst` — adding a plugin this
-      // way ALSO opens its native editor window immediately (by the app's own
-      // design, not something this script asked for). RULES for this dispatch
-      // forbid using a plugin's own editor window in a test, so close it
-      // without touching its contents the moment it appears.
-      const editorClose = page.getByRole('button', { name: new RegExp(`^Close .*${PLUGIN_NAME}.*window$`, 'i') })
-      if (await editorClose.count().catch(() => 0)) {
-        await safeClick(editorClose.first())
-        await page.waitForTimeout(200)
-      }
+      // FxChainList's onAddVst is `addAndEditTrackVst`: adding a plugin also asks
+      // for its editor window. Windows are switched off for QA (qaLib), so none
+      // appears; scenario 2 checks WHICH editor the app reached for.
 
       // Backend truth: exactly one new session, exactly one new host process.
       // NOTE: sessionRegistry.acquire() only runs when buildEffectChain
@@ -319,6 +326,31 @@ async function main() {
         `(FxChainList in EffectWindows.tsx never renders vstLiveBadge/liveBadge; that only happens inside <FxRack>, which EDIT's per-track rack does not use). ` +
         `Popover text was: ${JSON.stringify(popoverText.slice(0, 300))}`,
       )
+    })
+
+    // ── Scenario 1b: the window the app asks for is the LIVE instance's ────
+    await report.scenario('plugin-window-request-goes-to-the-live-instance', async () => {
+      expect(!!sessionId, 'setup: no live session')
+      // The request follows the session going live (a cold start can take a few seconds).
+      const deadline = Date.now() + 20000
+      while (Date.now() < deadline && withheld.live === 0 && withheld.offline === 0 && offlineEditorPosts === 0) {
+        await page.waitForTimeout(250)
+      }
+      expect(
+        withheld.offline === 0 && offlineEditorPosts === 0,
+        `the app reached for the OFFLINE (pedalboard) editor after adding a plugin with a live host available ` +
+        `(withheld offline opens=${withheld.offline}, open-editor POSTs=${offlineEditorPosts}) — a second copy of the plugin, not the one being heard`,
+      )
+      expect(withheld.live >= 1, 'the app never asked the LIVE host to open the plugin window within 20s of adding the plugin')
+
+      // Closing the plugin window must not take the live plugin out of the mix.
+      const editorClose = page.getByRole('button', { name: new RegExp(`^Close .*${PLUGIN_NAME}.*window$`, 'i') })
+      if (await editorClose.count().catch(() => 0)) {
+        await safeClick(editorClose.first())
+        await page.waitForTimeout(500)
+      }
+      const s = await apiGet(`/api/vst/live/session/${sessionId}`)
+      expect(s.status === 200 && s.body?.alive === true, `session ${sessionId} is no longer alive after the window request/close: ${JSON.stringify(s.body)}`)
     })
 
     // ── Scenario 2: press play, prove blocks flow through the plugin ──────
@@ -395,7 +427,9 @@ async function main() {
       await page.waitForTimeout(300)
       await page.screenshot({ path: report.shotPath('04b-removed') })
 
-      const deadline = Date.now() + 8000
+      // 10 s grace (VST_LIVE_GRACE_MS) + the host's own shutdown: see the header.
+      const removedAt = Date.now()
+      const deadline = removedAt + 16000
       let closed = false
       let procGone = false
       while (Date.now() < deadline) {
@@ -405,13 +439,15 @@ async function main() {
         if ((s.status === 404 || aliveNow === false) && procGone) { closed = true; break }
         await page.waitForTimeout(400)
       }
-      expect(closed, `session ${sessionId} / pid ${hostPid} did not close within 8s of Remove (last check: procGone=${procGone})`)
+      expect(closed, `session ${sessionId} / pid ${hostPid} did not close within 16s of Remove (last check: procGone=${procGone})`)
+      console.log(`  host exited ${((Date.now() - removedAt) / 1000).toFixed(1)} s after Remove`)
+      const pills = await readPills()
+      expect(pills.length === 0, `the removed plugin still shows a live pill: ${JSON.stringify(pills)}`)
     })
 
     // ── Scenario 5: failure path — kill the host process out from under it ─
     await report.scenario('failure-path-kill-host-recovers-to-live', async () => {
-      const before = await apiGet('/api/vst/live/sessions')
-      const beforeCount = before.body?.sessions?.length ?? 0
+      const knownIds = new Set(((await apiGet('/api/vst/live/sessions')).body?.sessions ?? []).map((s) => s.session_id))
       trackName = await firstTrackName(page)
 
       await safeClick(page.getByRole('button', { name: `Track ${trackName} insert FX` }))
@@ -427,81 +463,118 @@ async function main() {
       await pluginBtn.waitFor({ state: 'visible', timeout: 5000 })
       await safeClick(pluginBtn)
 
+      // A session this run has not seen before, by id: counting sessions is wrong
+      // while the removed plugin's host is still inside its grace period.
       let mine = null
-      let deadline = Date.now() + 10000
+      let deadline = Date.now() + 15000
       while (Date.now() < deadline) {
-        const r = await apiGet('/api/vst/live/sessions')
-        if ((r.body?.sessions?.length ?? 0) > beforeCount) { mine = r.body.sessions[r.body.sessions.length - 1]; break }
+        mine = (await aliveSessions()).find((s) => !knownIds.has(s.session_id)) ?? null
+        if (mine) break
         await page.waitForTimeout(300)
       }
-      expect(!!mine, 're-adding the plugin never produced a new session within 10s')
+      expect(!!mine, 're-adding the plugin never produced a new session within 15s')
       sessionId = mine.session_id
       hostPid = mine.pid
+      liveEntryId = mine.chain_entry_id
       createdSessionIds.add(sessionId)
+
+      deadline = Date.now() + 15000
+      while (Date.now() < deadline && !(await readPills()).some((t) => t.startsWith('LIVE'))) await page.waitForTimeout(250)
+      expect((await readPills()).some((t) => t.startsWith('LIVE')), `the re-added plugin never showed LIVE: ${JSON.stringify(await readPills())}`)
 
       await safeClick(page.getByRole('button', { name: 'Play the arrangement' }))
       await page.waitForTimeout(1500)
 
       const killResult = killPid(hostPid);
       expect(killResult === true, `taskkill /PID ${hostPid} /F failed: ${killResult}`)
-      await page.waitForTimeout(500)
 
-      // EXPECTED: row leaves LIVE, shows error/reconnecting with a reason —
-      // but per scenario 1's finding, EDIT's row never showed LIVE in the
-      // first place, so there is no visible "leaves LIVE" transition to
-      // observe there either. Check the only place that reachably renders a
-      // status string for this entry.
-      await page.waitForTimeout(1000)
-      const domText = await page.evaluate(() => document.body.textContent || '')
-      const sawErrorWord = /error|reconnect/i.test(domText)
-
-      // Track must keep SOUNDING (dry), not go silent — no meter/analyser
-      // value is exposed in the DOM or on window to check directly; verify
-      // instead that the transport itself does not stop/crash, which is the
-      // one dry-vs-silent proxy actually reachable from outside the audio
-      // graph.
-      const stillPlaying = await page.getByRole('button', { name: 'Pause the arrangement' }).count()
-      await page.screenshot({ path: report.shotPath('05a-after-host-killed') })
-      expect(stillPlaying > 0, 'transport stopped/crashed after the host process was killed — should keep running dry')
-      expect(consoleErrors.length === 0, `uncaught console errors after killing the host: ${consoleErrors.join(' | ')}`)
-
-      // EXPECTED: a retry brings it back to LIVE. Find the retry control the
-      // error badge offers (FxRack.tsx: aria-label pattern for the retry
-      // button) — but that button lives inside <FxRack>, which (per scenario
-      // 1) is not what EDIT renders. FxChainList (EDIT) exposes no retry
-      // control at all for a vst3 row. Fall back to the one mechanism that
-      // IS reachable: re-opening/re-adding is not idempotent-safe to spam, so
-      // report this precisely instead of clicking blind.
-      const retryBtn = page.getByRole('button', { name: /retry/i })
-      if (await retryBtn.count()) {
-        await safeClick(retryBtn.first())
-        deadline = Date.now() + 10000
-        let recovered = false
-        while (Date.now() < deadline) {
-          const s = await apiGet('/api/vst/live/sessions')
-          if ((s.body?.sessions ?? []).some((x) => x.chain_entry_id === mine.chain_entry_id && x.alive)) { recovered = true; break }
-          await page.waitForTimeout(400)
+      // EXPECTED: the row leaves LIVE and says so, the transport keeps running
+      // (the track plays dry), and the registry re-creates the host by itself.
+      const seen = []
+      let recovered = null
+      let clickedRetry = false
+      const killedAt = Date.now()
+      while (Date.now() - killedAt < 25000) {
+        const pill = (await readPills())[0] ?? '(none)'
+        if (seen[seen.length - 1] !== pill) seen.push(pill)
+        const again = (await aliveSessions()).find((s) => s.chain_entry_id === liveEntryId && s.pid !== hostPid)
+        if (again && pill.startsWith('LIVE')) { recovered = again; break }
+        // Still down after 12 s: use the retry the error row offers.
+        if (!clickedRetry && Date.now() - killedAt > 12000) {
+          const retryBtn = page.getByRole('button', { name: /^Retry the live plugin host/i })
+          if (await retryBtn.count()) { await safeClick(retryBtn.first()); clickedRetry = true }
         }
-        expect(recovered, 'clicked a retry control but no new alive session appeared within 10s')
-      } else {
-        throw new Error(
-          'BLOCKED (partial): killed the host and confirmed the transport kept running dry with no uncaught error ' +
-          `(sawErrorWord=${sawErrorWord} in page text), but no retry control is reachable from EDIT\'s track FX rack ` +
-          '(FxChainList renders no error/retry affordance for a vst3 row — that control only exists in <FxRack>, ' +
-          'per the same gap found in scenario 1), so the "retry brings it back to LIVE" half cannot be exercised through the UI.',
-        )
+        await page.waitForTimeout(120)
       }
+      console.log(`  pill sequence after the kill: ${seen.join(' -> ')}${clickedRetry ? ' (retry clicked)' : ''}`)
+      await page.screenshot({ path: report.shotPath('05a-after-host-killed') })
+
+      const stillPlaying = await page.getByRole('button', { name: 'Pause the arrangement' }).count()
+      expect(stillPlaying > 0, 'transport stopped/crashed after the host process was killed — should keep running dry')
+      // A failed WebSocket logs a console error by itself; an uncaught exception is the real failure.
+      const pageErrors = consoleErrors.filter((t) => t.startsWith('PAGEERROR'))
+      expect(pageErrors.length === 0, `uncaught exception after killing the host: ${pageErrors.join(' | ')}`)
+      expect(seen.some((t) => /^(error|starting)/.test(t)), `the row never left LIVE after its host was killed (saw: ${seen.join(' -> ')})`)
+      expect(!!recovered, `the plugin did not come back LIVE within 25s of its host being killed (saw: ${seen.join(' -> ')})`)
+      sessionId = recovered.session_id
+      hostPid = recovered.pid
+      createdSessionIds.add(sessionId)
+      console.log(`  recovered ${((Date.now() - killedAt) / 1000).toFixed(1)} s after the kill, new pid ${hostPid}`)
 
       await safeClick(page.getByRole('button', { name: 'Stop and return to start' })).catch(() => {})
     })
 
     // ── Scenario 6: save + reload persistence ──────────────────────────────
-    await report.scenario('project-save-reload-keeps-plugin-live-with-params', async () => {
-      throw new Error(
-        'BLOCKED: this dispatch\'s RULES explicitly forbid saving a project to disk from the app ' +
-        '("Do not save projects to disk from the app"). Testing save/reload persistence requires exactly that action, ' +
-        'so it cannot be exercised without violating the constraint. Not attempted; no result invented.',
-      )
+    await report.scenario('refresh-and-restore-brings-the-plugin-back-live', async () => {
+      expect(!!liveEntryId, 'setup: no live plugin left in the chain from scenario 5')
+      // The crash-recovery autosave is debounced 2 s behind the last edit.
+      await page.waitForTimeout(4000)
+      const oldSessionId = sessionId
+      const oldPid = hostPid
+
+      await page.reload({ waitUntil: 'networkidle', timeout: 60000 })
+      await dismissBootAndTour(page)
+      const restore = page.getByRole('button', { name: 'Restore', exact: true })
+      await restore.waitFor({ state: 'visible', timeout: 20000 })
+      await restore.click()
+      await page.locator('[data-tour="tab-edit"]').click()
+      await page.waitForFunction(() => document.querySelectorAll('[data-clip="1"]').length > 0, { timeout: 20000 })
+
+      // The page that went away must have closed ITS host (pagehide -> keepalive DELETE).
+      let deadline = Date.now() + 8000
+      while (Date.now() < deadline && (await pidAlive(oldPid))) await page.waitForTimeout(300)
+      expect(!(await pidAlive(oldPid)), `the refreshed page left its host process running (pid ${oldPid}, session ${oldSessionId})`)
+
+      // The restored plugin is the same chain entry, hosted again.
+      let again = null
+      let neededPlay = false
+      deadline = Date.now() + 10000
+      while (Date.now() < deadline && !again) {
+        again = (await aliveSessions()).find((s) => s.chain_entry_id === liveEntryId && s.session_id !== oldSessionId) ?? null
+        if (!again) await page.waitForTimeout(300)
+      }
+      if (!again) {
+        neededPlay = true
+        await safeClick(page.getByRole('button', { name: 'Play the arrangement' }))
+        deadline = Date.now() + 15000
+        while (Date.now() < deadline && !again) {
+          again = (await aliveSessions()).find((s) => s.chain_entry_id === liveEntryId && s.session_id !== oldSessionId) ?? null
+          if (!again) await page.waitForTimeout(300)
+        }
+      }
+      expect(!!again, `after refresh + Restore the plugin (entry ${liveEntryId}) was never hosted again`)
+      createdSessionIds.add(again.session_id)
+      if (neededPlay) console.log('  NOTE: the restored plugin only went live once Play was pressed')
+
+      trackName = await firstTrackName(page)
+      await safeClick(page.getByRole('button', { name: `Track ${trackName} insert FX` }))
+      deadline = Date.now() + 15000
+      while (Date.now() < deadline && !(await readPills()).some((t) => t.startsWith('LIVE'))) await page.waitForTimeout(250)
+      const pills = await readPills()
+      await page.screenshot({ path: report.shotPath('06a-after-refresh-restore') })
+      expect(pills.some((t) => t.startsWith('LIVE')), `the restored plugin row does not say LIVE: ${JSON.stringify(pills)}`)
+      expect(!pills.some((t) => t.includes('DEFAULTS')), `the restored plugin came back at its DEFAULTS — its saved state was refused: ${JSON.stringify(pills)}`)
+      await safeClick(page.getByRole('button', { name: 'Stop and return to start' })).catch(() => {})
     })
   } finally {
     // Close only the sessions THIS run opened — never touch a session another
