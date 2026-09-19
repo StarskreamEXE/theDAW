@@ -655,11 +655,21 @@ void Vst3Instance::setParamNormalized(std::int32_t index, double value) {
 // Plugin callbacks
 // ---------------------------------------------------------------------------------------------
 
-void Vst3Instance::handleBeginEdit(Steinberg::Vst::ParamID /*id*/) {
-    // Gesture boundaries matter for automation recording, which the live host does not do.
+// beginEdit / endEdit are the boundaries of one gesture in the plugin's own window (JUCE turns
+// them into beginChangeGesture / endChangeGesture). Reported from the message thread only: a
+// boundary is advice to the app about grouping, and one that arrives on another thread is
+// not worth a queue of its own.
+void Vst3Instance::handleBeginEdit(Steinberg::Vst::ParamID id) {
+    if (!isMessageThread() || events_ == nullptr) return;
+    const std::int32_t index = indexForParamId(id);
+    if (index >= 0) events_->onParamGesture(index, true);
 }
 
-void Vst3Instance::handleEndEdit(Steinberg::Vst::ParamID /*id*/) {}
+void Vst3Instance::handleEndEdit(Steinberg::Vst::ParamID id) {
+    if (!isMessageThread() || events_ == nullptr) return;
+    const std::int32_t index = indexForParamId(id);
+    if (index >= 0) events_->onParamGesture(index, false);
+}
 
 void Vst3Instance::handlePerformEdit(Steinberg::Vst::ParamID id, double normalizedValue) {
     // The user moved a control in the editor. The component does NOT hear that by itself, so the

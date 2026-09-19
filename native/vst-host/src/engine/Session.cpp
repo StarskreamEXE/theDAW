@@ -914,6 +914,19 @@ void Session::onParamEdited(int32_t index, double normalizedValue) {
     flushParamEchoes(false);
 }
 
+void Session::onParamGesture(int32_t index, bool begin) {
+    // The end of a gesture goes out AFTER the last value of it: the echo is rate-limited, so
+    // whatever is still pending is flushed first.
+    if (!begin) flushParamEchoes(true);
+    json::Writer writer;
+    writer.beginObject()
+        .strField("ev", "param_gesture")
+        .intField("index", index)
+        .boolField("begin", begin)
+        .endObject();
+    sendText(writer.take());
+}
+
 void Session::onEditorResized(int32_t width, int32_t height) {
     sendEditorState(true, width, height);
 }

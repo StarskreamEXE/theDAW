@@ -70,6 +70,7 @@ public:
     // ---- IPluginEvents (MESSAGE thread) ----
     void onLatencyChanged(int32_t latencySamples) override;
     void onParamEdited(int32_t index, double normalizedValue) override;
+    void onParamGesture(int32_t index, bool begin) override;
     void onEditorResized(int32_t width, int32_t height) override;
     void onEditorClosed() override;
     void onWarning(const std::string& text) override;

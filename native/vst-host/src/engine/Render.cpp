@@ -68,6 +68,7 @@ public:
         latencyChanges_.push_back(latencySamples);
     }
     void onParamEdited(int32_t, double) override {}
+    void onParamGesture(int32_t, bool) override {}
     void onEditorResized(int32_t, int32_t) override {}
     void onEditorClosed() override {}
     void onWarning(const std::string& text) override { warnings_.push_back(text); }

@@ -83,6 +83,9 @@ public:
     virtual ~IPluginEvents() = default;
     virtual void onLatencyChanged(int32_t latencySamples) = 0;
     virtual void onParamEdited(int32_t index, double normalizedValue) = 0;  // user moved a control in the editor
+    // The user grabbed (begin = true) or let go of (begin = false) a control in the editor. Every
+    // onParamEdited for that parameter in between belongs to ONE gesture.
+    virtual void onParamGesture(int32_t index, bool begin) = 0;
     virtual void onEditorResized(int32_t width, int32_t height) = 0;        // physical px
     virtual void onEditorClosed() = 0;                                      // floating window closed by the user
     virtual void onWarning(const std::string& text) = 0;
