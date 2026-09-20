@@ -5,8 +5,13 @@
  *
  * Ported from VST-Foundry-UI/src/components/orb/Transcript.tsx and restyled to
  * theDAW's panel (Tailwind classes instead of the Foundry's inline styles,
- * primary/violet accent instead of its red, react-markdown instead of its
- * hand-rolled renderer).
+ * primary/violet accent instead of its red).
+ *
+ * Bubble metrics are the Foundry's: max-width 85%, 8px/12px padding, 12px
+ * radius with a 4px tail corner on the speaker's side, a 24px avatar dot with a
+ * caption under it, `white-space: pre-line` user text, and the blinking caret
+ * on the live row. What is NOT copied is the Foundry's habit of stuffing
+ * thinking, tools, meta and the action row INSIDE the bubble — see below.
  *
  * The behavioural fix this port carries: an assistant turn that produced only
  * tool activity renders its tool list and meta line with NO bubble and NO
@@ -20,7 +25,9 @@ import { Bot, Copy, Loader2, RotateCcw, User } from 'lucide-react';
 import { CollapsibleReasoning } from './CollapsibleReasoning';
 import { ControlRequestCard } from './ControlRequestCard';
 import type { ControlAnswerHandler } from './ControlRequestCard';
-import { Markdown } from './Markdown';
+// Extension required: ./markdown.ts and ./Markdown.tsx differ only by case, and
+// resolvers try `.ts` first on a case-insensitive filesystem.
+import { Markdown } from './Markdown.tsx';
 import { PendingActionCard } from './PendingActionCard';
 import { ToolCallList } from './ToolCallList';
 import { TurnMetaLine } from './TurnMetaLine';
@@ -52,14 +59,24 @@ export interface TranscriptProps {
     onSkipPendingAction: (messageId: string | null, callId: string) => void;
 }
 
+/**
+ * The Foundry's speaker column: a 24px dot with a small caption under it. The
+ * dot keeps theDAW's own accent gradient and Bot glyph — only the layout is
+ * copied.
+ */
 function AssistantAvatar({ isError = false }: { isError?: boolean }) {
     return (
-        <div
-            className={`w-6 h-6 rounded-full flex items-center justify-center shrink-0 ${
-                isError ? 'bg-red-500/20' : 'bg-linear-to-br from-primary to-pink-500'
-            }`}
-        >
-            <Bot size={12} className={isError ? 'text-red-400' : 'text-white'} aria-hidden="true" />
+        <div className="flex flex-col items-center gap-0.5 shrink-0">
+            <div
+                className={`w-6 h-6 rounded-full flex items-center justify-center ${
+                    isError ? 'bg-red-500/20' : 'bg-linear-to-br from-primary to-pink-500'
+                }`}
+            >
+                <Bot size={12} className={isError ? 'text-red-400' : 'text-white'} aria-hidden="true" />
+            </div>
+            <span className="text-[7px] tracking-wider whitespace-nowrap text-zinc-500" aria-hidden="true">
+                GANTASMO
+            </span>
         </div>
     );
 }
@@ -105,7 +122,8 @@ export function Transcript({
                                 <div
                                     className={`px-3 py-2 rounded-xl rounded-br-sm bg-primary text-white ${scaleClass}`}
                                 >
-                                    <p className="whitespace-pre-wrap m-0">{message.text}</p>
+                                    {/* The Foundry's user text is `white-space: pre-line`. */}
+                                    <p className="whitespace-pre-line m-0">{message.text}</p>
                                 </div>
                             ) : (
                                 <Fragment>
@@ -193,10 +211,10 @@ export function Transcript({
                         {liveText && (
                             <div className={`px-3 py-2 rounded-xl rounded-bl-sm bg-white/5 border border-white/10 ${scaleClass}`}>
                                 <Markdown text={liveText} />
-                                <span
-                                    className="inline-block w-1.5 h-3.5 align-middle bg-primary animate-pulse"
-                                    aria-hidden="true"
-                                />
+                                {/* The Foundry's `orb-chat__cursor`: a 2x14px caret
+                                    blinking on step-end, styled in
+                                    transcript/assistant-prose.css. */}
+                                <span className="assistant-prose__cursor" aria-hidden="true" />
                             </div>
                         )}
                         {/* Parked T2 tools from the turn in flight. The CLI is

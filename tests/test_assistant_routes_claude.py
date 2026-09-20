@@ -352,6 +352,75 @@ def test_two_turns_reuse_one_child_and_stream_session_id_once(monkeypatch, tmp_p
 
 
 # ---------------------------------------------------------------------------
+# The browser never sends a conversation id of its own. /chat fills one in, so
+# "announce it only when minted in _stream_claude" never fired, the browser kept
+# `null`, and an approved tool call was refused (422) while the CLI sat blocked:
+# "stuck even after I approved it" (2026-09-19, mcp__thedaw__navigate).
+# ---------------------------------------------------------------------------
+def test_a_turn_always_announces_the_key_its_approval_is_accepted_under(monkeypatch):
+    use_fake_cli(monkeypatch, "control")
+
+    async def body():
+        agen = ar._stream_claude(chat_request("conv-announce", "run echo hi"), None)
+        announced = None
+        answered = None
+        keyless = None
+
+        async for line in agen:
+            if not line.startswith("data: "):
+                continue
+            frame = json.loads(line[len("data: ") :])
+            if frame["type"] == "conversationId":
+                announced = frame["conversationId"]
+            if frame["type"] == "control_request":
+                # The bubble names its own session key as well.
+                assert frame["conversationId"] == "conv-announce"
+                async with client() as http:
+                    # What the browser used to send: no usable id at all.
+                    keyless = await http.post(
+                        "/api/assistant/control-response",
+                        json={
+                            "conversationId": None,
+                            "requestId": frame["requestId"],
+                            "response": {"behavior": "allow"},
+                        },
+                    )
+                answered = frame["requestId"]
+            if frame["type"] == "done":
+                break
+
+        await agen.aclose()
+        assert announced == "conv-announce", "the id is announced even when not minted"
+        assert answered is not None
+        assert keyless is not None and keyless.status_code == 200, keyless.text
+
+    run(body)
+
+
+def test_a_warm_turn_carries_the_browsers_fresh_app_context():
+    request = ar.ChatRequest(
+        messages=[
+            ar.ChatMessage(
+                role="system",
+                content="<current_app_context>tab: EDIT</current_app_context>",
+            ),
+            ar.ChatMessage(role="user", content="first question"),
+            ar.ChatMessage(role="assistant", content="an answer"),
+            ar.ChatMessage(role="user", content="second question"),
+        ],
+        conversationId="conv-context",
+        provider="claude",
+        model="claude-test",
+    )
+    turn_text, _seed = ar._build_claude_turn_texts(request, "ask")
+    # From the second turn on the model used to get the bare message only.
+    assert "tab: EDIT" in turn_text
+    assert turn_text.index("tab: EDIT") < turn_text.index("second question")
+    assert "first question" not in turn_text, "the warm child remembers the transcript"
+    assert turn_text.rstrip().endswith("Permission mode: ask")
+
+
+# ---------------------------------------------------------------------------
 # (b) control_request round trip, with the C1 policy extension, plus ownership.
 # ---------------------------------------------------------------------------
 def test_control_request_round_trip_and_foreign_request_id_is_403(monkeypatch):
@@ -534,10 +603,15 @@ def test_permission_mode_route_updates_policy_and_forwards_to_the_cli():
                 json={"conversationId": "conv-mode", "mode": "accept_edits"},
             )
         assert resp.status_code == 200, resp.text
+        # G5 audit item 1 (CRITICAL): every policy mode maps to the CLI's
+        # "default" --permission-mode now, never acceptEdits/bypassPermissions
+        # -- those make the CLI auto-approve tools ITSELF with no
+        # control_request at all, so decide() (and its self-modify rule)
+        # never runs. See CLI_PERMISSION_MODES' comment in permissions.py.
         assert resp.json() == {
             "ok": True,
             "mode": "accept_edits",
-            "cliMode": "acceptEdits",
+            "cliMode": "default",
             "acknowledged": True,
         }
         assert session.permission_mode == "accept_edits"
@@ -547,7 +621,7 @@ def test_permission_mode_route_updates_policy_and_forwards_to_the_cli():
         assert forwarded[0]["type"] == "control_request"
         assert forwarded[0]["request"] == {
             "subtype": "set_permission_mode",
-            "mode": "acceptEdits",
+            "mode": "default",
         }
 
         # The new mode governs the very next decision: an in-repo edit is now
@@ -1195,5 +1269,277 @@ def test_finished_turn_with_nothing_queued_releases_its_relay(monkeypatch):
             )
         assert late.json()["ok"] is False
         assert "no active relay session" in late.json()["error"]
+
+    run(body)
+
+
+# ---------------------------------------------------------------------------
+# G5 audit round 3, item 1 (CRITICAL): /control-response must never forward
+# `updatedPermissions` to the CLI for a can_use_tool answer -- a CLI-side
+# allow rule built from it suppresses can_use_tool entirely for whatever it
+# covers, silently defeating decide() (and its never-remember self-modify
+# rule) for every later call that rule matches.
+# ---------------------------------------------------------------------------
+def test_control_response_ordinary_allow_has_nothing_to_strip():
+    ordinary = {
+        "subtype": "can_use_tool",
+        "tool_name": "Bash",
+        "input": {"command": "ls"},
+    }
+
+    async def body():
+        session = register_bare_session("conv-strip-ordinary")
+        session.pending_controls["rid"] = {
+            "request": ordinary,
+            "created": 0.0,
+            "task": None,
+        }
+        async with client() as http:
+            answered = await http.post(
+                "/api/assistant/control-response",
+                json={
+                    "conversationId": "conv-strip-ordinary",
+                    "requestId": "rid",
+                    "response": {
+                        "behavior": "allow",
+                        "updatedInput": {"command": "ls"},
+                    },
+                },
+            )
+        assert answered.status_code == 200, answered.text
+        forwarded = session.proc.stdin.payloads()
+        assert len(forwarded) == 1
+        assert forwarded[0]["response"]["response"] == {
+            "behavior": "allow",
+            "updatedInput": {"command": "ls"},
+        }
+
+    run(body)
+
+
+def test_control_response_always_allow_strips_updated_permissions_from_the_cli():
+    ordinary = {
+        "subtype": "can_use_tool",
+        "tool_name": "Bash",
+        "input": {"command": "ls"},
+    }
+
+    async def body():
+        session = register_bare_session("conv-strip-always")
+        session.pending_controls["rid"] = {
+            "request": ordinary,
+            "created": 0.0,
+            "task": None,
+        }
+        async with client() as http:
+            answered = await http.post(
+                "/api/assistant/control-response",
+                json={
+                    "conversationId": "conv-strip-always",
+                    "requestId": "rid",
+                    "response": {
+                        "behavior": "allow",
+                        "updatedInput": {"command": "ls"},
+                        "updatedPermissions": ["Bash"],
+                    },
+                    "scope": "session",
+                },
+            )
+        assert answered.status_code == 200, answered.text
+        forwarded = session.proc.stdin.payloads()
+        assert len(forwarded) == 1
+        assert "updatedPermissions" not in forwarded[0]["response"]["response"]
+        assert forwarded[0]["response"]["response"] == {
+            "behavior": "allow",
+            "updatedInput": {"command": "ls"},
+        }
+        # The app's OWN policy state is where the standing rule lives.
+        assert session.session_allow == {"Bash"}
+
+    run(body)
+
+
+def test_control_response_self_modify_allow_strips_updated_permissions_and_never_remembers():
+    self_modify = {
+        "subtype": "can_use_tool",
+        "tool_name": "Edit",
+        "input": {"file_path": "backend/assistant_routes.py"},
+    }
+
+    async def body():
+        session = register_bare_session("conv-strip-selfmod")
+        session.pending_controls["rid"] = {
+            "request": self_modify,
+            "created": 0.0,
+            "task": None,
+        }
+        async with client() as http:
+            answered = await http.post(
+                "/api/assistant/control-response",
+                json={
+                    "conversationId": "conv-strip-selfmod",
+                    "requestId": "rid",
+                    "response": {
+                        "behavior": "allow",
+                        "updatedInput": {"file_path": "backend/assistant_routes.py"},
+                        "updatedPermissions": ["Edit"],
+                    },
+                    "scope": "session",
+                },
+            )
+        assert answered.status_code == 200, answered.text
+        forwarded = session.proc.stdin.payloads()
+        assert len(forwarded) == 1
+        assert "updatedPermissions" not in forwarded[0]["response"]["response"]
+        # permissions.py's self-modify rule: NEVER remembered for the session.
+        assert session.session_allow == set()
+
+    run(body)
+
+
+def test_control_response_ask_user_question_answer_passes_through_unmodified():
+    question = {
+        "subtype": "ask_user_question",
+        "tool_name": "AskUserQuestion",
+        "input": {"questions": []},
+    }
+
+    async def body():
+        session = register_bare_session("conv-strip-askq")
+        session.pending_controls["rid"] = {
+            "request": question,
+            "created": 0.0,
+            "task": None,
+        }
+        async with client() as http:
+            answered = await http.post(
+                "/api/assistant/control-response",
+                json={
+                    "conversationId": "conv-strip-askq",
+                    "requestId": "rid",
+                    "response": {
+                        "behavior": "allow",
+                        "updatedInput": {"questions": [], "answers": []},
+                    },
+                },
+            )
+        assert answered.status_code == 200, answered.text
+        forwarded = session.proc.stdin.payloads()
+        assert len(forwarded) == 1
+        # Not a can_use_tool answer -- passed through exactly as sent.
+        assert forwarded[0]["response"]["response"] == {
+            "behavior": "allow",
+            "updatedInput": {"questions": [], "answers": []},
+        }
+
+    run(body)
+
+
+# ---------------------------------------------------------------------------
+# G5 round 3, item 5: mirrors the Foundry's own item 5 -- an omitted
+# claude_permission_mode must fall back to the session's OWN current mode,
+# never silently reset it back to CLAUDE_DEFAULT_PERMISSION_MODE.
+# ---------------------------------------------------------------------------
+def test_resolve_claude_permission_mode_returns_none_for_an_omitted_field():
+    req = ar.ChatRequest(**chat_payload("conv-x", "hi"))
+    assert req.claude_permission_mode is None
+    assert ar._resolve_claude_permission_mode(req) is None
+
+
+def test_resolve_claude_permission_mode_returns_none_for_an_invalid_value():
+    req = ar.ChatRequest(**chat_payload("conv-x", "hi", claude_permission_mode="bogus"))
+    assert ar._resolve_claude_permission_mode(req) is None
+
+
+def test_resolve_claude_permission_mode_returns_the_explicit_valid_value():
+    req = ar.ChatRequest(
+        **chat_payload("conv-x", "hi", claude_permission_mode="readonly")
+    )
+    assert ar._resolve_claude_permission_mode(req) == "readonly"
+
+
+def test_omitted_permission_mode_keeps_the_existing_sessions_own_mode(monkeypatch):
+    """The actual regression: a turn that omits claude_permission_mode must
+    pass the LIVE session's own mode into stream_turn, not the app default."""
+
+    async def body():
+        session = register_bare_session("conv-omit-mode")
+        session.permission_mode = "readonly"
+
+        captured: dict = {}
+
+        async def fake_stream_turn(conversation_id, **kwargs):
+            captured["permission_mode"] = kwargs.get("permission_mode")
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+        monkeypatch.setattr(cs, "stream_turn", fake_stream_turn)
+
+        payload = chat_payload("conv-omit-mode", "hello")
+        payload.pop("claude_permission_mode", None)
+        req = ar.ChatRequest(**payload)
+
+        async for _ in ar._stream_claude(req, None):
+            pass
+
+        assert captured["permission_mode"] == "readonly"
+
+    run(body)
+
+
+def test_explicit_permission_mode_still_overrides_the_sessions_own_mode(monkeypatch):
+    """No regression: an explicitly-sent mode still wins over the session's
+    current one."""
+
+    async def body():
+        session = register_bare_session("conv-explicit-mode")
+        session.permission_mode = "readonly"
+
+        captured: dict = {}
+
+        async def fake_stream_turn(conversation_id, **kwargs):
+            captured["permission_mode"] = kwargs.get("permission_mode")
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+        monkeypatch.setattr(cs, "stream_turn", fake_stream_turn)
+
+        payload = chat_payload(
+            "conv-explicit-mode", "hello", claude_permission_mode="trusted"
+        )
+        req = ar.ChatRequest(**payload)
+
+        async for _ in ar._stream_claude(req, None):
+            pass
+
+        assert captured["permission_mode"] == "trusted"
+
+    run(body)
+
+
+def test_omitted_permission_mode_on_a_brand_new_conversation_uses_the_app_default(
+    monkeypatch,
+):
+    """No existing session -> falls back to CLAUDE_DEFAULT_PERMISSION_MODE,
+    same as before."""
+
+    async def body():
+        captured: dict = {}
+
+        async def fake_stream_turn(conversation_id, **kwargs):
+            captured["permission_mode"] = kwargs.get("permission_mode")
+            return
+            yield  # pragma: no cover - makes this an async generator
+
+        monkeypatch.setattr(cs, "stream_turn", fake_stream_turn)
+
+        payload = chat_payload("conv-brand-new", "hello")
+        payload.pop("claude_permission_mode", None)
+        req = ar.ChatRequest(**payload)
+
+        async for _ in ar._stream_claude(req, None):
+            pass
+
+        assert captured["permission_mode"] == ar.CLAUDE_DEFAULT_PERMISSION_MODE
 
     run(body)

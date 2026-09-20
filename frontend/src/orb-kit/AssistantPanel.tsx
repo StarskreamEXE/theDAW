@@ -14,6 +14,15 @@ import { useChatStream } from './stream';
 import type { ChatTurnContext, SendAttachment } from './stream';
 import type { ChatMessage } from './stream/types';
 import { Transcript } from './transcript';
+import {
+    EFFORT_OPTIONS,
+    effortLabel,
+    normalizeEffort,
+    readStoredEffort,
+    writeStoredEffort,
+    type AssistantEffort,
+} from './assistantEffort';
+import { contextPercentage, fetchContextUsage, type ContextUsage } from './contextUsage';
 import { PermissionModeSelect } from './permission/PermissionModeSelect';
 import { useAssistantPermissionStore } from './permission/assistantPermissionStore';
 import {
@@ -151,16 +160,21 @@ const PANEL_MARGIN = 16;
 
 // Provider info type and defaults (shared between useState init and fetch fallback)
 type ProviderInfo = { id: string; label: string; default_model: string; has_key: boolean; is_local: boolean };
-const ASSISTANT_DEFAULTS_VERSION = 'claude-opus-4-6-effort-max-v1';
+const ASSISTANT_DEFAULTS_VERSION = 'bcc-claude-opus-4-8-effort-max-v2';
 const DEFAULT_ASSISTANT_PROVIDER = 'claude';
-const DEFAULT_ASSISTANT_MODEL = 'claude-opus-4-6';
-const DEFAULT_ASSISTANT_EFFORT = 'max';
+/** The Foundry's `CLAUDE_DEFAULT_MODEL` (server/claude-bridge.ts), verbatim. */
+const DEFAULT_ASSISTANT_MODEL = 'claude-opus-4-8';
 /** The provider whose CLI has permission modes. */
 const CLAUDE_PROVIDER_ID = 'claude';
+/** What the Claude provider is CALLED — the Foundry's label, same product. */
+const CLAUDE_PROVIDER_LABEL = 'BCC (Better Claude Code)';
 
+// BCC leads: it is the default provider, the one with the CLI, the permission
+// modes and the effort control, so it is the first thing the dropdown offers.
+// (The backend sends the same order; this list is the offline fallback.)
 const DEFAULT_PROVIDERS: ProviderInfo[] = [
+   { id: 'claude', label: CLAUDE_PROVIDER_LABEL, default_model: DEFAULT_ASSISTANT_MODEL, has_key: true, is_local: false },
    { id: 'gemini', label: 'Gemini', default_model: 'gemini-flash-recent', has_key: true, is_local: false },
-    { id: 'claude', label: 'Claude Code', default_model: DEFAULT_ASSISTANT_MODEL, has_key: true, is_local: false },
    { id: 'openai', label: 'OpenAI', default_model: 'gpt-4.1-mini', has_key: false, is_local: false },
    { id: 'anthropic', label: 'Anthropic', default_model: 'claude-sonnet-4-20250514', has_key: false, is_local: false },
    { id: 'grok', label: 'xAI Grok', default_model: 'grok-3-mini-fast', has_key: false, is_local: false },
@@ -256,6 +270,45 @@ export function composerStatusIsLiveRegion(state: ComposerStatusState): boolean 
     return !transcriptIndicatorShowing(state);
 }
 
+/** Everything the context meter renders, decided from the reading and the %. */
+export interface ContextMeterView {
+    /** `Context` for the CLI's real reading, `Memory` for the estimate. */
+    label: 'Context' | 'Memory';
+    /** The bar's fill class — the panel's primary until the window fills up. */
+    barClass: string;
+    /** Hover text: the real token counts, or a plain admission that it is a guess. */
+    title: string;
+    /** What a screen reader hears instead of a bare number. */
+    ariaLabel: string;
+}
+
+/**
+ * How the context meter reads.
+ *
+ * Ported from the Foundry's status bar (AIAssistantOrb.tsx ~L1075-1090). Two
+ * things it gets right and are worth keeping: the label distinguishes the CLI's
+ * REAL context-window reading from the character-count estimate — a meter that
+ * called a guess "Context" would be lying — and the bar warms from primary
+ * through amber to red as the window fills, so a conversation about to be
+ * compacted is visible before it happens.
+ *
+ * Pure, and exported, because it is the whole of the meter's logic; the JSX
+ * below is just the shape it is poured into.
+ */
+export function contextMeterView(usage: ContextUsage | null, percent: number): ContextMeterView {
+    const isLive = !!usage;
+    return {
+        label: isLive ? 'Context' : 'Memory',
+        barClass: percent > 80 ? 'bg-red-500' : percent > 50 ? 'bg-amber-500' : 'bg-primary',
+        title: isLive
+            ? `Context: ${usage!.totalTokens.toLocaleString()} / ${usage!.maxTokens.toLocaleString()} tokens`
+            : 'Estimated (no live context reading yet)',
+        ariaLabel: isLive
+            ? `Context window used: ${percent}%`
+            : `Estimated context window used: ${percent}%`,
+    };
+}
+
 /**
  * The conversation id a freshly mounted panel starts from.
  *
@@ -311,6 +364,12 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
 
     const [selectedModel, setSelectedModel] = useState<string>(initialAssistantSelection.model);
 
+    // How hard the Claude CLI is asked to think. theDAW pinned this to `max`
+    // and never showed it; the Foundry's orb has had a dropdown for it since
+    // its BCC port. Remembered across reloads under `thedaw:effort`.
+    const [effort, setEffort] = useState<AssistantEffort>(readStoredEffort);
+    useEffect(() => { writeStoredEffort(effort); }, [effort]);
+
     // --- conversation identity ------------------------------------------------
     // Two ids, and they are NOT the same thing: `conversationId` is the
     // backend's key (control-response, interrupt, permission-mode all address
@@ -358,11 +417,15 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
     const contextReferencesRef = useRef<AssistantReference[]>([]);
     // Provider/model read fresh at send time rather than closed over, so a
     // model switched between typing and sending is the one that gets used.
-    const selectionRef = useRef({ provider: selectedProvider, model: selectedModel });
-    selectionRef.current = { provider: selectedProvider, model: selectedModel };
+    // Effort for the same reason, and one more: a send made DURING a live turn
+    // is queued by the hook and its context is built when the queue drains, so
+    // a closed-over value would send the effort the user had chosen minutes
+    // earlier.
+    const selectionRef = useRef({ provider: selectedProvider, model: selectedModel, effort });
+    selectionRef.current = { provider: selectedProvider, model: selectedModel, effort };
 
     const getTurnContext = useCallback((): ChatTurnContext => {
-        const { provider, model } = selectionRef.current;
+        const { provider, model, effort: turnEffort } = selectionRef.current;
         const isClaude = shouldShowPermissionSelect(provider);
         return {
             provider,
@@ -373,7 +436,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                 attachments: contextAttachmentsRef.current,
                 references: contextReferencesRef.current,
             }),
-            effort: isClaude ? DEFAULT_ASSISTANT_EFFORT : undefined,
+            effort: isClaude ? turnEffort : undefined,
             conversationId: conversationIdRef.current,
             claudeSessionId: claudeSessionIdRef.current,
             permissionMode: useAssistantPermissionStore.getState().mode,
@@ -446,6 +509,42 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
     // off the ground. Distinct from the turn's `statusText`, which the hook owns.
     const [localStatus, setLocalStatus] = useState<string | null>(null);
 
+    // --- context meter ---------------------------------------------------------
+    // The CLI's REAL context-window reading, or null while the meter is running
+    // on the character-count estimate. Only the Claude provider has a CLI to ask.
+    const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null);
+
+    /**
+     * Ask the backend for the CLI's context usage.
+     *
+     * A failed read KEEPS the previous reading (the Foundry does the same): a
+     * busy child that skips one answer should not make the meter jump back to
+     * the estimate. `provider` is passed explicitly by callers that have just
+     * switched it, because `selectionRef` only catches up on the next render.
+     */
+    const refreshContextUsage = useCallback(async (provider?: string) => {
+        if (!shouldShowPermissionSelect(provider ?? selectionRef.current.provider)) return;
+        const usage = await fetchContextUsage(conversationIdRef.current);
+        if (usage) setContextUsage(usage);
+    }, []);
+
+    // A turn just finished (streaming fell): the child is idle, so this is the
+    // moment it can answer. The hook has no "turn ended" callback — the falling
+    // edge of `isStreaming` IS that event.
+    const wasStreamingRef = useRef(false);
+    useEffect(() => {
+        const wasStreaming = wasStreamingRef.current;
+        wasStreamingRef.current = isStreaming;
+        if (wasStreaming && !isStreaming) void refreshContextUsage();
+    }, [isStreaming, refreshContextUsage]);
+
+    // Leaving Claude leaves the reading behind with it: no other provider has a
+    // CLI to report a window, so keeping the number would attribute one
+    // provider's usage to another.
+    useEffect(() => {
+        if (!shouldShowPermissionSelect(selectedProvider)) setContextUsage(null);
+    }, [selectedProvider]);
+
     const composerStatus: ComposerStatusState = {
         isStreaming,
         statusText,
@@ -463,6 +562,8 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
     };
     const statusLine = composerStatusLine(composerStatus);
     const statusIsLive = composerStatusIsLiveRegion(composerStatus);
+    const contextPercent = contextPercentage(contextUsage, messages);
+    const contextMeter = contextMeterView(contextUsage, contextPercent);
 
     /**
      * Stop.
@@ -992,6 +1093,8 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
         setConversationId(null);
         setClaudeSessionId(null);
         setLocalStatus(null);
+        // The reading belonged to the CLI session we just walked away from.
+        setContextUsage(null);
         setShowHistory(false);
     };
 
@@ -1032,6 +1135,12 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
         if (conv.provider) setSelectedProvider(conv.provider);
         if (conv.model) setSelectedModel(conv.model);
         setShowHistory(false);
+        // The resumed chat has its own window. Drop the old reading and ask for
+        // this one's — `setConversationId` above already moved the ref, and the
+        // provider is passed explicitly because the state setter just above has
+        // not re-rendered yet.
+        setContextUsage(null);
+        void refreshContextUsage(conv.provider ?? selectionRef.current.provider);
     };
 
     const removeConversation = (id: string) => {
@@ -1251,6 +1360,29 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                                 id="assistant-permission-mode", so a second copy
                                 would duplicate that id and break the label
                                 association for both (HARD RULE 3). */}
+                            {/* Effort — only the Claude CLI has one, so only it
+                                gets the control (the Foundry gates it the same
+                                way). A native <select> like the permission
+                                dropdown: five values, no badges, and a real
+                                <label htmlFor> for free. */}
+                            {shouldShowPermissionSelect(selectedProvider) && (
+                                <div>
+                                    <label htmlFor="assistant-effort" className="text-[10px] text-muted block mb-0.5">Effort</label>
+                                    <select
+                                        id="assistant-effort"
+                                        name="assistant-effort"
+                                        value={effort}
+                                        onChange={(e) => setEffort(normalizeEffort(e.target.value))}
+                                        className="w-full bg-black/30 border border-white/10 rounded px-2 py-1 text-[11px] text-white cursor-pointer hover:border-white/20 focus:outline-none focus:border-primary/50 transition-colors"
+                                    >
+                                        {EFFORT_OPTIONS.map((level) => (
+                                            <option key={level} value={level} className="bg-black text-white">
+                                                {effortLabel(level)}
+                                            </option>
+                                        ))}
+                                    </select>
+                                </div>
+                            )}
                             <div className="flex items-center justify-between text-[10px] pt-0.5">
                                 {/* The CLI reports the model it actually loaded,
                                     which can differ from the one requested (a
@@ -1263,8 +1395,8 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                                     )}
                                 </span>
                                 <span className="inline-flex items-center gap-1 font-mono text-green-400">
-                                    {selectedProvider === 'claude' ? (
-                                        `effort ${DEFAULT_ASSISTANT_EFFORT}`
+                                    {selectedProvider === CLAUDE_PROVIDER_ID ? (
+                                        `effort ${effort}`
                                     ) : (
                                         <>
                                             <KeyRound className="w-3 h-3 shrink-0" aria-hidden="true" />
@@ -1526,20 +1658,50 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                         ))}
                     </div>
                 )}
-                {/* The ONE place transient status shows. It used to render as a
-                    fake assistant row in the transcript, complete with avatar.
-                    `role="status"` only when the transcript's live-row indicator
-                    is NOT up, so there is never a second region announcing. */}
-                {statusLine && (
+                {/* The composer status row: transient status on the left, the
+                    context meter on the right. Status is still the ONE place
+                    transient chatter shows — it used to render as a fake
+                    assistant row in the transcript, complete with avatar — and
+                    still takes `role="status"` only when the transcript's
+                    live-row indicator is NOT up, so there is never a second
+                    region announcing. The meter beside it is not a region at
+                    all. */}
+                <div className="mb-2 flex items-center gap-2 px-0.5">
+                    {statusLine && (
+                        <div
+                            className="flex min-w-0 flex-1 items-center gap-1.5 text-[10px] text-muted"
+                            role={statusIsLive ? 'status' : undefined}
+                            aria-live={statusIsLive ? 'polite' : undefined}
+                        >
+                            <Loader2 className="w-3 h-3 shrink-0 animate-spin text-primary" aria-hidden="true" />
+                            <span className="truncate" title={statusLine}>{statusLine}</span>
+                        </div>
+                    )}
+                    {/* The context meter, ported from the Foundry's status bar.
+                        Deliberately NOT a live region: it sits beside the status
+                        line, which already owns the one announcement allowed
+                        here, and a percentage ticking over would talk across it.
+                        role="meter" is what it is — a reading inside a known
+                        range — so it still reads correctly on demand. */}
                     <div
-                        className="mb-2 flex items-center gap-1.5 px-0.5 text-[10px] text-muted"
-                        role={statusIsLive ? 'status' : undefined}
-                        aria-live={statusIsLive ? 'polite' : undefined}
+                        role="meter"
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={contextPercent}
+                        aria-label={contextMeter.ariaLabel}
+                        title={contextMeter.title}
+                        className="ml-auto flex shrink-0 items-center gap-1.5 text-[10px] text-muted"
                     >
-                        <Loader2 className="w-3 h-3 shrink-0 animate-spin text-primary" aria-hidden="true" />
-                        <span className="truncate" title={statusLine}>{statusLine}</span>
+                        <span>{contextMeter.label}</span>
+                        <div className="h-1 w-16 overflow-hidden rounded-full bg-white/6">
+                            <div
+                                className={`h-full rounded-full transition-all ${contextMeter.barClass}`}
+                                style={{ width: `${contextPercent}%` }}
+                            />
+                        </div>
+                        <span className="font-mono">{contextPercent}%</span>
                     </div>
-                )}
+                </div>
                 <div className="flex gap-2">
                     <label htmlFor="assistant-chat-input" className="sr-only">Message the assistant</label>
                     <input
@@ -1557,7 +1719,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                         type="button"
                         onClick={() => fileInputRef.current?.click()}
                         className="px-3 py-2 bg-white/5 border border-white/10 text-muted hover:text-white hover:border-primary/30 rounded-lg transition-all relative"
-                        title="Attach code, logs, images, audio, or video for Claude Code to inspect"
+                        title={`Attach code, logs, images, audio, or video for ${CLAUDE_PROVIDER_LABEL} to inspect`}
                         aria-label="Attach files"
                     >
                         <Paperclip size={14} aria-hidden="true" />

@@ -8,7 +8,10 @@ export { ToolCallList, ToolCallRow, AgentToolCard } from './ToolCallList';
 export { PlainToolRow, DiffToolRow, TodoList } from './ToolRows';
 export { CollapsibleReasoning } from './CollapsibleReasoning';
 export { TurnMetaLine } from './TurnMetaLine';
-export { Markdown } from './Markdown';
+// Extension required: ./markdown.ts and ./Markdown.tsx differ only by case, and
+// resolvers try `.ts` first on a case-insensitive filesystem.
+export { Markdown } from './Markdown.tsx';
+export { inlineMd, simpleMarkdown } from './markdown.ts';
 
 export { countTools, extractDiffHunks, diffLines, isDiffableTool, parseTodos } from './diff';
 export type { DiffHunks, DiffRow, DiffRowType, TodoItem } from './diff';

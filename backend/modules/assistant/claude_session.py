@@ -96,14 +96,27 @@ ALLOWED_TOOLS = (
 SETTING_SOURCES = "project,local"
 
 # Contract C2: our permission modes -> the CLI's --permission-mode values.
-# "default" is accepted by claude 2.1.261 even though `claude --help` omits it
-# from the documented choice list (verified: `--permission-mode default` parses,
-# `--permission-mode DEFAULT` is rejected as an invalid choice).
+# "default" is accepted by claude 2.1.278 even though `claude --help` lists
+# only acceptEdits/auto/bypassPermissions/manual/dontAsk/plan (live-verified:
+# `--permission-mode default` still parses; `--permission-mode DEFAULT` is
+# rejected as an invalid choice).
+#
+# CRITICAL: every mode maps to "default", not to the CLI's own acceptEdits /
+# bypassPermissions. A live proof against 2.1.278 (see build_base_args'
+# docstring) showed that under "bypassPermissions" and "acceptEdits" the CLI
+# auto-approves tools ITSELF and never emits a control_request at all -- so
+# the policy hook (decide(), permissions.py) never runs, and a self-modify
+# write (which must always become "ask", in every mode) sails through
+# ungoverned. "default" is the only CLI mode that asks the host for EVERY
+# tool, which is what lets decide() be the sole authority on the verdict for
+# every one of theDAW's four modes -- they differ only in what decide()
+# itself returns, never in what the CLI pre-approves. Do not reintroduce
+# acceptEdits/bypassPermissions here without re-running that live proof.
 CLI_PERMISSION_MODES = {
     "ask": "default",
-    "accept_edits": "acceptEdits",
+    "accept_edits": "default",
     "readonly": "default",
-    "trusted": "bypassPermissions",
+    "trusted": "default",
 }
 
 ControlHook = Callable[["ClaudeSession", dict], Awaitable[Optional[dict]]]
@@ -881,6 +894,12 @@ async def _handle_control_request(session: ClaudeSession, frame: dict) -> None:
                 policy = candidate
     if policy is not None:
         frame = {**frame, "policy": policy}
+    # The answer has to come back under THIS session's key: a turn can run on a
+    # session the request reached through its Claude session id, so the id the
+    # browser holds is not always the one pending_controls lives under. Without
+    # this an approval was refused (404, or 422 for no id at all) and the CLI
+    # stayed blocked until the auto-deny.
+    frame = {**frame, "conversationId": session.conversation_id}
     session.pending_controls[request_id] = {
         "request": request,
         "created": time.monotonic(),

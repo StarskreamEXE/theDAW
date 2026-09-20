@@ -40,8 +40,13 @@ if (typeof (globalThis as { localStorage?: unknown }).localStorage === 'undefine
     } as Storage;
 }
 
-const { shouldShowPermissionSelect, composerStatusLine, composerStatusIsLiveRegion, seedConversationId } =
-    await import('./AssistantPanel.tsx');
+const {
+    shouldShowPermissionSelect,
+    composerStatusLine,
+    composerStatusIsLiveRegion,
+    contextMeterView,
+    seedConversationId,
+} = await import('./AssistantPanel.tsx');
 
 /** Defaults for the composer-status helpers; each case overrides what it tests. */
 const idle = {
@@ -158,5 +163,38 @@ assert.equal(seedConversationId(null, 'conv-in-tab'), 'conv-in-tab', 'no saved c
 assert.equal(seedConversationId(null, null), null);
 assert.equal(seedConversationId({ sessionId: '' }, 'conv-in-tab'), 'conv-in-tab', 'an empty id is not an id');
 assert.equal(seedConversationId({ sessionId: 'only-history' }, null), 'only-history');
+
+// ---------------------------------------------------------------------------
+// contextMeterView — a guess is never labelled as a reading
+// ---------------------------------------------------------------------------
+// The meter draws two different things through one bar: the CLI's real
+// context-window usage, and a character-count estimate. Calling the estimate
+// "Context" would present a guess as a measurement, so the label is the tell.
+
+{
+    const estimate = contextMeterView(null, 12);
+    assert.equal(estimate.label, 'Memory', 'no reading means the estimate, and it says so');
+    assert.equal(estimate.title, 'Estimated (no live context reading yet)');
+    assert.match(estimate.ariaLabel, /^Estimated context window used: 12%$/);
+}
+{
+    const live = contextMeterView({ totalTokens: 42000, maxTokens: 200000, percentage: 21 }, 21);
+    assert.equal(live.label, 'Context', 'a real reading is labelled as one');
+    assert.equal(live.title, `Context: ${(42000).toLocaleString()} / ${(200000).toLocaleString()} tokens`);
+    assert.equal(live.ariaLabel, 'Context window used: 21%');
+}
+
+// The bar warms as the window fills: primary → amber over half → red over 80%.
+// The boundaries are exclusive, exactly as the Foundry draws them.
+const usage = { totalTokens: 1, maxTokens: 2, percentage: 0 };
+assert.equal(contextMeterView(usage, 0).barClass, 'bg-primary');
+assert.equal(contextMeterView(usage, 50).barClass, 'bg-primary', '50 is not yet amber');
+assert.equal(contextMeterView(usage, 51).barClass, 'bg-amber-500');
+assert.equal(contextMeterView(usage, 80).barClass, 'bg-amber-500', '80 is not yet red');
+assert.equal(contextMeterView(usage, 81).barClass, 'bg-red-500');
+assert.equal(contextMeterView(usage, 100).barClass, 'bg-red-500');
+// The colour is the percentage's business, not the reading's: an estimate that
+// says the window is nearly full is just as urgent.
+assert.equal(contextMeterView(null, 95).barClass, 'bg-red-500');
 
 console.log('AssistantPanel render decisions: all assertions passed');

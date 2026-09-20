@@ -315,6 +315,51 @@ async function openTurn(prompt: string): Promise<{ finished: Promise<void> }> {
     assert.equal(last.pendingActions, undefined, 'a declined action must not offer Run on the interrupted row');
 }
 
+// ---------------------------------------------------------------------------
+// An approval is answered under the REQUEST's own conversation id
+//
+// The backend runs a turn on the session it resolved, which is not always keyed
+// by the id the host holds (a request can reach a live session through its
+// Claude session id). The permission frame carries the session's own key; the
+// answer has to go back under it. Before this, an approved `mcp__thedaw__navigate`
+// was refused by the route (422 for a null id, 404 for a stale one) and the CLI
+// stayed blocked until its auto-deny — "stuck even after I approved it".
+// ---------------------------------------------------------------------------
+
+{
+    const turn = await openTurn('take me to the edit tab');
+    push({ type: 'session_id', sessionId: 'cli-session-9' });
+    push({
+        type: 'control_request',
+        requestId: 'nav1',
+        conversationId: 'canonical-conv',
+        request: { subtype: 'can_use_tool', tool_name: 'mcp__thedaw__navigate', input: { tab: 'edit' } },
+    });
+    await settle();
+    assert.equal(hook().pendingControls[0]?.conversationId, 'canonical-conv');
+
+    await act(async () => {
+        await hook().answerControl('nav1', { behavior: 'allow', updatedInput: { tab: 'edit' } }, 'once');
+    });
+    const answer = controlPostsFor('nav1')[0];
+    assert.equal(answer.body.conversationId, 'canonical-conv', 'answered under the request’s own session key');
+    assert.equal(answer.body.claudeSessionId, 'cli-session-9', 'the CLI session id rides along as a fallback key');
+
+    await act(async () => {
+        await hook().interrupt();
+    });
+    const stop = postsTo('/api/assistant/interrupt').at(-1);
+    assert.ok(stop, 'Stop reached the backend');
+    assert.equal(typeof stop.body.conversationId, 'string', 'Stop never sends a null conversation id');
+    assert.equal(stop.body.claudeSessionId, 'cli-session-9');
+
+    push({ type: 'done', usage: {} });
+    await act(async () => {
+        await turn.finished;
+    });
+    await settle();
+}
+
 await act(async () => {
     root.unmount();
 });
