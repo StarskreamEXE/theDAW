@@ -428,9 +428,16 @@ function applyMixLive(): void {
 
    `decodeCache.releaseDecoded(blob)` is the other half of this — telling the
    cache a clip is GONE, so its PCM and its encoded Blob are freed without
-   waiting for the budget to notice. Nothing calls it: wiring it to clip removal
-   needs to know when a deleted clip can no longer be undone back, which is a
-   ticket of its own. */
+   waiting for the budget to notice. `state/editorStore.ts`'s `releaseClipAudio`
+   calls it from `removeClip`, `removeTrack`, and `loadProject` (T66B) — it does
+   NOT wait for a deleted clip to fall out of undo history first. The tradeoff:
+   undoing a removal back in is always correct (undo restores the clip object,
+   whose `audioBlob` is untouched, and never re-decodes), but if the freed
+   buffer was released, the FIRST play/bounce after that undo re-decodes from
+   the Blob instead of reusing a cached one — a cost, never wrong audio.
+   `releaseClipAudio` also skips releasing any Blob a clip still LIVE in the
+   document shares (a split's sibling, a duplicate, a shared import), so this
+   only ever costs a re-decode for a Blob nothing but undo history was holding. */
 
 /** One outstanding pin: a decoded blob at one sample rate. */
 export interface DecodePin {

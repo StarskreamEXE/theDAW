@@ -14,6 +14,7 @@ import {
   type CompRegion,
 } from '../lib/clipComp';
 import { crossfadeRegions } from '../lib/crossfade';
+import { releaseDecoded } from '../lib/decodeCache';
 import { MIN_CLIP_SEC } from '../lib/clipDragMath';
 import { moveByOffset, moveIds, sameOrder } from '../lib/timeline/trackOrder';
 import { deleteFolder, folderFlagPatch, moveIntoFolder, moveOutOfFolder, newFolderFromSelection } from '../lib/timeline/folderOps';
@@ -579,9 +580,10 @@ interface EditorStoreState {
   /** The edit cursor, timeline seconds, >= 0. Independent of the playhead. */
   editCursorSec: number;
   /** Multi-selected clip ids. `selectedClipId` stays the single focused clip
-   *  (the marquee's anchor), which is why `setSelectedClipIds` leaves it alone.
-   *  `setSelectedClips` is the one setter that writes BOTH — the assistant's
-   *  `editor_select_clips` and the canvas share it so they cannot drift. */
+   *  (the marquee's anchor), which is why plain `setSelectedClipIds` leaves it
+   *  alone. `setSelectedClipIds(ids, { focus: true })` is the one call that
+   *  writes BOTH — the assistant's `editor_select_clips` and the canvas share
+   *  the same setter so the two fields cannot drift (Unify F4). */
   selectedClipIds: string[];
   /** Multi-selected track ids. */
   selectedTrackIds: string[];
@@ -775,9 +777,6 @@ interface EditorStoreState {
   keepActiveTakeOnly: (clipId: string) => void;
 
   setSelected: (id: string | null) => void;
-  /** Replace the multi-clip selection. Order is kept, duplicates collapse, and
-   *  `selectedClipId` follows the first entry. */
-  setSelectedClips: (ids: string[]) => void;
   setTool: (t: ToolMode) => void;
   setZoom: (z: number) => void;
   setTrackHeight: (h: number) => void;
@@ -797,9 +796,27 @@ interface EditorStoreState {
   setTimeSelection: (r: EditorTimeRange | null) => void;
   /** Move the edit cursor (seconds), clamped to >= 0; non-finite is ignored. */
   setEditCursor: (sec: number) => void;
-  /** Replace the clip multi-selection (deduped, unknown ids dropped). Does not
-   *  touch `selectedClipId`. */
-  setSelectedClipIds: (ids: readonly string[]) => void;
+  /** Replace the clip multi-selection: order kept, duplicates collapse, unknown
+   *  ids dropped (Unify F4 — the ONE implementation `selectedClipIds` writes
+   *  through, with `setSelectedClips` kept as its old name for the
+   *  `{ focus: true }` variant — NOT a same-semantics alias, since PLAIN calls
+   *  here (no opts) differ from it: this setter, by default, leaves
+   *  `selectedClipId` (the FOCUS — the marquee's anchor) untouched, because the
+   *  timeline sets the whole multi-select first and only then names the anchor
+   *  inside it — a call that moved the focus every time would collapse every
+   *  marquee to one clip. Pass `{ focus: true }` to also point the focus at the
+   *  first surviving id (or clear it when the selection is empty): this is what
+   *  the assistant's `editor_select_clips` / `editor_select_range` and any other
+   *  caller that means "select AND make current" want. */
+  setSelectedClipIds: (ids: readonly string[], opts?: { focus?: boolean }) => void;
+  /** Alias of `setSelectedClipIds(ids, { focus: true })` — replace the
+   *  multi-selection AND move the focus to its first id (or clear it when
+   *  `ids` is empty). Kept as its own name because the assistant's
+   *  `editor_select_clips` / `editor_select_range` and the canvas's
+   *  multi-select both already call it; unifying the two setters' BODIES
+   *  (Unify F4) closed the drift risk between them without forcing every call
+   *  site to rename. */
+  setSelectedClips: (ids: string[]) => void;
   /** Replace the track multi-selection (deduped, unknown ids dropped). */
   setSelectedTrackIds: (ids: readonly string[]) => void;
   /** Move `ids` to sit before `beforeId` (null = end), keeping their current
@@ -940,6 +957,12 @@ interface EditorStoreState {
    *  one undo step; any other caller gets a step of its own (see
    *  `stretchClipToFit`, which carries the same rule). */
   setAutomationPointCurve: (laneId: string, index: number, curve: number, opts?: { coalesce?: boolean }) => void;
+  /** Create an empty, enabled lane for `target` — one undo step, like `addBus`
+   *  — or return the id of the lane that already exists for it. Until now a
+   *  lane could only be born by riding a control with WRITE armed
+   *  (`recordAutomationPoint`); this is the explicit "add automation lane" a
+   *  UI control can call with nothing recorded yet. */
+  addAutomationLane: (target: AutomationTarget) => string;
   recordAutomationPoint: (target: AutomationTarget, t: number, v: number) => void;
   addAutomationPoint: (laneId: string, t: number, v: number) => void;
   updateAutomationPoint: (laneId: string, index: number, t: number, v: number) => void;
@@ -1199,6 +1222,59 @@ const takeFromClip = (clip: AudioClip): ClipTake => ({
 /** The clip's takes, seeding one from its own media when it has none. */
 const takesOf = (clip: AudioClip): ClipTake[] =>
   (clip.takes && clip.takes.length > 0 ? clip.takes : [takeFromClip(clip)]);
+
+/** Every Blob a set of clips still reads — each clip's own media and every
+ *  take's. A Blob object is not owned by one clip: `splitClipAt` leaves both
+ *  halves pointing at the SAME Blob (and the same take blobs, offset only),
+ *  `addClipToTrack` shares takes BY REFERENCE for a duplicate/paste (its own
+ *  header), and `projectImport`'s active-take mirroring can hand two different
+ *  clips the identical Blob it fetched once. Built fresh from live clips, so
+ *  it always reflects whatever sharing exists RIGHT NOW. */
+const liveClipBlobs = (clips: readonly AudioClip[]): Set<Blob> => {
+  const blobs = new Set<Blob>();
+  for (const c of clips) {
+    blobs.add(c.audioBlob);
+    for (const take of c.takes ?? []) blobs.add(take.audioBlob);
+  }
+  return blobs;
+};
+
+/** Every clip a document still holds onto, live OR parked: `state.clips` PLUS
+ *  every track's `frozenOriginal.clips`. A frozen track's originals are not in
+ *  `clips` — they are stashed on the track for `unfreezeTrack` — but they are
+ *  exactly as "still in the document" as anything actually playing, so the
+ *  keep-set `releaseClipAudio` builds from this must include them or a
+ *  removal elsewhere sharing a Blob with a parked original would release audio
+ *  the freeze still needs back (audit follow-up #2: `liveClipBlobs` alone,
+ *  called with only `state.clips`, would have missed this). */
+const allDocumentClips = (state: { clips: readonly AudioClip[]; tracks: readonly EditorTrack[] }): AudioClip[] => [
+  ...state.clips,
+  ...state.tracks.flatMap((t) => t.frozenOriginal?.clips ?? []),
+];
+
+/** Free the decode cache's hold on `removed` clips' audio — but ONLY the
+ *  Blobs no clip in `live` still reads, so a split's sibling, a duplicate/
+ *  paste copy, a shared active-take import, or a frozen track's parked
+ *  original (`allDocumentClips`) is never left to silently re-decode from
+ *  scratch on its next play/bounce/unfreeze (audit MAJOR #1 on T66B). A Blob
+ *  only UNDO HISTORY still holds — not `live` — IS released: undo does not
+ *  re-decode on removal, it restores the clip object with its `audioBlob`
+ *  field untouched, and the next play decodes it fresh exactly like any clip
+ *  that was never played. `releaseDecoded` is itself a safe no-op for a Blob
+ *  that was never decoded, is still decoding, or is pinned by a live/offline
+ *  scheduler, so this is safe to call for every clip a removal or a project
+ *  swap drops, whether or not it was ever played. Callers pass `live` as
+ *  `allDocumentClips(get())` (or the equivalent for an incoming document), not
+ *  bare `.clips` — see that helper's own doc for why. */
+const releaseClipAudio = (removed: readonly AudioClip[], live: readonly AudioClip[]): void => {
+  const keep = liveClipBlobs(live);
+  for (const clip of removed) {
+    if (!keep.has(clip.audioBlob)) releaseDecoded(clip.audioBlob);
+    for (const take of clip.takes ?? []) {
+      if (!keep.has(take.audioBlob)) releaseDecoded(take.audioBlob);
+    }
+  }
+};
 
 /** Which take the clip is mirroring. Undefined — and anything that does not
  *  name a take — reads as 0, which is what a clip recorded before takes existed
@@ -1574,6 +1650,12 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     // that has none (which is every project written before this existed) and
     // completes one that does.
     const loadedTracks = tracks.length ? tracks : defaultTracks();
+    // T66B: the OUTGOING document's clips (live AND any frozen track's parked
+    // originals — see `allDocumentClips`), captured before the swap below
+    // replaces `clips`/`tracks` — every one of their decode-cache entries is
+    // released once the swap lands, since nothing in the new document (or the
+    // cleared undo/redo/snapshots) still needs them.
+    const outgoingClips = allDocumentClips(get());
     historyApplying = true;
     set({
       tracks: loadedTracks,
@@ -1611,13 +1693,17 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     });
     historyApplying = false;
     beginUndoStep(); // a fresh document: no clock, no open gesture
+    // Skip any outgoing Blob the INCOMING document still reads (projectImport's
+    // active-take mirroring can hand two clips the identical fetched Blob) —
+    // including a frozen INCOMING track's own parked originals.
+    releaseClipAudio(outgoingClips, allDocumentClips({ clips, tracks: loadedTracks })); // T66B
     logInfo('editor', `Loaded project: ${tracks.length} track(s), ${clips.length} clip(s)`);
   },
 
   addTrack: (overrides) => get().insertTrack(get().tracks.length, overrides),
 
   insertTrack: (index, overrides) => {
-    const id = `track-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const id = uid();
     set((s) => {
       const at = Math.max(0, Math.min(s.tracks.length, Math.round(index)));
       const track: EditorTrack = {
@@ -1638,6 +1724,17 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   },
 
   removeTrack: (id) => {
+    // Captured before the set() below so it names exactly the clips the
+    // removal takes with it, for the T66B release after the write lands.
+    // A FROZEN track's parked originals (`frozenOriginal.clips`) live inside
+    // the track object, not `s.clips` — the track itself is about to be
+    // deleted, so they must be gathered here or they leak silently forever
+    // (audit follow-up #1: the same leak class as `unfreezeTrack`'s stem).
+    const removedTrack = get().tracks.find((t) => t.id === id);
+    const removedClips = [
+      ...get().clips.filter((c) => c.trackId === id),
+      ...(removedTrack?.frozenOriginal?.clips ?? []),
+    ];
     set((s) => {
       const target = s.tracks.find((t) => t.id === id);
       const hasChildren = s.tracks.some((t) => t.parentTrackId === id);
@@ -1670,6 +1767,9 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
         ...pruneSelections(s, clips, tracks),
       };
     });
+    // Skip any Blob a clip on a SURVIVING track — live or parked in ANOTHER
+    // track's freeze — still reads.
+    releaseClipAudio(removedClips, allDocumentClips(get())); // T66B
     logInfo('editor', `Removed track: ${id}`);
   },
 
@@ -1706,7 +1806,7 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   duplicateTrack: (id) => {
     const source = get().tracks.find((t) => t.id === id);
     if (!source) return null;
-    const newTrackId = `track-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const newTrackId = uid();
     beginUndoStep(); // a duplicate is one discrete structural edit, like addBus
     set((s) => {
       const index = s.tracks.findIndex((t) => t.id === id);
@@ -1780,6 +1880,9 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   },
 
   unfreezeTrack: (trackId) => {
+    // The stem clip(s) this swaps OUT — captured before the set() so the
+    // release below (T66B) knows exactly what was discarded.
+    const discardedStem = get().clips.filter((c) => c.trackId === trackId);
     set((s) => {
       const track = s.tracks.find((t) => t.id === trackId);
       if (!track || !track.frozenOriginal) return {};
@@ -1795,13 +1898,18 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
         ...pruneSelections(s, clips, s.tracks),
       };
     });
+    // The printed stem's audio is gone from the document the moment the
+    // originals are back — release its decode-cache entry unless something
+    // else still shares the Blob, including another track's own freeze
+    // (audit follow-up #1/#2 on T66B).
+    releaseClipAudio(discardedStem, allDocumentClips(get()));
     logInfo('editor', `Unfroze track ${trackId}: restored clips + FX`);
   },
 
   addFolderFromSelectedTracks: (ids, name) => {
     if (ids.length === 0) return null;
     const { tracks } = get();
-    const folderId = `track-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const folderId = uid();
     const folderCount = tracks.filter((t) => t.isFolder).length;
     const folder: EditorTrack = {
       ...makeTrack(tracks.length, { id: folderId }),
@@ -1902,8 +2010,8 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
         tracks,
         clips: [...s.clips, full],
         // Focus only. The multi-selection is workspace state with its own
-        // writers (`setSelectedClipIds` / `setSelectedClips`) — a paste that
-        // adds five clips selects all five once, not the last one five times.
+        // writer (`setSelectedClipIds`) — a paste that adds five clips selects
+        // all five once, not the last one five times.
         selectedClipId: id,
       };
     });
@@ -1945,6 +2053,9 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       // An inpaint range on a clip that no longer exists has nothing to inpaint.
       inpaintSelection: s.inpaintSelection?.clipId === id ? null : s.inpaintSelection,
     }));
+    // Skip any Blob a surviving clip (e.g. the other half of a split, a
+    // duplicate/paste copy, or a frozen track's parked original) still reads.
+    if (clip) releaseClipAudio([clip], allDocumentClips(get())); // T66B
     if (clip) logInfo('editor', `Removed clip: ${clip.label}`);
   },
 
@@ -2304,14 +2415,10 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   // `selectedClipId` is the FOCUS (the marquee's anchor), not a one-element
   // view of `selectedClipIds`: the timeline sets the set first and then names
   // the anchor inside it, so narrowing the set here would collapse every
-  // marquee to one clip. `setSelectedClips` is the setter that writes both.
+  // marquee to one clip. `setSelectedClipIds({ focus: true })` is the call
+  // that moves both together.
   setSelected: (id) => set({ selectedClipId: id }),
 
-  setSelectedClips: (ids) =>
-    set(() => {
-      const unique = ids.filter((id, i) => id && ids.indexOf(id) === i);
-      return { selectedClipIds: unique, selectedClipId: unique[0] ?? null };
-    }),
   setTool: (t) => set({ tool: t }),
   setZoom: (z) => set({ zoom: Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, z)) }),
   setTrackHeight: (h) => set({ trackHeight: Math.max(TRACK_HEIGHT_MIN, Math.min(TRACK_HEIGHT_MAX, Math.round(h))) }),
@@ -2357,8 +2464,14 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     if (!Number.isFinite(sec)) return;
     set({ editCursorSec: Math.max(0, sec) });
   },
-  setSelectedClipIds: (ids) =>
-    set((s) => ({ selectedClipIds: keepKnown(ids, new Set(s.clips.map((c) => c.id))) })),
+  setSelectedClipIds: (ids, opts) =>
+    set((s) => {
+      const known = keepKnown(ids, new Set(s.clips.map((c) => c.id)));
+      return opts?.focus
+        ? { selectedClipIds: known, selectedClipId: known[0] ?? null }
+        : { selectedClipIds: known };
+    }),
+  setSelectedClips: (ids) => get().setSelectedClipIds(ids, { focus: true }),
   setSelectedTrackIds: (ids) =>
     set((s) => ({ selectedTrackIds: keepKnown(ids, new Set(s.tracks.map((t) => t.id))) })),
 
@@ -2380,7 +2493,7 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   // ── Routing + buses ────────────────────────────────────────────────────────
 
   addBus: (name) => {
-    const id = `bus-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const id = uid();
     beginUndoStep();
     set((s) => {
       const bus: EditorBus = {
@@ -2895,6 +3008,22 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     });
   },
 
+  addAutomationLane: (target) => {
+    const key = automationTargetKey(target);
+    const existing = get().automationLanes.find((l) => automationTargetKey(l.target) === key);
+    // Idempotent: a target that already has a lane hands its id back rather
+    // than growing a second lane for it — the same dedupe-by-target-key
+    // `recordAutomationPoint` uses, so a lane either action creates is the
+    // one the other later reuses.
+    if (existing) return existing.id;
+    beginUndoStep(); // a discrete structural edit, like addBus
+    const id = uid();
+    set((s) => ({
+      automationLanes: [...s.automationLanes, { id, target, points: [], enabled: true }],
+    }));
+    return id;
+  },
+
   recordAutomationPoint: (target, t, v) => {
     coalesceAs(controlKeyForTarget(target)); // the non-hold record path, same control
     return set((s) => {
@@ -2995,6 +3124,21 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     }));
   },
 
+  // `undo`/`redo`/`restoreSnapshot` all replace `clips` wholesale but
+  // deliberately do NOT call `releaseClipAudio` for whatever clips that drops
+  // (audit follow-up #1 on T66B, decided rather than left silent): the clips
+  // being swapped OUT are not abandoned — `undo` and `redo` push the CURRENT
+  // document onto the opposite stack in this same call, so their Blobs stay
+  // reachable through it, and `restoreSnapshot`'s own write goes through the
+  // normal document-change subscriber, which pushes the pre-restore state onto
+  // `_undo` for exactly the same reason. Proving a Blob has no OTHER reference
+  // anywhere in `_undo`/`_redo`/`snapshots` (not just the one entry this call
+  // just added) would mean scanning all of it on every click of a feature that
+  // is clicked in rapid bursts — undo, redo, undo, redo — and the payoff would
+  // be reclaiming memory for exactly the case that same burst clicking is
+  // about to re-decode a moment later. `releaseClipAudio` stays reserved for
+  // the actually-abandoning ops: `removeClip`, `removeTrack`, `loadProject`,
+  // `unfreezeTrack`.
   undo: () => {
     const s = get();
     if (s._undo.length === 0) return;
@@ -3025,6 +3169,8 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     beginUndoStep(); // the next real edit starts a fresh undo step
   },
 
+  // See `undo`'s comment just above: `redo` does not release either, for the
+  // same reason — it pushes the current document onto `_undo` in this call.
   redo: () => {
     const s = get();
     if (s._redo.length === 0) return;
@@ -3064,6 +3210,12 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     const key = String(name ?? '').trim();
     const snap = get().snapshots[key];
     if (!snap) return false;
+    // Same decision as `undo`/`redo` (its own comment): the clips this
+    // replaces are not released, because this write is NOT under
+    // `historyApplying` (see just below) — it goes through the normal
+    // document-change subscriber, which pushes the pre-restore state onto
+    // `_undo` for this very call, so those Blobs stay reachable through it.
+    //
     // Deliberately NOT under historyApplying: putting a checkpoint back is an
     // edit to the document, and the user must be able to undo out of it. One
     // `set` for the whole document, so it is ONE undo step.
@@ -3315,7 +3467,16 @@ useEditorStore.subscribe((state, prev) => {
 /**
  * Decode an audio Blob and produce a downsampled peak array suitable for
  * rendering. Returns a Float32Array of `bins` values in [0, 1] representing
- * the absolute peak amplitude in each bin.
+ * the absolute peak amplitude in each bin, taken across EVERY channel of the
+ * decode (D16) — a signal that only ever moves on, say, the right channel of
+ * a stereo file is not a flat line just because channel 0 is silent.
+ *
+ * The value is the sample's own amplitude, never rescaled to the clip's own
+ * loudest sample — normalising per clip would draw a quiet clip exactly as
+ * tall as a loud one, which defeats the waveform's one job of showing which
+ * is which — but it IS clamped to 1: a float WAV's samples are not guaranteed
+ * to stay within [-1, 1], and an over-unity peak must not draw taller than
+ * every other bucket that IS in range (audit MINOR #3).
  */
 export const computePeaks = async (blob: Blob, bins = 200): Promise<{ peaks: Float32Array; duration: number }> => {
   const arrayBuf = await blob.arrayBuffer();
@@ -3323,24 +3484,22 @@ export const computePeaks = async (blob: Blob, bins = 200): Promise<{ peaks: Flo
   const ctx = new Ctor();
   try {
     const audioBuf = await ctx.decodeAudioData(arrayBuf.slice(0));
-    const data = audioBuf.getChannelData(0);
+    const channels: Float32Array[] = [];
+    for (let c = 0; c < audioBuf.numberOfChannels; c += 1) channels.push(audioBuf.getChannelData(c));
+    const length = channels[0]?.length ?? 0;
     const out = new Float32Array(bins);
-    const samplesPerBin = Math.floor(data.length / bins);
-    let max = 0;
+    const samplesPerBin = Math.floor(length / bins);
     for (let i = 0; i < bins; i += 1) {
       let peak = 0;
       const start = i * samplesPerBin;
-      const end = Math.min(start + samplesPerBin, data.length);
-      for (let j = start; j < end; j += 1) {
-        const v = Math.abs(data[j]);
-        if (v > peak) peak = v;
+      const end = Math.min(start + samplesPerBin, length);
+      for (const data of channels) {
+        for (let j = start; j < end; j += 1) {
+          const v = Math.abs(data[j]);
+          if (v > peak) peak = v;
+        }
       }
-      out[i] = peak;
-      if (peak > max) max = peak;
-    }
-    // Normalize.
-    if (max > 0) {
-      for (let i = 0; i < bins; i += 1) out[i] /= max;
+      out[i] = Math.min(1, peak);
     }
     return { peaks: out, duration: audioBuf.duration };
   } finally {

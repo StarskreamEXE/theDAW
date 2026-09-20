@@ -26,6 +26,29 @@ from .engine import MidiHint, convert_to_midi, hint_for_stem
 log = logging.getLogger(__name__)
 
 
+def _mirror_as_notation_artifact(db: LibraryDB, entry_id: str) -> None:
+    """Mirror this entry's ``midis`` rows into ``notation_artifacts`` right
+    away, so a freshly-converted MIDI is a first-class notation artifact
+    without waiting on a GET's old self-heal (removed, SCORE-009) or a
+    later backfill launch. Local import: ``.notation.engine`` is a separate,
+    heavier module (music21 et al.) that this module otherwise has no reason
+    to load, and importing it at module scope here risks becoming a cycle if
+    notation code ever needs something from ``midi`` in the future -- there
+    is no cycle today, but every other caller of ``register_existing_midis``
+    (``library.store``, ``notation.backfill``) already imports it locally for
+    the same reason. Best-effort: a mirroring failure must not fail the MIDI
+    conversion that already succeeded and is already recorded.
+    """
+    try:
+        from backend.modules.notation.engine import register_existing_midis
+
+        register_existing_midis(db, entry_id)
+    except Exception as exc:  # noqa: BLE001 - best-effort, never fail the conversion
+        log.debug(
+            "midi.runner: notation-artifact mirror failed for %s: %s", entry_id, exc
+        )
+
+
 def convert_entry(
     db: LibraryDB,
     entry_id: str,
@@ -117,6 +140,16 @@ def convert_entry(
 
     successes = sum(1 for r in results if r.get("ok"))
     failures = len(results) - successes
+
+    if successes:
+        # Once, after every target has been attempted, not once per target:
+        # register_existing_midis mirrors the ENTIRE entry (every midis row,
+        # not just the one just added), so calling it inside the per-target
+        # loop mirrored the whole table again per success -- a 6-stem entry
+        # mirrored (and bumped library_revision) 7 times for one conversion
+        # pass. Guarded on at least one success: a run where everything
+        # failed added no new midis row, so there is nothing new to mirror.
+        _mirror_as_notation_artifact(db, entry_id)
 
     if successes == 0 and failures > 0:
         _set_status(db, entry_id, "failed")

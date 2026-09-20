@@ -95,6 +95,134 @@ interface ContextMenuProps {
   minWidth?: string;
 }
 
+/**
+ * The clamp / outside-dismiss / focus-roundtrip shell shared by every
+ * anchored popup that portals to `<body>` — `ContextMenu` itself and
+ * `MetronomeLevelPopover` (finding 3, T25b edit B re-audit). Lifted here so
+ * a fix to one caller's dismissal or focus handling is a fix to both,
+ * rather than two copies free to drift.
+ *
+ * `focusOnOpen` must be a stable (`useCallback`-wrapped) function — it runs
+ * inside an effect keyed on `position`, so a fresh identity every render
+ * would re-arm the focus effect every render too.
+ */
+export function usePopoverShell({
+  position,
+  onClose,
+  panelRef,
+  focusOnOpen,
+}: {
+  position: ContextMenuPosition | null;
+  onClose: () => void;
+  panelRef: React.RefObject<HTMLElement | null>;
+  focusOnOpen: () => HTMLElement | null | undefined;
+}): ContextMenuPosition | null {
+  // After mount we measure the panel and nudge its position so it stays
+  // inside the viewport — anchoring to (clientX, clientY) without this
+  // would overflow on right-edge / bottom-edge clicks.
+  const [adjusted, setAdjusted] = useState<ContextMenuPosition | null>(null);
+
+  useLayoutEffect(() => {
+    if (!position || !panelRef.current) {
+      setAdjusted(null);
+      return;
+    }
+    const rect = panelRef.current.getBoundingClientRect();
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const pad = 6;
+    let nx = position.x;
+    let ny = position.y;
+    if (nx + rect.width + pad > vw) nx = Math.max(pad, vw - rect.width - pad);
+    if (ny + rect.height + pad > vh) ny = Math.max(pad, vh - rect.height - pad);
+    setAdjusted({ x: nx, y: ny });
+  }, [position, panelRef]);
+
+  // Outside-click / Escape / wheel-scroll all close the panel so it never
+  // lingers in a stale position after the user moved on. The wheel guard
+  // mirrors the outside-click one: a hosted continuous control (a slider)
+  // arms wheel-to-adjust while it's focused, and without this guard rolling
+  // the wheel over the panel's OWN control both adjusts the value AND
+  // dismisses the panel hosting it.
+  useEffect(() => {
+    if (!position) return;
+    const onDown = (e: MouseEvent) => {
+      if (panelRef.current && panelRef.current.contains(e.target as Node)) return;
+      onClose();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    const onScroll = (e: WheelEvent) => {
+      if (panelRef.current && panelRef.current.contains(e.target as Node)) return;
+      onClose();
+    };
+    // Defer attaching the dismiss listeners to the next macrotask. The
+    // right-click that opens this panel is still mid-dispatch when React
+    // flushes this effect (discrete-event synchronous flush), so attaching
+    // synchronously lets that same `contextmenu`/`mousedown` bubble to
+    // `window` and immediately close the panel we just opened. A macrotask
+    // boundary guarantees the opening gesture is fully over first.
+    let attached = false;
+    const attach = () => {
+      attached = true;
+      window.addEventListener('mousedown', onDown);
+      window.addEventListener('contextmenu', onDown);
+      window.addEventListener('keydown', onKey);
+      window.addEventListener('wheel', onScroll, { passive: true });
+    };
+    const timer = window.setTimeout(attach, 0);
+    return () => {
+      window.clearTimeout(timer);
+      if (attached) {
+        window.removeEventListener('mousedown', onDown);
+        window.removeEventListener('contextmenu', onDown);
+        window.removeEventListener('keydown', onKey);
+        window.removeEventListener('wheel', onScroll);
+      }
+    };
+  }, [position, onClose, panelRef]);
+
+  // FOCUS. A panel opened from the keyboard (Shift+F10 / the Menu key on a
+  // focused control) is unusable if focus stays behind on the opener: nothing
+  // is reachable but Tab, which walks straight past the panel into whatever
+  // follows it in the document. So focus moves to the caller's chosen target
+  // on open and back to the opener on close.
+  //
+  // Deferred a frame: `useLayoutEffect` above is still clamping the panel
+  // into the viewport, and focusing an element parked at -9999 scrolls the
+  // page to it. Restoring is CONDITIONAL — an `onSelect` that opened a modal
+  // and focused it has already run by the time this cleanup does, and
+  // stealing focus back from it would be worse than not restoring at all. So
+  // the opener only gets focus back when nothing else took it (focus is on
+  // the body, lost with the removed row, or still inside the panel).
+  //
+  // `requestAnimationFrame` is asked for rather than assumed: the contrast
+  // suite renders this component under a Node DOM shim that has no frame
+  // clock, and a panel with no frames to wait for has no clamp to wait for
+  // either — the focus can just happen now.
+  useEffect(() => {
+    if (!position || typeof document === 'undefined') return;
+    const opener = document.activeElement as HTMLElement | null;
+    const panel = panelRef.current;
+    const framed = typeof requestAnimationFrame === 'function';
+    const raf = framed ? requestAnimationFrame(() => focusOnOpen()?.focus()) : 0;
+    if (!framed) focusOnOpen()?.focus();
+    return () => {
+      if (framed) cancelAnimationFrame(raf);
+      const active = document.activeElement;
+      const lost = !active || active === document.body || (!!panel && panel.contains(active));
+      if (!lost) return;
+      if (opener && opener !== document.body && document.contains(opener)) opener.focus();
+    };
+  }, [position, focusOnOpen, panelRef]);
+
+  return adjusted;
+}
+
 export const ContextMenu: React.FC<ContextMenuProps> = ({
   position,
   onClose,
@@ -117,104 +245,16 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({
     const scopeVars = Object.fromEntries(Object.entries(vars).filter(([name]) => name !== '--et-root-bg'));
     return { vars: scopeVars, light };
   }, [editThemeId, editThemeImage]);
-  // After mount we measure the menu and nudge its position so it stays
-  // inside the viewport — anchoring to (clientX, clientY) without this
-  // would overflow on right-edge / bottom-edge clicks.
-  const [adjusted, setAdjusted] = useState<ContextMenuPosition | null>(null);
-
-  useLayoutEffect(() => {
-    if (!position || !menuRef.current) {
-      setAdjusted(null);
-      return;
-    }
-    const rect = menuRef.current.getBoundingClientRect();
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
-    const pad = 6;
-    let nx = position.x;
-    let ny = position.y;
-    if (nx + rect.width + pad > vw) nx = Math.max(pad, vw - rect.width - pad);
-    if (ny + rect.height + pad > vh) ny = Math.max(pad, vh - rect.height - pad);
-    setAdjusted({ x: nx, y: ny });
-  }, [position]);
-
-  // Outside-click / Escape / wheel-scroll all close the menu so it
-  // never lingers in a stale position after the user moved on.
-  useEffect(() => {
-    if (!position) return;
-    const onDown = (e: MouseEvent) => {
-      if (menuRef.current && menuRef.current.contains(e.target as Node)) return;
-      onClose();
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        onClose();
-      }
-    };
-    const onScroll = () => onClose();
-    // Defer attaching the dismiss listeners to the next macrotask. The
-    // right-click that opens this menu is still mid-dispatch when React
-    // flushes this effect (discrete-event synchronous flush), so attaching
-    // synchronously lets that same `contextmenu`/`mousedown` bubble to
-    // `window` and immediately close the menu we just opened. A macrotask
-    // boundary guarantees the opening gesture is fully over first.
-    let attached = false;
-    const attach = () => {
-      attached = true;
-      window.addEventListener('mousedown', onDown);
-      window.addEventListener('contextmenu', onDown);
-      window.addEventListener('keydown', onKey);
-      window.addEventListener('wheel', onScroll, { passive: true });
-    };
-    const timer = window.setTimeout(attach, 0);
-    return () => {
-      window.clearTimeout(timer);
-      if (attached) {
-        window.removeEventListener('mousedown', onDown);
-        window.removeEventListener('contextmenu', onDown);
-        window.removeEventListener('keydown', onKey);
-        window.removeEventListener('wheel', onScroll);
-      }
-    };
-  }, [position, onClose]);
-
-  // FOCUS. A menu opened from the keyboard (Shift+F10 / the Menu key on a
-  // focused control) is unusable if focus stays behind on the opener: nothing
-  // is reachable but Tab, which walks straight past the menu into whatever
-  // follows it in the document. So focus moves to the first enabled row on
-  // open and back to the opener on close.
-  //
-  // Deferred a frame: `useLayoutEffect` above is still clamping the menu into
-  // the viewport, and focusing an element parked at -9999 scrolls the page to
-  // it. Restoring is CONDITIONAL — an `onSelect` that opened a modal and
-  // focused it has already run by the time this cleanup does, and stealing
-  // focus back from it would be worse than not restoring at all. So the
-  // opener only gets focus back when nothing else took it (focus is on the
-  // body, lost with the removed row, or still inside the menu).
-  //
-  // `requestAnimationFrame` is asked for rather than assumed: the contrast
-  // suite renders this component under a Node DOM shim that has no frame
-  // clock, and a menu with no frames to wait for has no clamp to wait for
-  // either — the focus can just happen now.
-  useEffect(() => {
-    if (!position || typeof document === 'undefined') return;
-    const opener = document.activeElement as HTMLElement | null;
-    const menu = menuRef.current;
-    const focusFirst = () => {
-      itemRefs.current.find((el) => el && !el.disabled)?.focus();
-    };
-    const framed = typeof requestAnimationFrame === 'function';
-    const raf = framed ? requestAnimationFrame(focusFirst) : 0;
-    if (!framed) focusFirst();
-    return () => {
-      if (framed) cancelAnimationFrame(raf);
-      const active = document.activeElement;
-      const lost = !active || active === document.body || (!!menu && menu.contains(active));
-      if (!lost) return;
-      if (opener && opener !== document.body && document.contains(opener)) opener.focus();
-    };
-  }, [position]);
+  // Row-focus target for the shared shell's open effect — first enabled row.
+  // Stable identity: it closes only over the ref, never over `items`.
+  const focusFirstRow = useCallback(
+    () => itemRefs.current.find((el) => el && !el.disabled) ?? null,
+    [],
+  );
+  // Clamp into the viewport, outside-click/Escape/wheel dismiss, and the
+  // open/close focus round trip — all shared with MetronomeLevelPopover via
+  // `usePopoverShell` (finding 3, T25b edit B re-audit).
+  const adjusted = usePopoverShell({ position, onClose, panelRef: menuRef, focusOnOpen: focusFirstRow });
 
   if (!position) return null;
 

@@ -20,8 +20,9 @@ formats:
     song.ogg, zipped) written by :mod:`.exporters.beatsaber` from the same
     note chart.
   - ``chordtrack`` (the CHORDS play-along document) is built by the router's
-    ``/chords`` route through :mod:`.exporters.chordtrack`; it is listed here
-    so the capabilities probe and the artifact kinds know about it.
+    own ``/chords`` route through :mod:`.exporters.chordtrack`, not by
+    ``/export`` -- it has no entry in :func:`capabilities`'s ``formats``
+    list; look for ``caps["chords"]`` instead.
 
 A drum-kit MIDI (``is_drum`` instrument, or a ``midis`` row transcribed by the
 ``drum-onsets`` engine) is engraved as an unpitched percussion staff via
@@ -40,21 +41,27 @@ module/sidecar boundary and plug into ``convert_score`` later.
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
+import mimetypes
 import os
 import re
 import shutil
 import subprocess
 import sys
+import uuid
+import xml.dom.minidom as minidom
 import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
-from typing import Any, NamedTuple, Optional, Sequence
+from typing import Any, Mapping, NamedTuple, Optional, Sequence
 
 from backend.modules.library.db import LibraryDB, normalize_artifact_path
 
 from . import pdf_render
 from .midi_read import is_midi, read_score
 from .tempo_marks import engrave_tempo_marks, restore_sounding_tempi
+from backend.lib.atomic import atomic_replace
 from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
@@ -122,6 +129,196 @@ def strip_track_prefix(title: str) -> str:
     return title
 
 
+_XML10_VALID_CHARS_LOW = chr(0x09) + chr(0x0A) + chr(0x0D)
+_XML10_INVALID_CHAR_RE = re.compile(
+    "[^"
+    + _XML10_VALID_CHARS_LOW
+    + chr(0x20)
+    + "-"
+    + chr(0xD7FF)
+    + chr(0xE000)
+    + "-"
+    + chr(0xFFFD)
+    + chr(0x10000)
+    + "-"
+    + chr(0x10FFFF)
+    + "]"
+)
+
+
+def _strip_invalid_xml_chars(text: str) -> str:
+    """Drop every character outside the XML 1.0 Char production.
+
+    ElementTree happily assigns any Python str to el.text and only
+    discovers a bare control character (the C0 range below tab/LF/CR,
+    and 0x0B/0x0C/0x0E-0x1F) or a lone UTF-16 surrogate is unrepresentable
+    when it serializes -- by then the caller already has a document that
+    corrupts on write. Called on title/composer before either reaches
+    el.text so the bytes that hit disk are always well-formed XML.
+    """
+    return _XML10_INVALID_CHAR_RE.sub("", text)
+
+
+def _strip_score_part_names(score: Any) -> None:
+    """Strip XML-1.0-invalid characters from every part/instrument name on a
+    music21 ``Score`` before it reaches the writer.
+
+    ``partName``/``instrumentName`` (and their abbreviations) come straight
+    from the source file -- a MIDI track-name meta event, for example -- and
+    are never routed through :func:`_strip_invalid_xml_chars` the way
+    title/composer are. music21's MusicXML writer does not escape, substitute,
+    or drop invalid characters itself, so an unstripped control character
+    (e.g. ``b"Gui\\x01tar"``) reaches ``<part-name>`` raw and the file fails to
+    parse.
+    """
+    for part in score.parts:
+        for attr in ("partName", "partAbbreviation"):
+            value = getattr(part, attr, None)
+            if isinstance(value, str):
+                setattr(part, attr, _strip_invalid_xml_chars(value))
+        for inst in part.recurse().getElementsByClass("Instrument"):
+            for attr in (
+                "partName",
+                "partAbbreviation",
+                "instrumentName",
+                "instrumentAbbreviation",
+            ):
+                value = getattr(inst, attr, None)
+                if isinstance(value, str):
+                    setattr(inst, attr, _strip_invalid_xml_chars(value))
+
+
+def _validate_written_musicxml(path: Path) -> None:
+    """Parse-validate a MusicXML file just written to disk (plain or the
+    compressed ``.mxl`` zip container).
+
+    Neither music21's writer nor a hand-filtered ``ElementTree`` rewrite
+    applies any XML-1.0 validity check of its own, so this is called on
+    every MusicXML file this module writes before the caller may register or
+    move it -- an unstripped source-derived string can never result in a
+    corrupt artifact being registered. Raises :class:`ValueError` when the
+    file is not well-formed; the caller decides what to do with the bad
+    file.
+    """
+    try:
+        if path.suffix.lower() == ".mxl":
+            with zipfile.ZipFile(path) as archive:
+                container = ET.fromstring(archive.read("META-INF/container.xml"))
+                rootfile = next(
+                    (
+                        element.get("full-path")
+                        for element in container.iter()
+                        if element.tag.endswith("rootfile") and element.get("full-path")
+                    ),
+                    None,
+                )
+                if not rootfile:
+                    raise ValueError(
+                        "compressed musicxml has no rootfile in META-INF/container.xml"
+                    )
+                ET.fromstring(archive.read(rootfile))
+        else:
+            ET.fromstring(path.read_bytes())
+    except (
+        ET.ParseError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+        KeyError,
+        OSError,
+        RuntimeError,
+    ) as exc:
+        raise ValueError(f"musicxml failed to write as well-formed XML: {exc}") from exc
+
+
+def _strip_score_lyrics(score: Any) -> None:
+    """Strip XML-1.0-invalid characters from every note's lyric text on a
+    music21 ``Score`` before it reaches the writer.
+
+    Lyric text (a MIDI ``lyrics`` meta event, for example) reaches
+    ``<lyric><text>`` raw otherwise. ``Lyric`` is not a stream element, so
+    ``score.recurse().getElementsByClass("Lyric")`` finds nothing -- lyrics
+    live on each note's own ``.lyrics`` list instead.
+    """
+    for n in score.recurse().notes:
+        for ly in getattr(n, "lyrics", None) or []:
+            if isinstance(getattr(ly, "text", None), str):
+                ly.text = _strip_invalid_xml_chars(ly.text)
+
+
+_METADATA_TEXT_ATTRS = (
+    "title",
+    "movementName",
+    "movementNumber",
+    "composer",
+    "lyricist",
+    "copyright",
+)
+
+
+def _strip_score_metadata(score: Any) -> None:
+    """Strip XML-1.0-invalid characters from every text field on a music21
+    ``Score``'s ``metadata`` before it reaches the writer.
+
+    ``score.metadata`` carries source-derived strings the same way part
+    names and lyrics do (a raw song title stamped unfiltered by
+    :func:`.arrangers.score_arrange._new_score`, for example) but was never
+    routed through :func:`_strip_invalid_xml_chars`.
+    """
+    md = getattr(score, "metadata", None)
+    if md is None:
+        return
+    for attr in _METADATA_TEXT_ATTRS:
+        value = getattr(md, attr, None)
+        if isinstance(value, str):
+            setattr(md, attr, _strip_invalid_xml_chars(value))
+
+
+def _write_musicxml(score: Any, path: Path, *, what: str) -> Path:
+    """The single MusicXML writer: every place in this module that writes a
+    music21 ``Score`` as MusicXML goes through this function, and nothing
+    else in this module may call ``score.write("musicxml", ...)`` directly.
+
+    Strips every source-derived string that becomes XML text (part /
+    instrument names via :func:`_strip_score_part_names`, lyric text via
+    :func:`_strip_score_lyrics`, metadata text via
+    :func:`_strip_score_metadata`), then writes to a uuid-suffixed temp file
+    beside the real destination (never into ``path`` itself) and
+    parse-validates that temp file. Only once validation passes is the temp
+    file atomically replaced onto ``path`` (or ``path`` with ``.musicxml``
+    appended, when ``path`` had no suffix of its own -- matching what
+    music21's own writer does with a suffix-less ``fp``). On a validation
+    failure the temp file is removed and a :class:`ValueError` is raised,
+    prefixed with ``what`` (what failed and for which export); whatever was
+    already at the destination -- a previous good export, on a re-export --
+    is left byte-identical. Returns the path the artifact now lives at.
+    """
+    _strip_score_part_names(score)
+    _strip_score_lyrics(score)
+    _strip_score_metadata(score)
+    final_path = path if path.suffix else path.with_suffix(".musicxml")
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = final_path.with_name(
+        f".{final_path.stem}.{uuid.uuid4().hex}{final_path.suffix}"
+    )
+    written_path = tmp
+    try:
+        written = score.write("musicxml", fp=str(tmp))
+        written_path = Path(written) if written else tmp
+        try:
+            _validate_written_musicxml(written_path)
+        except ValueError as exc:
+            written_path.unlink(missing_ok=True)
+            raise ValueError(f"{what}: {exc}") from exc
+        atomic_replace(written_path, final_path)
+        if written_path != tmp:
+            tmp.unlink(missing_ok=True)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        written_path.unlink(missing_ok=True)
+        raise
+    return final_path
+
+
 def clean_title(title: str) -> str:
     """Sanitize a song title for display + engraving.
 
@@ -140,7 +337,7 @@ def clean_title(title: str) -> str:
             break
     if t.strip().lower() in _PLACEHOLDER_TITLES:
         return ""
-    return strip_track_prefix(t.strip())
+    return _strip_invalid_xml_chars(strip_track_prefix(t.strip()))
 
 
 def artist_name() -> str:
@@ -154,7 +351,152 @@ def artist_name() -> str:
         name = str((section or {}).get("artist", "") or "").strip()
     except Exception:
         name = ""
-    return name or DEFAULT_ARTIST
+    return _strip_invalid_xml_chars(name) or DEFAULT_ARTIST
+
+
+def _chart_artist(entry: Optional[Any]) -> str:
+    """The artist to stamp on a generated note chart / Beat Saber level.
+
+    :mod:`.identity` splits the entry's own name ("Artist - Song") or reads
+    the user's per-entry override; when that is confident it names the actual
+    performer, which the single global composer credit (:func:`artist_name`)
+    never could. ``identity`` answers "" rather than guess, so that empty
+    case -- and a caller with no entry row to read -- falls back to
+    :func:`artist_name` exactly as :mod:`.identity`'s own docstring promises.
+    """
+    from . import identity
+
+    if entry is not None:
+        parsed_artist, _ = identity.resolve_identity(entry)
+        if parsed_artist:
+            return _strip_invalid_xml_chars(parsed_artist)
+    return artist_name()
+
+
+def _chart_title(entry: Optional[Any], title: str) -> str:
+    """The title to stamp on a generated note chart / Beat Saber level.
+
+    NOTE: this only titles those two chart-based targets, not the engraved
+    PDF/SVG/MusicXML/ABC sheet -- those still take their title straight from
+    the caller's ``title`` argument (:func:`_stage_musicxml`,
+    :func:`_convert_with_music21`, :func:`stage_parts`). Wiring this in there
+    too is a separate change; if that ever happens, update this note.
+
+    An explicit override title (the DETAILS identity form's ``notation_title``,
+    read via :mod:`.identity`) always wins, even when the user did not also
+    set an override artist -- :func:`.identity.resolve_identity` preserves it
+    regardless. Otherwise, when the entry's own name carries a confident
+    "Artist - Song" split, the chart is titled with the SONG half only
+    (:mod:`.identity` already resolved it alongside the artist). When neither
+    applies -- no override, no confident split, or no entry to read -- this
+    falls back exactly as before this function existed: the caller's own
+    ``title`` argument, cleaned.
+    """
+    from . import identity
+
+    if entry is not None:
+        override_title = _lookup_field(
+            entry, identity.OVERRIDE_TITLE_KEY
+        ) or _lookup_metadata_field(entry, identity.OVERRIDE_TITLE_KEY)
+        if override_title:
+            return _strip_invalid_xml_chars(override_title)
+        parsed_artist, parsed_title = identity.resolve_identity(entry)
+        if parsed_artist and parsed_title:
+            return _strip_invalid_xml_chars(parsed_title)
+    return clean_title(title)
+
+
+# mimetypes.guess_type is registry-based and disagrees with itself per OS: on
+# this Windows machine ``.mp3`` guesses "audio/mp3" (not the IANA-registered
+# "audio/mpeg") and ``.m4a`` guesses "video/m4a". A note chart's audio MIME
+# type has to be stable across machines, so the audio extensions this app
+# actually deals with are looked up here FIRST; ``mimetypes`` is only the
+# fallback for anything else.
+_AUDIO_MIME_BY_EXTENSION = {
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".flac": "audio/flac",
+    ".m4a": "audio/mp4",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".aac": "audio/aac",
+    ".aif": "audio/aiff",
+    ".aiff": "audio/aiff",
+}
+
+
+def _guess_audio_mime(filename: str) -> str:
+    """The MIME type for an audio filename: the fixed table above first,
+    ``mimetypes.guess_type`` for anything not in it."""
+    suffix = Path(filename).suffix.lower()
+    fixed = _AUDIO_MIME_BY_EXTENSION.get(suffix)
+    if fixed:
+        return fixed
+    guessed, _ = mimetypes.guess_type(filename)
+    return guessed or ""
+
+
+def _chart_audio_block(entry: Optional[Any]) -> Optional[dict[str, Any]]:
+    """Filename + MIME type for a note chart's ``audio`` block, read off the
+    entry's own library record so the chart names the real source file
+    instead of leaving those fields blank. ``None`` when there is no entry to
+    read, so the chart writer falls back to its own (empty) defaults.
+
+    The MIME type prefers the entry's own ``mime_type`` (metadata_json), then
+    a guess from the filename's extension (:func:`_guess_audio_mime`), and
+    only then the DB ``mime`` column -- that column defaults to
+    ``"audio/wav"`` regardless of the real file (library/db.py), so it is the
+    least trustworthy of the three.
+    """
+    if entry is None:
+        return None
+    filename = str(_lookup_field(entry, "audio_filename") or "")
+    mime = _lookup_metadata_field(entry, "mime_type")
+    if not mime and filename:
+        mime = _guess_audio_mime(filename)
+    if not mime:
+        mime = str(_lookup_field(entry, "mime") or "")
+    if not filename and not mime:
+        return None
+    return {"filename": filename, "mimeType": mime}
+
+
+def _lookup_field(entry: Any, key: str) -> str:
+    """Read one string field off an entry dict (a DB row) or object
+    attribute, mirroring :func:`.identity._lookup`'s two shapes without
+    pulling that private helper in."""
+    if isinstance(entry, Mapping):
+        value = entry.get(key)
+    else:
+        value = getattr(entry, key, None)
+    return str(value).strip() if value else ""
+
+
+def _lookup_metadata_field(entry: Any, key: str) -> str:
+    """Read one string field from an entry's ``metadata_json`` blob only
+    (never a top-level column), mirroring :func:`.identity._lookup`'s
+    metadata_json probing without pulling that private helper in. The blob
+    arrives either as a parsed mapping or as a JSON string (a raw DB row)."""
+    if entry is None:
+        return ""
+    raw_meta: Any = (
+        entry.get("metadata_json")
+        if isinstance(entry, Mapping)
+        else getattr(entry, "metadata_json", None)
+    )
+    nested: Optional[Mapping[str, Any]] = None
+    if isinstance(raw_meta, str) and raw_meta.strip():
+        try:
+            parsed = json.loads(raw_meta)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, Mapping):
+            nested = parsed
+    elif isinstance(raw_meta, Mapping):
+        nested = raw_meta
+    if nested is not None and nested.get(key):
+        return str(nested[key]).strip()
+    return ""
 
 
 # Targets music21 can write directly from a parsed score. ABC is deliberately
@@ -347,15 +689,19 @@ def capabilities() -> dict[str, Any]:
 
     musescore = musescore_binary()
     osmd = pdf_render.available()
+    # What ``POST /{entry_id}/export`` (``_EXT_FOR_FORMAT``) actually accepts,
+    # plus pdf/svg below when an engraver is present. "midi", "json" and
+    # "alphatex" are artifact *kinds* this module already produces (a
+    # registered MIDI, a note chart's raw dict, a tab arrangement) but none of
+    # them is an /export target -- advertising them here promised a
+    # conversion the route then rejected with 422. "chordtrack" is likewise
+    # not an /export target: chord tracks are built through their own
+    # POST /{entry_id}/chords route (see ``caps["chords"]`` below).
     formats = [
-        "midi",
         "musicxml",
         "abc",
-        "json",
-        "alphatex",
         "notechart",
         "beatsaber",
-        "chordtrack",
     ]
     # PDF and SVG each come from EITHER engraver: the headless OSMD renderer
     # first (the SCORE tab's own engraver, so the sheet matches the screen),
@@ -390,6 +736,11 @@ def capabilities() -> dict[str, Any]:
             "future": ["mt3-sidecar", "audiveris-sidecar", "guitarpro-export"],
         },
         "formats": formats,
+        # Chord tracks are always buildable (pure-Python writer, like
+        # notechart/beatsaber) but reach the entry through their own
+        # POST /{entry_id}/chords route rather than /export, so they get
+        # their own capability flag instead of a "formats" entry.
+        "chords": True,
         # song.ogg for a Beat Saber level needs ffmpeg; the UI shows the pack
         # card's audio status from this.
         "ffmpeg": find_ffmpeg() is not None,
@@ -548,7 +899,16 @@ def lyrics_artifact_id(entry_id: str) -> str:
 
 def _kind_and_stem_for_file(path: Path) -> tuple[Optional[str], str]:
     """Artifact ``kind`` and id stem for a file on disk, or ``(None, stem)``
-    when the file is not a notation artifact."""
+    when the file is not a notation artifact.
+
+    A leading-dot filename is never a real artifact -- it is the naming
+    convention :func:`_write_musicxml` uses for its in-progress temp file
+    (``.<stem>.<uuid>.musicxml``), and a leaked one (a crash between the
+    write and the ``try`` that now guards it, or a name a future writer
+    invents the same way) must never be registered as a notation artifact.
+    """
+    if path.name.startswith("."):
+        return None, path.stem
     name = path.name.lower()
     for suffix, kind in _KIND_FOR_COMPOUND_SUFFIX:
         if name.endswith(suffix):
@@ -754,9 +1114,15 @@ def _is_musicxml(path: Path) -> bool:
     return path.suffix.lower() in _MUSICXML_SUFFIXES
 
 
-def _stage_musicxml(source_path: Path, scratch: Path, title: str) -> Path:
+def _stage_musicxml(
+    source_path: Path, scratch: Path, title: str, *, artist: str = ""
+) -> Path:
     """Write ``source_path`` (any music21-readable source, normally MIDI) as a
     MusicXML file at ``scratch``, titled + credited, and return ``scratch``.
+
+    ``artist`` is the composer credit to stamp; callers resolve it once via
+    :func:`_chart_artist` (falls back to the global :func:`artist_name` when
+    empty) so every staged copy of the same entry carries the same credit.
 
     The engravers read MusicXML only. The file is written beside the caller's
     output and the caller removes it afterwards; it is never registered as an
@@ -772,13 +1138,173 @@ def _stage_musicxml(source_path: Path, scratch: Path, title: str) -> Path:
             if staged_score.metadata is None:
                 staged_score.insert(0, Metadata())
             staged_score.metadata.title = clean
-            staged_score.metadata.composer = artist_name()
+            staged_score.metadata.composer = artist or artist_name()
         except Exception as exc:  # noqa: BLE001 - titling is best-effort
             log.debug("notation: staging title skipped: %s", exc)
-    scratch.parent.mkdir(parents=True, exist_ok=True)
     engrave_tempo_marks(staged_score)
-    staged_score.write("musicxml", fp=str(scratch))
-    return scratch
+    return _write_musicxml(
+        staged_score, scratch, what=f"staging {source_path.name} as musicxml"
+    )
+
+
+_MUSICXML_DECL_RE = re.compile(rb"\A\s*<\?xml[^>]*\?>")
+
+
+def _quote_doctype_literal(value: str) -> str:
+    """Quote a DOCTYPE ``PubidChar``/``SystemLiteral`` value, choosing a
+    quote character not present in ``value``.
+
+    ``xml.dom.minidom.DocumentType.writexml`` (and therefore
+    ``DocumentType.toxml()``) always wraps both the public and system
+    identifiers in single quotes with no escaping -- see the CPython stdlib
+    source (``writer.write("%s  PUBLIC '%s'%s  '%s'" % (...))``). An
+    apostrophe is a legal ``PubidChar`` and legal inside a double-quoted
+    ``SystemLiteral``, so a value containing one (e.g. a Windows path like
+    ``Bob's Scores``) round-trips through ``toxml()`` into an unescaped
+    single-quoted literal, corrupting the XML. A double quote cannot appear
+    in a ``PubidChar``, so the double-quoted branch below is always safe for
+    a public id; for a system id (which may contain either quote character,
+    just not both) this still covers every value minidom itself accepts.
+    """
+    if "'" in value and '"' in value:
+        raise ValueError(
+            f"cannot quote DOCTYPE literal {value!r}: contains both quote "
+            "characters (unreachable from a SystemLiteral/PubidChar a real "
+            "parser can produce -- see this function's docstring)"
+        )
+    if "'" in value:
+        return '"%s"' % value
+    return "'%s'" % value
+
+
+def _musicxml_prolog_extras(raw: bytes) -> bytes:
+    """The DOCTYPE declaration and any comments (or processing instructions)
+    that sit between the XML declaration and the root element of a MusicXML
+    file, re-encoded to UTF-8 and joined with newlines.
+
+    ``ElementTree`` has no representation for either -- a plain
+    ``ET.parse`` / ``tree.write`` round trip silently drops both. This
+    locates the root element BY POSITION FROM A REAL XML PARSER
+    (``xml.dom.minidom``, which models both the ``DocumentType`` and any
+    pre-root ``Comment``/processing-instruction nodes, and decodes the
+    document per its own declared encoding -- UTF-8 BOM included, unlike a
+    byte-level regex scan, which neither recognises a BOM nor stops at a
+    pre-root comment containing ``<`` (e.g. a URL) rather than scanning
+    through it). Each node is then re-serialized as UTF-8, so the extras
+    are always safe to splice into a UTF-8 body (e.g.
+    ``ET.write(..., encoding="UTF-8")`` output).
+
+    Returns ``b""`` when ``raw`` cannot be parsed this way (malformed XML,
+    no root element) or there is nothing before the root to preserve --
+    the lossy-but-valid fallback -- rather than ever produce a corrupt
+    splice.
+
+    Only pre-root nodes are captured (the loop below stops at ``root``): a
+    comment or processing instruction AFTER the root element is dropped,
+    same as a plain ``ET`` round trip. Lossy but still valid XML, so this
+    is left as-is.
+    """
+    try:
+        doc = minidom.parseString(raw)
+    except Exception:
+        return b""
+    root = doc.documentElement
+    if root is None:
+        return b""
+    pieces: list[bytes] = []
+    for node in doc.childNodes:
+        if node is root:
+            break
+        if node.nodeType == node.DOCUMENT_TYPE_NODE:
+            # Built by hand rather than ``node.toxml()``: minidom's own
+            # writer always single-quotes both identifiers with no
+            # escaping, which corrupts the DOCTYPE for any value (e.g. a
+            # file path) containing an apostrophe. See
+            # ``_quote_doctype_literal``. Note ``node.name`` comes back
+            # prefix-stripped for a namespaced root (e.g. ``mx:score``
+            # captures as just ``score``) while the ``ET`` rewrite emits
+            # ``ns0:score`` -- harmless, since root-element-type agreement
+            # between the DOCTYPE and the document is a Validity
+            # Constraint, not a Well-Formedness one, and neither parser
+            # used here validates.
+            if node.publicId:
+                piece = (
+                    f"<!DOCTYPE {node.name} PUBLIC "
+                    f"{_quote_doctype_literal(node.publicId)} "
+                    f"{_quote_doctype_literal(node.systemId or '')}"
+                )
+            elif node.systemId:
+                piece = (
+                    f"<!DOCTYPE {node.name} SYSTEM "
+                    f"{_quote_doctype_literal(node.systemId)}"
+                )
+            else:
+                piece = f"<!DOCTYPE {node.name}"
+            if node.internalSubset is not None:
+                piece += f" [{node.internalSubset}]"
+            piece += ">"
+        elif node.nodeType == node.COMMENT_NODE:
+            piece = f"<!--{node.data}-->"
+        elif node.nodeType == node.PROCESSING_INSTRUCTION_NODE:
+            piece = f"<?{node.target} {node.data}?>"
+        else:
+            continue
+        pieces.append(piece.encode("utf-8"))
+    return b"\n".join(pieces).strip(b"\r\n")
+
+
+def _splice_musicxml_prolog_extras(body: bytes, extras: bytes) -> bytes:
+    """Insert ``extras`` (see :func:`_musicxml_prolog_extras`) right after
+    ``body``'s own XML declaration.
+
+    ``body`` is assumed to be ``ElementTree``'s own clean UTF-8 output
+    (``tree.write(..., encoding="UTF-8")``), so its declaration always
+    matches ``_MUSICXML_DECL_RE`` from the very first byte -- no BOM, no
+    leading whitespace to confuse the match.
+    """
+    if not extras:
+        return body
+    decl_match = _MUSICXML_DECL_RE.match(body)
+    decl_end = decl_match.end() if decl_match else 0
+    return body[:decl_end] + b"\n" + extras + b"\n" + body[decl_end:].lstrip(b"\r\n")
+
+
+def _set_musicxml_composer(root: ET.Element, composer: str) -> None:
+    """Set (or create) ``<identification><creator type="composer">`` on a
+    parsed ``<score-partwise>`` root, in place -- and remove every OTHER
+    ``type="composer"`` creator, so a sheet some other tool wrote with more
+    than one never keeps a stale second credit beside the one just set.
+
+    Shared by :func:`stage_parts` (filtering a whole sheet down to a part
+    subset), :func:`_engrave` (re-crediting an already-MusicXML source
+    before handing it to the MuseScore CLI, which reads the composer straight
+    off the file and has no ``--artist`` override the way the OSMD renderer
+    does), and the ``/pack`` route's non-part-scoped re-credit.
+    """
+    identification = root.find("identification")
+    if identification is None:
+        # score-partwise orders: work, movement-number, movement-title,
+        # identification, ... so it goes right after the last of those.
+        identification = ET.Element("identification")
+        after = -1
+        for pos, child in enumerate(list(root)):
+            if child.tag in ("work", "movement-number", "movement-title"):
+                after = pos
+        root.insert(after + 1, identification)
+    composer_creators = [
+        c
+        for c in identification.findall("creator")
+        if (c.get("type") or "composer").strip().lower() == "composer"
+    ]
+    if composer_creators:
+        creator, extras = composer_creators[0], composer_creators[1:]
+    else:
+        creator = ET.Element("creator", {"type": "composer"})
+        identification.insert(0, creator)
+        extras = []
+    creator.text = composer
+    for extra in extras:
+        identification.remove(extra)
 
 
 class StagedParts(NamedTuple):
@@ -820,6 +1346,7 @@ def stage_parts(
     title: str = "",
     *,
     output_path: Path,
+    artist: str = "",
 ) -> StagedParts:
     """Write a MusicXML holding only the parts at ``part_indices`` beside
     ``output_path`` (``<stem>__parts_src.musicxml``) and return it.
@@ -837,8 +1364,12 @@ def stage_parts(
 
     The title is ``clean_title(title)`` (the sheet's own ``<work-title>`` when
     that is empty) with `` · <Part name>`` appended when exactly one part is
-    kept, so the engraved page says which part it is. The caller deletes the
-    staged file in a ``finally`` and never registers it.
+    kept, so the engraved page says which part it is. ``artist`` is the
+    composer credit to stamp (falls back to the global :func:`artist_name`
+    when empty, exactly as before this parameter existed) -- callers resolve
+    it once via :func:`_chart_artist` so the filtered sheet carries the same
+    credit as the whole one. The caller deletes the staged file in a
+    ``finally`` and never registers it.
     """
     scratch = output_path.with_name(f"{output_path.stem}__parts_src.musicxml")
     midi_scratch: Optional[Path] = None
@@ -848,7 +1379,9 @@ def stage_parts(
             midi_scratch = output_path.with_name(
                 f"{output_path.stem}__parts_midi_src.musicxml"
             )
-            source = _stage_musicxml(source_path, midi_scratch, title)
+            midi_scratch = source = _stage_musicxml(
+                source_path, midi_scratch, title, artist=artist
+            )
         tree = ET.parse(str(source))
         root = tree.getroot()
         if root.tag != "score-partwise":
@@ -906,31 +1439,20 @@ def stage_parts(
             if work_title is None:
                 work_title = ET.SubElement(work, "work-title")
             work_title.text = stamped
-        identification = root.find("identification")
-        if identification is None:
-            # score-partwise orders: work, movement-number, movement-title,
-            # identification, ... so it goes right after the last of those.
-            identification = ET.Element("identification")
-            after = -1
-            for pos, child in enumerate(list(root)):
-                if child.tag in ("work", "movement-number", "movement-title"):
-                    after = pos
-            root.insert(after + 1, identification)
-        composer = next(
-            (
-                c
-                for c in identification.findall("creator")
-                if c.get("type") == "composer"
-            ),
-            None,
-        )
-        if composer is None:
-            composer = ET.Element("creator", {"type": "composer"})
-            identification.insert(0, composer)
-        composer.text = artist_name()
+        _set_musicxml_composer(root, artist or artist_name())
 
         scratch.parent.mkdir(parents=True, exist_ok=True)
         tree.write(str(scratch), encoding="UTF-8", xml_declaration=True)
+        try:
+            _validate_written_musicxml(scratch)
+        except ValueError as exc:
+            # A control character reached the staged XML (composer/title
+            # credit) despite the chokepoint strip -- never hand callers a
+            # StagedParts pointing at a file no XML parser accepts.
+            scratch.unlink(missing_ok=True)
+            raise ValueError(
+                f"part-scoped MusicXML failed to stage as well-formed XML: {exc}"
+            ) from exc
         kept = [{"index": i, "name": names[i]} for i in wanted]
         return StagedParts(scratch, stamped, kept)
     finally:
@@ -997,6 +1519,13 @@ def convert_score(
     if not source_path.is_file():
         return {"ok": False, "error": f"source not found: {source_path}"}
 
+    # Resolved ONCE, early, and threaded through every converter below so one
+    # entry carries one credit everywhere -- the identity split (or the
+    # global composer, when it has none to offer) rather than each converter
+    # separately (and, before this, inconsistently) calling artist_name().
+    entry = db.get_entry(entry_id) if entry_id else None
+    artist = _chart_artist(entry)
+
     parts = _requested_parts(options)
     if parts and fmt in _PART_SCOPED_FORMATS:
         if importlib.util.find_spec("music21") is None and not _is_musicxml(
@@ -1004,7 +1533,9 @@ def convert_score(
         ):
             return {"ok": False, "error": "music21 is not installed."}
         try:
-            staged = stage_parts(source_path, parts, title, output_path=output_path)
+            staged = stage_parts(
+                source_path, parts, title, output_path=output_path, artist=artist
+            )
         except Exception as exc:  # noqa: BLE001 - report, never raise into the route
             log.warning("notation: part staging failed for %s: %s", source_path, exc)
             return {"ok": False, "engine": "music21", "error": str(exc) or repr(exc)}
@@ -1040,6 +1571,8 @@ def convert_score(
                 analysis_bpm=analysis_bpm,
                 register_source=source_path,
                 extra_metadata={"parts": staged.parts},
+                artist=artist,
+                entry=entry,
             )
         finally:
             staged.path.unlink(missing_ok=True)
@@ -1058,6 +1591,8 @@ def convert_score(
         audio_path=audio_path,
         audio_duration_sec=audio_duration_sec,
         analysis_bpm=analysis_bpm,
+        artist=artist,
+        entry=entry,
     )
 
 
@@ -1086,12 +1621,17 @@ def _convert_one(
     analysis_bpm: Optional[float],
     register_source: Optional[Path] = None,
     extra_metadata: Optional[dict[str, Any]] = None,
+    artist: str = "",
+    entry: Optional[Any] = None,
 ) -> dict[str, Any]:
     """Route one (already staged, if part-scoped) source to its converter.
 
     ``register_source`` is the path the artifact's ``metadata.source`` and
     lineage relation record when ``source_path`` is a staging file; the
-    converters otherwise record the file they read.
+    converters otherwise record the file they read. ``artist`` and ``entry``
+    are what :func:`convert_score` already resolved once (``entry`` via
+    ``db.get_entry(entry_id)``, ``artist`` via :func:`_chart_artist`); the
+    chart-based converters below take ``entry`` too so they never re-read it.
     """
     if fmt == "abc":
         return _convert_to_abc(
@@ -1104,6 +1644,7 @@ def _convert_one(
             title=title,
             register_source=register_source,
             extra_metadata=extra_metadata,
+            artist=artist,
         )
     if fmt in _MUSIC21_FORMATS:
         return _convert_with_music21(
@@ -1115,6 +1656,7 @@ def _convert_one(
             source_ref=source_ref,
             artifact_id=artifact_id,
             title=title,
+            artist=artist,
         )
     if fmt in _MUSESCORE_FORMATS:
         return _engrave(
@@ -1129,6 +1671,7 @@ def _convert_one(
             options=options,
             register_source=register_source,
             extra_metadata=extra_metadata,
+            artist=artist,
         )
     if fmt in _NOTECHART_FORMATS:
         return _convert_to_notechart(
@@ -1142,6 +1685,8 @@ def _convert_one(
             audio_duration_sec=audio_duration_sec,
             register_source=register_source,
             extra_metadata=extra_metadata,
+            artist=artist,
+            entry=entry,
         )
     if fmt in _BEATSABER_FORMATS:
         return _convert_to_beatsaber(
@@ -1156,6 +1701,8 @@ def _convert_one(
             audio_path=audio_path,
             audio_duration_sec=audio_duration_sec,
             analysis_bpm=analysis_bpm,
+            artist=artist,
+            entry=entry,
         )
     return {"ok": False, "error": f"unsupported notation format: {fmt!r}"}
 
@@ -1180,17 +1727,34 @@ def _engrave(
     options: Optional[dict[str, Any]] = None,
     register_source: Optional[Path] = None,
     extra_metadata: Optional[dict[str, Any]] = None,
+    artist: str = "",
 ) -> dict[str, Any]:
     """Engrave a PDF or SVG: the frontend's OSMD first (the engraver the SCORE
     tab draws with), MuseScore when OSMD is unavailable or its render fails.
 
     ``options["engine"]`` ('osmd' | 'musescore') pins one engraver; an
-    unavailable pinned engraver is an error, not a silent switch. Both
-    engravers read MusicXML only, so a MIDI source is staged through music21
-    first. That staging file is written beside the output and removed
-    afterwards, and it is deliberately NOT registered as an artifact:
-    registering it would leave a DB row pointing at a path this function then
-    deletes.
+    unavailable pinned engraver is an error, not a silent switch. A tab
+    source (``.alphatex``) is handed to the renderer as-is: it reads it
+    through alphaTab (see :mod:`.pdf_render`), never through music21, which
+    cannot parse alphaTex and has no tab source to stage a MusicXML from.
+    Every other source is MusicXML or MIDI; OSMD reads MusicXML only, so a
+    MIDI source is staged through music21 into MusicXML first, REGARDLESS of
+    which engraver ends up rendering it (even a forced ``options["engine"]:
+    "musescore"``, which could otherwise read the MIDI directly) -- staging
+    also stamps the title and composer credit, which the engravers would
+    otherwise print un-credited. That staging file is written beside the
+    output and removed afterwards, and it is deliberately NOT registered as
+    an artifact: registering it would leave a DB row pointing at a path this
+    function then deletes.
+
+    ``artist`` is the composer credit :func:`convert_score` already resolved
+    once via :func:`_chart_artist`. The OSMD renderer takes it as an explicit
+    ``artist=`` argument; MuseScore has no such override and reads the
+    composer straight off the file, so an ALREADY-MusicXML source (one that
+    skipped the staging above) gets it re-stamped onto a throwaway MuseScore
+    scratch copy, mirroring how :func:`stage_parts` re-credits a filtered
+    sheet. A MIDI source's staged copy is already credited by
+    :func:`_stage_musicxml` and needs no second copy.
     """
     forced = str((options or {}).get("engine") or "").lower().strip() or None
     if forced is not None and forced not in _ENGRAVE_ENGINES:
@@ -1199,32 +1763,60 @@ def _engrave(
             "engine": forced,
             "error": f"unknown engraver {forced!r}; use one of {_ENGRAVE_ENGINES}",
         }
+    is_tab_source = source_path.suffix.lower() == ".alphatex"
     osmd_ok = bool(pdf_render.available()["ok"])
     musescore = musescore_command()
     try_osmd = forced in (None, "osmd") and osmd_ok
-    try_musescore = forced in (None, "musescore") and musescore is not None
+    # MuseScore has no alphaTex reader; a tab source can only be engraved by
+    # the alphaTab-capable OSMD path above.
+    try_musescore = (
+        forced in (None, "musescore") and musescore is not None and not is_tab_source
+    )
     if not try_osmd and not try_musescore:
         if forced == "osmd":
             error = f"the OSMD renderer is unavailable: {pdf_render.available()}"
         elif forced == "musescore":
-            error = _MUSESCORE_NOT_FOUND
+            error = (
+                "tablature (.alphatex) cannot be engraved by MuseScore; use the "
+                "OSMD engraver"
+                if is_tab_source
+                else _MUSESCORE_NOT_FOUND
+            )
+        elif is_tab_source:
+            # MuseScore has no alphaTex reader and was therefore never a
+            # candidate for this source -- naming it here (the generic hint
+            # below mentions both engravers) would be misleading.
+            error = (
+                f"{fmt.upper()} export of a tab (.alphatex) source needs the "
+                f"OSMD renderer: {pdf_render.available()}"
+            )
         else:
             error = f"{fmt.upper()} export {_ENGRAVE_NOTHING_HINT}"
         return {"ok": False, "engine": forced or "osmd", "error": error}
 
+    credited_artist = artist or artist_name()
     source = source_path
     scratch: Optional[Path] = None
-    if not _is_musicxml(source_path):
-        if importlib.util.find_spec("music21") is None:
-            return {"ok": False, "engine": "osmd", "error": "music21 is not installed."}
-        scratch = output_path.with_name(f"{output_path.stem}__osmd_src.musicxml")
-        try:
-            source = _stage_musicxml(source_path, scratch, title)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("notation: %s staging failed for %s: %s", fmt, source_path, exc)
-            return {"ok": False, "engine": "osmd", "error": repr(exc)}
-
+    musescore_scratch: Optional[Path] = None
     try:
+        if not _is_musicxml(source_path) and not is_tab_source:
+            if importlib.util.find_spec("music21") is None:
+                return {
+                    "ok": False,
+                    "engine": "osmd",
+                    "error": "music21 is not installed.",
+                }
+            scratch = output_path.with_name(f"{output_path.stem}__staged_src.musicxml")
+            try:
+                scratch = source = _stage_musicxml(
+                    source_path, scratch, title, artist=credited_artist
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "notation: %s staging failed for %s: %s", fmt, source_path, exc
+                )
+                return {"ok": False, "engine": "osmd", "error": repr(exc)}
+
         errors: list[str] = []
         if try_osmd:
             render = (
@@ -1232,7 +1824,7 @@ def _engrave(
                 if fmt == "pdf"
                 else pdf_render.render_musicxml_svg
             )
-            result = render(source, output_path, artist=artist_name())
+            result = render(source, output_path, artist=credited_artist)
             if result.get("ok"):
                 registered = _register_conversion(
                     db,
@@ -1257,10 +1849,38 @@ def _engrave(
                     errors[-1],
                 )
         if try_musescore:
+            musescore_source = source
+            if scratch is None and _is_musicxml(source_path):
+                # ``source`` is still the ORIGINAL MusicXML file (nothing was
+                # staged above) -- MuseScore reads its composer straight off
+                # the file and has no ``--artist`` override, so it is
+                # re-credited onto a throwaway copy exactly as
+                # :func:`stage_parts` re-credits a filtered sheet.
+                try:
+                    musescore_scratch = output_path.with_name(
+                        f"{output_path.stem}__musescore_src.musicxml"
+                    )
+                    tree = ET.parse(str(source))
+                    _set_musicxml_composer(tree.getroot(), credited_artist)
+                    musescore_scratch.parent.mkdir(parents=True, exist_ok=True)
+                    tree.write(
+                        str(musescore_scratch), encoding="UTF-8", xml_declaration=True
+                    )
+                    musescore_source = musescore_scratch
+                except Exception as exc:  # noqa: BLE001 - crediting is best-effort
+                    log.debug(
+                        "notation: MuseScore re-credit skipped for %s: %s",
+                        source,
+                        exc,
+                    )
+                    if musescore_scratch is not None:
+                        musescore_scratch.unlink(missing_ok=True)
+                    musescore_scratch = None
+                    musescore_source = source
             result = _convert_with_musescore(
                 db,
                 entry_id=entry_id,
-                source_path=source,
+                source_path=musescore_source,
                 fmt=fmt,
                 output_path=output_path,
                 source_ref=source_ref,
@@ -1280,6 +1900,8 @@ def _engrave(
     finally:
         if scratch is not None:
             scratch.unlink(missing_ok=True)
+        if musescore_scratch is not None:
+            musescore_scratch.unlink(missing_ok=True)
 
 
 def _convert_to_pdf(db: LibraryDB, **kwargs: Any) -> dict[str, Any]:
@@ -1291,6 +1913,37 @@ def _convert_to_svg(db: LibraryDB, **kwargs: Any) -> dict[str, Any]:
     """Engrave an SVG (page 1; MuseScore writes ``<stem>-N.svg`` per page,
     OSMD the same): OSMD first, MuseScore second (see :func:`_engrave`)."""
     return _engrave(db, fmt="svg", **kwargs)
+
+
+def _with_part_scope_suffix(
+    title: str, extra_metadata: Optional[dict[str, Any]]
+) -> str:
+    """Append `` · <part name>`` to ``title`` when ``extra_metadata["parts"]``
+    (set by :func:`convert_score`'s part-scoped branch from
+    :attr:`StagedParts.parts`) names exactly one part.
+
+    ``_chart_title`` resolves a chart's title from the entry's own identity
+    (an override, or a confident "Artist - Song" split) rather than from the
+    raw ``title`` string a part-scoped export bakes the suffix into
+    (:func:`stage_parts`) -- so that suffix has to be re-applied here, after
+    the identity resolution, to whatever title identity produced. Mirrors
+    :func:`stage_parts`'s own suffix exactly (`` · <name>``, same separator).
+
+    Idempotent: when identity has no confident split (or no entry), its
+    fallback IS the raw ``title`` -- which, for a part-scoped export, is
+    :func:`stage_parts`'s OWN already-suffixed ``StagedParts.title``. Without
+    this check that would double the suffix (``"Song · Lead · Lead"``).
+    """
+    parts = (extra_metadata or {}).get("parts") or []
+    if len(parts) != 1:
+        return title
+    part_name = str(parts[0].get("name") or "")
+    if not part_name:
+        return title
+    suffix = f" · {part_name}"
+    if title.endswith(suffix):
+        return title
+    return f"{title}{suffix}" if title else part_name
 
 
 def _convert_to_notechart(
@@ -1305,6 +1958,8 @@ def _convert_to_notechart(
     audio_duration_sec: Optional[float] = None,
     register_source: Optional[Path] = None,
     extra_metadata: Optional[dict[str, Any]] = None,
+    artist: str = "",
+    entry: Optional[Any] = None,
 ) -> dict[str, Any]:
     """Write the Unity flying-notation chart (timecode + spelled notes).
 
@@ -1312,22 +1967,34 @@ def _convert_to_notechart(
     MIDI is handed to the chart builder so every event also carries its raw
     (unquantised) onset — what the play-along judge and Beat Saber map against.
     ``register_source`` / ``extra_metadata`` come from a part-scoped export
-    (the chart was built from a staged file; the artifact records the sheet).
+    (the chart was built from a staged file; the artifact records the sheet) --
+    ``register_source`` names the real, un-staged source so the chart's
+    ``source.sourcePath`` never carries a ``__parts_..._src.musicxml``
+    scratch filename, and ``extra_metadata["parts"]`` restores the single-part
+    `` · <name>`` title suffix (see :func:`_with_part_scope_suffix`).
+    ``artist`` and ``entry`` are what :func:`convert_score` already resolved
+    once (``entry`` via ``db.get_entry(entry_id)``, ``artist`` via
+    :func:`_chart_artist`); this never re-reads the row.
     """
     try:
         from .exporters.notechart import write_notechart
 
         raw_midi_path, raw_midi_artifact_id = raw_midi_for(db, source_ref)
+        chart_title = _with_part_scope_suffix(
+            _chart_title(entry, title), extra_metadata
+        )
         result = write_notechart(
             source_path,
             output_path,
-            title=clean_title(title),
-            artist=artist_name(),
+            title=chart_title,
+            artist=artist,
             entry_id=entry_id,
             audio_duration_sec=audio_duration_sec,
             source_artifact_id=source_ref or "",
+            source_rel_path=(register_source or source_path).name,
             raw_midi_path=raw_midi_path,
             raw_midi_artifact_id=raw_midi_artifact_id,
+            audio=_chart_audio_block(entry),
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("notation: notechart export failed for %s: %s", source_path, exc)
@@ -1382,6 +2049,8 @@ def _convert_to_beatsaber(
     audio_path: Optional[Path] = None,
     audio_duration_sec: Optional[float] = None,
     analysis_bpm: Optional[float] = None,
+    artist: str = "",
+    entry: Optional[Any] = None,
 ) -> dict[str, Any]:
     """Write a Beat Saber custom level (zip) from a MIDI/MusicXML source.
 
@@ -1390,6 +2059,15 @@ def _convert_to_beatsaber(
     handed to :func:`.exporters.beatsaber.write_beatsaber`. Info.dat carries ONE
     constant BPM: the analysis BPM by default (``bpm_source`` 'analysis') so the
     in-game grid matches the recording, else the chart's first tempo.
+    ``artist`` and ``entry`` are what :func:`convert_score` already resolved
+    once (``entry`` via ``db.get_entry(entry_id)``, ``artist`` via
+    :func:`_chart_artist`); this never re-reads the row. ``options["parts"]``
+    is beatsaber's own part filter (it is not part of
+    :data:`_PART_SCOPED_FORMATS`, so it never goes through
+    :func:`stage_parts`); a single filtered part's name -- read from the
+    unfiltered chart's own ``parts`` list, built before filtering -- is
+    appended to the title the same way :func:`_with_part_scope_suffix` does
+    for a notechart.
     """
     opts = dict(options or {})
     try:
@@ -1397,16 +2075,18 @@ def _convert_to_beatsaber(
         from .exporters.notechart import build_notechart
 
         raw_midi_path, raw_midi_artifact_id = raw_midi_for(db, source_ref)
-        clean = clean_title(title)
+        chart_artist = artist
+        clean = _chart_title(entry, title)
         chart = build_notechart(
             source_path,
             title=clean,
-            artist=artist_name(),
+            artist=chart_artist,
             entry_id=entry_id,
             audio_duration_sec=audio_duration_sec,
             source_artifact_id=source_ref or "",
             raw_midi_path=raw_midi_path,
             raw_midi_artifact_id=raw_midi_artifact_id,
+            audio=_chart_audio_block(entry),
         )
     except Exception as exc:  # noqa: BLE001 - report, never raise into the route
         log.warning(
@@ -1430,12 +2110,28 @@ def _convert_to_beatsaber(
     part_indices: Optional[list[int]] = None
     if isinstance(parts, list) and parts:
         part_indices = [int(p) for p in parts]
+    if part_indices and len(part_indices) == 1:
+        chart_parts = chart.get("parts") or []
+        part_name = str(
+            next(
+                (
+                    p.get("name")
+                    for p in chart_parts
+                    if p.get("index") == part_indices[0]
+                ),
+                "",
+            )
+            or ""
+        )
+        if part_name:
+            clean = f"{clean} · {part_name}" if clean else part_name
+            chart.setdefault("source", {})["title"] = clean
 
     result = write_beatsaber(
         chart,
         output_path,
         song_name=clean or "Untitled",
-        artist=artist_name(),
+        artist=chart_artist,
         bpm=bpm,
         bpm_source=bpm_source,
         difficulties=[str(d) for d in difficulties],
@@ -1489,6 +2185,7 @@ def _convert_to_abc(
     title: str = "",
     register_source: Optional[Path] = None,
     extra_metadata: Optional[dict[str, Any]] = None,
+    artist: str = "",
 ) -> dict[str, Any]:
     """Write ABC from a symbolic source using the local ABC writer.
 
@@ -1496,6 +2193,8 @@ def _convert_to_abc(
     :func:`.exporters.abc_writer.score_to_abc` because music21 has no ABC
     writer. A score with no notes raises rather than registering an empty file.
     ``register_source`` / ``extra_metadata`` come from a part-scoped export.
+    ``artist`` is the composer credit (falls back to the global
+    :func:`artist_name` when empty).
     """
     if importlib.util.find_spec("music21") is None:
         return {
@@ -1518,7 +2217,7 @@ def _convert_to_abc(
         text = score_to_abc(
             score,
             title=clean_title(title),
-            composer=artist_name(),
+            composer=artist or artist_name(),
         )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(text, encoding="utf-8")
@@ -1550,6 +2249,7 @@ def _convert_with_music21(
     source_ref: Optional[str],
     artifact_id: Optional[str],
     title: str = "",
+    artist: str = "",
 ) -> dict[str, Any]:
     try:
         import music21  # type: ignore[import]
@@ -1594,7 +2294,7 @@ def _convert_with_music21(
         # and a "Music21" composer. The composer is ALWAYS overwritten (never
         # left as music21's default); the title drops any media extension.
         clean = clean_title(title)
-        composer = artist_name()
+        composer = artist or artist_name()
         try:
             from music21.metadata import Metadata  # type: ignore[import]
 
@@ -1614,12 +2314,13 @@ def _convert_with_music21(
         except Exception as exc:  # noqa: BLE001 - titling is best-effort
             log.debug("notation: could not set title on %s: %s", output_path, exc)
         engrave_tempo_marks(score)
-        written = score.write(fmt, fp=str(output_path))
+        final_path = _write_musicxml(
+            score, output_path, what=f"{fmt} export of {source_path.name}"
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning("notation: %s export failed for %s: %s", fmt, source_path, exc)
         return {"ok": False, "engine": "music21", "error": repr(exc)}
 
-    final_path = Path(written) if written else output_path
     return _register_conversion(
         db,
         entry_id=entry_id,
@@ -1886,9 +2587,11 @@ def midi_to_arrangement(
 
     # Credit the artist as composer on the arrangement too, and re-stamp a
     # cleaned title (the arranger sets it from the song name, which may carry a
-    # media extension).
+    # media extension). Resolved via the entry's own identity split, same as
+    # every other export (:func:`_chart_artist`), not the bare global name.
+    entry = db.get_entry(entry_id) if entry_id else None
     clean = clean_title(title)
-    composer = artist_name()
+    composer = _chart_artist(entry)
     try:
         from music21.metadata import Metadata  # type: ignore[import]
 
@@ -1905,15 +2608,15 @@ def midi_to_arrangement(
     except Exception as exc:  # noqa: BLE001 - crediting is best-effort
         log.debug("notation: could not set composer on arrangement: %s", exc)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         engrave_tempo_marks(result["score"])
-        written = result["score"].write("musicxml", fp=str(output_path))
+        final_path = _write_musicxml(
+            result["score"], output_path, what=f"{style} arrangement export"
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning("notation: arrangement write failed for %s: %s", output_path, exc)
         return {"ok": False, "engine": "music21-arrange", "error": repr(exc)}
 
-    final_path = Path(written) if written else output_path
     art_id = artifact_id or f"{entry_id}__{output_path.stem}__{style}__musicxml"
     db.add_notation_artifact(
         artifact_id=art_id,

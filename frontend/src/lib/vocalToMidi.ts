@@ -190,14 +190,6 @@ const notePermissionGranted = (): void => {
     });
 };
 
-/** Available microphone inputs. Labels are blank until mic permission is granted
- * once, so call this after a successful capture (or permission prompt). */
-export const listAudioInputs = async (): Promise<MediaDeviceInfo[]> => {
-  if (!navigator.mediaDevices?.enumerateDevices) return [];
-  const all = await navigator.mediaDevices.enumerateDevices();
-  return all.filter((d) => d.kind === 'audioinput');
-};
-
 export interface InputMonitor {
   stream: MediaStream;
   /** Current mic RMS level, 0..1. */

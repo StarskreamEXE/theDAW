@@ -18,7 +18,11 @@ const fullCaps: NotationCapabilities = {
   ffmpeg: true,
   engravers: { pdf: ['osmd', 'musescore'], svg: ['osmd', 'musescore'] },
   musescore_download_url: 'https://musescore.org/download',
-  formats: ['midi', 'musicxml', 'abc', 'json', 'alphatex', 'notechart', 'beatsaber', 'chordtrack', 'pdf', 'svg'],
+  // The real list capabilities() returns (backend/modules/notation/engine.py):
+  // "midi" / "json" / "alphatex" are artifact kinds, never /export targets,
+  // and "chordtrack" is its own caps["chords"] flag, not a formats entry --
+  // none of the three was ever a real POST /export target.
+  formats: ['musicxml', 'abc', 'notechart', 'beatsaber', 'pdf', 'svg'],
 };
 
 /** Neither engraver: no node, no MuseScore — pdf and svg are not listed. */

@@ -17,7 +17,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel
 
@@ -41,6 +41,15 @@ from backend.modules.vst.host import (
     list_builtin_effects,
 )
 from backend.modules.vst.live_host import HostLocator, _os_reason
+from backend.modules.vst import path_policy
+from backend.modules.vst.path_policy import (
+    PluginPathError,
+    check_plugin_path,
+    root_contains,
+)
+from backend.modules.genaiproxy.access import _caller_is_loopback
+from backend.lib.cross_site import refuse_cross_site, require_loopback_or_launch_token
+from backend.lib.known_paths import is_remote_or_device_path
 from backend.lib import paths
 from backend.lib.launch_token import child_env
 
@@ -48,7 +57,7 @@ log = logging.getLogger(__name__)
 
 #: Render subprocesses are headless: no console window may flash on Windows.
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(refuse_cross_site)])
 
 # Per-plugin captured editor state (from the native-GUI sidecar) lands here.
 _PRESET_DIR = paths.data_path("vst_presets")
@@ -58,7 +67,123 @@ _PRESET_DIR = paths.data_path("vst_presets")
 _editor_procs: dict[str, subprocess.Popen] = {}
 
 
+# Only the desktop shell's own loopback socket ever needs a live VST host: the
+# native process it spawns binds a loopback-only WebSocket (live_host.py), so
+# a LAN caller could never reach the session it asked for, only spend a slot
+# and an OS process on a plugin it can never talk to. In dev/desktop, the
+# browser never talks to this server directly — it goes through the Vite
+# proxy (frontend/vite.config.ts, electron-ui/electron.vite.config.ts), which
+# runs ON THIS MACHINE and therefore always arrives here as a loopback peer
+# itself, regardless of where the original browser request came from. The
+# proxy's ``xfwd: true`` stamps X-Forwarded-For with the real caller's
+# address, and uvicorn's ``ProxyHeadersMiddleware`` reads it back and rewrites
+# ``request.client``. ``proxy_headers`` defaults to True; ``backend/run.py``
+# pins ``forwarded_allow_ips="127.0.0.1"`` explicitly (T02) rather than
+# leaning on that argument's own default, which reads the
+# ``FORWARDED_ALLOW_IPS`` environment variable (falling back to the literal
+# ``"127.0.0.1"`` only when it is unset — verified against the installed
+# uvicorn's own source, ``uvicorn/config.py``) and so could be widened by
+# whatever sets that variable on the machine or spawns this process.
+def _require_loopback(request: Request) -> None:
+    """403 for a caller whose TCP peer is not this machine (LAN2).
+
+    Delegates to ``genaiproxy.access._caller_is_loopback`` — the same check
+    ``backend.lib.cross_site.require_loopback_or_launch_token`` uses — rather
+    than re-deriving loopback-ness from ``request.client`` here. 403, not
+    409: every other identity refusal in the repo is 403
+    (``backend/lib/cross_site.py``), and this route bars a caller from a slot
+    the way those do, not a resource conflict a 409 would imply.
+    """
+    if not _caller_is_loopback(request):
+        raise HTTPException(
+            status_code=403, detail="Live VST sessions are loopback-only."
+        )
+
+
+def _validated_plugin_path(raw: str) -> Path:
+    """A browser-supplied ``plugin_path``, policed by ``path_policy`` (R5-2).
+
+    Validates shape (a real ``.vst3`` path, no UNC/network path) and
+    containment inside ``path_policy.allowed_roots()`` — the same directories
+    the scanner offers in the UI. Deliberately does not check existence:
+    ``path_policy.check_plugin_path`` never touches the filesystem beyond
+    ``resolve()``, so callers that want a specific "not found" message do
+    that check themselves, afterward, using the returned path.
+    """
+    try:
+        return check_plugin_path(raw)
+    except PluginPathError as e:
+        raise HTTPException(status_code=e.status, detail=e.message)
+
+
+def _validated_scan_directory(raw: str) -> Path:
+    """A browser-supplied scan directory, policed the same way a plugin path
+    is (R5-2's containment half only — a directory has no ``.vst3`` suffix to
+    require)."""
+    raw = str(raw or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="path is required")
+    if is_remote_or_device_path(raw):
+        raise HTTPException(
+            status_code=400, detail="Network or device paths are not allowed."
+        )
+    try:
+        resolved = Path(raw).resolve(strict=False)
+    except (OSError, ValueError):
+        raise HTTPException(status_code=400, detail="path could not be resolved.")
+    roots = path_policy.allowed_roots()
+    if not any(root_contains(root, resolved) for root in roots):
+        if not roots:
+            # "not inside any of the 0 allowed VST3 directories" tells the
+            # user nothing they can act on — this is the one case where NO
+            # path could ever pass, because none of this platform's standard
+            # VST3 directories exists on this machine yet (a fresh install,
+            # or a machine with no plugins).
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "No standard VST3 directory exists on this machine yet — "
+                    "install a VST3 plugin in one of this platform's standard "
+                    "locations first. This endpoint cannot scan a directory "
+                    "outside them."
+                ),
+            )
+        count = len(roots)
+        noun = "directory" if count == 1 else "directories"
+        raise HTTPException(
+            status_code=403,
+            detail=f"path is not inside any of the {count} allowed VST3 {noun}.",
+        )
+    return resolved
+
+
+def _canonical_plugin_key(raw: str) -> str:
+    """The one normalisation every editor route (open, rect, size, result,
+    alive) must agree on before hashing a plugin path into its session key.
+
+    ``/open-editor`` validates and resolves ``plugin_path`` through
+    ``_validated_plugin_path`` once, when the sidecar is spawned. Every other
+    editor route is a poll or a follow-up against a session that call already
+    started — a forward-slash, different-case, or junction/symlink form of
+    the SAME path the browser happens to send this time must still hash to
+    the session ``/open-editor`` created, or the state capture, embed move,
+    and close paths all silently miss it (the failure this function fixes).
+    Unlike ``_validated_plugin_path`` this never raises and never enforces
+    containment: a read/update route must not 403 or "not found" a caller
+    over policy — it must find the session the validated route already
+    started, using the exact same key, or correctly report none exists.
+    """
+    raw = str(raw or "").strip()
+    if not raw:
+        return raw
+    try:
+        return str(Path(raw).resolve(strict=False))
+    except (OSError, ValueError):
+        return raw
+
+
 def _preset_path(plugin_path: str) -> Path:
+    plugin_path = _canonical_plugin_key(plugin_path)
     h = hashlib.sha1(plugin_path.encode("utf-8")).hexdigest()[:16]
     stem = Path(plugin_path).stem
     safe = "".join(c for c in stem if c.isalnum() or c in "-_") or "plugin"
@@ -109,6 +234,7 @@ def _editor_alive(plugin_path: str) -> bool:
     the pid file covers the case where the server restarted underneath a live
     editor, so a running editor is never declared dead.
     """
+    plugin_path = _canonical_plugin_key(plugin_path)
     proc = _editor_procs.get(plugin_path)
     if proc is not None:
         return proc.poll() is None
@@ -172,7 +298,10 @@ class EditorRectRequest(BaseModel):
 
 @router.get("/scan", response_model=ScanResponse)
 def scan_vst3(
-    refresh: bool = False, enrich: bool = True, include_unloadable: bool = False
+    request: Request,
+    refresh: bool = False,
+    enrich: bool = True,
+    include_unloadable: bool = False,
 ):
     """Scan standard VST3 directories.
 
@@ -180,7 +309,32 @@ def scan_vst3(
     roots; ``refresh=true`` forces a fresh walk and gives previously failed
     plugins another chance. Plugins this host cannot load are withheld unless
     ``include_unloadable`` asks for them, so the UI never offers a dead tile.
+
+    Gated: this is what hands a LAN caller the absolute plugin paths that
+    make finding a ``/load``/``/process``/``/process-file`` LAN reachability
+    gap exploitable in the first place -- enumerating installed plugins is
+    itself information this machine's filesystem layout should not leak.
+
+    This route IS reachable from the LAN, not just from this machine's own
+    UI: ``frontend/vite.config.ts`` and ``electron-ui/electron.vite.config.ts``
+    both bind their dev server to ``host: '0.0.0.0'`` with ``xfwd: true``, so
+    a LAN browser that loads ``http://<this-machine's-lan-ip>:5173/`` gets
+    the full desktop SPA, and ``backend/server.py`` also mounts
+    ``frontend/dist`` at ``/`` when it exists, serving the same UI over the
+    LAN once built. Either way the MIX tab's own ``/api/vst/scan`` call then
+    arrives here as a genuine LAN peer -- uvicorn's ``forwarded_allow_ips``
+    is pinned to ``127.0.0.1`` in ``backend/run.py``, so ``request.client``
+    is rewritten from ``X-Forwarded-For`` only for a proxy connecting from
+    loopback, and this gate then 403s it like any other LAN caller. That is
+    the point of this gate, not a theoretical case: without it, a LAN
+    browser that loaded the desktop UI could scan for installed plugins.
+    The failure is visible to the user of that LAN session --
+    ``frontend/src/state/vstStore.ts`` writes ``VST SCAN FAILED: <msg>`` to
+    the status bar -- and MIX over LAN could not have worked regardless,
+    since ``/load``, ``/process-file`` and ``/open-editor`` are gated the
+    same way.
     """
+    require_loopback_or_launch_token(request)
     plugins: list[Vst3PluginInfo] | None = None
     if not refresh:
         plugins = load_cached_scan()
@@ -198,17 +352,54 @@ def scan_vst3(
 
 
 @router.get("/scan/{path:path}", response_model=ScanResponse)
-def scan_vst3_custom(path: str, include_unloadable: bool = False):
-    """Scan a custom directory for VST3 plugins (always live, never cached)."""
-    plugins = scan_vst3_directories(extra_paths=[path])
+def scan_vst3_custom(path: str, request: Request, include_unloadable: bool = False):
+    """Scan one directory for VST3 plugins (always live, never cached).
+
+    NOT a general "browse anywhere on disk" scan, despite the name and this
+    route's original docstring: R5-2 requires ``path`` to already resolve
+    inside one of ``path_policy.allowed_roots()`` — the same standard,
+    per-platform VST3 directories ``/load``, ``/process-file``,
+    ``/open-editor`` and ``/live/session`` require a plugin path to resolve
+    inside. Scanning a directory outside them would only ever list plugins
+    every one of those routes then refuses to load — a 403 the UI has no way
+    to explain, since it already believed the scan — which is worse than this
+    endpoint simply refusing that directory up front.
+
+    There is currently no way for a user to ADD a non-standard directory to
+    the allowed set: that would mean giving ``path_policy.allowed_roots()`` a
+    user-configured-roots source that ``scanner._default_vst3_dirs()`` also
+    reads, which is real, standalone feature work (a persisted, user-editable
+    location list, its own settings UI, migration for whoever already has
+    plugins outside the standard roots) — out of scope for this fix, and
+    deliberately not bolted on here. Nothing in the app calls this route
+    today (T03 batch-12 audit, grepped the whole frontend); it is left
+    working for the one case still consistent with the rule above — browsing
+    a SUBDIRECTORY of a standard root, e.g. one vendor folder inside
+    ``...\\Common Files\\VST3\\`` — which ``/scan`` (no ``path``) does not
+    offer on its own since it always walks every standard root at once.
+
+    Gated for the same reason ``/scan`` is: it hands back absolute plugin
+    paths.
+    """
+    require_loopback_or_launch_token(request)
+    resolved = _validated_scan_directory(path)
+    plugins = scan_vst3_directories(extra_paths=[str(resolved)])
     return ScanResponse(plugins=_plugin_dicts(plugins, include_unloadable))
 
 
 @router.post("/load")
-def load_vst(req: LoadRequest):
-    """Load a VST3 plugin and return its parameter descriptors."""
+def load_vst(req: LoadRequest, request: Request):
+    """Load a VST3 plugin and return its parameter descriptors.
+
+    Gated: this initializes a third-party native DLL inside the server
+    process and leaks an instance into ``_instances`` with no cap -- a LAN
+    caller looping this with a fresh ``instance_id`` each time must not be
+    able to.
+    """
+    require_loopback_or_launch_token(request)
+    resolved = _validated_plugin_path(req.plugin_path)
     try:
-        inst = load_plugin(req.plugin_path, req.instance_id)
+        inst = load_plugin(str(resolved), req.instance_id)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -222,25 +413,74 @@ def load_vst(req: LoadRequest):
 
 
 @router.get("/plugins")
-def get_loaded_plugins():
-    """List all currently loaded plugin instances."""
+def get_loaded_plugins(request: Request):
+    """List all currently loaded plugin instances.
+
+    Gated: this hands back absolute plugin paths (the same leak ``/scan``'s
+    docstring already flags) and the live ``instance_id``s that a LAN caller
+    would need to target ``/param/{instance_id}`` or ``/unload/{instance_id}``.
+    """
+    require_loopback_or_launch_token(request)
     return list_instances()
 
 
 @router.post("/process")
-def process_audio(req: ProcessRequest):
+def process_audio(req: ProcessRequest, request: Request):
     """Run an audio file through an ordered chain of loaded VST instances.
 
     Reads the file at its native sample rate, processes it through the
     instances named in ``instance_ids`` (in order), and writes a WAV to
     ``output_path`` (or a temp file) at the source's own bit depth. Returns
     the output path.
+
+    Gated: this runs plugin code against an arbitrary instance chain.
+    ``audio_path`` (arbitrary read) and ``output_path`` (arbitrary write) are
+    also policed the same way every other path-taking route in this repo
+    refuses a network/device path -- checked against BOTH the raw text and
+    the ``resolve()``d path (``known_paths.is_remote_or_device_path`` -- the
+    same check ``_validated_scan_directory`` and
+    ``backend/modules/storage/router.py`` use). The raw-text check alone is
+    not enough: an NT object-manager prefix like ``\\??\\UNC\\host\\share\\x``
+    has only ONE leading backslash, so the raw-text regex misses it, but
+    Windows honours the prefix and ``Path.resolve()`` normalises it to
+    ``\\\\host\\share\\x``, which the same check then catches.
     """
+    require_loopback_or_launch_token(request)
     import soundfile as sf
 
     from backend.lib.audio_depth import write_like_source
 
-    src = Path(req.audio_path)
+    def _reject_remote_or_device(raw: str) -> Path:
+        """The resolved ``Path`` for ``raw``, after rejecting it (400) as a
+        network/device path by BOTH its raw text and its resolved form.
+
+        ``resolve(strict=False)`` can itself raise ``OSError`` for an
+        object-manager path naming a device that does not exist on this
+        machine (e.g. an out-of-range ``HarddiskVolumeN``) -- that is a
+        malformed/inapplicable path, not a server error, so it is rejected
+        the same way.
+        """
+        if is_remote_or_device_path(raw):
+            raise HTTPException(
+                status_code=400, detail="Network or device paths are not allowed."
+            )
+        try:
+            resolved = Path(raw).resolve(strict=False)
+        except (OSError, ValueError):
+            raise HTTPException(
+                status_code=400, detail="Network or device paths are not allowed."
+            )
+        if is_remote_or_device_path(str(resolved)):
+            raise HTTPException(
+                status_code=400, detail="Network or device paths are not allowed."
+            )
+        return resolved
+
+    src = _reject_remote_or_device(req.audio_path)
+    resolved_output_path = None
+    if req.output_path:
+        resolved_output_path = _reject_remote_or_device(req.output_path)
+
     if not src.is_file():
         raise HTTPException(
             status_code=404, detail=f"Audio file not found: {req.audio_path}"
@@ -259,7 +499,7 @@ def process_audio(req: ProcessRequest):
         raise HTTPException(status_code=500, detail=f"VST processing failed: {e}")
 
     created_temp = False
-    out_path = req.output_path
+    out_path = str(resolved_output_path) if resolved_output_path else req.output_path
     if out_path:
         out = Path(out_path)
         if out.is_dir():
@@ -560,6 +800,7 @@ def _render_with_thedaw_host(
 
 @router.post("/process-file")
 async def process_file(
+    request: Request,
     audio: UploadFile = File(...),
     plugin_path: str = Form(...),
     params: str = Form("{}"),
@@ -573,14 +814,18 @@ async def process_file(
     MIX effect chain: the frontend uploads the running audio plus the plugin
     path and receives processed WAV back. The plugin is loaded fresh and
     discarded (never added to the instance registry).
+
+    Gated: this loads and runs a plugin, same as ``/load`` and ``/process``.
     """
+    require_loopback_or_launch_token(request)
     import soundfile as sf
 
-    path = Path(plugin_path)
-    if not path.exists():
+    resolved = _validated_plugin_path(plugin_path)
+    if not resolved.exists():
         raise HTTPException(
             status_code=404, detail=f"VST3 plugin not found: {plugin_path}"
         )
+    plugin_path = str(resolved)
 
     mode = (state_host or "").strip().lower() or "pedalboard"
     if mode not in ("pedalboard", "thedaw"):
@@ -723,7 +968,7 @@ async def process_file(
 
 
 @router.post("/open-editor")
-def open_editor(req: EditorRequest):
+def open_editor(req: EditorRequest, request: Request):
     """Open a VST3 plugin's native GUI in a sidecar process.
 
     pedalboard's ``show_editor()`` blocks its thread and must run on a process
@@ -731,22 +976,35 @@ def open_editor(req: EditorRequest):
     the plugin's full state to a per-plugin JSON file; poll ``/editor-result`` to
     read it back and store it on the chain node, so the dialed-in sound is reused
     at process time.
+
+    A LAN caller must not be able to pop a native plugin GUI open on this
+    machine's desktop — ``require_loopback_or_launch_token``, not the local
+    ``_require_loopback``, because the desktop shell (not only this machine's
+    browser tab) legitimately opens editors too.
     """
-    path = Path(req.plugin_path)
-    if not path.exists():
+    require_loopback_or_launch_token(request)
+    resolved = _validated_plugin_path(req.plugin_path)
+    if not resolved.exists():
         raise HTTPException(
             status_code=404, detail=f"VST3 plugin not found: {req.plugin_path}"
         )
+    # Every other editor route (rect/size/result/alive) hashes its own
+    # plugin_path through this same helper — going through it here too, on
+    # top of the already-resolved path, is what makes all five routes
+    # provably agree on one key rather than merely computing the same thing
+    # twice by coincidence.
+    plugin_path = _canonical_plugin_key(str(resolved))
+    path = resolved
     _PRESET_DIR.mkdir(parents=True, exist_ok=True)
-    out = _preset_path(req.plugin_path)
+    out = _preset_path(plugin_path)
     # Clear any prior result so the poller tracks THIS session, not a stale one.
     out.write_text(
-        json.dumps({"status": "launching", "plugin_path": req.plugin_path}),
+        json.dumps({"status": "launching", "plugin_path": plugin_path}),
         encoding="utf-8",
     )
     # The published editor size belongs to the session too: leaving the old one
     # in place would size this session's scroll area to the last plugin's window.
-    for stale in (_size_path(req.plugin_path), _pid_path(req.plugin_path)):
+    for stale in (_size_path(plugin_path), _pid_path(plugin_path)):
         stale.unlink(missing_ok=True)
 
     preset_in: Path | None = None
@@ -771,7 +1029,7 @@ def open_editor(req: EditorRequest):
 
     # Embedding: seed the rect file with the initial geometry and hand the sidecar
     # the parent HWND + rect file so its watcher reparents the editor in-window.
-    rect_file = _rect_path(req.plugin_path)
+    rect_file = _rect_path(plugin_path)
     if req.parent_hwnd:
         r = req.rect or {}
         rect_file.write_text(
@@ -815,10 +1073,10 @@ def open_editor(req: EditorRequest):
     finally:
         if log_fh:
             log_fh.close()
-    _editor_procs[req.plugin_path] = proc
+    _editor_procs[plugin_path] = proc
     # Also on disk, so an editor that outlives a server restart is still
     # recognized as running rather than reported dead.
-    _pid_path(req.plugin_path).write_text(str(proc.pid), encoding="utf-8")
+    _pid_path(plugin_path).write_text(str(proc.pid), encoding="utf-8")
     # No directory, no extension: the app only ever polls /editor-result with
     # the plugin_path it already has, so this key never needs to round-trip
     # back to the client. Returning the real on-disk path here would leak the
@@ -827,14 +1085,25 @@ def open_editor(req: EditorRequest):
 
 
 @router.post("/editor-rect")
-def editor_rect(req: EditorRectRequest):
+def editor_rect(req: EditorRectRequest, request: Request):
     """Push a live embed-rect update (or a close request) for an open editor.
 
     The frontend calls this as the MIX embed area moves/resizes, or with
     close=true to dismiss the embedded editor. The sidecar's watcher polls this
     file and re-positions (or WM_CLOSEs) the reparented window.
+
+    Gated unconditionally, not just the close=true branch: the non-close
+    branch writes the same rect file ``win_embed.py`` reads to ``SetWindowPos``
+    and clip the embedded window's region, so a LAN caller could otherwise
+    shove an open editor offscreen (or to a 1x1 clip) repeatedly without ever
+    sending close=true. A plain viewport move/resize still only repositions a
+    window that is already open, on a session the caller must already know
+    the (session-scoped) plugin_path for -- but that is not a reason to leave
+    it reachable from the LAN.
     """
-    rect_file = _rect_path(req.plugin_path)
+    require_loopback_or_launch_token(request)
+    plugin_path = _canonical_plugin_key(req.plugin_path)
+    rect_file = _rect_path(plugin_path)
     if not rect_file.parent.exists():
         rect_file.parent.mkdir(parents=True, exist_ok=True)
     rect_file.write_text(
@@ -856,10 +1125,16 @@ def editor_rect(req: EditorRectRequest):
 
 
 @router.get("/editor-size")
-def editor_size(plugin_path: str):
+def editor_size(plugin_path: str, request: Request):
     """Natural (physical px) size of the embedded editor window, published by the
     sidecar watcher so the frontend can size its scroll area. ``{status:'none'}``
-    until it is known."""
+    until it is known.
+
+    Gated: a LAN caller who guesses a plugin path can otherwise poll another
+    session's editor state.
+    """
+    require_loopback_or_launch_token(request)
+    plugin_path = _canonical_plugin_key(plugin_path)
     size_file = _size_path(plugin_path)
     if not size_file.is_file():
         return {"status": "none"}
@@ -871,7 +1146,7 @@ def editor_size(plugin_path: str):
 
 
 @router.get("/editor-result")
-def editor_result(plugin_path: str):
+def editor_result(plugin_path: str, request: Request):
     """Read the latest captured state from a plugin's editor session.
 
     Returns ``{"status": "none"|"launching"|"opening"|"ok"|"error", ...}``. When
@@ -879,7 +1154,15 @@ def editor_result(plugin_path: str):
     sidecar that died before writing its result is reported as an error here,
     because the in-progress statuses are otherwise terminal and the frontend
     would poll them forever.
+
+    Gated: on success this returns the session's captured base64
+    ``raw_state``, and this route also writes a file, unlinks the pid file,
+    and pops ``_editor_procs`` -- a LAN caller who guesses a plugin path must
+    not be able to read that state back or force a live session's tracking
+    entry into an error.
     """
+    require_loopback_or_launch_token(request)
+    plugin_path = _canonical_plugin_key(plugin_path)
     out = _preset_path(plugin_path)
     if not out.is_file():
         return {"status": "none"}
@@ -955,8 +1238,13 @@ def _editor_failure_detail(preset_out: Path) -> str:
 
 
 @router.get("/param/{instance_id}")
-def get_params(instance_id: str):
-    """Read all current parameter values on a loaded plugin."""
+def get_params(instance_id: str, request: Request):
+    """Read all current parameter values on a loaded plugin.
+
+    Gated: matches the write half of this pair (``PUT /param``) -- a LAN
+    caller must not be able to read a loaded plugin's live parameter state.
+    """
+    require_loopback_or_launch_token(request)
     try:
         inst = get_instance(instance_id)
     except KeyError as e:
@@ -965,8 +1253,13 @@ def get_params(instance_id: str):
 
 
 @router.put("/param/{instance_id}")
-def set_param(instance_id: str, req: SetParamRequest):
-    """Set a single parameter value on a loaded plugin."""
+def set_param(instance_id: str, req: SetParamRequest, request: Request):
+    """Set a single parameter value on a loaded plugin.
+
+    Gated: this mutates a loaded plugin's live parameter state; a LAN caller
+    must not be able to change what the user's own mix is doing.
+    """
+    require_loopback_or_launch_token(request)
     try:
         inst = get_instance(instance_id)
     except KeyError as e:
@@ -991,8 +1284,14 @@ def set_param(instance_id: str, req: SetParamRequest):
 
 
 @router.delete("/unload/{instance_id}")
-def unload_vst(instance_id: str):
-    """Unload a plugin instance."""
+def unload_vst(instance_id: str, request: Request):
+    """Unload a plugin instance.
+
+    Gated: this destroys server-side state; a LAN caller must not be able to
+    unload instances out from under the session the desktop UI still
+    believes exist.
+    """
+    require_loopback_or_launch_token(request)
     try:
         unload_plugin(instance_id)
     except KeyError as e:
@@ -1109,14 +1408,25 @@ class LiveHostInfo(BaseModel):
 
 
 @router.get("/live/host", response_model=LiveHostInfo)
-def live_host_status():
-    """Whether the native host is built, and if not, why live VST is off."""
+def live_host_status(request: Request):
+    """Whether the native host is built, and if not, why live VST is off.
+
+    Gated the same way every other ``/live/*`` route is (``_require_loopback``):
+    ``LiveHostInfo.path`` is the absolute path of the native host binary, and
+    this route otherwise has no caller-supplied input to police -- gating the
+    whole route is simpler than special-casing one field of the response for
+    a non-loopback caller, and matches ``/live/sessions``,
+    ``/live/session/{id}`` and the DELETE variant, which are all
+    loopback-only already.
+    """
+    _require_loopback(request)
     return live_host.get_manager().host_info()
 
 
 @router.post("/live/session", response_model=LiveSessionCreated)
-def create_live_session(req: LiveSessionRequest):
+def create_live_session(req: LiveSessionRequest, request: Request):
     """Start a host for a chain entry, or return the one it already has."""
+    _require_loopback(request)
     try:
         session = live_host.get_manager().create(
             chain_entry_id=req.chain_entry_id,
@@ -1138,16 +1448,18 @@ def create_live_session(req: LiveSessionRequest):
 
 
 @router.get("/live/sessions", response_model=LiveSessionList)
-def list_live_sessions():
+def list_live_sessions(request: Request):
     """Every tracked session, including ones that died recently."""
+    _require_loopback(request)
     manager = live_host.get_manager()
     manager.reap()
     return {"sessions": [s.to_dict() for s in manager.list()]}
 
 
 @router.get("/live/session/{session_id}", response_model=LiveSessionInfo)
-def get_live_session(session_id: str):
+def get_live_session(session_id: str, request: Request):
     """One session's state, with the tail of its host log."""
+    _require_loopback(request)
     manager = live_host.get_manager()
     manager.reap()
     try:
@@ -1157,8 +1469,9 @@ def get_live_session(session_id: str):
 
 
 @router.delete("/live/session/{session_id}", response_model=LiveSessionClosed)
-def delete_live_session(session_id: str):
+def delete_live_session(session_id: str, request: Request):
     """Shut a host down and return the plugin state it saved on the way out."""
+    _require_loopback(request)
     try:
         return live_host.get_manager().delete(session_id)
     except LiveHostError as e:

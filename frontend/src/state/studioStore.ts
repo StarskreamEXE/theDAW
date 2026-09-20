@@ -4,7 +4,14 @@ import { logError, logInfo } from './logStore';
 import { uuid } from '../orb-kit/utils';
 import { useLibraryStore } from './libraryStore';
 import { usePlayerStore } from './playerStore';
-import { useEffectChainStore, EFFECT_LABELS, MIX_RACK_IDS, vstStateHost, type VstStateHost } from './effectChainStore';
+import {
+  useEffectChainStore,
+  EFFECT_LABELS,
+  MIX_RACK_IDS,
+  vstStateHost,
+  vstStatesLoaded,
+  type VstStateHost,
+} from './effectChainStore';
 import { useAdvancedEditorSourceStore } from './advancedEditorStore';
 import { getRackEffect, buildEffectChain, ensureChopModule, ensureGranularModule } from '../lib/rackEffects';
 import { encodeWav } from '../lib/wavEncode';
@@ -327,10 +334,16 @@ export const useStudioStore = create<StudioStoreState>()((set, get) => ({
       return;
     }
 
+    // Busy BEFORE the wait below, so a second click inside the (startup-only)
+    // load window cannot queue a second render of the same chain.
+    set({ isChainProcessing: true, error: null });
+    // A plugin's saved state arrives from IndexedDB a moment after startup;
+    // read the chain only once it has, never the empty value before it.
+    await vstStatesLoaded;
     const enabled = useEffectChainStore.getState().chain.filter((e) => e.enabled);
     if (enabled.length === 0) {
       const message = 'Add at least one enabled effect to the chain.';
-      set({ error: message });
+      set({ error: message, isChainProcessing: false });
       useStatusBarStore.getState().setText(`MIX FAILED: ${message}`);
       return;
     }
@@ -339,7 +352,6 @@ export const useStudioStore = create<StudioStoreState>()((set, get) => ({
     const chainLabel = enabled
       .map((e) => (e.vst ? e.vst.plugin_name : EFFECT_LABELS[e.effect] || getRackEffect(e.effect)?.label || e.effect))
       .join(' → ');
-    set({ isChainProcessing: true, error: null });
     useStatusBarStore.getState().setText(`MIX CHAIN STARTED: ${chainLabel}`);
     logInfo('studio', `Chain process: ${chainLabel} (${enabled.length} effects) format=${fmt}`);
 

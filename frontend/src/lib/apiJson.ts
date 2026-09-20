@@ -3,6 +3,7 @@
 // are relative. Errors surface the FastAPI {detail} (or {error}) field.
 
 import { describeHttpError } from './httpError';
+import { pairingHeader } from './pairing';
 
 async function handle<T>(r: Response): Promise<T> {
   if (!r.ok) {
@@ -35,36 +36,56 @@ async function describeApiError(r: Response): Promise<string> {
   return describeHttpError(r);
 }
 
+/** The pairing token is a LAN/phone secret (backend/lib/pairing.py). Every
+ *  current call site uses a relative `/api/...` URL, so it never leaves
+ *  this origin -- but attach it only when the resolved URL's origin matches
+ *  the page's own origin, so a future absolute-URL (or protocol-relative,
+ *  or slash-backslash) call site can't ship it cross-origin by accident. */
+function pairingHeaderFor(url: string): Record<string, string> {
+  try {
+    return new URL(url, window.location.href).origin === window.location.origin ? pairingHeader() : {};
+  } catch {
+    return {};
+  }
+}
+
 export async function getJson<T>(url: string): Promise<T> {
-  return handle<T>(await fetch(url));
+  return handle<T>(await fetch(url, { headers: pairingHeaderFor(url) }));
 }
 
 export async function postJson<T>(url: string, body?: unknown): Promise<T> {
   return handle<T>(
     await fetch(url, {
       method: 'POST',
-      headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+      headers: {
+        ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+        ...pairingHeaderFor(url),
+      },
       body: body === undefined ? undefined : JSON.stringify(body),
     }),
   );
 }
 
 /** POST a multipart/form-data body (file uploads). The browser sets the
- *  Content-Type + boundary, so none is passed here. */
+ *  Content-Type + boundary, so none is passed here -- only the pairing
+ *  header (backend/lib/pairing.py), which the project routes' LAN/phone
+ *  gate looks for. */
 export async function postForm<T>(url: string, form: FormData): Promise<T> {
-  return handle<T>(await fetch(url, { method: 'POST', body: form }));
+  return handle<T>(
+    await fetch(url, { method: 'POST', body: form, headers: pairingHeaderFor(url) }),
+  );
 }
 
 export async function putJson<T>(url: string, body: unknown): Promise<T> {
   return handle<T>(
     await fetch(url, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...pairingHeaderFor(url) },
       body: JSON.stringify(body),
     }),
   );
 }
 
 export async function delJson<T>(url: string): Promise<T> {
-  return handle<T>(await fetch(url, { method: 'DELETE' }));
+  return handle<T>(await fetch(url, { method: 'DELETE', headers: pairingHeaderFor(url) }));
 }

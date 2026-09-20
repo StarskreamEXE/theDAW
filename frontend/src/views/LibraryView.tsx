@@ -24,7 +24,7 @@ import { TrackInfo } from '../components/library/TrackInfo';
 import { MicRecorder } from '../components/audio/MicRecorder';
 import { Section } from '../components/ui/Section';
 import { useLibraryStore, LibraryIdCapError, type LibraryEntry } from '../state/libraryStore';
-import { LibraryBulkConflictError, fetchLibraryMatchCount } from '../lib/backendLocalProvider';
+import { describeBulkConflict, LibraryBulkConflictError, fetchLibraryMatchCount } from '../lib/backendLocalProvider';
 import { useLibraryCounts, type LibraryCountKey } from '../state/libraryCountsStore';
 import { useGenerateParamsStore } from '../state/generateParamsStore';
 import { useEditorStore, computePeaks } from '../state/editorStore';
@@ -2060,7 +2060,15 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
                   return;
                 } catch (e) {
                   if (e instanceof LibraryBulkConflictError) {
-                    counts = { nonFavorites: e.totalMatched, all: counts.all };
+                    const notice = describeBulkConflict(e.totalMatched);
+                    if (notice.total === null) {
+                      // Unknown count — nothing safe to re-confirm with, and
+                      // nothing here to overwrite `counts` with either; leave
+                      // it as it was rather than storing NaN.
+                      window.alert(notice.message);
+                      return;
+                    }
+                    counts = { nonFavorites: notice.total, all: counts.all };
                     setMaintenanceCounts(counts);
                     continue;
                   }
@@ -2490,11 +2498,13 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
                 // A 409 means the library moved: re-ask with the count it has
                 // now, so the typed number is one the server will accept.
                 if (e instanceof LibraryBulkConflictError) {
-                  setClearAllTotal(e.totalMatched);
+                  const notice = describeBulkConflict(e.totalMatched);
+                  // Unknown count (server omitted it): leave `clearAllTotal`
+                  // as it was rather than storing NaN — there is nothing
+                  // valid to re-confirm with anyway.
+                  if (notice.total !== null) setClearAllTotal(notice.total);
                   setMaintenanceCounts(null);
-                  window.alert(
-                    `The library changed while the confirmation was open — nothing was deleted. It now holds ${e.totalMatched.toLocaleString()} entries.`,
-                  );
+                  window.alert(notice.message);
                   return;
                 }
                 setClearAllTotal(null);

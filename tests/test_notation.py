@@ -89,7 +89,11 @@ def test_capabilities_reports_music21_available():
     assert "musicxml" in caps["formats"]
     # Play-along / Beat Saber targets are unconditional (pure-Python writers).
     assert "beatsaber" in caps["formats"]
-    assert "chordtrack" in caps["formats"]
+    # Chord tracks are built through their own POST /{entry_id}/chords route,
+    # never through /export, so they are advertised as caps["chords"], not
+    # as a "chordtrack" entry in caps["formats"].
+    assert "chordtrack" not in caps["formats"]
+    assert caps["chords"] is True
     assert caps["engines"]["score_to_beatsaber"] == "beatsaber"
     assert caps["engines"]["chords"] == "chordtrack"
     # song.ogg encoding depends on ffmpeg; the UI reads a plain bool.
@@ -668,7 +672,7 @@ def test_pdf_export_no_longer_needs_musescore(tmp_path: Path):
         assert result["engine"] in ("osmd", "musescore"), result
         # The staging MusicXML written for a MIDI source must be cleaned up, and
         # must never leave a DB row pointing at a deleted path.
-        assert not list(final.parent.glob("*__osmd_src.musicxml"))
+        assert not list(final.parent.glob("*__staged_src.musicxml"))
     elif musescore_binary() is None:
         assert result["ok"] is False
         assert "OSMD" in result["error"] and "MuseScore" in result["error"], result
@@ -1203,7 +1207,7 @@ def test_pack_route_packs_a_midi_source_too(
     assert any(n.endswith(".mid") for n in names), names
     if pdf_render.available()["ok"] or musescore_binary() is not None:
         assert any(n.endswith(".pdf") for n in names), names
-    assert not list((entry_dir / "notation").glob("*__osmd_src.musicxml"))
+    assert not list((entry_dir / "notation").glob("*__staged_src.musicxml"))
 
 
 def test_arrange_route_lays_a_band_score_out_at_the_analysed_tempo(

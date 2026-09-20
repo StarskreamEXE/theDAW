@@ -6,6 +6,7 @@ import { logError, logInfo } from '../state/logStore';
 import { renderNotesToBlob, type RenderNote } from './midiSynth';
 import type { PianoNote } from '../state/pianoRollStore';
 import { validTimeSignature } from './timeSignatureIO';
+import { pairingHeader } from './pairing';
 
 const DEFAULT_CLIP_SECONDS = 4;
 
@@ -71,7 +72,7 @@ const loadClipAudio = async (clip: DawClip, project: DawProject): Promise<{
   sourceTotalSteps?: number;
 }> => {
   if (clip.file_path) {
-    const response = await fetch(dawImportAudioUrl(clip.file_path));
+    const response = await fetch(dawImportAudioUrl(clip.file_path), { headers: pairingHeader() });
     if (!response.ok) throw new Error(`Could not load ${clip.name}`);
     // arrayBuffer + new Blob, never response.blob(): blob() spools through
     // disk and fails outright on a full disk for large media (fetchRetry.ts

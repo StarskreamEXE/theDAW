@@ -689,18 +689,45 @@ def _lyria_provider_status() -> dict:
         missing = status.get("missing") or []
         install = status.get("install") or {}
         installing = install.get("status") in ("cloning", "installing")
-        ok = not issues
+        # A confirmed-listening sidecar (probe()'s identity-checked
+        # "listening", INT-001) is demonstrably usable right now regardless
+        # of what the static prerequisite checks say -- e.g. a key removed
+        # from disk after the currently-running process already picked one
+        # up. Ignoring `listening` here (INT-004) made "ready" purely a
+        # function of stale-at-read-time prerequisites.
+        listening = bool(status.get("listening"))
+        # process_alive = theDAW itself holds a live handle to the listening
+        # process, i.e. WE spawned it (sidecar.owns_process()). A confirmed
+        # listener that isn't process_alive was launched outside theDAW
+        # (INT-001's "one the user launched manually"): its cost mode is
+        # whatever ITS OWN environment says, which theDAW never set and
+        # cannot see -- claiming "mock" or "live" for it would be a guess
+        # dressed up as a fact, so say so instead (item 5).
+        process_alive = bool(status.get("process_alive"))
+        external = listening and not process_alive
+        ok = listening or not issues
         mock = is_mock()
         if ok:
-            summary = (
-                "Mock mode: generations are free and synthesized locally."
-                if mock
-                else "Live mode: each generation costs $0.08 (Pro) / $0.04 (Clip)."
-            )
-            if status.get("gemini_key"):
-                summary += f" Gemini key: {status.get('gemini_key_source')}."
-            elif mock:
-                summary += " Add a Gemini key before switching to live mode."
+            if external:
+                summary = (
+                    "Running, but not started by theDAW (an external process "
+                    "already holds the port): its cost mode is unknown."
+                )
+            else:
+                summary = (
+                    "Mock mode: generations are free and synthesized locally."
+                    if mock
+                    else "Live mode: each generation costs $0.08 (Pro) / $0.04 (Clip)."
+                )
+                if status.get("gemini_key"):
+                    summary += f" Gemini key: {status.get('gemini_key_source')}."
+                elif mock:
+                    summary += " Add a Gemini key before switching to live mode."
+                else:
+                    summary += (
+                        " GEMINI_API_KEY is not set: live mode cannot generate "
+                        "without it."
+                    )
         elif installing:
             summary = f"Installing: {install.get('message')}"
         elif install.get("status") == "error":
@@ -721,7 +748,11 @@ def _lyria_provider_status() -> dict:
                 "install": install,
                 "gemini_key": bool(status.get("gemini_key")),
                 "gemini_key_source": status.get("gemini_key_source"),
-                "mock": mock,
+                # theDAW's own LYRIA_MOCK preference only describes a process
+                # WE spawned -- an external process's cost mode is unknown
+                # (item 5 / item 7), so don't report it as mock/live either.
+                "mock": None if external else mock,
+                "external": external,
                 "project_path": status.get("project_path"),
                 "repo": status.get("repo"),
                 "repo_url": status.get("repo_url"),
@@ -737,10 +768,18 @@ def _lyria_provider_status() -> dict:
                     "source": "api" if ok else "missing",
                     "recommended": ok,
                     "reason": (
-                        "mock mode (free)" if mock else "live — $0.08 per generation"
-                    )
-                    if ok
-                    else summary,
+                        (
+                            "external process (cost mode unknown)"
+                            if external
+                            else (
+                                "mock mode (free)"
+                                if mock
+                                else "live — $0.08 per generation"
+                            )
+                        )
+                        if ok
+                        else summary
+                    ),
                 }
             ],
         }

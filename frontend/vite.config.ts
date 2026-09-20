@@ -182,6 +182,21 @@ export default defineConfig(({mode}) => {
           ws: true, // proxy WebSocket upgrades too (e.g. /api/questmidi/ws)
           timeout: 0,
           proxyTimeout: 0,
+          // Stamps X-Forwarded-For/-Proto/-Port so the backend can recover the
+          // real caller's address (this proxy always connects to it from
+          // loopback itself, dev server bound on 0.0.0.0 or not). Without this
+          // every LAN caller — e.g. a phone on the network — reaches a
+          // loopback-gated route (POST /api/vst/live/session, LAN2) looking
+          // like this machine. uvicorn's ProxyHeadersMiddleware reads this
+          // header and rewrites request.client to the real caller.
+          // proxy_headers defaults to True; backend/run.py pins
+          // forwarded_allow_ips="127.0.0.1" (this proxy's own peer address)
+          // explicitly (T02), rather than leaning on that argument's own
+          // default, which reads the FORWARDED_ALLOW_IPS environment
+          // variable (falling back to the literal "127.0.0.1" only when it
+          // is unset) and so could be widened by whatever sets that variable
+          // on the machine.
+          xfwd: true,
           configure: (proxy) => {
             // Under require-corp the browser demands a Cross-Origin-Resource-
             // Policy on anything the document pulls in. The backend does not

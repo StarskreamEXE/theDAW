@@ -1745,11 +1745,11 @@ const takeShape = (clipId: string) => {
   assert.equal(after.comp?.length, 2, 'the comp survives, boundary and all');
   assert.equal(after.comp![1].startSec, 4, 'at the second the user put it');
   assert.equal(after.comp![1].takeIndex, 2, 'and its last region plays the pass that just landed');
-  // KNOWN GAP (the same one the two-track block below pins): `addTakeToClip`
-  // and `setCompRegionAt` each open an undo step, so a pass onto a COMPED clip
-  // costs two — one undo leaves the take appended and active with the comp
-  // still on the old take. The coalesce seam belongs to `editorStore` (T46H).
-  assert.equal(undoDepth(), before + 2, 'two steps for a pass onto a comped clip — see the gap above');
+  // `addTakeToClip` and `setCompRegionAt` each open an undo step of their own
+  // (T46H): `placeTakes` wraps the whole pass in `editorStore.undoGroup` so a
+  // pass onto a COMPED clip is still one undo — it takes the append and the
+  // comp retarget off together, never leaving the comp on the old take.
+  assert.equal(undoDepth(), before + 1, 'the take append and comp retarget are one undo step');
 }
 
 // A STRETCHED clip reads more source seconds than its timeline span, so a pass
@@ -1830,14 +1830,11 @@ const takeShape = (clipId: string) => {
 
 // TWO tracks, one press, both landing on clips that are already there.
 //
-// KNOWN GAP, pinned here rather than left to be discovered: `addTakeToClip`
-// opens an undo step of its own (`editorStore.ts`, the takes actions all do),
-// so a pass that appends to TWO clips leaves two steps where a pass that lands
-// two new CLIPS leaves one. Every clip is still restored — it just takes one
-// undo per appended take. The fix is one line in `editorStore.addTakeToClip`:
-// the `opts?.coalesce ? coalesceWithOpenStep(key) : beginUndoStep(key)` seam
-// `moveCompBoundary` already has, called with `coalesce` from here. That file
-// belongs to T46D, so this suite pins what the store does today.
+// `addTakeToClip` opens an undo step of its own (`editorStore.ts`, the takes
+// actions all do), so without a group a pass that appends to TWO clips would
+// leave two steps where a pass that lands two new CLIPS leaves one (T46H).
+// `placeTakes` wraps the pass in `editorStore.undoGroup`, so it is one step
+// here too — one undo restores both clips together.
 {
   const h = harness(['trk-a', 'trk-b']);
   es().updateTrack('trk-a', { armed: true });
@@ -1851,11 +1848,10 @@ const takeShape = (clipId: string) => {
   await pass(h, [fakeTake('trk-a', 4, 8), fakeTake('trk-b', 4, 8)]);
   assert.equal(es().clips.length, 2, 'the second press adds no clips');
   assert.deepEqual(es().clips.map((c) => c.takes?.length), [2, 2], 'a take on each');
-  assert.equal(undoDepth(), before + 2, 'one step per appended take — see the gap above');
+  assert.equal(undoDepth(), before + 1, 'both appended takes are one undo step');
 
   es().undo();
-  es().undo();
-  assert.deepEqual(es().clips.map((c) => c.takes), [undefined, undefined], 'and undo restores every clip');
+  assert.deepEqual(es().clips.map((c) => c.takes), [undefined, undefined], 'and one undo restores every clip');
   assert.equal(es().clips.length, 2, 'without losing the clips they were appended to');
 }
 

@@ -74,7 +74,14 @@
  *
  * `releaseDecoded(blob)` is the other half of an unbounded cache: with no budget
  * to evict them, a deleted clip's buffers are freed only when someone says the
- * clip is gone. Nothing calls it yet either.
+ * clip is gone. `state/editorStore.ts`'s `releaseClipAudio` calls it from
+ * `removeClip`, `removeTrack`, and `loadProject` (T66B) — but only for a Blob
+ * no clip still LIVE in the document references, since a split, a duplicate/
+ * paste, and a shared active-take import can all leave two clips pointing at
+ * the same Blob object (audit MAJOR #1 on T66B). A Blob only undo history
+ * still holds is released anyway: undo restores the clip object rather than
+ * re-decoding, so the next play simply decodes it again, same as any clip
+ * that was never played.
  *
  * DESIGN SOURCE (design only — no code was copied, and none may be):
  * Ardour's `libs/ardour/disk_reader.cc` (GNU GPL-2.0-or-later), whose butler
@@ -343,8 +350,10 @@ export function withPinned<T>(blob: Blob, rate: number, fn: () => T): T {
  *
  * Pinned entries and entries whose Blob has a decode in flight are left alone,
  * by the same rule eviction follows; calling it for a clip that was never
- * decoded is a no-op. Nothing calls it yet — wiring it to clip removal is a
- * later ticket.
+ * decoded is a no-op. Called from `state/editorStore.ts`'s `releaseClipAudio`
+ * (`removeClip`, `removeTrack`, `loadProject` — T66B), which skips this call
+ * entirely for any Blob a clip still live in the document shares (see the
+ * module header).
  */
 export function releaseDecoded(blob: Blob): void {
   if ((inFlight.get(blob)?.size ?? 0) > 0) return;

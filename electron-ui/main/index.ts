@@ -22,6 +22,7 @@ import { pathToFileURL } from 'url'
 // carries meaning is transliterated rather than dropped, so a key of F-sharp
 // still reads as F# in the log.
 import { plainAscii } from '../../frontend/src/lib/plainText'
+import { AutoDownloadClaims, uniqueDownloadPath } from './downloadNaming'
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -909,8 +910,26 @@ async function recordDownload(savePath: string): Promise<void> {
   }
 }
 
+// Item 4 (T17 audit): which exact filenames the renderer's autoDownload
+// toggle is about to click — set by the downloads:markAutomatic IPC call,
+// right before it clicks an <a download> once per finished take. Matched on
+// filename (not just counted) so an unrelated user download never gets
+// silently auto-saved by a leftover count, and each mark expires on its own
+// (AutoDownloadClaims' TTL) so a mismatch never leaks a slot indefinitely —
+// see downloadNaming.ts.
+const autoDownloads = new AutoDownloadClaims()
+
 function watchDownloads(ses: Electron.Session): void {
   ses.on('will-download', (_event, item) => {
+    if (autoDownloads.claim(item.getFilename())) {
+      // setSavePath() is what skips Electron's "original routine" (the save
+      // dialog) — see download-item.md. Unique against the real Downloads
+      // folder so a batch's takes never silently overwrite one another.
+      const dir = app.getPath('downloads')
+      const savePath = uniqueDownloadPath(dir, item.getFilename(), (p) => fs.existsSync(p))
+      item.setSavePath(savePath)
+      log(`Auto-download: saving to ${savePath}`)
+    }
     item.once('done', async (_doneEvent, state) => {
       const filename = item.getFilename()
       const savePath = state === 'completed' ? item.getSavePath() || null : null
@@ -1236,6 +1255,14 @@ function registerIpcHandlers(): void {
     } catch {
       return null
     }
+  })
+
+  // Item 4 (T17 audit): the renderer's auto-download loop calls this once,
+  // just before it clicks, with the EXACT filenames it's about to save —
+  // watchDownloads' will-download handler (above) claims a slot only for a
+  // matching filename, within AutoDownloadClaims' TTL.
+  ipcMain.handle('downloads:markAutomatic', (_event, names: unknown) => {
+    autoDownloads.mark(Array.isArray(names) ? names.filter((n): n is string => typeof n === 'string') : [])
   })
 
   registerUpdaterHandlers()

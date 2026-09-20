@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from backend.modules.vst import path_policy  # noqa: E402
 from backend.modules.vst import router as vst_router  # noqa: E402
 
 
@@ -36,9 +37,15 @@ class _FakeEditorProc:
 
 @pytest.fixture
 def client() -> TestClient:
+    """Starlette's ``TestClient`` reports its TCP peer as ``testclient`` by
+    default, not a loopback address; ``client=`` overrides that so this
+    fixture exercises the legitimate-local-caller path through
+    ``require_loopback_or_launch_token`` (``/open-editor``) rather than
+    tripping it.
+    """
     app = FastAPI()
     app.include_router(vst_router.router, prefix="/api/vst")
-    return TestClient(app)
+    return TestClient(app, client=("127.0.0.1", 51000))
 
 
 @pytest.fixture
@@ -56,8 +63,21 @@ def fake_popen(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def plugin_file(tmp_path: Path) -> Path:
-    path = tmp_path / "Fake.vst3"
+def vst3_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """An allowed VST3 root (R5-2, extended to ``/open-editor``).
+
+    ``path_policy.allowed_roots`` is patched directly, the same thing
+    ``tests/test_vst_path_policy.py`` does.
+    """
+    root = tmp_path / "VST3"
+    root.mkdir()
+    monkeypatch.setattr(path_policy, "allowed_roots", lambda: [root.resolve()])
+    return root
+
+
+@pytest.fixture
+def plugin_file(vst3_root: Path) -> Path:
+    path = vst3_root / "Fake.vst3"
     path.write_bytes(b"only the path is validated by the route")
     return path
 

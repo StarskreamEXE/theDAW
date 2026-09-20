@@ -22,7 +22,7 @@ from typing import Any, Optional
 
 from backend.modules.library.db import LibraryDB
 
-from .bars import estimate_bars, estimate_rms_db
+from .bars import estimate_bars, estimate_loudness_lufs, estimate_rms_db
 from .ffprobe import probe_file
 from .key import detect_key
 from .pitch import detect_pitch_stats
@@ -36,6 +36,12 @@ log = logging.getLogger(__name__)
 # record whether the samples are float, which bit_depth alone never said — 32
 # means pcm_s32le and pcm_f32le equally. The GET endpoint reports
 # version<ANALYSIS_VERSION rows as 'pending' so they re-run.
+#
+# loudness_lufs is now actually computed (pyloudnorm) instead of always
+# persisting null (LIB-003), but this deliberately did NOT bump the version:
+# with ~200k library rows, a bump marks every row stale and re-decodes/
+# re-analyzes the whole library on idle for one new field. New analyses, and
+# any row re-analyzed for its own reasons, get loudness; nothing mass-requeues.
 ANALYSIS_VERSION = 3
 
 
@@ -99,6 +105,9 @@ def analyze_audio(
 
     out["bars_estimated"] = estimate_bars(out.get("beats") or [])
     out["rms_db"] = estimate_rms_db(p, y_sr=y_sr)
+    # Native decode inside estimate_loudness_lufs — NOT the shared y_sr mono
+    # decode the steps above use (see estimate_loudness_lufs' docstring).
+    out["loudness_lufs"] = estimate_loudness_lufs(p)
 
     if include_key:
         out.update(detect_key(p, y_sr=y_sr))

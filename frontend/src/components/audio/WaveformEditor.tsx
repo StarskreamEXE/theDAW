@@ -19,6 +19,7 @@ import { useMetamorphPanelRequest } from '../../state/metamorphPanelRequestStore
 import { MagentaToolStage } from './MagentaToolStage';
 import { MAGENTA_TOOLS, magentaToolById, type MagentaTool } from '../../lib/magentaToolCatalog';
 import { AutomationLane } from './AutomationLane';
+import { buildAddAutomationLaneOptions } from './automationLaneOptions';
 import { RACK_EFFECTS, getRackEffect, buildEffectChain, ensureChopModule } from '../../lib/rackEffects';
 import { decodeClipBlob } from '../../lib/decodeCache';
 import { type FadeCurve } from '../../lib/clipFade';
@@ -83,6 +84,14 @@ import { setLocalOnly } from '../../lib/storageClient';
 import { requireFeature } from '../../notices/featureGateStore';
 import { logError, logInfo } from '../../state/logStore';
 import { saveFile } from '../../lib/saveFile';
+import { dirnameOf, basenameOf } from '../../lib/placesClient';
+import {
+  mixdownSaveOptions, mixdownSaveTargetFromPath, shouldApplyMixdownSave, type MixdownSaveTarget,
+} from './mixdownSaveTarget';
+import { clipsNeedingPeaksDecode, pruneFailedBlobs } from './peaksDecodeScheduler';
+import { usePeaksDecodeQueue } from './usePeaksDecodeQueue';
+import { allStemsMenuInfo, stemsFolderName, stemTrackSpecs } from './insertAllStems';
+import { pruneMixdownJobExplicitNames } from './mixdownJobExplicitName';
 import { KnownFilesMenu } from '../ui/KnownFilesMenu';
 import { registerEditorPlayback, unregisterEditorPlayback } from '../../state/editorPlaybackBridge';
 import { publishSelectedClips, publishSelectedTracks } from '../../state/editorSelectionBridge';
@@ -121,6 +130,8 @@ import { ContextMenu, useContextMenu, type ContextMenuItem, type ContextMenuPosi
 import { RenderRangeDialog } from '../render/RenderRangeDialog';
 import { SurfacePlayKey } from '../ui/SurfacePlayKey';
 import { StemsRunModal, type StemsRunOptions } from '../library/StemsRunModal';
+import { ExportDialog } from './ExportDialog';
+import type { ExportRenderItem, ExportRenderPlan } from '../../lib/render/exportDialogModel';
 import { EffectWindowsHost, FxChainList, openEffectWindow, type EffectWindowOrigin, type FxScope } from './EffectWindows';
 import { browserPopoverEnv, popoverMaxHeight, sameLayout, watchPopover, type PopoverLayout } from '../../lib/popoverPlacement';
 import { useTrackFxRackStore, type TrackFxRackAnchor } from '../../state/trackFxRackStore';
@@ -162,6 +173,11 @@ const ADD_ENTRY_ICON: Record<AddToTrackEntry['id'], React.ReactNode> = {
   'new-track': <Plus className="w-3 h-3" />,
 };
 
+// How many peaks decodes (FE-007) run at once. Each holds a full decoded PCM
+// buffer plus its own AudioContext, so a project with many undecoded clips at
+// once (a fresh import, a big paste) does not decode all of them in parallel.
+const PEAKS_DECODE_CONCURRENCY = 2;
+
 // Track/clip colors for exploded stems, keyed by Demucs/LARSNET stem name.
 const STEM_TRACK_COLORS: Record<string, string> = {
   vocals: '#f472b6',
@@ -177,6 +193,77 @@ const STEM_TRACK_COLORS: Record<string, string> = {
   cymbals: '#fef08a',
   toms: '#fdba74',
 };
+
+export interface AllStemsInsertResult {
+  /** The parent clip's label at the moment of the write — for the caller's log line. */
+  readonly parentLabel: string;
+  readonly insertedTrackCount: number;
+  /** Aggregate names left out, unchanged from `planStemInsert`. */
+  readonly skippedAggregates: readonly string[];
+}
+
+/**
+ * F14's store writes: one folder track, one track+clip per already-decoded
+ * stem, all in ONE undo step, then the parent clip muted. Module-level (not
+ * a `useCallback`) and exported so this — the part an audit specifically
+ * asked to be proven against the REAL store (one undo step, one `undo()`
+ * restores everything) — is directly testable without mounting the editor or
+ * faking a fetch/AudioContext; see `insertAllStemsStore.test.ts`.
+ *
+ * `insertAllStemsBesideClip` (the component callback) does the fetch +
+ * `computePeaks` I/O and calls this once decoding is done. `decoded` is
+ * stems already fetched and peak-decoded, in insertion order; `skipped` is
+ * the aggregate names `planStemInsert` left out, carried through only for
+ * the log line. Returns `null` when the clip is gone by the time this runs
+ * (the caller logs) — nothing is written in that case.
+ *
+ * The folder is built with `addTrack({ isFolder: true, ... })` + each stem
+ * track's `parentTrackId` set at creation, NOT the `addFolderFromSelectedTracks`
+ * store action: that action opens its OWN undo step (it calls
+ * `beginUndoStep()` before its write), which would split "add the stem
+ * tracks" and "wrap them in a folder" into two steps — one Ctrl-Z would
+ * un-fold the folder but leave the stems and the muted parent behind.
+ * `addTrack` / `addClipToTrack` are anonymous writes (no `beginUndoStep()`
+ * of their own), so every write here folds into the ONE burst the explicit
+ * `beginUndoStep()` below opens — same pattern `explodeClipToStems` uses.
+ */
+export function applyAllStemsInsert(
+  clipId: string,
+  decoded: readonly { ref: StemRef; blob: Blob; peaks: Float32Array; duration: number }[],
+  skipped: readonly string[],
+): AllStemsInsertResult | null {
+  const live = useEditorStore.getState().clips.find((c) => c.id === clipId);
+  if (!live) return null;
+  const specs = stemTrackSpecs(live.label, live.color, STEM_TRACK_COLORS, decoded.map((d) => d.ref));
+  beginUndoStep();
+  const store = useEditorStore.getState();
+  const folderId = store.addTrack({ name: stemsFolderName(live.label), isFolder: true, collapsed: false });
+  for (let i = 0; i < decoded.length; i++) {
+    const { blob, peaks, duration } = decoded[i];
+    const { label, color } = specs[i];
+    const trackId = store.addTrack({ name: label, color, parentTrackId: folderId });
+    const newClipId = store.addClipToTrack({
+      trackId,
+      label,
+      audioBlob: blob,
+      mimeType: 'audio/wav',
+      sourceDuration: duration,
+      ...stemClipPlacement(live, duration),
+      color,
+      gain: live.gain,
+      fadeInSec: live.fadeInSec,
+      fadeOutSec: live.fadeOutSec,
+    });
+    store.cachePeaks(newClipId, peaks);
+  }
+  // Mute the source clip — kept, so this is undoable/reversible, same as
+  // `explodeClipToStems`. `{ coalesce: true }` for the same reason that
+  // needs it there: `updateClip` keys its coalescing on the clip while
+  // `addTrack` / `addClipToTrack` are anonymous, so without the opt-in this
+  // write opens a SECOND undo step.
+  useEditorStore.getState().updateClip(clipId, { muted: true }, { coalesce: true });
+  return { parentLabel: live.label, insertedTrackCount: decoded.length, skippedAggregates: skipped };
+}
 
 const formatTimecode = (sec: number): string => {
   if (!Number.isFinite(sec) || sec < 0) sec = 0;
@@ -424,6 +511,7 @@ const JOB_NOUN: Record<RenderJobKind, string> = {
   stem: 'Track stem',
   freeze: 'Freeze',
   pattern: 'Pattern print',
+  export: 'Export',
 };
 
 /**
@@ -467,12 +555,62 @@ const processThroughVst = async (file: File, vst: VstNode, name: string): Promis
   return new File([await res.blob()], name, { type: 'audio/wav' });
 };
 
+/** The disk destination the last SAVED mixdown landed on (D18), or `null`
+ *  before the first one this session, or after one that was cancelled or
+ *  fell back to a browser download. `runMixdownJob` reads it to default the
+ *  next mixdown's Save As dialog onto the same file, and writes it back once
+ *  a save actually lands on a real path — see `mixdownSaveTarget.ts`. */
+let lastMixdownSaveTarget: MixdownSaveTarget | null = null;
+/** The `seq` of whichever mixdown save last won the race to update
+ *  `lastMixdownSaveTarget` (`shouldApplyMixdownSave`'s `lastAppliedSeq`),
+ *  `-1` before any has. */
+let lastAppliedMixdownSaveSeq = -1;
+/** Assigns each mixdown job a distinct, increasing `seq`, captured once at
+ *  the top of `runMixdownJob` — never assigned inside the `.then()` below,
+ *  since two mixdowns queued back to back render independently and their
+ *  never-awaited Save As dialogs can complete in EITHER order; `seq` records
+ *  the order the jobs actually started running in, so `shouldApplyMixdownSave`
+ *  can tell an older job's late-arriving save from a newer job's. */
+let nextMixdownSaveSeq = 0;
+/**
+ * Whether the label a mixdown job runs under is TEXT THE USER TYPED into the
+ * mixdown-name field ("explicit"), keyed by the job's own id — set by
+ * `setMixdownJobExplicitName` right after `enqueueBounce` hands back the id,
+ * read (and cleared) once by `runMixdownJob`. A caller-supplied FACT, not
+ * something guessed from the label's text later: a user who happens to type
+ * exactly the auto-generated `mixdown_<n>.wav` shape must still be treated
+ * as explicit, which sniffing the text at save time cannot tell apart from
+ * the real auto-generated fallback (`mixdownSaveOptions`'s whole point).
+ *
+ * `let`, not `const`: `setMixdownJobExplicitName` reassigns it to a PRUNED
+ * map before every write (see there) — a job cancelled while still queued,
+ * or dropped by the runner before `runMixdownJob` ever reads its entry,
+ * would otherwise leak one entry into this map for the life of the tab.
+ */
+let mixdownJobExplicitName = new Map<string, boolean>();
+
+/** Record whether `jobId`'s label is user-typed, pruning stale entries
+ *  first: any id whose job is no longer queued/running in `useRenderJobs`
+ *  (done, failed, cancelled, or aged out of the jobs list entirely) is
+ *  dropped, so a job that never reaches `runMixdownJob`'s own read-and-
+ *  delete does not leak its entry forever. */
+const setMixdownJobExplicitName = (jobId: string, explicitName: boolean): void => {
+  mixdownJobExplicitName = pruneMixdownJobExplicitNames(mixdownJobExplicitName, useRenderJobs.getState().jobs);
+  mixdownJobExplicitName.set(jobId, explicitName);
+};
+
 /** COMMIT EDIT, end to end: the full-fidelity master bounce, then the library
  *  entry and the Save As that used to follow the `await` in `commitEdit`. */
 const runMixdownJob = async (
   job: RenderJob,
   isCancelled: () => boolean,
 ): Promise<RenderJobResult> => {
+  // Captured at the top, before the (possibly long) render/save below, so it
+  // reflects the order jobs actually started running in — see
+  // `nextMixdownSaveSeq` and `shouldApplyMixdownSave`.
+  const saveSeq = nextMixdownSaveSeq++;
+  const explicitName = mixdownJobExplicitName.get(job.id) ?? false;
+  mixdownJobExplicitName.delete(job.id);
   const st = useEditorStore.getState();
   const start = performance.now();
   logInfo('editor', `Mixing ${st.clips.length} clips on ${st.tracks.length} tracks…`);
@@ -495,9 +633,30 @@ const runMixdownJob = async (
       tags: ['mixdown'],
     },
   });
-  // Also put the file on disk. Save As opens in the folder last used for audio;
-  // not awaited, so the queue moves on to the next job while the dialog is up.
-  void saveFile({ blob, suggestedName: title.replace(/[<>:"/\\|?*]/g, '_'), kind: 'audio' });
+  // Also put the file on disk. Save As opens in the folder last used for audio,
+  // and — when a mixdown was already saved to a real path this session (D18) —
+  // defaulted onto that SAME file, so confirming the dialog (its own overwrite
+  // prompt included) re-writes it instead of navigating to a folder and typing
+  // a fresh name from scratch. Not awaited, so the queue moves on to the next
+  // job while the dialog is up: two mixdowns queued back to back can have
+  // their saves land in EITHER order, so the remembered target is only
+  // updated when this save's `saveSeq` is not older than whichever save last
+  // won (`shouldApplyMixdownSave`) — an older job's save finishing late must
+  // not clobber a newer job's fresher target. A cancel or a browser download
+  // (`target === null`) always leaves the remembered target as it was.
+  const { suggestedName, initialDir } = mixdownSaveOptions(title, explicitName, lastMixdownSaveTarget);
+  void saveFile({
+    blob,
+    suggestedName: suggestedName.replace(/[<>:"/\\|?*]/g, '_'),
+    initialDir,
+    kind: 'audio',
+  }).then((result) => {
+    const target = mixdownSaveTargetFromPath(result.path, dirnameOf, basenameOf);
+    if (target && shouldApplyMixdownSave(saveSeq, lastAppliedMixdownSaveSeq)) {
+      lastMixdownSaveTarget = target;
+      lastAppliedMixdownSaveSeq = saveSeq;
+    }
+  });
   const ms = (performance.now() - start).toFixed(0);
   logInfo('editor', `Mixdown complete: ${rendered.duration.toFixed(2)}s rendered in ${ms}ms → library + save`);
   return { blob, durationSec: rendered.duration };
@@ -544,6 +703,147 @@ const runSelectionJob = async (
 };
 
 /**
+ * Delivers one export-dialog item's rendered blob per its chosen destination
+ * (T25c) — the SAME two steps `runMixdownJob` above always performs
+ * (`importEntry`, `saveFile`), just gated on the choice instead of hardcoded
+ * to both. No new encoder or upload path: both calls are the app's existing
+ * library-import and Save-As primitives.
+ */
+export const deliverExport = async (
+  blob: Blob,
+  durationSec: number,
+  item: Pick<ExportRenderItem, 'label' | 'kind' | 'destination'>,
+): Promise<void> => {
+  const filename = item.label;
+  let libraryFailed: string | undefined;
+  if (item.destination === 'library' || item.destination === 'both') {
+    // Its own try/catch (T25c finding 6): a library-import failure (provider
+    // down, disk full) must not cancel the download half below — the user
+    // asked for both, and a failed library write should still leave them the
+    // file they could still have.
+    try {
+      await useLibraryStore.getState().importEntry({
+        blob,
+        filename,
+        mimeType: 'audio/wav',
+        metadata: {
+          title: filename,
+          prompt: `Editor export (${item.kind})`,
+          model: 'editor-export',
+          duration: durationSec,
+          source: 'studio',
+          tags: ['export'],
+        },
+      });
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      libraryFailed = message;
+      logError('editor', `${filename}: library import failed — ${message}`);
+    }
+  }
+  if (item.destination === 'download' || item.destination === 'both') {
+    void saveFile({ blob, suggestedName: filename.replace(/[<>:"/\\|?*]/g, '_'), kind: 'audio' });
+  }
+  if (libraryFailed && item.destination === 'library') {
+    throw new Error(`${filename}: library import failed — ${libraryFailed}`);
+  }
+};
+
+/**
+ * The export dialog's own render (T25c finding 5): bounce, encode, deliver —
+ * the same `renderBounce` + `encodeBounce` every job kind uses, run under the
+ * QUEUE rather than called directly, so an export gets the FIFO serialisation
+ * every other render gets (two `OfflineAudioContext`s never compete), a job
+ * pill, a real cancel, and `runRenderJob`'s shared catch (toast + `logError`)
+ * on failure — none of which a direct call bypassing the queue could offer.
+ *
+ * Not `mixdown` or `selection`: `mixdown` jobs (`runMixdownJob`) always write
+ * to both the library and a Save As, ignoring the dialog's destination choice
+ * (finding 3), and `selection` jobs (`runSelectionJob`) hand the blob to MAKE
+ * and switch tabs — reusing either kind here would silently misroute or
+ * ignore what the dialog actually asked for. `export` runs the bounce and
+ * nothing else, then delivers exactly where `item.destination` says.
+ */
+const runExportJob = async (
+  job: RenderJob,
+  isCancelled: () => boolean,
+): Promise<RenderJobResult> => {
+  if (job.destination === undefined) {
+    throw new Error(`${job.label}: export job carries no destination`);
+  }
+  const rendered = await renderBounce(job.request, currentRenderDeps());
+  const blob = encodeBounce(rendered, job.request);
+  if (isCancelled()) return {};
+  await deliverExport(blob, rendered.duration, {
+    label: job.label,
+    kind: job.exportItemKind ?? 'mixdown',
+    destination: job.destination,
+  });
+  return { blob, durationSec: rendered.duration };
+};
+
+/**
+ * Runs one plan item from the export dialog (`exportDialogModel.buildRenderRequest`).
+ * `item.range` sits beside `item.request` in the model rather than on it
+ * (its header explains why) — merged onto the request here, the one place
+ * that actually renders it.
+ *
+ * `stem` items reuse the EXISTING `stem` job kind (`runStemJob`, apply=false:
+ * render + hosted-VST print, no timeline write) via `enqueueBounceAndWait`,
+ * then deliver through `deliverExport` — a stem never had a delivery step of
+ * its own before this dialog.
+ *
+ * `mixdown` and `selection` items BOTH go through the new `export` job kind
+ * above (T25c finding 3 + finding 5) rather than the existing `mixdown` /
+ * `selection` `RenderJobKind`s: those two are each hardcoded to a DIFFERENT
+ * fixed behaviour (always-both-destinations; hand-off to MAKE) that has
+ * nothing to do with what this dialog asks for, and reusing them would
+ * misroute or ignore the user's choice. `export` also sidesteps
+ * `runMixdownJob`'s remembered-Save-As-target tracking entirely (finding 4):
+ * a dialog export never touches `mixdownJobExplicitName` or
+ * `lastMixdownSaveTarget`, so there is no stale remembered filename for it to
+ * collide with — `deliverExport`'s Save As always uses `item.label` as typed.
+ */
+export const runExportPlanItem = async (item: ExportRenderItem): Promise<void> => {
+  const request: BounceRequest = item.range ? { ...item.request, range: item.range } : item.request;
+  if (item.kind === 'stem') {
+    const job = await enqueueBounceAndWait({
+      kind: 'stem', label: item.label, trackId: item.trackId, request, range: item.range ?? undefined,
+    });
+    if (job.status === 'done' && job.result?.blob) {
+      try {
+        await deliverExport(job.result.blob, job.result.durationSec ?? 0, item);
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        requireFeature({
+          id: `render:failed:${item.kind}`,
+          kind: 'error',
+          title: `${JOB_NOUN.export} failed`,
+          message,
+          autoDismissMs: 10000,
+        });
+      }
+    }
+    return;
+  }
+  await enqueueBounceAndWait({
+    kind: 'export',
+    label: item.label,
+    request,
+    range: item.range ?? undefined,
+    destination: item.destination,
+    exportItemKind: item.kind,
+  });
+};
+
+/** Fires every item in an export-dialog plan. Each item runs independently —
+ *  one stem failing (logged by `runRenderJob`'s own catch, for the two kinds
+ *  that go through the queue) does not stop the others. */
+export const runExportPlan = (plan: ExportRenderPlan): void => {
+  for (const item of plan.items) void runExportPlanItem(item);
+};
+
+/**
  * A freeze, master or per-track — structurally one thing: bounce offline, print
  * the hosted VST3 chain on the backend one plugin at a time, then apply.
  *
@@ -579,7 +879,7 @@ const runStemJob = async (
   // for nothing. Rebuilt through the same tested builder the caller used, so
   // the rule lives in exactly one place. The master branch is untouched: its
   // bounce was always 16-bit and changing that would change fidelity.
-  const request = isTrack ? stemRequest(trackId, chain.length > 0) : job.request;
+  const request = isTrack ? { ...job.request, float32: job.request.float32 || chain.length > 0 } : job.request;
   const total = 1 + chain.length + (isTrack ? 1 : 0);
   let stage = 0;
   const step = (): void => { stage += 1; onProgress(stage, total); };
@@ -602,7 +902,7 @@ const runStemJob = async (
   // A track freeze replaces what the transport is playing, so it stops first.
   // The master freeze does not: re-rendering a stale frozen master while the
   // live mix plays is a normal thing to do, and it never did stop it.
-  if (isTrack) usePlayerStore.getState().stop();
+  if (isTrack && apply) usePlayerStore.getState().stop();
 
   const rendered = await renderBounce(request, currentRenderDeps());
   const fileName = isTrack ? 'track-stem.wav' : 'edit-master.wav';
@@ -624,7 +924,10 @@ const runStemJob = async (
     return { blob: file, durationSec: rendered.duration };
   }
 
-  const { peaks } = await computePeaks(file, 240);
+  let peaks: Float32Array | undefined;
+  if (apply) {
+    ({ peaks } = await computePeaks(file, 240));
+  }
   step();
   if (isCancelled()) return {};
   if (apply) {
@@ -632,7 +935,7 @@ const runStemJob = async (
     liveMixer.reactivate();
     logInfo('editor', 'Track frozen — VST FX printed into the stem.');
   }
-  return { blob: file, durationSec, peaks };
+  return { blob: file, durationSec: apply ? durationSec : rendered.duration, peaks };
 };
 
 /**
@@ -653,6 +956,7 @@ export async function runRenderJob(
   try {
     if (job.kind === 'mixdown') return await runMixdownJob(job, isCancelled);
     if (job.kind === 'selection') return await runSelectionJob(job, isCancelled);
+    if (job.kind === 'export') return await runExportJob(job, isCancelled);
     if (job.kind === 'stem' || job.kind === 'freeze') {
       return await runStemJob(job, onProgress, isCancelled, job.kind === 'freeze');
     }
@@ -959,6 +1263,18 @@ const TrackInputMeter: React.FC<{ trackId: string; trackName: string }> = ({ tra
  * only the clip's trim window of its source audio (viewport mapped from
  * offsetIntoSource/sourceDuration). Owns one object URL per clip, revoked on
  * unmount. No per-clip playhead — the timeline draws a global one over clips.
+ *
+ * `normalize={false}` (D16): the EDIT timeline draws every clip at its
+ * ABSOLUTE amplitude, not scaled up to fill the lane by each clip's own
+ * peak — REAPER's intent, and the one this app matches, so a quiet clip
+ * draws SMALLER than a loud one, both readable against each other at a
+ * glance. This is not a promise of linear pixels: `drawWaveform`'s own
+ * gamma curve (`pow(peak, 0.58)`, floored at 0.72) still applies on top, so
+ * a -20 dBFS clip draws roughly twice as tall as a linear mapping would give
+ * it — only the ORDERING (quiet < loud) is what `normalize` controls here.
+ * The DJ decks (a different surface, a different job: cueing one track at a
+ * time, not comparing levels across an arrangement) keep `SemanticWave`'s
+ * own default of `true`.
  */
 const ClipWave: React.FC<{ clip: AudioClip; height: number; selected: boolean }> = ({ clip, height, selected }) => {
   // The object URL is minted INSIDE the effect that revokes it, so each mount
@@ -986,7 +1302,7 @@ const ClipWave: React.FC<{ clip: AudioClip; height: number; selected: boolean }>
   return (
     <div className="h-full w-full" style={{ opacity: selected ? 1 : 0.85 }}>
       {url && (
-        <SemanticWave audioUrl={url} height={height} viewportStart={viewportStart} viewportEnd={Math.max(viewportStart + 1e-4, viewportEnd)} transparentBg />
+        <SemanticWave audioUrl={url} height={height} viewportStart={viewportStart} viewportEnd={Math.max(viewportStart + 1e-4, viewportEnd)} transparentBg normalize={false} />
       )}
     </div>
   );
@@ -1635,6 +1951,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const toggleAutomationLane = useEditorStore((s) => s.toggleAutomationLane);
   const clearAutomationLane = useEditorStore((s) => s.clearAutomationLane);
   const removeAutomationLane = useEditorStore((s) => s.removeAutomationLane);
+  const addAutomationLane = useEditorStore((s) => s.addAutomationLane);
   const projectBpm = useEditorStore((s) => s.bpm);
   const loopEnabled = useEditorStore((s) => s.loopEnabled);
   const loopStart = useEditorStore((s) => s.loopStart);
@@ -1892,6 +2209,22 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     return `${k === 'masterFx' ? 'Master' : trackName} · ${effLabel} ${paramLabel ?? ''}`.trim();
   };
 
+  // The "Add lane" picker's options — see automationLaneOptions.ts for why this
+  // is a pure module rather than inline: the picker's coverage of every
+  // AUTOMATION_KINDS shape is unit-tested there, DOM-free.
+  const addLaneOptions = useMemo(
+    () => buildAddAutomationLaneOptions(tracks, masterFxChain, automationLanes),
+    [tracks, masterFxChain, automationLanes],
+  );
+
+  // The picker's own selection — reset whenever the option it names disappears
+  // (added, or the track/entry it pointed at was removed) so a stale key never
+  // silently resolves to nothing.
+  const [addLaneKey, setAddLaneKey] = useState('');
+  useEffect(() => {
+    if (addLaneKey && !addLaneOptions.some((o) => o.key === addLaneKey)) setAddLaneKey('');
+  }, [addLaneKey, addLaneOptions]);
+
   const MASTER_STRIP_H = 80;
   const masterLanes = automationLanes.filter((l) => l.target.kind === 'masterFx');
 
@@ -1934,6 +2267,10 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   // nothing to put on the queue and keeps its own flag.
   const [isBleeding, setIsBleeding] = useState(false);
   const [mixdownName, setMixdownName] = useState('');
+  // T25c: the export dialog opens beside MIXDOWN rather than replacing it —
+  // MIXDOWN stays the one-click "everything, as WAV" path, this is where
+  // format/bit-depth/range/destination/stems/selection live.
+  const [exportDialogOpen, setExportDialogOpen] = useState(false);
   // ONE master FX panel — built-in rack effects, VST3s and .gan surfaces are
   // the same concept (chain entries) and share a single list + add menu.
   const [showMasterFx, setShowMasterFx] = useState(false);
@@ -3036,24 +3373,58 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     selectTrackWithModifiers(trackId, e);
   }, [selectTrackWithModifiers]);
 
-  // Decode + cache peaks for any clip that doesn't have them yet.
+  // Decode + cache peaks for any clip that doesn't have them yet, keyed PER
+  // CLIP+BLOB (FE-007) with at most PEAKS_DECODE_CONCURRENCY running at once
+  // AND NEVER MORE THAN ONE decode per clip id at a time (see
+  // peaksDecodeScheduler.ts for the full history: a shared `cancelled` flag
+  // used to abort every in-flight decode and restart the scan from the top on
+  // ANY clips change; keying on id alone fixed that but then a decode for a
+  // clip's OLD blob could settle after `acceptInpaint` / a take switch
+  // replaced that clip's audio, writing the old audio's peaks onto the new
+  // one; keying on id+blob fixed THAT but let a stale decode's slot get
+  // silently overwritten instead of counted, so the concurrency cap could be
+  // exceeded). `getPeaksQueue` owns the ONE queue instance for this
+  // component's whole life — see `usePeaksDecodeQueue.ts` for why it has to
+  // be built on demand and disposed+NULLED (not just disposed) on unmount:
+  // StrictMode's dev-only mount→cleanup→remount dance killed the queue
+  // forever otherwise, with no waveform for anything imported/recorded/
+  // pasted/inpainted/take-switched after the remount.
+  const getPeaksQueue = usePeaksDecodeQueue(PEAKS_DECODE_CONCURRENCY);
+  // The blob that most recently FAILED to decode, per clip id: a clip whose
+  // audio truly cannot be decoded must not be retried (and re-logged) on
+  // every unrelated `clips` change (a drag, a rename elsewhere) — only once
+  // its blob actually changes to something new. Pruned to the clips that
+  // still exist before every sync (below): a deleted clip's entry would
+  // otherwise pin its Blob in memory forever, never dropped by anything.
+  const peaksFailedBlob = useRef<Map<string, Blob>>(new Map());
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      for (const c of clips) {
-        if (c.peaks || cancelled) continue;
+    const queue = getPeaksQueue();
+    peaksFailedBlob.current = pruneFailedBlobs(peaksFailedBlob.current, new Set(clips.map((c) => c.id)));
+    const startDecode = (item: { id: string; blob: Blob }): void => {
+      void (async () => {
         try {
-          const { peaks } = await computePeaks(c.audioBlob, 240);
-          if (!cancelled) cachePeaks(c.id, peaks);
+          const { peaks } = await computePeaks(item.blob, 240);
+          peaksFailedBlob.current.delete(item.id);
+          // Apply the result ONLY if the live clip still holds this EXACT
+          // blob and still has no peaks: a clip that moved on to a newer
+          // blob while this decode ran (or that already got peaks another
+          // way) must not have a stale decode's result written onto it.
+          const live = useEditorStore.getState().clips.find((c) => c.id === item.id);
+          if (live && live.audioBlob === item.blob && !live.peaks) cachePeaks(item.id, peaks);
         } catch (e) {
-          if (!cancelled) {
-            logError('editor', `Peak decode failed for ${c.label}: ${e instanceof Error ? e.message : e}`);
-          }
+          peaksFailedBlob.current.set(item.id, item.blob);
+          // Read live, not the `clips` this effect closed over: this decode
+          // can still be running long after a later render replaced that
+          // closure, and the label should name the clip as it is now.
+          const label = useEditorStore.getState().clips.find((c) => c.id === item.id)?.label ?? item.id;
+          logError('editor', `Peak decode failed for ${label}: ${e instanceof Error ? e.message : e}`);
+        } finally {
+          queue.settle(item.id, item.blob, startDecode);
         }
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [clips, cachePeaks]);
+      })();
+    };
+    queue.sync(clipsNeedingPeaksDecode(clips, peaksFailedBlob.current), startDecode);
+  }, [clips, cachePeaks, getPeaksQueue]);
 
 
   const stopPreview = useCallback(() => {
@@ -3811,11 +4182,15 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     }
     // The label IS the filename the runner writes under, so the jobs pill names
     // the file rather than the verb.
-    enqueueBounce({
+    const jobId = enqueueBounce({
       kind: 'mixdown',
       label: mixdownTitle(mixdownName),
       request: mixdownRequest(),
     });
+    // D18: whether this job's label is text the user typed, decided HERE
+    // (the one place that actually knows), not re-derived from the label's
+    // text later.
+    setMixdownJobExplicitName(jobId, mixdownName.trim().length > 0);
   }, [mixdownName]);
 
   // --- Master VST freeze (render-on-change) ----------------------------------
@@ -5080,6 +5455,52 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     }
   }, []);
 
+  /**
+   * F14 — put EVERY already-separated stem of a clip's library entry on its
+   * own track, all in one folder, in ONE undo step, with the parent clip
+   * muted. Unlike `explodeClipToStems` this never runs separation: `refs` are
+   * stems `warmClipStems` already found, and — like every other BULK stem
+   * path — an aggregate sum is left off (`planStemInsert`; naming a stem is
+   * the only place a sum is deliberately offered, see the "Insert stem…"
+   * menu build).
+   *
+   * This is the fetch + `computePeaks` I/O only; the store writes (folder,
+   * per-stem track+clip, mute) are `applyAllStemsInsert`, split out above so
+   * that part is testable against the real store with no fetch/AudioContext.
+   */
+  const insertAllStemsBesideClip = useCallback(async (clipId: string, refs: readonly StemRef[]) => {
+    const src = useEditorStore.getState().clips.find((c) => c.id === clipId);
+    if (!src) return;
+    const plan = planStemInsert(refs);
+    if (!plan.insert.length) return;
+    try {
+      const decoded: Array<{ ref: StemRef; blob: Blob; peaks: Float32Array; duration: number }> = [];
+      for (const ref of plan.insert) {
+        const res = await fetch(ref.url);
+        if (!res.ok) {
+          logError('editor', `stem ${ref.name}: fetch failed (${res.status})`);
+          continue;
+        }
+        const blob = await res.blob();
+        const { peaks, duration } = await computePeaks(blob, 240);
+        decoded.push({ ref, blob, peaks, duration });
+      }
+      if (!decoded.length) throw new Error('no stem audio could be fetched');
+      const result = applyAllStemsInsert(clipId, decoded, plan.skipped);
+      if (!result) {
+        logError('editor', 'Stems not inserted: the clip they were aimed at is gone');
+        return;
+      }
+      const note = skippedAggregatesNote(result.skippedAggregates);
+      logInfo(
+        'editor',
+        `Inserted ${result.insertedTrackCount} stem track(s) beside "${result.parentLabel}" in a folder${note ? ` — ${note}` : ''}`,
+      );
+    } catch (e) {
+      logError('editor', `Stems could not be inserted: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }, []);
+
   /** Read the two indexes the add menu counts, so it can tell "there is none of
    *  this in the library" (disable the row, say why) from "not fetched yet"
    *  (offer it). Both are cheap and cached, both are no-ops once warm, and the
@@ -6030,6 +6451,17 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
               cancel that can honestly be offered. */}
           <RenderJobsPill />
           <button
+            type="button"
+            onClick={() => setExportDialogOpen(true)}
+            aria-haspopup="dialog"
+            aria-expanded={exportDialogOpen}
+            className="p-1 px-1.5 rounded text-zinc-500 hover:text-white hover:bg-white/5"
+            aria-label="Export options"
+            title="Export options — format, bit depth, range, stems or a clip selection"
+          >
+            <Ellipsis className="w-3 h-3" />
+          </button>
+          <button
             onClick={commitEdit}
             // Reads `isBusy('mixdown')`, so a MASTER VST FREEZE deliberately does
             // not light it: the freeze is its own `freeze` job now, not the
@@ -6051,6 +6483,18 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
           </button>
         </div>
       </div>
+
+      {exportDialogOpen && (
+        <ExportDialog
+          onClose={() => setExportDialogOpen(false)}
+          onExport={runExportPlan}
+          projectEndSec={totalDuration}
+          selectionSec={timeSelection}
+          tracks={tracks.map((t) => ({ id: t.id, name: t.name }))}
+          selectedClipIds={selectedClipIds}
+          defaultName={mixdownName.trim() || undefined}
+        />
+      )}
 
       {/* MASTER FX + METAMORPH float as popups (like the per-track FX rack) so
           they never shove the timeline down; close with the X. They open under
@@ -6325,9 +6769,50 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
               <X className="w-3.5 h-3.5" />
             </button>
           </div>
+          {/* Add a lane for a parameter that has not been ridden yet. Before this,
+              `addAutomationLane` (editorStore.ts) was reachable only from the
+              assistant tool surface (`editor_add_automation_lane`) — a user who
+              wanted a lane for a control they had not touched under WRITE had no
+              way in. The picker offers the same target shapes that tool resolves:
+              volume/pan per track, and one entry per numeric FX param, track racks
+              and the master rack alike. A native select, so it needs a real
+              id/name and an sr-only <label htmlFor> (CLAUDE.md rule 3) — the
+              "Add lane" button beside it is the visible name for the pair. */}
+          <div className="flex items-center gap-1 border-b border-white/5 pb-2">
+            <label htmlFor="add-automation-lane" className="sr-only">Parameter to automate</label>
+            <select
+              id="add-automation-lane"
+              name="addAutomationLane"
+              value={addLaneKey}
+              onChange={(e) => setAddLaneKey(e.target.value)}
+              disabled={addLaneOptions.length === 0}
+              title="Add an automation lane for a parameter you have not ridden yet"
+              className="flex-1 min-w-0 bg-black/40 text-zinc-300 border border-white/10 rounded px-1.5 py-1 text-[9px] font-mono focus:outline-hidden focus:ring-1 focus:ring-amber-500/60 disabled:opacity-40"
+            >
+              <option value="">{addLaneOptions.length === 0 ? 'No parameters left to automate' : 'Choose a parameter…'}</option>
+              {addLaneOptions.map((o) => (
+                <option key={o.key} value={o.key} className="bg-[#0d0a14] text-zinc-200">{o.label}</option>
+              ))}
+            </select>
+            <button
+              onClick={() => {
+                const opt = addLaneOptions.find((o) => o.key === addLaneKey);
+                if (!opt) return;
+                const laneId = addAutomationLane(opt.target);
+                setActiveLaneId(laneId);
+                setAddLaneKey('');
+              }}
+              disabled={!addLaneKey}
+              aria-label="Add automation lane for the chosen parameter"
+              title="Add lane"
+              className="p-1 rounded text-amber-300 hover:text-white hover:bg-amber-600/30 disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-amber-300 shrink-0"
+            >
+              <Plus className="w-3.5 h-3.5" />
+            </button>
+          </div>
           {automationLanes.length === 0 ? (
             <span className="text-[9px] font-mono text-zinc-600 leading-relaxed">
-              No lanes yet. Turn on WRITE and ride a fader or FX control while playing to record one.
+              No lanes yet. Pick a parameter above, or turn on WRITE and ride a fader or FX control while playing to record one.
             </span>
           ) : (
             <div className="flex flex-col gap-1">
@@ -7692,6 +8177,23 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
           } else if (stemRows.length > 0) {
             pushSeparator(items);
             items.push({ type: 'header', label: 'Insert stem…' });
+            // ── F14: every stem at once, grouped, one undo step ──────────────
+            // Gated and counted by how many stems would actually be INSERTED
+            // (aggregate sums excluded — same rule `planStemInsert` applies to
+            // the bulk paths), not the raw row count: a clip with one real
+            // stem plus its aggregate sum must not offer a 2-stem bulk action
+            // that is really the same single insert as the row below it.
+            const allStems = allStemsMenuInfo(stemRows);
+            if (allStems.offer) {
+              items.push({
+                type: 'item',
+                icon: <AudioLines className="w-3 h-3" />,
+                label: `All ${allStems.insertCount} stems`,
+                hint: 'new folder',
+                title: 'Add every separated stem on its own track, grouped in a folder, lined up with this clip, with this clip muted',
+                onSelect: () => { void insertAllStemsBesideClip(payload.clipId, stemRows); },
+              });
+            }
             for (const ref of stemRows) {
               items.push({
                 type: 'item',
@@ -7973,7 +8475,10 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         anchor={rangeRender ?? undefined}
         onCancel={() => setRangeRender(null)}
         onConfirm={({ title, range }) => {
-          enqueueBounce({ kind: 'mixdown', label: title, request: { ...mixdownRequest(), range }, range });
+          const jobId = enqueueBounce({ kind: 'mixdown', label: title, request: { ...mixdownRequest(), range }, range });
+          // This dialog's title is always text the user confirmed here, never
+          // the `commitEdit` auto-generated fallback.
+          setMixdownJobExplicitName(jobId, true);
           setRangeRender(null);
         }}
       />

@@ -25,8 +25,16 @@ import { vstApi, getNativeWindowHandle, setLiveEditorRectRouter } from '../lib/v
 import { setVstLiveStateSink, vstSessions, type VstLiveSession } from '../lib/vstLive/sessionRegistry';
 import { useVstLiveStore } from './vstLiveStore';
 import { beginUndoStep, useEditorStore } from './editorStore';
-import { useEffectChainStore } from './effectChainStore';
-import type { ChainEntry } from './effectChainStore';
+import {
+  useEffectChainStore,
+  setVstStateStorageErrorHandler,
+  setVstStateLoadListener,
+  areVstStatesLoaded,
+  isVstStateUnresolved,
+  retryVstStateLoad,
+  vstStatesLoaded,
+} from './effectChainStore';
+import type { ChainEntry, VstStateStorageOp } from './effectChainStore';
 
 /** A VST entry's human name. `plugin_name` is what the chain stored when the
  *  entry was added; a chain saved before the scanner learned real names (or by
@@ -57,8 +65,14 @@ interface VstEditorState {
   open: (
     entry: ChainEntry,
     sinkRawState: (entryId: string, rawState: string) => void,
-    /** Internal: skip the live-first branch (the fallback after the live host turned out to be unavailable). */
-    opts?: { offlineOnly?: boolean },
+    opts?: {
+      /** Internal: skip the live-first branch (the fallback after the live host turned out to be unavailable). */
+      offlineOnly?: boolean;
+      /** Internal: this open already waited for the entry's saved state (and
+       *  retried a failed read), so it must not wait again — without it a
+       *  read that keeps failing would defer the open forever. */
+      stateReady?: boolean;
+    },
   ) => void;
   /** Remember `mode` for the session's plugin and relaunch the editor in it.
    *  A LIVE session relaunches straight through openLiveEditor, which closes
@@ -276,6 +290,29 @@ function sinkLiveParams(entryId: string, values: Map<number, number>): void {
 }
 
 /**
+ * The user moved a control IN THE PLUGIN'S OWN EDITOR WINDOW — grabbed
+ * (`gestureSink`) or dragged (`paramSink`). This is a genuine user gesture,
+ * unlike `vstLiveNode.pushParams`'s `stateDirty` marking, which also fires on
+ * every chain rebuild and on `relive`/`attachWorklet`'s unconditional
+ * re-push. It is the ONLY thing `sinkLiveRawState`'s save-time rejection
+ * guard may trust as evidence that a capture on a defaulted plugin is the
+ * user's new sound, not merely a respawn nobody has touched yet (T18 fifth
+ * audit, CRITICAL 1). Routed through the same session lookup the guard reads,
+ * so a test double substituted there is exercised exactly like the registry.
+ */
+function markUserMovedOnRejectedState(entryId: string): void {
+  const session = liveSessionLookup(entryId);
+  if (session) session.userMovedOnRejectedState = true;
+}
+
+/** Test-only hook: simulate a genuine user gesture in the plugin's own editor
+ *  window — what `gestureSink` calls in the real app — without wiring up
+ *  `openLiveEditor`'s full window/DOM machinery. The app never calls this. */
+export function __simulateLiveEditorGestureForTest(entryId: string): void {
+  markUserMovedOnRejectedState(entryId);
+}
+
+/**
  * Write a plugin state captured from the LIVE host onto whichever chain entry
  * `entryId` names, stamped `state_host: 'thedaw'`.
  *
@@ -294,15 +331,39 @@ function sinkLiveParams(entryId: string, values: Map<number, number>): void {
  * no VST raw-state setter to write through. A plugin on the master lives in
  * `masterVstChain`.
  */
-function sinkLiveRawState(entryId: string, rawState: string): void {
-  if (!rawState) return;
+/** `true` when the raw state was actually written onto the entry; `false`
+ *  when there was nothing to write or the rejection guard refused it — the
+ *  save-time capture pass (`captureLiveVstStates`) uses this to decide
+ *  whether the session's `stateDirty` flag may be cleared (T18 fifth audit,
+ *  CRITICAL 1 secondary). */
+function sinkLiveRawState(entryId: string, rawState: string): boolean {
+  if (!rawState) return false;
+  // The running plugin is known NOT to hold this entry's state: the host
+  // refused the restore (sessionRegistry records that), or it was spawned with
+  // nothing because the state could not be read. What it would hand back is
+  // its FACTORY DEFAULTS, and storing those would destroy the saved state —
+  // five seconds after the rejection, with no user action at all (T18 fourth
+  // audit, CRITICAL 1).
+  //
+  // `userMovedOnRejectedState` is the other half: once the user has ACTUALLY
+  // moved something on the defaulted plugin, the capture is their new sound
+  // and IS wanted. `stateDirty` alone cannot answer this — a chain rebuild
+  // sets it too (`vstLiveNode.pushParams`, `relive`, `attachWorklet`'s
+  // unconditional re-push), which used to unlock this guard on a rejected
+  // plugin nobody had touched (T18 fifth audit, CRITICAL 1).
+  const row = useVstLiveStore.getState().entries[entryId];
+  if (row?.stateOrigin === 'state-rejected' && !liveSessionLookup(entryId)?.userMovedOnRejectedState) return false;
   const flip = () => useVstLiveStore.getState().setStateOrigin(entryId, 'live');
 
   const mix = useEffectChainStore.getState().chain.find((e) => e.id === entryId);
   if (mix?.vst) {
-    useEffectChainStore.getState().setVstRawState(entryId, rawState, 'thedaw');
-    flip();
-    return;
+    // Refused while the entry's saved state is still loading: the plugin is
+    // then at its defaults, and the row keeps the user's real state.
+    if (useEffectChainStore.getState().setVstRawState(entryId, rawState, 'thedaw')) {
+      flip();
+      return true;
+    }
+    return false;
   }
   const ed = useEditorStore.getState();
   for (const t of ed.tracks) {
@@ -310,20 +371,46 @@ function sinkLiveRawState(entryId: string, rawState: string): void {
     if (e?.vst) {
       ed.setTrackVstRawState(t.id, entryId, rawState, 'thedaw');
       flip();
-      return;
+      return true;
     }
   }
   const master = ed.masterVstChain.find((e) => e.id === entryId);
   if (master?.vst) {
     ed.setMasterVstRawState(entryId, rawState, 'thedaw');
     flip();
+    return true;
   }
+  return false;
 }
 
 // The registry rescues the state a host writes as it shuts down (the DELETE
 // response) and has nowhere to put it — it is keyed by chain entry id and knows
 // nothing about chains. This is the module that does, so it installs itself.
 setVstLiveStateSink(sinkLiveRawState);
+
+/** Human text for a failed plugin-state store operation, `QuotaExceededError`
+ *  named explicitly since it is the expected way a save fails (a browser
+ *  storage quota, not a bug). Nothing retries on its own, so no message
+ *  promises a retry. */
+function describeVstStateStorageError(error: unknown): string {
+  if (error instanceof DOMException && error.name === 'QuotaExceededError') {
+    return 'storage quota exceeded - free up space (clear old projects/cache)';
+  }
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+
+/** What failed, worded per operation: [status-bar phrase, editor-banner phrase]. */
+const STORAGE_FAILURE_WORDING: Record<VstStateStorageOp, [string, string]> = {
+  save: ['failed to save plugin state', 'Failed to save plugin state'],
+  load: ['could not load saved plugin state', 'Could not load saved plugin state'],
+  delete: ['could not delete stored plugin state', 'Could not delete stored plugin state'],
+};
+
+/** Entries THIS module marked as running on defaults because their saved
+ *  state could not be read — as opposed to a rejection the HOST reported,
+ *  which only the host can take back. */
+const markedUnreadable = new Set<string>();
 
 /** How long ONE plugin is given to answer a save-time `get_state`. */
 export const LIVE_STATE_CAPTURE_TIMEOUT_MS = 750;
@@ -333,7 +420,9 @@ export interface CaptureLiveVstStatesDeps {
   sessions?: () => VstLiveSession[];
   /** Is this entry's session live, and does it have an editor open? */
   liveRow?: (entryId: string) => { status: string; editorOpen: boolean } | undefined;
-  sink?: (entryId: string, rawState: string) => void;
+  /** Returns whether the state was actually written; a refused write (the
+   *  rejection guard) must not clear `stateDirty` below. */
+  sink?: (entryId: string, rawState: string) => boolean;
   timeoutMs?: number;
 }
 
@@ -392,16 +481,30 @@ export async function captureLiveVstStates(deps: CaptureLiveVstStatesDeps = {}):
             settled = true;
             clearTimeout(timer);
             session.stateSink = previous;
-            if (captured) {
-              sink(session.entryId, captured);
-              session.stateDirty = false;
-            } else {
-              console.warn(
-                `[vstLive] ${session.entryId}: plugin ${why} — the previously captured state is ` +
-                  'what this save records.',
-              );
+            // `resolve()` in a finally: the sink writes the store, and that
+            // write can throw (a capture too big for the localStorage quota).
+            // Before this, such a throw escaped between clearTimeout and
+            // resolve — the promise never settled and every save that awaited
+            // this hung for good (T18 re-audit, MAJOR 2).
+            try {
+              if (captured) {
+                // Only clear the flag when the sink actually wrote: a refused
+                // capture (the rejection guard) must leave `stateDirty` set so
+                // the next `relive`/`attachWorklet` and the next autosave keep
+                // trying rather than silently giving up on this session
+                // forever (T18 fifth audit, CRITICAL 1 secondary).
+                if (sink(session.entryId, captured)) session.stateDirty = false;
+              } else {
+                console.warn(
+                  `[vstLive] ${session.entryId}: plugin ${why} — the previously captured state is ` +
+                    'what this save records.',
+                );
+              }
+            } catch (err) {
+              console.warn(`[vstLive] ${session.entryId}: storing the captured state failed:`, err);
+            } finally {
+              resolve();
             }
-            resolve();
           };
           const timer = setTimeout(() => finish(null), timeoutMs);
           session.stateSink = (stateB64) => finish(stateB64);
@@ -459,7 +562,18 @@ async function drainSession(record: SessionRecord): Promise<string | null> {
       const res = await vstApi.editorResult(record.pluginPath);
       if (isTerminalStatus(res.status)) {
         if (res.status === 'ok' && res.raw_state) {
-          record.sink(record.entryId, res.raw_state);
+          // A sidecar opened on a `state-rejected` entry (both reads failed
+          // and no live host was available to retry through) starts the
+          // plugin at factory defaults; writing that capture through the
+          // caller's sink unconditionally would silently overwrite the
+          // still-intact stored blob with those defaults. `sinkLiveRawState`
+          // carries this same guard for the live path -- mirrored here
+          // because the caller's sink stamps `state_host: 'pedalboard'`,
+          // which `sinkLiveRawState` cannot do (T18 batch-12 note 2).
+          const row = useVstLiveStore.getState().entries[record.entryId];
+          if (row?.stateOrigin !== 'state-rejected') {
+            record.sink(record.entryId, res.raw_state);
+          }
           return res.raw_state;
         }
         return null;
@@ -544,8 +658,10 @@ async function openLiveEditor(
   // some other edit is folded into it, and one Ctrl+Z takes both back.
   session.gestureSink = (_index, begin) => {
     if (begin) beginUndoStep();
+    markUserMovedOnRejectedState(entry.id);
   };
   session.paramSink = (index, value) => {
+    markUserMovedOnRejectedState(entry.id);
     rec.pendingParams.set(index, value);
     if (rec.paramTimer) return;
     rec.paramTimer = window.setTimeout(() => {
@@ -589,10 +705,20 @@ async function openLiveEditor(
     ownerTab,
     mode: embedded ? 'embedded' : 'floating',
   });
+  // "processing the signal now" was an unconditional constant — it said so
+  // even when the row's own stateOrigin already knew the host had rejected
+  // the saved state and the plugin was running at its factory defaults
+  // (T18 fourth audit, MINOR 5: the open status line must report the real
+  // outcome, not an optimistic one).
+  const onDefaults = useVstLiveStore.getState().entries[entry.id]?.stateOrigin === 'state-rejected';
   status.setText(
     embedded
-      ? `VST GUI: ${name} embedding... (live)`
-      : `VST GUI: ${name} opened in its own window (live) - it is processing the signal now`,
+      ? `VST GUI: ${name} embedding... (live)${onDefaults ? ' - running at factory defaults, saved state was rejected' : ''}`
+      : `VST GUI: ${name} opened in its own window (live) - ${
+          onDefaults
+            ? 'running at factory defaults, saved state was rejected'
+            : 'it is processing the signal now'
+        }`,
   );
 }
 
@@ -679,6 +805,23 @@ export const useVstEditorStore = create<VstEditorState>()((set, get) => ({
 
   open: (entry, sinkRawState, opts) => {
     if (!entry.vst) return;
+    // A MIX entry's saved state arrives from IndexedDB a moment after startup;
+    // until it has, `entry.vst.raw_state` reads as "defaults", and both the
+    // live host and the offline sidecar would open the plugin on that. Wait,
+    // then open on the entry as it is NOW (with its state), if it still exists.
+    // An entry whose read FAILED gets one retry here: a transient read error
+    // then costs this open a moment, not the plugin's saved state (which no
+    // capture may overwrite while it counts as failed).
+    if (!opts?.stateReady && (!areVstStatesLoaded() || isVstStateUnresolved(entry.id))) {
+      void vstStatesLoaded
+        .then(() => retryVstStateLoad(entry.id))
+        .then(() => {
+          if (!chainEntryExists(entry.id)) return;
+          const fresh = useEffectChainStore.getState().chain.find((e) => e.id === entry.id);
+          get().open(fresh ?? entry, sinkRawState, { ...opts, stateReady: true });
+        });
+      return;
+    }
     if (get().entryId === entry.id && !opts?.offlineOnly) return; // already open for this entry
     // A different entry takes over: whatever session the editor was holding goes back.
     if (heldEntryId !== null && heldEntryId !== entry.id) releaseHold();
@@ -835,7 +978,20 @@ export const useVstEditorStore = create<VstEditorState>()((set, get) => ({
               if (gen !== sessionGen) return;
               if (res.status === 'ok' && res.raw_state) {
                 if (uncaptured?.gen === gen) uncaptured = null;
-                sinkRawState(entry.id, res.raw_state);
+                // Same `state-rejected` guard as `drainSession` above, for
+                // the same reason: an `unreadable` entry opened through the
+                // sidecar with no live host available starts at factory
+                // defaults, and this capture must not overwrite the stored
+                // blob with them (T18 batch-12 note 2).
+                // Same `state-rejected` guard as `drainSession` above, for
+                // the same reason: an `unreadable` entry opened through the
+                // sidecar with no live host available starts at factory
+                // defaults, and this capture must not overwrite the stored
+                // blob with them (T18 batch-12 note 2).
+                const row = useVstLiveStore.getState().entries[entry.id];
+                if (row?.stateOrigin !== 'state-rejected') {
+                  sinkRawState(entry.id, res.raw_state);
+                }
                 status.setText(`VST GUI: ${name} settings captured`);
                 clearEmbed();
                 return;
@@ -929,6 +1085,83 @@ useAppUiStore.subscribe((state, prevState) => {
   if (state.centerTab === prevState.centerTab) return;
   const s = useVstEditorStore.getState();
   if (s.entryId && s.ownerTab && state.centerTab !== s.ownerTab) s.close();
+});
+
+// FE-004: an operation on the IndexedDB plugin-state store failed — a
+// captured raw_state that could not be saved (from the sidecar path's poll()
+// below, or the live path's sinkLiveRawState above), a saved state that could
+// not be loaded at startup, or a stored state that could not be deleted
+// (effectChainStore). Previously a save rejection had no listener at all.
+// Surfaced two ways: the status bar always gets a line, and the entry's own
+// embed gets `error` set when it is the one currently open so VstEmbedHost
+// shows it instead of leaving the user to guess why the dialed-in sound did
+// not come back.
+// The other half of the plugin-state story, installed for the same reason
+// (effectChainStore cannot reach the live host without closing the rackEffects
+// import cycle):
+//
+//  - `unreadable`: the saved state could not be read, so whatever the host is
+//    running started from NOTHING and is at its factory defaults. The row says
+//    so — the same LIVE · DEFAULTS badge a host-rejected state gets — instead
+//    of the plugin quietly sounding wrong while its capture is refused every
+//    5 s in silence (T18 third audit, MAJOR 2).
+//  - `restored`: the state was read after the plugin had already started, so
+//    it is SENT to the running session before the refusal latch comes off.
+//    Without that the latch came off while the plugin was still at its
+//    defaults, and its next capture wrote those over the row that had just
+//    been read (T18 third audit, CRITICAL 1).
+//
+// What `restored` returning true does and does not mean (T18 fourth audit,
+// MAJOR 2). It means the state was HANDED OVER — not that the plugin took it.
+// The wire has no acknowledgement for `set_state`, and the client's send path
+// reports no transport failure, so there is nothing here to check against.
+// Asking the plugin for its state back and comparing is not an answer either:
+// plugins re-serialize, so a byte comparison would report a mismatch on a
+// perfectly restored plugin and refuse its captures for good. What actually
+// protects the row when a plugin does NOT take the state is the host saying
+// so: `sessionRegistry` records the rejection, and `sinkLiveRawState` above
+// refuses to capture a plugin whose row says it is on its defaults until the
+// user has moved something on it. A real round-trip belongs with a protocol
+// change that adds the acknowledgement, not here.
+setVstStateLoadListener({
+  unreadable: (entryId, reason) => {
+    markedUnreadable.add(entryId);
+    useVstLiveStore.getState().setStateOrigin(entryId, 'state-rejected', reason);
+    useStatusBarStore
+      .getState()
+      .setText(`VST GUI: a plugin is running at its factory defaults - ${reason}`);
+  },
+  restored: (entryId, rawState) => {
+    const session = liveSessionLookup(entryId);
+    if (!session) {
+      markedUnreadable.delete(entryId);
+      return true; // nothing is running: the next spawn gets the row
+    }
+    // Mark BEFORE the send: `sessionRegistry`'s rejection recorders gate on
+    // `session.stateSent`, and the host's refusal (or its `ready`/`warning`)
+    // can arrive as soon as `setState` is called. A late `restored()` never
+    // touches `slot.entry`, so without this the recorders had no way to know
+    // this plugin had just been handed a real blob, and a refusal of THIS
+    // delivery went unrecorded (T18 sixth audit, CRITICAL 1).
+    session.stateSent = true;
+    session.client.setState(rawState);
+    session.stateDirty = false;
+    // Only OUR mark is cleared here. A rejection the HOST reported stands
+    // until the host itself says otherwise — we have no way to know the
+    // plugin took this state.
+    if (markedUnreadable.delete(entryId)) useVstLiveStore.getState().setStateOrigin(entryId, 'live');
+    return true;
+  },
+});
+
+setVstStateStorageErrorHandler((entryId, error, op) => {
+  const message = describeVstStateStorageError(error);
+  const [line, banner] = STORAGE_FAILURE_WORDING[op];
+  const what = entryId === '*' ? line.replace('plugin state', 'plugin states') : line;
+  useStatusBarStore.getState().setText(`VST GUI: ${what} - ${message}`);
+  if (useVstEditorStore.getState().entryId === entryId) {
+    useVstEditorStore.setState({ error: `${banner}: ${message}` });
+  }
 });
 
 /** Is this chain entry still in the project: the mix chain, a track's rack, or the master VST chain? */

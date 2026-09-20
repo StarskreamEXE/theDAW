@@ -35,6 +35,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from backend.modules.vst import live_host as lh  # noqa: E402
+from backend.modules.vst import path_policy  # noqa: E402
 from backend.modules.vst import router as vst_router  # noqa: E402
 
 FAKE_HOST = Path(__file__).resolve().parent / "fake_vst_host.py"
@@ -44,12 +45,28 @@ FAKE_HOST = Path(__file__).resolve().parent / "fake_vst_host.py"
 def client() -> TestClient:
     app = FastAPI()
     app.include_router(vst_router.router, prefix="/api/vst")
-    return TestClient(app)
+    # The VST routes are loopback-gated (T03): TestClient's default peer is
+    # "testclient", which is not loopback, so name a real loopback peer the
+    # way tests/test_vst_b12.py does.
+    return TestClient(app, client=("127.0.0.1", 51000))
 
 
 @pytest.fixture
-def plugin_file(tmp_path: Path) -> Path:
-    path = tmp_path / "Vinyl.vst3"
+def vst3_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """An allowed VST3 root (R5-2, extended to ``/process-file``).
+
+    ``path_policy.allowed_roots`` is patched directly, the same thing
+    ``tests/test_vst_path_policy.py`` does.
+    """
+    root = tmp_path / "VST3"
+    root.mkdir()
+    monkeypatch.setattr(path_policy, "allowed_roots", lambda: [root.resolve()])
+    return root
+
+
+@pytest.fixture
+def plugin_file(vst3_root: Path) -> Path:
+    path = vst3_root / "Vinyl.vst3"
     path.write_bytes(b"only the path is validated by the route")
     return path
 
@@ -250,9 +267,11 @@ def test_thedaw_non_zero_exit_is_502_with_the_meaning_and_the_log_tail(
 
 
 def test_thedaw_missing_plugin_is_still_a_404_before_any_spawn(
-    client, tmp_path, wav_bytes, fake_host, render_root, pedalboard_spy
+    client, vst3_root, wav_bytes, fake_host, render_root, pedalboard_spy
 ):
-    resp = _post(client, tmp_path / "Nope.vst3", wav_bytes, state_host="thedaw")
+    # Inside the allowed root (so this exercises the "not found" branch, not
+    # the R5-2 containment check) but never created.
+    resp = _post(client, vst3_root / "Nope.vst3", wav_bytes, state_host="thedaw")
 
     assert resp.status_code == 404
     assert pedalboard_spy == []

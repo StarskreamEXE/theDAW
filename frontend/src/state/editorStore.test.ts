@@ -148,14 +148,32 @@ const clip = (over: Partial<AudioClip> = {}): AudioClip =>
 // A gesture is one undo step because the recorder coalesces changes closer than
 // 300 ms — but that same rule would fold a gesture into whatever edit happened
 // just before it. beginUndoStep cuts the burst so the next change starts fresh.
+//
+// The "within the coalescing window" half of this used to rely on the two
+// `setState` calls below actually landing inside 300 ms of REAL wall-clock
+// time — true on every ordinary run, but a GC pause or a loaded CI box can
+// stretch a few synchronous statements past 300 ms, and the coalescing
+// subscriber reads `performance.now()` directly (`editorStore.ts`'s write
+// tracker), so that would flip the "records nothing new" assertion (audit
+// MINOR #5 — flaked 1/15 in the batch-12 audit run). `performance.now` is
+// mocked to a FROZEN instant for this block instead, so the two writes are
+// unconditionally 0 ms apart and `beginUndoStep`'s own reset to `-Infinity`
+// (not the clock) is what proves the boundary — no real elapsed time is load
+// -bearing anywhere in this block.
 {
-  useEditorStore.setState({ clips: [clip()] });
-  const base = st()._undo.length;
-  useEditorStore.setState({ clips: [clip({ startSec: 1 })] });
-  assert.equal(st()._undo.length, base, 'a change within the coalescing window records nothing new');
-  beginUndoStep();
-  useEditorStore.setState({ clips: [clip({ startSec: 2 })] });
-  assert.equal(st()._undo.length, base + 1, 'beginUndoStep forces the next change to start a step');
+  const realNow = performance.now.bind(performance);
+  performance.now = () => 1000; // frozen: every read in this block is identical
+  try {
+    useEditorStore.setState({ clips: [clip()] });
+    const base = st()._undo.length;
+    useEditorStore.setState({ clips: [clip({ startSec: 1 })] });
+    assert.equal(st()._undo.length, base, 'a change within the coalescing window records nothing new');
+    beginUndoStep();
+    useEditorStore.setState({ clips: [clip({ startSec: 2 })] });
+    assert.equal(st()._undo.length, base + 1, 'beginUndoStep forces the next change to start a step');
+  } finally {
+    performance.now = realNow;
+  }
 }
 
 /** Seat a fixture and report the undo depth it left behind. It deliberately
@@ -450,34 +468,47 @@ const seed = () => {
   });
 };
 
-/* ── multi-select mirrors the single-select field ────────────────────────── */
+/* ── multi-select mirrors the single-select field (Unify F4) ─────────────────
+ * `setSelectedClips` and `setSelectedClipIds` used to be two setters for the
+ * same field, one of which forgot to filter unknown ids and the other of
+ * which forgot to move the focus — exactly the kind of drift the comment on
+ * `selectedClipIds` warned about. There is now one: `setSelectedClipIds`,
+ * with `{ focus: true }` for the "and move the anchor" case the assistant's
+ * `editor_select_clips` and `editor_select_range` need.                     */
 {
   seed();
   const api = useEditorStore.getState();
-  api.setSelectedClips(['c2', 'c3', 'c2']);
+  api.setSelectedClipIds(['c2', 'c3', 'c2'], { focus: true });
 
   const after = useEditorStore.getState();
   assert.deepEqual(after.selectedClipIds, ['c2', 'c3'], 'duplicates collapse');
   assert.equal(after.selectedClipId, 'c2', 'the first id stays readable by single-select consumers');
 
-  after.setSelectedClips([]);
+  after.setSelectedClipIds([], { focus: true });
   assert.deepEqual(useEditorStore.getState().selectedClipIds, []);
   assert.equal(useEditorStore.getState().selectedClipId, null, 'an empty selection clears, not strands');
 
+  // Unknown ids are dropped, same as every other plain `setSelectedClipIds`
+  // call — the old `setSelectedClips` never filtered these, which is the
+  // other half of the drift this unification closes.
+  useEditorStore.getState().setSelectedClipIds(['c1', 'nope'], { focus: true });
+  assert.deepEqual(useEditorStore.getState().selectedClipIds, ['c1'], 'an unknown id is dropped even with focus');
+  assert.equal(useEditorStore.getState().selectedClipId, 'c1');
+
   // `setSelected` moves the FOCUS (the marquee's anchor) and nothing else: the
-  // timeline sets the whole set with `setSelectedClipIds` and THEN names the
-  // anchor inside it, so a `setSelected` that narrowed the set would collapse
-  // every marquee to one clip. `setSelectedClips` is the setter that writes
-  // both, and it is the one the canvas and `editor_select_clips` share.
+  // timeline sets the whole set with plain `setSelectedClipIds` and THEN names
+  // the anchor inside it, so a `setSelected` that narrowed the set would
+  // collapse every marquee to one clip — which is why the default (no `focus`
+  // option) leaves `selectedClipId` alone.
   useEditorStore.getState().setSelectedClipIds(['c1', 'c2']);
   useEditorStore.getState().setSelected('c2');
   assert.deepEqual(useEditorStore.getState().selectedClipIds, ['c1', 'c2'], 'the anchor does not narrow the set');
   assert.equal(useEditorStore.getState().selectedClipId, 'c2');
 
-  useEditorStore.getState().setSelectedClips(['c1']);
+  useEditorStore.getState().setSelectedClipIds(['c1'], { focus: true });
   assert.deepEqual(useEditorStore.getState().selectedClipIds, ['c1']);
   assert.equal(useEditorStore.getState().selectedClipId, 'c1');
-  useEditorStore.getState().setSelectedClips([]);
+  useEditorStore.getState().setSelectedClipIds([], { focus: true });
   assert.deepEqual(useEditorStore.getState().selectedClipIds, []);
   useEditorStore.getState().setSelected(null);
   assert.equal(useEditorStore.getState().selectedClipId, null);
@@ -705,6 +736,50 @@ const label = (id: string) => useEditorStore.getState().clips.find((c) => c.id =
   // A group that writes nothing records nothing.
   useEditorStore.getState().undoGroup(() => undefined);
   assert.equal(depth(), 4);
+}
+
+// ── Structural ids are collision-safe under a synchronous burst ─────────────
+// `insertTrack`, `duplicateTrack`, `addFolderFromSelectedTracks` and `addBus`
+// used to build ids as `track-${Date.now()}-${random 0..999}` — two of them in
+// the SAME millisecond (explode-to-stems, "insert all N stems") only had 1000
+// buckets to avoid colliding in, and 300 bursts of 7 collided about 2% of the
+// time. They now use the store's `uid()` (crypto.randomUUID, or a Math.random
+// fallback with far more entropy than 1000 buckets).
+{
+  useEditorStore.setState({ tracks: [], clips: [], buses: [], _undo: [], _redo: [] });
+  const ids = new Set<string>();
+  for (let i = 0; i < 1000; i += 1) {
+    ids.add(useEditorStore.getState().insertTrack(0));
+  }
+  assert.equal(ids.size, 1000, '1000 synchronous insertTrack calls produce 1000 distinct ids');
+  assert.equal(useEditorStore.getState().tracks.length, 1000);
+
+  useEditorStore.setState({ tracks: [], clips: [], buses: [], _undo: [], _redo: [] });
+  const seedId = useEditorStore.getState().insertTrack(0);
+  const dupIds = new Set<string>();
+  for (let i = 0; i < 1000; i += 1) {
+    const id = useEditorStore.getState().duplicateTrack(seedId);
+    assert.ok(id, 'duplicateTrack succeeded');
+    dupIds.add(id!);
+  }
+  assert.equal(dupIds.size, 1000, '1000 synchronous duplicateTrack calls produce 1000 distinct ids');
+
+  useEditorStore.setState({ tracks: [], clips: [], buses: [], _undo: [], _redo: [] });
+  const t1 = useEditorStore.getState().insertTrack(0);
+  const folderIds = new Set<string>();
+  for (let i = 0; i < 1000; i += 1) {
+    const id = useEditorStore.getState().addFolderFromSelectedTracks([t1], `f${i}`);
+    assert.ok(id, 'addFolderFromSelectedTracks succeeded');
+    folderIds.add(id!);
+  }
+  assert.equal(folderIds.size, 1000, '1000 synchronous addFolderFromSelectedTracks calls produce 1000 distinct ids');
+
+  useEditorStore.setState({ tracks: [], clips: [], buses: [], _undo: [], _redo: [] });
+  const busIds = new Set<string>();
+  for (let i = 0; i < 1000; i += 1) {
+    busIds.add(useEditorStore.getState().addBus(`b${i}`));
+  }
+  assert.equal(busIds.size, 1000, '1000 synchronous addBus calls produce 1000 distinct ids');
 }
 
 console.log('editorStore extensions: ok');

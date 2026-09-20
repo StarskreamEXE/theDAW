@@ -49,10 +49,18 @@ def allowed_roots() -> list[Path]:
     return [root.resolve(strict=False) for root in _default_vst3_dirs()]
 
 
-def _root_contains(root: Path, resolved: Path) -> bool:
+def root_contains(root: Path, resolved: Path) -> bool:
     """Whether ``resolved`` sits inside ``root``, case-insensitively on
     Windows (an install under ``C:\\Program Files`` must match regardless of
-    how either side happens to be cased)."""
+    how either side happens to be cased).
+
+    Public: this is the one containment predicate for a resolved path against
+    a single allowed root, used both by ``check_plugin_path`` below and by
+    ``router._validated_scan_directory`` (which checks a scan directory
+    against every root in ``allowed_roots()`` rather than a plugin file
+    against a single ``.vst3`` root) — a second, router-local copy of the
+    same check would drift from this one.
+    """
     return Path(os.path.normcase(str(resolved))).is_relative_to(
         Path(os.path.normcase(str(root)))
     )
@@ -83,7 +91,7 @@ def check_plugin_path(raw: str) -> Path:
         raise PluginPathError(400, "Plugin path must be a .vst3 file or bundle.")
 
     roots = allowed_roots()
-    if not any(_root_contains(root, resolved) for root in roots):
+    if not any(root_contains(root, resolved) for root in roots):
         count = len(roots)
         noun = "directory" if count == 1 else "directories"
         raise PluginPathError(

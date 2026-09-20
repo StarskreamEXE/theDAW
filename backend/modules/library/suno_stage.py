@@ -1468,20 +1468,56 @@ def ensure_promotions(connection: sqlite3.Connection) -> None:
     connection.commit()
 
 
+def read_only_sqlite_uri(database: Path) -> str:
+    """Build a ``mode=ro`` SQLite URI for a WAL database opened for reading.
+
+    Two things a plain ``mode=ro`` open gets wrong for a WAL database that
+    has never had a reader before:
+
+    * SQLite still creates the ``-wal``/``-shm`` sidecars next to it on
+      first open, and a ``mode=ro`` connection cannot remove them again --
+      a dry run would leave litter next to a database it must not touch at
+      all. ``mode=ro&immutable=1`` tells SQLite the file will not change out
+      from under it, which skips that step entirely -- but only when no
+      ``-wal`` sidecar exists yet: with a real WAL file already there
+      (pending frames a writer has not checkpointed), an immutable open
+      would read a stale snapshot, so that case gets plain ``mode=ro``,
+      which still avoids WRITING (only the harmless sidecars already exist).
+
+    Raises :class:`ValueError` for a UNC root (``\\\\server\\share\\...``):
+    every caller refuses these explicitly, with its own error type, rather
+    than risk handing SQLite a URI that was never proven to open one.
+    """
+    resolved = database.resolve()
+    if resolved.drive.startswith("\\\\"):
+        raise ValueError(f"UNC path not supported for a read-only open: {resolved}")
+    uri = resolved.as_uri()
+    wal_sidecar = resolved.with_name(resolved.name + "-wal")
+    if wal_sidecar.is_file():
+        return f"{uri}?mode=ro"
+    return f"{uri}?mode=ro&immutable=1"
+
+
 def open_promotion_db(
     stage_root: Path, *, read_only: bool = False
 ) -> sqlite3.Connection:
     """Open ``stage_root``'s staging database for a promotion pass.
 
-    ``read_only=True`` opens the file through a ``mode=ro`` URI, so a dry run
-    cannot write the staging database even by accident, and a missing
-    ``promotions`` table is left missing rather than created.
+    ``read_only=True`` opens the file through a ``mode=ro`` (or, when safe,
+    ``mode=ro&immutable=1``) URI -- see :func:`read_only_sqlite_uri` -- so a
+    dry run cannot write the staging database even by accident, never leaves
+    fresh ``-wal``/``-shm`` sidecars next to it, and a missing ``promotions``
+    table is left missing rather than created.
     """
     database = stage_db_path(stage_root)
     if read_only:
         if not database.is_file():
             raise StagingDatabaseError(f"No staging database at {database}")
-        connection = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            uri = read_only_sqlite_uri(database)
+        except ValueError as exc:
+            raise StagingDatabaseError(str(exc)) from exc
+        connection = sqlite3.connect(uri, uri=True)
         connection.row_factory = sqlite3.Row
         try:
             marker = connection.execute(

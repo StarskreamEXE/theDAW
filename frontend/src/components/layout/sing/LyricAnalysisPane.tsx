@@ -22,10 +22,14 @@ import {
   SlidersHorizontal,
   Sparkles,
   Trash2,
+  Waves,
   X,
 } from 'lucide-react';
 import { useLibraryStore } from '../../../state/libraryStore';
 import { useLyricsStore } from '../../../state/lyricsStore';
+import { useLyricStudioStore } from '../../../state/lyricStudioStore';
+import { RhythmBlock } from '../RhythmBlock';
+import type { AnalysisSummary } from '../rhythmReport';
 import {
   DEVICE_FAMILIES,
   FAMILY_LABELS,
@@ -116,6 +120,36 @@ const mapSections = (doc: LyricAnalysisDoc, rows: SheetRow[]): SectionSummary[] 
 
 const pct = (v: number): string => `${Math.round(v * 100)}%`;
 const clamp01 = (v: number): number => (v < 0 ? 0 : v > 1 ? 1 : v);
+
+/** Which library entry (if any) the METER MAP popover should read. A hosted
+ *  host (LyricStudioView's writing surface, the LYRIC tab) has no track of
+ *  its own: its `entryId` prop is a lyric-NOTEBOOK document id, not a
+ *  library entry, so handing it straight to RhythmBlock made it call
+ *  `/api/rhythm/<that-id>` for audio that does not exist and offer a RUN
+ *  button for nothing. The notebook doc may still be LINKED to a real
+ *  library entry (lyricStudioStore.entryId, set by importFromEntry /
+ *  attachToEntry) — only that one is real audio, so it is the one used when
+ *  hosted; anything hosted with no link gets no meter map at all. */
+export const meterMapEntryId = (
+  hosted: boolean,
+  entryId: string | null,
+  linkedEntryId: string | null,
+): string | null => (hosted ? linkedEntryId : entryId);
+
+/** Title and analysis RhythmBlock should show for `meterEntryId`. Always the
+ *  TRACK's own title, not the notebook doc's (`fallbackTitle`) — the two are
+ *  unrelated strings in hosted/linked mode, and RhythmBlock's exports are
+ *  named from this title. Falls back to the notebook title, then "track",
+ *  only when no library entry was found (meterMapEntryId already prevents
+ *  that whenever it matters, by returning null instead; this is a safety net
+ *  for a stale/deleted entry, not the expected path). */
+export const rhythmBlockDisplay = (
+  meterEntry: { title: string; analysis?: Record<string, unknown> } | null,
+  fallbackTitle: string,
+): { title: string; analysis: AnalysisSummary | null } => ({
+  title: meterEntry?.title || fallbackTitle || 'track',
+  analysis: (meterEntry?.analysis as AnalysisSummary | undefined) ?? null,
+});
 
 /** Confidence as ink: the same ramp the karaoke overlay uses. */
 const alphaFor = (confidence: number): string => (0.34 + 0.66 * clamp01(confidence)).toFixed(2);
@@ -311,18 +345,30 @@ const BarPopover: React.FC<{
   onOpen?: () => void;
   /** Hide the word when the bar is narrow (under 1024px); the icon stays. */
   compact?: boolean;
+  /** w-96 instead of the default w-64, for a panel that needs the room (a
+   *  chart, not just a few controls). */
+  wide?: boolean;
   children: React.ReactNode;
-}> = ({ id, label, title, icon, align = 'left', on = false, onOpen, compact = false, children }) => {
+}> = ({ id, label, title, icon, align = 'left', on = false, onOpen, compact = false, wide = false, children }) => {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLSpanElement>(null);
   const keyRef = useRef<HTMLButtonElement>(null);
+  // Focus lands here when the dialog opens (WAI-ARIA dialog pattern).
+  // stopPropagation below guards against ancestor popovers this BarPopover
+  // might itself be nested inside (none today, but the meter-map instance
+  // sets the precedent); RhythmBlock's own SAVE menu, which it embeds, no
+  // longer competes for Escape — that stops its own via a React onKeyDown on
+  // its menu wrapper, not a second document listener.
+  const panelRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!open) return;
+    panelRef.current?.focus();
     const onDown = (e: PointerEvent) => {
       if (!rootRef.current?.contains(e.target as Node)) setOpen(false);
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
+      e.stopPropagation();
       setOpen(false);
       keyRef.current?.focus();
     };
@@ -355,10 +401,12 @@ const BarPopover: React.FC<{
       </button>
       {open && (
         <div
+          ref={panelRef}
           id={id}
           role="dialog"
           aria-label={title}
-          className={`et-opaque absolute top-full z-30 mt-1 flex w-64 flex-col gap-3 rounded-md border border-white/10 bg-[#0a080f] p-3 text-xs font-bold shadow-[0_8px_24px_rgba(0,0,0,0.6)] ${
+          tabIndex={-1}
+          className={`et-opaque absolute top-full z-30 mt-1 flex ${wide ? 'w-96' : 'w-64'} max-h-[70vh] flex-col gap-3 overflow-y-auto rounded-md border border-white/10 bg-[#0a080f] p-3 text-xs font-bold shadow-[0_8px_24px_rgba(0,0,0,0.6)] outline-none ${
             align === 'right' ? 'right-0' : 'left-0'
           }`}
         >
@@ -1837,6 +1885,19 @@ export const LyricAnalysisPane: React.FC<LyricAnalysisPaneProps> = ({
   );
   const entryId = entryIdProp ?? entry?.id ?? null;
   const title = titleProp ?? (entry && entry.id === entryId ? entry.title : entryId ?? '');
+  // The LYRIC tab's notebook doc (lyricStudioStore), read only for the METER
+  // MAP gate below — see meterMapEntryId. Harmless to read unconditionally:
+  // when this pane is NOT hosted by LyricStudioView, meterMapEntryId never
+  // looks at it.
+  const lyricStudioEntryId = useLyricStudioStore((s) => s.entryId);
+  const meterEntryId = meterMapEntryId(hosted, entryId, lyricStudioEntryId);
+  // Looked up fresh by meterEntryId, not reused from `entry` above: `entry`
+  // is the GLOBALLY selected library track, which in hosted (linked) mode is
+  // whatever the user last had open elsewhere in the app, not the track the
+  // notebook doc is linked to. RhythmBlock's key/tempo line and its title
+  // (the TRACK's title, not the notebook's) both come from this lookup.
+  const meterEntry = useLibraryStore((s) => (meterEntryId ? s.entries.find((e) => e.id === meterEntryId) ?? null : null));
+  const rhythmDisplay = rhythmBlockDisplay(meterEntry, title);
 
   // The words themselves live in the lyrics document the analysis was anchored
   // to; only take them when that document is for the same entry.
@@ -2587,6 +2648,25 @@ export const LyricAnalysisPane: React.FC<LyricAnalysisPaneProps> = ({
               </button>
             )}
           </>
+        )}
+
+        {/* Independent of `doc`: the meter map reads the audio's rhythm, not
+            the lyric findings, so it belongs on the bar whether or not an
+            analysis has run. Same RhythmBlock the library menu (save-meter-
+            map) and DETAILS already embed — not a second implementation.
+            Gated on meterEntryId, not entryId: hosted (LYRIC tab) has no
+            track of its own unless its notebook doc is linked to one. */}
+        {meterEntryId && (
+          <BarPopover
+            id={`la-meter-${uid}`}
+            label="Meter map"
+            title="Metamorphic meter map: time signature per section, tempo segments, syncopation, swing"
+            icon={<Waves className="size-3.5" aria-hidden="true" />}
+            wide
+            compact
+          >
+            <RhythmBlock entryId={meterEntryId} title={rhythmDisplay.title} analysis={rhythmDisplay.analysis} />
+          </BarPopover>
         )}
 
         <span className="flex-1" />

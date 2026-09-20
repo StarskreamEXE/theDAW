@@ -26,14 +26,14 @@ import { List, type ListImperativeAPI, type RowComponentProps } from 'react-wind
 import {
   Disc, Play, Pause, Plus, Save, Trash2, Cast, Music2, Square,
   ChevronDown, ChevronRight, Magnet, Gauge, Lock,
-  KeyRound, Pencil, Search, Library as LibraryIcon, ListMusic, Layers, Sparkles, Download, Link2, Loader2, Shield, Headphones, Piano, X, Scissors, ArrowDownAZ, Plug, Wand2, Ban,
+  KeyRound, Pencil, Search, Library as LibraryIcon, ListMusic, Sparkles, Download, Link2, Loader2, Shield, Headphones, Piano, X, Scissors, ArrowDownAZ, Plug, Wand2, Ban, Settings2, Repeat,
 } from 'lucide-react';
 import { subscribeToMidi } from '../state/midiBus';
 import { useDjControlMap, sigLabel, type MidiKind, type MidiSig } from '../state/djControlMap';
 import { midiIgnoreLabel, useMidiIgnoreStore } from '../state/midiIgnoreStore';
 import { enableMidi } from '../state/midiTriggerStore';
 import { useMidiDevicesStore } from '../state/midiDevicesStore';
-import { useDjSampler } from '../state/djSamplerStore';
+import { useDjSampler, type SamplerPad } from '../state/djSamplerStore';
 import { useDjSideList } from '../state/djSideListStore';
 import { useFeatureToggleStore } from '../state/featureToggleStore';
 import { IoGlobalSelect } from '../components/audio/IoDeviceSelect';
@@ -95,6 +95,64 @@ const AUTO_GAIN_TARGET_DB = -12;
 const AUTOMIX_TAIL = 18;   // s before a track ends to begin the blend
 const AUTOMIX_XFADE = 10;  // s the auto-crossfade takes
 const STOP_CUE_EPS = 0.05; // treat cue hits inside 50ms as "at this cue"
+
+/** Keeps a ref pointed at the LATEST `value` on every render, so a long-lived
+ *  effect that deliberately does not re-subscribe on every render (e.g. the
+ *  automix interval below, which must not restart the sequence on every
+ *  deck-state change) can still read `ref.current` and get the function from
+ *  the render that just committed, instead of the one it closed over when it
+ *  last (re)subscribed. Exported so the pattern itself is testable in
+ *  isolation from djEngine. */
+export function useLatestRef<T>(value: T): React.RefObject<T> {
+  const ref = useRef(value);
+  ref.current = value;
+  return ref;
+}
+
+/** Automix (D7): should the outgoing deck blend into the incoming one right
+ *  now? A prepared set's exact `mixOut` point on the outgoing track wins when
+ *  present; otherwise it's due `tailSec` before the outgoing track ends. The
+ *  assistant's "transition NOW" request (`pendingTransition`) jumps the blend
+ *  early. Either way, the incoming deck must actually have a decoded buffer
+ *  and the outgoing deck must be playing, or there is nothing to blend. Pure
+ *  so the automix interval's decision is testable without the engine. */
+export function automixTransitionDue(args: {
+  playing: boolean;
+  currentTime: number;
+  duration: number;
+  mixOut: number | null | undefined;
+  tailSec: number;
+  pendingTransition: boolean;
+  incomingHasBuffer: boolean;
+}): boolean {
+  if (!args.playing || !args.incomingHasBuffer) return false;
+  const due = args.mixOut != null
+    ? args.currentTime >= args.mixOut
+    : args.duration > 0 && args.duration - args.currentTime <= args.tailSec;
+  return due || args.pendingTransition;
+}
+
+/** One djEngine call the automix transition into `nxt` must make, in order. */
+export type AutomixTransitionStep =
+  | { type: 'seek'; deck: djEngine.DeckId; to: number }
+  | { type: 'play'; deck: djEngine.DeckId }
+  | { type: 'sync'; deck: djEngine.DeckId };
+
+/** The ordered engine calls an automix transition into `nxt` makes: seek to
+ *  the incoming track's start point, start it playing, THEN beatmatch it.
+ *  `sync` must come after `play` — syncDeck's phase-align branch (see
+ *  syncDeck below) only nudges playback into phase when BOTH decks already
+ *  read as playing; called before `play`, the incoming deck always reads
+ *  not-playing there, so only the tempo (pitch) half of the beatmatch would
+ *  ever apply and phase never would. Pure so the ORDER is testable without
+ *  the engine. */
+export function automixTransitionSteps(nxt: djEngine.DeckId, cueIn: number): AutomixTransitionStep[] {
+  return [
+    { type: 'seek', deck: nxt, to: cueIn },
+    { type: 'play', deck: nxt },
+    { type: 'sync', deck: nxt },
+  ];
+}
 const PITCH_RANGES = [10, 15] as const;
 type PitchRange = typeof PITCH_RANGES[number];
 
@@ -878,6 +936,14 @@ export const DJView: React.FC = () => {
     setFlash(`BPM Sync: Deck ${follower} follows Deck ${master} at ${masterEffBpm.toFixed(1)} BPM`);
     return follower;
   };
+  // syncDeck closes over ctlA/ctlB/deckAPitch/deckBPitch, so it is redefined
+  // every render. The automix interval effect below only re-subscribes on
+  // [automixOn, automixRestart] (by design — it must not restart the sequence
+  // on every tick), so calling `syncDeck` directly from inside it would freeze
+  // the beatmatch at whatever deck state existed the moment automix turned on.
+  // Read the CURRENT function through a ref instead (same pattern as
+  // deckATrackRef below) so every tick beatmatches against live deck state.
+  const syncDeckRef = useLatestRef(syncDeck);
   const toggleSyncLock = (which: djEngine.DeckId) => {
     const synced = syncDeck(which);
     if (!synced) return;
@@ -1128,20 +1194,36 @@ export const DJView: React.FC = () => {
         loadNextAfter(outEntry, nxt);
         const outPerf = perfOf(outEntry);
         // Prepared sets carry an exact mix-out point on the OUTGOING track;
-        // classic sets use the fixed distance-from-end rule.
-        let due = outPerf?.mixOut != null
-          ? cs.currentTime >= outPerf.mixOut
-          : cs.duration > 0 && cs.duration - cs.currentTime <= AUTOMIX_TAIL;
-        // Assistant override: "transition NOW" jumps the blend regardless of
-        // the prepared mix-out point (consumed only once it can actually act).
-        if (!due && useDjAutomix.getState().pendingTransition && ns.hasBuffer) due = true;
-        if (cs.playing && due && ns.hasBuffer) {
+        // classic sets use the fixed distance-from-end rule. Assistant
+        // override: "transition NOW" jumps the blend regardless of the
+        // prepared mix-out point (consumed only once it can actually act).
+        const shouldTransition = automixTransitionDue({
+          playing: cs.playing,
+          currentTime: cs.currentTime,
+          duration: cs.duration,
+          mixOut: outPerf?.mixOut,
+          tailSec: AUTOMIX_TAIL,
+          pendingTransition: useDjAutomix.getState().pendingTransition,
+          incomingHasBuffer: ns.hasBuffer,
+        });
+        if (shouldTransition) {
           useDjAutomix.getState().consumeTransition();
           const incomingEntryId = nextEntryIdAfter(outEntry);
           const inPerf = incomingEntryId ? perfOf(incomingEntryId) : undefined;
-          syncDeck(nxt);              // beatmatch the incoming deck to the outgoing tempo + phase
-          djEngine.seekDeck(nxt, inPerf?.cueIn ?? 0);
-          djEngine.playDeck(nxt);
+          // Dispatches automixTransitionSteps' order verbatim — seek, then
+          // play, THEN sync — rather than three calls written out by hand,
+          // so the tested order and the executed order can never drift
+          // apart. syncDeck's phase-align branch (see syncDeck above,
+          // `masterStatus.playing && followerStatus.playing`) only nudges
+          // playback into phase when BOTH decks already read as playing —
+          // dispatched before `play`, the incoming deck always reads
+          // not-playing there, so only the tempo (pitch) half of the
+          // beatmatch would ever apply and phase never would.
+          for (const step of automixTransitionSteps(nxt, inPerf?.cueIn ?? 0)) {
+            if (step.type === 'seek') djEngine.seekDeck(step.deck, step.to);
+            else if (step.type === 'play') djEngine.playDeck(step.deck);
+            else syncDeckRef.current(step.deck);   // via ref: see syncDeckRef
+          }
           mix.fading = true; mix.fadeStart = now; mix.fadeFrom = djEngine.getCrossfade(); mix.fadeTo = nxt === 'B' ? 1 : -1;
           mix.fadeSec = outPerf?.transitionSec != null && outPerf.transitionSec > 0 ? outPerf.transitionSec : AUTOMIX_XFADE;
           setFlash(`Automix: blending → Deck ${nxt}`);
@@ -1218,8 +1300,20 @@ export const DJView: React.FC = () => {
         />
       )}
       {/* In flow — as an absolute bottom-right overlay it covered the
-          library's "load onto deck" buttons. */}
-      <div className="shrink-0 flex justify-end px-2 py-0.5 border-t border-white/5 bg-black/40">
+          library's "load onto deck" buttons. The flash status line (BPM
+          sync, automix state, import/eject results, set additions, …) lives
+          here too, on the empty left side of this bar: an absolute overlay
+          over the console (the first place this was tried) sat on top of
+          the Modes row (pitchRange/qtz/automix, mixToggles in
+          defaultDjLayout above) and hid it right after those controls were
+          pressed. The wrapper is always mounted with `role="status"` so a
+          screen reader hears every message — only the text inside is
+          conditional — instead of the whole live region appearing already
+          filled each time. */}
+      <div className="shrink-0 flex items-center justify-between gap-2 px-2 py-0.5 border-t border-white/5 bg-black/40">
+        <div role="status" aria-live="polite" className="min-w-0 flex-1">
+          {flash && <span className="block truncate text-[10px] font-mono font-bold text-purple-300">{flash}</span>}
+        </div>
         <InfiNightCredit feature="DJ" />
       </div>
     </div>
@@ -1327,15 +1421,45 @@ const PlatterDropTarget: React.FC<{
 /* ═══════════════════════════════ SamplerRail ════════════════════════════════ */
 
 const SAMPLER_SLOTS = 10;
+// A single instance of the pad-options panel ever mounts at once (whichever
+// pad is `editingPad`), so every pad's gear button can share one id.
+const SAMPLER_PAD_OPTIONS_ID = 'dj-sampler-pad-options';
+
+/** The per-pad options (gain/loop/choke) a persisted pad carries into
+ *  `djEngine.triggerSample`. An absent pad (nothing assigned yet) or an
+ *  absent field defaults to a plain, non-looping, non-choking one-shot at
+ *  full volume — exactly the behavior before per-pad options existed, so an
+ *  untouched pad's playback never changes. Pure so the defaulting is
+ *  testable without the audio engine. */
+export function samplerTriggerOpts(pad: Pick<SamplerPad, 'gain' | 'loop' | 'choke'> | undefined): { gain: number; loop: boolean; choke: boolean } {
+  return { gain: pad?.gain ?? 1, loop: !!pad?.loop, choke: !!pad?.choke };
+}
+
+/** What a press of the pad options panel's Loop toggle should do. djEngine
+ *  only stops a looping voice when the NEXT trigger carries `loop: true`
+ *  (djEngine.ts:894 — `if (opts.loop && ... > 0) { stopSample(padId); return; }`)
+ *  — pressing the pad again fires the option's re-press-to-stop behavior.
+ *  Flipping the stored option to `false` while a right-click hasn't cleared
+ *  the pad left a looping voice with no way to press it again into silence,
+ *  since the next press would now trigger a plain one-shot instead of
+ *  hitting that stop branch. Turning Loop OFF here must stop the pad
+ *  directly instead. Pure so the toggle is testable without the engine. */
+export function samplerLoopToggle(currentLoop: boolean): { loop: boolean; stopSample: boolean } {
+  const loop = !currentLoop;
+  return { loop, stopSample: !loop };
+}
 
 /** Sampler bank (D7): 10 one-shot pads. Drop a library track — or an audio file
  *  from the desktop, which imports to the library first — onto a pad to load
  *  it; click fires it (polyphonic, through the DJ master); right-click clears.
- *  Pad→track assignments persist (djSamplerStore); buffers re-decode on mount. */
+ *  Pad→track assignments persist (djSamplerStore); buffers re-decode on mount.
+ *  A loaded pad's gear icon opens its gain/loop/choke controls inline. */
 const SamplerRail: React.FC = () => {
   const pads = useDjSampler((s) => s.pads);
   const setPad = useDjSampler((s) => s.setPad);
+  const setPadOpts = useDjSampler((s) => s.setPadOpts);
   const clearPad = useDjSampler((s) => s.clearPad);
+  const [editingPad, setEditingPad] = useState<number | null>(null);
   const entries = useLibraryStore((s) => s.entries);
   const lookupVersion = useLibraryStore((s) => s.lookupVersion);
   const [over, setOver] = useState<number | null>(null);
@@ -1392,25 +1516,96 @@ const SamplerRail: React.FC = () => {
         {Array.from({ length: SAMPLER_SLOTS }, (_, i) => {
           const pad = pads[i];
           return (
-            <button key={i} type="button"
-              onClick={() => { if (pad) djEngine.triggerSample(`sampler:${i}`); }}
-              onContextMenu={(e) => { e.preventDefault(); if (pad) { djEngine.clearSample(`sampler:${i}`); clearPad(i); } }}
-              onDragOver={(e) => { if (dropHasLibraryOrFiles(e.dataTransfer, [DJ_TRACK_MIME])) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; setOver(i); } }}
-              onDragLeave={() => setOver((o) => (o === i ? null : o))}
-              onDrop={(e) => void drop(i, e)}
-              title={pad ? `${pad.name} — click to fire, right-click to clear` : 'Drop a library track or an audio file here to load a one-shot'}
-              className={`flex flex-col items-center justify-center gap-0.5 rounded-md border py-1.5 transition-colors active:scale-95 ${
-                over === i ? 'border-amber-400/70 bg-amber-500/15'
-                  : pad ? 'border-amber-500/40 bg-amber-500/8 text-amber-200 hover:bg-amber-500/15'
-                    : 'border-white/10 bg-black/40 text-zinc-600 hover:border-white/20'
-              }`}>
-              <span className="text-[11px] font-black leading-none">{i === 9 ? 0 : i + 1}</span>
-              <span className="text-[7px] font-mono uppercase tracking-wide leading-none truncate max-w-full px-0.5">{pad ? pad.name : '—'}</span>
-            </button>
+            <div key={i} className="relative min-w-0 min-h-0">
+              <button type="button"
+                onClick={() => { if (pad) djEngine.triggerSample(`sampler:${i}`, samplerTriggerOpts(pad)); }}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  if (!pad) return;
+                  djEngine.clearSample(`sampler:${i}`);
+                  clearPad(i);
+                  setEditingPad((p) => (p === i ? null : p));
+                }}
+                onDragOver={(e) => { if (dropHasLibraryOrFiles(e.dataTransfer, [DJ_TRACK_MIME])) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; setOver(i); } }}
+                onDragLeave={() => setOver((o) => (o === i ? null : o))}
+                onDrop={(e) => void drop(i, e)}
+                title={pad ? `${pad.name} — click to fire, right-click to clear` : 'Drop a library track or an audio file here to load a one-shot'}
+                className={`w-full h-full flex flex-col items-center justify-center gap-0.5 rounded-md border py-1.5 transition-colors active:scale-95 ${
+                  over === i ? 'border-amber-400/70 bg-amber-500/15'
+                    : pad ? 'border-amber-500/40 bg-amber-500/8 text-amber-200 hover:bg-amber-500/15'
+                      : 'border-white/10 bg-black/40 text-zinc-600 hover:border-white/20'
+                }`}>
+                <span className="text-[11px] font-black leading-none">{i === 9 ? 0 : i + 1}</span>
+                <span className="text-[7px] font-mono uppercase tracking-wide leading-none truncate max-w-full px-0.5">{pad ? pad.name : '—'}</span>
+              </button>
+              {/* A sibling, not a child of the pad button — a nested button is
+                  invalid DOM (see the Sets-row comment further down this file
+                  for the same constraint). */}
+              {pad && (
+                <button type="button"
+                  onClick={() => setEditingPad((p) => (p === i ? null : i))}
+                  aria-expanded={editingPad === i}
+                  aria-controls={SAMPLER_PAD_OPTIONS_ID}
+                  aria-label={`Pad ${i === 9 ? 0 : i + 1} gain, loop and choke options`}
+                  title="Gain / loop / choke options"
+                  className={`absolute top-0.5 right-0.5 rounded p-0.5 ${editingPad === i ? 'text-amber-100 bg-black/50' : 'text-amber-300/60 hover:text-amber-100 hover:bg-black/40'}`}>
+                  <Settings2 className="w-2.5 h-2.5" />
+                </button>
+              )}
+            </div>
           );
         })}
       </div>
-      <div className="shrink-0 px-1.5 pb-1.5 text-[7px] font-mono text-zinc-600 text-center">click fires · right-click clears</div>
+      {editingPad != null && pads[editingPad] && (() => {
+        const i = editingPad;
+        const pad = pads[i] as SamplerPad;
+        const opts = samplerTriggerOpts(pad);
+        const gainId = `dj-sampler-gain-${i}`;
+        return (
+          <div id={SAMPLER_PAD_OPTIONS_ID} className="shrink-0 border-t border-white/5 px-1.5 py-1.5 flex flex-col gap-1">
+            <div className="flex items-center justify-between gap-1">
+              <span className="min-w-0 truncate text-[8px] font-mono uppercase tracking-wide text-amber-200">Pad {i === 9 ? 0 : i + 1} · {pad.name}</span>
+              <button type="button" onClick={() => setEditingPad(null)} aria-label="Close pad options" title="Close" className="shrink-0 text-zinc-500 hover:text-zinc-200">
+                <X className="w-2.5 h-2.5" />
+              </button>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <label htmlFor={gainId} className="shrink-0 text-[7px] font-mono uppercase tracking-wide text-zinc-500">Gain</label>
+              <input
+                id={gainId}
+                name={gainId}
+                type="range"
+                min={0}
+                max={1}
+                step={0.01}
+                value={opts.gain}
+                onChange={(e) => setPadOpts(i, { gain: Number(e.target.value) })}
+                className="flex-1 accent-amber-400"
+              />
+              <span className="w-7 shrink-0 text-right text-[7px] font-mono tabular-nums text-zinc-400">{Math.round(opts.gain * 100)}%</span>
+            </div>
+            <div className="flex items-center gap-1">
+              <button type="button" aria-pressed={opts.loop} onClick={() => {
+                const { loop, stopSample } = samplerLoopToggle(opts.loop);
+                setPadOpts(i, { loop });
+                if (stopSample) djEngine.stopSample(`sampler:${i}`);
+              }}
+                className={`flex-1 flex items-center justify-center gap-1 rounded border px-1 py-0.5 text-[7px] font-black uppercase tracking-wide ${
+                  opts.loop ? 'border-amber-400/70 bg-amber-500/20 text-amber-200' : 'border-white/10 text-zinc-500 hover:text-zinc-200 hover:border-white/25'
+                }`} title="Loop the sample; re-press the pad to stop">
+                <Repeat className="w-2.5 h-2.5" /> Loop
+              </button>
+              <button type="button" aria-pressed={opts.choke} onClick={() => setPadOpts(i, { choke: !opts.choke })}
+                className={`flex-1 flex items-center justify-center gap-1 rounded border px-1 py-0.5 text-[7px] font-black uppercase tracking-wide ${
+                  opts.choke ? 'border-amber-400/70 bg-amber-500/20 text-amber-200' : 'border-white/10 text-zinc-500 hover:text-zinc-200 hover:border-white/25'
+                }`} title="Choke group: firing this pad cuts every other choke pad">
+                <Ban className="w-2.5 h-2.5" /> Choke
+              </button>
+            </div>
+          </div>
+        );
+      })()}
+      <div className="shrink-0 px-1.5 pb-1.5 text-[7px] font-mono text-zinc-600 text-center">click fires · right-click clears · gear = gain/loop/choke</div>
     </div>
   );
 };
@@ -1432,11 +1627,7 @@ const DeckTimes: React.FC<{ deckId: djEngine.DeckId; mirror?: boolean }> = ({ de
   );
 };
 
-/* ═══════════════════════════════ DeckRack (FX + STEMS, scaffold) ════════════ */
-
-const DJ_FX: Array<{ key: djEngine.DjFx; label: string }> = [
-  { key: 'flanger', label: 'Flng' }, { key: 'reverb', label: 'Verb' }, { key: 'wahwah', label: 'Wah' },
-];
+/* ═══════════════════════════════ OnboardFxPanel (FX + STEMS) ════════════════ */
 const FX_PAD_BT = 'w-full h-full px-1 py-1 text-[7px] min-w-0 tracking-normal leading-tight';
 const STEM_COUNT_OPTIONS = [2, 4, 6, 12] as const;
 type StemCount = typeof STEM_COUNT_OPTIONS[number];
@@ -1609,187 +1800,6 @@ const StemPadBank: React.FC<{ deck: djEngine.DeckId; entryId: string | null; col
   return (
     <div className="h-full w-full min-w-0 min-h-0 grid grid-cols-4 grid-rows-2 gap-1 p-0.5">
       {(mirror ? [...cells].reverse() : cells).map((cell) => cell)}
-    </div>
-  );
-};
-
-const DeckRack: React.FC<{ deck: 'A' | 'B'; accent: 'purple' | 'cyan'; entryId: string | null; ctl: DeckCtl }> = ({ deck, accent, entryId, ctl }) => {
-  const accentText = accent === 'purple' ? 'text-purple-300' : 'text-cyan-300';
-  const color = DECK_RGB[accent];
-  const hasTrack = !!entryId;
-  // Deck A's rack sits on the left — push its contents to the right (toward the
-  // center) so A and B mirror symmetrically around the browser.
-  const toCenter = deck === 'A';
-  // Per-deck FX wet amounts (0..1), wired live to the engine (D5). Lazy-builds
-  // the deck's FX rack on first non-zero touch.
-  const [fx, setFx] = useState<Record<string, number>>({ flanger: 0, reverb: 0, wahwah: 0 });
-  const onFx = (k: djEngine.DjFx, v: number) => { setFx((p) => ({ ...p, [k]: v })); djEngine.setDeckFx(deck, k, v); };
-  const triggerFx = (k: djEngine.DjFx, amount = 0.72) => onFx(k, fx[k] > 0.001 ? 0 : amount);
-
-  // Live stems (D4): load (separate if needed) cached stems, then per-stem faders.
-  const stemSettings = useFeatureToggleStore((s) => s.settings.stems);
-  const [stemNames, setStemNames] = useState<string[]>(() => djEngine.getDeckStemNames(deck));
-  const [stemLevels, setStemLevels] = useState<Record<string, number>>({});
-  const [stemCount, setStemCount] = useState<StemCount>(() => toStemCount(stemSettings.default_count));
-  const [stemBusy, setStemBusy] = useState(false);
-  const [stemMsg, setStemMsg] = useState<string | null>(null);
-  useEffect(() => { setStemCount(toStemCount(stemSettings.default_count)); }, [stemSettings.default_count]);
-  // The engine clears stems on track change (loadDeck) and pad toggles can change
-  // levels outside this rack, so mirror the live engine stem state here.
-  useEffect(() => djEngine.subscribe((sa, sb) => {
-    const st = deck === 'A' ? sa : sb;
-    setStemNames((p) => (sameStringArray(p, st.stems) ? p : st.stems));
-    setStemLevels((p) => (sameNumberRecord(p, st.stemLevels) ? p : st.stemLevels));
-  }), [deck]);
-  useEffect(() => { setStemMsg(null); }, [entryId]);
-  const loadStems = async () => {
-    if (!entryId || stemBusy) return;
-    setStemBusy(true); setStemMsg('checking cached stems');
-    try {
-      const device = stemSettings.device || 'auto';
-      const quality = stemSettings.quality || 'balanced';
-      const refs = await prepareStems(
-        entryId,
-        { stems: stemCount, device, quality },
-        (pct, phase) => setStemMsg(`${phase.replace(/_/g, ' ')}${pct > 0 ? ` ${pct}%` : ''}`),
-      );
-      if (!refs.length) { setStemMsg('no stems'); return; }
-      setStemMsg('loading stems');
-      const names = await djEngine.loadDeckStems(deck, refs);
-      setStemNames(names);
-      setStemLevels(Object.fromEntries(names.map((n) => [n, 1])));
-      setStemMsg(null);
-    } catch (e) {
-      setStemMsg(e instanceof Error ? e.message.slice(0, 36) : 'failed');
-    } finally { setStemBusy(false); }
-  };
-  const abortStems = async () => {
-    if (!entryId || !stemBusy) return;
-    setStemMsg('aborting');
-    try { await fetch(`/api/stems/${encodeURIComponent(entryId)}/abort`, { method: 'POST' }); }
-    catch { /* the running request will surface the final state */ }
-  };
-  const onStem = (name: string, v: number) => { setStemLevels((p) => ({ ...p, [name]: v })); djEngine.setStemGain(deck, name, v); };
-  const stemActionLabel = stemBusy ? 'Running' : stemNames.length >= stemCount ? 'Reload' : 'Separate';
-
-  return (
-    <div className="hardware-card flex flex-col min-h-0 overflow-hidden">
-      <div className={`shrink-0 flex items-center gap-1.5 px-2 py-1 border-b border-white/5 ${toCenter ? 'flex-row-reverse' : ''}`}>
-        <Layers className={`w-3 h-3 shrink-0 ${accentText}`} />
-        <span className={`text-[9px] font-black uppercase tracking-wider ${accentText}`}>Onboard FX · Stems {deck}</span>
-      </div>
-      <div className={`flex-1 min-h-0 flex flex-col gap-1.5 p-1.5 overflow-hidden ${toCenter ? 'items-end' : 'items-start'}`}>
-        <div className="w-full min-w-0 border-b border-white/5 pb-1.5">
-          <div className={`mb-1 flex items-center gap-1.5 ${toCenter ? 'flex-row-reverse text-right' : ''}`}>
-            <Sparkles className={`w-3 h-3 ${accentText}`} />
-            <span className={`text-[8px] font-black uppercase tracking-widest ${accentText}`}>Onboard FX</span>
-          </div>
-          <div className="w-full min-w-0 grid grid-cols-2 gap-1">
-            <div className={`min-w-0 ${toCenter ? 'text-right' : ''}`}>
-              <div className="mb-0.5 flex items-center gap-1 text-[7px] font-black uppercase tracking-widest text-zinc-500">
-                <Magnet className="w-2.5 h-2.5" />
-                <span>Beat Grid</span>
-              </div>
-              <div className="grid grid-cols-4 gap-1">
-                {([[-4, '«4'], [-1, '‹1'], [1, '1›'], [4, '4»']] as const).map(([n, label]) => (
-                  <SlidePad key={label} className={FX_PAD_BT} color={color} disabled={!hasTrack} onClick={() => ctl.beatJump(n)} title={`Jump ${n > 0 ? '+' : ''}${n} beat${Math.abs(n) === 1 ? '' : 's'} on the beat grid`}>
-                    {label}
-                  </SlidePad>
-                ))}
-              </div>
-            </div>
-            <div className={`min-w-0 ${toCenter ? 'text-right' : ''}`}>
-              <div className="mb-0.5 flex items-center gap-1 text-[7px] font-black uppercase tracking-widest text-zinc-500">
-                <Link2 className="w-2.5 h-2.5" />
-                <span>Loop Roll</span>
-              </div>
-              <div className="grid grid-cols-3 gap-1">
-                {ROLL_SIZES.map((b) => (
-                  <SlidePad
-                    key={b.label}
-                    className={FX_PAD_BT}
-                    color={color}
-                    disabled={!hasTrack}
-                    onPointerDown={(e) => { e.preventDefault(); ctl.rollDown(b.beats); }}
-                    onPointerUp={ctl.rollUp}
-                    onPointerLeave={(e) => { if (e.buttons) ctl.rollUp(); }}
-                    title={`${b.label}-beat loop-roll (hold)`}
-                  >
-                    {b.label}
-                  </SlidePad>
-                ))}
-              </div>
-            </div>
-          </div>
-          <div className="mt-1 grid grid-cols-[1fr_auto] gap-1 items-center">
-            <div className="grid grid-cols-2 gap-1">
-              <SlidePad className={FX_PAD_BT} on={fx.flanger > 0.001} color={color} disabled={!hasTrack} onClick={() => triggerFx('flanger')} title="Trigger deck flanger">
-                Flanger
-              </SlidePad>
-              <SlidePad className={FX_PAD_BT} on={fx.reverb > 0.001} color={color} disabled={!hasTrack} onClick={() => triggerFx('reverb', 0.65)} title="Trigger deck reverb">
-                Reverb
-              </SlidePad>
-            </div>
-            <div className={`grid grid-cols-3 gap-1 place-items-center w-fit ${toCenter ? 'justify-self-start' : 'justify-self-end'}`}>
-              {DJ_FX.map(({ key, label }) => (
-                <SlideKnob key={key} label={label} value={fx[key]} onChange={(v) => onFx(key, v)} min={0} max={1} step={0.01} size={30} centerReadout />
-              ))}
-            </div>
-          </div>
-        </div>
-        {/* Live stems (D4) — per-stem gain faders, or a load/separate button */}
-        <div className="mt-auto w-full min-h-0">
-          <div className={`flex flex-wrap items-center gap-1 mb-1 min-w-0 ${toCenter ? 'flex-row-reverse' : ''}`}>
-            <span className="text-[7px] font-black uppercase tracking-widest text-zinc-500">Stems</span>
-            <div className={`flex items-center gap-0.5 ${toCenter ? 'flex-row-reverse' : ''}`}>
-              {STEM_COUNT_OPTIONS.map((count) => (
-                <button
-                  key={count}
-                  onClick={() => setStemCount(count)}
-                  disabled={stemBusy}
-                  className={`h-5 min-w-5 rounded border px-1 text-[7px] font-black tabular-nums leading-none ${
-                    stemCount === count
-                      ? `${accentText} border-current bg-white/10`
-                      : 'border-white/10 text-zinc-500 hover:text-zinc-200 hover:border-white/25'
-                  } disabled:opacity-40`}
-                  title={`${count} stem separation`}
-                >
-                  {count}
-                </button>
-              ))}
-            </div>
-            <button onClick={() => void loadStems()} disabled={!entryId || stemBusy}
-              className="text-[7px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded border border-white/10 text-zinc-400 hover:text-zinc-100 hover:border-white/20 disabled:opacity-30 disabled:pointer-events-none flex items-center gap-1"
-              title={entryId ? `Separate or load cached ${stemCount}-stem split using ${stemSettings.device || 'auto'} / ${stemSettings.quality || 'balanced'}` : 'Load a track first'}>
-              <Scissors className="w-2.5 h-2.5" />
-              {stemActionLabel}
-            </button>
-            {stemBusy ? (
-              <button
-                onClick={() => void abortStems()}
-                className="h-5 w-5 grid place-items-center rounded border border-rose-400/30 text-rose-300 hover:bg-rose-500/15"
-                title="Abort stem separation"
-              >
-                <X className="w-2.5 h-2.5" />
-              </button>
-            ) : null}
-          </div>
-          {stemMsg && (
-            <div className={`mb-1 text-[8px] font-mono truncate ${stemBusy ? 'text-zinc-500' : 'text-rose-300'} ${toCenter ? 'text-right' : ''}`} title={stemMsg}>
-              {stemMsg}
-            </div>
-          )}
-          {stemNames.length > 0 ? (
-            <div className="max-h-22 min-h-0 overflow-y-auto pr-0.5">
-              <div className="grid gap-1 place-items-center" style={{ gridTemplateColumns: `repeat(${Math.min(stemNames.length, 4)}, minmax(0,1fr))` }}>
-                {stemNames.map((name) => (
-                  <SlideKnob key={name} label={stemLabel(name)} value={stemLevels[name] ?? 1} onChange={(v) => onStem(name, v)} min={0} max={1} step={0.01} size={28} centerReadout />
-                ))}
-              </div>
-            </div>
-          ) : null}
-        </div>
-      </div>
     </div>
   );
 };
@@ -2464,7 +2474,19 @@ const TrackBrowser: React.FC<{ source: Source; setSource: (s: Source) => void; o
       <div className="shrink-0 flex items-center gap-1.5 px-2 py-1 border-b border-white/5">
         {isSet ? <ListMusic className="w-3.5 h-3.5 text-purple-400 shrink-0" /> : <LibraryIcon className="w-3.5 h-3.5 text-purple-400 shrink-0" />}
         {editing && set ? (
-          <input autoFocus value={editName} onChange={(e) => setEditName(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') commitRename(); if (e.key === 'Escape') setEditing(false); }} onBlur={commitRename} className="bg-black/50 border border-purple-400/50 rounded px-1.5 py-0.5 text-[10px] text-zinc-100 focus:outline-none w-36" />
+          <>
+            <label htmlFor="dj-set-rename" className="sr-only">Set name</label>
+            <input
+              id="dj-set-rename"
+              name="dj-set-rename"
+              autoFocus
+              value={editName}
+              onChange={(e) => setEditName(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') commitRename(); if (e.key === 'Escape') setEditing(false); }}
+              onBlur={commitRename}
+              className="bg-black/50 border border-purple-400/50 rounded px-1.5 py-0.5 text-[10px] text-zinc-100 focus:outline-none w-36"
+            />
+          </>
         ) : (
           <span className="text-[10px] font-black uppercase tracking-wider text-purple-300 truncate max-w-40" title={sourceLabel}>{sourceLabel}</span>
         )}
@@ -2628,9 +2650,13 @@ const SourceTree: React.FC<{ source: Source; setSource: (s: Source) => void; lib
     } finally { setDlBusy(false); }
   };
 
-  const Item: React.FC<{ active?: boolean; soon?: boolean; onClick?: () => void; children: React.ReactNode; right?: React.ReactNode; title?: string }> = ({ active, soon, onClick, children, right, title }) => (
-    <button type="button" disabled={soon} onClick={onClick} title={title ?? (soon ? 'Source — coming soon' : undefined)}
-      className={`w-full flex items-center gap-1.5 pl-4 pr-1.5 py-0.5 text-[10px] font-mono rounded transition-colors ${active ? 'bg-purple-500/15 text-purple-200' : soon ? 'text-zinc-700 cursor-default' : 'text-zinc-400 hover:bg-white/5 hover:text-zinc-200'}`}>
+  // `soon` (a disabled "coming soon" state) is never passed by any caller
+  // below — every source is actually available — so keeping the branch would
+  // claim a feature-gate that doesn't exist. Removed rather than left dead
+  // (FE-032-adjacent: this repo doesn't ship unreachable disabled-state code).
+  const Item: React.FC<{ active?: boolean; onClick?: () => void; children: React.ReactNode; right?: React.ReactNode; title?: string }> = ({ active, onClick, children, right, title }) => (
+    <button type="button" onClick={onClick} title={title}
+      className={`w-full flex items-center gap-1.5 pl-4 pr-1.5 py-0.5 text-[10px] font-mono rounded transition-colors ${active ? 'bg-purple-500/15 text-purple-200' : 'text-zinc-400 hover:bg-white/5 hover:text-zinc-200'}`}>
       <span className={`w-1 h-1 rounded-full shrink-0 ${active ? 'bg-purple-300' : 'bg-zinc-700'}`} />
       <span className="flex-1 truncate text-left">{children}</span>
       {right}
@@ -2663,8 +2689,9 @@ const SourceTree: React.FC<{ source: Source; setSource: (s: Source) => void; lib
           <div className="px-2 py-1 flex flex-col gap-1">
             <div className="flex items-center gap-1 bg-black/40 border border-white/10 rounded px-1.5">
               <Link2 className="w-3 h-3 text-zinc-600 shrink-0" />
-              <input value={dlUrl} onChange={(e) => setDlUrl(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') void runImport(); }}
-                placeholder="paste URL…" disabled={dlBusy} aria-label="Online import URL"
+              <label htmlFor="dj-online-download-url" className="sr-only">Online import URL</label>
+              <input id="dj-online-download-url" name="dj-online-download-url" value={dlUrl} onChange={(e) => setDlUrl(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') void runImport(); }}
+                placeholder="paste URL…" disabled={dlBusy}
                 className="flex-1 min-w-0 bg-transparent text-[9px] font-mono text-zinc-200 py-1 focus:outline-none placeholder:text-zinc-600 disabled:opacity-50" />
               <button onClick={() => void runImport()} disabled={dlBusy || !dlUrl.trim()} className="shrink-0 text-purple-300 hover:text-purple-100 disabled:opacity-30" title="Download into library">
                 {dlBusy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}

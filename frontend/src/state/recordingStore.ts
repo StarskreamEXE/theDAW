@@ -148,7 +148,7 @@ import {
   type RecordingEngine,
   type Take,
 } from '../lib/recordingEngine';
-import { beginUndoStep, clipStretchRate, computePeaks, useEditorStore } from './editorStore';
+import { clipStretchRate, computePeaks, useEditorStore } from './editorStore';
 import { usePlayerStore } from './playerStore';
 import { currentTransportSec } from './liveMixer';
 import {
@@ -923,9 +923,16 @@ export function currentPassPunchWindow(): { from: number; to: number } | null {
 /**
  * Every take of ONE pass onto the timeline as ONE undo step.
  *
- * `beginUndoStep()` cuts the coalescing burst so the next document change opens
- * a fresh step; the adds that follow are synchronous, so they fold into that
- * one step and a single undo takes the whole pass back off the timeline.
+ * The whole placement loop runs inside `editorStore`'s `undoGroup` (T46H): the
+ * group's first write opens a fresh step regardless of the coalescing clock,
+ * every later write in the loop folds into it however many keys or gestures
+ * the individual actions (`addTakeToClip`, `setCompRegionAt`, ...) use
+ * internally, and closing the group cuts the burst again — so a single undo
+ * takes the whole pass back off the timeline, whether it landed on one clip or
+ * several. A bare `beginUndoStep()` before the group used to attempt the same
+ * thing and did not work (see the "One caveat" paragraph below, which this
+ * fixed) — it is not needed at all now, since the group already forces every
+ * write inside it to ignore the coalescing clock entirely.
  *
  * `sourceDuration` is the take's own length: a take IS its source. With punch
  * off nothing is trimmed off its front either (`offsetIntoSource` is 0) and
@@ -946,11 +953,10 @@ export function currentPassPunchWindow(): { from: number; to: number } | null {
  * The `record.takeMode` preference turns it off (`'clips'`), which is the
  * behaviour every pass had before takes existed.
  *
- * One caveat, pinned by the suite: `editorStore.addTakeToClip` opens an undo
- * step of its own, so a pass that appends to TWO clips at once costs two undos
- * rather than one. Everything is restored either way; closing it needs the
- * `coalesce` option `moveCompBoundary` already has, which is `editorStore`'s to
- * add.
+ * FIXED (T46H, was a caveat here): `editorStore.addTakeToClip` opens an undo
+ * step of its own, so without the `undoGroup` wrap above, a pass that appends
+ * to TWO clips at once cost two undos rather than one. The group fold — not a
+ * `coalesce` option on `addTakeToClip` — is what closes it.
  *
  * `place.startSec` is the take's anchor already slid back by the device's
  * measured round trip, so it is where the clip really belongs on the timeline —
@@ -985,143 +991,151 @@ function placeTakes(takes: readonly Take[]): void {
   // a device swapped between two takes of the same press is not a thing that
   // can happen, and re-reading it would only invite the two to disagree.
   const comp = latencyCompSec();
-  beginUndoStep();
   let faulted: RecordingError | null = null;
   let placed = 0;
   let dropped = 0;
-  for (const take of takes) {
-    if (take.meta.error) faulted = take.meta.error;
-    const place = takeClipPlacement(take, { latencyCompSec: comp });
-    const editor = useEditorStore.getState();
-    if (!editor.tracks.some((t) => t.id === place.trackId)) continue; // the track was deleted mid-pass
-    const track = editor.tracks.find((t) => t.id === place.trackId);
-    const color = track?.color ?? FALLBACK_CLIP_COLOR;
-    const measured = place.durationSec > 0 && transportRolled;
-    // The punch crop. Only on a take the CLOCK measured: an unmeasured one has
-    // no true extent to intersect the window with (its length is about to come
-    // from the decode instead), so it is laid down whole — see the header.
-    let startSec = place.startSec;
-    let durationSec = place.durationSec;
-    let offsetIntoSource: number = place.offsetIntoSource;
-    if (measured && punchWin) {
-      const from = Math.max(place.startSec, punchWin.from);
-      const to = Math.min(place.startSec + place.durationSec, punchWin.to);
-      // Wholly outside the window: nothing was punched in, so nothing lands —
-      // and the take number is not burnt on a clip that does not exist.
-      if (to <= from) {
-        dropped += 1;
-        continue;
-      }
-      startSec = from;
-      durationSec = to - from;
-      offsetIntoSource = from - place.startSec;
-    }
-    placed += 1;
-    // A pass that lands ON a clip is a TAKE of it, not a second clip stacked
-    // over the first. The crop above has already run, so the span tested is the
-    // one that would have been laid down — a punched pass is matched against
-    // where it really goes, not against the whole take it was cut out of.
-    // `measured` gates it for the same reason the crop is gated: a take whose
-    // clock never moved has no true extent yet — its length arrives from the
-    // decode — and the repair that supplies it writes the CLIP's length, which
-    // on an existing clip would resize somebody else's work.
-    const span = { startSec, durationSec, offsetIntoSource };
-    // A FROZEN track's clips are one printed stem, and unfreezing throws it away
-    // for the originals it was printed from — a take hung off it would go with
-    // it. The pass lands as its own clip, where it survives the unfreeze.
-    // A STRETCHED or WARPED clip reads more (or other) source seconds than its
-    // timeline span — `clipSourceSpanSec`, and the markers tie moments of the
-    // OLD source to clip moments — so a take that covers the timeline span
-    // does not cover what the clip reads. Such a clip is never a target.
-    const candidates = measured && takeMode() === 'takes' && !track?.frozenOriginal
-      ? editor.clips.filter(
-          (c) => c.trackId === place.trackId && clipStretchRate(c) === 1 && !c.warpMarkers?.length,
-        )
-      : [];
-    const onto = matchClipForTake(candidates, span);
-    const target = onto ? editor.clips.find((c) => c.id === onto) : undefined;
-    // The read head the CLIP needs, which is not the head the take was cropped
-    // to: the clip keeps its own start, so the take is read from the moment the
-    // clip begins. `matchClipForTake` refuses every clip this cannot be computed
-    // for, so a null here is only reachable if the two disagreed — in which case
-    // the pass takes the clip branch, which is always correct.
-    const readOffset = target ? takeReadOffsetFor(target, span) : null;
-    let clipId: string;
-    if (target && readOffset !== null) {
-      const alternate: ClipTake = {
-        id: take.meta.id,
-        label: nextTakeLabel(target),
-        audioBlob: take.blob,
-        mimeType: take.meta.mime,
-        // Same field set the new-clip branch fills in, and for the same reason:
-        // a take IS its source. The OFFSET is the one field that differs — it is
-        // rebased onto the clip's head, so the clip reads the take from the
-        // moment it itself begins.
-        sourceDuration: place.durationSec,
-        offsetIntoSource: readOffset,
-      };
-      // `addTakeToClip` seeds the clip's CURRENT media as take 1 when it has
-      // none, so the pass it is replacing is never lost, and `activate` makes
-      // the new one what the clip plays — which is what pressing record over a
-      // phrase asks for. The clip keeps its own position and length: a take is
-      // an alternate reading of that stretch of timeline, not a re-placement of
-      // it.
-      editor.addTakeToClip(target.id, alternate, { activate: true });
-      clipId = target.id;
-      // A COMPED clip does not play its active take — it plays its comp — so
-      // `activate` alone would file the pass away inaudibly. The comp's LAST
-      // region is retargeted onto it, which is the closest thing to "this is
-      // what the clip plays now" that leaves the user's earlier boundaries
-      // standing. (Retargeting every region would silently delete the comp.)
-      const targetComp = target.comp;
-      if (targetComp && targetComp.length > 0) {
-        const newIndex = target.takes && target.takes.length > 0 ? target.takes.length : 1;
-        useEditorStore.getState().setCompRegionAt(target.id, targetComp[targetComp.length - 1].startSec, newIndex);
-      }
-    } else {
-      takeSeq += 1;
-      clipId = editor.addClipToTrack({
-        trackId: place.trackId,
-        label: `Take ${takeSeq}`,
-        audioBlob: take.blob,
-        mimeType: take.meta.mime,
-        // The SOURCE is the whole pass however the window cropped it: the bytes
-        // outside the punch are trimmed off the clip, not thrown away.
-        sourceDuration: place.durationSec,
-        offsetIntoSource,
-        durationSec,
-        startSec,
-        color,
-      });
-    }
-    // WHAT THE DECODE IS ALLOWED TO WRITE, decided now rather than when it
-    // resolves. `applyClipRender` writes the clip AND mirrors onto its ACTIVE
-    // take, so a decode that lands after a later pass has appended and activated
-    // a take would hang this pass's peaks on that pass's take, and the length
-    // repair would re-length a clip that is no longer the one it measured. The
-    // take list and the active index together are that identity: unchanged, the
-    // clip is still playing what this pass just put on it.
-    const placedTakeState = takeStateOf(clipId);
-    void deps
-      .computePeaks(take.blob, TAKE_PEAK_BINS)
-      .then(({ peaks, duration }) => {
-        const store = useEditorStore.getState();
-        // Something moved under us: the peaks belong to a take that is no longer
-        // the one the write would reach, and the newer pass's own decode is
-        // about to supply the peaks for what IS playing.
-        if (takeStateOf(clipId) !== placedTakeState) return;
-        if (!measured && Number.isFinite(duration) && duration > 0) {
-          // `applyClipRender` is history-exempt and keeps the redo stack, so the
-          // pass is still one undo step however long the decode took.
-          store.applyClipRender(clipId, { durationSec: duration, sourceDuration: duration }, peaks);
-          return;
+  // The whole pass is one undo step, however many clips or takes it touches.
+  // `addTakeToClip` and `setCompRegionAt` (below) each open an undo step of
+  // their own, so without a group a pass that appends to two clips — or lands
+  // on a comped clip, which appends AND retargets — would cost two or more
+  // undos where a pass that lands new clips costs one (T46H). `undoGroup`
+  // folds every write the loop makes into a single step regardless of the
+  // keys or timing those actions use internally; see its doc in `editorStore`.
+  useEditorStore.getState().undoGroup(() => {
+    for (const take of takes) {
+      if (take.meta.error) faulted = take.meta.error;
+      const place = takeClipPlacement(take, { latencyCompSec: comp });
+      const editor = useEditorStore.getState();
+      if (!editor.tracks.some((t) => t.id === place.trackId)) continue; // the track was deleted mid-pass
+      const track = editor.tracks.find((t) => t.id === place.trackId);
+      const color = track?.color ?? FALLBACK_CLIP_COLOR;
+      const measured = place.durationSec > 0 && transportRolled;
+      // The punch crop. Only on a take the CLOCK measured: an unmeasured one has
+      // no true extent to intersect the window with (its length is about to come
+      // from the decode instead), so it is laid down whole — see the header.
+      let startSec = place.startSec;
+      let durationSec = place.durationSec;
+      let offsetIntoSource: number = place.offsetIntoSource;
+      if (measured && punchWin) {
+        const from = Math.max(place.startSec, punchWin.from);
+        const to = Math.min(place.startSec + place.durationSec, punchWin.to);
+        // Wholly outside the window: nothing was punched in, so nothing lands —
+        // and the take number is not burnt on a clip that does not exist.
+        if (to <= from) {
+          dropped += 1;
+          continue;
         }
-        store.cachePeaks(clipId, peaks);
-      })
-      .catch(() => {
-        /* a clip that draws flat is still a clip; the bytes are on it */
-      });
-  }
+        startSec = from;
+        durationSec = to - from;
+        offsetIntoSource = from - place.startSec;
+      }
+      placed += 1;
+      // A pass that lands ON a clip is a TAKE of it, not a second clip stacked
+      // over the first. The crop above has already run, so the span tested is the
+      // one that would have been laid down — a punched pass is matched against
+      // where it really goes, not against the whole take it was cut out of.
+      // `measured` gates it for the same reason the crop is gated: a take whose
+      // clock never moved has no true extent yet — its length arrives from the
+      // decode — and the repair that supplies it writes the CLIP's length, which
+      // on an existing clip would resize somebody else's work.
+      const span = { startSec, durationSec, offsetIntoSource };
+      // A FROZEN track's clips are one printed stem, and unfreezing throws it away
+      // for the originals it was printed from — a take hung off it would go with
+      // it. The pass lands as its own clip, where it survives the unfreeze.
+      // A STRETCHED or WARPED clip reads more (or other) source seconds than its
+      // timeline span — `clipSourceSpanSec`, and the markers tie moments of the
+      // OLD source to clip moments — so a take that covers the timeline span
+      // does not cover what the clip reads. Such a clip is never a target.
+      const candidates = measured && takeMode() === 'takes' && !track?.frozenOriginal
+        ? editor.clips.filter(
+            (c) => c.trackId === place.trackId && clipStretchRate(c) === 1 && !c.warpMarkers?.length,
+          )
+        : [];
+      const onto = matchClipForTake(candidates, span);
+      const target = onto ? editor.clips.find((c) => c.id === onto) : undefined;
+      // The read head the CLIP needs, which is not the head the take was cropped
+      // to: the clip keeps its own start, so the take is read from the moment the
+      // clip begins. `matchClipForTake` refuses every clip this cannot be computed
+      // for, so a null here is only reachable if the two disagreed — in which case
+      // the pass takes the clip branch, which is always correct.
+      const readOffset = target ? takeReadOffsetFor(target, span) : null;
+      let clipId: string;
+      if (target && readOffset !== null) {
+        const alternate: ClipTake = {
+          id: take.meta.id,
+          label: nextTakeLabel(target),
+          audioBlob: take.blob,
+          mimeType: take.meta.mime,
+          // Same field set the new-clip branch fills in, and for the same reason:
+          // a take IS its source. The OFFSET is the one field that differs — it is
+          // rebased onto the clip's head, so the clip reads the take from the
+          // moment it itself begins.
+          sourceDuration: place.durationSec,
+          offsetIntoSource: readOffset,
+        };
+        // `addTakeToClip` seeds the clip's CURRENT media as take 1 when it has
+        // none, so the pass it is replacing is never lost, and `activate` makes
+        // the new one what the clip plays — which is what pressing record over a
+        // phrase asks for. The clip keeps its own position and length: a take is
+        // an alternate reading of that stretch of timeline, not a re-placement of
+        // it.
+        editor.addTakeToClip(target.id, alternate, { activate: true });
+        clipId = target.id;
+        // A COMPED clip does not play its active take — it plays its comp — so
+        // `activate` alone would file the pass away inaudibly. The comp's LAST
+        // region is retargeted onto it, which is the closest thing to "this is
+        // what the clip plays now" that leaves the user's earlier boundaries
+        // standing. (Retargeting every region would silently delete the comp.)
+        const targetComp = target.comp;
+        if (targetComp && targetComp.length > 0) {
+          const newIndex = target.takes && target.takes.length > 0 ? target.takes.length : 1;
+          useEditorStore.getState().setCompRegionAt(target.id, targetComp[targetComp.length - 1].startSec, newIndex);
+        }
+      } else {
+        takeSeq += 1;
+        clipId = editor.addClipToTrack({
+          trackId: place.trackId,
+          label: `Take ${takeSeq}`,
+          audioBlob: take.blob,
+          mimeType: take.meta.mime,
+          // The SOURCE is the whole pass however the window cropped it: the bytes
+          // outside the punch are trimmed off the clip, not thrown away.
+          sourceDuration: place.durationSec,
+          offsetIntoSource,
+          durationSec,
+          startSec,
+          color,
+        });
+      }
+      // WHAT THE DECODE IS ALLOWED TO WRITE, decided now rather than when it
+      // resolves. `applyClipRender` writes the clip AND mirrors onto its ACTIVE
+      // take, so a decode that lands after a later pass has appended and activated
+      // a take would hang this pass's peaks on that pass's take, and the length
+      // repair would re-length a clip that is no longer the one it measured. The
+      // take list and the active index together are that identity: unchanged, the
+      // clip is still playing what this pass just put on it.
+      const placedTakeState = takeStateOf(clipId);
+      void deps
+        .computePeaks(take.blob, TAKE_PEAK_BINS)
+        .then(({ peaks, duration }) => {
+          const store = useEditorStore.getState();
+          // Something moved under us: the peaks belong to a take that is no longer
+          // the one the write would reach, and the newer pass's own decode is
+          // about to supply the peaks for what IS playing.
+          if (takeStateOf(clipId) !== placedTakeState) return;
+          if (!measured && Number.isFinite(duration) && duration > 0) {
+            // `applyClipRender` is history-exempt and keeps the redo stack, so the
+            // pass is still one undo step however long the decode took.
+            store.applyClipRender(clipId, { durationSec: duration, sourceDuration: duration }, peaks);
+            return;
+          }
+          store.cachePeaks(clipId, peaks);
+        })
+        .catch(() => {
+          /* a clip that draws flat is still a clip; the bytes are on it */
+        });
+    }
+  });
   // A faulted take still LANDS — the spec flushes what it gathered — so the
   // fault is reported beside the clip rather than instead of it.
   if (faulted) setState({ lastError: faulted });

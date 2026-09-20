@@ -29,8 +29,16 @@ import pytest
 from backend.modules.library import suno_stage
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-INGEST_SCRIPT = REPO_ROOT / "scripts" / "ingest_suno_cache.py"
+# F12 (batch 12): the old title-dedupe importer is retired, moved to the
+# git-ignored deprecated/ folder, and kept only as the reference the "old
+# CLI" regression tests below pin. It does not exist on a fresh clone/CI
+# checkout.
+INGEST_SCRIPT = REPO_ROOT / "deprecated" / "ingest_suno_cache.py"
 STAGE_SCRIPT = REPO_ROOT / "scripts" / "stage_suno_cache.py"
+INGEST_SCRIPT_SKIP_REASON = (
+    "deprecated/ingest_suno_cache.py is git-ignored and absent on this "
+    "checkout; the retired importer (F12) is only kept as a local reference"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +679,8 @@ def _load_script(path: Path, name: str) -> Any:
 
 
 def _load_ingest_script(name: str = "ingest_suno_cache_under_test") -> Any:
+    if not INGEST_SCRIPT.is_file():
+        pytest.skip(INGEST_SCRIPT_SKIP_REASON)
     return _load_script(INGEST_SCRIPT, name)
 
 
@@ -772,6 +782,8 @@ def test_old_script_never_writes_a_zero_duration(tmp_path: Path) -> None:
 
 
 def test_old_script_does_not_pip_install() -> None:
+    if not INGEST_SCRIPT.is_file():
+        pytest.skip(INGEST_SCRIPT_SKIP_REASON)
     body = INGEST_SCRIPT.read_text(encoding="utf-8")
 
     assert "pip" not in body

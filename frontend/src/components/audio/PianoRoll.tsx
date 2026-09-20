@@ -32,7 +32,7 @@ import {
 } from '../../lib/pitchBend';
 import { BEND_TAIL_SEC, type VoiceBend } from '../../lib/pitchBendVoice';
 import { midiFileToRoll, rollToMidiFile } from '../../lib/rollMidi';
-import { playedRollNotes, rollClipFields } from '../../lib/rollClip';
+import { playedRollNotes, quantizeRollClip, rollClipFields } from '../../lib/rollClip';
 import { copyNotes, duplicateNotes, pasteNotes, type NoteClipboardPayload } from '../../lib/noteClipboard';
 import {
   MARQUEE_MIN_PX,
@@ -53,7 +53,6 @@ import {
 } from '../../lib/rollSelection';
 import { syncopationByBar } from '../../lib/syncopation';
 import {
-  applyGroove,
   builtinGrooves,
   fromVirtuosoTemplate,
   swingToGroove,
@@ -499,8 +498,6 @@ export const PianoRollZoom: React.FC<{ stepPx: number; onStepPxChange: (px: numb
  * picked a groove — and a persisted feel record with a stale id — lands here.
  */
 const SLIDER_GROOVE_ID = DEFAULT_GROOVE_ID;
-/** A step is a 16th and a beat is a quarter everywhere in the roll. */
-const FEEL_STEPS_PER_BEAT = 4;
 const GROOVE_FILE_ACCEPT = '.mid,.midi,audio/midi';
 
 /**
@@ -555,18 +552,9 @@ export const PianoRollFeel: React.FC = () => {
   };
 
   const applyTimingFeel = () => {
-    const { notes, replaceAll, meterMap, pickupSteps, totalSteps } = usePianoRollStore.getState();
+    const { notes, replaceAll, meterMap, pickupSteps, totalSteps, lanes } = usePianoRollStore.getState();
     if (notes.length === 0) return;
     const q = Math.max(0, Math.min(1, quantizePct / 100));
-    const quantized = notes.map((note) => {
-      const quantizedStep = Math.round(note.step);
-      const quantizedLength = Math.max(1, Math.round(note.length));
-      return {
-        ...note,
-        step: note.step + (quantizedStep - note.step) * q,
-        length: Math.max(1, note.length + (quantizedLength - note.length) * q),
-      };
-    });
     // An id that resolves to nothing — a stale one out of the persisted feel
     // record, or the MIDI groove of a previous session — IS the slider entry,
     // so resolve first and read the depth off what came back: the slider groove
@@ -577,18 +565,29 @@ export const PianoRollFeel: React.FC = () => {
         ? null
         : ((imported && imported.id === grooveId ? imported : builtins.find((g) => g.id === grooveId)) ?? null);
     const groove = picked ?? swingToGroove(swingPct);
-    // The slot counts from the bar's start, so after a bar with an odd number of
-    // steps (5/16, 7/16) the next bar's downbeat still lands on the beat. The
-    // last step of the grid is the ceiling: a deep groove cannot drag the roll's
-    // final notes off the end of it.
-    const adjusted = applyGroove(
-      quantized,
-      groove,
-      FEEL_STEPS_PER_BEAT,
-      picked ? q : 1,
-      (step) => barAt(meterMap, step, pickupSteps).start,
-      Math.max(0, totalSteps - 1),
+    // Quantize each note's start toward the nearest 16th at strength `q`
+    // (`rollClip.quantizeRollClip`, which is `clipNotes.quantizeNotes` — the
+    // arithmetic is not reimplemented here), then lay the groove over it
+    // (`grooveTemplate.applyGroove`, same as before). Lengths are handled
+    // separately, unchanged: a note's DURATION rounds toward the nearest whole
+    // step, which is not what `quantizeEnds` computes (that snaps the note's
+    // END POSITION to the grid, a different quantity).
+    const { sourceRollNotes: quantizedSteps } = quantizeRollClip(
+      {
+        sourceRollNotes: notes,
+        sourcePianoRoll: [],
+        sourceLanes: lanes,
+        sourceMeterMap: meterMap,
+        sourcePickupSteps: pickupSteps,
+        sourceTotalSteps: totalSteps,
+      },
+      { grid: '1/16', strength: q, groove, grooveStrength: picked ? q : 1 },
     );
+    const adjusted = quantizedSteps.map((note, i) => {
+      const originalLength = notes[i].length;
+      const quantizedLength = Math.max(1, Math.round(originalLength));
+      return { ...note, length: Math.max(1, originalLength + (quantizedLength - originalLength) * q) };
+    });
     replaceAll(adjusted);
     logInfo('piano-roll', `Applied timing feel: quantize ${quantizePct}% · groove ${groove.name}`);
   };

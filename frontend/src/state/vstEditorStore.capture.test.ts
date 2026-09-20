@@ -43,6 +43,8 @@ const session = (entryId: string, over: Partial<FakeSession> = {}): FakeSession 
     wsUrl: 'ws://x',
     pid: 1,
     stateDirty: false,
+    userMovedOnRejectedState: false,
+    stateSent: true,
     asked: 0,
     answerAfterMs: 0,
     answer: `STATE-${entryId}`,
@@ -70,7 +72,10 @@ function run(
   const done = captureLiveVstStates({
     sessions: () => sessions,
     liveRow: (id) => rows[id],
-    sink: (entryId, rawState) => captured.push([entryId, rawState]),
+    sink: (entryId, rawState) => {
+      captured.push([entryId, rawState]);
+      return true;
+    },
     timeoutMs,
   });
   return { captured, done };

@@ -78,7 +78,7 @@ def test_take_only_project_registers_the_take_folder(clean_roots, tmp_path):
     take = _recording(takes_dir, "vocal_take1.wav")
     assert media_access.resolve_media_path(str(take)) is None
 
-    _register_project_media(_project(_clip(None, [_take(1, take)])))
+    _register_project_media(_project(_clip(None, [_take(1, take)])), request=None)
 
     assert media_access.resolve_media_path(str(take)) == take.resolve()
 
@@ -89,7 +89,8 @@ def test_linked_take_in_another_folder_is_registered(clean_roots, tmp_path):
     far_take = _recording(tmp_path / "overdubs", "vocal_take2.wav")
 
     _register_project_media(
-        _project(_clip(str(clip_audio), [_take(1, clip_audio), _take(2, far_take)]))
+        _project(_clip(str(clip_audio), [_take(1, clip_audio), _take(2, far_take)])),
+        request=None,
     )
 
     assert media_access.resolve_media_path(str(clip_audio)) == clip_audio.resolve()
@@ -103,7 +104,7 @@ def test_in_archive_take_refs_are_not_registered(clean_roots, tmp_path):
         id="tk1", name="Take 1", audio_file="audio/vocal_take1.wav", mime_type=""
     )
 
-    _register_project_media(_project(_clip(str(clip_audio), [embedded])))
+    _register_project_media(_project(_clip(str(clip_audio), [embedded])), request=None)
 
     assert media_access._session_roots == [(tmp_path / "session").resolve()]
 
@@ -112,7 +113,7 @@ def test_clip_only_project_registers_what_it_did_before(clean_roots, tmp_path):
     """No takes: the same one folder, and nothing else."""
     clip_audio = _recording(tmp_path / "session", "vocal.wav")
 
-    _register_project_media(_project(_clip(str(clip_audio), None)))
+    _register_project_media(_project(_clip(str(clip_audio), None)), request=None)
 
     assert media_access._session_roots == [(tmp_path / "session").resolve()]
     assert media_access.resolve_media_path(str(clip_audio)) == clip_audio.resolve()
@@ -124,7 +125,9 @@ def test_extra_paths_argument_still_registers(clean_roots, tmp_path):
     tasmo = _recording(tasmo_dir, "song.tasmo")
     take = _recording(tmp_path / "recordings", "vocal_take1.wav")
 
-    _register_project_media(_project(_clip(None, [_take(1, take)])), str(tasmo))
+    _register_project_media(
+        _project(_clip(None, [_take(1, take)])), str(tasmo), request=None
+    )
 
     assert media_access.resolve_media_path(str(tasmo)) == tasmo.resolve()
     assert media_access.resolve_media_path(str(take)) == take.resolve()

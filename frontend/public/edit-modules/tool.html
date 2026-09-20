@@ -330,7 +330,7 @@ async function loadSpec(){
 
 /* ── AUDIO PREVIEW (monitor input or output; the tool itself renders offline) ── */
 function ensureAudio(){ if (actx) return; actx = new AudioContext(); analyser = actx.createAnalyser(); analyser.fftSize = 4096; analyser.smoothingTimeConstant = 0.8; analyser.connect(actx.destination); }
-function postTransportState(playing){ window.parent.postMessage({ type: 'thedaw-transport-state', playing: playing }, '*'); }
+function postTransportState(playing){ window.parent.postMessage({ type: 'thedaw-transport-state', playing: playing }, window.location.origin); }
 function stopSource(){ if (!source) return; try { source.stop(); } catch(e){} source = null; postTransportState(false); }
 function startSource(){ if (!liveBuf) return; if (source) try { source.stop(); } catch(e){} source = actx.createBufferSource(); source.buffer = liveBuf; source.loop = true; source.connect(analyser); source.start(); postTransportState(true); }
 function prepareBuf(buf){ stopSource(); liveBuf = buf; }
@@ -421,6 +421,7 @@ function previewStillAudible(){ return !!(source || (ainEl && !ainEl.paused && !
 
 // ── Receive audio + transport from parent page ──
 window.addEventListener('message', async (e) => {
+  if (e.source !== window.parent) return;
   if (e.data && e.data.type === 'thedaw-audio' && e.data.buffer) {
     try {
       const blob = new Blob([e.data.buffer], { type: 'audio/wav' });

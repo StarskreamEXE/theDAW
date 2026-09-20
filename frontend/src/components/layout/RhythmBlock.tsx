@@ -59,6 +59,7 @@ export const RhythmBlock: React.FC<{
   const [menuOpen, setMenuOpen] = useState(false);
   const [saving, setSaving] = useState<SaveFormat | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const saveButtonRef = useRef<HTMLButtonElement | null>(null);
   const uid = useId().replace(/[^a-zA-Z0-9]/g, '');
 
   // Read the cache when the selection changes. A track nobody has mapped comes
@@ -85,19 +86,24 @@ export const RhythmBlock: React.FC<{
     };
   }, [entryId]);
 
+  // Outside-click only: Escape is handled by a React onKeyDown on the menu
+  // wrapper below (MarkComposer's pattern, LyricAnalysisPane.tsx), not a
+  // native document listener. RhythmBlock is itself embedded in a popover
+  // (ScoreView's METER MAP button, LyricAnalysisPane's STUDY bar) that has
+  // its own document-level Escape handler; a same-target native listener
+  // here fired alongside that one on every press, closing both at once. A
+  // React onKeyDown's stopPropagation() reaches the real DOM event too, so
+  // it actually shields the ancestor popover — a native document listener
+  // registered independently cannot (stopPropagation only stops an event
+  // moving to OTHER elements, not sibling listeners already on `document`).
   useEffect(() => {
     if (!menuOpen) return;
     const onDown = (e: PointerEvent) => {
       if (!menuRef.current?.contains(e.target as Node)) setMenuOpen(false);
     };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setMenuOpen(false);
-    };
     document.addEventListener('pointerdown', onDown);
-    document.addEventListener('keydown', onKey);
     return () => {
       document.removeEventListener('pointerdown', onDown);
-      document.removeEventListener('keydown', onKey);
     };
   }, [menuOpen]);
 
@@ -183,8 +189,21 @@ export const RhythmBlock: React.FC<{
             <span className="text-[8px] font-mono text-zinc-600">not mapped</span>
           )}
           {result && (
-            <div ref={menuRef} className="relative">
+            <div
+              ref={menuRef}
+              className="relative"
+              onKeyDown={(e) => {
+                // Only while the menu is actually open: closed, Escape here
+                // must fall through to whatever popover RhythmBlock itself
+                // is embedded in (ScoreView's METER MAP button, STUDY's bar).
+                if (e.key !== 'Escape' || !menuOpen) return;
+                e.stopPropagation();
+                setMenuOpen(false);
+                saveButtonRef.current?.focus();
+              }}
+            >
               <button
+                ref={saveButtonRef}
                 type="button"
                 onClick={() => setMenuOpen((v) => !v)}
                 disabled={!!saving}

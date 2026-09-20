@@ -12,7 +12,9 @@
  */
 import type { AudioClip } from '../state/editorStore';
 import { DEFAULT_LANES, rollMeterOf, sanitizeLanes, type PianoNote, type RollMeter } from '../state/pianoRollStore';
-import { normalizeMeterMap, roundUpToBar, unrollLanes, type PolyLane } from './meterMap';
+import { STEPS_PER_BEAT, quantizeNotes, type QuantizeOptions } from './clipNotes';
+import { applyGroove, type GrooveTemplate } from './grooveTemplate';
+import { barAt, normalizeMeterMap, roundUpToBar, unrollLanes, type PolyLane } from './meterMap';
 import { copyBends, rollRenderBends, sanitizeBends, type LaneBend, type RollRenderBends } from './pitchBend';
 
 /** The roll state a bounce reads. */
@@ -36,6 +38,10 @@ export type RollClipInput = Pick<AudioClip, 'id' | RollClipKeys>;
 
 /** The arguments of pianoRollStore's loadFromClip. */
 export type RollLoadArgs = [clipId: string, notes: PianoNote[], bpm: number, totalSteps: number, meter: RollMeter, bends: LaneBend[]];
+
+/** The step just past the last note's end — the grid length a note list implies when nothing else says otherwise. */
+const noteEndSteps = (notes: readonly PianoNote[]): number =>
+  notes.reduce((m, n) => Math.max(m, n.step + Math.max(1, n.length)), 0);
 
 /**
  * The notes as they sound: each looping lane's repeats written out across the
@@ -90,10 +96,79 @@ export function clipRollLoad(clip: RollClipInput): RollLoadArgs {
   const meterMap = normalizeMeterMap(clip.sourceMeterMap);
   const pickupSteps = clip.sourcePickupSteps ?? 0;
   const lanes = sanitizeLanes(clip.sourceLanes?.length ? clip.sourceLanes : DEFAULT_LANES);
-  const noteEnd = notes.reduce((m, n) => Math.max(m, n.step + Math.max(1, n.length)), 0);
+  const noteEnd = noteEndSteps(notes);
   const totalSteps =
     clip.sourceMeterMap && clip.sourceTotalSteps !== undefined
       ? clip.sourceTotalSteps
       : roundUpToBar(meterMap, Math.max(1, clip.sourceTotalSteps ?? noteEnd), pickupSteps);
   return [clip.id, notes, clip.sourceBpm ?? 120, totalSteps, { meterMap, pickupSteps, lanes }, sanitizeBends(clip.sourceBends ?? [])];
+}
+
+/**
+ * clipNotes' quantize (grid/strength/swing/quantizeEnds), plus an optional
+ * groove template (`lib/grooveTemplate.ts`) layered on top with its own
+ * strength — the same two-stage feel `PianoRollFeel`'s APPLY uses on the live
+ * roll, expressed as a document operation instead of a store mutation.
+ */
+export interface RollClipQuantizeOptions extends QuantizeOptions {
+  /** A named feel (or the swing slider's synthesized groove, `swingToGroove`)
+   *  laid over the quantized grid. Omit for grid quantize alone. */
+  groove?: GrooveTemplate;
+  /** How far into the groove's shape to go, 0..1. Defaults to 1 (the
+   *  template's full depth) — callers that want it tied to the grid's own
+   *  `strength` pass that value explicitly. */
+  grooveStrength?: number;
+}
+
+/** The clip fields quantizeRollClip needs: the roll's own notes and enough of
+ *  its meter to unroll them back into the played list it also returns. */
+export type RollClipNoteInput = Pick<
+  RollClipInput,
+  'sourceRollNotes' | 'sourcePianoRoll' | 'sourceLanes' | 'sourceMeterMap' | 'sourcePickupSteps' | 'sourceTotalSteps'
+>;
+
+/**
+ * Quantize (and optionally apply a groove to) a roll clip's OWN notes — the
+ * lane-based document `sourceRollNotes` a reopened roll reads — then
+ * re-derives the played list `sourcePianoRoll` the timeline renders from the
+ * result, so re-quantizing a bounced clip can never leave the two note lists
+ * this module keeps in sync out of step (T37B: there was no such operation in
+ * this module at all).
+ *
+ * A clip bounced before the roll had its own note list (`sourceRollNotes`
+ * empty — the same legacy case `clipRollLoad` treats as "no roll document",
+ * see its own comment) has no lanes to preserve: its played notes are
+ * quantized directly, `sourcePianoRoll` carries the result, and
+ * `sourceRollNotes` stays empty rather than manufacturing lane data that was
+ * never authored.
+ *
+ * The math is not reimplemented here: quantize/strength/swing is
+ * `clipNotes.quantizeNotes`, the groove pass is `grooveTemplate.applyGroove`.
+ */
+export function quantizeRollClip(
+  clip: RollClipNoteInput,
+  options: RollClipQuantizeOptions,
+): Pick<RollClipFields, 'sourceRollNotes' | 'sourcePianoRoll'> {
+  const legacy = !clip.sourceRollNotes?.length;
+  const own = legacy ? (clip.sourcePianoRoll ?? []) : (clip.sourceRollNotes as PianoNote[]);
+  const totalSteps = clip.sourceTotalSteps ?? noteEndSteps(own);
+
+  const quantized = quantizeNotes(own, options);
+  let result = quantized;
+  if (options.groove) {
+    const meterMap = normalizeMeterMap(clip.sourceMeterMap);
+    const pickupSteps = clip.sourcePickupSteps ?? 0;
+    result = applyGroove(
+      quantized,
+      options.groove,
+      STEPS_PER_BEAT,
+      options.grooveStrength ?? 1,
+      (step) => barAt(meterMap, step, pickupSteps).start,
+      Math.max(0, totalSteps - 1),
+    );
+  }
+
+  if (legacy) return { sourceRollNotes: [], sourcePianoRoll: result };
+  const lanes = sanitizeLanes(clip.sourceLanes?.length ? clip.sourceLanes : DEFAULT_LANES);
+  return { sourceRollNotes: result, sourcePianoRoll: playedRollNotes(result, lanes, totalSteps) };
 }

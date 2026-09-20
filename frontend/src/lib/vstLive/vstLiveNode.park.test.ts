@@ -59,7 +59,16 @@ class FakeRegistry {
   give: VstLiveSession | null = null;
   session(entryId: string): VstLiveSession {
     const client = { ready: true, blockSize: 512, sendAudio: () => {}, setParam: (i: number, v: number) => this.sent.push([i, v]), close: () => {} };
-    return { entryId, sessionId: `s-${entryId}`, wsUrl: 'ws://x', pid: 1, client: client as never, stateDirty: false };
+    return {
+      entryId,
+      sessionId: `s-${entryId}`,
+      wsUrl: 'ws://x',
+      pid: 1,
+      client: client as never,
+      stateDirty: false,
+      userMovedOnRejectedState: false,
+      stateSent: true,
+    };
   }
   /** A session whose client can take a MessagePort — a worker-backed one. */
   portSession(entryId: string): VstLiveSession {

@@ -3,7 +3,7 @@
 // (.tasmo JSON), reload, open in the roll again. projectImport.ts does not load
 // under node, so the save and the reload replay its projectClient mappers.
 import assert from 'node:assert/strict';
-import { clipRenderInput, clipRollLoad, playedRollNotes, rollClipFields, type RollClipInput, type RollLoadArgs } from './rollClip.ts';
+import { clipRenderInput, clipRollLoad, playedRollNotes, quantizeRollClip, rollClipFields, type RollClipInput, type RollLoadArgs } from './rollClip.ts';
 import { clipMeterToTasmo, pianoNoteToTasmo, tasmoMeterToClip, tasmoNotesToPiano, type TasmoStepNote } from './projectClient.ts';
 import { migrateNotes, rollMeterOf, tickOfStep, usePianoRollStore, type PianoNote } from '../state/pianoRollStore.ts';
 import { unrollLanes, type MeterSegment } from './meterMap.ts';
@@ -192,6 +192,64 @@ assertRoll('clip-1');
   // The same clip saved and reloaded from a file without meter fields stays 4/4.
   const fromFile: RollClipInput = { id: 'old', sourceBpm: 110, sourcePianoRoll: legacy.sourcePianoRoll, ...tasmoMeterToClip({}) };
   assert.deepEqual(clipRollLoad(fromFile)[4], meter);
+}
+
+// 8. quantizeRollClip — T37B: quantize/swing/groove on the roll clip document
+// (there was none in rollClip.ts; the math is clipNotes.quantizeNotes and
+// grooveTemplate.applyGroove, not reimplemented here).
+{
+  const qnotes: PianoNote[] = [
+    { id: 'q0', note: 60, step: 0.2, length: 1.1, velocity: 100 },
+    { id: 'q1', note: 62, step: 3.9, length: 0.6, velocity: 90 },
+  ];
+
+  // A clip bounced before the roll had its own note list: only sourcePianoRoll
+  // exists, so that is what gets quantized, and sourceRollNotes stays empty —
+  // exactly what clipRollLoad already treats as "no roll document".
+  const legacyClip: RollClipInput = { id: 'q-legacy', sourcePianoRoll: qnotes, sourceBpm: 120, sourceTotalSteps: 8 };
+  const legacyOut = quantizeRollClip(legacyClip, { grid: '1/16', strength: 1, quantizeEnds: true });
+  assert.deepEqual(legacyOut.sourceRollNotes, []);
+  assert.deepEqual(legacyOut.sourcePianoRoll.map((n) => n.step), [0, 4]);
+  assert.deepEqual(legacyOut.sourcePianoRoll.map((n) => n.length), [1, 1]);
+  // The input list is untouched.
+  assert.deepEqual(qnotes.map((n) => n.step), [0.2, 3.9]);
+
+  // A clip with its own lane-based document: sourceRollNotes is quantized and
+  // sourcePianoRoll is re-derived from the result, so the two never drift.
+  const ownClip: RollClipInput = {
+    id: 'q-own',
+    sourceRollNotes: qnotes,
+    sourcePianoRoll: [],
+    sourceLanes: LANE_A,
+    sourceMeterMap: M44,
+    sourcePickupSteps: 0,
+    sourceTotalSteps: 8,
+    sourceBpm: 120,
+  };
+  const ownOut = quantizeRollClip(ownClip, { grid: '1/16', strength: 1, quantizeEnds: true });
+  assert.deepEqual(ownOut.sourceRollNotes.map((n) => n.step), [0, 4]);
+  assert.deepEqual(ownOut.sourceRollNotes.map((n) => n.length), [1, 1]);
+  // Lane A has no cycle, so the played list is the same notes unrolled once
+  // with the lane id dropped.
+  assert.deepEqual(ownOut.sourcePianoRoll.map((n) => n.step), [0, 4]);
+  assert.equal(ownOut.sourcePianoRoll.some((n) => 'lane' in n), false);
+
+  // A groove nudges the already-quantized grid: a flat lateness of +0.5 step on
+  // slot 0 (16 slots/bar; both notes' quantized steps land on-the-beat slots)
+  // pushes a note landing on that slot forward by 0.5 step at full strength.
+  const groove = { id: 'g', name: 'g', slots: 16, lateness: [0.5, ...new Array(15).fill(0)] };
+  const groovedOut = quantizeRollClip(ownClip, { grid: '1/16', strength: 1, groove, grooveStrength: 1 });
+  assert.equal(groovedOut.sourceRollNotes.find((n) => n.id === 'q0')?.step, 0.5);
+  // Slot 4 (q1's quantized step) has no lateness in this groove, so it is untouched.
+  assert.equal(groovedOut.sourceRollNotes.find((n) => n.id === 'q1')?.step, 4);
+
+  // grooveStrength scales the groove independently of the grid quantize's own strength.
+  const halfGrooved = quantizeRollClip(ownClip, { grid: '1/16', strength: 1, groove, grooveStrength: 0.5 });
+  assert.equal(halfGrooved.sourceRollNotes.find((n) => n.id === 'q0')?.step, 0.25);
+
+  // An empty roll's own notes (never any lane document) quantize to nothing and stay that way.
+  const emptyOut = quantizeRollClip({}, { grid: '1/16', strength: 1 });
+  assert.deepEqual(emptyOut, { sourceRollNotes: [], sourcePianoRoll: [] });
 }
 
 console.log('rollClip: ok');

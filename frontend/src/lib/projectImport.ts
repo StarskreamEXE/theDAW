@@ -65,6 +65,7 @@ import { useSwayImportStore, startSwayImportDriver } from '../state/swayImportSt
 import { usePerformRoutingStore } from '../state/performRouting';
 import { tasmoLoadedToDawProject } from './tasmoToSession';
 import { meterFromTasmo } from './timeSignatureIO';
+import { pairingHeader } from './pairing';
 
 const TRACK_COLORS = ['#8b5cf6', '#a855f7', '#ec4899', '#06b6d4', '#10b981', '#facc15', '#f97316', '#ef4444'];
 
@@ -308,7 +309,7 @@ const loadTakes = async (
       logWarn('project', `Clip "${c.name}": take "${label}" has no audio file — takes dropped`);
       return null;
     }
-    const res = await fetch(projectApi.clipAudioUrl(t.audio_file));
+    const res = await fetch(projectApi.clipAudioUrl(t.audio_file), { headers: pairingHeader() });
     if (!res.ok) {
       logWarn(
         'project',
@@ -360,7 +361,7 @@ const buildClip = async (
   let sourcePianoRoll: PianoNote[] | undefined;
 
   if (c.audio_file) {
-    const res = await fetch(projectApi.clipAudioUrl(c.audio_file));
+    const res = await fetch(projectApi.clipAudioUrl(c.audio_file), { headers: pairingHeader() });
     if (!res.ok) {
       logError('project', `Clip "${c.name}" audio not loadable (${res.status}): ${c.audio_file}`);
       return null;

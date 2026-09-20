@@ -67,11 +67,27 @@ async def parse_upload(file: UploadFile = File(...)):
 
 @router.post("/parse-path")
 def parse_path(req: PathRequest):
-    """Parse a score already on disk (native file-picker flow)."""
+    """Parse a score already on disk (native file-picker flow).
+
+    ``req.path`` must resolve inside the library root or one of the app's
+    other allowed import directories (SEC-005) -- the same containment
+    policy ``/api/project/clip-audio`` already enforces for server-side audio
+    paths. Resolution happens before the check, so a ``..`` segment or a
+    symlink pointing outside those roots cannot slip through, and a path
+    that resolves outside them is refused before the filesystem is ever read.
+    """
+    from backend.modules.project.media_access import resolve_media_path
+
     from .parser import parse_score_path
 
+    resolved = resolve_media_path(req.path)
+    if resolved is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Path is outside the library and the app's allowed import directories",
+        )
     try:
-        return parse_score_path(req.path)
+        return parse_score_path(str(resolved))
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:  # noqa: BLE001 - surface parse errors to the client

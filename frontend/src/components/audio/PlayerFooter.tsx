@@ -1,4 +1,5 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Volume, Volume2, Download, Share2, Heart, Repeat, Repeat1, Shuffle, VolumeX, Cast, Check, Activity, Circle, Headphones, Speaker, Triangle } from 'lucide-react';
 import { useGenerateStore } from '../../state/generateStore';
 import { usePlaybackStore } from '../../state/playbackStore';
@@ -63,7 +64,7 @@ import {
   type PunchMode,
   type RecordingStatus,
 } from '../../state/recordingStore';
-import { ContextMenu, menuAnchorFromEvent, type ContextMenuPosition } from '../ui/ContextMenu';
+import { ContextMenu, menuAnchorFromEvent, usePopoverShell, type ContextMenuPosition } from '../ui/ContextMenu';
 import { postStatus } from '../../state/statusNoticeStore';
 import { keyBelongsToFocusedControl } from '../../lib/keyTargets';
 
@@ -679,6 +680,180 @@ const INFO_BLOCK = 'basis-48 2xl:basis-64 shrink min-w-0 overflow-hidden flex-co
  *  box so PLAYING, PAUSED and IDLE all take the same room. */
 const STATE_WORD = 'w-20 shrink-0 text-center font-display font-bold text-xs leading-4 uppercase rounded-xs border px-1';
 
+/**
+ * The click's level. `metronomeStore.setVolume` had no caller before this —
+ * the click was stuck at its persisted default with no way to turn it down
+ * against the mix. A custom SlideTrack, same as the master Volume control
+ * elsewhere in this footer, so it carries its own aria-label and is never
+ * wrapped in a <label>.
+ *
+ * Exported and props-only (no store read inside it) so it can be rendered in
+ * isolation in a test, the same way `MixerStrips.tsx` exports `BusNameField`
+ * to avoid standing up the whole drawer just to prove a control's wiring.
+ * `volume` is the store's 0..1 scale; the 0..100 SlideTrack scale is the
+ * footer's own convention (see the master Volume control below).
+ */
+export function MetronomeVolumeControl({ volume, onChange }: { volume: number; onChange: (v: number) => void }) {
+  return (
+    <SlideTrack
+      min={0}
+      max={100}
+      step={1}
+      value={Math.round(volume * 100)}
+      onChange={(v) => onChange(v / 100)}
+      className="w-10"
+      ariaLabel="Metronome volume"
+    />
+  );
+}
+
+/**
+ * The metronome level's below-2xl home. `MetronomeVolumeControl` itself is
+ * gated `hidden 2xl:flex` beside the metronome toggle (see that wrapper's
+ * comment), so below 2xl the only way to `setVolume` is a second gesture on
+ * the toggle button itself — right-click, Shift+F10, or the Menu key, same
+ * three openers RecordKey's plate documents for PUNCH. The toggle carries no
+ * `disabled:pointer-events-none` (it is never disabled), so unlike RecordKey
+ * the listener sits directly on the button rather than needing a wrapping
+ * plate.
+ *
+ * Not built on `ContextMenu`: that primitive is a list of discrete items,
+ * and this hosts one continuous control (`MetronomeVolumeControl`'s
+ * `SlideTrack`), not a set of rows to choose between. This panel is a
+ * smaller sibling that shares ContextMenu's contract — portal to <body>,
+ * clamp into the viewport, dismiss on outside click / Escape / wheel-scroll,
+ * and hand focus to its one control on open and back to the opener on close
+ * — rather than reusing its item-rendering internals.
+ */
+export const MetronomeLevelPopover: React.FC<{
+  position: ContextMenuPosition | null;
+  onClose: () => void;
+  volume: number;
+  onChange: (v: number) => void;
+}> = ({ position, onClose, volume, onChange }) => {
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  // Focus the slider on open, and hand focus back to whatever opened the
+  // panel on close — same contract as ContextMenu's first-row focus. Stable
+  // identity: it closes only over the ref, never over props.
+  const focusSlider = useCallback(
+    () => panelRef.current?.querySelector<HTMLElement>('[role="slider"]') ?? null,
+    [],
+  );
+  // Clamp into the viewport, outside-click/Escape/wheel dismiss (guarded
+  // against the popover's own hosted slider — finding 1, T25b edit B
+  // re-audit), and the open/close focus round trip — shared with ContextMenu
+  // via `usePopoverShell`.
+  const adjusted = usePopoverShell({ position, onClose, panelRef, focusOnOpen: focusSlider });
+
+  // The panel portals to <body>, outside the Shell's `.edit-theme-scope`,
+  // same reason ContextMenu carries this wrapper (finding 4, T25b edit B
+  // re-audit) — without it, `et-ink-2` on the "Level" label below has no
+  // `--et-*` value in scope and silently falls back to body ink.
+  const editThemeId = useEditThemeStore((s) => s.themeId);
+  const editThemeImage = useEditThemeStore((s) => s.customImage);
+  const editTheme = React.useMemo(() => {
+    const { vars, light } = resolveEditThemeVars(editThemeId, editThemeImage);
+    const scopeVars = Object.fromEntries(Object.entries(vars).filter(([name]) => name !== '--et-root-bg'));
+    return { vars: scopeVars, light };
+  }, [editThemeId, editThemeImage]);
+
+  if (!position) return null;
+  const pos = adjusted ?? { x: -9999, y: -9999 };
+
+  return createPortal(
+    <div
+      className="edit-theme-scope contents"
+      data-et-light={editTheme.light ? '1' : undefined}
+      style={editTheme.vars as React.CSSProperties}
+    >
+    <div
+      ref={panelRef}
+      role="dialog"
+      aria-label="Metronome level"
+      className="fixed z-10000 bg-[#0a080f] border border-purple-500/40 rounded shadow-[0_8px_24px_rgba(0,0,0,0.6)] px-3 py-2 flex items-center gap-2 font-sans text-xs font-bold select-none"
+      style={{ left: pos.x, top: pos.y }}
+      onClick={(e) => e.stopPropagation()}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      }}
+    >
+      <span className="et-ink-2 uppercase tracking-wider">Level</span>
+      <MetronomeVolumeControl volume={volume} onChange={onChange} />
+    </div>
+    </div>,
+    document.body,
+  );
+};
+
+/**
+ * Whether a keydown on the metronome toggle should open
+ * `MetronomeLevelPopover` — the platform's own "context menu here" gestures
+ * (Shift+F10, the Menu/ContextMenu key), same predicate RecordKey's plate
+ * uses inline for PUNCH. Exported and unit-tested on its own (finding 2,
+ * T25b edit B re-audit) so `MetronomeToggle`'s onKeyDown below can never
+ * drift from what the tests assert.
+ */
+export const opensLevelPopover = (e: { key: string; shiftKey: boolean }): boolean =>
+  e.key === 'ContextMenu' || (e.key === 'F10' && e.shiftKey);
+
+/**
+ * The metronome toggle button plus its below-2xl level-popover opener,
+ * split out from `PlayerFooter`'s body (finding 2, T25b edit B re-audit) so
+ * the toggle -> popover wiring — the single route to `setVolume` below
+ * 1536px — is renderable and testable without standing up the whole footer
+ * and its store graph.
+ */
+export const MetronomeToggle: React.FC<{
+  metronomeOn: boolean;
+  onToggle: () => void;
+  volume: number;
+  onChangeVolume: (v: number) => void;
+  className?: string;
+}> = ({ metronomeOn, onToggle, volume, onChangeVolume, className = '' }) => {
+  const [levelPopover, setLevelPopover] = useState<ContextMenuPosition | null>(null);
+  const btnRef = useRef<HTMLButtonElement | null>(null);
+  return (
+    <>
+      {/* A custom control, so it carries its own accessible name and its
+          state in aria-pressed — never a wrapping <label>. It is also the
+          below-2xl opener for the level popover (right-click / Shift+F10 /
+          Menu key) — see MetronomeVolumeControl's wrapper and
+          MetronomeLevelPopover's own comment for why. The button carries no
+          `disabled:pointer-events-none` (it is never disabled), so the
+          listener sits on it directly rather than needing RecordKey's
+          wrapping plate. */}
+      <button
+        ref={btnRef}
+        type="button"
+        onClick={onToggle}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setLevelPopover(menuAnchorFromEvent(e));
+        }}
+        onKeyDown={(e) => {
+          if (!opensLevelPopover(e)) return;
+          e.preventDefault();
+          const rect = btnRef.current?.getBoundingClientRect();
+          setLevelPopover({ x: rect?.left ?? 0, y: rect?.bottom ?? 0 });
+        }}
+        aria-label={`Metronome click ${metronomeOn ? 'on' : 'off'} - right-click for level`}
+        aria-pressed={metronomeOn}
+        title={`Metronome click ${metronomeOn ? 'on' : 'off'} - the EDIT timeline's count - right-click for level`}
+        className={`${iconButton} ${metronomeOn ? 'text-[rgb(var(--et-accent))] bg-white/5' : ''} ${className}`}
+      >
+        <Triangle className="w-3.5 h-3.5" strokeWidth={1.5} absoluteStrokeWidth />
+      </button>
+      <MetronomeLevelPopover
+        position={levelPopover}
+        onClose={() => setLevelPopover(null)}
+        volume={volume}
+        onChange={onChangeVolume}
+      />
+    </>
+  );
+};
+
 export const PlayerFooter: React.FC = () => {
   const [isLiked, setIsLiked] = useState(false);
   // The footer sits OUTSIDE Shell (to escape the layout zoom), so it must
@@ -779,6 +954,8 @@ export const PlayerFooter: React.FC = () => {
   // and schedules nothing until EDIT plays with the metronome on.
   const metronomeOn = useMetronomeStore((s) => s.enabled);
   const toggleMetronome = useMetronomeStore((s) => s.toggle);
+  const metronomeVolume = useMetronomeStore((s) => s.volume);
+  const setMetronomeVolume = useMetronomeStore((s) => s.setVolume);
   const countInBars = useMetronomeStore((s) => s.countInBars);
   const setCountInBars = useMetronomeStore((s) => s.setCountInBars);
   useEffect(() => { initMetronome(); }, []);
@@ -1149,18 +1326,32 @@ export const PlayerFooter: React.FC = () => {
               is in the RIGHT track for the same reason; see the plate comment
               below for why no sixth key can balance. */}
           <div className="flex shrink-0 items-center gap-1">
-            {/* A custom control, so it carries its own accessible name and its
-                state in aria-pressed — never a wrapping <label>. */}
-            <button
-              type="button"
-              onClick={toggleMetronome}
-              aria-label={`Metronome click ${metronomeOn ? 'on' : 'off'}`}
-              aria-pressed={metronomeOn}
-              title={`Metronome click ${metronomeOn ? 'on' : 'off'} - the EDIT timeline's count`}
-              className={`${iconButton} ${metronomeOn ? 'text-[rgb(var(--et-accent))] bg-white/5' : ''}`}
-            >
-              <Triangle className="w-3.5 h-3.5" strokeWidth={1.5} absoluteStrokeWidth />
-            </button>
+            {/* Toggle + below-2xl level-popover opener, in one component so
+                the wiring between them is testable on its own — see
+                MetronomeToggle's comment. */}
+            <MetronomeToggle
+              metronomeOn={metronomeOn}
+              onToggle={toggleMetronome}
+              volume={metronomeVolume}
+              onChangeVolume={setMetronomeVolume}
+            />
+            {/* MetronomeVolumeControl: gated `hidden 2xl:flex`, the count-in
+                select's own PUNCH-select neighbour's pattern. This is a
+                w-10 SlideTrack, 40px plus the same 4px gap — 44px, against
+                the 960px measurements this file records above (RECORD's
+                comment): 40.4px of slack
+                before the plate, so 44px lands the compact RECORD key's right
+                edge at 346.0 against the plate's left edge at 342.4, 3.6px of
+                overlap — the same failure the rejected 68px PUNCH experiment
+                caused (see the removed-experiment comment below), just
+                smaller. So this renders nothing below 2xl, and the metronome
+                TOGGLE button above takes the second gesture instead — same
+                model as RecordKey's plate right-click for PUNCH — so
+                `setVolume` stays reachable at every width, not only
+                >=1536px. */}
+            <div className="hidden 2xl:flex shrink-0 items-center gap-1">
+              <MetronomeVolumeControl volume={metronomeVolume} onChange={setMetronomeVolume} />
+            </div>
             {/* A native select, so it needs a real id/name and a <label htmlFor>.
                 The label is sr-only: the footer row is 48px and the three option
                 texts already say what the control is on screen. */}
@@ -1331,8 +1522,8 @@ export const PlayerFooter: React.FC = () => {
               (CLAUDE.md rule 3); the WINDOW itself is the editor's loop region,
               and this only picks which of its edges a take may cross.
 
-              A w-16 select costs 80px wherever it goes (64 + the track's gap),
-              and 2xl is the first width that HAS 80px. Measured in Chrome on
+              A w-16 select costs 68px wherever it goes (64 + the track's gap),
+              and 2xl is the first width that HAS 68px. Measured in Chrome on
               the EDIT tab, getBoundingClientRect, this build:
                 - 960:  in the LEFT track it took the now-playing title from
                         32.4px to 0.4px — 32.4 being what batch 7 left after

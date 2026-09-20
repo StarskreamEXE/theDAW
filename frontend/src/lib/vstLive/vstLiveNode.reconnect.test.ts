@@ -109,6 +109,8 @@ class FakeRegistry implements VstSessionRegistry {
       pid: 1,
       client: client as never,
       stateDirty: false,
+      userMovedOnRejectedState: false,
+      stateSent: true,
     };
   }
   acquire(entry: ChainEntry, sampleRate: number): Promise<VstLiveSession | null> {
@@ -143,6 +145,13 @@ class FakeRegistry implements VstSessionRegistry {
   markParamsChanged(entryId: string): void {
     this.paramsChanged.push(entryId);
     if (this.give) this.give.stateDirty = true;
+  }
+  markUserParamsChanged(entryId: string): void {
+    this.paramsChanged.push(entryId);
+    if (this.give) {
+      this.give.stateDirty = true;
+      this.give.userMovedOnRejectedState = true;
+    }
   }
 }
 

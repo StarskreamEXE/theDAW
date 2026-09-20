@@ -40,6 +40,10 @@ data/plugins/
 backend/modules/vst/vst3_scan_cache.json
 # Captured VST3 native-editor state (per-plugin presets, machine-specific)
 data/vst_presets/
+# LAN pairing token (a secret, generated per install)
+data/pairing_token.txt
+# One-time notation migration bookkeeping (regenerated on demand)
+data/notation_migrations.json
 CHANGES-LOGS/
 backend/rag_index/
 archive/

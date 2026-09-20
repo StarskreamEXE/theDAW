@@ -42,6 +42,9 @@ import {
 import { useVstLiveStore } from '../../state/vstLiveStore';
 import type { RackEffectInstance } from '../rackEffects';
 import type { ChainEntry } from '../../state/effectChainStore';
+// From the storage module, NOT effectChainStore: that store imports
+// rackEffects, which imports this module, and the cycle breaks initialization.
+import { areVstStatesLoaded, loadedVstEntry, vstStatesLoaded } from '../vstStateStorage';
 
 /** Absolute URL of the worklet module, served from `frontend/public`. */
 export const VST_BRIDGE_WORKLET_URL = '/vst-bridge.worklet.js';
@@ -513,7 +516,17 @@ export function createVstLiveNode(
       return;
     }
     if (disposed) return;
-    const s = await registry.acquire(entry, ctx.sampleRate);
+    // The host is spawned with the entry's `raw_state`. A MIX entry's saved
+    // state arrives from IndexedDB a moment after startup, and until then it
+    // reads as the plugin's defaults — so wait, then spawn with the entry as
+    // it is once loaded. A node torn down while waiting never acquires.
+    let spawnEntry = entry;
+    if (!areVstStatesLoaded()) {
+      await vstStatesLoaded;
+      if (disposed) return;
+      spawnEntry = loadedVstEntry(entry.id) ?? currentEntry;
+    }
+    const s = await registry.acquire(spawnEntry, ctx.sampleRate);
     if (!s) return;
     if (disposed) {
       // The node was disposed while the host was still spawning. The process

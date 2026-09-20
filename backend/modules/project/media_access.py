@@ -95,15 +95,28 @@ def _static_roots() -> list[Path]:
     return out
 
 
+# Persisted-file format version. A bare JSON list is the pre-v2 shape written
+# before roots were narrowed at registration time: a machine that was already
+# exploited under that bug could have a widened root (e.g. a drive root or
+# System32) sitting in the file, and nothing about that old entry re-validates
+# it against today's `_is_too_broad`/static-root rules. Any file that is not
+# `{"v": 2, "roots": [...]}` is treated as empty, forcing a re-grant the next
+# time the user opens each project instead of silently re-admitting it.
+_ROOTS_STATE_VERSION = 2
+
+
 def _load_session_roots() -> list[Path]:
     try:
         raw = json.loads(_ROOTS_STATE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
-    if not isinstance(raw, list):
+    if not isinstance(raw, dict) or raw.get("v") != _ROOTS_STATE_VERSION:
+        return []
+    items = raw.get("roots")
+    if not isinstance(items, list):
         return []
     out: list[Path] = []
-    for item in raw:
+    for item in items:
         if not isinstance(item, str):
             continue
         p = _safe_resolve(item)
@@ -121,7 +134,11 @@ def _persist() -> None:
         _ROOTS_STATE.parent.mkdir(parents=True, exist_ok=True)
         tmp = _ROOTS_STATE.with_suffix(".json.tmp")
         tmp.write_text(
-            json.dumps([str(p) for p in _session_roots], indent=2), encoding="utf-8"
+            json.dumps(
+                {"v": _ROOTS_STATE_VERSION, "roots": [str(p) for p in _session_roots]},
+                indent=2,
+            ),
+            encoding="utf-8",
         )
         tmp.replace(_ROOTS_STATE)
     except OSError as e:

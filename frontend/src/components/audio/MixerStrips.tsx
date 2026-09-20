@@ -274,6 +274,65 @@ const KeyBadge: React.FC<{
   );
 };
 
+/**
+ * The bus name — a real, always-editable native `<input>` bound straight to
+ * `updateBus`, matching the track header's own name field
+ * (`WaveformEditor.tsx`'s `#editor-track-name-<id>` input): the store
+ * supported renaming a bus (`editorStore.ts:831`) since batch 6, but nothing
+ * in this drawer ever called it, so a bus was stuck with whatever name
+ * `addBus` gave it. `updateBus` records no undo step of its own (see its
+ * doc comment) — same as a fader ride, a rename coalesces under the 300 ms
+ * window rather than cutting one step per keystroke.
+ *
+ * Exported so it can be rendered and driven in isolation
+ * (`MixerStrips.b12.test.tsx`) without mounting the whole drawer, which pulls
+ * in the strip meters' AudioContext taps.
+ */
+export const BusNameField: React.FC<{
+  busId: string;
+  name: string;
+  onRename: (name: string) => void;
+}> = ({ busId, name, onRename }) => {
+  // Local draft rather than a fully-controlled `value={name}`: the user must
+  // be able to select-all and delete while typing a replacement without the
+  // field being yanked back to the last COMMITTED name on every keystroke.
+  const [draft, setDraft] = useState(name);
+  useEffect(() => {
+    setDraft(name);
+  }, [name]);
+
+  return (
+    <>
+      <label htmlFor={`mixer-bus-name-${busId}`} className="sr-only">{`Bus ${name} name`}</label>
+      <input
+        id={`mixer-bus-name-${busId}`}
+        name={`mixerBusName-${busId}`}
+        type="text"
+        value={draft}
+        onChange={(e) => {
+          const next = e.target.value;
+          setDraft(next);
+          // `editorStore.updateBus` treats a falsy `name` as "no rename" for
+          // the ROUTING GRAPH, but unconditionally spreads `updates` onto the
+          // strip object regardless — so writing an empty/whitespace value
+          // through would blank the strip while the routing picker kept
+          // showing the OLD name. Never let the two disagree: only a real
+          // name reaches the store.
+          if (next.trim()) onRename(next);
+        }}
+        onBlur={() => {
+          // Left blank: snap the FIELD back to the committed name — nothing
+          // was ever written through for an empty value, so there is nothing
+          // to undo, only a local display to correct.
+          if (!draft.trim()) setDraft(name);
+        }}
+        title={name}
+        className="min-w-0 flex-1 truncate rounded bg-transparent px-1 -mx-1 text-xs font-bold text-purple-200 outline-hidden hover:bg-white/5 focus:bg-white/5"
+      />
+    </>
+  );
+};
+
 /** Surface a refusal on the app's notice stack. */
 function toastRefusal(what: string, reason: RoutingRefusal): void {
   requireFeature({
@@ -764,9 +823,7 @@ export const MixerStrips: React.FC = () => {
             className={`${STRIP} border-purple-500/25`}
           >
             <div className="flex items-center justify-between gap-1">
-              <span className="truncate text-xs font-bold text-purple-200" title={b.name}>
-                {b.name}
-              </span>
+              <BusNameField busId={b.id} name={b.name} onRename={(next) => updateBus(b.id, { name: next })} />
               {armedDelete === b.id ? (
                 // Cancel sits where the × was — under the pointer that just
                 // clicked — and Confirm is to its RIGHT, so a fast double-click

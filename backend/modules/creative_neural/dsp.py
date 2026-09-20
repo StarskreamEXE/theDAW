@@ -56,7 +56,6 @@ def grainlab(input_path: Path, output_path: Path, params: dict) -> None:
         if abs(pitch_spread) > 0.01:
             shift_st = rng.uniform(-abs(pitch_spread), abs(pitch_spread))
             ratio = 2.0 ** (shift_st / 12.0)
-            max(int(grain.shape[0] / ratio), 4)
             # per-channel resample
             shifted_channels = []
             for ch in range(n_channels):

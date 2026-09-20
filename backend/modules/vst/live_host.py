@@ -96,6 +96,7 @@ from typing import Any, Optional
 
 from backend.lib import paths
 from backend.lib.launch_token import child_env
+from backend.modules.vst.path_policy import PluginPathError, check_plugin_path
 
 log = logging.getLogger(__name__)
 
@@ -449,19 +450,28 @@ def _build_stamp(mtime: float) -> str:
 
 
 def _validate_plugin(plugin_path: Any) -> str:
-    """The plugin argument, validated. Errors name the file, never the folder."""
+    """The plugin argument, validated and resolved.
+
+    ``plugin_path`` is browser-supplied, untrusted input, so it goes through
+    ``path_policy.check_plugin_path`` first (R5-2): the raw text must name a
+    ``.vst3`` file or bundle, must not be a network/device path (UNC paths
+    included), and must resolve inside one of the scanned VST3 roots — the
+    same directories the scanner itself offers in the UI. Only after that
+    does existence get checked; ``check_plugin_path`` validates shape and
+    containment without touching the filesystem.
+    """
     raw = str(plugin_path or "").strip()
     if not raw:
         raise LiveHostError(400, "plugin_path is required")
-    path = Path(raw)
-    name = path.name or raw
-    if path.suffix.lower() != ".vst3":
-        raise LiveHostError(400, f"'{name}' is not a .vst3 plugin")
+    try:
+        resolved = check_plugin_path(raw)
+    except PluginPathError as e:
+        raise LiveHostError(e.status, e.message) from e
     # A VST3 is a file on some platforms and a bundle directory on others;
-    # both are valid, so existence is the only question.
-    if not path.exists():
-        raise LiveHostError(400, f"Plugin not found: '{name}'")
-    return raw
+    # both are valid, so existence is the only remaining question.
+    if not resolved.exists():
+        raise LiveHostError(400, f"Plugin not found: '{resolved.name}'")
+    return str(resolved)
 
 
 def _validate_audio(sample_rate: Any, block_size: Any, channels: Any) -> None:

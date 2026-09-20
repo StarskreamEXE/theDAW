@@ -575,7 +575,12 @@ def test_the_vj_build_and_server_start_without_the_token(
 ) -> None:
     from backend.modules.vj import sidecar
 
-    (tmp_path / "node_modules").mkdir()
+    # _vite_bin_js spawns VJ-9000's vite CLI directly (node
+    # node_modules/vite/bin/vite.js) instead of going through npm scripts,
+    # so the fixture must stub that exact file, not just node_modules/.
+    vite_js = tmp_path / "node_modules" / "vite" / "bin" / "vite.js"
+    vite_js.parent.mkdir(parents=True)
+    vite_js.write_text("", encoding="utf-8")
     monkeypatch.setenv("theDAW_VJ_PROJECT", str(tmp_path))
     monkeypatch.delenv("theDAW_VJ_DEV", raising=False)
     monkeypatch.setattr(sidecar, "_proc", None)

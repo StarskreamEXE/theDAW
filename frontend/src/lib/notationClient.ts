@@ -69,6 +69,9 @@ export interface NotationCapabilities {
   tab_tuning_pitches?: Record<string, number[]>;
   arrangement_styles?: string[];
   engines?: Record<string, unknown>;
+  /** True when chord tracks are buildable. They are never in `formats`:
+   *  they reach the entry through POST /{entry}/chords, not /export. */
+  chords?: boolean;
   /** True when an ffmpeg binary is reachable, so a Beat Saber export can
    *  encode song.ogg itself. */
   ffmpeg?: boolean;

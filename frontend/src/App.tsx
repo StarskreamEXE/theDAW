@@ -33,6 +33,7 @@ import { useDownloadStore } from './state/downloadStore';
 import { useLayoutPrefs } from './state/layoutPrefsStore';
 import { triggerPianoNoteFromMidi } from './lib/pianoTrigger';
 import { publishMidi, subscribeToMidi } from './state/midiBus';
+import { isMidiMessageIgnored } from './state/midiIgnoreStore';
 // Live MIDI capture (see the mount below). Every module here is already in this
 // file's eager import graph via Shell/pianoTrigger EXCEPT `recordingStore`,
 // which has to be loaded anyway for anything to record.
@@ -56,7 +57,6 @@ import { startSwayRouting } from './state/swayRouting';
 import { startSwaySurface, swaySurfaceConsumes } from './state/swaySurface';
 import { startSwayImportDriver } from './state/swayImportStore';
 import { useSwaySurfaceStore } from './state/swaySurfaceStore';
-import { detectProfileFromNames, AUDIMA_SWAY_ID } from './state/controllerProfiles';
 import { poseControlSource, startPoseXrMirror } from './state/poseControlSource';
 import { startPoseRouting } from './state/poseRouting';
 import { startXrViz, stopXrViz } from './state/xrViz';
@@ -286,13 +286,24 @@ export default function App() {
       //    what to do with it. ONE Web MIDI listener, many readers.
       publishMidi(e.data);
 
-      // 2. Built-in piano-synth trigger on note-on. Skipped when the
-      //    user has muted MIDI audio triggering (VJ performers who
-      //    want the controller to drive effects only). The bus
-      //    publish above still runs, so visual effects keep reacting.
+      // 2. Built-in piano-synth trigger on note-on. This reads raw
+      //    `e.data` directly — it is NOT a bus subscriber, so
+      //    publishMidi's own ignore filter (midiBus.ts) never sees
+      //    it and the check has to be repeated here. Skipped when
+      //    the user has muted MIDI audio triggering (VJ performers
+      //    who want the controller to drive effects only), or when
+      //    the note is on the DJ MIDI map's ignore list. The bus
+      //    publish above still runs (minus ignored controls), so
+      //    visual effects keep reacting.
       const [status, data1, data2] = e.data;
       const command = status & 0xf0;
-      if (command === 0x90 && data2 > 0 && !isMidiAudioMuted() && !swaySurfaceConsumes(e.data)) {
+      if (
+        command === 0x90 &&
+        data2 > 0 &&
+        !isMidiAudioMuted() &&
+        !swaySurfaceConsumes(e.data) &&
+        !isMidiMessageIgnored(e.data)
+      ) {
         try {
           triggerPianoNoteFromMidi(data1, data2);
         } catch (err) {
@@ -416,12 +427,32 @@ export default function App() {
   // Auto-enable the Sway DAW-control mirror when the Audima Sway is the detected
   // controller — until the user manually toggles it, after which their choice
   // sticks (autoEnable is a no-op once touched).
+  //
+  // FE-025: controllerProfiles.ts is a 400+ line static table of every known
+  // DJ/MIDI controller's control layout, only ever consulted here (once a MIDI
+  // device is actually connected) — never during initial render. A DYNAMIC
+  // import keeps it out of the first-paint bundle, the same pattern the render
+  // runner below uses for WaveformEditor's runRenderJob.
   const midiInputNames = useMidiDevicesStore((s) => s.inputs);
   useEffect(() => {
     if (!midiInputNames.length) return;
-    if (detectProfileFromNames(midiInputNames)?.id === AUDIMA_SWAY_ID) {
-      useSwaySurfaceStore.getState().autoEnable();
-    }
+    let cancelled = false;
+    void import('./state/controllerProfiles')
+      .then(({ detectProfileFromNames, AUDIMA_SWAY_ID }) => {
+        if (cancelled) return;
+        if (detectProfileFromNames(midiInputNames)?.id === AUDIMA_SWAY_ID) {
+          useSwaySurfaceStore.getState().autoEnable();
+        }
+      })
+      .catch((err: unknown) => {
+        // A failed chunk fetch (stale build after a deploy, dev server gone)
+        // must not fail silently: without this, connecting the Audima Sway
+        // would just never auto-enable its mirror with no diagnostic at all.
+        console.warn('[controllerProfiles] failed to load for Sway auto-detect:', err);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [midiInputNames]);
 
   // Quest MIDI bridge (loopMIDI-free): when MIDI is on, open the WebSocket to

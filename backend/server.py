@@ -14,6 +14,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -23,11 +24,21 @@ import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
-from fastapi import Body, FastAPI, Form, File, HTTPException, Request, UploadFile
+from fastapi import (
+    Body,
+    Depends,
+    FastAPI,
+    Form,
+    File,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
@@ -36,7 +47,8 @@ from backend.lib.audio_io import load_audio, load_audio_array, save_audio, save_
 from backend.assistant_routes import mcp_relay_router
 from backend.assistant_routes import router as assistant_router
 from backend.modules.loader import load_modules
-from backend.lib import paths
+from backend.lib import pairing, paths
+from backend.lib.cross_site import refuse_cross_site, require_loopback_or_launch_token
 from backend.lib.launch_token import child_env
 
 # Heavy imports (torch, torchaudio, matplotlib, and the stable_audio_3 model
@@ -64,10 +76,34 @@ async def _lifespan(_: FastAPI):
 
 app = FastAPI(title="theDAW API", lifespan=_lifespan)
 
+# A page's own site never triggers CORS at all -- only cross-origin browser
+# JS does -- so this only has to cover the one legitimate cross-origin
+# browser caller: Vite's dev server (a different port on this same machine)
+# talking to this API, plus the packaged app's own custom scheme, which
+# reports an origin of "app://." rather than an http(s) one (registered
+# `scheme: 'app'` with no host, electron-ui/main/index.ts:1348-1358 -- so
+# "app://." is the ONE origin that scheme ever produces; a bare `app://.*`
+# would needlessly also match a host-bearing app://evil that scheme cannot
+# actually emit). A LAN client (the phone companion, a headset) reaches the
+# API at its own address, which is same-origin from the browser's point of
+# view and is therefore unaffected by this restriction either way; routes
+# that must additionally tell a genuine LAN caller apart from a hostile one
+# gate on a real secret themselves (backend/lib/launch_token.py,
+# backend/lib/pairing.py, backend/lib/cross_site.py), not on CORS. No request
+# here carries cookies or any other ambient credential (grepped: nothing sets
+# `credentials: 'include'`), so nothing needs Access-Control-Allow-Credentials
+# either -- leaving it off means a response is never even eligible to be read
+# by an origin this regex missed.
+_CORS_ORIGIN_REGEX = (
+    r"^(https?://(localhost|127\.0\.0\.1|\[?::1\]?)(:\d+)?"
+    r"|app://\."
+    r"|(file|tauri|capacitor)://.*)$"
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origin_regex=_CORS_ORIGIN_REGEX,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -76,6 +112,12 @@ pipeline: Any = None
 sample_rate = 44100
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MODULES_DIR = Path(__file__).parent / "modules"
+
+#: GET /api/build-info's payload, resolved once in `_on_startup` (git and
+#: pyproject reads are ~ms-cheap but have no business running per-request).
+#: Every field stays null until startup fills it, so the route always answers
+#: — including under a bare TestClient that never runs the lifespan.
+_BUILD_INFO: dict[str, Any] = {"commit": None, "built": None, "version": None}
 
 #: Stamped on the console handler this module installs, so a second call finds
 #: its own handler instead of adding another one.
@@ -517,6 +559,47 @@ def _safe_filename(filename: str | None, fallback: str = "output.wav") -> str:
     if suffix.lower() not in {".wav", ".flac", ".ogg", ".png", ".json", ".safetensors"}:
         suffix = fallback_suffix
     return f"{stem}{suffix}"
+
+
+#: Exclusive upper bound for a *resolved* random seed — 2**31 (not the full
+#: unsigned 32-bit range), so a resolved seed always fits the UI's Seed
+#: slider (AdvancedGenPanel.tsx: ``max={2147483647}``, i.e. 2**31 - 1). A
+#: batch take's actual seed can still exceed this bound (``base + i`` for a
+#: large ``base`` near the top of the range and ``batch_size > 1``); that is
+#: existing, accepted behaviour for explicit non-default seeds, not something
+#: this bound constrains.
+_SEED_RESOLUTION_BOUND = 2**31
+
+
+def _resolve_seed(seed: int) -> int:
+    """Resolve a caller-supplied generation seed.
+
+    ``-1`` means "pick one for me" (the Form default on every generate
+    route); any other value is used exactly as given. Callers must reject
+    ``seed < -1`` before this point (see ``_require_valid_seed``) — passing
+    it through here would return it unchanged and indistinguishable from a
+    deliberate negative seed. The concrete value is never -1 so it can be
+    reported back to the caller (response JSON / X-Seed header) and reused
+    verbatim.
+    """
+    if seed == -1:
+        return random.randint(0, _SEED_RESOLUTION_BOUND - 1)
+    return seed
+
+
+def _require_valid_seed(seed: int) -> None:
+    """Reject a seed below -1.
+
+    -1 is the "pick one for me" sentinel; anything below it is not a valid
+    seed and, for a batch request, ``base + i`` (see ``_run_generate_job``)
+    could land exactly on -1 for some take (e.g. base -2, batch 3) — which
+    would then be silently re-resolved to a random seed instead of failing.
+    """
+    if seed < -1:
+        raise HTTPException(
+            status_code=400,
+            detail="seed must be -1 (pick one for me) or a non-negative integer",
+        )
 
 
 def _make_generation_filename(
@@ -975,6 +1058,44 @@ def _generate_spectrograms(waveform: torch.Tensor, sr: int) -> dict[str, str]:
     return result
 
 
+def _resolve_build_commit(repo_root: Path) -> str | None:
+    """The full git SHA this backend is running from, or None when git or the
+    repo is unavailable. Called once at startup; never raises — a missing
+    git, a non-repo checkout, or a timeout must not crash the server."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            env=child_env(),
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if out.returncode != 0:
+        return None
+    sha = out.stdout.strip()
+    return sha or None
+
+
+def _read_pyproject_version(repo_root: Path) -> str | None:
+    """The ``[project].version`` string from ``pyproject.toml``, or None when
+    the file is missing or malformed."""
+    try:
+        import tomllib
+
+        with (repo_root / "pyproject.toml").open("rb") as f:
+            data = tomllib.load(f)
+    except (OSError, ValueError) as e:
+        logger.debug("build-info: pyproject.toml read failed: %s", e)
+        return None
+    version = data.get("project", {}).get("version")
+    return version if isinstance(version, str) else None
+
+
 async def _on_startup():
     startup_t0 = time.perf_counter()
 
@@ -995,6 +1116,17 @@ async def _on_startup():
         install_log_ring()
     except Exception:
         logger.debug("log ring install failed", exc_info=True)
+
+    # Build identity for GET /api/build-info: resolved once here so the
+    # request path never shells out to git or reopens pyproject.toml. A
+    # missing git/.git or malformed pyproject leaves the field null rather
+    # than failing startup.
+    try:
+        _BUILD_INFO["commit"] = _resolve_build_commit(PROJECT_ROOT)
+        _BUILD_INFO["built"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        _BUILD_INFO["version"] = _read_pyproject_version(PROJECT_ROOT)
+    except Exception as e:
+        logger.warning("startup: build-info probe failed: %s", e)
 
     # System stats (kept torch-free so server-ready never waits on the ~9.6s
     # torch/stable_audio_3 import; the GPU/torch line is logged by _warm_heavy
@@ -1148,11 +1280,49 @@ async def set_module_enabled(module_name: str, enabled: bool = Body(..., embed=T
         raise HTTPException(status_code=400, detail="Invalid module name")
     if not config_path.exists():
         raise HTTPException(status_code=404, detail="Module not found")
-    config = json.loads(config_path.read_text())
-    config["enabled"] = enabled
-    config_path.write_text(json.dumps(config, indent=2))
+    # newline="" on both read and write: disables Python's universal-newline
+    # translation so a file's original line endings pass through untouched
+    # instead of `write_text`'s platform default (`\n` -> `\r\n` on Windows,
+    # which would rewrite every one of the 53 module.json files' line endings
+    # on the first toggle). `Path.read_text` has no `newline` parameter, so
+    # the read side goes through `open()` directly.
+    with config_path.open("r", encoding="utf-8", newline="") as f:
+        raw = f.read()
+    new_text = _toggle_module_enabled_text(raw, enabled)
+    config_path.write_text(new_text, encoding="utf-8", newline="")
+    config = json.loads(new_text)
     config["_dir"] = module_name
     return config
+
+
+_MODULE_ENABLED_LITERAL_RE = re.compile(r'"enabled"\s*:\s*(true|false)')
+
+
+def _toggle_module_enabled_text(raw: str, enabled: bool) -> str:
+    """Flip a module.json's ``enabled`` value by editing the raw text in
+    place, so every other byte — line endings, key order, and any literal
+    ``\\uXXXX`` escape already in the file — survives untouched.
+
+    Falls back to a full ``json.dumps(..., ensure_ascii=False)`` rewrite only
+    when the literal can't be found unambiguously (the key is missing, or the
+    pattern matches more than once, e.g. inside a string value); that
+    fallback still preserves the original trailing newline and is validated
+    with ``json.loads`` before it is ever returned, matching the format 45 of
+    53 real module.json files already use.
+    """
+    replacement = "true" if enabled else "false"
+    matches = list(_MODULE_ENABLED_LITERAL_RE.finditer(raw))
+    if len(matches) == 1:
+        start, end = matches[0].span(1)
+        new_text = raw[:start] + replacement + raw[end:]
+    else:
+        config = json.loads(raw)
+        config["enabled"] = enabled
+        new_text = json.dumps(config, indent=2, ensure_ascii=False) + (
+            "\n" if raw.endswith("\n") else ""
+        )
+    json.loads(new_text)  # never write text that wouldn't parse back
+    return new_text
 
 
 def _gpu_snapshot() -> list[dict]:
@@ -1319,6 +1489,54 @@ def _flash_attn_imported() -> bool:
     """Did the attention module bind flash_attn at import time (GPU aside)?"""
     mod = sys.modules.get("stable_audio_3.models.transformer")
     return mod is not None and getattr(mod, "flash_attn_func", None) is not None
+
+
+@app.get("/api/build-info")
+async def build_info() -> dict[str, Any]:
+    """Which code this backend runs: git commit, when this process started
+    (its build stamp — there is no separate compiled-artifact step to stamp
+    instead), and the pyproject-declared version. All three are resolved once
+    in ``_on_startup``; this route never touches git or the filesystem."""
+    return dict(_BUILD_INFO)
+
+
+@app.get(
+    "/api/pairing/token",
+    dependencies=[
+        Depends(refuse_cross_site),
+        Depends(require_loopback_or_launch_token),
+    ],
+)
+async def pairing_token() -> dict[str, str]:
+    """The LAN pairing token, for the desktop shell only (loopback or the
+    launch token -- never the pairing token itself, which would let a
+    caller who already has it mint nothing new). The share link carries it
+    in the URL fragment (``#pair=<token>``), which no server or proxy log
+    ever sees; see ``backend/lib/pairing.py``.
+
+    ``refuse_cross_site`` matters here specifically because the loopback gate
+    alone is not enough: a page the user's own desktop browser visits has a
+    loopback TCP peer too, so without it a hostile page could reach this
+    route (and, worse, the regenerate route below) with no preflight and no
+    CORS header needed for a simple request -- silently un-pairing every
+    phone even though it could never read the token back."""
+    return {"token": pairing.get_token()}
+
+
+@app.post(
+    "/api/pairing/token/regenerate",
+    dependencies=[
+        Depends(refuse_cross_site),
+        Depends(require_loopback_or_launch_token),
+    ],
+)
+async def regenerate_pairing_token() -> dict[str, str]:
+    """Replace the pairing token, revoking every share link issued so far --
+    same gate as ``GET /api/pairing/token``. A paired phone's already-open tab
+    keeps sending the OLD token until the user reloads it (or re-scans a new
+    share link/QR), at which point it gets refused like any other stale
+    credential."""
+    return {"token": pairing.regenerate_token()}
 
 
 @app.get("/api/health")
@@ -1696,6 +1914,12 @@ async def generate(
     # frontend sends them; USER_GUIDE lists them) but the local pipeline has
     # no inversion path yet, so they are accepted and intentionally unused.
     _ = (inversion_steps, inversion_gamma, inversion_unconditional)
+
+    # -1 ("pick one for me", the Form default) is resolved to a concrete seed
+    # here so it can be generated with, reported in the X-Seed header /
+    # filename below, and reused verbatim by the caller ("reuse seed").
+    _require_valid_seed(seed)
+    seed = _resolve_seed(seed)
 
     import torch
     from stable_audio_3.inference.distribution_shift import (
@@ -2156,6 +2380,10 @@ async def _run_generate_job(
                             "mime_type": mime_type,
                             "filename": filename,
                             "spectrograms": spectrograms,
+                            # CONTRACT (T01 -> T17): the seed actually used for
+                            # this take — never -1, `_resolve_seed` already
+                            # ran on `base_args["seed"]` before this loop.
+                            "seed": int(args.get("seed", -1)),
                             **artifact_info,
                         }
                     )
@@ -2262,6 +2490,11 @@ async def generate_jobs(
     # no inversion path yet, so they are accepted and intentionally unused.
     _ = (inversion_steps, inversion_gamma, inversion_unconditional)
 
+    # Reject before any model load / idle-gate hold: a batch take's seed is
+    # derived as base + i (below), and an explicit seed < -1 could otherwise
+    # land a take exactly on -1, the "pick one for me" sentinel.
+    _require_valid_seed(seed)
+
     from stable_audio_3.inference.distribution_shift import (
         DistributionShift,
         FluxDistributionShift,
@@ -2352,7 +2585,10 @@ async def generate_jobs(
             "duration": float(duration),
             "steps": int(steps),
             "cfg_scale": float(cfg_scale),
-            "seed": int(seed),
+            # -1 ("pick one for me") is resolved once here, before the batch
+            # loop in `_run_generate_job` derives each take's seed from it and
+            # every take reports the seed it actually used.
+            "seed": _resolve_seed(int(seed)),
             "apg_scale": float(apg_scale),
             "duration_padding_sec": float(duration_padding_sec),
             "scale_phi": float(cfg_rescale),
@@ -2434,7 +2670,12 @@ async def generate_jobs(
         # The task now owns the hold and releases "generate" in its own finally.
         hold.hand_off()
 
-        return {"job": {"id": job_id}}
+        # base_args["seed"] is the resolved base seed: for batch_size > 1
+        # each take actually uses base + i (`_run_generate_job`), reported
+        # per-take once the job completes. `generateStore.extractResolvedSeed`
+        # reads this field so the UI's "Seed used" / "reuse seed" don't have
+        # to wait for a poll.
+        return {"job": {"id": job_id, "seed": base_args["seed"]}}
 
 
 @app.get("/api/jobs")

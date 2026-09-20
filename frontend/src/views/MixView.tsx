@@ -5,7 +5,7 @@ import {
   Upload, X, Eye, EyeOff, ChevronLeft, ChevronRight, ChevronUp, ChevronDown, Trash2,
   Download, Send, Sparkles, Plus, Gauge, History, LayoutList, Grid3x3,
   Plug, RefreshCw, Loader2, Square, Blocks, FolderOpen, SlidersHorizontal,
-  AudioWaveform, Activity, Layers,
+  AudioWaveform, Activity, Layers, LayoutGrid,
 } from 'lucide-react';
 import { effectiveZoom } from '../lib/canvasScale';
 import { useEffectChainStore, EFFECT_LABELS, EFFECT_DEFAULTS, MIX_RACK_IDS } from '../state/effectChainStore';
@@ -615,6 +615,7 @@ function buildMixRegistry(p: MixRegArgs): WidgetRegistry {
         <button onClick={() => p.setActiveCategory('all')}
           title="Every effect in MIX, grouped by category"
           className={`flex items-center gap-1.5 px-1.5 py-1.5 rounded w-full text-left border-l-2 transition-colors ${p.activeCategory === 'all' ? 'border-purple-400 text-purple-200 bg-purple-500/10' : 'border-transparent text-zinc-300 hover:text-zinc-100 hover:bg-white/5'}`}>
+          <LayoutGrid className="w-3.5 h-3.5 shrink-0" />
           <span className="text-[10px] font-bold flex-1 truncate">All</span>
           <span className="text-[8px] font-mono text-zinc-500 shrink-0">{p.allEffectCount}</span>
         </button>
@@ -1102,7 +1103,7 @@ function buildMixRegistry(p: MixRegArgs): WidgetRegistry {
     : selected
       ? (() => {
           const schema = schemaForEffectId(selected.effect);
-          if (!schema) return <EffectsVizPanel effect={selected.effect} params={selected.params} className="h-full! border-purple-500/15!" />;
+          if (!schema) return <EffectsVizPanel effect={selected.effect} params={selected.params} enabled={selected.enabled} className="h-full! border-purple-500/15!" />;
           return (
             <div className="h-full min-h-0 flex flex-col gap-2">
               <div className="shrink-0 max-h-[62%] overflow-y-auto rounded border border-purple-500/15 bg-black/30">
@@ -1116,7 +1117,7 @@ function buildMixRegistry(p: MixRegArgs): WidgetRegistry {
                   onChange={(np) => p.updateParams(selected.id, np)}
                 />
               </div>
-              <EffectsVizPanel effect={selected.effect} params={selected.params} className="flex-1 min-h-0 border-purple-500/15!" />
+              <EffectsVizPanel effect={selected.effect} params={selected.params} enabled={selected.enabled} className="flex-1 min-h-0 border-purple-500/15!" />
             </div>
           );
         })()

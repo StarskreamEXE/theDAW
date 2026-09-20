@@ -35,6 +35,9 @@ import type { VstBridgeClientLike, VstBridgeClientOptions } from './bridgeClient
 import { createDefaultBridgeClient } from './bridgeWorkerClient';
 import type { VstFrame } from './frames';
 import type { ChainEntry } from '../../state/effectChainStore';
+// From the storage module, NOT effectChainStore: that store imports
+// rackEffects, which imports vstLiveNode, which imports this file.
+import { isVstStateUnresolvedFor, loadedVstEntry } from '../vstStateStorage';
 
 /**
  * Where a plugin state this module rescues is written back to.
@@ -99,6 +102,30 @@ export interface VstLiveSession {
    *  parks the audio thread, and doing it for every idle plugin on every
    *  autosave would tick the transport. */
   stateDirty: boolean;
+  /** The user has moved a control on this plugin WHILE it is running at its
+   *  factory defaults because a saved-state restore was refused. Set ONLY
+   *  from a genuine user gesture — `markUserParamsChanged` (a live-param push
+   *  routed through `liveParamSink`), or a knob moved in the plugin's OWN
+   *  editor window (`vstEditorStore`'s `paramSink`/`gestureSink`) — never from
+   *  a chain rebuild or `relive`/`attachWorklet`'s unconditional re-push,
+   *  which mark `stateDirty` with no user action at all. This is the one
+   *  thing the save-time rejection guard in `sinkLiveRawState` may trust as
+   *  evidence that a capture on a rejected-state plugin is the user's new
+   *  sound rather than its untouched defaults (T18 fifth audit, CRITICAL 1).
+   *  Reset whenever a NEW rejection is recorded, so a flag left over from a
+   *  previous incarnation of the session cannot wave through a capture of
+   *  defaults the user never touched. */
+  userMovedOnRejectedState: boolean;
+  /** Whether ANY state blob has ever been handed to this session's plugin
+   *  process — at spawn (from `entry.vst.raw_state`) or later via a retried
+   *  `restored()` delivery. The three rejection recorders below must NOT ask
+   *  `slot.entry.vst?.raw_state`: a late `restored()` delivery sends a state
+   *  to the running plugin without ever touching `slot.entry`, so that field
+   *  stays `undefined` for a session whose plugin was just handed a real
+   *  blob and then refused it — the refusal went unrecorded and the next
+   *  capture overwrote the saved state with factory defaults (T18 sixth
+   *  audit, CRITICAL 1). `stateSent` tracks the delivery itself instead. */
+  stateSent: boolean;
 }
 
 export interface VstSessionRegistryDeps {
@@ -176,6 +203,11 @@ export interface VstSessionRegistry {
   /** A parameter was pushed to this entry's plugin: its stored state is now
    *  behind what is sounding. No-op for an entry with no session. */
   markParamsChanged(entryId: string): void;
+  /** The SAME, plus: this push was a genuine user gesture (a live-param push
+   *  from `liveParamSink`, or a knob moved in the plugin's own editor
+   *  window) — not a chain rebuild's re-push. No-op for an entry with no
+   *  session. See `VstLiveSession.userMovedOnRejectedState`. */
+  markUserParamsChanged(entryId: string): void;
   /** Cached answer to "is there a host binary"; null until the probe lands. */
   hostAvailable(): boolean | null;
   /** Ids with a live or pending session, for the unload handler. */
@@ -264,16 +296,75 @@ export function createVstSessionRegistry(deps: VstSessionRegistryDeps = {}): Vst
    *
    * The host does not have a dedicated "state rejected" event: a restore that
    * fails surfaces as a `ready` warning, or as a non-fatal `warning`/`error`
-   * once `set_state` has been answered. Matching on the word is deliberate and
-   * deliberately narrow — an unrelated warning (an editor that would not open,
-   * an unused output pair) must not accuse the state and put a "defaults" badge
-   * on a plugin that is holding exactly what the user saved.
+   * once `set_state` has been answered. Matching on the bare word "state" is
+   * too broad -- it also catches the round-trip ADVISORY ("this plugin does
+   * not reliably round-trip its own state, so its live state is kept
+   * separately from the one the offline renderer uses", emitted by
+   * `vst3_instance.cpp`'s `prepare()`), which measures the plugin's own state
+   * container against itself BEFORE any user state is ever applied and says
+   * nothing about whether a restore succeeded (T18 sixth audit, MAJOR 2).
+   * Matching only the host's actual restore-failure wording keeps that
+   * advisory from reading as a refusal.
+   *
+   * This is the SOLE path -- the ninth audit removed the `armStatePending()`
+   * window this used to be the belt-and-braces fallback for: every refusal
+   * `set_state` and `restoreStateFile()` can produce already matches one of
+   * the wordings below, and the window's blanket catch-anything-while-armed
+   * behaviour false-rejected a successful restore whenever the plugin's own
+   * post-restore `onRestartRequired()` replayed an unrelated `prepare()`
+   * warning over the same connection (T18 ninth audit, CRITICAL 1). Every
+   * wording below is read verbatim from the host:
+   *   - `Session.cpp` `restoreStateFile()`: "could not read the state file: "
+   *     and "the state file was not restored: "
+   *   - `Session.cpp`'s two fault-path wordings for a faulted restore --
+   *     `handleSetState`'s live `set_state` path (line 554): "the plugin
+   *     faulted while restoring state", and `restoreStateFile()`'s startup
+   *     path (line 882): "the plugin faulted while restoring the state
+   *     file" -- matched via their shared prefix, "the plugin faulted while
+   *     restoring", so one alternation entry covers both wordings instead of
+   *     needing to track each verbatim. Line 554's is fatal today (its
+   *     `onError` carries `fatal: true`, which `onError`'s handler below
+   *     already excludes before `mentionsState` ever runs), so a session
+   *     that hits it dies and respawns, and the respawn's own restore
+   *     attempt is what actually gets recorded as the rejection -- via line
+   *     882's wording, which IS reachable. If line 554 is ever made
+   *     non-fatal, this shared-prefix match is what keeps it from going
+   *     unrecorded.
+   *   - `Session.cpp` `handleSetState`'s live `set_state` refusal (empty
+   *     `stateError` branch): "rejected the state blob"
+   *   - `Session.cpp` `handleSetState`'s busy/park-timeout branch: "set_state:
+   *     the plugin is busy (audio did not pause in time); try again" --
+   *     matched via the generic `set_state:` prefix, which also covers the
+   *     base64/empty-payload refusals from the same handler
+   *   - `vst3_instance.cpp` `Vst3Instance::setState`: "the plugin rejected
+   *     this component state (it is probably from another plugin)"
+   *   - `vst3_instance.cpp` `Vst3Instance::getState`/`setState`'s faulted-
+   *     instance guard: "this plugin faulted on an earlier state call and
+   *     cannot be trusted with another"
+   *   - `vst3_instance.cpp` `Vst3Instance::runStateCall`'s crash guard (via
+   *     `onWarning`): "the plugin crashed (...) inside IComponent::setState;
+   *     this state blob does not belong to it" -- matched via the fixed tail,
+   *     "this state blob does not belong to it", since the fault description
+   *     in the middle varies
+   *   - `vst3_state_container.cpp` `readStateContainer()`: "state blob is not
+   *     a plugin state container (bad magic)", "state blob is not a
+   *     VST3PluginState document", "state blob has no IComponent element"
    */
-  const mentionsState = (text: string): boolean => /\bstate\b/i.test(text);
+  const mentionsState = (text: string): boolean =>
+    /(the state file was not restored|could not read the state file|the plugin faulted while restoring|rejected the state blob|set_state:|set_state needs|the plugin rejected this component state|this plugin faulted on an earlier state call|this state blob does not belong to it|state blob is not a plugin state container|state blob is not a VST3PluginState document|state blob has no IComponent element|state blob is too small|state blob declares|state blob has an unterminated element|state text |no plugin is loaded)/i.test(
+      text,
+    );
 
-  /** The host says the state did not take — record it, in the host's words. */
-  const stateRejected = (entryId: string, reason: string): void =>
+  /** The host says the state did not take — record it, in the host's words.
+   *  A NEW rejection retires any earlier `userMovedOnRejectedState`: that flag
+   *  answered for a previous defaulted incarnation of this session, and must
+   *  not wave through a capture of defaults from THIS one that the user has
+   *  not touched yet (T18 fifth audit, CRITICAL 1). */
+  const stateRejected = (entryId: string, reason: string): void => {
+    const session = slots.get(entryId)?.session;
+    if (session) session.userMovedOnRejectedState = false;
     store().setStateOrigin(entryId, 'state-rejected', reason);
+  };
 
   const spawn = async (entry: ChainEntry, sampleRate: number): Promise<VstLiveSessionInfo> =>
     vstLiveApi.createSession({
@@ -286,11 +377,37 @@ export function createVstSessionRegistry(deps: VstSessionRegistryDeps = {}): Vst
       raw_state: entry.vst?.raw_state,
     });
 
-  /** Re-create a session whose socket died, in the background. */
+  /** Re-create a session whose socket died, in the background.
+   *
+   * `slot.entry` is only refreshed by `ensure()`, which a stopped transport
+   * never calls. Respawning straight from it would hand the new process
+   * whatever `raw_state` the entry carried at the last rebuild, discarding
+   * every capture recorded since -- and leave `stateOrigin` claiming 'live'
+   * over a process that was just handed that stale (or absent) state (T18
+   * sixth audit, MINOR 3). So the entry is re-read through `loadedVstEntry`
+   * right before the respawn, same as a fresh `open()` would see it. */
   const recreate = (slot: Slot): void => {
     if (slot.recreating) return;
     slot.recreating = true;
-    void spawn(slot.entry, slot.sampleRate)
+    const entry = loadedVstEntry(slot.entry.id) ?? slot.entry;
+    slot.entry = entry;
+    if (slot.session) slot.session.stateSent = Boolean(entry.vst?.raw_state);
+    // Never CLEAR a rejection the host actually reported: doing so
+    // unconditionally opened a window between this write and the respawn's
+    // own `ready`/`warning`/`error` in which the row claimed 'live' over a
+    // plugin whose state was refused. If the entry left the project inside
+    // that window, `shutdown`'s `wasRejected` read the 'live' this line had
+    // just written instead of the rejection, and wrote the DELETE's
+    // factory-default `raw_state` over the user's saved one (T18 seventh
+    // audit, MAJOR 2). A row that was never rejected respawns as 'live' same
+    // as before -- self-heal for an ACTUAL rejection instead waits for the
+    // new session's own response, exactly like a fresh `open()` does.
+    if (isVstStateUnresolvedFor(entry.id)) {
+      store().setStateOrigin(entry.id, 'state-rejected', 'its saved state could not be read, so it started at its factory defaults');
+    } else if (store().entries[entry.id]?.stateOrigin !== 'state-rejected') {
+      store().setStateOrigin(entry.id, 'live');
+    }
+    void spawn(entry, slot.sampleRate)
       .then((info) => {
         if (!slot.session || !slots.has(slot.entry.id)) {
           // Torn down already: DELETE is swallowed — --parent-pid reaps the process regardless.
@@ -317,6 +434,13 @@ export function createVstSessionRegistry(deps: VstSessionRegistryDeps = {}): Vst
       slot.graceHandle = null;
     }
     const session = slot.session;
+    // Snapshot BEFORE clearEntry wipes the row: the DELETE's rescue below runs
+    // in a `.then()`, by which point `entries[entryId]` is gone, so a guard
+    // that reads the live row (the same one `sinkLiveRawState` reads) would be
+    // inert and let the host's factory defaults overwrite a state that was
+    // rejected right up until shutdown (T18 fifth audit, CRITICAL 2).
+    const wasRejected = store().entries[entryId]?.stateOrigin === 'state-rejected';
+    const userMoved = session?.userMovedOnRejectedState === true;
     slot.session = null;
     slot.opening = null;
     slots.delete(entryId);
@@ -331,10 +455,16 @@ export function createVstSessionRegistry(deps: VstSessionRegistryDeps = {}): Vst
     // it, because the socket is already gone. A rejection is not actionable
     // (the process is reaped by `--parent-pid` regardless), so it is swallowed
     // rather than thrown at a caller who is tearing down.
+    //
+    // A row that was on `state-rejected` right up to shutdown means the
+    // process it is now writing was NEVER what the entry says it holds — the
+    // DELETE's own `raw_state` is the plugin's untouched factory defaults,
+    // unless the user actually moved something on it, in which case it is
+    // their new sound and IS wanted (same rule `sinkLiveRawState` applies).
     void vstLiveApi
       .deleteSession(session.sessionId)
       .then((res) => {
-        if (res?.raw_state) stateSink(entryId, res.raw_state);
+        if (res?.raw_state && !(wasRejected && !userMoved)) stateSink(entryId, res.raw_state);
       })
       .catch(() => {});
   };
@@ -352,7 +482,16 @@ export function createVstSessionRegistry(deps: VstSessionRegistryDeps = {}): Vst
     // Every open starts from "the plugin holds what the entry holds": the saved
     // state IS sent (see `spawn`), so only the host can contradict that, and a
     // rejection recorded for a previous session must not outlive it.
-    store().setStateOrigin(entry.id, 'live');
+    //
+    // Unless there IS no state to send: an entry whose saved state could not be
+    // read is spawned with nothing and runs at its factory defaults, and saying
+    // 'live' there put a plain LIVE badge on a defaulted plugin whose captures
+    // are being refused (T18 fourth audit, MAJOR 3).
+    if (isVstStateUnresolvedFor(entry.id)) {
+      store().setStateOrigin(entry.id, 'state-rejected', 'its saved state could not be read, so it started at its factory defaults');
+    } else {
+      store().setStateOrigin(entry.id, 'live');
+    }
     const probe = await probeHost();
     if (!probe.available) {
       store().setStatus(
@@ -377,6 +516,8 @@ export function createVstSessionRegistry(deps: VstSessionRegistryDeps = {}): Vst
       client: null as unknown as VstBridgeClientLike,
       audioSink: null,
       stateDirty: false,
+      userMovedOnRejectedState: false,
+      stateSent: Boolean(entry.vst?.raw_state),
     };
     session.client = makeClient({
       url: info.ws_url,
@@ -391,6 +532,34 @@ export function createVstSessionRegistry(deps: VstSessionRegistryDeps = {}): Vst
           }
         },
         onReady: (ready) => {
+          // Record any rejection BEFORE setReady: zustand runs subscribers
+          // SYNCHRONOUSLY inside the `set()` call below, and
+          // `waitForLiveThenOpen`'s floating-editor path reads `stateOrigin`
+          // with no `await` in between (`wantFloating` skips the
+          // `getNativeWindowHandle()` await the embedded path has). Recording
+          // the rejection after `setReady` let that read land while the row
+          // still said 'live', for a plugin the host was about to refuse (T18
+          // fifth audit, MINOR 3).
+          //
+          // Only a session that has actually HAD a state handed to its plugin
+          // process can have had it refused -- `session.stateSent`, not
+          // `slot.entry.vst?.raw_state`: the latter stays `undefined` for a
+          // session whose state arrived late via a retried `restored()`
+          // delivery, which never touches `slot.entry` (T18 sixth audit,
+          // CRITICAL 1). A fresh plugin at its defaults is not a failed
+          // restore either way.
+          //
+          // `ready.state_compat === false` is NOT a restore failure: it is the
+          // plugin's own state-container round-trip measured before any user
+          // state is applied at all (`vst3_instance.cpp`'s `prepare()`), so it
+          // is dropped from this condition entirely (T18 sixth audit, MAJOR 2).
+          //
+          if (session.stateSent) {
+            const stateWarning = ready.warnings.find((w) => mentionsState(w));
+            if (stateWarning) {
+              stateRejected(entry.id, stateWarning);
+            }
+          }
           store().setReady(entry.id, {
             plugin: ready.plugin,
             pluginLatencySamples: ready.latency_samples,
@@ -398,21 +567,20 @@ export function createVstSessionRegistry(deps: VstSessionRegistryDeps = {}): Vst
             sampleRate: ready.sample_rate,
             hasEditor: ready.has_editor,
           });
-          // Only an entry that HAD something saved can have had it refused;
-          // a fresh plugin at its defaults is not a failed restore.
-          if (!slot.entry.vst?.raw_state) return;
-          const stateWarning = ready.warnings.find(mentionsState);
-          if (ready.state_compat === false || stateWarning) {
-            stateRejected(entry.id, stateWarning ?? 'the plugin refused the saved state');
-          }
         },
         onWarning: (text) => {
-          if (slot.entry.vst?.raw_state && mentionsState(text)) stateRejected(entry.id, text);
+          if (!session.stateSent) return;
+          if (mentionsState(text)) {
+            stateRejected(entry.id, text);
+          }
         },
         onError: (text, fatal) => {
           // A fatal error is a dead session, which the row already says through
           // `onStatus`; only a survivable one is a state story.
-          if (!fatal && slot.entry.vst?.raw_state && mentionsState(text)) stateRejected(entry.id, text);
+          if (fatal || !session.stateSent) return;
+          if (mentionsState(text)) {
+            stateRejected(entry.id, text);
+          }
         },
         onAudio: (frame) => session.audioSink?.(frame),
         onState: (stateB64) => session.stateSink?.(stateB64),
@@ -576,6 +744,13 @@ export function createVstSessionRegistry(deps: VstSessionRegistryDeps = {}): Vst
     markParamsChanged(entryId) {
       const session = slots.get(entryId)?.session;
       if (session) session.stateDirty = true;
+    },
+
+    markUserParamsChanged(entryId) {
+      const session = slots.get(entryId)?.session;
+      if (!session) return;
+      session.stateDirty = true;
+      session.userMovedOnRejectedState = true;
     },
 
     hostAvailable() {

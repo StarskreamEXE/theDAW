@@ -54,13 +54,18 @@ import type { RenderRange } from '../lib/render/renderRange';
 import { frameToSec, keptFrameCount } from '../lib/render/renderRange';
 import type { BounceRequest } from '../lib/renderCore';
 import type { ChainEntry } from './effectChainStore';
+import type { ExportDestination, ExportRenderItem } from '../lib/render/exportDialogModel';
 
 /* ── the job ───────────────────────────────────────────────────────────────── */
 
 /** Which of the app's renders this job is. One per call site the queue replaces:
  *  the master mixdown, a track stem, the selection bounce, a VST freeze, and the
- *  step sequencer's pattern print. */
-export type RenderJobKind = 'mixdown' | 'stem' | 'selection' | 'freeze' | 'pattern';
+ *  step sequencer's pattern print. `export` is the export dialog's own bounce
+ *  (T25c, F25) — a plain render + deliver with no timeline write and no MAKE
+ *  handoff, so it cannot reuse `mixdown` (always both destinations) or `selection`
+ *  (routes to MAKE) without misrouting or dropping the dialog's destination
+ *  choice. */
+export type RenderJobKind = 'mixdown' | 'stem' | 'selection' | 'freeze' | 'pattern' | 'export';
 
 /** `queued` → `running` → one of the three terminal states. A job never moves
  *  out of a terminal state; a late `cancel` on a finished job is a no-op. */
@@ -105,6 +110,15 @@ export interface RenderJob {
    * what a queued render covers without re-deriving it from `request`.
    */
   range?: RenderRange;
+  /** For an `export` job only: which destination(s) `deliverExport` should
+   *  write to — the export dialog's own choice, not hardcoded like a
+   *  `mixdown` job's library-and-save-both. */
+  destination?: ExportDestination;
+  /** For an `export` job only: which `ExportRenderItem` kind this job came
+   *  from (`mixdown` | `stem` | `selection`), carried through only for
+   *  `deliverExport`'s library-entry description — the queue itself treats
+   *  every `export` job identically. */
+  exportItemKind?: ExportRenderItem['kind'];
   status: RenderJobStatus;
   /** 0..1. Binary jobs go 0 → 1; a staged job walks `stage / total`. */
   progress: number;

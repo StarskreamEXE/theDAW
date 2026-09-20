@@ -17,6 +17,7 @@ import type { StorageProvider } from './storageProvider';
 import { fetchBlobWithRetry } from './fetchRetry';
 import type { LibraryFacetField, LibraryFacetValue, LibraryFacets } from './libraryFacets';
 import { stripSourceId } from './displayName';
+import { logWarn } from '../state/logStore';
 
 export type {
   LibraryFacetField,
@@ -67,61 +68,200 @@ interface ServerRecord {
   embedded_tags?: Record<string, unknown>;
 }
 
-const toEntry = (r: ServerRecord): LibraryEntry => ({
-  id: r.id,
-  // Strip the importer's source id ONCE, here at the read boundary, so
-  // every panel that renders a title gets a clean one. `audioFilename`
-  // below stays raw: it resolves files and backs the Filename row.
-  title: stripSourceId(r.title),
-  prompt: r.prompt,
-  negativePrompt: r.negative_prompt,
-  model: r.model,
-  duration: r.duration,
-  steps: r.steps,
-  cfg: r.cfg,
-  seed: r.seed,
-  audioUrl: r.audio_url,
-  audioFilename: r.audio_filename,
-  fileSizeBytes: r.file_size_bytes,
-  mimeType: r.mime_type,
-  timestamp: r.timestamp,
-  favorite: r.favorite,
-  rating: r.rating,
-  tags: r.tags ?? [],
-  notes: r.notes ?? '',
-  // A paged row carries at most the preview; the full text arrives with the
-  // single-entry fetch and replaces it in the cache.
-  lyrics: r.lyrics ?? r.lyrics_preview ?? '',
-  source: (['generate', 'studio', 'import'].includes(r.source)
-    ? r.source
-    : 'generate') as LibraryEntry['source'],
-  chimeraSources: r.chimera_sources ?? [],
-  playCount: r.play_count ?? 0,
-  lastPlayedAt: r.last_played_at ?? null,
-  // Cover art the backend found embedded in the file. Null (not undefined)
-  // when there is none, so the UI knows the answer without a probe request.
-  coverUrl: r.cover_url ?? null,
-  // Carry the kind through, so a list that keeps audio sees what the backend
-  // said. A record without one is audio, as LibraryEntry.kind documents.
-  kind: r.kind ?? 'audio',
-  // Pass the backend analysis enrichment straight through (snake_case →
-  // camelCase only). Left undefined when the entry hasn't been analyzed, which
-  // the inspector + search treat as "no extra data" rather than empty objects.
-  analysis: r.analysis,
-  embeddedTags: r.embedded_tags,
-});
+/**
+ * Entry ids whose FULL lyrics text (not the 280-character list preview) has
+ * actually been seen this session — a single-entry GET always carries it in
+ * full, and so does a paged/list row when the lyrics are short enough that
+ * the backend didn't need to truncate (see `toEntry`, which populates this).
+ *
+ * `patchToServerKeys` consults it before forwarding a `lyrics` patch: a
+ * preview-only entry's `.lyrics` field holds the 280-character stand-in
+ * (below), so a save path that includes it in a patch — a naive spread of a
+ * preview-only entry, today or in the future — would otherwise silently
+ * truncate the server's full lyrics down to that preview. MAJOR, possible
+ * data loss; see FE-T22 follow-up 2. No current caller sends `lyrics`
+ * through a spread (traced every `update()`/`updateEntry()` call site at the
+ * time of this fix), but the ambiguity baked into `toEntry`'s single
+ * `lyrics` field makes that one accidental spread away at any time, so the
+ * guard lives at the one choke point every save passes through rather than
+ * trusting every future caller to remember.
+ */
+const knownFullLyricsIds = new Set<string>();
 
-const patchToServerKeys = (patch: LibraryEntryPatch): Record<string, unknown> => {
+const toEntry = (r: ServerRecord): LibraryEntry => {
+  if (r.lyrics !== undefined) knownFullLyricsIds.add(r.id);
+  return {
+    id: r.id,
+    // Strip the importer's source id ONCE, here at the read boundary, so
+    // every panel that renders a title gets a clean one. `audioFilename`
+    // below stays raw: it resolves files and backs the Filename row.
+    title: stripSourceId(r.title),
+    prompt: r.prompt,
+    negativePrompt: r.negative_prompt,
+    model: r.model,
+    duration: r.duration,
+    steps: r.steps,
+    cfg: r.cfg,
+    seed: r.seed,
+    audioUrl: r.audio_url,
+    audioFilename: r.audio_filename,
+    fileSizeBytes: r.file_size_bytes,
+    mimeType: r.mime_type,
+    timestamp: r.timestamp,
+    favorite: r.favorite,
+    rating: r.rating,
+    tags: r.tags ?? [],
+    notes: r.notes ?? '',
+    // A paged row carries at most the preview; the full text arrives with the
+    // single-entry fetch and replaces it in the cache. DISPLAY ONLY — see
+    // `knownFullLyricsIds` for why a save must not trust this blindly.
+    lyrics: r.lyrics ?? r.lyrics_preview ?? '',
+    source: (['generate', 'studio', 'import'].includes(r.source)
+      ? r.source
+      : 'generate') as LibraryEntry['source'],
+    chimeraSources: r.chimera_sources ?? [],
+    playCount: r.play_count ?? 0,
+    lastPlayedAt: r.last_played_at ?? null,
+    // Cover art the backend found embedded in the file. Null (not undefined)
+    // when there is none, so the UI knows the answer without a probe request.
+    coverUrl: r.cover_url ?? null,
+    // Carry the kind through, so a list that keeps audio sees what the backend
+    // said. A record without one is audio, as LibraryEntry.kind documents.
+    kind: r.kind ?? 'audio',
+    // Pass the backend analysis enrichment straight through (snake_case →
+    // camelCase only). Left undefined when the entry hasn't been analyzed, which
+    // the inspector + search treat as "no extra data" rather than empty objects.
+    analysis: r.analysis,
+    embeddedTags: r.embedded_tags,
+  };
+};
+
+const patchToServerKeys = (id: string, patch: LibraryEntryPatch): Record<string, unknown> => {
   const body: Record<string, unknown> = {};
   if (patch.title !== undefined) body.title = patch.title;
   if (patch.favorite !== undefined) body.favorite = patch.favorite;
   if (patch.rating !== undefined) body.rating = patch.rating;
   if (patch.tags !== undefined) body.tags = patch.tags;
   if (patch.notes !== undefined) body.notes = patch.notes;
-  if (patch.lyrics !== undefined) body.lyrics = patch.lyrics;
+  if (patch.lyrics !== undefined) {
+    if (knownFullLyricsIds.has(id)) {
+      body.lyrics = patch.lyrics;
+    } else {
+      // Never send lyrics for an id whose full text this session has never
+      // actually loaded — it could only be the 280-character preview. Drop
+      // just this key, silently: every OTHER field in the same patch still
+      // applies, the same as a caller who simply never mentioned lyrics.
+      logWarn(
+        'library',
+        `update(${id.slice(0, 8)}): dropped a lyrics patch — full lyrics for this entry were never loaded, so it could only be the list preview`,
+      );
+    }
+  }
   if (patch.chimeraSources !== undefined) body.chimera_sources = patch.chimeraSources;
   return body;
 };
+
+/**
+ * Default byte budget for the in-memory audio blob cache. Library files
+ * average ~26 MB (mostly uncompressed WAV, not compressed audio), so 256 MiB
+ * holds roughly 10 tracks resident — a generous working set for a session's
+ * scrubbing/auditioning (MATCH previews, a big playlist scrub, an hour of
+ * Scout auditions) without growing without bound.
+ */
+export const AUDIO_BLOB_CACHE_BUDGET_BYTES = 256 * 1024 * 1024;
+
+/**
+ * Byte-bounded LRU cache for audio Blobs fetched via `fetchAudioBlob`.
+ *
+ * The `Map<string, Promise<Blob>>` this replaces never freed an entry, so a
+ * long session held every audio Blob it ever fetched in RAM for the life of
+ * the tab (FE-019). This caps total resident bytes and evicts the
+ * least-recently-used entry to make room — the same convention
+ * `decodeCache.ts` uses for decoded PCM, except a Blob's own `.size` is the
+ * byte cost here, no derivation needed.
+ *
+ * A failed fetch's entry is removed on rejection, so the same id can be
+ * retried later (mirrors the old `.catch` cleanup). A blob is only charged to
+ * the budget once it has actually arrived, so a slow fetch cannot be evicted
+ * out from under itself — its provisional entry costs 0 bytes until it
+ * resolves. The entry that JUST resolved is never evicted by its own
+ * admission pass, even if it alone exceeds the budget: dropping it would only
+ * force an immediate re-fetch on the very next request for that id.
+ */
+export class AudioBlobCache {
+  private readonly entries = new Map<string, { promise: Promise<Blob>; bytes: number }>();
+  private residentBytes = 0;
+
+  constructor(private readonly budgetBytes: number = AUDIO_BLOB_CACHE_BUDGET_BYTES) {}
+
+  /** A cache hit (pending or resolved); touches recency. `undefined` on a miss or eviction. */
+  get(id: string): Promise<Blob> | undefined {
+    const hit = this.entries.get(id);
+    if (!hit) return undefined;
+    // Touch: move to the most-recently-used end.
+    this.entries.delete(id);
+    this.entries.set(id, hit);
+    return hit.promise;
+  }
+
+  /** Register an in-flight (or already-settled) fetch for `id`. */
+  set(id: string, promise: Promise<Blob>): void {
+    this.delete(id);
+    const entry = { promise, bytes: 0 };
+    this.entries.set(id, entry);
+    void promise.then(
+      (blob) => {
+        // Deleted or superseded (a newer fetch for the same id landed) while
+        // this one was in flight — do not resurrect or double-count it.
+        if (this.entries.get(id) !== entry) return;
+        entry.bytes = blob.size;
+        this.residentBytes += blob.size;
+        this.evict(id);
+      },
+      () => {
+        // Same guard as above, for the reject path: a STALE promise (a retry
+        // already replaced it with a newer `set()` for this id) failing later
+        // must not delete the newer, healthy entry.
+        if (this.entries.get(id) !== entry) return;
+        this.delete(id);
+      },
+    );
+  }
+
+  delete(id: string): void {
+    const entry = this.entries.get(id);
+    if (!entry) return;
+    this.entries.delete(id);
+    this.residentBytes -= entry.bytes;
+    if (this.residentBytes < 0) this.residentBytes = 0;
+  }
+
+  /** For tests and debugging only. */
+  stats(): { entries: number; bytes: number } {
+    return { entries: this.entries.size, bytes: this.residentBytes };
+  }
+
+  /**
+   * Drop least-recently-used entries until back within budget.
+   *
+   * Two kinds of entry are never taken: `keepId` — the entry that just
+   * triggered this pass — and any entry still PENDING (`bytes === 0`, its
+   * fetch has not resolved yet). Evicting a pending entry frees nothing (it
+   * has not been charged to the budget yet), so it would only discard the
+   * cache's reference to that in-flight promise — the next `get()` for that
+   * id would then miss and start a duplicate fetch, while the orphaned first
+   * fetch finishes, arrives, and is silently dropped on the floor.
+   */
+  private evict(keepId: string): void {
+    for (const [id, entry] of this.entries) {
+      if (this.residentBytes <= this.budgetBytes) break;
+      if (id === keepId || entry.bytes === 0) continue;
+      this.entries.delete(id);
+      this.residentBytes -= entry.bytes;
+    }
+    if (this.residentBytes < 0) this.residentBytes = 0;
+  }
+}
 
 const errorText = async (r: Response): Promise<string> => {
   try {
@@ -137,9 +277,11 @@ const errorText = async (r: Response): Promise<string> => {
 export class BackendLocalProvider implements StorageProvider {
   readonly name = 'backend-local';
   private readonly base: string;
+  private readonly blobCache: AudioBlobCache;
 
-  constructor(base: string = DEFAULT_BASE) {
+  constructor(base: string = DEFAULT_BASE, blobCacheBudgetBytes: number = AUDIO_BLOB_CACHE_BUDGET_BYTES) {
     this.base = base.replace(/\/$/, '');
+    this.blobCache = new AudioBlobCache(blobCacheBudgetBytes);
   }
 
   async list(): Promise<LibraryEntry[]> {
@@ -185,7 +327,7 @@ export class BackendLocalProvider implements StorageProvider {
     const r = await fetch(`${this.base}/entries/${encodeURIComponent(id)}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(patchToServerKeys(patch)),
+      body: JSON.stringify(patchToServerKeys(id, patch)),
     });
     if (!r.ok) throw new Error(`library.update(${id}): ${await errorText(r)}`);
     return toEntry((await r.json()) as ServerRecord);
@@ -204,10 +346,6 @@ export class BackendLocalProvider implements StorageProvider {
     return entry.audioUrl;
   }
 
-  // Session-scoped blob cache so multiple consumers don't re-fetch the
-  // same audio. Keyed by entry id. Cleared on page reload.
-  private readonly blobCache = new Map<string, Promise<Blob>>();
-
   async fetchAudioBlob(entry: LibraryEntry): Promise<Blob> {
     const cached = this.blobCache.get(entry.id);
     if (cached) return cached;
@@ -215,13 +353,11 @@ export class BackendLocalProvider implements StorageProvider {
     // loads a model, dropping a large audio response even after a 200. Short
     // retries ride over that window instead of surfacing "Failed to fetch".
     const promise = fetchBlobWithRetry(entry.audioUrl, { label: entry.title || entry.id });
+    // AudioBlobCache.set() already removes this entry on rejection (guarded
+    // against a stale promise that lost a race with a newer `set()` for the
+    // same id) — no separate cleanup needed here.
     this.blobCache.set(entry.id, promise);
-    try {
-      return await promise;
-    } catch (e) {
-      this.blobCache.delete(entry.id);
-      throw e;
-    }
+    return promise;
   }
 }
 
@@ -433,14 +569,21 @@ export interface LibraryFacetsResult {
   revision: number;
 }
 
-/** `[{value, count}]`, dropping anything that is not that shape. */
-const asFacetValues = (raw: unknown): LibraryFacetValue[] => {
+/**
+ * `[{value, count}]`, dropping anything that is not that shape.
+ *
+ * `value` is a string when the server sent one, and `null` for everything
+ * else — the empty bucket (a genuine `null`), a missing field, or any
+ * malformed value (a number, an object, ...) the server should never send but
+ * that must not crash the filter dropdown. Exported for direct testing.
+ */
+export const asFacetValues = (raw: unknown): LibraryFacetValue[] => {
   if (!Array.isArray(raw)) return [];
   const out: LibraryFacetValue[] = [];
   for (const item of raw) {
     if (!item || typeof item !== 'object') continue;
     const v = item as { value?: unknown; count?: unknown };
-    const value = typeof v.value === 'string' ? v.value : v.value == null ? null : null;
+    const value = typeof v.value === 'string' ? v.value : null;
     const count = typeof v.count === 'number' && Number.isFinite(v.count) ? v.count : 0;
     out.push({ value, count });
   }
@@ -532,13 +675,58 @@ export interface LibraryBulkDeleteResult {
 
 /** The server re-counted and got a different number: nothing was deleted. */
 export class LibraryBulkConflictError extends Error {
-  /** What the server counts NOW — re-ask the user with this. */
+  /**
+   * What the server counts NOW — re-ask the user with this. `NaN` when the
+   * 409 body did not say (the server should always send it, but a caller
+   * that blindly trusted a fallback here would otherwise be told "0 entries
+   * left" — a specific, wrong fact — instead of "unknown"). There is no list
+   * of ids/entries in a 409 body to count as a substitute (see
+   * `backend/modules/library/router.py`'s 409, `{detail, total_matched}`
+   * only).
+   */
   readonly totalMatched: number;
   constructor(message: string, totalMatched: number) {
     super(message);
     this.name = 'LibraryBulkConflictError';
     this.totalMatched = totalMatched;
   }
+}
+
+/** What a conflict-handling caller should show the user, and store. */
+export interface BulkConflictNotice {
+  /** Ready to hand to `window.alert` or similar — never contains "NaN". */
+  message: string;
+  /**
+   * The re-counted total, or `null` when the server didn't say
+   * (`LibraryBulkConflictError.totalMatched` was `NaN`). A caller MUST NOT
+   * store `null` in place of whatever count it already had — that would
+   * itself be a lie ("0 entries"/blank) as much as storing NaN would be.
+   * Leave the existing stored value alone, or re-fetch, instead.
+   */
+  total: number | null;
+}
+
+/**
+ * Turns a `LibraryBulkConflictError` into what a confirmation dialog should
+ * show and store, in ONE place — so every caller (the non-favorites retry
+ * loop, the Clear All confirmation) applies the same rule instead of each
+ * needing its own NaN guard. `totalMatched` is `NaN` exactly when the
+ * server's 409 body omitted `total_matched` (see the class doc); rendering
+ * that straight into a template literal produces "It now holds NaN entries",
+ * and storing it feeds the SAME NaN into the next render. Pure — no DOM, no
+ * React — so it is testable on its own.
+ */
+export function describeBulkConflict(totalMatched: number): BulkConflictNotice {
+  if (!Number.isFinite(totalMatched)) {
+    return {
+      message: 'The library changed while the confirmation was open — nothing was deleted.',
+      total: null,
+    };
+  }
+  return {
+    message: `The library changed while the confirmation was open — nothing was deleted. It now holds ${totalMatched.toLocaleString()} entries.`,
+    total: totalMatched,
+  };
 }
 
 const isIdForm = (req: LibraryBulkDeleteRequest): req is { ids: readonly string[] } =>
@@ -589,7 +777,10 @@ export async function bulkDeleteLibraryEntries(
     const detail = typeof conflict.detail === 'string'
       ? conflict.detail
       : 'the library changed since the count you confirmed';
-    const matched = typeof conflict.total_matched === 'number' ? conflict.total_matched : 0;
+    const matched =
+      typeof conflict.total_matched === 'number' && Number.isFinite(conflict.total_matched)
+        ? conflict.total_matched
+        : NaN;
     throw new LibraryBulkConflictError(detail, matched);
   }
   if (!r.ok) throw new Error(`library.bulkDelete: ${await errorText(r)}`);

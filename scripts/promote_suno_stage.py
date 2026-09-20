@@ -48,7 +48,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from backend.lib import paths  # noqa: E402
 from backend.modules.library import suno_promote  # noqa: E402
-from backend.modules.library.store import LibraryStore  # noqa: E402
 
 INTERRUPTED_EXIT_CODE = 130
 REFUSED_EXIT_CODE = 1
@@ -193,8 +192,22 @@ def main(
     installed = should_stop is None
     if installed:
         stop.install()
+    store = None
     try:
-        store = LibraryStore(Path(root))
+        # L1: a --dry-run opens the library read-only (mode=ro) and never
+        # creates or migrates it; only a real run opens a writable store.
+        try:
+            store = suno_promote.open_promotion_target(
+                Path(root), dry_run=bool(args.dry_run)
+            )
+        except OSError as exc:
+            # Follow-up item 3: a real run's LibraryStore mkdir's its root;
+            # a drive that does not exist at all raises OSError there. Same
+            # clean refusal (exit 1) as any other PromotionRefused, not a
+            # traceback.
+            raise suno_promote.PromotionRefused(
+                f"cannot open library at {root}: {exc}"
+            ) from exc
         report = suno_promote.promote_stage(
             args.stage_root,
             store,
@@ -213,6 +226,14 @@ def main(
     finally:
         if installed:
             stop.restore()
+        # Follow-up item 3: close whichever target we opened -- a
+        # ReadOnlyLibraryTarget (dry run) has its own close(); a real,
+        # writable LibraryStore only exposes close() on its .db.
+        if store is not None:
+            if hasattr(store, "close"):
+                store.close()
+            elif store.db is not None:
+                store.db.close()
 
     print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))
     if report.status == "cancelled":

@@ -1,8 +1,9 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { AlertCircle, ExternalLink, Loader2, RefreshCw } from 'lucide-react';
 import { backendHttpBase } from '../lib/backendBase';
-import { PANEL_MODEL_OPTIONS } from '../lib/cloudModels';
+import { panelModelDefaults, panelModelOptions } from '../lib/cloudModels';
 import { useGenerateParamsStore } from '../state/generateParamsStore';
+import { probeLyriaCheckedOut } from '../state/generateStore';
 
 // The Lyria 3 Pro app (StarskreamEXE/lyria-3-pro) is embedded WHOLE and
 // unmodified: it ships its own Express server, its own SPA, its own settings
@@ -28,6 +29,16 @@ export const LyriaPanel: React.FC = () => {
   const [mock, setMock] = useState<boolean | null>(null);
   const [detail, setDetail] = useState('');
   const [popped, setPopped] = useState(false);
+  // INT-005: fails open (true) until the probe answers, same convention as
+  // generateStore's own model-status gating — never hides the switcher's
+  // options on a slow/unreachable probe.
+  const [lyriaCheckedOut, setLyriaCheckedOut] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    void probeLyriaCheckedOut().then((ok) => { if (!cancelled) setLyriaCheckedOut(ok); });
+    return () => { cancelled = true; };
+  }, []);
 
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const poppedWindowRef = useRef<Window | null>(null);
@@ -163,11 +174,17 @@ export const LyriaPanel: React.FC = () => {
             name="lyria-model"
             className="appearance-none rounded-full border border-purple-400/30 bg-purple-500/10 hover:bg-purple-500/15 pl-3 pr-7 py-1 text-[10px] font-bold uppercase tracking-wider text-purple-100 outline-none transition-colors cursor-pointer"
             value={model}
-            onChange={(e) => patchParams({ model: e.target.value })}
+            onChange={(e) => {
+              const m = e.target.value;
+              // FE-006: patching model alone left the RF-Inversion-era
+              // steps/cfg defaults stale on an ARC selection (or vice versa)
+              // until the real MAKE dropdown was touched — mirror it here.
+              patchParams({ model: m, ...panelModelDefaults(m) });
+            }}
             style={{ colorScheme: 'dark' }}
             title="Switch the active model. Pick a Stable Audio model to return to the local generator."
           >
-            {PANEL_MODEL_OPTIONS.map((m) => (
+            {panelModelOptions(model, lyriaCheckedOut).map((m) => (
               <option
                 key={m.value}
                 value={m.value}

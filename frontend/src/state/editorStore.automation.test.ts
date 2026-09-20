@@ -556,4 +556,42 @@ const undoSteps = (): number => st()._undo.length;
   assert.equal(laneFor(VOL), undefined);
 }
 
+// ── addAutomationLane: the only way to get a lane WITHOUT riding a control
+//    with WRITE armed. UI control lands in T25b; this is the store side (T24). ──
+{
+  reset();
+  assert.equal(laneFor(VOL), undefined, 'no lane exists yet');
+
+  const id = st().addAutomationLane(VOL);
+  assert.notEqual(id, '', 'a real id comes back');
+  const created = laneFor(VOL);
+  assert.ok(created, 'the lane now exists');
+  assert.equal(created!.id, id);
+  assert.deepEqual(created!.points, [], 'empty — nothing has been recorded');
+  assert.equal(created!.enabled, true, 'a freshly added lane starts enabled, same as recordAutomationPoint\'s');
+  assert.equal(undoSteps(), 1, 'a discrete structural edit, like addBus');
+
+  // Idempotent: a target that already has a lane hands back the SAME id and
+  // creates nothing new — "add automation lane" on an already-armed control is
+  // not a second lane for it.
+  const before = undoSteps();
+  const again = st().addAutomationLane(VOL);
+  assert.equal(again, id, 'the existing lane\'s id, not a new one');
+  assert.equal(st().automationLanes.filter((l) => automationTargetKey(l.target) === automationTargetKey(VOL)).length, 1);
+  assert.equal(undoSteps(), before, 'no undo step for a no-op');
+
+  // A second target gets its own lane, independent of the first.
+  const panId = st().addAutomationLane(PAN);
+  assert.notEqual(panId, id);
+  assert.deepEqual(pointsFor(PAN), []);
+  assert.equal(st().automationLanes.length, 2);
+
+  // What `recordAutomationPoint` later writes to a lane `addAutomationLane`
+  // created lands on that SAME lane, not a duplicate — the two creators dedupe
+  // by the same target key.
+  st().recordAutomationPoint(VOL, 3, 0.4);
+  assert.equal(laneFor(VOL)!.id, id, 'recordAutomationPoint reused the lane addAutomationLane made');
+  assert.deepEqual(pointsFor(VOL), [{ t: 3, v: 0.4 }]);
+}
+
 console.log('editorStore.automation.test.ts: all assertions passed');

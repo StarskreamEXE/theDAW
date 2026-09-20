@@ -7,10 +7,27 @@
 
 import { GoogleGenAI, Type } from '@google/genai';
 import type { PianoNote } from '../state/pianoRollStore';
+import { pairingHeader } from './pairing';
 
 const PROXY_BASE =
   (typeof window !== 'undefined' ? window.location.origin : '') + '/api/genai-proxy';
-const ai = new GoogleGenAI({ apiKey: 'thedaw-proxy', httpOptions: { baseUrl: PROXY_BASE } });
+// SEC-001: a non-loopback caller (the phone, over a plain http://<lan-ip>
+// share link) needs a real secret to reach the proxy — see
+// backend/lib/pairing.py. pairingHeader() is {} on this machine's own UI,
+// which never needed it.
+//
+// Read once here, not per request: @google/genai's HttpOptions.headers is a
+// plain object captured at construction (js-genai's api-report.md — no
+// per-call hook), so making this live would mean rebuilding `ai` on every
+// call across three files. A phone tab already open keeps using its current
+// token after POST /api/pairing/token/regenerate revokes it, same as any
+// other credential a page is already holding — until that tab is reloaded
+// (a fresh #pair= link/QR scan) it gets refused like any other stale one, no
+// worse than closing and reopening the tab today.
+const ai = new GoogleGenAI({
+  apiKey: 'thedaw-proxy',
+  httpOptions: { baseUrl: PROXY_BASE, headers: pairingHeader() },
+});
 
 // Default model matches the rest of the in-app Gemini suite. Overridable per call.
 export const DEFAULT_COMPOSE_MODEL = 'gemini-3.5-flash';

@@ -539,6 +539,34 @@ _MAX_SQL_PARAMS = 900
 #: entries is 100 commits rather than 50,000.
 DEFAULT_DELETE_BATCH = 500
 
+#: Columns :meth:`LibraryDB.get_all_analysis` reads for the library list's
+#: enrichment path (backend/modules/library/router.py -- ``_analysis_payload``
+#: / ``_ANALYSIS_SCALAR_KEYS``). Excludes ``beats_json`` (a per-beat timeline,
+#: never surfaced in the list enrichment) and ``version`` (an internal
+#: re-analysis marker) -- a ``SELECT *`` here pulls both into memory for every
+#: entry in a 200,000-track library for nothing (LIB-004). Keep in sync with
+#: what ``_analysis_payload`` actually reads.
+_ANALYSIS_LIST_COLUMNS = (
+    "entry_id",
+    "bpm",
+    "key",
+    "key_confidence",
+    "scale",
+    "pitch_mean_hz",
+    "pitch_std_hz",
+    "loudness_lufs",
+    "rms_db",
+    "bars_estimated",
+    "genre",
+    "genre_confidence",
+    "prompt_guess",
+    "prompt_confidence",
+    "analyzed_at",
+    "semantic_tags_json",
+    "embedded_tags_json",
+    "ffprobe_json",
+)
+
 
 def _chunks(items: Sequence[Any], size: int) -> Iterator[Sequence[Any]]:
     for start in range(0, len(items), size):
@@ -695,6 +723,16 @@ def _entry_row(payload: dict[str, Any]) -> dict[str, Any]:
     the two can never drift into writing different rows for one payload
     (``tests/test_library_bulk.py`` pins that they don't). ``created_at`` and
     ``updated_at`` are the caller's business.
+
+    Deliberately excludes ``analysis_status`` / ``stems_status`` /
+    ``midi_status``: those are owned by the analysis, stems, and midi engines
+    via their own dedicated ``UPDATE`` statements (each module's own
+    ``_set_status`` -- ``backend.modules.analysis.engine._set_status``,
+    ``backend.modules.midi.runner._set_status``,
+    ``backend.modules.stems.engine._set_status``), never by a metadata
+    upsert. A routine title/tag edit or a ``reindex()`` pass must not reset a
+    track's analysis progress back to 'pending' (``tests/test_library_b12.py``
+    pins this).
     """
     return {
         "id": str(payload["id"]),
@@ -719,9 +757,6 @@ def _entry_row(payload: dict[str, Any]) -> dict[str, Any]:
         else None,
         "notes": str(payload.get("notes") or ""),
         "timestamp": str(payload.get("timestamp") or ""),
-        "analysis_status": str(payload.get("analysis_status") or "pending"),
-        "stems_status": str(payload.get("stems_status") or "pending"),
-        "midi_status": str(payload.get("midi_status") or "pending"),
         "metadata_json": json.dumps(payload.get("metadata_json") or {}),
     }
 
@@ -747,14 +782,12 @@ _UPSERT_ENTRY_SQL = """
         id, kind, title, prompt, negative_prompt, model,
         duration_sec, steps, cfg, seed, mime, audio_filename,
         file_size_bytes, source, favorite, rating, notes,
-        timestamp, created_at, updated_at,
-        analysis_status, stems_status, midi_status, metadata_json
+        timestamp, created_at, updated_at, metadata_json
     ) VALUES (
         :id, :kind, :title, :prompt, :negative_prompt, :model,
         :duration_sec, :steps, :cfg, :seed, :mime, :audio_filename,
         :file_size_bytes, :source, :favorite, :rating, :notes,
-        :timestamp, :created_at, :updated_at,
-        :analysis_status, :stems_status, :midi_status, :metadata_json
+        :timestamp, :created_at, :updated_at, :metadata_json
     )
     ON CONFLICT(id) DO UPDATE SET
         kind = excluded.kind,
@@ -775,10 +808,12 @@ _UPSERT_ENTRY_SQL = """
         notes = excluded.notes,
         timestamp = excluded.timestamp,
         updated_at = excluded.updated_at,
-        analysis_status = excluded.analysis_status,
-        stems_status = excluded.stems_status,
-        midi_status = excluded.midi_status,
         metadata_json = excluded.metadata_json
+    -- analysis_status / stems_status / midi_status are intentionally NOT
+    -- listed above (neither INSERT column nor ON CONFLICT SET): a brand new
+    -- row gets the column's own 'pending' DEFAULT, and an existing row's
+    -- status is left exactly as the analysis/stems/midi engines last set it.
+    -- See LIB-001 and the docstring on _entry_row().
 """
 
 
@@ -1197,6 +1232,49 @@ class LibraryDB:
                 cur.close()
         return found
 
+    def new_or_changed_entry_ids(self, payloads: Sequence[dict[str, Any]]) -> list[str]:
+        """Which of these :func:`_entry_row`-shaped upsert payloads are a new
+        row, or differ from what is already stored, by ``file_size_bytes``,
+        ``duration_sec``, and ``audio_filename``.
+
+        MUST be called before the matching upsert commits -- it reads the
+        pre-upsert state to compare against. Lets :meth:`LibraryStore.reindex`
+        enqueue analysis only for entries it actually changed, instead of
+        every entry in the library on every reindex pass (LIB-002).
+        """
+        rows = [_entry_row(p) for p in payloads]
+        ids = [row["id"] for row in rows]
+        if not ids:
+            return []
+        prior: dict[str, tuple[int, float, str]] = {}
+        with self._writelock:
+            cur = self._conn.cursor()
+            try:
+                for chunk in _chunks(ids, _MAX_SQL_PARAMS):
+                    marks = ", ".join("?" * len(chunk))
+                    for r in cur.execute(
+                        "SELECT id, file_size_bytes, duration_sec, audio_filename "
+                        f"FROM entries WHERE id IN ({marks})",
+                        list(chunk),
+                    ).fetchall():
+                        prior[str(r["id"])] = (
+                            int(r["file_size_bytes"]),
+                            float(r["duration_sec"]),
+                            str(r["audio_filename"]),
+                        )
+            finally:
+                cur.close()
+        changed: list[str] = []
+        for row in rows:
+            fingerprint = (
+                row["file_size_bytes"],
+                row["duration_sec"],
+                row["audio_filename"],
+            )
+            if prior.get(row["id"]) != fingerprint:
+                changed.append(row["id"])
+        return changed
+
     def entries_summary_for(
         self,
         entry_ids: Sequence[str],
@@ -1567,6 +1645,30 @@ class LibraryDB:
             cur.close()
         return out
 
+    def all_play_counts(self) -> dict[str, dict[str, Any]]:
+        """``{id: {'play_count', 'last_played_at'}}`` for EVERY entry -- the
+        unpaged sibling of :meth:`play_counts_for`, for the list endpoint's
+        no-filter ("select all") path.
+
+        Reads only these three columns rather than every column of every row
+        (LIB-004): ``_attach_play_counts`` used to call :meth:`list_entries`
+        (``SELECT *``, including ``metadata_json``) just to read two fields,
+        which is ruinous once the library has 200,000 rows.
+        """
+        out: dict[str, dict[str, Any]] = {}
+        with self._writelock:
+            cur = self._conn.cursor()
+            rows = cur.execute(
+                "SELECT id, play_count, last_played_at FROM entries"
+            ).fetchall()
+            cur.close()
+        for row in rows:
+            out[str(row["id"])] = {
+                "play_count": int(row["play_count"] or 0),
+                "last_played_at": row["last_played_at"],
+            }
+        return out
+
     def get_analysis_for(self, entry_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
         """Analysis rows for these ids only -- the page-sized sibling of
         :meth:`get_all_analysis`, which loads every analyzed entry."""
@@ -1790,12 +1892,14 @@ class LibraryDB:
         endpoint enriches every entry with its analysis (so the Catalogue
         inspector + library search can read ``entry.analysis``); doing that
         with a per-entry ``get_analysis`` call would be an N+1 query storm on a
-        large library. One ``SELECT *`` + a dict keyed by ``entry_id`` keeps the
-        enrichment O(1) queries. Rows are returned verbatim (same shape as
-        ``get_analysis``); callers parse the ``*_json`` columns themselves."""
+        large library. One narrowed query (see :data:`_ANALYSIS_LIST_COLUMNS`)
+        + a dict keyed by ``entry_id`` keeps the enrichment O(1) queries
+        without pulling every column (e.g. ``beats_json``) of every row into
+        memory. Callers parse the ``*_json`` columns themselves."""
+        cols = ", ".join(_ANALYSIS_LIST_COLUMNS)
         with self._writelock:
             cur = self._conn.cursor()
-            rows = cur.execute("SELECT * FROM analysis").fetchall()
+            rows = cur.execute(f"SELECT {cols} FROM analysis").fetchall()
             cur.close()
             return {row["entry_id"]: dict(row) for row in rows}
 

@@ -30,6 +30,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from backend.modules.vst import live_host as lh  # noqa: E402
+from backend.modules.vst import path_policy  # noqa: E402
 
 FAKE_HOST = Path(__file__).resolve().parent / "fake_vst_host.py"
 
@@ -40,17 +41,35 @@ FAKE_HOST = Path(__file__).resolve().parent / "fake_vst_host.py"
 
 
 @pytest.fixture
-def plugin_file(tmp_path: Path) -> Path:
-    """A path that passes validation: exists and ends in ``.vst3``."""
-    path = tmp_path / "Ozone 11.vst3"
+def vst3_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """An allowed VST3 root (R5-2).
+
+    ``live_host._validate_plugin`` now runs every plugin path through
+    ``path_policy.check_plugin_path``, which only accepts a path inside
+    ``path_policy.allowed_roots()``. Every plugin path this suite hands to
+    ``create()`` for a *successful* spawn has to live under this directory;
+    ``path_policy.allowed_roots`` is patched directly, the same thing
+    ``tests/test_vst_path_policy.py`` does.
+    """
+    root = tmp_path / "VST3"
+    root.mkdir()
+    monkeypatch.setattr(path_policy, "allowed_roots", lambda: [root.resolve()])
+    return root
+
+
+@pytest.fixture
+def plugin_file(vst3_root: Path) -> Path:
+    """A path that passes validation: exists, ends in ``.vst3``, is under
+    ``vst3_root``."""
+    path = vst3_root / "Ozone 11.vst3"
     path.write_bytes(b"not a real plugin, only the path is validated")
     return path
 
 
 @pytest.fixture
-def plugin_bundle(tmp_path: Path) -> Path:
+def plugin_bundle(vst3_root: Path) -> Path:
     """A ``.vst3`` *bundle directory*, the shape macOS/Windows VST3s use."""
-    path = tmp_path / "Bundled.vst3"
+    path = vst3_root / "Bundled.vst3"
     (path / "Contents").mkdir(parents=True)
     return path
 
@@ -89,13 +108,19 @@ def manager(tmp_path: Path, fake_host_env: None):
 
 @pytest.fixture
 def client(manager, monkeypatch: pytest.MonkeyPatch) -> TestClient:
-    """The real router mounted at /api/vst, backed by the test manager."""
+    """The real router mounted at /api/vst, backed by the test manager.
+
+    Starlette's ``TestClient`` reports its TCP peer as ``testclient`` by
+    default, not a loopback address; ``client=`` overrides that so these
+    tests exercise the legitimate-local-caller path rather than tripping the
+    LAN2 loopback gate on ``/live/session``.
+    """
     from backend.modules.vst import router as vst_router
 
     monkeypatch.setattr(lh, "_MANAGER", manager, raising=False)
     app = FastAPI()
     app.include_router(vst_router.router, prefix="/api/vst")
-    return TestClient(app)
+    return TestClient(app, client=("127.0.0.1", 51000))
 
 
 def make(mgr, plugin: Path, chain_entry_id: str = "entry-1", **kwargs):
@@ -210,9 +235,11 @@ def test_os_errors_are_reported_without_the_path_they_failed_on() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_missing_plugin_path_is_rejected(manager, tmp_path: Path) -> None:
+def test_missing_plugin_path_is_rejected(manager, vst3_root: Path) -> None:
+    # Inside the allowed root (so this exercises the "not found" branch, not
+    # the R5-2 containment check) but never created.
     with pytest.raises(lh.LiveHostError) as excinfo:
-        make(manager, tmp_path / "Ghost.vst3")
+        make(manager, vst3_root / "Ghost.vst3")
     assert excinfo.value.status_code == 400
     assert "Ghost.vst3" in excinfo.value.detail
 
@@ -262,14 +289,20 @@ def test_channel_count_out_of_range_is_rejected(
 
 
 def test_validation_errors_never_leak_the_plugin_directory(
-    manager, tmp_path: Path
+    manager, vst3_root: Path, tmp_path: Path
 ) -> None:
-    secret = tmp_path / "Private Sessions" / "Secret.vst3"
+    # Inside the allowed root, so this reaches the audio-parameter validation
+    # (channels=99) rather than being rejected earlier by R5-2's containment
+    # check.
+    secret = vst3_root / "Private Sessions" / "Secret.vst3"
     secret.parent.mkdir(parents=True)
     secret.write_bytes(b"x")
     with pytest.raises(lh.LiveHostError) as excinfo:
         make(manager, secret, channels=99)
     assert "Private Sessions" not in excinfo.value.detail
+    # The stronger check: the whole tmp_path, not just the VST3 subdirectory
+    # under it, must never appear — a leak via any other path under tmp_path
+    # would pass a narrower "vst3_root not in detail" check but not this one.
     assert str(tmp_path) not in excinfo.value.detail
 
 
@@ -337,7 +370,7 @@ def test_create_is_idempotent_per_chain_entry(manager, plugin_file: Path) -> Non
 
 
 def test_swapping_the_plugin_on_a_live_chain_entry_respawns_the_host(
-    manager, plugin_file: Path, tmp_path: Path
+    manager, plugin_file: Path, vst3_root: Path
 ) -> None:
     """Idempotency is per (chain entry, plugin) — not per chain entry alone.
 
@@ -346,7 +379,7 @@ def test_swapping_the_plugin_on_a_live_chain_entry_respawns_the_host(
     rule) left the previous plugin in the signal path with no way out short of
     a DELETE the frontend never sends.
     """
-    other = tmp_path / "Vinyl.vst3"
+    other = vst3_root / "Vinyl.vst3"
     other.write_bytes(b"a different plugin")
     first = make(manager, plugin_file, chain_entry_id="slot-1")
     old_pid = first.pid
@@ -363,10 +396,10 @@ def test_swapping_the_plugin_on_a_live_chain_entry_respawns_the_host(
 
 
 def test_swapping_the_plugin_discards_the_old_plugins_state(
-    manager, plugin_file: Path, tmp_path: Path
+    manager, plugin_file: Path, vst3_root: Path
 ) -> None:
     """The replaced plugin's state must not be handed to its replacement."""
-    other = tmp_path / "Vinyl.vst3"
+    other = vst3_root / "Vinyl.vst3"
     other.write_bytes(b"a different plugin")
     first = make(
         manager,

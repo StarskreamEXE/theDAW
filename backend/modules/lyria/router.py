@@ -24,6 +24,7 @@ git command:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import threading
@@ -78,15 +79,27 @@ async def url() -> dict:
     """
     _maybe_auto_spawn()
     try:
-        live = sidecar.ensure_running()
+        # ensure_running() can block for up to the sidecar's readiness
+        # deadline (installs included) -- run it off the event loop so it
+        # doesn't stall every other request this worker is handling.
+        live = await asyncio.to_thread(sidecar.ensure_running)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     cfg = sidecar.resolve_config()
     lan_ip = sidecar.detect_lan_ip()
+    # Only claim a cost mode (mock/live) for a process WE spawned -- theDAW
+    # controls that process's environment (LYRIA_MOCK). An adopted listener
+    # someone launched manually may be running with a different, unknown
+    # cost mode, so claiming "mock" for it would be a straight-up lie (item 5).
+    # owns_process() takes _state_lock, which can be held by a concurrent
+    # ensure_running()/stop() for a while -- off the loop like the rest.
+    owns = await asyncio.to_thread(sidecar.owns_process)
+    mode = ("mock" if cfg.mock else "live") if owns else "external"
     return {
         "url": live,
-        "mode": "mock" if cfg.mock else "live",
-        "mock": cfg.mock,
+        "mode": mode,
+        "mock": cfg.mock if owns else None,
+        "external": not owns,
         "port": cfg.port,
         "mobile_url": f"http://{lan_ip}:{cfg.port}" if lan_ip else None,
         "lan_ip": lan_ip,
@@ -98,7 +111,10 @@ async def status() -> dict:
     """Non-spawning diagnostics, plus a warm kick so opening Settings starts
     the child in the background."""
     _maybe_auto_spawn()
-    info = sidecar.probe()
+    # probe() now includes an HTTP identity call (_is_lyria_server) on top of
+    # the TCP check, so it can block for up to that request's timeout --
+    # keep it off the event loop like the other sidecar calls in this file.
+    info = await asyncio.to_thread(sidecar.probe)
     info["ok"] = not info["issues"] and info["listening"]
     return info
 
@@ -107,7 +123,7 @@ async def status() -> dict:
 async def start() -> dict:
     """Foreground spawn. Used by the view's Retry button."""
     try:
-        live = sidecar.ensure_running()
+        live = await asyncio.to_thread(sidecar.ensure_running)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     return {"ok": True, "url": live}
@@ -115,7 +131,9 @@ async def start() -> dict:
 
 @router.post("/stop")
 async def stop() -> dict:
-    return {"ok": True, "stopped": sidecar.stop()}
+    # stop() can taskkill+wait(5)+kill+wait(5) -- up to ~10s -- off the loop.
+    stopped = await asyncio.to_thread(sidecar.stop)
+    return {"ok": True, "stopped": stopped}
 
 
 # ── setup: clone + npm install, from a button ────────────────────────────────
@@ -162,7 +180,8 @@ async def set_key(key: str = Body(..., embed=True)) -> dict:
             status_code=400, detail="That does not look like an API key."
         )
     sidecar.set_gemini_key(value)
-    restarted = sidecar.stop()
+    # stop() can taskkill+wait(5)+kill+wait(5) -- up to ~10s -- off the loop.
+    restarted = await asyncio.to_thread(sidecar.stop)
     key_value, source = sidecar.gemini_key()
     return {
         "ok": True,

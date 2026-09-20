@@ -9,6 +9,7 @@ All 8 tools are implemented with real DSP processing:
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from ...core.module_base import build_router
@@ -48,10 +49,14 @@ def _crossfade_morph(inp: Path, out: Path, params: dict) -> None:
 
 # ── 5. timbreforge (process, pitch/formant shift via ffmpeg) ──────────────
 async def _timbreforge(inp: Path, out: Path, params: dict) -> None:
-    """Timbre transform via formant/pitch manipulation.
+    """Timbre transform via combined pitch+formant manipulation.
 
-    Uses asetrate to shift formants while aresample + atempo preserve pitch
-    and duration. timbreBlend drives the shift ratio.
+    ``asetrate`` reinterprets the sample rate, which shifts BOTH pitch and
+    formants together (that combined shift is the effect — it is not
+    undone). ``atempo`` only restores the original DURATION (the tempo
+    change asetrate introduced); it does not, and cannot, restore pitch.
+    ``aresample`` afterwards just puts the stream back at a standard rate
+    for downstream stages. timbreBlend drives the shift ratio.
     """
     blend = params["timbreBlend"]
     # Map timbreBlend 0..1 -> ratio 0.5..2.0 (octave down to octave up formant shift)
@@ -63,15 +68,32 @@ async def _timbreforge(inp: Path, out: Path, params: dict) -> None:
         await ffmpeg.render(inp, out, ["-af", "acopy"])
         return
 
-    # asetrate shifts pitch+formants, aresample restores sample rate,
-    # atempo corrects the duration change
-    new_rate = int(44100 * ratio)
+    # asetrate/aresample must reinterpret+restore at the SOURCE's own rate,
+    # not a hardcoded 44.1 kHz — a 48 kHz source resampled through a 44.1 kHz
+    # asetrate/aresample pair audibly shifts pitch/duration beyond what
+    # timbreBlend asked for. Best-effort probe via ffprobe; falls back to
+    # the CD-standard 44.1 kHz only when the source rate can't be read.
+    source_rate = await asyncio.to_thread(_probe_sample_rate, inp)
+    new_rate = int(source_rate * ratio)
     tempo = 1.0 / ratio
     # atempo only accepts 0.5..100.0; chain multiple if needed
     tempo_chain = _build_atempo_chain(tempo)
 
-    af = f"asetrate={new_rate},aresample=44100,{tempo_chain}"
+    af = f"asetrate={new_rate},aresample={source_rate},{tempo_chain}"
     await ffmpeg.render(inp, out, ["-af", af])
+
+
+def _probe_sample_rate(path: Path, default: int = 44100) -> int:
+    """Best-effort source sample rate via ffprobe.
+
+    Falls back to 44.1 kHz (CD-standard) when ffprobe is missing or the
+    probe fails — ``probe_file`` never raises, it returns ``{}`` instead.
+    """
+    from backend.modules.analysis.ffprobe import probe_file
+
+    info = probe_file(path)
+    rate = info.get("_summary", {}).get("sample_rate")
+    return int(rate) if rate else default
 
 
 def _build_atempo_chain(tempo: float) -> str:
@@ -214,11 +236,9 @@ TOOLS: list[ToolSpec] = [
         license="MIT / CC-BY-NC (OK free-use)",
         engine="pitch/formant shift (RAVE later)",
         handler=_timbreforge,
-        description="Neural timbre transfer — turn any sound into any instrument via an XY morph pad.",
+        description="Formant/pitch color shift via asetrate + atempo resampling, driven by a blend knob.",
         params=[
-            P("structureWeight", "float", 0, 1, 0.5, "", "ParamKnob", "Structure"),
             P("timbreBlend", "float", 0, 1, 0.5, "", "ParamKnob", "Timbre"),
-            P("latentWander", "float", 0, 1, 0.0, "", "ParamKnob", "Wander"),
         ],
     ),
     ToolSpec(
@@ -247,9 +267,11 @@ TOOLS: list[ToolSpec] = [
         license="MIT",
         engine="synth preview (TokenSynth later)",
         handler=_tokensynth,
-        description="Text -> playable instrument, driven from the piano roll.",
+        description=(
+            "Ring-modulate the input with vibrato + tremolo LFOs into a "
+            "tonal synth texture, shaped by Temp."
+        ),
         params=[
-            P("prompt", "string", default="", control="TextInput", label="Prompt"),
             P("temperature", "float", 0.1, 2.0, 1.0, "", "ParamKnob", "Temp"),
         ],
     ),
@@ -279,7 +301,7 @@ TOOLS: list[ToolSpec] = [
         license="LGPL",
         engine="spectral morph (RAVE SLERP later)",
         handler=_crossfade_morph,
-        description="Spectrally interpolate between two tracks.",
+        description="Spectrally morph a sound toward a heavily smeared version of itself (single input).",
         params=[
             P("morphPosition", "float", 0, 1, 0.5, "", "ParamSlider", "Morph"),
             P("mix", "float", 0, 1, 1.0, "", "ParamKnob", "Mix"),
@@ -295,9 +317,11 @@ TOOLS: list[ToolSpec] = [
         license="FFmpeg / CC-BY-NC (OK free-use)",
         engine="ffmpeg synth (MusicGen later)",
         handler=_ambientforge,
-        description="Generate ambience / drone / texture beds from a text prompt.",
+        description=(
+            "Generate a pink-noise drone/texture bed via lowpass/highpass, "
+            "tremolo and echo (ignores the input audio)."
+        ),
         params=[
-            P("prompt", "string", default="", control="TextInput", label="Prompt"),
             P("duration", "float", 5, 300, 30, "s", "ParamKnob", "Duration"),
         ],
     ),

@@ -153,8 +153,13 @@ class TasmoFile:
         with zipfile.ZipFile(path, "r") as zf:
             for name in zf.namelist():
                 if name.startswith("audio/"):
-                    zf.extract(name, out)
-                    extracted.append(str(out / name))
+                    # zf.extract() already sanitizes '..' in the member name
+                    # and returns the REAL path it wrote to; re-joining the
+                    # raw (still-'..'-bearing) name onto `out` by hand, as
+                    # before, produced a different string whose resolved form
+                    # could land outside `out` -- and this return value feeds
+                    # media_access.register_paths, which resolves it.
+                    extracted.append(zf.extract(name, out))
         return extracted
 
 

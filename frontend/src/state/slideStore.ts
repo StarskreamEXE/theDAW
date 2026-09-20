@@ -18,7 +18,12 @@
  */
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { DEFAULT_PROFILE_ID } from './controllerProfiles';
+// FE-025: import the id from controllerProfileIds.ts, NOT controllerProfiles.ts
+// — this store is reachable eagerly (App -> Shell -> BottomMultiTabPanel ->
+// slideStore), and importing the constant from controllerProfiles.ts used to
+// drag its whole 400+ line CONTROLLER_PROFILES table into the first-paint
+// bundle. See controllerProfileIds.ts's header.
+import { DEFAULT_PROFILE_ID } from './controllerProfileIds';
 
 export type SlideContent = 'audio' | 'visual';
 export type SlideView = 'row' | 'focus' | 'controller';

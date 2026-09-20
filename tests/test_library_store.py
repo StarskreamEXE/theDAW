@@ -213,8 +213,22 @@ def test_import_blob_creates_top_level_entry(tmp_path: Path):
 
 def test_user_mutable_fields_frozenset_is_locked():
     # Lock the contract — adding a new field requires an intentional update.
+    # notation_artist / notation_title: the DETAILS identity form's manual
+    # artist/title overrides (frontend/src/components/layout/DetailsView.tsx,
+    # saveIdentity) -- added for SCORE-001 (batch-12 T04); T08's notation
+    # routes and T09's identity resolver read them off metadata.json.
     assert USER_MUTABLE_FIELDS == frozenset(
-        {"favorite", "rating", "tags", "notes", "title", "chimera_sources", "lyrics"}
+        {
+            "favorite",
+            "rating",
+            "tags",
+            "notes",
+            "title",
+            "chimera_sources",
+            "lyrics",
+            "notation_artist",
+            "notation_title",
+        }
     )
 
 

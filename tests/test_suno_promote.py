@@ -38,8 +38,15 @@ from backend.modules.library import suno_promote, suno_stage
 from backend.modules.library.store import LibraryStore
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-INGEST_SCRIPT = REPO_ROOT / "scripts" / "ingest_suno_cache.py"
+# F12 (batch 12): the old title-dedupe importer is retired, moved to the
+# git-ignored deprecated/ folder, and kept only as the reference these two
+# regression tests below pin. It does not exist on a fresh clone/CI checkout.
+INGEST_SCRIPT = REPO_ROOT / "deprecated" / "ingest_suno_cache.py"
 PROMOTE_SCRIPT = REPO_ROOT / "scripts" / "promote_suno_stage.py"
+INGEST_SCRIPT_SKIP_REASON = (
+    "deprecated/ingest_suno_cache.py is git-ignored and absent on this "
+    "checkout; the retired importer (F12) is only kept as a local reference"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +284,8 @@ def test_signed_urls_are_sanitized_before_they_reach_the_library(
 def test_an_entry_from_the_old_importer_is_updated_not_duplicated(
     tmp_path: Path, store: LibraryStore
 ):
+    if not INGEST_SCRIPT.is_file():
+        pytest.skip(INGEST_SCRIPT_SKIP_REASON)
     clip = _clip_id(20)
     song = _song(clip)
     ingest = _load_script(INGEST_SCRIPT, "ingest_for_promote_test")
@@ -300,6 +309,8 @@ def test_an_old_entry_with_no_db_row_is_updated_not_overwritten(
     answer -- "no row, so this is a new song" -- would write straight over
     whatever the user had done to it.
     """
+    if not INGEST_SCRIPT.is_file():
+        pytest.skip(INGEST_SCRIPT_SKIP_REASON)
     clip = _clip_id(70)
     song = _song(clip)
     ingest = _load_script(INGEST_SCRIPT, "ingest_unindexed")

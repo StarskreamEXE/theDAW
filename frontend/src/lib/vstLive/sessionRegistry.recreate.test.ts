@@ -129,7 +129,7 @@ const entry = (id: string, over: Partial<ChainEntry> = {}): ChainEntry => ({
   ...over,
 });
 
-function setup(graceMs = 10000) {
+function setup(graceMs = 10000, stateSink?: (entryId: string, rawState: string) => void) {
   FakeClient.made = [];
   useVstLiveStore.setState({ entries: {}, host: { available: null } });
   const backend = new FakeBackend();
@@ -140,6 +140,7 @@ function setup(graceMs = 10000) {
     cancel: clock.cancel,
     graceMs,
     makeClient: (opts) => new FakeClient(opts) as never,
+    stateSink,
   });
   return { backend, registry };
 }
@@ -219,6 +220,50 @@ const flush = () => new Promise((r) => setTimeout(r, 0));
   await flush();
   const postsAfter = backend.calls.filter((c) => c.url === '/api/vst/live/session' && c.method === 'POST').length;
   assert.equal(postsAfter, postsBefore + 1, 'recreating was cleared, so the second failure retries');
+}
+
+/* ── T18 seventh audit, MINOR 3 -- recreate() must not CLEAR an actual host
+   rejection before the new session confirms it, and a close() that races the
+   respawn must still rescue the DELETE's answer as a rejection, not 'live' ── */
+{
+  const rescued: Array<[string, string]> = [];
+  const { backend, registry } = setup(10000, (entryId, rawState) => rescued.push([entryId, rawState]));
+  const s = await registry.acquire(entry('e4'), 48000);
+  assert.ok(s);
+  const onStatus = FakeClient.made[0].opts.handlers.onStatus!;
+  const onWarning = FakeClient.made[0].opts.handlers.onWarning!;
+
+  // The host actually refused this session's state before the socket died.
+  onWarning('the plugin rejected the state blob');
+  assert.equal(liveEntries().e4?.stateOrigin, 'state-rejected', 'the refusal is recorded');
+
+  backend.deferNextCreate();
+  onStatus('error', 'socket closed (1006)'); // starts recreate() in the background
+
+  // Before the respawn's POST has even resolved -- let alone before its own
+  // `ready`/`warning`/`error` lands -- the row must still say the truth. The
+  // reverted code wrote 'live' here SYNCHRONOUSLY, with no confirmation from
+  // the new process at all.
+  assert.equal(
+    liveEntries().e4?.stateOrigin,
+    'state-rejected',
+    "recreate() must not clear a rejection before the new session confirms it",
+  );
+
+  // The entry leaves the project WHILE the respawn is still in flight -- the
+  // exact window the finding could not drive in the reverted code.
+  registry.close('e4');
+  backend.landDeferredCreate();
+  await flush();
+
+  // `shutdown`'s `wasRejected` read the row BEFORE `clearEntry` wiped it. With
+  // the origin still 'state-rejected' (never cleared by recreate()), the
+  // DELETE's `raw_state` -- the plugin's untouched factory defaults, since it
+  // was never actually handed a state that took -- must NOT be rescued onto
+  // the entry. The reverted code's premature 'live' write made `wasRejected`
+  // false here, so `rescued` would have gained an ['e4', ...] entry.
+  assert.deepEqual(rescued, [], "a rejection recorded before the window must survive it");
+  assert.equal(registry.get('e4'), undefined, 'the entry stays gone');
 }
 
 console.log('vstLive/sessionRegistry.recreate: ok');

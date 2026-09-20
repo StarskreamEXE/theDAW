@@ -9,6 +9,7 @@ import {
   Volume2,
 } from 'lucide-react';
 import { dawImportAudioUrl } from '../../lib/dawImportClient';
+import { pairingHeader } from '../../lib/pairing';
 import { SurfacePlayKey } from '../ui/SurfacePlayKey';
 import type { DawClip, DawProject, DawTrack } from '../../lib/dawImportClient';
 import { performScenes, performSceneCount, performTracks } from '../../lib/performModel';
@@ -798,7 +799,7 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
     const task = (async () => {
       const context = getEngineCtx();
       if (clip.file_path) {
-        const response = await fetch(dawImportAudioUrl(clip.file_path));
+        const response = await fetch(dawImportAudioUrl(clip.file_path), { headers: pairingHeader() });
         if (!response.ok) throw new Error(`clip fetch ${response.status}`);
         return context.decodeAudioData(await response.arrayBuffer());
       }

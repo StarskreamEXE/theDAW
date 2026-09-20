@@ -96,7 +96,12 @@ export default defineConfig({
           // never reaches consumers (VST-Foundry bindings, XR headset).
           ws: true,
           timeout: 0,
-          proxyTimeout: 0
+          proxyTimeout: 0,
+          // Stamps X-Forwarded-For/-Proto/-Port (matches frontend/vite.config.ts)
+          // so the backend can recover the real caller's address instead of
+          // this proxy's own loopback peer — see that file's comment for why
+          // this matters for loopback-gated routes (LAN2).
+          xfwd: true
         },
         // Static VJ build served by the backend (matches frontend/vite.config.ts).
         // Without this the VJ iframe's /vj-app/ request fell through to Vite's

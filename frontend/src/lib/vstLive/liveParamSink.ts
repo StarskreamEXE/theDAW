@@ -135,7 +135,11 @@ function ensureSingleton(): LiveParamSink {
     };
     singleton = createLiveParamSink({
       lookup,
-      markParamsChanged: (entryId) => vstSessions.markParamsChanged(entryId),
+      // A push routed through here IS a genuine user gesture — a Sway
+      // dimension or a Perform macro sweep the user is driving — not a chain
+      // rebuild's re-push, so it may also unlock the save-time rejection
+      // guard in `sinkLiveRawState` (T18 fifth audit, CRITICAL 1).
+      markParamsChanged: (entryId) => vstSessions.markUserParamsChanged(entryId),
       timers: {
         now: () => performance.now(),
         schedule: (fn, ms) => setTimeout(fn, ms) as unknown as number,

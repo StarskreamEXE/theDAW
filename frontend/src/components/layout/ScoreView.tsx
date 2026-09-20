@@ -1,10 +1,12 @@
-import React, { useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { ChevronLeft, ChevronRight, Download, Expand, Loader2, Minus, Plus, RefreshCw, Shrink } from 'lucide-react';
+import { ChevronDown, ChevronLeft, ChevronRight, Download, Expand, Loader2, Minus, Plus, RefreshCw, Shrink, Waves } from 'lucide-react';
 import { useLibraryStore, type LibraryEntry } from '../../state/libraryStore';
 import { usePlayerStore } from '../../state/playerStore';
 import { logError, logInfo } from '../../state/logStore';
 import { useFeatureToggleStore } from '../../state/featureToggleStore';
+import { RhythmBlock } from './RhythmBlock';
+import type { AnalysisSummary } from './rhythmReport';
 import {
   buildTimeMap,
   createCursorDriver,
@@ -233,6 +235,41 @@ export const ScoreView: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [caps, setCaps] = useState<NotationCapabilities | null>(null);
   const [exporting, setExporting] = useState<string | null>(null);
+  // METER MAP popover: the same RhythmBlock the library menu (save-meter-map)
+  // and DETAILS embed, reached here so a track opened straight into SCORE (or
+  // the SING split) does not need a trip back to DETAILS just to read it.
+  const [meterOpen, setMeterOpen] = useState(false);
+  const meterPanelRef = useRef<HTMLDivElement | null>(null);
+  const meterToggleRef = useRef<HTMLButtonElement | null>(null);
+  // Focus lands here when the dialog opens (WAI-ARIA dialog pattern), and it
+  // is what stopPropagation below is protecting: this component's own
+  // focus-mode toggle (above) listens for Escape on `window` too, and
+  // `document` precedes `window` in the bubble chain, so without
+  // stopPropagation one press exited fullscreen focus mode AND closed this
+  // dialog at once. RhythmBlock's own SAVE menu no longer competes here — it
+  // stops its OWN Escape via a React onKeyDown on its menu wrapper, not a
+  // second document listener.
+  const meterDialogRef = useRef<HTMLDivElement | null>(null);
+  const meterPanelId = `score-meter-map-${useId()}`;
+  useEffect(() => {
+    if (!meterOpen) return;
+    meterDialogRef.current?.focus();
+    const onDown = (e: PointerEvent) => {
+      if (!meterPanelRef.current?.contains(e.target as Node)) setMeterOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.stopPropagation();
+      setMeterOpen(false);
+      meterToggleRef.current?.focus();
+    };
+    document.addEventListener('pointerdown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('pointerdown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [meterOpen]);
   // Beat Saber export popover: open flag, and the part names it offers (learnt
   // from a loaded view or fetched from the sheet's part-list; null = all).
   const [bsOpen, setBsOpen] = useState(false);
@@ -736,6 +773,39 @@ export const ScoreView: React.FC = () => {
               <option key={inst} value={inst}>{INSTRUMENT_LABELS[inst]}</option>
             ))}
           </select>
+          <div ref={meterPanelRef} className="relative shrink-0">
+            <button
+              type="button"
+              ref={meterToggleRef}
+              onClick={() => setMeterOpen((v) => !v)}
+              disabled={!entry}
+              className="shrink-0 rounded border border-white/10 bg-black/30 p-1 flex items-center gap-0.5 text-zinc-400 hover:text-fuchsia-200 hover:border-fuchsia-500/40 transition-colors disabled:opacity-40"
+              title="Meter map: time signature per section, tempo segments, syncopation, swing"
+              aria-label="Meter map"
+              aria-haspopup="dialog"
+              aria-expanded={meterOpen}
+              aria-controls={meterOpen ? meterPanelId : undefined}
+            >
+              <Waves className="w-3 h-3" />
+              <ChevronDown className="w-3 h-3" aria-hidden="true" />
+            </button>
+            {meterOpen && (
+              <div
+                ref={meterDialogRef}
+                id={meterPanelId}
+                role="dialog"
+                aria-label="Meter map"
+                tabIndex={-1}
+                className="et-opaque absolute right-0 top-full z-30 mt-1 w-96 max-h-[70vh] overflow-y-auto rounded-md border border-white/10 bg-[#0a080f] p-1 shadow-[0_8px_24px_rgba(0,0,0,0.6)] outline-none"
+              >
+                <RhythmBlock
+                  entryId={entry?.id ?? null}
+                  title={entry?.title ?? 'track'}
+                  analysis={(entry?.analysis as AnalysisSummary | undefined) ?? null}
+                />
+              </div>
+            )}
+          </div>
           <ExportMenu
             artifact={selectedArtifact}
             caps={caps}
@@ -783,6 +853,59 @@ export const ScoreView: React.FC = () => {
       {overlayHost ? createPortal(root, overlayHost) : root}
     </div>
   );
+};
+
+/** OSMD only ever builds a part-name label for the very first system of the
+ *  WHOLE piece (`createMusicSystemLabel(..., isFirstSystem)`, called with
+ *  `isFirstSystem = 1 === musicSystems.length`): every later system — the
+ *  second system of page 1 included, not just later pages — gets nothing
+ *  unless the source XML carries a `<part-abbreviation>`, in which case OSMD
+ *  prints THAT, never the full name (EngravingRules.RenderPartAbbreviations).
+ *  `RenderSystemLabelsAfterFirstPage` only controls whether an existing label
+ *  is drawn on page 2+; it cannot make OSMD build one it never created.
+ *
+ *  A multi-part chart is unreadable past the first system without a name to
+ *  tell the parts apart, so before OSMD ever sees the XML we copy each part's
+ *  full name into its own abbreviation slot: the "abbreviation" every later
+ *  system prints is then the full name too.
+ *
+ *  Single-part scores are skipped — not because OSMD is unable to label them:
+ *  its own gate (`1 === this.staffLines.length`) counts STAFF LINES, not
+ *  parts, so a solo grand staff (piano, harp, organ — one part, two staff
+ *  lines) would happily get one. They are skipped because there is only one
+ *  part in the piece to tell apart from another: naming it on every system
+ *  disambiguates nothing a reader needs. */
+/** Guarantees a leading `<?xml ...?>` declaration without doubling one that
+ *  is already there. jsdom's `XMLSerializer` always drops it; OSMD 1.9.9's
+ *  `load()` rejects input that doesn't start with one. */
+export const ensureXmlDeclaration = (s: string): string =>
+  s.startsWith('<?xml') ? s : `<?xml version="1.0" encoding="UTF-8"?>\n${s}`;
+
+export const withPartNamesOnEverySystem = (xml: string): string => {
+  try {
+    const doc = new DOMParser().parseFromString(xml, 'application/xml');
+    if (doc.querySelector('parsererror')) return xml;
+    const scoreParts = Array.from(doc.querySelectorAll('part-list > score-part'));
+    if (scoreParts.length < 2) return xml;
+    for (const scorePart of scoreParts) {
+      const nameEl = scorePart.querySelector('part-name');
+      const name = (nameEl?.textContent || '').trim();
+      if (!name) continue;
+      let abbr = scorePart.querySelector('part-abbreviation');
+      if (!abbr) {
+        abbr = doc.createElement('part-abbreviation');
+        // MusicXML orders part-abbreviation right after part-name-display
+        // when the part has one, else right after part-name itself.
+        const insertAfter = scorePart.querySelector('part-name-display') ?? nameEl;
+        if (insertAfter?.nextSibling) scorePart.insertBefore(abbr, insertAfter.nextSibling);
+        else scorePart.appendChild(abbr);
+      }
+      abbr.textContent = name;
+    }
+    return ensureXmlDeclaration(new XMLSerializer().serializeToString(doc));
+  } catch {
+    return xml;
+  }
 };
 
 /** Sheet-music preview. Renders the score as real A4 pages laid out left-to-
@@ -1190,6 +1313,19 @@ const MusicXmlPreview: React.FC<{ artifact: NotationArtifact; entry: LibraryEntr
         osmd.cursorsOptions = [{ type: CursorType.ThinLeft, color: highlightColor(), alpha: 0.95, follow: false }];
         osmd.FollowCursor = false;
         applySheetEngraving(osmd.EngravingRules);
+        // Part names on every system, not just the first: see
+        // withPartNamesOnEverySystem for why the rules alone cannot do
+        // this. The three below already default true in the installed OSMD
+        // (confirmed by reading opensheetmusicdisplay's own source), so this
+        // makes that explicit rather than changing it; the try/catch is only
+        // for a future OSMD upgrade that might rename or drop one of them.
+        try {
+          osmd.EngravingRules.RenderPartNames = true;
+          osmd.EngravingRules.RenderPartAbbreviations = true;
+          osmd.EngravingRules.RenderSystemLabelsAfterFirstPage = true;
+        } catch {
+          /* a future OSMD upgrade renamed or dropped one of these */
+        }
         // Song as the centered title (wrapped if long), artist as the subtitle
         // under it; capture the song name for the running page footer.
         const prepared = prepareMusicXml(xml, computePageW(), artist);
@@ -1199,7 +1335,7 @@ const MusicXmlPreview: React.FC<{ artifact: NotationArtifact; entry: LibraryEntr
         // title; only a real arrangement or tab label is worth printing.
         const label = describeArtifact(artifact);
         footerLabelRef.current = label === 'Sheet' ? '' : label;
-        await osmd.load(prepared.xml);
+        await osmd.load(withPartNamesOnEverySystem(prepared.xml));
         if (cancelled) return;
         osmdRef.current = osmd;
         // The map needs only Sheet.MusicPartManager, which exists as soon as

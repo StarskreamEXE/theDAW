@@ -45,6 +45,7 @@ Lifecycle:
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import os
@@ -54,6 +55,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -95,6 +98,18 @@ DEFAULT_PORT = 5188
 PORT_READY_TIMEOUT_SEC = 90.0
 PORT_POLL_INTERVAL_SEC = 0.5
 NPM_INSTALL_TIMEOUT_SEC = 600.0
+
+# _terminate_proc's own wait() budget: taskkill/terminate, then (if that
+# doesn't land within this) kill -- each phase waits up to this long for the
+# process to actually exit.
+_TERMINATE_WAIT_SEC = 5.0
+# Worst case for a full _terminate_proc call: the first wait() times out
+# (_TERMINATE_WAIT_SEC), THEN kill()'s wait() also has to complete
+# (_TERMINATE_WAIT_SEC again) -- 2x, plus a small margin for the taskkill/
+# terminate calls themselves. _wait_while_stopping and the adoption-race
+# guard (item 1) both use this as their bound, so a truly slow teardown
+# is never treated as "stopped()" giving up too early.
+_STOPPING_WAIT_TIMEOUT_SEC = 2 * _TERMINATE_WAIT_SEC + 2.0
 
 # Child-process output (npm install, the Express/tsx server) lands here so
 # failures are diagnosable rather than vanishing into DEVNULL.
@@ -142,8 +157,42 @@ class LyriaConfig:
 
 
 _state_lock = Lock()
+# Serializes ensure_running()'s own "decide to spawn, then Popen" sequence
+# against itself, so two concurrent ensure_running() callers don't both spawn
+# a second Node process. Deliberately separate from _state_lock: the section
+# it guards can take up to NPM_INSTALL_TIMEOUT_SEC (10 min) via _ensure_deps,
+# and stop()/probe() -- which only need a quick read of _proc/_resolved_url --
+# must never block behind it.
+_run_lock = Lock()
+# Serializes _ensure_deps' own critical section (node_modules re-check + the
+# `npm install` call) -- acquired INSIDE _ensure_deps, not by its callers, so
+# both callers (ensure_running(), which also holds _run_lock while it calls
+# _ensure_deps, and _install_worker()/start_install()'s "Install" button path,
+# which holds neither) are covered without two concurrent `npm install`s ever
+# running in the same directory. A plain Lock is safe here specifically
+# because _run_lock and _spawn_lock are different objects: ensure_running()
+# holding _run_lock while _ensure_deps acquires _spawn_lock is not a
+# self-deadlock.
+_spawn_lock = Lock()
 _proc: Optional[subprocess.Popen[bytes]] = None
 _resolved_url: Optional[str] = None
+# Set by stop() under _state_lock; consumed by ensure_running() right before
+# (and right after) it spawns a new child. A stop() that arrives while
+# ensure_running() is mid-install or mid-Popen -- i.e. before _proc exists,
+# so stop()'s own "_proc is None" early return has nothing to terminate --
+# must still prevent that in-flight spawn from completing, or it orphans a
+# Node process holding the port with nothing left tracking it.
+_stop_requested = False
+# .is_set() while stop() is actively tearing down the previous process (from
+# just after _proc is cleared under _state_lock, until _terminate_proc's
+# taskkill/wait or terminate/wait completes -- up to ~10s worst case).
+# _proc going back to None happens BEFORE the process is actually dead, so
+# without this a concurrent ensure_running() could see "nothing of ours is
+# running", probe the port, get a confirmed answer from the still-alive (but
+# dying) server, and adopt it moments before it exits (item 5). A plain
+# Event.wait() blocks until SET, which is the wrong direction for "wait until
+# no longer stopping" -- _wait_while_stopping() below polls it instead.
+_stopping = threading.Event()
 
 
 def is_mock() -> bool:
@@ -284,6 +333,54 @@ def _port_is_listening(port: int, host: str = "127.0.0.1") -> bool:
         return False
 
 
+def _is_lyria_server(port: int) -> bool:
+    """Identity check: does whatever is listening on ``port`` answer as OUR
+    Lyria sidecar, not some other process that happened to grab the port?
+
+    ``_port_is_listening`` only proves a TCP listener exists there -- on
+    Windows another dev server (or a leftover process from a prior run of a
+    different app) can easily be squatting on it, and treating that as "our
+    sidecar is up" would silently point generate calls at the wrong service
+    (see the port-collision history in this module's docstring). Lyria's
+    server (server.ts) registers ``GET /api/settings/status`` before it calls
+    ``app.listen`` -- so a successful TCP connect already guarantees the route
+    table is live -- and the handler always returns exactly the keys
+    ``geminiServerKey`` / ``openRouterServerKey`` / ``defaultProvider``. No
+    unrelated service is expected to answer with that shape, so requiring
+    both keys is a cheap, sufficient identity check without needing a
+    dedicated health route we'd have to add to the vendored project (we spawn
+    it, we don't rebuild it -- see the module docstring).
+
+    Uses a ProxyHandler({}) opener rather than plain ``urlopen`` -- which
+    honours ``HTTP_PROXY``/``NO_PROXY`` from the environment by default -- so
+    a system/corporate proxy can never sit between theDAW and its own
+    loopback sidecar (same rule as underfit/router.py's ``trust_env=False``
+    httpx client). Without it, a proxy that can't reach 127.0.0.1 would make
+    this identity check -- and therefore every real Lyria sidecar -- fail.
+
+    A port collision doesn't always mean an HTTP server: an SSH banner or
+    any other non-HTTP listener makes ``http.client`` raise
+    ``http.client.HTTPException`` (e.g. ``BadStatusLine``) rather than
+    ``OSError``/``URLError`` -- uncaught, that propagates out of probe()/
+    ensure_running() as a 500 instead of the intended "port in use" 503.
+    ``ValueError`` also covers malformed/undecodable headers on top of the
+    JSON-parse failures it already catches.
+    """
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(
+            f"http://127.0.0.1:{port}/api/settings/status", timeout=1.0
+        ) as response:
+            body = json.loads(response.read(4096))
+    except (OSError, urllib.error.URLError, http.client.HTTPException, ValueError):
+        return False
+    return (
+        isinstance(body, dict)
+        and "geminiServerKey" in body
+        and "openRouterServerKey" in body
+    )
+
+
 def _ensure_deps(cfg: LyriaConfig) -> None:
     """Install node_modules when missing.
 
@@ -291,41 +388,47 @@ def _ensure_deps(cfg: LyriaConfig) -> None:
     inline in ensure_running() only, so its _ensure_build() path can run
     `npm run build` against a checkout with no node_modules and fail with a
     bare "vite: not found". Every path that runs npm here goes through this
-    first.
+    first -- ensure_running()'s spawn sequence AND the "Install" button's
+    _install_worker() both call this directly, so the node_modules re-check
+    and the `npm install` call itself are wrapped in _spawn_lock: without it,
+    both paths could see node_modules missing at the same instant and run
+    `npm install` concurrently in the same directory (the Install button is a
+    background thread with no lock of its own).
     """
-    node_modules = cfg.project_path / "node_modules"
-    if node_modules.is_dir():
-        return
-    log.info("lyria.sidecar: node_modules missing -- running npm install")
-    try:
-        # Output goes to the sidecar log so install failures are diagnosable;
-        # the timeout stops a hung npm (network stall) from pinning the state
-        # lock forever.
-        with _sidecar_log_handle() as install_log:
-            rc = subprocess.call(
-                [cfg.npm_path, "install"],
-                cwd=str(cfg.project_path),
-                stdout=install_log,
-                stderr=subprocess.STDOUT,
-                shell=False,
-                timeout=NPM_INSTALL_TIMEOUT_SEC,
-                env=child_env(),
+    with _spawn_lock:
+        node_modules = cfg.project_path / "node_modules"
+        if node_modules.is_dir():
+            return
+        log.info("lyria.sidecar: node_modules missing -- running npm install")
+        try:
+            # Output goes to the sidecar log so install failures are
+            # diagnosable; the timeout stops a hung npm (network stall) from
+            # pinning _spawn_lock forever.
+            with _sidecar_log_handle() as install_log:
+                rc = subprocess.call(
+                    [cfg.npm_path, "install"],
+                    cwd=str(cfg.project_path),
+                    stdout=install_log,
+                    stderr=subprocess.STDOUT,
+                    shell=False,
+                    timeout=NPM_INSTALL_TIMEOUT_SEC,
+                    env=child_env(),
+                )
+        except FileNotFoundError as e:
+            raise RuntimeError(
+                f"Lyria sidecar: npm not found ({e}). Install Node.js."
+            ) from e
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                f"npm install timed out after {int(NPM_INSTALL_TIMEOUT_SEC)}s in "
+                f"{cfg.project_path} -- check the network, then retry."
+            ) from e
+        if rc != 0:
+            raise RuntimeError(
+                f"npm install failed in {cfg.project_path} (rc={rc}). See "
+                f"{SIDECAR_LOG_PATH} for the full output, then retry."
             )
-    except FileNotFoundError as e:
-        raise RuntimeError(
-            f"Lyria sidecar: npm not found ({e}). Install Node.js."
-        ) from e
-    except subprocess.TimeoutExpired as e:
-        raise RuntimeError(
-            f"npm install timed out after {int(NPM_INSTALL_TIMEOUT_SEC)}s in "
-            f"{cfg.project_path} -- check the network, then retry."
-        ) from e
-    if rc != 0:
-        raise RuntimeError(
-            f"npm install failed in {cfg.project_path} (rc={rc}). See "
-            f"{SIDECAR_LOG_PATH} for the full output, then retry."
-        )
-    log.info("lyria.sidecar: npm install complete")
+        log.info("lyria.sidecar: npm install complete")
 
 
 def detect_lan_ip() -> Optional[str]:
@@ -409,6 +512,23 @@ def probe() -> dict:
             issues.append(
                 "GEMINI_API_KEY is not set: live mode cannot generate without it."
             )
+    # A TCP listener on the port isn't enough -- confirm it actually answers
+    # as our Lyria sidecar before reporting "listening" (INT-001). A listener
+    # that fails the identity check is a port collision -- UNLESS we already
+    # own a live process on this port (owns_process()), in which case it's
+    # almost always our own child still starting up, not a rogue process
+    # (round-4 item 3): don't report a false "port already in use" against
+    # ourselves, just leave "listening" False so the normal readiness wait
+    # keeps polling.
+    port_open = _port_is_listening(cfg.port)
+    confirmed = port_open and _is_lyria_server(cfg.port)
+    listening = confirmed
+    if port_open and not confirmed and not owns_process():
+        issues.append(
+            f"Port {cfg.port} is already in use by another process that is not "
+            "the Lyria sidecar. Set theDAW_LYRIA_PORT to a free port, or stop "
+            "the process using it."
+        )
     return {
         "project_path": str(pkg),
         "project_exists": pkg_json.is_file(),
@@ -422,7 +542,7 @@ def probe() -> dict:
         "node": bool(node),
         "gemini_key": bool(key),
         "gemini_key_source": key_source,
-        "listening": _port_is_listening(cfg.port),
+        "listening": listening,
         "process_alive": _proc is not None and _proc.poll() is None,
         "url": _resolved_url or f"http://127.0.0.1:{cfg.port}",
         "lan_ip": detect_lan_ip(),
@@ -572,122 +692,308 @@ def start_install() -> dict:
     return install_status()
 
 
+def _probe_adoption(cfg: LyriaConfig) -> tuple[bool, bool]:
+    """Network probe for "is a confirmed Lyria instance already listening on
+    cfg.port" -- deliberately run WITHOUT holding _state_lock (item 6): the
+    TCP connect (~0.4s) plus the HTTP identity check (~1s) worst case must
+    never block stop()/probe()/owns_process(), which only need a quick read
+    of _proc/_resolved_url under that same lock. Callers re-check whatever
+    state they need under _state_lock immediately after calling this.
+
+    Returns ``(confirmed, collision)``: ``confirmed`` is True when a Lyria
+    instance is already listening there (our child, or one the user launched
+    manually); ``collision`` is True when the port is held by something else
+    (INT-001: a bare TCP connect alone is not enough to adopt a listener as
+    "our sidecar").
+
+    A failed identity check while we already own a live child on this port
+    (round-4 item 3) is NOT a collision: it almost always means our own
+    just-spawned process is still starting up (Vite/Express warm-up) rather
+    than a rogue process having grabbed the port out from under us. Treating
+    it as "not confirmed, no collision" lets the caller fall through to the
+    normal readiness-wait loop instead of raising a false "port already in
+    use" error against our own child."""
+    if not _port_is_listening(cfg.port):
+        return False, False
+    if _is_lyria_server(cfg.port):
+        return True, False
+    if owns_process():
+        return False, False
+    return False, True
+
+
+def _port_collision_error(cfg: LyriaConfig) -> RuntimeError:
+    return RuntimeError(
+        f"Port {cfg.port} is already in use by another process that did not "
+        "answer as the Lyria sidecar. Set theDAW_LYRIA_PORT to a free port, "
+        "or stop the process using it, then retry."
+    )
+
+
+def _wait_while_stopping(timeout: float = _STOPPING_WAIT_TIMEOUT_SEC) -> None:
+    """Bounded poll for an in-progress stop() to finish tearing down the
+    previous process (item 5), so ensure_running() doesn't probe/adopt a
+    server that is dying right now. Defaults to _STOPPING_WAIT_TIMEOUT_SEC,
+    derived from _terminate_proc's own worst-case duration -- see that
+    constant's comment -- rather than an arbitrary guess."""
+    deadline = time.monotonic() + timeout
+    while _stopping.is_set() and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+
+def _probe_adoption_guarded(cfg: LyriaConfig) -> tuple[bool, bool]:
+    """_probe_adoption() guarded against the stop() race from round-4 item 1:
+    a stop() firing between the identity probe (inside _probe_adoption) and
+    the caller trusting its `confirmed` result could make ensure_running()
+    adopt the very process now being torn down -- it can briefly still
+    answer HTTP requests while _terminate_proc is mid-kill. Rejects a
+    `confirmed` result that raced against a stop() like that, waits for the
+    teardown to finish, and retries -- bounded by _STOPPING_WAIT_TIMEOUT_SEC,
+    after which it raises "stopped" rather than looping forever."""
+    deadline = time.monotonic() + _STOPPING_WAIT_TIMEOUT_SEC
+    while True:
+        _wait_while_stopping()
+        confirmed, collision = _probe_adoption(cfg)
+        if not (confirmed and _stopping.is_set()):
+            return confirmed, collision
+        if time.monotonic() >= deadline:
+            raise RuntimeError("stopped")
+
+
+def owns_process() -> bool:
+    """True when the module holds a live handle to the process currently
+    listening on the sidecar's port -- i.e. WE spawned it, as opposed to an
+    already-running instance ensure_running() merely adopted (INT-001's
+    "one the user launched manually" case). Callers (the /url route, the
+    storage provider-status summary) use this to avoid claiming a cost mode
+    (mock/live) for a process whose environment theDAW never set (item 5)."""
+    with _state_lock:
+        return _proc is not None and _proc.poll() is None
+
+
+def _consume_stop_requested() -> bool:
+    """Read-and-clear _stop_requested under _state_lock. Returns the value it
+    held before clearing."""
+    global _stop_requested
+    with _state_lock:
+        was = _stop_requested
+        _stop_requested = False
+        return was
+
+
+def _terminate_proc(proc: subprocess.Popen[bytes]) -> None:
+    """Best-effort kill of a Lyria child process tree. Shared by stop() and
+    ensure_running()'s post-Popen stop-request check (item 1). Worst-case
+    duration is bounded by _STOPPING_WAIT_TIMEOUT_SEC (see its comment)."""
+    try:
+        if sys.platform == "win32":
+            # npm.cmd is a shim: terminate() kills the cmd wrapper and leaves
+            # the node child listening. Kill the whole tree.
+            subprocess.call(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=child_env(),
+            )
+            proc.wait(timeout=_TERMINATE_WAIT_SEC)
+        else:
+            proc.terminate()
+            proc.wait(timeout=_TERMINATE_WAIT_SEC)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            # Reap the killed child so it doesn't linger as a zombie until
+            # interpreter shutdown (POSIX).
+            proc.wait(timeout=_TERMINATE_WAIT_SEC)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+
 def ensure_running(*, wait_for_ready: bool = True) -> str:
     """Spawn the Lyria Express server if it isn't already, and return the URL
     it serves on. Safe to call repeatedly -- no-ops if the port is already
-    listening, even if some other process started it."""
-    global _proc, _resolved_url
+    listening AND confirmed to be our sidecar (INT-001), even if some other
+    process started it."""
+    global _proc, _resolved_url, _stop_requested
+    cfg = resolve_config()
+    # 127.0.0.1, not localhost -- see _port_is_listening for why.
+    url = f"http://127.0.0.1:{cfg.port}"
+
+    # Network probe happens OUTSIDE _state_lock (item 6) -- see
+    # _probe_adoption's docstring. _probe_adoption_guarded also waits out an
+    # in-progress stop() and rejects a `confirmed` result that raced against
+    # one (round-4 item 1) -- see its docstring.
+    confirmed, collision = _probe_adoption_guarded(cfg)
+    if collision:
+        raise _port_collision_error(cfg)
     with _state_lock:
-        cfg = resolve_config()
-        # 127.0.0.1, not localhost -- see _port_is_listening for why.
-        url = f"http://127.0.0.1:{cfg.port}"
-
-        # Already listening (our child, or one the user launched manually).
-        if _port_is_listening(cfg.port):
+        if confirmed:
             _resolved_url = url
             return url
+        proc_alive = _proc is not None and _proc.poll() is None
 
-        if _proc is not None and _proc.poll() is None:
-            # Live child, not yet listening; fall through to the wait loop.
-            pass
-        else:
-            if not cfg.project_path.is_dir():
-                raise RuntimeError(
-                    f"Lyria project not found at {cfg.project_path}. Clone "
-                    "StarskreamEXE/lyria-3-pro beside this repo, or set "
-                    "theDAW_LYRIA_PROJECT to override."
-                )
-            _ensure_deps(cfg)
-            # `npm run dev` is `tsx server.ts`: the Express server hosts Vite in
-            # middleware mode and serves both the API and the SPA from one port.
-            # We use it rather than build+start because it needs no build step
-            # and is the path the app is developed and tested against.
-            cmd = [cfg.npm_path, "run", "dev"]
-            log.info(
-                "lyria.sidecar: spawning %s (cwd=%s, port=%d, mock=%s)",
-                " ".join(cmd),
-                cfg.project_path,
-                cfg.port,
-                cfg.mock,
-            )
-            try:
-                # On Windows npm is a .cmd shim; CREATE_NEW_PROCESS_GROUP keeps
-                # the spawn quiet inside the theDAW console instead of popping a
-                # separate cmd window.
-                creationflags = 0
-                if sys.platform == "win32":
-                    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-                with _sidecar_log_handle() as spawn_out:
-                    _proc = subprocess.Popen(
-                        cmd,
-                        cwd=str(cfg.project_path),
-                        stdout=spawn_out,
-                        stderr=subprocess.STDOUT,
-                        creationflags=creationflags,
-                        shell=False,
-                        env=_child_env(cfg),
+    if not proc_alive:
+        # _run_lock (not _state_lock) serializes this whole sequence so two
+        # concurrent callers can't both spawn a second Node process, while
+        # leaving _state_lock free for stop()/probe() to keep reading _proc
+        # without waiting on it (INT-003). _ensure_deps takes the separate
+        # _spawn_lock for its own npm-install critical section (item 3) --
+        # different lock object, so holding _run_lock here doesn't deadlock.
+        with _run_lock:
+            # Another caller may have started tearing down the previous
+            # process, or finished spawning, while we waited for _run_lock --
+            # re-check both before deciding to spawn ourselves.
+            confirmed, collision = _probe_adoption_guarded(cfg)
+            if collision:
+                raise _port_collision_error(cfg)
+            with _state_lock:
+                if confirmed:
+                    _resolved_url = url
+                    return url
+                proc_alive = _proc is not None and _proc.poll() is None
+
+            if not proc_alive:
+                if not cfg.project_path.is_dir():
+                    raise RuntimeError(
+                        f"Lyria project not found at {cfg.project_path}. Clone "
+                        "StarskreamEXE/lyria-3-pro beside this repo, or set "
+                        "theDAW_LYRIA_PROJECT to override."
                     )
-            except FileNotFoundError as e:
-                raise RuntimeError(
-                    f"Failed to launch Lyria sidecar: {e}. Is npm on PATH?"
-                ) from e
-
-        if not wait_for_ready:
-            _resolved_url = url
-            return url
-
-        deadline = time.monotonic() + PORT_READY_TIMEOUT_SEC
-        while time.monotonic() < deadline:
-            if _port_is_listening(cfg.port):
-                _resolved_url = url
-                log.info("lyria.sidecar: ready at %s (mock=%s)", url, cfg.mock)
-                return url
-            if _proc is not None and _proc.poll() is not None:
-                raise RuntimeError(
-                    f"Lyria sidecar exited before becoming ready "
-                    f"(rc={_proc.returncode}). See {SIDECAR_LOG_PATH}."
+                # A stop() from BEFORE this attempt began is stale -- clear it
+                # so a fresh attempt isn't haunted by an old request that
+                # already had its effect (or had nothing to act on).
+                _consume_stop_requested()
+                _ensure_deps(cfg)  # npm install -- runs outside _state_lock
+                # A stop() may have arrived while _ensure_deps (up to
+                # NPM_INSTALL_TIMEOUT_SEC) was running -- with nothing yet
+                # spawned, stop()'s own "_proc is None" check has nothing to
+                # terminate, so this is the only place that can prevent the
+                # install from completing into an orphaned Node process.
+                if _consume_stop_requested():
+                    raise RuntimeError("stopped")
+                # `npm run dev` is `tsx server.ts`: the Express server hosts
+                # Vite in middleware mode and serves both the API and the SPA
+                # from one port. We use it rather than build+start because it
+                # needs no build step and is the path the app is developed
+                # and tested against.
+                cmd = [cfg.npm_path, "run", "dev"]
+                log.info(
+                    "lyria.sidecar: spawning %s (cwd=%s, port=%d, mock=%s)",
+                    " ".join(cmd),
+                    cfg.project_path,
+                    cfg.port,
+                    cfg.mock,
                 )
-            time.sleep(PORT_POLL_INTERVAL_SEC)
-        raise RuntimeError(
-            f"Lyria sidecar didn't open port {cfg.port} within "
-            f"{int(PORT_READY_TIMEOUT_SEC)}s -- likely an npm-install or "
-            f"server startup hang. See {SIDECAR_LOG_PATH}."
-        )
+                try:
+                    # On Windows npm is a .cmd shim; CREATE_NEW_PROCESS_GROUP
+                    # keeps the spawn quiet inside the theDAW console instead
+                    # of popping a separate cmd window.
+                    creationflags = 0
+                    if sys.platform == "win32":
+                        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+                    with _sidecar_log_handle() as spawn_out:
+                        new_proc = subprocess.Popen(
+                            cmd,
+                            cwd=str(cfg.project_path),
+                            stdout=spawn_out,
+                            stderr=subprocess.STDOUT,
+                            creationflags=creationflags,
+                            shell=False,
+                            env=_child_env(cfg),
+                        )
+                except FileNotFoundError as e:
+                    raise RuntimeError(
+                        f"Failed to launch Lyria sidecar: {e}. Is npm on PATH?"
+                    ) from e
+                # item 4: read-and-clear the stop flag AND assign _proc
+                # atomically in ONE _state_lock section -- doing them as two
+                # separate critical sections (as before) left a gap where a
+                # stop() landing between them would see _proc still None
+                # (nothing to terminate) right before this assigns it,
+                # orphaning the just-spawned process. Terminate OUTSIDE the
+                # lock: _terminate_proc can block for several seconds.
+                with _state_lock:
+                    if _stop_requested:
+                        _stop_requested = False
+                        stop_hit = True
+                    else:
+                        stop_hit = False
+                        _proc = new_proc
+                if stop_hit:
+                    _terminate_proc(new_proc)
+                    raise RuntimeError("stopped")
+
+    with _state_lock:
+        expected_proc = _proc
+
+    if not wait_for_ready:
+        with _state_lock:
+            _resolved_url = url
+        return url
+
+    deadline = time.monotonic() + PORT_READY_TIMEOUT_SEC
+    while time.monotonic() < deadline:
+        # item 3: a stop() during the readiness wait must abort immediately
+        # instead of being silently ignored until the 90s deadline, which
+        # then reports a misleading "npm-install or server startup hang"
+        # message for what was actually a deliberate stop.
+        with _state_lock:
+            proc = _proc
+        # Always consume the flag -- `or` short-circuits and would otherwise
+        # leave _stop_requested stuck True (never cleared) whenever the
+        # `proc is not expected_proc` branch is the one that fires (item 4).
+        stop_requested = _consume_stop_requested()
+        if proc is not expected_proc or stop_requested:
+            raise RuntimeError("stopped")
+        if _port_is_listening(cfg.port) and _is_lyria_server(cfg.port):
+            with _state_lock:
+                _resolved_url = url
+            log.info("lyria.sidecar: ready at %s (mock=%s)", url, cfg.mock)
+            return url
+        if proc is not None and proc.poll() is not None:
+            raise RuntimeError(
+                f"Lyria sidecar exited before becoming ready "
+                f"(rc={proc.returncode}). See {SIDECAR_LOG_PATH}."
+            )
+        time.sleep(PORT_POLL_INTERVAL_SEC)
+    raise RuntimeError(
+        f"Lyria sidecar didn't open port {cfg.port} within "
+        f"{int(PORT_READY_TIMEOUT_SEC)}s -- likely an npm-install or "
+        f"server startup hang. See {SIDECAR_LOG_PATH}."
+    )
 
 
 def stop() -> bool:
     """Terminate the sidecar if we spawned it. Returns True if we actually
-    stopped a live process."""
-    global _proc, _resolved_url
+    stopped a live process.
+
+    Always sets _stop_requested BEFORE the "_proc is None" early return:
+    called while ensure_running() is mid-install or mid-Popen, _proc doesn't
+    exist yet, so this function alone has nothing to terminate -- without the
+    flag, the in-flight spawn would complete moments later into an orphaned
+    Node process holding the port that nothing is left tracking (item 1).
+
+    _proc is cleared to None BEFORE the process is actually dead (the kill
+    itself can take up to _STOPPING_WAIT_TIMEOUT_SEC and must not hold
+    _state_lock -- see _terminate_proc). _stopping is set INSIDE the same
+    _state_lock section that clears _proc (round-4 item 1) -- not after
+    releasing the lock -- so there is no window where a concurrent reader
+    could observe _proc already None but _stopping still clear. It stays set
+    for the whole teardown so a concurrent ensure_running() waits it out
+    (_wait_while_stopping) instead of adopting a server that answers now but
+    is about to exit (item 5)."""
+    global _proc, _resolved_url, _stop_requested
     with _state_lock:
+        _stop_requested = True
         if _proc is None:
             return False
         if _proc.poll() is not None:
             _proc = None
             return False
-        try:
-            if sys.platform == "win32":
-                # npm.cmd is a shim: terminate() kills the cmd wrapper and
-                # leaves the node child listening. Kill the whole tree.
-                subprocess.call(
-                    ["taskkill", "/PID", str(_proc.pid), "/T", "/F"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    env=child_env(),
-                )
-                _proc.wait(timeout=5.0)
-            else:
-                _proc.terminate()
-                _proc.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            _proc.kill()
-            try:
-                # Reap the killed child so it doesn't linger as a zombie until
-                # interpreter shutdown (POSIX).
-                _proc.wait(timeout=5.0)
-            except (subprocess.TimeoutExpired, OSError):
-                pass
-        finally:
-            _proc = None
-            _resolved_url = None
-        return True
+        proc, _proc, _resolved_url = _proc, None, None
+        _stopping.set()
+    try:
+        _terminate_proc(proc)
+    finally:
+        _stopping.clear()
+    return True

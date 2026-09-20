@@ -21,6 +21,7 @@ import { createVstSessionRegistry } from './sessionRegistry.ts';
 import type { VstBridgeClientOptions } from './bridgeClient.ts';
 import { useVstLiveStore } from '../../state/vstLiveStore.ts';
 import type { ChainEntry } from '../../state/effectChainStore.ts';
+import { setLoadedVstEntryLookup } from '../vstStateStorage.ts';
 
 /* ── fakes ─────────────────────────────────────────────────────────────────── */
 
@@ -369,12 +370,12 @@ const liveEntries = () => useVstLiveStore.getState().entries;
     channels_out: 2,
     has_editor: false,
     state_compat: false,
-    warnings: ['saved state rejected by the plugin'],
+    warnings: ['the state file was not restored: the plugin rejected it'],
   });
   assert.equal(liveEntries().broken.stateOrigin, 'state-rejected');
   assert.equal(
     liveEntries().broken.stateReason,
-    'saved state rejected by the plugin',
+    'the state file was not restored: the plugin rejected it',
     "the host's own words reach the row",
   );
 }
@@ -402,9 +403,9 @@ const liveEntries = () => useVstLiveStore.getState().entries;
   // non-fatal `error`/`warning` on the socket.
   const { registry } = setup();
   await registry.acquire(entry('late'), 48000);
-  FakeClient.made[0].opts.handlers.onWarning!('set_state: component state too short');
+  FakeClient.made[0].opts.handlers.onWarning!('the plugin rejected the state blob');
   assert.equal(liveEntries().late.stateOrigin, 'state-rejected');
-  assert.equal(liveEntries().late.stateReason, 'set_state: component state too short');
+  assert.equal(liveEntries().late.stateReason, 'the plugin rejected the state blob');
 }
 {
   const { registry } = setup();
@@ -440,14 +441,33 @@ const liveEntries = () => useVstLiveStore.getState().entries;
   const s = await registry.acquire(entry('e1'), 48000);
   assert.ok(s);
   assert.equal(s.stateDirty, false, 'a fresh session has nothing uncaptured');
+  assert.equal(s.userMovedOnRejectedState, false, 'and nothing the user touched yet either');
   registry.markParamsChanged('e1');
   assert.equal(registry.get('e1')?.stateDirty, true, 'a parameter push marks it for the next capture');
+  assert.equal(
+    registry.get('e1')?.userMovedOnRejectedState,
+    false,
+    'a plain rebuild-shaped push (markParamsChanged) must NOT look like a user gesture (T18 fifth audit, CRITICAL 1)',
+  );
   registry.markParamsChanged('nobody'); // an entry with no session is a no-op
   assert.deepEqual(
     registry.sessions().map((x) => x.entryId),
     ['e1'],
     'the capture pass can enumerate what is running',
   );
+}
+
+/* ── markUserParamsChanged is what a GENUINE user gesture calls (a
+   liveParamSink push, or a knob moved in the plugin's own editor window) —
+   it marks both flags, unlike markParamsChanged above ─────────────────────── */
+{
+  const { registry } = setup();
+  const s = await registry.acquire(entry('e1'), 48000);
+  assert.ok(s);
+  registry.markUserParamsChanged('e1');
+  assert.equal(registry.get('e1')?.stateDirty, true, 'still marks the session stale for the next capture');
+  assert.equal(registry.get('e1')?.userMovedOnRejectedState, true, 'AND records that it was the user');
+  registry.markUserParamsChanged('nobody'); // an entry with no session is a no-op
 }
 
 /* ── closing a session keeps the state the host wrote on its way out ───────── */
@@ -473,6 +493,197 @@ const liveEntries = () => useVstLiveStore.getState().entries;
   // before removing the entry — or closing the project — was simply lost.
   await new Promise((r) => setTimeout(r, 0));
   assert.deepEqual(captured, [{ entryId: 'e1', rawState: 'ZmluYWw=' }], 'the shutdown state reaches the entry');
+}
+
+/** Build a registry wired the same way as the block above, but with its own
+ *  `captured` sink so each rejection-guard scenario starts clean. */
+function setupWithStateSink(graceMs = 1000) {
+  const captured: { entryId: string; rawState: string }[] = [];
+  FakeClient.made = [];
+  useVstLiveStore.setState({ entries: {}, host: { available: null } });
+  const backend = new FakeBackend();
+  const clock = new FakeClock();
+  (globalThis as { fetch: unknown }).fetch = backend.fetch;
+  const registry = createVstSessionRegistry({
+    schedule: clock.schedule,
+    cancel: clock.cancel,
+    graceMs,
+    makeClient: (opts) => new FakeClient(opts) as never,
+    stateSink: (entryId, rawState) => captured.push({ entryId, rawState }),
+  });
+  return { captured, backend, clock, registry };
+}
+
+const rejectReady = {
+  protocol: 1,
+  plugin: { name: 'p', vendor: 'v', version: '1', category: 'Fx', identifier: 'id', format: 'VST3' },
+  latency_samples: 0,
+  tail_seconds: 0,
+  sample_rate: 48000,
+  block_size: 512,
+  channels_in: 2,
+  channels_out: 2,
+  has_editor: false,
+  state_compat: false,
+  warnings: ['the state file was not restored: the plugin rejected it'],
+};
+
+/* ── shutdown's DELETE rescue must NOT overwrite a state the host refused
+   (T18 fifth audit, CRITICAL 2): `clearEntry` wipes the row BEFORE the DELETE
+   resolves, so the guard has to be snapshotted before that happens, not read
+   from the store afterward ─────────────────────────────────────────────────── */
+{
+  const { captured, registry } = setupWithStateSink();
+  await registry.acquire(entry('e1'), 48000);
+  FakeClient.made[0].opts.handlers.onReady!(rejectReady);
+  assert.equal(liveEntries().e1.stateOrigin, 'state-rejected', 'precondition: the row already knows');
+
+  registry.close('e1'); // shutdown()
+  await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual(captured, [], 'the DELETE state is the plugin\'s untouched defaults, and must not land');
+}
+
+/* ── ...but once the user HAS moved something on the defaulted plugin, the
+   shutdown rescue keeps it, same rule `sinkLiveRawState` applies ──────────── */
+{
+  const { captured, registry } = setupWithStateSink();
+  await registry.acquire(entry('e1'), 48000);
+  FakeClient.made[0].opts.handlers.onReady!(rejectReady);
+  registry.markUserParamsChanged('e1');
+  assert.equal(registry.get('e1')?.userMovedOnRejectedState, true, 'precondition');
+
+  registry.close('e1');
+  await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual(
+    captured,
+    [{ entryId: 'e1', rawState: 'ZmluYWw=' }],
+    "the user's own edit on the defaulted plugin is not lost",
+  );
+}
+
+/* ── closeAll (project close / page unload) applies the SAME guard ─────────── */
+{
+  const { captured, registry } = setupWithStateSink();
+  await registry.acquire(entry('e1'), 48000);
+  FakeClient.made[0].opts.handlers.onReady!(rejectReady);
+  registry.closeAll();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual(captured, [], 'closeAll must not overwrite a rejected row nobody touched either');
+}
+
+/* ── T18 sixth audit, CRITICAL 1: a late `restored()` delivery marks the
+   session `stateSent`, and the rejection recorders must gate on THAT, not on
+   `slot.entry.vst?.raw_state` -- which stays `undefined` for a session that
+   was spawned with nothing and only got a state later. `restored()` itself
+   lives in vstEditorStore and is exercised there
+   (vstEditorStore.unreadableRetry.test.ts); this pins the registry side of
+   the contract: with `stateSent` false, a refusal is NOT recorded, and once
+   something has been marked `stateSent` (as `restored()` does before it
+   calls `client.setState`), the SAME refusal IS recorded. ────────────────── */
+{
+  const { registry } = setup();
+  // Spawned with nothing: the entry never had a saved state, so this session
+  // starts with stateSent === false, same as a late-`restored()` candidate
+  // before its retry lands.
+  const s = await registry.acquire(entry('lateArrival', { vst: { plugin_path: 'p.vst3', plugin_name: 'p' } }), 48000);
+  assert.ok(s);
+  assert.equal(s.stateSent, false, 'nothing has been handed to this plugin yet');
+
+  // The host refuses on ready anyway (a stray/unrelated event) -- must not be
+  // recorded, because nothing was ever sent for it to refuse.
+  FakeClient.made[0].opts.handlers.onReady!({
+    protocol: 1,
+    plugin: { name: 'p', vendor: 'v', version: '1', category: 'Fx', identifier: 'id', format: 'VST3' },
+    latency_samples: 0,
+    tail_seconds: 0,
+    sample_rate: 48000,
+    block_size: 512,
+    channels_in: 2,
+    channels_out: 2,
+    has_editor: false,
+    state_compat: false,
+    warnings: ['the state file was not restored: the plugin rejected it'],
+  });
+  assert.equal(
+    liveEntries().lateArrival.stateOrigin,
+    'live',
+    'nothing was sent, so there is nothing to have been rejected',
+  );
+
+  // `restored()`'s retry marks the session BEFORE it calls setState.
+  s.stateSent = true;
+  FakeClient.made[0].opts.handlers.onWarning!('the plugin rejected the state blob');
+  assert.equal(
+    liveEntries().lateArrival.stateOrigin,
+    'state-rejected',
+    'the SAME session, now marked stateSent, has the refusal recorded',
+  );
+  assert.equal(liveEntries().lateArrival.stateReason, 'the plugin rejected the state blob');
+}
+
+/* ── T18 sixth audit, MAJOR 2: `state_compat: false` alone is a round-trip
+   ADVISORY, not a restore failure, and its warning text must not be read as
+   one either -- the plugin's restore actually SUCCEEDED here. ────────────── */
+{
+  const { registry } = setup();
+  await registry.acquire(entry('roundtrip'), 48000);
+  FakeClient.made[0].opts.handlers.onReady!({
+    protocol: 1,
+    plugin: { name: 'p', vendor: 'v', version: '1', category: 'Fx', identifier: 'id', format: 'VST3' },
+    latency_samples: 0,
+    tail_seconds: 0,
+    sample_rate: 48000,
+    block_size: 512,
+    channels_in: 2,
+    channels_out: 2,
+    has_editor: false,
+    state_compat: false,
+    warnings: [
+      "this plugin does not reliably round-trip its own state, so its live state is kept separately from the one the offline renderer uses",
+    ],
+  });
+  assert.equal(
+    liveEntries().roundtrip.stateOrigin,
+    'live',
+    'a round-trip-compatibility advisory is not a restore refusal',
+  );
+}
+
+/* ── T18 sixth audit, MINOR 3: `recreate()` must re-read the entry instead of
+   respawning from a stale `slot.entry`. With the transport stopped nothing
+   calls `ensure()`, so `slot.entry` still carries the entry as it was at
+   `acquire()` time -- a capture that landed since then updated the ENTRY
+   (via `loadedVstEntry`'s backing store) but not this stale snapshot.
+   `recreate()` must re-read through `loadedVstEntry` and reset both
+   `stateOrigin` and the new session's `stateSent` to match what it actually
+   just spawned with, not keep claiming 'live' over a process handed the OLD
+   blob ─────────────────────────────────────────────────────────────────── */
+{
+  const { registry, backend } = setup();
+  const acquired = entry('stale', { vst: { plugin_path: 'p.vst3', plugin_name: 'p', raw_state: 'T0xE' } });
+  const s = await registry.acquire(acquired, 48000);
+  assert.ok(s);
+  const onStatus = FakeClient.made[0].opts.handlers.onStatus!;
+
+  // A capture landed since acquire(): the backing store now holds a NEWER
+  // blob than what `slot.entry` was built from, exactly like a socket loss
+  // with the transport stopped and no rebuild in between.
+  setLoadedVstEntryLookup((id) =>
+    id === 'stale' ? entry('stale', { vst: { plugin_path: 'p.vst3', plugin_name: 'p', raw_state: 'TkVX' } }) : undefined,
+  );
+
+  onStatus('error', 'socket closed (1006)'); // trigger recreate(slot)
+  await new Promise((r) => setTimeout(r, 0));
+  setLoadedVstEntryLookup(() => undefined); // don't leak into later tests
+
+  const post = backend.calls.filter((c) => c.url === '/api/vst/live/session' && c.method === 'POST').at(-1);
+  assert.equal(
+    (post?.body as { raw_state?: string }).raw_state,
+    'TkVX',
+    "recreate() respawns with the FRESHLY-READ entry's raw_state, not the acquire()-time snapshot",
+  );
+  assert.equal(liveEntries().stale.stateOrigin, 'live', 'the row matches what was actually just spawned with');
+  assert.equal(registry.get('stale')?.stateSent, true, "the new session's stateSent reflects the fresh blob it was sent");
 }
 
 console.log('vstLive/sessionRegistry: ok');

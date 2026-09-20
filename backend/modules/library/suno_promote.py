@@ -119,9 +119,10 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterator, Optional, Sequence
+from typing import Any, Callable, Iterator, Optional, Sequence, Union
 
 from . import suno_stage
+from .db import _MAX_SQL_PARAMS
 from .store import (
     LibraryRecord,
     LibraryStore,
@@ -953,7 +954,281 @@ def stage_report(stage_root: Path) -> dict[str, Any]:
     return payload
 
 
-def _validate_roots(stage_root: Path, store: LibraryStore) -> tuple[Path, Path, str]:
+#: Matches ``LibraryStore.__init__``'s own default (``store.py``). Not
+#: importable as a constant from there; kept as one literal, here, so a dry
+#: run's read-only reader looks at the exact same file a real run would open.
+_LIBRARY_DB_FILENAME = "library.db"
+_LIBRARY_DEFAULT_API_PREFIX = "/api/library"
+
+
+#: Raised for a ``library.db`` an old schema cannot answer a read-only
+#: query with (missing column/table this codebase's version expects) --
+#: only a real, writable open runs the migration that would fix it. Item 5.
+_SCHEMA_REFUSAL = "{path} needs a real open to migrate first: {exc}"
+
+#: A ``sqlite3.OperationalError`` message fragment meaning "this file has no
+#: schema yet, not that it's broken" -- a missing table (never migrated) or
+#: an empty/0-byte file (which SQLite's ``immutable=1`` reads as a valid,
+#: empty database with no ``entries`` table at all). Follow-up item 4: a
+#: real, writable ``LibraryDB`` would treat either the same way -- as a
+#: fresh database to initialize on first write -- not as something broken.
+_EMPTY_DB_MESSAGES = ("no such table",)
+
+
+def _is_unc_root(path: Path) -> bool:
+    """UNC roots (``\\\\server\\share\\...``) are refused for a dry run's
+    read-only open (follow-up item 1): checked before any filesystem access
+    at all, so the refusal is the same whether or not a ``library.db``
+    exists there, and a possibly slow/unreachable network stat is never
+    attempted for a path being refused either way."""
+    return path.resolve().drive.startswith("\\\\")
+
+
+class _ReadOnlyEntrySummaries:
+    """Read-only stand-in for ``LibraryDB.entries_summary_for`` (L1).
+
+    Opens ``library.db`` through :func:`suno_stage.read_only_sqlite_uri` --
+    the same guarantee :func:`suno_stage.open_promotion_db` already gives the
+    staging side of a dry run -- so a ``--dry-run`` promotion can never
+    create, migrate, or otherwise write to the real library's database, and
+    never leaves fresh ``-wal``/``-shm`` sidecars behind either.
+
+    The query mirrors ``LibraryDB.entries_summary_for`` exactly -- it is the
+    only entry point ``promote_stage`` reads through during a dry run -- but
+    is not the same class, so opening it never runs a schema migration or an
+    auto-reindex against the live database file.
+
+    Item 4: a missing OR empty ``library.db`` does not mean the library is
+    empty -- a real, writable ``LibraryStore`` auto-reindexes from disk in
+    exactly that situation (``store.py``'s own ``__init__``). Falling back to
+    "everything is new" here would make a dry run's counts lie whenever
+    someone deleted ``library.db`` (or it was never created) but the entry
+    folders are still on disk. ``entries_summary_for`` mirrors that read,
+    straight off each entry's ``metadata.json``, without writing anything.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.path = root / _LIBRARY_DB_FILENAME
+        self._connection: Optional[sqlite3.Connection] = None
+        self._disk_fallback = True
+        #: Follow-up item 2: whether this open used ``immutable=1`` (no
+        #: ``-wal`` sidecar existed yet). Only then can a writer showing up
+        #: mid-dry-run matter -- see :meth:`refuse_if_changed_since_open`.
+        self._opened_immutable = False
+        #: Follow-up item 4: set when ``library.db`` exists but has no
+        #: schema yet (0 bytes, or truly never migrated) -- reported,
+        #: not refused.
+        self.empty_reason: Optional[str] = None
+        # Follow-up item 1: the UNC check runs before ANY filesystem access,
+        # so a UNC root refuses the same way whether or not a library.db
+        # exists there yet, and a possibly slow/unreachable network stat is
+        # never attempted for a path being refused either way.
+        if _is_unc_root(root):
+            raise PromotionRefused(
+                f"UNC path not supported for a read-only open: {root}"
+            )
+        if not self.path.is_file():
+            return
+        try:
+            uri = suno_stage.read_only_sqlite_uri(self.path)
+        except ValueError as exc:
+            raise PromotionRefused(str(exc)) from exc
+        self._opened_immutable = "immutable=1" in uri
+        connection = sqlite3.connect(uri, uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            count = int(
+                connection.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+            )
+        except sqlite3.OperationalError as exc:
+            connection.close()
+            if any(fragment in str(exc).lower() for fragment in _EMPTY_DB_MESSAGES):
+                self.empty_reason = (
+                    f"{self.path.name} is empty; a real run will create it"
+                )
+                return
+            raise PromotionRefused(
+                _SCHEMA_REFUSAL.format(path=self.path, exc=exc)
+            ) from exc
+        except sqlite3.DatabaseError as exc:
+            # sqlite3.DatabaseError (NOT a sqlite3.OperationalError) is what
+            # an actually corrupt file -- garbage bytes, not simply empty --
+            # raises. Not covered by follow-up item 4 (that is specifically
+            # the 0-byte/never-migrated case, caught above): refuse rather
+            # than silently treat corruption as "everything is new".
+            connection.close()
+            raise PromotionRefused(
+                _SCHEMA_REFUSAL.format(path=self.path, exc=exc)
+            ) from exc
+        self._connection = connection
+        self._disk_fallback = count == 0
+
+    def close(self) -> None:
+        if self._connection is not None:
+            self._connection.close()
+
+    def refuse_if_changed_since_open(self) -> None:
+        """Follow-up item 2: an ``immutable=1`` read assumes the file will
+        not change out from under it -- never true (it only ever helps a
+        dry run avoid leaving sidecars), but never harmful to the live
+        database either. If a writer showed up mid-dry-run, though, an
+        immutable reader could have read torn pages: if a ``-wal`` sidecar
+        exists now where none did when this reader opened, the counts this
+        run collected cannot be trusted. Called once, at the very end of a
+        dry run.
+        """
+        if not self._opened_immutable:
+            return
+        wal_sidecar = self.path.with_name(self.path.name + "-wal")
+        if wal_sidecar.is_file():
+            raise PromotionRefused("library changed during the dry run; run it again")
+
+    def count_entries(self) -> int:
+        if self._connection is None:
+            return 0
+        return int(
+            self._connection.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+        )
+
+    def entries_summary_for(
+        self,
+        entry_ids: Sequence[str],
+        *,
+        json_keys: Sequence[str] = (),
+    ) -> dict[str, dict[str, Any]]:
+        ids = [str(entry_id) for entry_id in entry_ids]
+        if not ids:
+            return {}
+        if self._disk_fallback:
+            return self._disk_summary_for(ids, json_keys)
+        assert self._connection is not None
+        paths = [str(key) for key in json_keys]
+        projection = "".join(
+            f", CASE WHEN json_valid(metadata_json)"
+            f" THEN json_extract(metadata_json, ?) END AS j{index}"
+            for index in range(len(paths))
+        )
+        out: dict[str, dict[str, Any]] = {}
+        cur = self._connection.cursor()
+        try:
+            for start in range(0, len(ids), _MAX_SQL_PARAMS - len(paths)):
+                chunk = ids[start : start + (_MAX_SQL_PARAMS - len(paths))]
+                marks = ", ".join("?" * len(chunk))
+                rows = cur.execute(
+                    f"SELECT id, title, favorite, rating, notes, source,"
+                    f" timestamp{projection} FROM entries WHERE id IN ({marks})",
+                    [*paths, *chunk],
+                ).fetchall()
+                for row in rows:
+                    summary = {
+                        "id": str(row["id"]),
+                        "title": row["title"],
+                        "favorite": bool(row["favorite"]),
+                        "rating": row["rating"],
+                        "notes": row["notes"],
+                        "source": row["source"],
+                        "timestamp": row["timestamp"],
+                    }
+                    for index, key in enumerate(paths):
+                        summary[key] = row[f"j{index}"]
+                    out[summary["id"]] = summary
+        except sqlite3.OperationalError as exc:
+            raise PromotionRefused(
+                _SCHEMA_REFUSAL.format(path=self.path, exc=exc)
+            ) from exc
+        finally:
+            cur.close()
+        return out
+
+    def _disk_summary_for(
+        self, ids: Sequence[str], json_keys: Sequence[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Item 4's fallback: read each entry's ``metadata.json`` straight off
+        disk, mirroring what ``LibraryStore.reindex()`` would put in the DB,
+        without writing anything. Every caller only ever asks for simple
+        top-level keys (``"$.suno_revision"``); a compound path just resolves
+        to ``None``, same as the SQL projection does for a key the row does
+        not have."""
+        out: dict[str, dict[str, Any]] = {}
+        for entry_id in ids:
+            meta = _read_metadata(self.root / entry_id)
+            if meta is None:
+                continue
+            summary: dict[str, Any] = {
+                "id": entry_id,
+                "title": meta.get("title"),
+                "favorite": bool(meta.get("favorite", False)),
+                "rating": meta.get("rating"),
+                "notes": meta.get("notes"),
+                "source": meta.get("source"),
+                "timestamp": meta.get("timestamp"),
+            }
+            for key in json_keys:
+                path = str(key)
+                summary[path] = meta.get(path[2:]) if path.startswith("$.") else None
+            out[entry_id] = summary
+        return out
+
+
+class ReadOnlyLibraryTarget:
+    """Everything ``promote_stage`` reads from ``store`` during a dry run.
+
+    Stands in for :class:`~backend.modules.library.store.LibraryStore`
+    without ever instantiating it: constructing a real ``LibraryStore``
+    unconditionally ``mkdir``s the library root and, on an empty database,
+    auto-reindexes -- both writes a ``--dry-run`` must not perform against a
+    library it may not even be pointed at correctly yet. See L1.
+    """
+
+    def __init__(
+        self, root: Path, *, api_prefix: str = _LIBRARY_DEFAULT_API_PREFIX
+    ) -> None:
+        self.root = root
+        self.api_prefix = api_prefix
+        self.db = _ReadOnlyEntrySummaries(root)
+
+    def close(self) -> None:
+        self.db.close()
+
+
+#: What ``promote_stage`` and its helpers accept for ``store``: a real,
+#: writable target for a live run, or the read-only stand-in a dry run opens.
+PromotionTarget = Union[LibraryStore, ReadOnlyLibraryTarget]
+
+
+def open_promotion_target(
+    root: Path, *, dry_run: bool, api_prefix: str = _LIBRARY_DEFAULT_API_PREFIX
+) -> PromotionTarget:
+    """Open the library ``promote_stage`` writes into (or, for a dry run,
+    only reads from).
+
+    ``dry_run=True`` returns a :class:`ReadOnlyLibraryTarget`: ``library.db``
+    is opened ``mode=ro`` and the library folder is never created. Anything
+    else returns a real, writable :class:`LibraryStore`.
+    """
+    if dry_run:
+        return ReadOnlyLibraryTarget(Path(root), api_prefix=api_prefix)
+    return LibraryStore(Path(root))
+
+
+def _existing_ancestor(path: Path) -> Path:
+    """The nearest of ``path`` or one of its parents that already exists.
+
+    ``shutil.disk_usage`` needs a real path; a dry run's target may not have
+    one yet (see :class:`ReadOnlyLibraryTarget`, L1), and creating it just to
+    measure free space would defeat the point.
+    """
+    current = path
+    while not current.exists():
+        parent = current.parent
+        if parent == current:  # reached a filesystem root; give up climbing
+            break
+        current = parent
+    return current
+
+
+def _validate_roots(stage_root: Path, store: PromotionTarget) -> tuple[Path, Path, str]:
     if store.db is None:
         raise PromotionRefused("promotion needs the library DB")
     root = store.root.resolve()
@@ -976,7 +1251,7 @@ def _validate_roots(stage_root: Path, store: LibraryStore) -> tuple[Path, Path, 
 
 def promote_stage(
     stage_root: Path,
-    store: LibraryStore,
+    store: PromotionTarget,
     *,
     batch_size: int = DEFAULT_BATCH_SIZE,
     dry_run: bool = False,
@@ -1002,6 +1277,10 @@ def promote_stage(
         dry_run=bool(dry_run),
         batch_size=int(batch_size),
     )
+    if isinstance(store, ReadOnlyLibraryTarget) and store.db.empty_reason:
+        # Follow-up item 4: reported, not refused -- a real run treats this
+        # the same as any other fresh database.
+        report.errors.append(store.db.empty_reason)
     try:
         connection = suno_stage.open_promotion_db(stage, read_only=dry_run)
     except suno_stage.StagingDatabaseError as exc:
@@ -1015,7 +1294,19 @@ def promote_stage(
         _per_entry, report.estimated_bytes = estimate_promotion_bytes(
             connection, pending
         )
-        report.free_bytes = int(shutil.disk_usage(root).free)
+        # L1: a dry run against a library that does not exist yet must not
+        # create it just to measure free space; walk up to whatever ancestor
+        # is actually on disk (real runs always find ``root`` itself here,
+        # since a writable LibraryStore already created it).
+        try:
+            report.free_bytes = int(shutil.disk_usage(_existing_ancestor(root)).free)
+        except OSError as exc:
+            # Item 6: a drive that does not exist at all (``Q:\lib``) has no
+            # existing ancestor to climb to; refuse cleanly instead of
+            # crashing inside shutil.
+            raise PromotionRefused(
+                f"cannot measure free space at {root}: {exc}"
+            ) from exc
         if report.estimated_bytes > report.free_bytes:
             message = (
                 f"{root} has {report.free_bytes:,} bytes free; promoting "
@@ -1031,6 +1322,13 @@ def promote_stage(
             taken = backup_library_db(store)
             report.backup_path = str(taken) if taken is not None else None
 
+        # L2: asset ids this run resolves to a non-deferred outcome, tracked
+        # separately from the staging ``promotions`` table because a dry run
+        # never writes a receipt there. Without it, the lineage pass below
+        # would call every parent staged (and promotable) in THIS SAME run
+        # "unresolved" just because no earlier run had promoted it yet.
+        run_resolved: set[str] = set()
+
         _promote_assets(
             connection,
             store,
@@ -1040,18 +1338,25 @@ def promote_stage(
             started=started,
             on_batch=on_batch,
             should_stop=should_stop,
+            run_resolved=run_resolved,
         )
         if report.status == "complete":
-            _promote_lineage(connection, store, report)
+            _promote_lineage(connection, store, report, run_resolved=run_resolved)
     finally:
         connection.close()
         report.elapsed_seconds = max(0.0, time.perf_counter() - started)
+    if dry_run and isinstance(store, ReadOnlyLibraryTarget):
+        # Follow-up item 2: only meaningful now, at the very end -- checked
+        # once, after every read this run did, so a writer that appeared
+        # and vanished mid-run (or is still mid-transaction) is still
+        # caught by the -wal sidecar it leaves behind either way.
+        store.db.refuse_if_changed_since_open()
     return report
 
 
 def _promote_assets(
     connection: sqlite3.Connection,
-    store: LibraryStore,
+    store: PromotionTarget,
     report: PromotionReport,
     *,
     root: Path,
@@ -1059,6 +1364,7 @@ def _promote_assets(
     started: float,
     on_batch: Optional[Callable[[PromotionProgress], None]],
     should_stop: Optional[Callable[[], bool]],
+    run_resolved: set[str],
 ) -> None:
     api_prefix = store.api_prefix
     cursor = ""
@@ -1078,6 +1384,7 @@ def _promote_assets(
             root=root,
             root_normcase=root_normcase,
             api_prefix=api_prefix,
+            run_resolved=run_resolved,
         )
         if on_batch is not None:
             on_batch(report.progress(started, report.total_staged))
@@ -1085,13 +1392,14 @@ def _promote_assets(
 
 def _promote_page(
     connection: sqlite3.Connection,
-    store: LibraryStore,
+    store: PromotionTarget,
     report: PromotionReport,
     page: list[StagedAsset],
     *,
     root: Path,
     root_normcase: str,
     api_prefix: str,
+    run_resolved: set[str],
 ) -> None:
     report.seen += len(page)
     asset_ids = [asset.id for asset in page]
@@ -1240,6 +1548,15 @@ def _promote_page(
             report.created += 1
             receipts_out.append((asset.id, asset.content_hash, entry_id, "created"))
 
+    # L2: every id this page resolves to something other than "no media" is
+    # promotable, whether or not the receipt below actually gets written --
+    # a dry run needs the lineage pass to see it too.
+    run_resolved.update(
+        asset_id
+        for asset_id, _content_hash, _entry_id, outcome in receipts_out
+        if outcome != "deferred_no_media"
+    )
+
     if report.dry_run:
         return
     if payloads:
@@ -1257,9 +1574,10 @@ def _promote_page(
 
 def _promote_lineage(
     connection: sqlite3.Connection,
-    store: LibraryStore,
+    store: PromotionTarget,
     report: PromotionReport,
     *,
+    run_resolved: set[str],
     page_size: int = 2000,
 ) -> None:
     """Turn staged lineage hints into typed relations, once every entry exists.
@@ -1301,7 +1619,7 @@ def _promote_lineage(
         parents = {
             (str(row["namespace"]), str(row["parent_external_id"])) for row in rows
         }
-        promoted = _promoted_parents(connection, sorted(parents))
+        promoted = _promoted_parents(connection, sorted(parents), run_resolved)
         edges: list[tuple[str, str, str]] = []
         for row in rows:
             namespace = str(row["namespace"])
@@ -1320,13 +1638,21 @@ def _promote_lineage(
 
 
 def _promoted_parents(
-    connection: sqlite3.Connection, parents: Sequence[tuple[str, str]]
+    connection: sqlite3.Connection,
+    parents: Sequence[tuple[str, str]],
+    run_resolved: set[str],
 ) -> set[tuple[str, str]]:
     """Which of these ``(namespace, provider id)`` parents are in the library.
 
     ``promotions`` is the authority rather than ``staged_assets``: a parent
     that is staged but was deferred for having no media has no entry to point
     at, and its child's edge has to stay an external label.
+
+    L2: ``promotions`` alone is not the whole story during a dry run, which
+    never writes a receipt there. ``run_resolved`` (built while THIS run
+    processed its asset pages) fills that gap so a parent staged and
+    resolved earlier in the very same run is not reported unresolved just
+    because nothing was persisted for it.
     """
     found: set[tuple[str, str]] = set()
     if not parents:
@@ -1335,6 +1661,9 @@ def _promoted_parents(
         suno_stage.asset_id(namespace, external): (namespace, external)
         for namespace, external in parents
     }
+    for candidate_id, pair in asset_ids.items():
+        if candidate_id in run_resolved:
+            found.add(pair)
     keys = list(asset_ids)
     try:
         for start in range(0, len(keys), 900):
@@ -1346,8 +1675,16 @@ def _promoted_parents(
                 chunk,
             ):
                 found.add(asset_ids[str(row[0])])
-    except sqlite3.OperationalError:
-        return set()
+    except sqlite3.OperationalError as exc:
+        # Item 3: only an actually missing ``promotions`` table (nothing has
+        # ever been promoted for real against this stage) is not an error --
+        # anything else ("database is locked", a corrupt index, ...) must not
+        # be swallowed into "this parent is unresolved", which would silently
+        # turn a real edge into a permanent external-label one. ``found`` may
+        # already hold this run's own matches from ``run_resolved`` above;
+        # keep them rather than discarding on the benign path.
+        if "no such table" not in str(exc).lower():
+            raise
     return found
 
 
@@ -1512,10 +1849,24 @@ def run_promote_job(
         job.finish("cancelled")
         return job
     job.begin()
+    target: Optional[PromotionTarget] = None
     try:
+        # Item 8: the caller (the shared app-wide store from get_store())
+        # always hands us a real, writable LibraryStore -- it is live and
+        # shared, used for everything else the app does, and never closed
+        # here. A dry run must still never read through ITS connection
+        # either: swap in a read-only target against the same root, exactly
+        # like the CLI's own dry run does, and leave ``store`` untouched.
+        # Constructing it can itself refuse (a UNC root, an old schema);
+        # that belongs in this same try so the job reports it, not raises.
+        target = (
+            open_promotion_target(store.root, dry_run=True, api_prefix=store.api_prefix)
+            if dry_run
+            else store
+        )
         report = promote_stage(
             Path(stage_root),
-            store,
+            target,
             batch_size=batch_size,
             dry_run=dry_run,
             on_batch=job.note_promotion,
@@ -1540,6 +1891,9 @@ def run_promote_job(
     except Exception as exc:  # noqa: BLE001 - a job reports, it does not raise
         log.warning("library.suno_promote: promote job %s failed: %s", job.id, exc)
         job.finish("failed", error=repr(exc))
+    finally:
+        if dry_run and isinstance(target, ReadOnlyLibraryTarget):
+            target.close()
     return job
 
 

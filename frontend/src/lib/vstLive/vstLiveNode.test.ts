@@ -126,6 +126,8 @@ class FakeRegistry implements VstSessionRegistry {
       pid: 1,
       client: client as never,
       stateDirty: false,
+      userMovedOnRejectedState: false,
+      stateSent: true,
     };
   }
   /** A session whose client can take a MessagePort — a worker-backed one. */
@@ -169,6 +171,13 @@ class FakeRegistry implements VstSessionRegistry {
   markParamsChanged(entryId: string): void {
     this.paramsChanged.push(entryId);
     if (this.give) this.give.stateDirty = true;
+  }
+  markUserParamsChanged(entryId: string): void {
+    this.paramsChanged.push(entryId);
+    if (this.give) {
+      this.give.stateDirty = true;
+      this.give.userMovedOnRejectedState = true;
+    }
   }
 }
 

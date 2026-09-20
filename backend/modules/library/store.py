@@ -41,6 +41,15 @@ log = logging.getLogger(__name__)
 #: drive would otherwise return 200,000 strings.
 MAX_IMPORT_ERRORS = 50
 
+#: Ceiling on how many new/changed entries a single :meth:`LibraryStore.reindex`
+#: call may enqueue for background analysis. Above this, NONE are enqueued --
+#: the user's rule is never to mass re-analyze, and a lost or empty DB next to
+#: an existing 200,000-entry library would otherwise queue the whole thing the
+#: moment analysis is enabled once. This is also :meth:`reindex`'s default
+#: ``max_enqueue``, so a bare, uncapped call cannot happen by accident; the
+#: `/reindex` route imports this constant rather than defining its own.
+MAX_REINDEX_ANALYSIS_ENQUEUE = 500
+
 
 # Fields a frontend client is allowed to modify on an entry. Everything
 # else in metadata.json is owned by the backend (filenames, paths,
@@ -52,8 +61,22 @@ MAX_IMPORT_ERRORS = 50
 # from the Details / SING surfaces. The lyrics module mirrors the text of
 # `<entry>/lyrics.json` into it on every save, so it never diverges from
 # the timed document. Suno imports already carry it via `_flatten_suno_meta`.
+# `notation_artist` / `notation_title` are the DETAILS identity form's manual
+# overrides for the notation engine's artist/title guess (see
+# frontend/src/components/layout/DetailsView.tsx, `saveIdentity`) — the notation
+# routes (T08) and identity resolver (T09) read these off metadata.json.
 USER_MUTABLE_FIELDS: frozenset[str] = frozenset(
-    {"favorite", "rating", "tags", "notes", "title", "chimera_sources", "lyrics"}
+    {
+        "favorite",
+        "rating",
+        "tags",
+        "notes",
+        "title",
+        "chimera_sources",
+        "lyrics",
+        "notation_artist",
+        "notation_title",
+    }
 )
 
 
@@ -891,9 +914,19 @@ class LibraryStore:
                 db_path if isinstance(db_path, Path) else self.root / "library.db"
             )
             self.db = LibraryDB(resolved_db_path)
-            # Auto-reindex on a fresh DB so the query layer is hot.
+            # Auto-reindex on a fresh DB so the query layer is hot. This runs
+            # any time the DB is empty -- first boot, but also a lost,
+            # deleted, or rebuilt DB file next to a library that already has
+            # 200,000 entries on disk. With no stored rows every entry looks
+            # "new", so this must never enqueue analysis: that would queue
+            # the entire library the instant the app opens, not just what
+            # actually changed. reindex()'s own default is now False for
+            # exactly this reason (a bare call must never enqueue); passed
+            # explicitly here anyway so this call stays correct even if that
+            # default ever changes. A user wanting analysis on a manual
+            # reindex opts in via POST /reindex?analyze=true.
             if self.db.count_entries() == 0:
-                self.reindex()
+                self.reindex(enqueue_analysis=False)
 
         #: Entry ids whose missing cover art has already been looked for, so a
         #: track that simply has none costs one tag read per process rather
@@ -1138,6 +1171,10 @@ class LibraryStore:
             meta["notes"] = str(meta["notes"] or "")
         if "lyrics" in meta:
             meta["lyrics"] = str(meta["lyrics"] or "")
+        if "notation_artist" in meta:
+            meta["notation_artist"] = str(meta["notation_artist"] or "")
+        if "notation_title" in meta:
+            meta["notation_title"] = str(meta["notation_title"] or "")
         if "chimera_sources" in meta:
             raw = meta["chimera_sources"] or []
             if not isinstance(raw, list):
@@ -1667,7 +1704,14 @@ class LibraryStore:
                     e,
                 )
 
-    def reindex(self, *, batch: int = 1000) -> int:
+    def reindex(
+        self,
+        *,
+        batch: int = 1000,
+        enqueue_analysis: bool = False,
+        max_enqueue: Optional[int] = MAX_REINDEX_ANALYSIS_ENQUEUE,
+        report: Optional[dict[str, Any]] = None,
+    ) -> int:
         """Walk the filesystem and upsert every entry into the DB.
         Returns the number of entries indexed. Idempotent.
 
@@ -1675,6 +1719,37 @@ class LibraryStore:
         straight through) and one transaction per ``batch``. It used to read
         every file twice and commit once per entry, which on a 200,000-entry
         library is 400,000 reads and 200,000 fsyncs.
+
+        ``enqueue_analysis`` defaults to ``False``: a bare ``reindex()`` call
+        must never enqueue anything. A caller opts IN explicitly. When it is
+        ``True``, new or changed entries (by
+        :meth:`LibraryDB.new_or_changed_entry_ids`) are enqueued for
+        background analysis the same way import does (LIB-002) -- still
+        gated by the ``analysis.auto_on_import`` setting inside
+        :func:`_maybe_enqueue_analysis`, so opting in is still a no-op unless
+        the user also enabled that setting. An unchanged entry is never
+        re-enqueued, so re-running reindex over a stable library queues
+        nothing. Enqueuing happens only AFTER every batch has been upserted
+        (not per-batch), so it can be capped atomically across the whole
+        call.
+
+        ``max_enqueue`` (default :data:`MAX_REINDEX_ANALYSIS_ENQUEUE`) caps
+        how many new/changed entries may be enqueued in one call: if MORE
+        than that many changed, NONE are enqueued -- a mass re-analysis is
+        exactly what the "never mass re-analyze" rule forbids, so this fails
+        closed rather than queueing a partial batch. Pass ``max_enqueue=None``
+        to disable the cap entirely. Ids are stopped from accumulating in
+        memory once the running total exceeds the cap (the outcome is
+        already decided at that point), though the exact count is still
+        tracked for the report.
+
+        ``report``, when given, is filled in place with ``{'changed': int,
+        'enqueued': int, 'analysis_skipped': int}`` -- ``enqueued`` counts
+        only jobs :func:`_maybe_enqueue_analysis` actually handed to the
+        background queue, not every id it was offered -- so a caller
+        (``POST /api/library/reindex``) can report what happened without
+        changing this method's ``int`` return value, which existing callers
+        rely on.
         """
         if self.db is None:
             return 0
@@ -1682,19 +1757,49 @@ class LibraryStore:
         next_log = 5000
         payloads: list[dict[str, Any]] = []
         edges: list[tuple[str, str, str]] = []
+        all_changed_ids: list[str] = []
+        changed_count = 0
+
+        def flush() -> None:
+            nonlocal payloads, changed_count
+            if not payloads:
+                return
+            if enqueue_analysis:
+                batch_changed = self.db.new_or_changed_entry_ids(payloads)
+                changed_count += len(batch_changed)
+                if max_enqueue is None or changed_count <= max_enqueue:
+                    all_changed_ids.extend(batch_changed)
+                # else: already over the cap -- the whole run will be
+                # skipped, so stop growing the list; changed_count keeps
+                # counting for an accurate report.
+            self.db.upsert_entries_bulk(payloads, batch=len(payloads))
+            payloads = []
+
         for record, meta, _entry_dir in self._iter_disk_entries():
             payloads.append(_db_payload(record, meta))
             edges.extend(_chimera_edges(record.id, meta))
             count += 1
             if len(payloads) >= batch:
-                self.db.upsert_entries_bulk(payloads, batch=len(payloads))
-                payloads = []
+                flush()
             if count >= next_log:
                 log.info("library.store: reindexed %d entries", count)
                 next_log += 5000
-        if payloads:
-            self.db.upsert_entries_bulk(payloads, batch=len(payloads))
+        flush()
         self.db.add_relations_bulk(edges)
+
+        enqueued = 0
+        skipped = 0
+        if enqueue_analysis and changed_count:
+            if max_enqueue is not None and changed_count > max_enqueue:
+                skipped = changed_count
+            else:
+                for entry_id in all_changed_ids:
+                    if _maybe_enqueue_analysis(self, entry_id, source="import"):
+                        enqueued += 1
+        if report is not None:
+            report["changed"] = changed_count
+            report["enqueued"] = enqueued
+            report["analysis_skipped"] = skipped
         return count
 
     # ---- Helpers ------------------------------------------------------------
@@ -1722,33 +1827,37 @@ def _maybe_enqueue_analysis(
     entry_id: str,
     *,
     source: str,
-) -> None:
+) -> bool:
     """If feature settings have ``analysis.auto_on_<source>`` enabled,
     queue a background analysis job. Failures here never block the
     import / generate flow — analysis is opt-in enrichment.
 
-    ``source`` is either ``"import"`` or ``"generate"``.
+    ``source`` is either ``"import"`` or ``"generate"``. Returns ``True``
+    only when a job was actually handed to the background queue -- callers
+    that report a count (e.g. ``reindex()``'s ``analysis_enqueued``) must
+    count real enqueues, not attempts skipped by the settings gate, a
+    missing audio file, or a queue failure.
     """
     if store.db is None:
-        return
+        return False
     try:
         from backend.core.background_workers import get_background_queue
         from backend.modules.settings.router import get_store as get_settings_store
     except ImportError:
-        return
+        return False
 
     try:
         settings = get_settings_store().get_section("analysis")
     except Exception:
-        return
+        return False
 
     key = f"auto_on_{source}"
     if not settings.get(key, False):
-        return
+        return False
 
     audio_path = store.get_audio_path(entry_id)
     if audio_path is None:
-        return
+        return False
     entry_dir = store._dir_for(entry_id)
     metadata_path = (entry_dir / "metadata.json") if entry_dir else None
 
@@ -1776,6 +1885,8 @@ def _maybe_enqueue_analysis(
         get_background_queue().enqueue(f"analysis:{entry_id}", _run)
     except Exception as e:
         log.debug("library.store: failed to enqueue analysis for %s: %s", entry_id, e)
+        return False
+    return True
 
 
 def _maybe_enqueue_stems(

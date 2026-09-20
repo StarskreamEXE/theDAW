@@ -32,9 +32,6 @@ let unsubscribe: (() => void) | null = null;
 /** The output ports as live devices, for the menu. */
 export const midiOutDevices = (): LiveDevice[] => ports.map((p) => ({ id: p.id, label: p.name }));
 
-/** The port thru is actually sending to ('' = nothing is being sent). */
-export const activeThruPortId = (): string => activeId;
-
 const stop = (): void => {
   unsubscribe?.();
   unsubscribe = null;

@@ -568,12 +568,21 @@ def test_listing_still_returns_an_unshadowed_recovery_row(tmp_path: Path):
 
 def test_artifacts_route_serves_one_row_per_file(tmp_path: Path, monkeypatch):
     """End to end through the route, including the ``kind`` filter: coverage is
-    computed over the whole listing so a filter cannot expose the shadowed row."""
+    computed over the whole listing so a filter cannot expose the shadowed row.
+
+    GET /{entry_id}/artifacts is a pure read (SCORE-009): it no longer mirrors
+    the legacy ``midis`` row into ``notation_artifacts`` itself. That mirror
+    is now an explicit step -- the one-time
+    :func:`backend.modules.notation.backfill.migrate_legacy_midi_mirror`
+    migration -- run here before the GET, the same way a real launch's
+    background pass would run it before any client calls the route.
+    """
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
     from backend.modules.library import router as library_router_module
     from backend.modules.notation import router as notation_router_module
+    from backend.modules.notation.backfill import migrate_legacy_midi_mirror
     from tests.test_library_store import _seed_generate_entry
 
     monkeypatch.setattr(library_router_module, "_store", None)
@@ -606,6 +615,10 @@ def test_artifacts_route_serves_one_row_per_file(tmp_path: Path, monkeypatch):
         engine="basic-pitch",
     )
 
+    mig_res = migrate_legacy_midi_mirror(store)
+    assert mig_res["errors"] == 0, mig_res
+    assert mig_res["mirrored"] >= 1, mig_res
+
     r = client.get(f"/api/notation/{entry_id}/artifacts")
     assert r.status_code == 200, r.text
     body = r.json()
@@ -626,6 +639,224 @@ def test_artifacts_route_serves_one_row_per_file(tmp_path: Path, monkeypatch):
     fb = r.json()
     assert [a["id"] for a in fb["artifacts"]] == [f"{entry_id}__full__artifact_midi"]
     assert fb["count"] == len(fb["artifacts"])
+
+
+def test_migrate_legacy_midi_mirror_runs_once(tmp_path: Path):
+    """The one-time migration mirrors a pre-existing ``midis`` row exactly
+    once: a second call (a second launch) does not rescan the library."""
+    from backend.modules.notation.backfill import (
+        legacy_midi_mirror_done,
+        migrate_legacy_midi_mirror,
+    )
+
+    class _Store:
+        def __init__(self, db: LibraryDB, root: Path) -> None:
+            self.db = db
+            self.root = root
+
+        def _dir_for(self, entry_id: str):  # noqa: ANN001, ANN201 - test stub
+            # No on-disk entry directories in this DB-only test: nothing for
+            # the on-disk-recovery half of the migration to find.
+            return None
+
+    db = _db(tmp_path, "e")
+    store = _Store(db, tmp_path)
+    mid = tmp_path / "e" / "midi" / "full.mid"
+    _write_scale_midi(mid)
+    db.add_midi(midi_id="e__full", entry_id="e", source="full", midi_path=str(mid))
+
+    assert legacy_midi_mirror_done(store) is False
+
+    res1 = migrate_legacy_midi_mirror(store)
+    assert res1["scanned"] == 1
+    assert res1["mirrored"] == 1
+    assert res1["errors"] == 0
+    assert legacy_midi_mirror_done(store) is True
+    mirrored_rows = db.list_notation_artifacts("e", kind="midi")
+    assert len(mirrored_rows) == 1
+    assert mirrored_rows[0]["id"] == "e__full__artifact_midi"
+
+    # A second launch: the row is removed so a rescan would recreate it, but
+    # the marker says it already ran, so the "second launch" call must not
+    # touch the DB at all.
+    db.delete_notation_artifact("e__full__artifact_midi")
+    res2 = migrate_legacy_midi_mirror(store)
+    assert res2 == {"scanned": 0, "mirrored": 0, "disk_recovered": 0, "errors": 0}
+    assert db.list_notation_artifacts("e", kind="midi") == []
+
+
+def test_migrate_legacy_midi_mirror_marks_done_only_without_errors(tmp_path: Path):
+    """A run that hits an error does not mark itself done, so the failed
+    entry is retried (not silently skipped forever); a run with zero errors
+    marks done and clears any earlier pending ids."""
+    from backend.modules.notation.backfill import (
+        legacy_midi_mirror_done,
+        migrate_legacy_midi_mirror,
+    )
+
+    class _Store:
+        def __init__(self, db: LibraryDB) -> None:
+            self.db = db
+
+        def _dir_for(self, entry_id: str):  # noqa: ANN001, ANN201 - test stub
+            return None
+
+    db = _db(tmp_path, "good")
+    db.upsert_entry({"id": "bad", "title": "bad"})
+    store = _Store(db)
+
+    good_mid = tmp_path / "good" / "midi" / "full.mid"
+    _write_scale_midi(good_mid)
+    db.add_midi(
+        midi_id="good__full", entry_id="good", source="full", midi_path=str(good_mid)
+    )
+    bad_mid = tmp_path / "bad" / "midi" / "full.mid"
+    _write_scale_midi(bad_mid)
+    db.add_midi(
+        midi_id="bad__full", entry_id="bad", source="full", midi_path=str(bad_mid)
+    )
+
+    from backend.modules.notation import engine as engine_module
+
+    real_register_existing_midis = engine_module.register_existing_midis
+
+    def _flaky(db_arg, entry_id):
+        if entry_id == "bad":
+            raise RuntimeError("simulated failure")
+        return real_register_existing_midis(db_arg, entry_id)
+
+    # migrate_legacy_midi_mirror does `from .engine import register_existing_midis`
+    # fresh on every call, so patching the attribute on the engine module
+    # itself (not a name inside backfill's namespace) is what actually takes
+    # effect.
+    engine_module.register_existing_midis = _flaky
+    try:
+        res1 = migrate_legacy_midi_mirror(store)
+    finally:
+        engine_module.register_existing_midis = real_register_existing_midis
+
+    import backend.modules.notation.backfill as backfill_module
+
+    assert res1["errors"] == 1, res1
+    assert res1["mirrored"] == 1, res1  # "good" still mirrored
+    assert legacy_midi_mirror_done(store) is False
+    # "good" is not retried again; only "bad" is pending.
+    state = backfill_module._read_migration_state(db)  # noqa: SLF001 - test only
+    assert state["pending_ids"] == ["bad"]
+
+    # Next call (real function restored): only "bad" is retried, and it now
+    # succeeds, so the migration marks itself done.
+    res2 = migrate_legacy_midi_mirror(store)
+    assert res2["scanned"] == 1, res2  # only the pending id, not a full rescan
+    assert res2["mirrored"] == 1, res2
+    assert res2["errors"] == 0, res2
+    assert legacy_midi_mirror_done(store) is True
+    assert db.list_notation_artifacts("bad", kind="midi")[0]["id"] == (
+        "bad__full__artifact_midi"
+    )
+
+
+def test_migrate_legacy_midi_mirror_abandons_after_max_attempts(tmp_path: Path, caplog):
+    """An id that keeps failing is retried up to a bound, not forever: after
+    3 attempts it is abandoned (dropped from pending_ids, logged), and the
+    migration marks itself done rather than re-walking an ever-pending id
+    (or, in an all-fail first run, the WHOLE library) on every launch."""
+    import logging
+
+    from backend.modules.notation.backfill import (
+        legacy_midi_mirror_done,
+        migrate_legacy_midi_mirror,
+    )
+
+    class _Store:
+        def __init__(self, db: LibraryDB) -> None:
+            self.db = db
+
+        def _dir_for(self, entry_id: str):  # noqa: ANN001, ANN201 - test stub
+            return None
+
+    db = _db(tmp_path, "bad")
+    store = _Store(db)
+    bad_mid = tmp_path / "bad" / "midi" / "full.mid"
+    _write_scale_midi(bad_mid)
+    db.add_midi(
+        midi_id="bad__full", entry_id="bad", source="full", midi_path=str(bad_mid)
+    )
+
+    from backend.modules.notation import engine as engine_module
+
+    def _always_fails(db_arg, entry_id):
+        raise RuntimeError("simulated permanent failure")
+
+    monkeypatch_target = engine_module.register_existing_midis
+    engine_module.register_existing_midis = _always_fails
+    try:
+        with caplog.at_level(
+            logging.WARNING, logger="backend.modules.notation.backfill"
+        ):
+            res1 = migrate_legacy_midi_mirror(store)
+            assert res1["errors"] == 1
+            assert legacy_midi_mirror_done(store) is False
+
+            res2 = migrate_legacy_midi_mirror(store)
+            assert res2["scanned"] == 1  # still just the one pending id
+            assert legacy_midi_mirror_done(store) is False
+
+            res3 = migrate_legacy_midi_mirror(store)
+            assert res3["scanned"] == 1
+            # Third attempt: now abandoned, so the migration marks itself
+            # done and warns about the abandoned id.
+            assert legacy_midi_mirror_done(store) is True
+            assert any(
+                "bad" in r.message and "abandon" in r.message.lower()
+                for r in caplog.records
+            )
+    finally:
+        engine_module.register_existing_midis = monkeypatch_target
+
+    # A fourth call is the true no-op the "done" marker promises: it must
+    # not attempt "bad" again (it would still fail, if it did).
+    res4 = migrate_legacy_midi_mirror(store)
+    assert res4 == {"scanned": 0, "mirrored": 0, "disk_recovered": 0, "errors": 0}
+
+
+def test_migrate_recovers_on_disk_artifacts_with_lost_rows(tmp_path: Path):
+    """An entry whose ``notation_artifacts`` rows are lost but whose files
+    survive on disk is recovered by the one-time migration itself: before
+    this, ``register_on_disk_artifacts`` was reachable only from the manual
+    ``POST /reindex`` route once the GET self-heal that used to call it was
+    removed (SCORE-009), so a library restored from an older DB backup would
+    otherwise show such an entry as permanently empty."""
+    from backend.modules.notation.backfill import migrate_legacy_midi_mirror
+
+    entry_id = "e"
+    db = _db(tmp_path, entry_id)
+    entry_dir = tmp_path / entry_id
+    notation = entry_dir / "notation"
+    notation.mkdir(parents=True)
+    sheet = notation / "song.musicxml"
+    sheet.write_text("<score-partwise/>", encoding="utf-8")
+
+    class _Store:
+        def __init__(self, db: LibraryDB, root: Path) -> None:
+            self.db = db
+            self.root = root
+
+        def _dir_for(self, eid: str):  # noqa: ANN001, ANN201 - test stub
+            d = self.root / eid
+            return d if d.is_dir() else None
+
+    store = _Store(db, tmp_path)
+    assert db.list_notation_artifacts(entry_id) == []
+
+    res = migrate_legacy_midi_mirror(store)
+    assert res["errors"] == 0, res
+    assert res["disk_recovered"] == 1, res
+
+    rows = db.list_notation_artifacts(entry_id, kind="musicxml")
+    assert len(rows) == 1
+    assert rows[0]["path"] == str(sheet)
+    assert rows[0]["engine"] == "recovered-from-disk"
 
 
 def test_shadowed_recovery_musicxml_is_not_a_lead_sheet_candidate(tmp_path: Path):

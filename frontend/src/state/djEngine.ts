@@ -860,10 +860,6 @@ export async function setCueSinkId(deviceId: string): Promise<void> {
   await applyCueSink();
 }
 
-export function getCueSinkId(): string {
-  return cueSinkId;
-}
-
 /* -------------------------------- sampler bank (D7) ------------------------ */
 
 /** Load a one-shot sample into a pad (decode the URL to a buffer). */

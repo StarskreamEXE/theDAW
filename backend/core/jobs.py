@@ -52,11 +52,31 @@ class Job:
 
 _jobs: dict[str, Job] = {}
 
+# Bound on the in-memory job table. Nothing ever calls list_jobs() today, so
+# nothing was trimming this dict — it grew for the life of the process.
+# Eviction never touches a job that is still queued/running or that a caller
+# is watching via subscribe(): only finished, unwatched jobs are prunable.
+_MAX_JOBS = 500
+
 
 def create_job(module: str, label: str) -> Job:
     job = Job(id=str(uuid.uuid4()), module=module, label=label)
     _jobs[job.id] = job
+    _prune_jobs()
     return job
+
+
+def _prune_jobs() -> None:
+    if len(_jobs) <= _MAX_JOBS:
+        return
+    terminal = {"done", "failed", "cancelled"}
+    evictable = sorted(
+        (j for j in _jobs.values() if j.status in terminal and not j._subscribers),
+        key=lambda j: j.updated_at,
+    )
+    overflow = len(_jobs) - _MAX_JOBS
+    for j in evictable[:overflow]:
+        _jobs.pop(j.id, None)
 
 
 def get_job(job_id: str) -> Optional[Job]:

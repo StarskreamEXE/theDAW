@@ -211,6 +211,11 @@ class _Job:
     bytes_written: int = 0
     progress: float = 0.0
     error: Optional[str] = None
+    # Members an import chose not to write: an unknown root id, a disallowed
+    # settings filename, an already-there file in merge mode, or a real write
+    # failure. A "done" state does not mean every member was restored — this
+    # count (and the message it produces) is what makes that visible.
+    skipped: int = 0
 
 
 _jobs: dict[str, _Job] = {}
@@ -237,12 +242,19 @@ def job_status(job_id: str, kind: str) -> Optional[dict]:
         job = _jobs.get(job_id)
         if job is None or job.kind != kind:
             return None
+        message = (
+            f"{job.skipped} file(s) skipped (see server log for details)."
+            if job.skipped
+            else ""
+        )
         return {
             "state": job.state,
             "zip_path": job.zip_path,
             "bytes_written": job.bytes_written,
             "progress": round(job.progress, 4),
             "error": job.error,
+            "skipped": job.skipped,
+            "message": message,
         }
 
 
@@ -418,6 +430,7 @@ def _run_import(job: _Job, zip_path: Path, mode: str) -> None:
         roots_by_id = {s.id: s for s in user_data_roots()}
         written = 0
         processed = 0
+        skipped = 0
         with zipfile.ZipFile(zip_path) as zf:
             members = [
                 m
@@ -429,6 +442,13 @@ def _run_import(job: _Job, zip_path: Path, mode: str) -> None:
                 processed += m.file_size
                 parts = m.filename.split("/", 2)
                 if len(parts) < 3 or not parts[2]:
+                    log.warning(
+                        "backup: malformed member path in archive: %s", m.filename
+                    )
+                    skipped += 1
+                    with _jobs_lock:
+                        job.skipped = skipped
+                        job.progress = processed / total
                     continue
                 spec = roots_by_id.get(parts[1])
                 if spec is None:
@@ -437,10 +457,16 @@ def _run_import(job: _Job, zip_path: Path, mode: str) -> None:
                         parts[1],
                         m.filename,
                     )
+                    skipped += 1
+                    with _jobs_lock:
+                        job.skipped = skipped
+                        job.progress = processed / total
                     continue
                 if spec.kind == "files" and not _is_restorable_settings_name(parts[2]):
                     log.warning("backup: not restoring settings member %s", m.filename)
+                    skipped += 1
                     with _jobs_lock:
+                        job.skipped = skipped
                         job.progress = processed / total
                     continue
                 base = spec.path
@@ -452,12 +478,26 @@ def _run_import(job: _Job, zip_path: Path, mode: str) -> None:
                         log.warning(
                             "backup: refusing path outside root: %s", m.filename
                         )
+                        skipped += 1
+                        with _jobs_lock:
+                            job.skipped = skipped
+                            job.progress = processed / total
                         continue
                 except OSError as e:
                     log.warning("backup: cannot resolve %s: %s", m.filename, e)
+                    skipped += 1
+                    with _jobs_lock:
+                        job.skipped = skipped
+                        job.progress = processed / total
                     continue
                 if mode == "merge" and target.exists():
+                    log.warning(
+                        "backup: not overwriting existing file in merge mode: %s",
+                        m.filename,
+                    )
+                    skipped += 1
                     with _jobs_lock:
+                        job.skipped = skipped
                         job.progress = processed / total
                     continue
                 try:
@@ -466,6 +506,10 @@ def _run_import(job: _Job, zip_path: Path, mode: str) -> None:
                         shutil.copyfileobj(src, dst, _COPY_CHUNK_BYTES)
                 except OSError as e:
                     log.warning("backup: failed to restore %s: %s", m.filename, e)
+                    skipped += 1
+                    with _jobs_lock:
+                        job.skipped = skipped
+                        job.progress = processed / total
                     continue
                 written += m.file_size
                 with _jobs_lock:
@@ -474,7 +518,18 @@ def _run_import(job: _Job, zip_path: Path, mode: str) -> None:
         with _jobs_lock:
             job.bytes_written = written
             job.progress = 1.0
+            job.skipped = skipped
             job.state = "done"
+        if skipped:
+            log.warning(
+                "backup: import %s restored %d bytes but skipped %d member(s) "
+                "from %s (mode=%s)",
+                job.id,
+                written,
+                skipped,
+                zip_path,
+                mode,
+            )
         log.info(
             "backup: import %s restored %d bytes from %s (mode=%s)",
             job.id,

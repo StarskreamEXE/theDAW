@@ -71,7 +71,13 @@ async def vocal_isolate(input_path: Path, output_path: Path, params: dict) -> No
 def stem_separation(input_path: Path, output_path: Path, params: dict) -> None:
     """Harmonic/percussive source separation via librosa HPSS.
 
-    Genuine separation algorithm. Default returns percussive stem.
+    ``stems`` (declared range 2-6) drives two things so every value in the
+    range produces a different result: 2 selects the harmonic
+    output, 3-6 select the percussive output with the HPSS ``margin``
+    scaled up (1.0 at 2 -> 4.0 at 6) for progressively more aggressive,
+    less-bleed separation. This is still 2-output HPSS, not N-stem source
+    separation — the knob controls output selection + separation strength,
+    not a stem count.
     """
     import librosa
 
@@ -80,27 +86,21 @@ def stem_separation(input_path: Path, output_path: Path, params: dict) -> None:
     # librosa.load returns (samples,) for mono, (channels, samples) for multi
     was_stereo = y.ndim == 2
 
+    stems_val = int(params.get("stems", 4))
+    stems_val = max(2, min(6, stems_val))
+    want_harmonic = stems_val == 2
+    margin = 1.0 + (stems_val - 2) * 0.75
+
+    def _separate(channel: np.ndarray) -> np.ndarray:
+        harmonic, percussive = librosa.effects.hpss(channel, margin=margin)
+        return harmonic if want_harmonic else percussive
+
     if was_stereo:
         # Process each channel independently
-        harmonics = []
-        percussives = []
-        for ch in range(y.shape[0]):
-            h, p = librosa.effects.hpss(y[ch])
-            harmonics.append(h)
-            percussives.append(p)
-        harmonic = np.stack(harmonics, axis=0)
-        percussive = np.stack(percussives, axis=0)
+        channels = [_separate(y[ch]) for ch in range(y.shape[0])]
+        result = np.stack(channels, axis=0)
     else:
-        harmonic, percussive = librosa.effects.hpss(y)
-
-    stems_val = int(params.get("stems", 4))
-    # stems param: even → percussive, odd → harmonic (simple toggle)
-    # But more useful: default to percussive for separation demo
-    # We'll use stems=2 → harmonic, stems=3 → percussive, else percussive
-    if stems_val == 2:
-        result = harmonic
-    else:
-        result = percussive
+        result = _separate(y)
 
     # Transpose for soundfile (expects samples, channels)
     if was_stereo:

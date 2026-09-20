@@ -37,6 +37,10 @@ export interface SemanticWaveProps {
   transparentBg?: boolean;
   className?: string;
   ariaLabel?: string;
+  /** `true` (default, unchanged): rescale peaks to this track's own loudest
+   *  sample — see `DJSemanticWaveform`'s prop of the same name. `false`:
+   *  absolute amplitude, never rescaled (REAPER's default). */
+  normalize?: boolean;
 }
 
 export const SemanticWave: React.FC<SemanticWaveProps> = ({
@@ -51,6 +55,7 @@ export const SemanticWave: React.FC<SemanticWaveProps> = ({
   transparentBg = false,
   className,
   ariaLabel,
+  normalize = true,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const span = Math.max(1e-6, viewportEnd - viewportStart);
@@ -115,6 +120,8 @@ export const SemanticWave: React.FC<SemanticWaveProps> = ({
         viewportStart={viewportStart}
         viewportEnd={viewportEnd}
         onDuration={onDuration}
+        transparentBg={transparentBg}
+        normalize={normalize}
       />
 
       {/* scrub layer */}

@@ -23,27 +23,6 @@ async function fetchOk(url: string, init?: RequestInit): Promise<Response> {
   return res;
 }
 
-/** Fetch bytes with retries; rejects only after the last attempt fails. */
-export async function fetchBytesWithRetry(url: string, opts: RetryOpts = {}): Promise<ArrayBuffer> {
-  const { retries = 3, backoffMs = 450, label } = opts;
-  let lastErr: unknown;
-  for (let attempt = 0; attempt <= retries; attempt += 1) {
-    try {
-      const res = await fetchOk(url);
-      const buf = await res.arrayBuffer();
-      if (buf.byteLength === 0) throw new Error('empty response body');
-      return buf;
-    } catch (e) {
-      lastErr = e;
-      if (attempt < retries) {
-        if (label) logWarn('library', `${label}: fetch attempt ${attempt + 1} failed (${e instanceof Error ? e.message : String(e)}); retrying…`);
-        await sleep(backoffMs * (attempt + 1));
-      }
-    }
-  }
-  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
-}
-
 /** True when the bytes are a structurally complete Standard MIDI File (header
  *  present and every declared MTrk chunk fits within the buffer) — catches a
  *  truncated 200 response that would otherwise parse as "Invalid track chunk". */

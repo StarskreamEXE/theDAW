@@ -101,6 +101,7 @@ const {
 const { useVstLiveStore } = await import('./vstLiveStore.ts');
 const { useVstEditorPrefs } = await import('./vstEditorPrefsStore.ts');
 const { useEditorStore } = await import('./editorStore.ts');
+const { useStatusBarStore } = await import('./statusBarStore.ts');
 
 /* ── fakes ─────────────────────────────────────────────────────────────────── */
 
@@ -116,6 +117,8 @@ function fakeSession(entryId: string): FakeSession {
     wsUrl: 'ws://x',
     pid: 1,
     stateDirty: false,
+    userMovedOnRejectedState: false,
+    stateSent: true,
     calls: [],
     client: null as never,
   };
@@ -539,6 +542,58 @@ const failIfCalled = () => assert.fail('the OFFLINE sidecar sink must never be c
   assert.ok(session.calls.some((c) => c.startsWith('closeEditor')), 'the host is told to close its window');
   liveSessions.delete(id);
   useEditorStore.setState({ tracks: [] as never });
+}
+
+/* ── the open status line reports the real outcome, not an optimistic
+   constant (T18 fourth audit, MINOR 5) ── */
+{
+  // Normal case: no rejection on the row, so the line still says the plugin
+  // is processing the signal.
+  const id = 'e-open-status-live';
+  const path = 'C:/VST3/Theta2.vst3';
+  useVstEditorPrefs.getState().setModeForPlugin(path, 'floating');
+  const session = fakeSession(id);
+  liveSessions.set(id, session);
+  useVstLiveStore.getState().setStatus(id, 'live');
+
+  store().open(chainEntry(id, path), failIfCalled);
+  await flush();
+
+  assert.match(
+    useStatusBarStore.getState().text,
+    /processing the signal now/,
+    'a plugin holding its saved state gets the normal message',
+  );
+  store().close();
+  liveSessions.delete(id);
+}
+{
+  // The host rejected the restore: the row's stateOrigin already knows the
+  // plugin is on its factory defaults, so the open line must say so instead
+  // of the unconditional "processing the signal now" it used to post.
+  const id = 'e-open-status-rejected';
+  const path = 'C:/VST3/Theta3.vst3';
+  useVstEditorPrefs.getState().setModeForPlugin(path, 'floating');
+  const session = fakeSession(id);
+  liveSessions.set(id, session);
+  useVstLiveStore.getState().setStateOrigin(id, 'state-rejected', 'plugin refused the state');
+  useVstLiveStore.getState().setStatus(id, 'live');
+
+  store().open(chainEntry(id, path), failIfCalled);
+  await flush();
+
+  assert.match(
+    useStatusBarStore.getState().text,
+    /factory defaults/,
+    'a plugin whose saved state was rejected says so, not that it is "processing the signal"',
+  );
+  assert.doesNotMatch(
+    useStatusBarStore.getState().text,
+    /processing the signal now/,
+    'the optimistic constant is not shown for a rejected restore',
+  );
+  store().close();
+  liveSessions.delete(id);
 }
 
 __setLiveHolderForTest(null);

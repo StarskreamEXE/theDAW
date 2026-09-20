@@ -6,6 +6,9 @@ verify), High-Quality SRC, Dither, Metadata and Batch Export.
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import weakref
 from pathlib import Path
 
 from ...core.module_base import build_router
@@ -14,6 +17,8 @@ from ...lib.params import ParamSpec as P
 from ...lib.params import ToolSpec
 
 FAMILY = "delivery"
+
+log = logging.getLogger(__name__)
 
 # 2026 platform targets: lufs / true-peak / container (see docs/edit-tool-stack/06-delivery.md)
 PRESETS: dict[str, dict] = {
@@ -34,9 +39,15 @@ CODEC_ARGS: dict[str, list[str]] = {
     "flac": ["-c:a", "flac", "-compression_level", "8"],
     "mp3": ["-c:a", "libmp3lame", "-q:a", "0"],
     "aac": ["-c:a", "aac", "-b:a", "256k"],
+    "m4a": ["-c:a", "aac", "-b:a", "256k"],  # same bitrate as "aac", MP4 container
     "opus": ["-c:a", "libopus", "-b:a", "192k", "-vbr", "on"],
     "ogg": ["-c:a", "libvorbis", "-q:a", "6"],
 }
+# Every extension MIME (backend/core/module_base.py) accepts as an
+# output_format must have an encode fallback here, or _metadata/_batch_export
+# silently fall back to `-c:a copy`, which fails whenever the source codec
+# doesn't already match the target container.
+assert set(CODEC_ARGS) == {"wav", "flac", "mp3", "aac", "m4a", "opus", "ogg"}
 
 
 async def _codec_matrix(inp: Path, out: Path, params: dict) -> None:
@@ -49,26 +60,214 @@ def _hq_src(params: dict) -> list[str]:
     return ["-af", "aresample=resampler=soxr:precision=28", "-ar", str(sr)]
 
 
+def _wave_tags(out: Path):
+    """Open a WAV's ID3v2 tag chunk via ``mutagen.wave.WAVE``.
+
+    ``mutagen.id3.ID3(path)`` on a plain ``.wav`` prepends a bare ID3v2 header
+    *before* the file's own bytes: the result no longer starts with ``RIFF``,
+    so stdlib ``wave`` and even ``mutagen.wave.WAVE`` itself reject it on the
+    next read. ``mutagen.wave.WAVE`` instead writes/reads the ID3 data inside
+    a proper RIFF ``id3 `` chunk, keeping the container valid.
+    """
+    from mutagen.wave import WAVE
+
+    w = WAVE(str(out))
+    if w.tags is None:
+        w.add_tags()
+    return w
+
+
+_MP4_TRUEPEAK_ATOM = "----:com.apple.iTunes:TRUEPEAK_DBTP"
+
+
+def _embed_true_peak_tag(out: Path, tp: float) -> None:
+    """Embed the measured true-peak (dBTP) into the delivered file's own tags.
+
+    ``/process`` (backend/core/module_base.py) returns only raw audio bytes plus
+    a Content-Disposition header — there is no JSON side-channel back to the
+    caller — so the file itself is the only place a measurement can travel.
+    Mirrors ``_metadata``'s codec branching (mutagen FLAC / WAVE / ID3 / MP4 /
+    Vorbis comment); never raises, matching that handler's "tagging is
+    advisory" contract. Raw ``.aac`` (ADTS elementary stream) has no
+    container-level tag format at all, so it is skipped with a debug log
+    rather than silently doing nothing.
+    """
+    ext = out.suffix.lstrip(".").lower()
+    value = f"{tp:.2f}"
+    try:
+        if ext == "flac":
+            from mutagen.flac import FLAC
+
+            f = FLAC(str(out))
+            f["TRUEPEAK_DBTP"] = value
+            f.save()
+        elif ext == "wav":
+            from mutagen.id3 import TXXX
+
+            w = _wave_tags(out)
+            w.tags.delall("TXXX:TRUEPEAK_DBTP")
+            w.tags.add(TXXX(encoding=3, desc="TRUEPEAK_DBTP", text=[value]))
+            w.save(str(out))
+        elif ext == "mp3":
+            import mutagen
+            from mutagen.id3 import TXXX, ID3
+
+            try:
+                tags = ID3(str(out))
+            except mutagen.id3.ID3NoHeaderError:
+                tags = ID3()
+            tags.delall("TXXX:TRUEPEAK_DBTP")
+            tags.add(TXXX(encoding=3, desc="TRUEPEAK_DBTP", text=[value]))
+            tags.save(str(out))
+        elif ext == "m4a":
+            from mutagen.mp4 import MP4, MP4FreeForm
+
+            f = MP4(str(out))
+            if f.tags is None:
+                f.add_tags()
+            f.tags[_MP4_TRUEPEAK_ATOM] = [MP4FreeForm(value.encode("utf-8"))]
+            f.save()
+        elif ext == "ogg":
+            from mutagen.oggvorbis import OggVorbis
+
+            f = OggVorbis(str(out))
+            if f.tags is None:
+                f.add_tags()
+            f["TRUEPEAK_DBTP"] = value
+            f.save()
+        elif ext == "opus":
+            from mutagen.oggopus import OggOpus
+
+            f = OggOpus(str(out))
+            if f.tags is None:
+                f.add_tags()
+            f["TRUEPEAK_DBTP"] = value
+            f.save()
+        elif ext == "aac":
+            log.debug(
+                "smart_export: true-peak %.2f dBTP not embedded on %s — raw "
+                "AAC (ADTS) has no container-level tag format",
+                tp,
+                out,
+            )
+        else:
+            log.debug(
+                "smart_export: no true-peak tag embedding defined for .%s (%s)",
+                ext,
+                out,
+            )
+    except Exception:
+        log.exception("smart_export: failed to embed true-peak tag on %s", out)
+
+
+_MAX_TRIM_PASSES = 2
+
+
 async def _smart_export(inp: Path, out: Path, params: dict) -> None:
     preset = PRESETS.get(str(params["platform"]), PRESETS["universal"])
-    m = await audio_analysis.measure_loudness(inp, preset["lufs"], 7.0, preset["tp"])
+    ceiling = preset["tp"]
+    m = await audio_analysis.measure_loudness(inp, preset["lufs"], 7.0, ceiling)
     ln = (
-        f"loudnorm=I={preset['lufs']}:LRA=7:TP={preset['tp']}"
+        f"loudnorm=I={preset['lufs']}:LRA=7:TP={ceiling}"
         f":measured_I={m['input_i']}:measured_LRA={m['input_lra']}"
         f":measured_TP={m['input_tp']}:measured_thresh={m['input_thresh']}"
         f":offset={m.get('target_offset', 0.0)}:linear=true"
     )
     ext = out.suffix.lstrip(".").lower()
-    await ffmpeg.render(inp, out, ["-af", ln], extra_out_args=CODEC_ARGS.get(ext, []))
-    # post-encode true-peak verification (advisory; logged, retry wired next)
-    try:
-        ok, tp = await audio_analysis.verify_true_peak(out, preset["tp"] + 0.1)
-        if not ok:
-            print(
-                f"[smart_export] true-peak {tp:.2f} exceeds {preset['tp']} for {params['platform']}"
+
+    # loudnorm's internal oversampled true-peak detection changes the output
+    # sample rate (typically to 192 kHz) unless the encode step is told to
+    # resample back down. Probe the source rate the same way
+    # creative_neural/router.py's _probe_sample_rate already does, and pin
+    # -ar to it so a 44.1k or 48k master doesn't silently leave at 192k.
+    # probe_file() shells out to ffprobe synchronously — run it off the
+    # event loop so one slow probe doesn't stall every other request.
+    from backend.modules.analysis.ffprobe import probe_file
+
+    info = await asyncio.to_thread(probe_file, inp)
+    source_rate = (info.get("_summary") or {}).get("sample_rate")
+    extra_out_args = list(CODEC_ARGS.get(ext, []))
+    if ext == "opus":
+        # libopus only accepts 48/24/16/12/8 kHz — pinning -ar to an
+        # arbitrary source rate (e.g. 44.1k) makes the encoder reject the
+        # stream outright. Let it run at its native 48k instead.
+        extra_out_args += ["-ar", "48000"]
+    elif source_rate:
+        extra_out_args += ["-ar", str(source_rate)]
+
+    await ffmpeg.render(inp, out, ["-af", ln], extra_out_args=extra_out_args)
+
+    # Post-encode true-peak verification + corrective trim. Resampling
+    # loudnorm's internal (often 192k) oversampled output back down to the
+    # delivery rate adds inter-sample overshoot the pre-encode measurement
+    # never saw — commonly ~0.1 dB, enough to put a lossless delivery file
+    # over its platform ceiling even though loudnorm itself targeted it
+    # correctly. Re-measure the ENCODED file and, if it's over the ceiling,
+    # apply a corrective `volume` trim and re-encode; at most twice.
+    tp: float | None = None
+    trimmed_any = False
+    for attempt in range(_MAX_TRIM_PASSES):
+        try:
+            _, tp = await audio_analysis.verify_true_peak(out, ceiling)
+        except Exception:
+            log.exception(
+                "smart_export: true-peak verification failed for platform %s",
+                params["platform"],
             )
-    except Exception:
-        pass
+            return
+        if tp <= ceiling:
+            break
+        trim_db = ceiling - tp - 0.05
+        trimmed_path = out.with_name(f"{out.stem}.trim{attempt}{out.suffix}")
+        await ffmpeg.render(
+            out,
+            trimmed_path,
+            ["-af", f"volume={trim_db:.3f}dB"],
+            extra_out_args=extra_out_args,
+        )
+        trimmed_path.replace(out)
+        trimmed_any = True
+        log.info(
+            "smart_export: true-peak %.2f dBTP over %.2f dBTP ceiling for "
+            "platform %s — applied %.2f dB corrective trim (pass %d/%d)",
+            tp,
+            ceiling,
+            params["platform"],
+            trim_db,
+            attempt + 1,
+            _MAX_TRIM_PASSES,
+        )
+
+    # Final measurement of the file as actually delivered. When the loop
+    # never trimmed, `tp` from the loop's own (single) measurement is
+    # already the true state of `out` — re-measuring again would be a full
+    # extra loudness analysis on every in-spec export, which is the common
+    # case. Only re-verify when a trim pass actually changed the file.
+    if trimmed_any:
+        try:
+            _, tp = await audio_analysis.verify_true_peak(out, ceiling)
+        except Exception:
+            log.exception(
+                "smart_export: true-peak verification failed for platform %s",
+                params["platform"],
+            )
+            return
+    if tp <= ceiling:
+        log.info(
+            "smart_export: measured true-peak %.2f dBTP (ceiling %.2f) for platform %s",
+            tp,
+            ceiling,
+            params["platform"],
+        )
+    else:
+        log.warning(
+            "smart_export: true-peak %.2f dBTP still exceeds %.2f dBTP ceiling "
+            "for platform %s after corrective trim",
+            tp,
+            ceiling,
+            params["platform"],
+        )
+    _embed_true_peak_tag(out, tp)
 
 
 # ── Dither (process) ────────────────────────────────────────────────────────
@@ -98,17 +297,62 @@ async def _dither(inp: Path, out: Path, params: dict) -> None:
     )
 
 
+# A source codec is only safe to stream-copy into a given output container
+# when it's already the codec that container needs — copying raw PCM into a
+# FLAC/MP3 bitstream (or a compressed stream into another codec's container)
+# fails in ffmpeg. "wav" is handled separately below via _is_wav_copy_safe.
+_METADATA_COPY_SAFE_CODEC: dict[str, set[str]] = {
+    "flac": {"flac"},
+    "mp3": {"mp3"},
+    "aac": {"aac"},
+    "m4a": {"aac"},
+    "ogg": {"vorbis"},
+    "opus": {"opus"},
+}
+
+
+def _is_wav_copy_safe_codec(codec: str) -> bool:
+    """WAV (RIFF) only supports little-endian PCM. An AIFF source reports a
+    big-endian codec (``pcm_s16be``/``pcm_s24be``/``pcm_s32be``) — copying
+    that straight into a WAV container is not safe and must be encoded
+    instead; ``pcm_*le`` and the endian-less ``pcm_u8`` are fine."""
+    return codec.startswith("pcm_") and not codec.endswith("be")
+
+
 # ── Metadata / Tagging (process) ────────────────────────────────────────────
 async def _metadata(inp: Path, out: Path, params: dict) -> None:
-    """Copy audio to output, then embed metadata tags via mutagen (if available).
+    """Copy audio to output when the source codec already fits the target
+    container; otherwise encode with the codec the rest of this module uses
+    for that format. Then embed metadata tags via mutagen (if available).
 
-    Never fails if mutagen is missing — falls back to a straight copy.
+    ``-c:a copy`` used to run unconditionally: a WAV (pcm_s16le) upload with
+    output_format=flac/mp3/m4a/ogg/opus made ffmpeg fail outright — you
+    cannot copy raw PCM straight into a FLAC/MP3/AAC/Vorbis/Opus bitstream —
+    which module_base.py's generic ``except ffmpeg.FFmpegError`` turned into
+    a bare 500. Encoding is skipped only when the source codec already
+    matches what the target container needs (and, for WAV specifically, is
+    little-endian PCM — an AIFF's big-endian PCM is not a valid WAV payload).
+
+    Never fails if mutagen is missing — falls back to whatever the render
+    step produced.
     """
     title = str(params.get("title", ""))
     artist = str(params.get("artist", ""))
+    ext = out.suffix.lstrip(".").lower()
 
-    # Pass-through encode: copy audio stream to output container
-    await ffmpeg.render(inp, out, [], extra_out_args=["-c:a", "copy"])
+    # probe_file() shells out to ffprobe synchronously — run it off the
+    # event loop so one slow probe doesn't stall every other request.
+    from backend.modules.analysis.ffprobe import probe_file
+
+    info = await asyncio.to_thread(probe_file, inp)
+    source_codec = str((info.get("_summary") or {}).get("codec") or "")
+    copy_safe = (ext == "wav" and _is_wav_copy_safe_codec(source_codec)) or (
+        source_codec in _METADATA_COPY_SAFE_CODEC.get(ext, set())
+    )
+    encode_args = (
+        ["-c:a", "copy"] if copy_safe else CODEC_ARGS.get(ext, ["-c:a", "copy"])
+    )
+    await ffmpeg.render(inp, out, [], extra_out_args=encode_args)
 
     # Attempt to write tags with mutagen
     try:
@@ -116,7 +360,6 @@ async def _metadata(inp: Path, out: Path, params: dict) -> None:
         from mutagen.flac import FLAC
         from mutagen.id3 import ID3, TIT2, TPE1
 
-        ext = out.suffix.lstrip(".").lower()
         if ext == "flac":
             f = FLAC(str(out))
             if title:
@@ -124,8 +367,16 @@ async def _metadata(inp: Path, out: Path, params: dict) -> None:
             if artist:
                 f["artist"] = artist
             f.save()
-        elif ext in ("wav", "mp3"):
-            # ID3 tagging for WAV and MP3
+        elif ext == "wav":
+            # WAV needs mutagen.wave.WAVE, not a bare ID3(path) — see
+            # _wave_tags' docstring for why ID3(path) corrupts the RIFF header.
+            w = _wave_tags(out)
+            if title:
+                w.tags.add(TIT2(encoding=3, text=[title]))
+            if artist:
+                w.tags.add(TPE1(encoding=3, text=[artist]))
+            w.save(str(out))
+        elif ext == "mp3":
             try:
                 tags = ID3(str(out))
             except mutagen.id3.ID3NoHeaderError:
@@ -135,20 +386,80 @@ async def _metadata(inp: Path, out: Path, params: dict) -> None:
             if artist:
                 tags.add(TPE1(encoding=3, text=[artist]))
             tags.save(str(out))
+        elif ext == "m4a":
+            from mutagen.mp4 import MP4
+
+            f = MP4(str(out))
+            if f.tags is None:
+                f.add_tags()
+            if title:
+                f.tags["\xa9nam"] = [title]
+            if artist:
+                f.tags["\xa9ART"] = [artist]
+            f.save()
+        elif ext == "ogg":
+            from mutagen.oggvorbis import OggVorbis
+
+            f = OggVorbis(str(out))
+            if f.tags is None:
+                f.add_tags()
+            if title:
+                f["title"] = title
+            if artist:
+                f["artist"] = artist
+            f.save()
+        elif ext == "opus":
+            from mutagen.oggopus import OggOpus
+
+            f = OggOpus(str(out))
+            if f.tags is None:
+                f.add_tags()
+            if title:
+                f["title"] = title
+            if artist:
+                f["artist"] = artist
+            f.save()
     except Exception:
         # mutagen missing or tagging failed — output is still valid audio
         pass
 
 
+# A cap on how many Batch Export renders run at once, server-wide, across
+# all concurrent /process requests for this tool. Earlier revisions took a
+# per-request `parallelJobs` and additionally tried to encode several target
+# formats per call — but /process (module_base.py) returns exactly one file,
+# so rendering extra formats nobody could receive was wasted CPU and a new
+# failure mode. Reverted to a single encode; the only thing worth bounding
+# here is concurrent *request* load, which a semaphore does without a
+# per-request knob.
+#
+# A single module-level `asyncio.Semaphore` cannot do this safely: a
+# Semaphore binds its internal wait queue to whichever event loop first
+# awaits it. FastAPI's TestClient (and, more importantly, every real
+# request-serving worker loop) can run more than one event loop over the
+# process lifetime — a second loop awaiting the same Semaphore instance
+# raises "got Future <Future pending> attached to a different loop", which
+# surfaced as a bare 500. Keep one Semaphore per running loop instead, in a
+# WeakKeyDictionary so a finished loop's entry is dropped automatically.
+_BATCH_EXPORT_SEMS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = weakref.WeakKeyDictionary()
+
+
+def _batch_sem() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    sem = _BATCH_EXPORT_SEMS.get(loop)
+    if sem is None:
+        sem = asyncio.Semaphore(2)
+        _BATCH_EXPORT_SEMS[loop] = sem
+    return sem
+
+
 # ── Batch Export (process) ───────────────────────────────────────────────────
 async def _batch_export(inp: Path, out: Path, params: dict) -> None:
-    """Single-file encode: transcode input to the output container at good quality.
-
-    Future: full batch queue dispatching parallel jobs across formats/platforms.
-    """
+    """Single-file encode, bounded by a server-wide concurrency cap."""
     ext = out.suffix.lstrip(".").lower()
     codec_args = CODEC_ARGS.get(ext, [])
-    await ffmpeg.render(inp, out, [], extra_out_args=codec_args)
+    async with _batch_sem():
+        await ffmpeg.render(inp, out, [], extra_out_args=codec_args)
 
 
 TOOLS: list[ToolSpec] = [
@@ -267,15 +578,18 @@ TOOLS: list[ToolSpec] = [
     ),
     ToolSpec(
         id="batch_export",
-        name="Stems / Batch / Multiformat",
+        name="Batch Export (single format)",
         family=FAMILY,
         viz="delivery",
         mode="process",
         license="LGPL",
-        engine="encode (batch queue later)",
+        engine="ffmpeg encoders",
         handler=_batch_export,
-        description="Export stems or one master to many formats/platforms at once.",
-        params=[P("parallelJobs", "int", 1, 8, 4, "", "ParamKnob", "Jobs")],
+        description=(
+            "Encode to the requested output format; concurrent requests to "
+            "this tool are capped server-side."
+        ),
+        params=[],
     ),
 ]
 

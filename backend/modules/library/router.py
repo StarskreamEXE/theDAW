@@ -61,6 +61,7 @@ from .bundle import build_bundle_bytes
 from .db import DEFAULT_SORT, FACET_FIELDS, SORTS, EntryFilters
 from .store import (
     AUDIO_EXTS,
+    MAX_REINDEX_ANALYSIS_ENQUEUE,
     ImportJob,
     LibraryStore,
     _read_metadata,
@@ -104,6 +105,11 @@ LYRICS_PREVIEW_CHARS = 280
 #: full count is always reported as ``created_total``.
 MAX_SYNC_IMPORT_ENTRIES = 200
 
+# MAX_REINDEX_ANALYSIS_ENQUEUE (the cap for POST /reindex?analyze=true) lives
+# in store.py -- it is also reindex()'s own default max_enqueue, so a bare
+# reindex() call is capped the same way even without going through this
+# route. Imported above, not redefined here.
+
 
 _store: Optional[LibraryStore] = None
 
@@ -128,16 +134,19 @@ def _attach_play_counts(
     dicts. The DB column is the source for these; entries with no DB row read 0.
     The frontend sorts on play_count, so it ships with every entry payload.
 
-    ``ids`` restricts the lookup to one page. Without it the whole ``entries``
-    table is read -- fine for the unpaged list, which is already reading every
-    row, and ruinous for a page of 200 out of 200,000."""
+    ``ids`` restricts the lookup to one page (:meth:`LibraryDB.play_counts_for`).
+    Without it, every entry is enriched (:meth:`LibraryDB.all_play_counts`) --
+    both read only ``id, play_count, last_played_at`` (LIB-004): the unpaged
+    path used to call :meth:`LibraryDB.list_entries` (``SELECT *``), reading
+    every column of every row -- including ``metadata_json`` -- just to
+    attach two numbers, which is ruinous once the library has 200,000 rows."""
     if store.db is None:
         for e in entries:
             e.setdefault("play_count", 0)
             e.setdefault("last_played_at", None)
         return
     if ids is None:
-        rows: dict[str, Any] = {row["id"]: row for row in store.db.list_entries()}
+        rows: dict[str, Any] = store.db.all_play_counts()
     else:
         rows = store.db.play_counts_for(ids)
     for e in entries:
@@ -1406,15 +1415,37 @@ def list_bundled_setlists() -> dict[str, Any]:
 
 
 @router.post("/reindex")
-def reindex_library() -> dict[str, Any]:
+def reindex_library(analyze: bool = False) -> dict[str, Any]:
     """Walk the on-disk library and upsert every entry into the SQLite mirror.
     Heals entries added to data/generations outside the API (dropped in by
     hand, synced from another machine, ...). store.reindex() is idempotent,
-    so repeated calls are safe."""
+    so repeated calls are safe.
+
+    ``analyze`` (query param, default ``false``) opts in to enqueuing
+    background analysis for new/changed entries (LIB-002); the default is a
+    heal-only pass that never analyzes, because a lost or empty DB next to an
+    existing 200,000-entry library would otherwise make EVERY entry look
+    "new" and mass re-analyze the whole thing -- the user's hard rule is
+    never to do that. Even with ``analyze=true``, more than
+    :data:`MAX_REINDEX_ANALYSIS_ENQUEUE` new/changed entries in one call
+    enqueues none and reports ``analysis_skipped`` instead, rather than
+    flooding the analysis worker."""
     store = get_store()
     if store.db is None:
         raise HTTPException(503, "library DB not available")
-    return {"reindexed": store.reindex()}
+    report: dict[str, Any] = {}
+    reindexed = store.reindex(
+        enqueue_analysis=analyze,
+        max_enqueue=MAX_REINDEX_ANALYSIS_ENQUEUE,
+        report=report,
+    )
+    if report.get("analysis_skipped"):
+        return {
+            "reindexed": reindexed,
+            "analysis_skipped": report["analysis_skipped"],
+            "reason": "too many entries to queue at once",
+        }
+    return {"reindexed": reindexed, "analysis_enqueued": report.get("enqueued", 0)}
 
 
 @router.patch("/entries/{entry_id}")

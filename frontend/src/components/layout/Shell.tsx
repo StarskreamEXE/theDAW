@@ -12,6 +12,15 @@ import { initEditorAutosave } from '../../lib/editorAutosave';
 // Lazy: the docs modal bundles a markdown/HTML renderer + screenshots; keep it
 // out of first paint and only fetch the chunk when the user opens Docs.
 const DocsModal = lazy(() => import('./DocsModal').then((m) => ({ default: m.DocsModal })));
+// T20 re-audit item 1: QR codes for the mobile-access link and the phone
+// companion link (the latter can carry the LAN pairing token in its URL
+// fragment) used to be rendered by GETting a third-party QR-image service
+// with the full URL folded into a query param — that leaks the token to
+// that service's access logs and any TLS-terminating proxy in between.
+// Render locally instead; lazy so the QR renderer chunk only loads when a
+// share/companion panel is actually opened, the same pattern
+// DocsModal/CatalogueView use.
+const QRCode = lazy(() => import('react-qr-code'));
 import { SettingsModal } from './SettingsModal';
 import { DawImportModal } from './DawImportModal';
 import { ProjectModal } from './ProjectModal';
@@ -163,14 +172,15 @@ export const Shell: React.FC = () => {
   const detectedShareUrl =
     lanUrl || (typeof window === 'undefined' ? '' : backendHttpBase());
   const shareUrl = shareUrlOverride.trim() || detectedShareUrl;
-  const qrImageUrl = useMemo(
-    () => `https://api.qrserver.com/v1/create-qr-code/?size=220x220&margin=12&data=${encodeURIComponent(shareUrl)}`,
-    [shareUrl],
-  );
 
   // Phone-companion pairing. The host picks the posture (open LAN or a required
-  // code) before handing out the QR; the code rides the URL as ?pair=<code> so
-  // scanning auto-fills it. See docs/companion-control-contract.md.
+  // code) before handing out the QR; the code rides the URL as ?xrcode=<code>
+  // (T20 re-audit item 7 — was ?pair=, which collided in NAME, though never in
+  // code, with the unrelated LAN pairing token below that rides #pair=<token>
+  // in the URL fragment; RemoteGate's on-screen guidance told a user holding
+  // that token to paste it here, where it would silently fail as an XR
+  // posture code) so scanning auto-fills it. See
+  // docs/companion-control-contract.md.
   const [postureMode, setPostureMode] = React.useState<'open' | 'code'>('open');
   const [pairCode, setPairCode] = React.useState('');
   const [companionPeers, setCompanionPeers] = React.useState<XrPeer[]>([]);
@@ -181,19 +191,40 @@ export const Shell: React.FC = () => {
     setXrHostPosture({ mode: postureMode, code: postureMode === 'code' ? pairCode : null });
   }, [postureMode, pairCode]);
 
+  // T20 re-audit item 6: the LAN pairing token (backend/lib/pairing.py) was
+  // minted by the backend and consumed by frontend/src/lib/pairing.ts, but
+  // nothing in the UI ever fetched it or put it on a link — the companion
+  // link worked only because SEC-001's loopback/cross-site gate on phones
+  // reaching over a real LAN IP was never actually enforced end-to-end. This
+  // fetches it once (loopback-or-launch-token gated route, desktop-shell
+  // only) and appends it to the companion link as `#pair=<token>`, the URL
+  // FRAGMENT — never sent to any server or proxy log, per pairing.ts. A
+  // failed fetch (no backend yet, route gate rejected) must not break the
+  // existing companion link; it just ships without the LAN pairing token.
+  const [lanPairingToken, setLanPairingToken] = React.useState<string | null>(null);
+  React.useEffect(() => {
+    let cancelled = false;
+    void fetch('/api/pairing/token')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j: { token?: string } | null) => {
+        if (!cancelled && j?.token) setLanPairingToken(j.token);
+      })
+      .catch(() => {
+        /* no backend yet, or this isn't the desktop shell — companion link
+           still works, just without a LAN pairing token attached */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const companionUrl = useMemo(() => {
     const base = (shareUrl || '').replace(/\/+$/, '');
     if (!base) return '';
-    const q = postureMode === 'code' && pairCode ? `?pair=${pairCode}` : '';
-    return `${base}/mobile.html${q}`;
-  }, [shareUrl, postureMode, pairCode]);
-  const companionQrUrl = useMemo(
-    () =>
-      companionUrl
-        ? `https://api.qrserver.com/v1/create-qr-code/?size=220x220&margin=12&data=${encodeURIComponent(companionUrl)}`
-        : '',
-    [companionUrl],
-  );
+    const q = postureMode === 'code' && pairCode ? `?xrcode=${pairCode}` : '';
+    const fragment = lanPairingToken ? `#pair=${encodeURIComponent(lanPairingToken)}` : '';
+    return `${base}/mobile.html${q}${fragment}`;
+  }, [shareUrl, postureMode, pairCode, lanPairingToken]);
   const chooseCodePosture = () => {
     setPairCode((c) => c || Math.floor(1000 + Math.random() * 9000).toString());
     setPostureMode('code');
@@ -477,7 +508,9 @@ export const Shell: React.FC = () => {
             <div className="p-4 flex flex-col gap-4">
               <div className="flex justify-center">
                 <div className="p-3 rounded-lg bg-white shadow-[0_0_24px_rgba(16,185,129,0.16)]">
-                  <img src={qrImageUrl} alt="theDAW mobile access QR code" className="w-55 h-55" />
+                  <Suspense fallback={<div className="w-55 h-55" role="img" aria-label="theDAW mobile access QR code loading" />}>
+                    <QRCode value={shareUrl} size={220} title="theDAW mobile access QR code" />
+                  </Suspense>
                 </div>
               </div>
 
@@ -559,10 +592,12 @@ export const Shell: React.FC = () => {
                   </div>
                 )}
 
-                {companionQrUrl && (
+                {companionUrl && (
                   <div className="flex justify-center pt-1">
                     <div className="p-3 rounded-lg bg-white shadow-[0_0_24px_rgba(139,92,246,0.16)]">
-                      <img src={companionQrUrl} alt="theDAW phone companion QR code" className="w-44 h-44" />
+                      <Suspense fallback={<div className="w-44 h-44" role="img" aria-label="theDAW phone companion QR code loading" />}>
+                        <QRCode value={companionUrl} size={176} title="theDAW phone companion QR code" />
+                      </Suspense>
                     </div>
                   </div>
                 )}
