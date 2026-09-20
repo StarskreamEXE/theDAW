@@ -581,7 +581,13 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStreamApi {
             await fetch(endpoints.interrupt, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ conversationId: conversationIdRef.current }),
+                // Never `null`: the route rejects it outright (422) and the turn
+                // keeps running. The CLI session id lets the backend find the
+                // session when the conversation id is missing or stale.
+                body: JSON.stringify({
+                    conversationId: conversationIdRef.current ?? turnStateRef.current?.conversationId ?? undefined,
+                    claudeSessionId: sessionIdRef.current ?? undefined,
+                }),
             });
         } catch (err) {
             // The interrupt never reached the backend, so the turn is NOT being
@@ -599,6 +605,11 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStreamApi {
             // It must come off the TURN as well as off React state. Clearing only
             // the latter left the turn's own list intact, and the very next frame
             // republished the answered card.
+            // The request's OWN conversation id (stamped by the backend) wins over
+            // the hook's: that is the key its pending entry lives under.
+            const ownConversationId = turnStateRef.current?.pendingControls.find(
+                (c) => c.requestId === requestId,
+            )?.conversationId;
             if (turnStateRef.current) turnStateRef.current = dismissControl(turnStateRef.current, requestId);
             setPendingControls((prev) => prev.filter((c) => c.requestId !== requestId));
             try {
@@ -606,7 +617,8 @@ export function useChatStream(options: UseChatStreamOptions): UseChatStreamApi {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        conversationId: conversationIdRef.current,
+                        conversationId: ownConversationId ?? conversationIdRef.current ?? undefined,
+                        claudeSessionId: sessionIdRef.current ?? undefined,
                         requestId,
                         response,
                         scope,

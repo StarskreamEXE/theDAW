@@ -125,13 +125,15 @@ export function teardownPosts(
         body: relayResultBody(target.callId, DECLINED_RESULT, true, target.sessionId, ids),
     }));
 
-    if (ids.conversationId) {
-        const denial: ControlResponse = { behavior: 'deny', message: TURN_ENDED_DENIAL };
-        for (const control of state.pendingControls) {
+    const denial: ControlResponse = { behavior: 'deny', message: TURN_ENDED_DENIAL };
+    for (const control of state.pendingControls) {
+        // The control's own id (stamped by the backend) first; the hook's as a fallback.
+        const conversationId = control.conversationId ?? ids.conversationId;
+        if (conversationId) {
             posts.push({
                 endpoint: 'controlResponse',
                 body: {
-                    conversationId: ids.conversationId,
+                    conversationId,
                     requestId: control.requestId,
                     response: denial,
                     scope: 'once',

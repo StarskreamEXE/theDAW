@@ -174,10 +174,14 @@ def test_build_base_args_includes_fallback_model_only_when_given():
 @pytest.mark.parametrize(
     "mode,cli_mode",
     [
+        # G5 audit item 1 (CRITICAL): every mode maps to the CLI's "default"
+        # -- never acceptEdits/bypassPermissions, which make the CLI
+        # auto-approve tools itself with no control_request, bypassing
+        # decide() (and its self-modify rule) entirely.
         ("ask", "default"),
-        ("accept_edits", "acceptEdits"),
+        ("accept_edits", "default"),
         ("readonly", "default"),
-        ("trusted", "bypassPermissions"),
+        ("trusted", "default"),
     ],
 )
 def test_build_base_args_maps_permission_mode(mode, cli_mode):
@@ -350,6 +354,9 @@ def test_control_request_is_forwarded_and_answer_control_writes_exact_json(
         assert frame["request"]["tool_name"] == "Bash"
         request_id = frame["requestId"]
         assert request_id in cs.sessions["conv-ctl"].pending_controls
+        # The bubble names the key its pending entry lives under, so the browser
+        # answers under THAT id even when it reached this session by another one.
+        assert frame["conversationId"] == "conv-ctl"
 
         assert cs.answer_control("conv-ctl", request_id, {"behavior": "allow"}) is True
         # Answering it clears the pending entry, so a second answer is rejected.

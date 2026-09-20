@@ -62,6 +62,9 @@ export interface ControlPolicy {
  */
 export interface PendingControl {
     requestId: string;
+    /** The backend's own key for the session this request is pending on. The
+     *  answer goes back under it, not under whatever id the host holds. */
+    conversationId?: string;
     toolName: string;
     input: Record<string, unknown> | undefined;
     suggestions?: unknown[];

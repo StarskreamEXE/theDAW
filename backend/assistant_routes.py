@@ -52,7 +52,7 @@ from typing import Any, List, Optional
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 # Nothing here spawns a child any more: the two create_subprocess_exec calls
@@ -333,8 +333,13 @@ STABLE_AUDIO_SKILL_PATH = (
     Path(PROJECT_CWD) / ".claude" / "skills" / STABLE_AUDIO_SKILL_NAME / "SKILL.md"
 )
 
-CLAUDE_DEFAULT_MODEL = "claude-opus-4-6"
+# Ported from the VST Foundry's red orb
+# (VST-Foundry-UI/VST-UI-FOUNDRY/server/claude-bridge.ts, CLAUDE_DEFAULT_MODEL
+# L32). Read from that file, never from training memory - see the HARD RULE at
+# the top of this module.
+CLAUDE_DEFAULT_MODEL = "claude-opus-4-8"
 CLAUDE_FALLBACK_MODEL = "claude-sonnet-4-6"
+CLAUDE_HAIKU_FALLBACK_MODEL = "claude-haiku-4-5"
 CLAUDE_DEFAULT_EFFORT = "max"
 CLAUDE_VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 # Permission modes (contract C3). "ask" is the default and the only value the UI
@@ -346,6 +351,44 @@ REPO_ROOT = Path(PROJECT_CWD)
 # Fallback for the port handed to the per-session stdio MCP server when the
 # request carries no usable one (direct/internal callers, tests).
 DEFAULT_BACKEND_PORT = 8600
+
+# --- Live Claude model catalog ---------------------------------------------
+# The CLI provider's model list is fetched from Anthropic's /v1/models at
+# runtime; CLAUDE_MODELS below is the fallback and the capability source.
+# Credentials, in order: ANTHROPIC_API_KEY (x-api-key), the
+# CLAUDE_CODE_OAUTH_TOKEN environment variable, then the Claude Code login's
+# own token file. An OAuth token needs the Bearer + anthropic-beta pair; an api
+# key must NOT carry them.
+ANTHROPIC_MODELS_URL = "https://api.anthropic.com/v1/models"
+ANTHROPIC_API_VERSION = "2023-06-01"
+ANTHROPIC_OAUTH_BETA = "oauth-2025-04-20"
+ANTHROPIC_MODELS_PAGE_SIZE = 100
+# Guard against a server that never stops saying has_more.
+ANTHROPIC_MODELS_MAX_PAGES = 10
+ANTHROPIC_MODELS_TIMEOUT_S = 8.0
+# Module-level so a test can point it at a temp file; the real path is the
+# Claude Code login this machine already has. Its token is used but NEVER
+# logged, returned or put in an exception message.
+CLAUDE_CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
+CLAUDE_LIVE_MODELS_TTL_S = 600.0
+# Only successful fetches land here; a failure stays uncached so the next
+# request retries instead of pinning a transient outage for ten minutes.
+_CLAUDE_LIVE_MODELS_CACHE: dict[str, Any] = {"models": None, "fetched_at": 0.0}
+
+# The 1M-context variants EXACTLY as the Foundry lists them (claude-bridge.ts
+# ~L60-65): base id + "[1m]", label "<name> (1M context)". Appended only for
+# base ids that are actually in the list we are about to return.
+CLAUDE_1M_BASE_IDS: tuple[str, ...] = (
+    "claude-sonnet-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+)
+CLAUDE_1M_SUFFIX = "[1m]"
+# The families the Foundry's resolveClaudeModel recognises (claude-bridge.ts
+# L114).
+_CLAUDE_FAMILY_RE = re.compile(r"(?:^|claude-)(opus|sonnet|haiku)", re.IGNORECASE)
 
 # ---------------------------------------------------------------------------
 # Provider catalog
@@ -461,8 +504,13 @@ class ChatRequest(BaseModel):
     # validating; nothing reads it on the live path.
     claudeMode: Optional[str] = "interactive"
     # Permission mode for the Claude Code provider (contract C3). Validated at
-    # the /chat route, which answers 400 for anything outside CLAUDE_PERMISSION_MODES.
-    claude_permission_mode: Optional[str] = CLAUDE_DEFAULT_PERMISSION_MODE
+    # the /chat route, which answers 400 for anything OUTSIDE
+    # CLAUDE_PERMISSION_MODES. G5 round 3 item 5: defaults to None, not
+    # CLAUDE_DEFAULT_PERMISSION_MODE -- an omitted field must fall back to the
+    # session's OWN current mode (see _stream_claude), never silently reset
+    # an existing session back to the app default on every turn that simply
+    # doesn't resend it.
+    claude_permission_mode: Optional[str] = None
     claudeSessionId: Optional[str] = None
     assistantProfile: Optional[str] = (
         None  # e.g. "underfit" → load the underfit MCP for this session
@@ -500,12 +548,62 @@ def _resolve_claude_mode(req: ChatRequest) -> str:
     return req.claudeMode or "interactive"
 
 
+def _claude_model_family(model: str) -> str | None:
+    """The Claude family ("opus"/"sonnet"/"haiku") a model id belongs to."""
+    match = _CLAUDE_FAMILY_RE.search(model)
+    return match.group(1).lower() if match else None
+
+
+def _claude_newest_in_family(family: str, ids: list[str]) -> str | None:
+    """The newest full id of ``family`` in ``ids``.
+
+    "Newest" is list order, exactly like the Foundry's ``ids.find(...)``: the
+    static catalog is newest-first within each family and Anthropic returns its
+    own list newest-first. ``[1m]`` variants are skipped so an alias never
+    silently buys the 1M-context tier.
+    """
+    prefix = f"claude-{family}"
+    for candidate in ids:
+        if candidate.endswith(CLAUDE_1M_SUFFIX):
+            continue
+        if candidate.startswith(prefix):
+            return candidate
+    return None
+
+
 def _resolve_claude_model(req: ChatRequest) -> str:
-    """Resolve the actual Claude Code model, migrating old mode-as-model values."""
+    """Resolve the actual Claude Code model, migrating old mode-as-model values.
+
+    Ported from the Foundry's ``resolveClaudeModel``
+    (VST-Foundry-UI/VST-UI-FOUNDRY/server/claude-bridge.ts L109-120): pass
+    through an id that is in the current list, map a family alias or a stale
+    pinned id to the newest id of that family, and fall back to the default for
+    everything else. Last line before ``--model``, so the CLI never receives a
+    dead model id.
+
+    The list is the live catalog while its cache is warm, otherwise the static
+    one — the same list ``GET /models/claude`` serves, ``[1m]`` variants
+    included. The bare CLI aliases ("opus"/"sonnet"/"haiku") are checked BEFORE
+    the pass-through because theDAW's static catalog still carries them as
+    entries (removing a catalog entry is forbidden) and the CLI cannot be
+    trusted with them: on the Foundry's machine "sonnet" fell back to a stale
+    default and 404'd.
+    """
     model = (req.model or "").strip()
     if not model or model.startswith("claude-code-"):
         return CLAUDE_DEFAULT_MODEL
-    return model
+    ids = _claude_current_model_ids()
+    alias = model.lower()
+    if alias in ("opus", "sonnet", "haiku"):
+        return _claude_newest_in_family(alias, ids) or CLAUDE_DEFAULT_MODEL
+    if model in ids:
+        return model
+    family = _claude_model_family(model)
+    if family:
+        newest = _claude_newest_in_family(family, ids)
+        if newest:
+            return newest
+    return CLAUDE_DEFAULT_MODEL
 
 
 def _resolve_claude_effort(req: ChatRequest) -> str:
@@ -515,13 +613,26 @@ def _resolve_claude_effort(req: ChatRequest) -> str:
 
 
 def _claude_fallback_model(model: str) -> str | None:
-    fallbacks = {
-        "opus": "sonnet",
-        "claude-opus-4-6": CLAUDE_FALLBACK_MODEL,
-        "sonnet": "haiku",
-        "claude-sonnet-4-6": "claude-haiku-4-5",
-    }
-    return fallbacks.get(model)
+    """The model to retry with when ``model`` itself refuses to start.
+
+    Family-derived rather than a table of pinned ids, because the list the
+    resolver can return is no longer fixed: it may be whatever Anthropic's
+    /v1/models answered. Every opus (and every 1M-context opus) therefore has a
+    fallback, and the two ids it can name are permanent members of the static
+    catalog below, so a fallback is never a dead id.
+    """
+    aliases = {"opus": "sonnet", "sonnet": "haiku"}
+    if model in aliases:
+        return aliases[model]
+    base = (
+        model[: -len(CLAUDE_1M_SUFFIX)] if model.endswith(CLAUDE_1M_SUFFIX) else model
+    )
+    family = _claude_model_family(base)
+    if family == "opus":
+        return CLAUDE_FALLBACK_MODEL
+    if family == "sonnet":
+        return CLAUDE_HAIKU_FALLBACK_MODEL
+    return None
 
 
 def _format_claude_rag_context(rag_chunks: list[dict]) -> str:
@@ -811,8 +922,16 @@ _stable_audio_skill_bootstrapped_sessions: set[str] = set()
 
 
 def _resolve_claude_permission_mode(req: ChatRequest) -> Optional[str]:
-    """Validated permission mode, or ``None`` when the client sent an unknown one."""
-    raw = (req.claude_permission_mode or CLAUDE_DEFAULT_PERMISSION_MODE).strip()
+    """The client's EXPLICITLY requested, validated permission mode.
+
+    Returns ``None`` both when the field was omitted and when it holds an
+    unrecognized value -- callers on the live turn path (``_stream_claude``)
+    treat ``None`` as "fall back to the session's own mode", which is correct
+    for an omission. ``chat_stream``'s own 400 guard distinguishes a
+    an actually invalid non-empty value from an omission BEFORE this is called
+    on that path, so the two ``None`` cases never get conflated there.
+    """
+    raw = (req.claude_permission_mode or "").strip()
     return raw if raw in CLAUDE_PERMISSION_MODES else None
 
 
@@ -1004,16 +1123,25 @@ def _last_user_text(messages: List[ChatMessage]) -> tuple[str, int]:
     return "", -1
 
 
+def _latest_client_system_text(messages: list) -> str:
+    """The newest ``system`` message the BROWSER sent with this turn: its app
+    context (current tab, selection, project state). Empty when it sent none."""
+    for msg in reversed(messages or []):
+        if getattr(msg, "role", None) == "system":
+            return _extract_text(msg.content).strip()
+    return ""
+
+
 def _build_claude_turn_texts(req: ChatRequest, permission_mode: str) -> tuple[str, str]:
     """
     Build ``(turn_text, seed_text)`` — the Foundry's ``buildClaudePrompt`` resume
     semantics.
 
     ``seed_text`` is written on the FIRST turn of a fresh child; ``turn_text`` on
-    every later turn of that warm child, carrying ONLY the new user message
-    (which already has the frontend's fresh ``<current_app_context>``) plus this
-    turn's attachments. The child remembers the rest, so resending it is pure
-    token burn.
+    every later turn of that warm child, carrying ONLY what is new: the
+    frontend's fresh app context (its ``system`` message), the new user message
+    and this turn's attachments. The child remembers the rest, so resending it
+    is pure token burn.
 
     The seed's ORDER is a correctness requirement, not formatting. It is, in
     order: the system block, the retrieved docs under an explicit
@@ -1034,8 +1162,14 @@ def _build_claude_turn_texts(req: ChatRequest, permission_mode: str) -> tuple[st
     attachments = _claude_attachments_block(staged)
     last_user, last_index = _last_user_text(req.messages)
 
-    # Warm child: the bare message, exactly as before.
+    # Warm child: only what is new this turn, the request last. The app context
+    # arrives as the browser's own `system` message, NOT inside the user message,
+    # so forwarding the bare message dropped it: from the second turn on the model
+    # never saw which tab, selection or project the user was looking at.
+    app_context = _latest_client_system_text(req.messages)
     turn_body = attachments + last_user
+    if turn_body.strip() and app_context:
+        turn_body = f"{app_context}\n\n{SEED_REQUEST_HEADER}\n{turn_body}"
     turn_text = f"{turn_body}\n\n{mode_line}" if turn_body.strip() else ""
 
     sections: list[str] = []
@@ -1084,13 +1218,31 @@ async def _stream_claude(req: ChatRequest, request: Optional[Request]):
     """
     model = _resolve_claude_model(req)
     effort = _resolve_claude_effort(req)
-    permission_mode = (
-        _resolve_claude_permission_mode(req) or CLAUDE_DEFAULT_PERMISSION_MODE
-    )
     conversation_id = (req.conversationId or req.claudeSessionId or "").strip()
     if not conversation_id:
         conversation_id = str(uuid.uuid4())
-        yield _sse_frame({"type": "conversationId", "conversationId": conversation_id})
+
+    # G5 round 3 item 5 (mirrors the Foundry's own item 5): resolve any live
+    # session BEFORE computing permission_mode below, so an OMITTED
+    # claude_permission_mode falls back to the session's OWN current mode --
+    # never to CLAUDE_DEFAULT_PERMISSION_MODE. A turn that simply doesn't
+    # resend the mode (the client's dropdown state didn't change) must not
+    # respawn an already-correctly-configured session back to the app
+    # default; claude_session.stream_turn's own dispatch-time comparison
+    # (`session.permission_mode != permission_mode`) would otherwise treat
+    # that as a real mode change and respawn for no reason.
+    warm = await claude_session.resolve_live(conversation_id, req.claudeSessionId)
+    if warm is not None:
+        # A turn addressed by Claude's own session id resolves through the alias;
+        # the session's own key is the only one its pending controls, its relay
+        # and the lookups below live under.
+        conversation_id = warm.conversation_id
+
+    permission_mode = (
+        _resolve_claude_permission_mode(req)
+        or (warm.permission_mode if warm is not None else None)
+        or CLAUDE_DEFAULT_PERMISSION_MODE
+    )
 
     turn_text, seed_text = _build_claude_turn_texts(req, permission_mode)
     if not turn_text.strip():
@@ -1109,11 +1261,18 @@ async def _stream_claude(req: ChatRequest, request: Optional[Request]):
     # starts. A cold one is spawned inside stream_turn; its relay is wired on the
     # first frame it yields — which is the CLI's `system/init`, i.e. strictly
     # before the MCP child has finished connecting, let alone issued a tools/call.
-    warm = await claude_session.resolve_live(conversation_id, req.claudeSessionId)
     if warm is not None:
         relay_id = warm.relay_id
         relay_registry.register(relay_id, _claude_relay_writer(warm))
         _alias_claude_relay(warm, aliased)
+
+    # Announce the key on EVERY turn. /chat fills req.conversationId in whenever
+    # the browser sent none, so "announce only when minted here" never fired: the
+    # browser kept no id at all, and every approval, Stop and permission-mode
+    # change went out with `null` and was refused (422) while the CLI sat blocked
+    # on an answer that never came. The frame reducer ignores an id it already
+    # holds, so this costs nothing.
+    yield _sse_frame({"type": "conversationId", "conversationId": conversation_id})
 
     agen = claude_session.stream_turn(
         conversation_id,
@@ -1177,20 +1336,50 @@ async def _stream_claude(req: ChatRequest, request: Optional[Request]):
 # ---------------------------------------------------------------------------
 
 
+# ``conversationId`` is optional on every control-plane request, and the Claude
+# CLI session id rides along. A host that had lost its conversation id used to
+# send ``null``: the body failed validation (422) before the route ran, so an
+# approved tool call never reached the CLI and Stop did nothing. The id a browser
+# holds is also not always the key the session lives under (a chat can reach a
+# live session through its Claude session id). ``_live_claude_session`` resolves
+# both cases the way ``stream_turn`` canonicalises a chat request.
 class ControlResponseRequest(BaseModel):
-    conversationId: str
+    conversationId: Optional[str] = None
+    claudeSessionId: Optional[str] = None
     requestId: str
     response: dict
     scope: Optional[str] = "once"
 
 
 class PermissionModeRequest(BaseModel):
-    conversationId: str
+    conversationId: Optional[str] = None
+    claudeSessionId: Optional[str] = None
     mode: str
 
 
 class InterruptRequest(BaseModel):
-    conversationId: str
+    conversationId: Optional[str] = None
+    claudeSessionId: Optional[str] = None
+
+
+class ContextUsageRequest(BaseModel):
+    conversationId: Optional[str] = None
+    claudeSessionId: Optional[str] = None
+
+
+def _live_claude_session(
+    conversation_id: Optional[str], claude_session_id: Optional[str] = None
+) -> Optional["claude_session.ClaudeSession"]:
+    """The live session a control-plane request is about: by conversation id,
+    failing that by the Claude CLI session id."""
+    cid = (conversation_id or "").strip()
+    session = claude_session.sessions.get(cid) if cid else None
+    if session is None:
+        sid = (claude_session_id or "").strip()
+        mapped = claude_session.sid_to_conversation.get(sid) if sid else None
+        if mapped:
+            session = claude_session.sessions.get(mapped)
+    return session
 
 
 @router.post("/control-response")
@@ -1202,22 +1391,35 @@ async def claude_control_response(payload: ControlResponseRequest):
     conversation is refused with 403, so one open tab can never approve another
     conversation's tool call.
     """
-    conversation_id = (payload.conversationId or "").strip()
     request_id = (payload.requestId or "").strip()
-    if not conversation_id or not request_id:
-        raise HTTPException(400, "conversationId and requestId are required")
+    if not request_id:
+        raise HTTPException(400, "requestId is required")
 
-    session = claude_session.sessions.get(conversation_id)
+    owner = next(
+        (
+            live
+            for live in claude_session.sessions.values()
+            if request_id in live.pending_controls
+        ),
+        None,
+    )
+    session = _live_claude_session(payload.conversationId, payload.claudeSessionId)
+    if session is None:
+        # No key that names a live session. The request id is only ever sent down
+        # the owning conversation's own stream, so holding it identifies the
+        # conversation; a caller that named a DIFFERENT live one is still refused
+        # below.
+        session = owner
     if session is None:
         raise HTTPException(404, "unknown conversation")
+    conversation_id = session.conversation_id
 
     entry = session.pending_controls.get(request_id)
     if entry is None:
-        for other in claude_session.sessions.values():
-            if other is not session and request_id in other.pending_controls:
-                raise HTTPException(
-                    403, "requestId is pending for a different conversation"
-                )
+        if owner is not None and owner is not session:
+            raise HTTPException(
+                403, "requestId is pending for a different conversation"
+            )
         raise HTTPException(404, "unknown or already-answered requestId")
 
     response = payload.response or {}
@@ -1225,8 +1427,30 @@ async def claude_control_response(payload: ControlResponseRequest):
     if behavior not in ("allow", "deny"):
         raise HTTPException(400, "response.behavior must be 'allow' or 'deny'")
 
-    tool_name, tool_input = _control_request_identity(entry.get("request") or {})
+    entry_request = entry.get("request") or {}
+    tool_name, tool_input = _control_request_identity(entry_request)
     key = _deny_key(tool_name, tool_input)
+
+    # G5 round 4 item 4 (MINOR): forward via an ALLOWLIST, not a
+    # strip-one-key blacklist (the round-3 fix only stripped
+    # `updatedPermissions` for a can_use_tool answer). `behavior`/`message`/
+    # `updatedInput` are the entire vocabulary either answer shape ever
+    # legitimately uses -- a permission prompt: `{behavior, updatedInput?,
+    # message?}`; an AskUserQuestion submit: `{behavior:"allow",
+    # updatedInput:{questions, answers}}`. Anything else the client sends
+    # (`updatedPermissions` included) is dropped UNCONDITIONALLY, for every
+    # answer type -- the orb's "Allow for session" sends `control.suggestions`
+    # as `updatedPermissions`; a live proof showed that a CLI-side allow rule
+    # built from it suppresses can_use_tool ENTIRELY for whatever it covers,
+    # so the policy hook above (and its never-remember self-modify rule)
+    # stops running for those calls -- a second, ungoverned enforcement path
+    # outside the app's own session_allow / deny-count / self-modify state.
+    # An allowlist also means a NEW permission-carrying field the CLI grows
+    # later is excluded by default, not forwarded by default.
+    _ALLOWED_CONTROL_RESPONSE_KEYS = {"behavior", "message", "updatedInput"}
+    forwarded_response = {
+        k: v for k, v in response.items() if k in _ALLOWED_CONTROL_RESPONSE_KEYS
+    }
 
     # CLAIM the bubble before touching any policy state. answer_control pops the
     # pending entry and writes to the CLI; if it fails — the entry was already
@@ -1234,7 +1458,9 @@ async def claude_control_response(payload: ControlResponseRequest):
     # nothing was delivered, so nothing may be remembered. Counting a denial the
     # model never received would walk the user toward the automatic
     # "declined 3x — not asking again" rule on an answer that went nowhere.
-    if not claude_session.answer_control(conversation_id, request_id, response):
+    if not claude_session.answer_control(
+        conversation_id, request_id, forwarded_response
+    ):
         raise HTTPException(409, "could not deliver the answer to the Claude CLI")
 
     if behavior == "deny":
@@ -1261,9 +1487,14 @@ async def claude_permission_mode(payload: PermissionModeRequest):
     """
     Switch a live session's permission mode.
 
-    The app-side policy changes IMMEDIATELY (that is what governs every
-    ``can_use_tool`` from here on); the CLI is told as well so its own view of
-    the mode matches.
+    The app-side policy changes IMMEDIATELY -- that is what governs every
+    ``can_use_tool`` from here on, since ``decide()`` (permissions.py) is the
+    SOLE authority on the verdict. The CLI is told as well (a
+    ``set_permission_mode`` control_request), but that is now purely
+    informational bookkeeping: every theDAW mode maps to the CLI's own
+    "default" ``--permission-mode`` (see ``CLI_PERMISSION_MODES``' comment),
+    so the CLI's "own view of the mode" never actually changes what it asks
+    for -- it always asks the host for every non-baseline tool regardless.
     """
     mode = (payload.mode or "").strip()
     if mode not in CLAUDE_PERMISSION_MODES:
@@ -1272,10 +1503,10 @@ async def claude_permission_mode(payload: PermissionModeRequest):
             f"unknown permission mode {payload.mode!r}; "
             f"valid: {', '.join(CLAUDE_PERMISSION_MODES)}",
         )
-    conversation_id = (payload.conversationId or "").strip()
-    session = claude_session.sessions.get(conversation_id)
+    session = _live_claude_session(payload.conversationId, payload.claudeSessionId)
     if session is None:
         raise HTTPException(404, "unknown conversation")
+    conversation_id = session.conversation_id
 
     session.permission_mode = mode
     cli_mode = permissions.cli_permission_mode(mode)
@@ -1290,13 +1521,82 @@ async def claude_permission_mode(payload: PermissionModeRequest):
     }
 
 
+def _first_number(source: dict, *keys: str) -> float | None:
+    """The first of ``keys`` present in ``source`` holding a real number."""
+    for key in keys:
+        value = source.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            return float(value)
+    return None
+
+
+def _parse_context_usage(answer: Any) -> dict | None:
+    """Normalise a ``get_context_usage`` answer, or None when it is unusable.
+
+    The CLI answers ``{subtype, request_id, response:{totalTokens, maxTokens,
+    percentage}}`` and is inconsistent about case, so both spellings are
+    accepted (the Foundry's parser does the same in
+    ``src/components/orb/useChatStream.ts`` ~L124-129). ``percentage`` is
+    normalised to the contract's 0-100: a value at or below 1 is read as a
+    fraction and scaled, exactly like the Foundry's ``getContextPercentage``.
+    """
+    if not isinstance(answer, dict) or answer.get("subtype") != "success":
+        return None
+    usage = answer.get("response")
+    if not isinstance(usage, dict):
+        return None
+    percentage = _first_number(usage, "percentage")
+    if percentage is None:
+        return None
+    if percentage <= 1.0:
+        percentage *= 100.0
+    percentage = min(100.0, max(0.0, percentage))
+    return {
+        "totalTokens": int(_first_number(usage, "totalTokens", "total_tokens") or 0),
+        "maxTokens": int(_first_number(usage, "maxTokens", "max_tokens") or 0),
+        "percentage": round(percentage, 4),
+    }
+
+
+@router.post("/context-usage")
+async def claude_context_usage(payload: ContextUsageRequest):
+    """
+    The live CLI's REAL context-window usage, for the orb's context meter.
+
+    Asks the persistent child over the same control channel
+    ``/permission-mode`` uses. The CLI answers between turns as well as during
+    one, so the meter can be refreshed whenever the panel wants it. When the
+    child says nothing usable the meter keeps whatever it had: this answers 504
+    rather than inventing a reading.
+    """
+    session = _live_claude_session(payload.conversationId, payload.claudeSessionId)
+    if session is None:
+        raise HTTPException(404, "unknown conversation")
+    conversation_id = session.conversation_id
+    answer = await claude_session.send_control_request(
+        conversation_id, {"subtype": "get_context_usage"}
+    )
+    usage = _parse_context_usage(answer)
+    if usage is None:
+        return JSONResponse(
+            status_code=504,
+            content={
+                "ok": False,
+                "error": "the Claude CLI did not report its context usage",
+            },
+        )
+    return {"ok": True, "usage": usage}
+
+
 @router.post("/interrupt")
 async def claude_interrupt(payload: InterruptRequest):
     """Interrupt the running turn over stdin. The child is NOT killed."""
-    conversation_id = (payload.conversationId or "").strip()
-    if conversation_id not in claude_session.sessions:
+    session = _live_claude_session(payload.conversationId, payload.claudeSessionId)
+    if session is None:
         raise HTTPException(404, "unknown conversation")
-    return {"ok": bool(claude_session.interrupt(conversation_id))}
+    return {"ok": bool(claude_session.interrupt(session.conversation_id))}
 
 
 @mcp_relay_router.get("/api/mcp-relay/tools")
@@ -1879,10 +2179,31 @@ async def _stream_anthropic(req: ChatRequest, request: Request):
 # Capability metadata for model discovery
 # ---------------------------------------------------------------------------
 
+# The Claude Code (BCC) catalog. This is BOTH the fallback for the live
+# /v1/models fetch and the capability source for whatever that fetch returns.
+# Ordered newest-first WITHIN each family, because _claude_newest_in_family
+# reads list order as recency (the Foundry does the same in claude-bridge.ts
+# ~L51-66, where these ids come from). Entries are ADDED here, never removed or
+# renamed - see the HARD RULE at the top of this module.
 CLAUDE_MODELS = [
     {
         "id": "claude-fable-5",
         "name": "Claude Fable 5",
+        "capabilities": ["tools", "reasoning", "vision", "code", "long_context"],
+    },
+    {
+        "id": "claude-sonnet-5",
+        "name": "Claude Sonnet 5",
+        "capabilities": ["tools", "reasoning", "vision", "code", "long_context"],
+    },
+    {
+        "id": "claude-opus-4-8",
+        "name": "Claude Opus 4.8",
+        "capabilities": ["tools", "reasoning", "vision", "code", "long_context"],
+    },
+    {
+        "id": "claude-opus-4-7",
+        "name": "Claude Opus 4.7",
         "capabilities": ["tools", "reasoning", "vision", "code", "long_context"],
     },
     {
@@ -2642,6 +2963,163 @@ async def _fetch_anthropic_models(api_key: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Live Claude Code (BCC) model catalog
+# ---------------------------------------------------------------------------
+
+
+def _claude_login_token() -> str:
+    """The Claude Code login's OAuth access token, or "" when there is none.
+
+    Reads ``claudeAiOauth.accessToken`` out of the CLI's own credentials file.
+    An entry whose ``expiresAt`` (milliseconds) is already in the past is
+    skipped: sending it would only earn a 401. The token itself is never
+    logged, returned or interpolated into an error.
+    """
+    try:
+        raw = CLAUDE_CREDENTIALS_PATH.read_text(encoding="utf-8")
+        oauth = (json.loads(raw) or {}).get("claudeAiOauth") or {}
+    except Exception:
+        return ""
+    if not isinstance(oauth, dict):
+        return ""
+    token = str(oauth.get("accessToken") or "").strip()
+    if not token:
+        return ""
+    expires_at = oauth.get("expiresAt")
+    if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool):
+        if expires_at / 1000.0 <= time.time():
+            logger.info("[AssistantModels] Claude Code login token has expired")
+            return ""
+    return token
+
+
+def _anthropic_models_headers() -> dict[str, str] | None:
+    """Headers for /v1/models, or None when this machine has no credential."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if api_key:
+        return {"x-api-key": api_key, "anthropic-version": ANTHROPIC_API_VERSION}
+    token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    if not token:
+        token = _claude_login_token()
+    if not token:
+        return None
+    return {
+        "Authorization": f"Bearer {token}",
+        "anthropic-version": ANTHROPIC_API_VERSION,
+        "anthropic-beta": ANTHROPIC_OAUTH_BETA,
+    }
+
+
+async def _fetch_claude_live_models() -> list[dict]:
+    """Every model Anthropic lists for this credential, newest first.
+
+    Follows the endpoint's ``has_more`` / ``after_id`` pagination. Raises on
+    anything that is not a complete answer; the caller falls back to the static
+    catalog. Nothing derived from the credential ever reaches the exception.
+    """
+    headers = _anthropic_models_headers()
+    if headers is None:
+        raise ValueError("no Anthropic credential available")
+
+    models: list[dict] = []
+    after_id: str | None = None
+    async with httpx.AsyncClient(timeout=ANTHROPIC_MODELS_TIMEOUT_S) as client:
+        for _page in range(ANTHROPIC_MODELS_MAX_PAGES):
+            params: dict[str, Any] = {"limit": ANTHROPIC_MODELS_PAGE_SIZE}
+            if after_id:
+                params["after_id"] = after_id
+            resp = await client.get(
+                ANTHROPIC_MODELS_URL, headers=headers, params=params
+            )
+            if resp.status_code != 200:
+                raise ValueError(f"HTTP {resp.status_code} from the models endpoint")
+            payload = resp.json() or {}
+            for m in payload.get("data") or []:
+                mid = str((m or {}).get("id") or "").strip()
+                if not mid:
+                    continue
+                models.append(
+                    {
+                        "id": mid,
+                        "name": str(m.get("display_name") or mid).strip() or mid,
+                    }
+                )
+            if not payload.get("has_more"):
+                break
+            after_id = payload.get("last_id")
+            if not after_id:
+                break
+
+    if not models:
+        raise ValueError("the models endpoint returned an empty list")
+    return models
+
+
+async def _claude_live_models() -> list[dict] | None:
+    """The live catalog (cached for ten minutes), or None when unavailable."""
+    cached = _CLAUDE_LIVE_MODELS_CACHE.get("models")
+    age = time.time() - float(_CLAUDE_LIVE_MODELS_CACHE.get("fetched_at") or 0.0)
+    if cached is not None and age < CLAUDE_LIVE_MODELS_TTL_S:
+        return [dict(m) for m in cached]
+    try:
+        models = await _fetch_claude_live_models()
+    except Exception as exc:
+        # Only the exception TYPE: an httpx error can carry the request it was
+        # raised for, and no credential-shaped string may ever reach a log.
+        logger.info(
+            "[AssistantModels] live Claude catalog unavailable (%s); "
+            "serving the static one",
+            type(exc).__name__,
+        )
+        return None
+    _enrich_anthropic_models(models)
+    _CLAUDE_LIVE_MODELS_CACHE["models"] = models
+    _CLAUDE_LIVE_MODELS_CACHE["fetched_at"] = time.time()
+    return [dict(m) for m in models]
+
+
+def _with_claude_1m_variants(models: list[dict]) -> list[dict]:
+    """Append the Foundry's ``[1m]`` variants for base ids that are present."""
+    by_id = {m.get("id"): m for m in models}
+    result = list(models)
+    for base_id in CLAUDE_1M_BASE_IDS:
+        base = by_id.get(base_id)
+        if base is None:
+            continue
+        result.append(
+            {
+                "id": f"{base_id}{CLAUDE_1M_SUFFIX}",
+                "name": f"{base.get('name') or base_id} (1M context)",
+                "capabilities": list(base.get("capabilities") or []),
+            }
+        )
+    return result
+
+
+async def _claude_model_catalog() -> tuple[list[dict], str]:
+    """``(models, source)`` for the Claude Code provider, ``[1m]`` included."""
+    live = await _claude_live_models()
+    base = live if live is not None else [dict(m) for m in CLAUDE_MODELS]
+    return _with_claude_1m_variants(base), ("live" if live is not None else "static")
+
+
+def _claude_current_model_ids() -> list[str]:
+    """The ids the model list would serve right now, without any HTTP.
+
+    The live catalog while its cache is warm, the static one otherwise — the
+    resolver must never block a chat turn on a network call.
+    """
+    cached = _CLAUDE_LIVE_MODELS_CACHE.get("models")
+    age = time.time() - float(_CLAUDE_LIVE_MODELS_CACHE.get("fetched_at") or 0.0)
+    base = (
+        cached
+        if cached is not None and age < CLAUDE_LIVE_MODELS_TTL_S
+        else CLAUDE_MODELS
+    )
+    return [m["id"] for m in _with_claude_1m_variants(list(base))]
+
+
+# ---------------------------------------------------------------------------
 # Route: provider catalog
 # ---------------------------------------------------------------------------
 
@@ -2656,8 +3134,22 @@ async def reindex_rag():
 
 @router.get("/providers")
 async def get_providers():
-    """Return the provider catalog for frontend dropdowns."""
-    result = []
+    """Return the provider catalog for frontend dropdowns.
+
+    Claude Code (CLI-based, always available) comes FIRST and is labelled
+    exactly as the Foundry labels it
+    (VST-Foundry-UI/VST-UI-FOUNDRY/server/routes.ts ~L146-163) — it is the
+    provider the orb is built around, so it is the one the dropdown opens on.
+    """
+    result = [
+        {
+            "id": "claude",
+            "label": "BCC (Better Claude Code)",
+            "default_model": CLAUDE_DEFAULT_MODEL,
+            "has_key": True,
+            "is_local": False,
+        }
+    ]
     for pid, cfg in PROVIDERS.items():
         has_key = True
         result.append(
@@ -2669,16 +3161,6 @@ async def get_providers():
                 "is_local": cfg["base_url"].startswith("http://localhost"),
             }
         )
-    # Claude Code (CLI-based, always available)
-    result.append(
-        {
-            "id": "claude",
-            "label": "Claude Code",
-            "default_model": CLAUDE_DEFAULT_MODEL,
-            "has_key": True,
-            "is_local": False,
-        }
-    )
     return {"providers": result}
 
 
@@ -2693,8 +3175,13 @@ async def get_provider_models(provider_id: str):
     cfg = PROVIDERS.get(provider_id)
 
     # --- Claude Code (CLI-based) ---
+    # The catalog is fetched LIVE from Anthropic and cached for ten minutes;
+    # ``source`` tells the UI which list it is looking at. Any failure (no
+    # credential, non-200, timeout, bad JSON) serves the static catalog
+    # instead, which is a normal state on a machine with no credential — not an
+    # error the UI should shout about, so ``error`` stays None.
     if provider_id == "claude":
-        models = [dict(m) for m in CLAUDE_MODELS]  # shallow copy
+        models, source = await _claude_model_catalog()
         return {
             "models": models,
             "model_ids": [m["id"] for m in models],
@@ -2702,6 +3189,7 @@ async def get_provider_models(provider_id: str):
             "note": "Set claudeMode in chat request. interactive/persistent keep one warm "
             "Claude Code stream-json process; resume/oneshot spawn per message.",
             "error": None,
+            "source": source,
         }
 
     if not cfg:
@@ -2928,8 +3416,17 @@ async def chat_stream(req: ChatRequest, request: Request):
 
     # Reject an unknown permission mode BEFORE any work: permissions.decide()
     # raises on one, and a silent fallback to "ask" would hide a client bug that
-    # the user would read as "the mode dropdown does nothing".
-    if provider == "claude" and _resolve_claude_permission_mode(req) is None:
+    # the user would read as "the mode dropdown does nothing". Checked against
+    # the RAW field, not _resolve_claude_permission_mode's result (G5 item 5) --
+    # that function now returns None for BOTH an omitted field (valid; falls
+    # back to the session's own mode) and an invalid one (a real client bug),
+    # so only the raw, non-empty-but-unrecognized case may 400 here.
+    _raw_claude_mode = (req.claude_permission_mode or "").strip()
+    if (
+        provider == "claude"
+        and _raw_claude_mode
+        and _raw_claude_mode not in CLAUDE_PERMISSION_MODES
+    ):
         raise HTTPException(
             400,
             f"unknown claude_permission_mode {req.claude_permission_mode!r}; "

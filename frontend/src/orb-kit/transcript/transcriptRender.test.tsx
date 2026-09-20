@@ -157,4 +157,102 @@ function transcript(props: Partial<React.ComponentProps<typeof Transcript>> = {}
     assert.match(markup, /aria-label="Retry this turn"/);
 }
 
+// ---------------------------------------------------------------------------
+// T2 — the bubble formats prose the way the Foundry's orb does
+//
+// The old renderer hung `prose prose-invert prose-sm …` on the container, and
+// `@tailwindcss/typography` is not installed here, so every one of those
+// classes compiled to nothing while preflight flattened the markup underneath.
+// These assertions are about the markup that replaced it.
+// ---------------------------------------------------------------------------
+
+const RICH = [
+    '# Heading',
+    '',
+    '- one',
+    '- two',
+    '',
+    '| a | b |',
+    '| --- | --- |',
+    '| 1 | 2 |',
+    '',
+    'call `npm test` first',
+    '',
+    '```ts',
+    'const a = 1;',
+    '```',
+    '',
+    '> quoted',
+    '',
+    '---',
+    '',
+    '[docs](https://example.com)',
+].join('\n');
+
+{
+    const markup = transcript({
+        isStreaming: false,
+        messages: [{ id: 'm1', role: 'assistant', text: RICH, timestamp: 0 }],
+    });
+
+    // The prose container the stylesheet targets. No `prose-*` no-ops left.
+    assert.match(markup, /class="assistant-prose"/);
+    assert.doesNotMatch(markup, /prose-invert/, 'the typography-plugin classes are gone');
+
+    // Every block the ticket names comes out as a real element.
+    assert.match(markup, /<h1>Heading<\/h1>/);
+    assert.match(markup, /<ul><li>one<\/li><li>two<\/li><\/ul>/);
+    assert.match(markup, /<table><thead><tr><th>a<\/th>/);
+    assert.match(markup, /<blockquote>quoted<\/blockquote>/);
+    assert.match(markup, /<hr\/>/);
+    assert.match(markup, /<pre><code class="language-ts">/);
+    assert.match(markup, /<a href="https:\/\/example.com" target="_blank" rel="noopener noreferrer">docs<\/a>/);
+
+    // theDAW's two extras on top of the copy.
+    assert.match(markup, /aria-label="Copy code block"/, 'the hover Copy-code button survives the swap');
+    assert.match(markup, /<code title="Click to copy">npm test<\/code>/, 'inline click-to-copy is restored');
+}
+
+// The HTML is injected, so the render layer gets its own inertness check.
+{
+    const markup = transcript({
+        isStreaming: false,
+        messages: [
+            {
+                id: 'm1',
+                role: 'assistant',
+                text: '<script>alert(1)</script> and [x](javascript:alert(1))',
+                timestamp: 0,
+            },
+        ],
+    });
+    assert.doesNotMatch(markup, /<script/i);
+    assert.doesNotMatch(markup, /javascript:/i);
+    assert.match(markup, /href="#"/);
+}
+
+// Bubble structure: the speaker column's caption, and pre-line user text.
+{
+    const markup = transcript({
+        isStreaming: false,
+        messages: [
+            { id: 'm1', role: 'user', text: 'line one\nline two', timestamp: 0 },
+            { id: 'm2', role: 'assistant', text: 'ok', timestamp: 0 },
+        ],
+    });
+    assert.match(markup, /GANTASMO/, 'the assistant avatar carries the Foundry caption');
+    assert.match(markup, /whitespace-pre-line/, 'user text keeps its line breaks');
+    // Foundry bubble metrics: 12px radius with a 4px tail on the speaker's side.
+    assert.match(markup, /rounded-xl rounded-br-sm/, 'user bubble tails bottom-right');
+    assert.match(markup, /rounded-xl rounded-bl-sm/, 'assistant bubble tails bottom-left');
+    assert.match(markup, /max-w-\[85%\]/);
+}
+
+// The live row carries the Foundry's blinking caret, not a Tailwind pulse bar.
+{
+    const markup = transcript({ isStreaming: true, liveText: 'thinking out loud' });
+    assert.match(markup, /class="assistant-prose__cursor"/);
+    assert.doesNotMatch(markup, /animate-pulse/);
+}
+
 console.log('transcript render regression passed');

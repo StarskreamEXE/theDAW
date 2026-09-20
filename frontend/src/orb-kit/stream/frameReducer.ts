@@ -261,6 +261,7 @@ export function reduceFrame(state: TurnState, frame: unknown, ctx: ReduceContext
             }
             const control: PendingControl = {
                 requestId,
+                conversationId: str(frame.conversationId) || next.conversationId || undefined,
                 toolName: str(request.tool_name) || 'tool',
                 input: isRecord(request.input) ? request.input : undefined,
                 suggestions: Array.isArray(request.permission_suggestions)
