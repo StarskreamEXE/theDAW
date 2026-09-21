@@ -1,10 +1,13 @@
 """T23 DEAD CODE (batch 12) -- moved modules stay moved, dead exports stay gone.
 
 ``deprecated/`` (repo root) is git-ignored (see ``.gitignore``), so it will
-not exist on a fresh clone/CI checkout -- mirroring the discipline in
-``tests/test_suno_promote_b12.py::test_the_legacy_ingest_script_moved_to_deprecated``,
-these assertions only check that the OLD path is gone, never that a
-git-ignored new path exists.
+not exist on a fresh clone/CI checkout: these assertions only check that the
+OLD path is gone, never that a git-ignored new path exists.
+
+``scripts/ingest_suno_cache.py`` is deliberately NOT in that list. It was
+retired here when a staged importer superseded it, but that importer does not
+ship, so the script -- which the user guide documents -- is back, byte-identical
+to upstream's. ``test_the_documented_suno_ingest_script_ships`` pins that.
 
 ``backend/deprecated/`` is explicitly un-ignored (``!backend/deprecated/``
 in ``.gitignore``), so files moved there ARE tracked and DO exist on a
@@ -43,7 +46,7 @@ OLD_ASSISTANT_BRIDGE_STORE = (
 OLD_STORAGE_QUOTA_STORE = (
     REPO_ROOT / "frontend" / "src" / "state" / "storageQuotaStore.ts"
 )
-OLD_INGEST_SCRIPT = REPO_ROOT / "scripts" / "ingest_suno_cache.py"
+INGEST_SCRIPT = REPO_ROOT / "scripts" / "ingest_suno_cache.py"
 
 OLD_MODEL_REGISTRY = REPO_ROOT / "backend" / "core" / "model_registry.py"
 NEW_MODEL_REGISTRY = REPO_ROOT / "backend" / "deprecated" / "model_registry.py"
@@ -68,14 +71,28 @@ DEAD_EXPORT_FILES = {
 }
 
 
-def test_the_four_previously_moved_files_are_absent_from_their_old_locations() -> None:
+def test_the_three_previously_moved_files_are_absent_from_their_old_locations() -> None:
     for old_path in (
         OLD_WAVEFORM_PREVIEW,
         OLD_ASSISTANT_BRIDGE_STORE,
         OLD_STORAGE_QUOTA_STORE,
-        OLD_INGEST_SCRIPT,
     ):
         assert not old_path.exists(), f"{old_path} should have moved to deprecated/"
+
+
+def test_the_documented_suno_ingest_script_ships() -> None:
+    """docs/USER_GUIDE.md tells users to run it; it has to exist and still be
+    wired to names the library module really exports."""
+    assert INGEST_SCRIPT.is_file(), "scripts/ingest_suno_cache.py must ship"
+    guide = (REPO_ROOT / "docs" / "USER_GUIDE.md").read_text(encoding="utf-8")
+    assert "ingest_suno_cache.py" in guide
+
+    from backend.modules.library import store
+
+    text = INGEST_SCRIPT.read_text(encoding="utf-8")
+    for name in ("default_library_root", "LibraryStore"):
+        assert name in text
+        assert hasattr(store, name), f"the script imports store.{name}, which is gone"
 
 
 def test_model_registry_moved_from_core_to_backend_deprecated() -> None:
