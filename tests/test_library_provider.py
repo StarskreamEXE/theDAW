@@ -488,6 +488,116 @@ def test_analytics_key_predicate():
         assert not is_analytics_key(key), key
 
 
+# --- the stock Suno download: five keys, none of them naming Suno -----------
+
+
+def _stock_suno(**overrides: str) -> dict[str, str]:
+    """A download straight from Suno: title, artist, album==title, id, year."""
+    tags = {
+        "title": "Harbour Lights",
+        "artist": "Neutral Test Account",
+        "album": "Harbour Lights",
+        "comment": SAMPLE_ID,
+        "date": "2025",
+    }
+    tags.update(overrides)
+    return tags
+
+
+def test_stock_suno_download_is_identified_by_its_fingerprint():
+    info = detect_provider(_stock_suno())
+    assert info is not None
+    assert info.provider == "suno"
+    assert info.label == "Suno"
+    assert info.is_ai is True
+    assert info.confidence == "inferred"
+    assert info.provider_id == SAMPLE_ID
+    assert "comment" in info.evidence
+    assert SAMPLE_ID in info.evidence
+
+
+def test_stock_suno_uuid_is_lowercased():
+    info = detect_provider(_stock_suno(comment=SAMPLE_ID.upper()))
+    assert info is not None
+    assert info.provider == "suno"
+    assert info.provider_id == SAMPLE_ID
+    assert SAMPLE_ID in info.evidence
+
+
+def test_stock_suno_comment_must_be_the_uuid_and_nothing_else():
+    assert detect_provider(_stock_suno(comment=f"track {SAMPLE_ID}")) is None
+    assert detect_provider(_stock_suno(comment=f"{SAMPLE_ID} (v2)")) is None
+
+
+def test_stock_suno_needs_album_to_equal_title():
+    assert detect_provider(_stock_suno(album="Harbour Lights EP")) is None
+    assert detect_provider(_stock_suno(album="")) is None
+
+
+def test_album_equal_to_title_alone_is_not_suno():
+    assert detect_provider(_stock_suno(comment="ripped from tape")) is None
+    assert detect_provider(_stock_suno(comment="")) is None
+
+
+def test_stock_suno_rejects_the_all_zero_uuid():
+    assert detect_provider(_stock_suno(comment=ZERO_UUID)) is None
+
+
+def test_an_explicit_generator_beats_the_stock_fingerprint():
+    info = detect_provider(_stock_suno(generator="udio"))
+    assert info is not None
+    assert info.provider == "udio"
+    assert info.confidence == "explicit"
+    assert info.evidence == "generator=udio"
+
+
+def test_a_known_domain_beats_the_stock_fingerprint():
+    info = detect_provider(
+        _stock_suno(source_url="https://someartist.bandcamp.com/track/harbour-lights")
+    )
+    assert info is not None
+    assert info.provider == "bandcamp"
+    assert info.confidence == "inferred"
+    assert info.evidence.startswith("source_url=")
+
+
+def test_legacy_meta_still_wins_over_the_stock_fingerprint():
+    info = detect_provider(_stock_suno(), {"provider": "bandcamp"})
+    assert info is not None
+    assert info.provider == "bandcamp"
+    assert info.evidence == "meta.provider"
+
+    info = detect_provider(_stock_suno(), {"source": "suno", "suno_id": PARENT_ID})
+    assert info is not None
+    assert info.provider == "suno"
+    assert info.confidence == "explicit"
+    assert info.evidence == "meta.source=suno"
+    assert info.provider_id == PARENT_ID
+
+
+def test_stock_suno_curated_fields_come_only_from_the_file():
+    embedded = _stock_suno()
+    info = detect_provider(embedded)
+    out = curated_fields(embedded, info)
+    assert out["provider_id"] == SAMPLE_ID
+    assert out["artist"] == "Neutral Test Account"
+    assert out["created_at"] == "2025"
+    assert "prompt" not in out
+    assert "lyrics" not in out
+    assert "style" not in out
+    assert "model" not in out
+
+
+def test_stock_suno_wire_fields():
+    info = detect_provider(_stock_suno())
+    assert provider_wire_fields(info) == {
+        "provider": "suno",
+        "provider_label": "Suno",
+        "provider_is_ai": True,
+        "provider_id": SAMPLE_ID,
+    }
+
+
 # --- wire shape -------------------------------------------------------------
 
 

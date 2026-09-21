@@ -1,12 +1,26 @@
 """Identify which service a library track came from, and curate its tags.
 
 A file the user drags in often already says where it was made or bought:
-Suno writes ``generator=suno`` plus a ``TXXX:suno_id`` uuid, a Bandcamp
-download carries a purchase URL, a DAW bounce carries nothing but an
-encoder string. This module turns those signals into one small, stable
-answer — :class:`ProviderInfo` — and picks the handful of embedded fields
-that describe the SONG out of the much larger pile of frames that describe
-how people reacted to it.
+a Bandcamp download carries a purchase URL, a DAW bounce carries nothing
+but an encoder string. This module turns those signals into one small,
+stable answer — :class:`ProviderInfo` — and picks the handful of embedded
+fields that describe the SONG out of the much larger pile of frames that
+describe how people reacted to it.
+
+Suno files come in two observed shapes:
+
+* **Re-tagged by a harvester** — ``generator=suno``, ``album=Suno AI``, a
+  ``TXXX:suno_id`` uuid and hundreds of ``txxx_suno_*`` frames. Any one of
+  those three markers identifies the track outright (confidence
+  ``"explicit"``, or ``"inferred"`` for the album).
+* **A stock download straight from Suno** — exactly five keys, none of them
+  Suno-specific by name: ``title``, ``artist`` (the account's display
+  name), ``album`` (the same string as the title), ``comment`` (the bare
+  track id: a lowercase hyphenated uuid and nothing else) and ``date``.
+  Nothing names the service, so this shape is identified by INFERENCE from
+  its fingerprint — a bare-uuid comment together with ``album == title``
+  (see :attr:`ProviderRule.fingerprint`). It is the weakest signal in the
+  module and runs only when every other rule found nothing.
 
 Everything here is pure: dicts in, dicts out. No file reads, no database,
 no imports from ``store`` / ``router`` / ``db``. The library holds ~200k
@@ -20,7 +34,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 __all__ = [
     "ANALYTICS_KEY_PATTERNS",
@@ -74,6 +88,13 @@ class ProviderRule:
 
     ``id_keys`` names actual frames, so a row may only fill it with a key
     someone has observed in a real file. Suno is the only such row.
+
+    ``fingerprint`` is the last resort for a download that names nobody: it
+    is handed the whole tag dict and returns ``(provider_id, evidence)``
+    when the SHAPE of the tags is that provider's, else None. It is the
+    weakest signal in the module — every other rule, explicit or inferred,
+    is tried first — so a row may only fill it with a shape someone has
+    observed. Suno is the only such row.
     """
 
     provider: str
@@ -83,12 +104,54 @@ class ProviderRule:
     albums: tuple[str, ...] = ()
     domains: tuple[str, ...] = ()
     id_keys: tuple[str, ...] = ()
+    fingerprint: Optional[Callable[[Mapping[str, Any]], Optional[tuple[str, str]]]] = (
+        None
+    )
+
+
+# A canonical uuid and nothing else: 8-4-4-4-12 hex, any case.
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
+
+
+def _suno_stock_fingerprint(
+    embedded: Mapping[str, Any],
+) -> Optional[tuple[str, str]]:
+    """The shape of an untouched Suno download: a bare track id + album==title.
+
+    A stock download carries five keys and names no service (see the module
+    docstring). Two of them together are the tell: ``comment`` holding one
+    canonical uuid and nothing else, and ``album`` repeating ``title``
+    verbatim. Either alone is far too common — plenty of files use the album
+    as the title, and a uuid in a comment is any tool's job id — so both are
+    required, and the all-zero uuid (a placeholder, never a real track) is
+    rejected.
+    """
+    comment = _lookup(embedded, "comment")
+    if not comment or _UUID_RE.fullmatch(comment) is None:
+        return None
+    if _is_blank(comment):
+        return None
+    title = _lookup(embedded, "title")
+    album = _lookup(embedded, "album")
+    if not album or album != title:
+        return None
+    track_id = comment.lower()
+    return track_id, f"comment={track_id} (bare track id, album==title)"
 
 
 # The only provider whose frame names we have actually observed is Suno
-# (the lead sampled 60 files); every other row identifies its provider
-# through generic signals only — a generator string, the album, or a
-# domain. Do not invent frame names for a service nobody has a file from.
+# (the lead sampled 60 harvester-re-tagged files and the user's stock
+# downloads); every other row identifies its provider through generic
+# signals only — a generator string, the album, or a domain. Do not invent
+# frame names for a service nobody has a file from.
+#
+# Suno therefore has three spellings in this table: the harvester shape's
+# `generator=suno` / `album=Suno AI` / `txxx_suno_id` frames, and the stock
+# download's `fingerprint`, which infers the provider from the shape of the
+# five keys such a file carries.
 PROVIDER_RULES: tuple[ProviderRule, ...] = (
     ProviderRule(
         provider="suno",
@@ -98,6 +161,7 @@ PROVIDER_RULES: tuple[ProviderRule, ...] = (
         albums=("suno ai",),
         domains=("suno.com", "suno.ai"),
         id_keys=("txxx_suno_id",),
+        fingerprint=_suno_stock_fingerprint,
     ),
     ProviderRule(
         provider="udio",
@@ -740,6 +804,24 @@ def detect_provider(
                 confidence="inferred",
                 evidence=f"{key}={host}",
             )
+
+    # 6. Weakest of all: a download that names nobody, recognised by the
+    #    SHAPE of the handful of tags it does carry. Everything above wins.
+    for rule in PROVIDER_RULES:
+        if rule.fingerprint is None:
+            continue
+        found = rule.fingerprint(embedded)
+        if found is None:
+            continue
+        track_id, evidence = found
+        return ProviderInfo(
+            provider=rule.provider,
+            label=rule.label,
+            is_ai=rule.is_ai,
+            provider_id=track_id or _provider_id_from(embedded, meta, rule),
+            confidence="inferred",
+            evidence=evidence,
+        )
 
     return None
 
