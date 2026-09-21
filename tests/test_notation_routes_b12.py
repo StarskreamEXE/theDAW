@@ -480,27 +480,36 @@ def test_parse_path_unc_path_is_refused(routes_client: TestClient):
 def test_parse_path_junction_escape_is_refused(
     routes_client: TestClient, tmp_path: Path, tmp_path_factory: pytest.TempPathFactory
 ):
-    """A directory junction planted INSIDE the library root but pointing
-    OUTSIDE it must not let a path reached through the junction escape
-    containment: `.resolve()` collapses junctions to their real target
-    before the allowed-roots check runs."""
+    """A directory link planted INSIDE the library root but pointing OUTSIDE
+    it must not let a path reached through the link escape containment:
+    `.resolve()` collapses the link to its real target before the
+    allowed-roots check runs. The link is an NTFS junction on Windows (no
+    privilege needed, unlike a Windows symlink) and a symlink elsewhere, so
+    the same escape is covered on every platform CI runs."""
     import subprocess
+    import sys
 
     outside_dir = tmp_path_factory.mktemp("outside_junction_target")
     secret = outside_dir / "secret.abc"
     secret.write_text(_ABC_TUNE, encoding="utf-8")
 
     junction = tmp_path / "linked"
-    result = subprocess.run(
-        ["cmd", "/c", "mklink", "/J", str(junction), str(outside_dir)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        pytest.skip(
-            f"could not create an NTFS junction: {result.stderr or result.stdout}"
+    if sys.platform == "win32":
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(junction), str(outside_dir)],
+            capture_output=True,
+            text=True,
+            check=False,
         )
+        if result.returncode != 0:
+            pytest.skip(
+                f"could not create an NTFS junction: {result.stderr or result.stdout}"
+            )
+    else:
+        try:
+            os.symlink(outside_dir, junction, target_is_directory=True)
+        except OSError as e:
+            pytest.skip(f"could not create a directory symlink: {e}")
 
     escaped = str(junction / "secret.abc")
     r = routes_client.post("/api/sheetimport/parse-path", json={"path": escaped})

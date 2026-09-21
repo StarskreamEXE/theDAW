@@ -80,6 +80,15 @@ from backend.modules.vst import router as vst_router  # noqa: E402
 from backend.lib import launch_token  # noqa: E402
 from backend.lib.known_paths import is_remote_or_device_path  # noqa: E402
 
+# Backslash spellings and NT object-manager prefixes only mean something to
+# Windows. Elsewhere they are inert characters in a filename: nothing resolves
+# them, nothing reaches a network through them, and a 404 is the right answer,
+# so these cases have nothing to assert off Windows.
+_WINDOWS_ONLY = pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="backslash path spellings and NT object-manager prefixes are Windows-only",
+)
+
 FAKE_HOST = Path(__file__).resolve().parent / "fake_vst_host.py"
 
 
@@ -715,6 +724,7 @@ def test_open_editor_accepts_a_plugin_path_inside_the_allowed_root(
 # ---------------------------------------------------------------------------
 
 
+@_WINDOWS_ONLY
 def test_editor_routes_agree_on_a_session_opened_with_a_different_slash_style(
     client: TestClient, plugin_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1352,6 +1362,7 @@ def test_walk_vst3_paths_prunes_a_junction_cycling_back_to_a_sibling(
 # ---------------------------------------------------------------------------
 
 
+@_WINDOWS_ONLY
 def test_is_remote_or_device_path_misses_the_raw_nt_unc_prefix() -> None:
     """Documents WHY the raw-text check alone (the pre-fix guard) was
     insufficient: an NT object-manager UNC prefix has only ONE leading
@@ -1363,6 +1374,7 @@ def test_is_remote_or_device_path_misses_the_raw_nt_unc_prefix() -> None:
     assert is_remote_or_device_path(resolved) is True
 
 
+@_WINDOWS_ONLY
 @pytest.mark.parametrize(
     "raw",
     [
