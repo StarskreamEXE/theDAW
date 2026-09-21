@@ -15,6 +15,7 @@ import { WorkletSynthesizer, audioBufferToWav } from 'spessasynth_lib';
 import { BasicMIDI } from 'spessasynth_core';
 import { getEngineCtx, getMasterGain } from '../state/playerStore';
 import { RANGE_LSB_SPESSA, bendRangeMessages } from './midi';
+import { addWorkletModule } from './audioWorkletSupport';
 import { notesToSmf, type SmfWheel } from './midiWrite';
 import type { RenderNote } from './midiSynth';
 
@@ -116,7 +117,7 @@ function getLiveSynth(): Promise<WorkletSynthesizer> {
   if (!liveSynthPromise) {
     liveSynthPromise = (async () => {
       const ctx = getEngineCtx();
-      await ctx.audioWorklet.addModule(await getProcessorUrl());
+      await addWorkletModule(ctx, await getProcessorUrl());
       const synth = new WorkletSynthesizer(ctx);
       synth.connect(getMasterGain());
       const sf = await loadDefaultSoundfont();
@@ -201,7 +202,7 @@ async function renderMidiToBlob(
   const midi = BasicMIDI.fromArrayBuffer(midiBytes, 'render');
   const length = Math.max(1, Math.ceil(sampleRate * (midi.duration + tailSec)));
   const ctx = new OfflineAudioContext({ numberOfChannels: 2, sampleRate, length });
-  await ctx.audioWorklet.addModule(await getProcessorUrl());
+  await addWorkletModule(ctx, await getProcessorUrl());
   const synth = new WorkletSynthesizer(ctx, { eventsEnabled: false });
   synth.connect(ctx.destination);
   await synth.startOfflineRender({

@@ -1,5 +1,6 @@
 import React from 'react';
 import { AlertTriangle, RotateCcw } from 'lucide-react';
+import { AudioWorkletUnavailableError } from '../../lib/audioWorkletSupport';
 
 interface TabErrorBoundaryProps {
   tabName: string;
@@ -87,6 +88,10 @@ export class TabErrorBoundary extends React.Component<TabErrorBoundaryProps, Tab
     if (!this.state.error) return this.props.children;
 
     const chunkFailure = isChunkLoadError(this.state.error);
+    // A page with no AudioWorklet cannot grow one by re-rendering or by
+    // reloading, so the error's own (actionable) message is the whole answer
+    // and there is no button that could honestly be labelled Retry.
+    const worklet = this.state.error instanceof AudioWorkletUnavailableError;
 
     return (
       <div className="absolute inset-0 grid place-items-center bg-[#09070d]">
@@ -100,14 +105,16 @@ export class TabErrorBoundary extends React.Component<TabErrorBoundaryProps, Tab
           <div className="mt-2 rounded bg-black/25 px-2 py-1.5 text-[9px] font-mono text-red-100/80 wrap-break-word">
             {this.state.error.message || 'Unknown error'}
           </div>
-          <button
-            type="button"
-            onClick={this.handleRetry}
-            className="mt-3 h-8 px-3 inline-flex items-center gap-1.5 rounded border border-white/10 bg-black/20 text-[9px] font-bold uppercase tracking-wider text-zinc-200 hover:bg-white/10"
-          >
-            <RotateCcw className="w-3 h-3" />
-            {chunkFailure ? 'Reload' : 'Retry'}
-          </button>
+          {worklet ? null : (
+            <button
+              type="button"
+              onClick={this.handleRetry}
+              className="mt-3 h-8 px-3 inline-flex items-center gap-1.5 rounded border border-white/10 bg-black/20 text-[9px] font-bold uppercase tracking-wider text-zinc-200 hover:bg-white/10"
+            >
+              <RotateCcw className="w-3 h-3" />
+              {chunkFailure ? 'Reload' : 'Retry'}
+            </button>
+          )}
         </div>
       </div>
     );

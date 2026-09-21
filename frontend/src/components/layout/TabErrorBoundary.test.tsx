@@ -55,6 +55,7 @@ const React = await import('react');
 const { act } = React;
 const { createRoot } = await import('react-dom/client');
 const { TabErrorBoundary, isChunkLoadError } = await import('./TabErrorBoundary');
+const { AudioWorkletUnavailableError } = await import('../../lib/audioWorkletSupport');
 
 const document = win.document;
 const step = (fn: () => void) => act(async () => { fn(); });
@@ -135,6 +136,34 @@ assert.equal(reloadCalls, reloadCallsBeforeFirstClick, 'first click on an unreco
 assert.ok(host.textContent?.includes('Unrecognised stopped'), 'boundary re-catches the same unrecognised error after the failed in-place retry');
 await click(retryButton());
 assert.equal(reloadCalls, reloadCallsBeforeFirstClick + 1, 'second click on the SAME unrecognised error must escalate to a reload');
+
+// ── No AudioWorklet on this page: explain, and offer no false Retry ────
+// Opening theDAW over plain http on a LAN address leaves `ctx.audioWorklet`
+// undefined, which used to reach this boundary as "Cannot read properties of
+// undefined (reading 'addModule')" plus a Retry button that could never
+// succeed — nothing on that card told the user what was wrong. The typed
+// error carries an actionable message, and no re-render or reload can make a
+// non-secure page secure, so there is no button to offer.
+shouldThrow = true;
+const workletError = new AudioWorkletUnavailableError('insecure-context');
+function WorkletBomb(): React.ReactElement {
+  throw workletError;
+}
+await step(() => root.render(
+  React.createElement(TabErrorBoundary, { tabName: 'Edit', children: React.createElement(WorkletBomb) }),
+));
+assert.ok(host.textContent?.includes('Edit stopped'), 'the boundary still catches it');
+assert.ok(host.textContent?.includes(workletError.message), "the error's own actionable message is shown");
+assert.ok(host.textContent?.includes('localhost'), 'the user is told where to open theDAW instead');
+assert.equal(host.querySelector('button'), null, 'no Retry button that could never succeed');
+assert.ok(!host.textContent?.includes('Retry'), 'and no "Retry" label anywhere on the card');
+
+// Every other error still renders exactly as before.
+thrownMessage = 'boom: an ordinary render error';
+await step(() => root.render(
+  React.createElement(TabErrorBoundary, { tabName: 'Other', children: React.createElement(Bomb) }),
+));
+assert.ok(host.textContent?.includes('Retry'), 'an ordinary error keeps its Retry button');
 
 await step(() => root.unmount());
 console.log('TabErrorBoundary: all assertions passed');

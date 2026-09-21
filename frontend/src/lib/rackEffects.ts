@@ -17,6 +17,7 @@
  */
 
 import { distCurve } from './synthVoiceKit';
+import { addWorkletModule } from './audioWorkletSupport';
 import { createVstLiveNode } from './vstLive/vstLiveNode';
 import { vstLiveLatencySec } from '../state/vstLiveStore';
 import type { ChainEntry } from '../state/effectChainStore';
@@ -1128,7 +1129,7 @@ const chopModuleByCtx = new WeakMap<BaseAudioContext, Promise<void>>();
 export const ensureChopModule = (ctx: BaseAudioContext): Promise<void> => {
   let p = chopModuleByCtx.get(ctx);
   if (!p) {
-    p = ctx.audioWorklet.addModule('/chop.worklet.js').catch((e) => {
+    p = addWorkletModule(ctx, '/chop.worklet.js').catch((e) => {
       chopModuleByCtx.delete(ctx);
       throw e;
     });
@@ -1144,7 +1145,7 @@ const granularModuleByCtx = new WeakMap<BaseAudioContext, Promise<void>>();
 export const ensureGranularModule = (ctx: BaseAudioContext): Promise<void> => {
   let p = granularModuleByCtx.get(ctx);
   if (!p) {
-    p = ctx.audioWorklet.addModule('/granular.worklet.js').catch((e) => {
+    p = addWorkletModule(ctx, '/granular.worklet.js').catch((e) => {
       granularModuleByCtx.delete(ctx);
       throw e;
     });
@@ -1281,7 +1282,7 @@ const subharmonicModuleByCtx = new WeakMap<BaseAudioContext, Promise<void>>();
 export const ensureSubharmonicModule = (ctx: BaseAudioContext): Promise<void> => {
   let p = subharmonicModuleByCtx.get(ctx);
   if (!p) {
-    p = ctx.audioWorklet.addModule('/subharmonic.worklet.js').catch((e) => {
+    p = addWorkletModule(ctx, '/subharmonic.worklet.js').catch((e) => {
       subharmonicModuleByCtx.delete(ctx);
       throw e;
     });

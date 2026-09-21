@@ -8,6 +8,7 @@ import { CenterTabBar } from './CenterTabBar';
 import { LogBody, LogStripCompactInfo } from './ProcessingLog';
 import { BottomMultiTabPanel, BOTTOM_TAB_LABELS } from './BottomMultiTabPanel';
 import { AutosaveRecoveryNotice } from './AutosaveRecoveryNotice';
+import { AudioWorkletUnavailableNotice } from './AudioWorkletUnavailableNotice';
 import { initEditorAutosave } from '../../lib/editorAutosave';
 // Lazy: the docs modal bundles a markdown/HTML renderer + screenshots; keep it
 // out of first paint and only fetch the chunk when the user opens Docs.
@@ -661,6 +662,10 @@ export const Shell: React.FC = () => {
       {/* Crash-recovery offer for the editor autosave (top-center; renders null
           when there is nothing to recover). */}
       <AutosaveRecoveryNotice />
+      {/* Standing explanation when this page cannot run AudioWorklet at all
+          (plain-http LAN address, or a browser without it). Renders null on a
+          page that is fine, and once dismissed for this session. */}
+      <AudioWorkletUnavailableNotice />
       {/* Startup HOME landing (card grid per workspace). Auto-opened by App on
           returning launches; also reachable from the app menu. */}
       {homeOpen && (

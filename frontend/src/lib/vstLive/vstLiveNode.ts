@@ -45,6 +45,7 @@ import type { ChainEntry } from '../../state/effectChainStore';
 // From the storage module, NOT effectChainStore: that store imports
 // rackEffects, which imports this module, and the cycle breaks initialization.
 import { areVstStatesLoaded, loadedVstEntry, vstStatesLoaded } from '../vstStateStorage';
+import { addWorkletModule, audioWorkletAvailable } from '../audioWorkletSupport';
 
 /** Absolute URL of the worklet module, served from `frontend/public`. */
 export const VST_BRIDGE_WORKLET_URL = '/vst-bridge.worklet.js';
@@ -72,7 +73,7 @@ const moduleByCtx = new WeakMap<BaseAudioContext, Promise<void>>();
 export function ensureVstBridgeModule(ctx: BaseAudioContext): Promise<void> {
   let p = moduleByCtx.get(ctx);
   if (!p) {
-    p = ctx.audioWorklet.addModule(VST_BRIDGE_WORKLET_URL).catch((e: unknown) => {
+    p = addWorkletModule(ctx, VST_BRIDGE_WORKLET_URL).catch((e: unknown) => {
       moduleByCtx.delete(ctx); // a failed load must be retryable on the next build
       throw e;
     });
@@ -153,9 +154,7 @@ export interface VstLiveNodeDeps {
 const isOffline = (ctx: BaseAudioContext): boolean =>
   typeof (ctx as unknown as { startRendering?: unknown }).startRendering === 'function';
 
-const hasWorklet = (ctx: BaseAudioContext): boolean =>
-  typeof (ctx as unknown as { audioWorklet?: { addModule?: unknown } }).audioWorklet?.addModule ===
-  'function';
+const hasWorklet = (ctx: BaseAudioContext): boolean => audioWorkletAvailable(ctx);
 
 /** `p<index>` is how a plugin parameter rides in `ChainEntry.params`, which is
  *  `Record<string, number>`: a VST3 parameter has an INDEX, not a name, and the

@@ -34,6 +34,7 @@
 
 import { describeMicFailure, type MicFailureKind } from './micErrors';
 import { micConstraints } from './recordingEngine';
+import { addWorkletModule, audioWorkletAvailable } from './audioWorkletSupport';
 import {
   DEFAULT_MAX_LAG_SEC,
   MAX_LAG_CAP_SEC,
@@ -231,7 +232,7 @@ async function ensureWorklet(ctx: AudioContext, inject?: (ctx: AudioContext) => 
   // Only the real load is cached: an injected loader is the caller's business
   // and must run every time it is passed.
   if (!inject && modulesLoaded.has(ctx)) return;
-  if (!inject && (!ctx.audioWorklet || typeof ctx.audioWorklet.addModule !== 'function')) {
+  if (!inject && !audioWorkletAvailable(ctx)) {
     throw new RoundTripProbeError(
       'unsupported-audio',
       'This browser has no AudioWorklet, so the loopback test cannot capture accurately.',
@@ -239,7 +240,7 @@ async function ensureWorklet(ctx: AudioContext, inject?: (ctx: AudioContext) => 
   }
   try {
     if (inject) await inject(ctx);
-    else await ctx.audioWorklet.addModule(ROUND_TRIP_WORKLET_URL);
+    else await addWorkletModule(ctx, ROUND_TRIP_WORKLET_URL);
   } catch (err) {
     if (err instanceof RoundTripProbeError) throw err;
     throw new RoundTripProbeError(

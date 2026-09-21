@@ -32,6 +32,7 @@ import type { StretchNode } from 'signalsmith-stretch';
 import { getEngineCtx, getMasterGain } from './playerStore';
 import { logError } from './logStore';
 import { summingDelaysSec } from '../lib/rackEffects';
+import { addWorkletModule } from '../lib/audioWorkletSupport';
 
 export type DeckId = 'A' | 'B';
 
@@ -1126,7 +1127,7 @@ let _scratchMode: 'classic' | 'cyber' = 'classic';
 
 function ensureVinylModule(ctx: AudioContext): Promise<void> {
   if (!_vinylModule) {
-    _vinylModule = ctx.audioWorklet.addModule('/vinyl-scratch.worklet.js').catch((e) => {
+    _vinylModule = addWorkletModule(ctx, '/vinyl-scratch.worklet.js').catch((e) => {
       _vinylModule = null; // allow a later retry
       throw e;
     });

@@ -13,6 +13,7 @@
  */
 
 import { getEngineCtx } from '../state/playerStore';
+import { addWorkletModule } from './audioWorkletSupport';
 import type { PianoNote } from '../state/pianoRollStore';
 import type { RenderNote } from './midiSynth';
 
@@ -52,7 +53,7 @@ const yinModuleByCtx = new WeakMap<BaseAudioContext, Promise<void>>();
 export const ensureYinModule = (ctx: BaseAudioContext): Promise<void> => {
   let p = yinModuleByCtx.get(ctx);
   if (!p) {
-    p = ctx.audioWorklet.addModule('/yin.worklet.js').catch((e) => {
+    p = addWorkletModule(ctx, '/yin.worklet.js').catch((e) => {
       yinModuleByCtx.delete(ctx);
       throw e;
     });
