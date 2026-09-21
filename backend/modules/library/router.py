@@ -35,10 +35,8 @@ import hashlib
 import json
 import logging
 import mimetypes
-import os
 import re
 import tempfile
-import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -56,7 +54,6 @@ from fastapi import (
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
-from . import suno_promote, suno_stage
 from .bundle import build_bundle_bytes
 from .db import DEFAULT_SORT, FACET_FIELDS, SORTS, EntryFilters
 from .store import (
@@ -1088,187 +1085,6 @@ def import_folder(
 # entry id.
 
 
-class SunoStageRequest(BaseModel):
-    cache_path: str
-    media_root: Optional[str] = None
-    stage_root: Optional[str] = None
-    namespace: str = "suno"
-
-
-class SunoPromoteRequest(BaseModel):
-    stage_root: str
-    dry_run: bool = False
-    batch_size: int = suno_promote.DEFAULT_BATCH_SIZE
-
-
-def _outside_library(candidate: Path, label: str) -> Path:
-    """Resolve ``candidate`` and refuse it if it lives under the library root.
-
-    Staging inside the library would put a multi-gigabyte SQLite file where the
-    entry walk and every bulk delete expect entry folders.
-    """
-    store = get_store()
-    root = os.path.normcase(str(store.root.resolve()))
-    try:
-        resolved = candidate.expanduser().resolve()
-    except OSError as e:
-        raise HTTPException(400, f"unusable {label} {str(candidate)!r}: {e}") from e
-    target = os.path.normcase(str(resolved))
-    if target == root or target.startswith(root + os.sep):
-        raise HTTPException(
-            400,
-            f"{label} {resolved} is inside the library root; "
-            "choose a folder outside it (a fast drive is worth it)",
-        )
-    return resolved
-
-
-def _readable_file(raw: str, label: str) -> Path:
-    path = Path(raw).expanduser()
-    if not path.is_file():
-        raise HTTPException(400, f"no such {label}: {raw!r}")
-    try:
-        with path.open("rb"):
-            pass
-    except OSError as e:
-        raise HTTPException(400, f"{label} {raw!r} is not readable: {e}") from e
-    return _outside_library(path, label)
-
-
-def _writable_dir(path: Path, label: str) -> Path:
-    resolved = _outside_library(path, label)
-    try:
-        resolved.mkdir(parents=True, exist_ok=True)
-        probe = resolved / ".theDAW-write-probe"
-        probe.write_bytes(b"")
-        probe.unlink()
-    except OSError as e:
-        raise HTTPException(400, f"{label} {resolved} is not writable: {e}") from e
-    return resolved
-
-
-def _enqueue_suno_job(job: suno_promote.SunoJob, run: Any) -> dict[str, Any]:
-    """Hand one Suno job to the shared background queue and answer with its handle."""
-
-    async def _run() -> None:
-        import asyncio
-
-        await asyncio.to_thread(run)
-
-    try:
-        from backend.core.background_workers import get_background_queue
-
-        get_background_queue().enqueue(f"library-{job.kind}:{job.id}", _run)
-    except Exception as e:  # noqa: BLE001 - the job must report, not raise
-        log.warning("library: failed to queue %s job %s: %s", job.kind, job.id, e)
-        job.finish("failed", error=f"could not start the job: {e!r}")
-    return {
-        "job_id": job.id,
-        "status_url": f"{get_store().api_prefix}/import-jobs/{job.id}",
-    }
-
-
-@router.post("/suno/stage", dependencies=[Depends(refuse_cross_site)])
-def suno_stage_cache(req: SunoStageRequest = Body(...)) -> dict[str, Any]:
-    """Stage a Suno/Harvester cache file into its own catalog, as a job.
-
-    Loss-free and read-only over the cache: identity is the provider song id,
-    every observed version is kept, malformed rows are quarantined, and local
-    media is matched by id and REFERENCED, never copied. Nothing reaches the
-    library until ``POST /suno/promote``.
-
-    ``stage_root`` defaults to the app data directory. A fast drive is worth
-    naming explicitly: 200,000 songs staged in ~1.7 min on NVMe against ~16 min
-    on a spinning disk.
-    """
-    cache = _readable_file(req.cache_path, "cache file")
-    media_root: Optional[Path] = None
-    if req.media_root:
-        candidate = Path(req.media_root).expanduser()
-        if not candidate.is_dir():
-            raise HTTPException(400, f"no such media root: {req.media_root!r}")
-        media_root = _outside_library(candidate, "media root")
-    stage_root = _writable_dir(
-        Path(req.stage_root).expanduser()
-        if req.stage_root
-        else suno_promote.default_stage_root(),
-        "stage root",
-    )
-    known_paths.record(cache.parent, "suno-cache", source="suno-cache")
-
-    job = get_import_jobs().register(
-        suno_promote.SunoJob(
-            uuid.uuid4().hex,
-            "suno-stage",
-            {
-                "cache_path": str(cache),
-                "stage_root": str(stage_root),
-                "media_root": str(media_root) if media_root else None,
-            },
-        )
-    )
-    return _enqueue_suno_job(
-        job,
-        lambda: suno_promote.run_stage_job(
-            job,
-            cache_path=cache,
-            stage_root=stage_root,
-            media_root=media_root,
-            namespace=req.namespace or "suno",
-        ),
-    )
-
-
-@router.get("/suno/stage-report")
-def suno_stage_report(stage_root: str = Query(...)) -> dict[str, Any]:
-    """What a staging catalog holds: identities, revisions, same-title songs,
-    media availability, quarantined rows, unresolved lineage, and how many of
-    the songs a promotion could actually place (``promotable``)."""
-    root = Path(stage_root).expanduser()
-    try:
-        return suno_promote.stage_report(root)
-    except suno_promote.PromotionRefused as e:
-        raise HTTPException(400, str(e)) from e
-
-
-@router.post("/suno/promote", dependencies=[Depends(refuse_cross_site)])
-def suno_promote_stage(req: SunoPromoteRequest = Body(...)) -> dict[str, Any]:
-    """Promote a staged catalog into the library, as a resumable job.
-
-    Reference-in-place (no audio is copied), updates rather than duplicates a
-    song that was imported before, keeps every user edit, and can be stopped
-    with ``DELETE /import-jobs/{id}`` and restarted without repeating work.
-    ``dry_run`` reports exactly what a real run would do and writes nothing.
-    """
-    stage_root = Path(req.stage_root).expanduser()
-    if not stage_root.is_dir():
-        raise HTTPException(400, f"no such stage root: {req.stage_root!r}")
-    resolved = _outside_library(stage_root, "stage root")
-    if not suno_stage.stage_db_path(resolved).is_file():
-        raise HTTPException(400, f"no Suno staging database under {resolved}")
-    store = get_store()
-    if store.db is None:
-        raise HTTPException(503, "library DB not available")
-
-    job = get_import_jobs().register(
-        suno_promote.SunoJob(
-            uuid.uuid4().hex,
-            "suno-promote",
-            {"stage_root": str(resolved), "dry_run": bool(req.dry_run)},
-        )
-    )
-    return _enqueue_suno_job(
-        job,
-        lambda: suno_promote.run_promote_job(
-            job,
-            store,
-            stage_root=resolved,
-            dry_run=bool(req.dry_run),
-            batch_size=max(1, int(req.batch_size)),
-        ),
-    )
-
-
 _PERF_SETS_DIRNAME = "performance-sets"
 
 
@@ -1859,3 +1675,15 @@ async def import_entry(
         metadata=meta_dict,
     )
     return record.to_dict()
+
+
+# Optional local extension. ``suno_routes`` (bulk provider-cache ingestion) is
+# not part of the repository; when the module is absent the library simply has
+# no such routes. Included last so everything it borrows from this module
+# already exists.
+try:
+    from . import suno_routes as _suno_routes
+except ImportError:
+    _suno_routes = None
+else:
+    router.include_router(_suno_routes.router)

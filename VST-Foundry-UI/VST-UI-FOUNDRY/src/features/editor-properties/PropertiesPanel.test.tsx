@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import PropertiesPanel from "../../components/PropertiesPanel";
 import type { PropertiesPanelProps } from "../../components/PropertiesPanel";
-import AlignmentPanel from "../../components/AlignmentPanel";
+import AlignmentPanel from "./AlignmentPanel";
 import type { CanvasState, UIElement } from "../../types";
 
 const canvasState: CanvasState = {
