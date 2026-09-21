@@ -3,14 +3,18 @@
     Configures, builds and installs thedaw-vst-host.exe.
 
 .DESCRIPTION
-    Keeps the build tree off the system drive by default (C: is nearly full on
-    this machine) and copies only the finished binary back into the worktree at
-    native/vst-host/bin/, which is gitignored.
+    Builds out of source and copies only the finished binary back into the
+    worktree at native/vst-host/bin/, which is gitignored.
+
+    The build tree defaults to native/vst-host/build, gitignored beside it, so
+    the script works on a machine that has nothing but a system drive. Put it
+    somewhere else - a scratch volume, a faster disk - with -BuildDir or the
+    THEDAW_VST_BUILD_DIR environment variable; -BuildDir wins over both.
 
 .EXAMPLE
     .\build.ps1
     .\build.ps1 -Vst3 OFF
-    .\build.ps1 -Clean -BuildDir E:\thedaw-build\vst-host
+    .\build.ps1 -Clean -BuildDir D:\scratch\vst-host
 #>
 [CmdletBinding()]
 param(
@@ -20,7 +24,10 @@ param(
     [ValidateSet('ON', 'OFF')]
     [string]$Vst3 = 'ON',
 
-    [string]$BuildDir = 'E:\thedaw-build\vst-host-engine',
+    # Empty on purpose: the real default needs $here, which does not exist yet
+    # at parameter-binding time. Resolved just below, in this order: -BuildDir,
+    # then $env:THEDAW_VST_BUILD_DIR, then <this directory>\build.
+    [string]$BuildDir = '',
 
     [ValidateSet('Release', 'Debug', 'RelWithDebInfo')]
     [string]$Config = 'Release',
@@ -34,6 +41,12 @@ $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 function Resolve-Cmake {
+    # PATH first: whatever `cmake` the user's shell resolves is the one every
+    # other tool of theirs uses, and it is the one theDAW.bat tested for before
+    # it offered this build. The absolute paths below are only a fallback for
+    # installs that never put CMake on PATH.
+    $found = Get-Command cmake -ErrorAction SilentlyContinue
+    if ($found) { return $found.Source }
     $candidates = @(
         'C:\Program Files\Python313\Scripts\cmake.exe',
         'C:\Program Files\CMake\bin\cmake.exe'
@@ -41,10 +54,13 @@ function Resolve-Cmake {
     foreach ($candidate in $candidates) {
         if (Test-Path $candidate) { return $candidate }
     }
-    $found = Get-Command cmake -ErrorAction SilentlyContinue
-    if ($found) { return $found.Source }
     throw 'cmake was not found. Install CMake or add it to PATH.'
 }
+
+# -BuildDir beats the environment, which beats the gitignored tree beside the
+# sources. Nothing here assumes a drive that this machine may not have.
+if (-not $BuildDir) { $BuildDir = $env:THEDAW_VST_BUILD_DIR }
+if (-not $BuildDir) { $BuildDir = Join-Path $here 'build' }
 
 $cmake = Resolve-Cmake
 Write-Host "cmake:     $cmake"

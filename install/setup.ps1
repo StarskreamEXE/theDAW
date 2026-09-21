@@ -17,9 +17,12 @@
     -Yes            assume "yes" to the prompts (non-interactive)
     -UnderfitVenv   only run the Underfit trainer-tab venv bootstrap, then exit
                     (theDAW.bat calls this after the main venv is built)
+    -VstHost        only run the native live-VST host build offer, then exit
+                    (theDAW.bat calls this when scripts/check_vst_host.py
+                    reports the host exe missing and CMake is on PATH)
 #>
 [CmdletBinding()]
-param([switch]$Yes, [switch]$UnderfitVenv)
+param([switch]$Yes, [switch]$UnderfitVenv, [switch]$VstHost)
 $ErrorActionPreference = 'Stop'
 
 # --------------------------------------------------------------------------- #
@@ -37,6 +40,13 @@ function Ask($q){
   $a = Read-Host "  $q  [Y/n]"
   return ($a -eq '' -or $a -match '^(y|yes)$')
 }
+
+# Ask() reads an empty line as yes, which is right for a prompt a person is
+# looking at. On a redirected or closed stdin Read-Host hands back that empty
+# line straight away, so an OPTIONAL multi-minute build would start itself in
+# CI or a piped launch. Callers that must not do that test the console first
+# and treat 'no console' as a decline. -Yes still wins: it is a real answer.
+function Interactive(){ try { return (-not [Console]::IsInputRedirected) } catch { return $false } }
 
 function Have($name){ return [bool](Get-Command $name -ErrorAction SilentlyContinue) }
 
@@ -80,6 +90,62 @@ function Initialize-UnderfitVenv(){
     if($LASTEXITCODE -eq 0){ OK 'Underfit trainer env created.' }
     else { WARN "uv sync exited $LASTEXITCODE - the Underfit tab stays unavailable for now." }
   } finally { Pop-Location }
+}
+
+# Remembering a 'no'. theDAW.bat skips its build offer while this file
+# exists, so declining once is not re-asked on every launch; deleting it, or
+# running setup.ps1 -VstHost by hand, brings the offer back, and a successful
+# build clears it. ONLY an interactive decline writes it - the no-console
+# auto-decline below must leave nothing behind, or one redirected launch (CI,
+# a piped run) would silence the offer on a real console afterwards. Both the
+# write and the delete are best-effort: on a read-only or locked checkout the
+# next launch simply asks again, which is not worth a line of output.
+function Set-VstHostDeclined($hostDir, $declined){
+  $marker = Join-Path $hostDir '.build-declined'
+  try {
+    if($declined){
+      $stamp = (Get-Date).ToString('s')
+      Set-Content -Path $marker -Encoding Ascii -Value "$stamp  delete this file to be asked again"
+    } else {
+      Remove-Item -Force -ErrorAction SilentlyContinue $marker
+    }
+  } catch { }
+}
+
+# The native live-VST host (native/vst-host) is what lets real VST3 plugins
+# process the live signal during playback. It is C++17 against Win32, built
+# locally with CMake + the Visual Studio Build Tools, and never committed
+# (native/vst-host/bin/ is gitignored), so a fresh clone has no exe. theDAW.bat
+# offers this when scripts/check_vst_host.py reports the exe missing. Like the
+# Underfit env above it is consent-gated and never blocks theDAW - declining
+# leaves live VST hosting unavailable for the session and plugins still work
+# offline. build.ps1 throws on a failed configure or build, so the call is
+# wrapped: a broken toolchain must not take setup.ps1 down with it.
+function Initialize-VstHost(){
+  Update-Path
+  $root    = Split-Path -Parent $PSScriptRoot
+  $hostDir = Join-Path $root 'native\vst-host'
+  $builder = Join-Path $hostDir 'build.ps1'
+  if(-not (Test-Path $builder)){ return }   # not vendored
+  if(Test-Path (Join-Path $hostDir 'bin\thedaw-vst-host.exe')){ OK 'Live VST host present'; return }
+  Head 'Live VST host (optional)'
+  if(-not (Have 'cmake')){ WARN 'CMake is required to build the live VST host - install CMake, then re-launch.'; return }
+  Info 'Real VST3 plugins only process the live signal when this native host is built.'
+  Info 'This runs native\vst-host\build.ps1 (needs the Visual Studio Build Tools; a few minutes).'
+  if(-not (Interactive) -and -not $Yes){ WARN 'Skipped - no console to ask at; live VST hosting stays unavailable and plugins still work offline.'; return }
+  if(-not (Ask 'Build the live VST host now?')){
+    Set-VstHostDeclined $hostDir $true
+    WARN 'Skipped, and not asked again at launch: delete native\vst-host\.build-declined or run install\setup.ps1 -VstHost to be offered it again, or set THEDAW_SKIP_VST_HOST_BUILD=1 to suppress the offer outright. Plugins still work offline.'
+    return
+  }
+  Info 'Building via: native\vst-host\build.ps1'
+  try {
+    & $builder
+    if($LASTEXITCODE -eq 0){ Set-VstHostDeclined $hostDir $false; OK 'Live VST host built.' }
+    else { WARN "build.ps1 exited $LASTEXITCODE - live VST hosting stays unavailable; plugins still work offline." }
+  } catch {
+    WARN ('Live VST host build failed: ' + $_.Exception.Message)
+  }
 }
 
 $wingetOk = Have 'winget'
@@ -140,6 +206,10 @@ function Install-AppInstaller(){
 # Dedicated mode: theDAW.bat calls `setup.ps1 -UnderfitVenv` after the main venv
 # bootstrap to create the optional Underfit trainer env if it's missing.
 if($UnderfitVenv){ Initialize-UnderfitVenv; exit 0 }
+
+# Dedicated mode: theDAW.bat calls `setup.ps1 -VstHost` when the launch-time
+# check finds no host exe. It always exits 0 - the launch continues either way.
+if($VstHost){ Initialize-VstHost; exit 0 }
 
 Clear-Host
 Write-Host ""

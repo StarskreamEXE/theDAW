@@ -15,14 +15,15 @@ all in `src/`.
 ## Build
 
 ```powershell
-# engine only (no VST3 layer) -- build tree lands on E: because C: is nearly full
+# engine only (no VST3 layer) -- build tree lands in native/vst-host/build
 .\build.ps1 -Vst3 OFF
 
 # with the VST3 hosting layer once src/vst3 exists
 .\build.ps1 -Vst3 ON
 
-# other options
-.\build.ps1 -Vst3 OFF -BuildDir E:\somewhere\else -Config RelWithDebInfo -Clean
+# other options -- -BuildDir wins over $env:THEDAW_VST_BUILD_DIR, which wins
+# over the default above, so a scratch volume needs no edit to this script
+.\build.ps1 -Vst3 OFF -BuildDir D:\somewhere\else -Config RelWithDebInfo -Clean
 ```
 
 The script configures, builds, and copies the binary to
@@ -66,11 +67,23 @@ manual, user-initiated step — theDAW never downloads a binary on its own.
 
 `theDAW.bat` runs `scripts/check_vst_host.py` and prints one of its three
 status lines verbatim. If the exe is missing and CMake is on PATH, it then
-asks — via `install/setup.ps1 -VstHost` — whether to build it now. Declining,
+asks — via `install\setup.ps1 -VstHost` — whether to build it now. Declining,
 or the build failing, never stops theDAW from starting; live VST hosting is
-simply unavailable for that session. Set `THEDAW_SKIP_VST_HOST_BUILD=1` to
-suppress the offer outright. `theDAW.sh` only ever prints the not-available
-line; it does not offer to build.
+simply unavailable for that session.
+
+It asks once, not every launch. Declining at the prompt writes
+`native/vst-host/.build-declined` (gitignored; one timestamped line), and
+while that file exists the launcher skips the offer — the status line still
+prints. To be asked again, delete it, or run `install\setup.ps1 -VstHost`
+yourself: run by hand the script always asks, because only the launcher
+consults the marker. A successful build deletes it. Writing and deleting it
+are both best-effort — if the write fails you are simply asked again. A
+launch with no console to ask at (redirected stdin) declines without writing
+anything, so a real console still gets the offer afterwards.
+
+Set `THEDAW_SKIP_VST_HOST_BUILD=1` to suppress the offer outright, marker or
+no marker; the status line is printed either way. `theDAW.sh` only ever
+prints the not-available line; it does not offer to build.
 
 ## Running
 

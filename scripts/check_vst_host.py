@@ -2,9 +2,11 @@
 
 ``theDAW.bat`` runs this on startup so a user sees, in one line, whether the
 native live-VST host (``native/vst-host``) is built and usable -- it is an
-optional capability, not a requirement to launch the app. This module must
-run before the project's virtual environment exists, so it imports nothing
-from ``backend`` and touches the network never. ``main()`` never raises and
+optional capability, not a requirement to launch the app. It imports nothing
+from ``backend`` and touches the network never, so it runs on a bare
+interpreter, with or without the project's virtual environment on top of it
+-- the launcher reaches it with whichever Python it has. ``main()`` never
+raises and
 never exits non-zero: a missing or broken host is reported as a status, not
 treated as a failure, and plugins still work offline without it.
 """

@@ -12,7 +12,7 @@ folder of Steinberg's VST3 SDK.
 | Source | <https://github.com/steinbergmedia/vst3sdk> |
 | Superproject tag | `v3.8.1_build_84` (commit `3cdf9ca5d1f5b1b21e0a86832aa4abe55607bd96`) |
 | `pluginterfaces` submodule commit | `4f547e8e102b47de4a8b8aaf343c73b700786372` (`v3.7.3_build_20-13-g4f547e8`) |
-| Copied | `base/`, `gui/`, `vst/` |
+| Copied | `base/`, `gui/`, `vst/`, and `LICENSE.txt` (the file every header banner points at; it sits beside `pluginterfaces/`, as upstream has it) |
 | Not copied | `test/`, and every other folder of the SDK |
 
 They live at `vst3_pluginterfaces/pluginterfaces/{base,gui,vst}` because the headers include

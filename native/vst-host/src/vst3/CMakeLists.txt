@@ -7,8 +7,8 @@
 #     vst3_probe CLI, which is how the layer is exercised against real plugins without the
 #     rest of the host existing.
 #
-#   cmake -S native/vst-host/src/vst3 -B E:/thedaw-build/vst-host-vst3 -A x64
-#   cmake --build E:/thedaw-build/vst-host-vst3 --config Release
+#   cmake -S native/vst-host/src/vst3 -B build/vst-host-vst3-probe -A x64
+#   cmake --build build/vst-host-vst3-probe --config Release
 
 cmake_minimum_required(VERSION 3.20)
 
