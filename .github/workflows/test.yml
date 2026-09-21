@@ -139,9 +139,11 @@ jobs:
   # `npm run lint` in frontend/ is `tsc --noEmit` plus the canonical-class
   # check (scripts/check-canonical-classes.mjs, the same rule VS Code reports
   # as suggestCanonicalClasses), so CI runs exactly what the repo defines.
+  # Job id kept as `frontend-typecheck` (branch protection may name it); it now
+  # also runs the suites, hence the longer budget: one tsx process per suite.
   frontend-typecheck:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 40
     defaults:
       run:
         working-directory: frontend
@@ -162,3 +164,12 @@ jobs:
       # their own tsconfig and were never typechecked in CI.
       - name: tsc --noEmit (scripts)
         run: npm run lint:scripts
+      # The test suites are plain tsx scripts (scripts/run-tests.mjs discovers every
+      # *.test.ts(x) under src/). They ran on developer machines only; nothing in CI
+      # executed them.
+      - name: Frontend tests
+        run: npm test
+      # electron-ui has no test runner of its own; its two suites cover code that
+      # ships (download naming, VST-host staging) and run on this job's toolchain.
+      - name: Electron shell tests
+        run: npm run test:electron

@@ -18,6 +18,7 @@
     "docs:coverage": "tsx ../scripts/screenshots/featureCoverage.ts",
     "test": "node scripts/run-tests.mjs",
     "test:bundle": "tsx src/App.bundle.check.ts",
+    "test:electron": "tsx ../electron-ui/main/downloadNaming.test.ts && node ../electron-ui/scripts/stage-vst-host.test.mjs",
     "test:playalong": "tsx src/state/playAlongStore.test.ts && tsx src/lib/chordShapes.test.ts && tsx src/components/layout/score/strip/stripXMap.test.ts && tsx src/components/layout/score/highway/schedule.test.ts && tsx src/components/layout/score/highway/HighwayScene.test.ts && tsx src/components/layout/score/chords/ChordDiagram.test.tsx && tsx src/components/layout/score/scoreFit.test.ts && tsx src/components/layout/score/playAlong/latencyMath.test.ts && tsx src/components/layout/score/playAlong/partRegistry.test.ts && tsx src/components/layout/score/beatsaber/beatsaberMeta.test.ts",
     "test:score-export-menu": "tsx src/components/layout/score/exportMenu.test.ts",
     "test:sing": "tsx src/components/layout/sing/singSync.test.ts && tsx src/components/layout/sing/wires.test.ts",
