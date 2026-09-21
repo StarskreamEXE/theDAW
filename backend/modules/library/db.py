@@ -38,10 +38,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
 
+from .provider import PROVIDER_SLUG_MAX, detect_provider
+
 log = logging.getLogger(__name__)
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 # Each tuple is (schema_version_after_running, statements list).
@@ -485,39 +487,65 @@ DEFAULT_SORT = "created_desc"
 
 # ---- Provider ---------------------------------------------------------------
 #
-# Which service an entry came from. ONE rule, written twice because two
-# languages have to answer it -- :data:`PROVIDER_SQL` for everything the
-# database answers, :func:`infer_provider` for everything Python answers -- and
-# the two must never disagree, because the same slug is both what a row is
-# labeled with and what the list filter is asked for.
+# Which service an entry came from. ONE rule, resolved in TWO stages so the
+# half of it that needs an entry's metadata is paid once per ENTRY instead of
+# once per query:
 #
-#   1. a stored ``$.provider`` in ``metadata_json``: an entry labeled at import
-#      from what the file itself carried (backend/modules/library/provider.py)
-#   2. legacy Suno: ``source`` of 'suno', a ``$.suno_id``, or 'suno' in ``model``
-#   3. 'magenta' or 'gemini' in ``model``   -> gemini-magenta
-#   4. 'udio' in ``model``                  -> udio
-#   5. 'riffusion' in ``model``             -> riffusion
-#   6. ``source`` of 'import'               -> import
-#   7. otherwise                            -> stable-audio
+#   1. the resolved ``entries.provider`` COLUMN -- everything only an entry's
+#      metadata knows: a stored ``$.provider`` (written at import, by the
+#      read-path write-through, or by a user edit) and the legacy Suno markers
+#      (``$.suno_id``, a ``suno`` / ``sunoid:<id>`` tag). Every writer fills it
+#      from the metadata dict it is already holding, through
+#      :func:`resolved_provider_slug`. NULL means "not resolved yet": either
+#      nothing in this row's metadata named a provider, or the row predates the
+#      column and no request has returned it since.
+#   2. failing that, :data:`PROVIDER_FALLBACK_SQL` over the indexed columns:
+#        'suno' in ``source`` or ``model``       -> suno
+#        'magenta' / 'gemini' in ``model``       -> gemini-magenta
+#        'udio' in ``model`` minus the word      -> udio
+#        'audio' (see _PROVIDER_BY_MODEL_SUBSTRING)
+#        'riffusion' in ``model``                -> riffusion
+#        ``source`` of 'import'                  -> import
+#        otherwise                               -> stable-audio
 #
-# Rules 2-7 are ``inferProvider`` in frontend/src/catalog/catalogProviders.ts,
-# which is what every catalogue row, badge and dropdown has always shown; rule
-# 1 is what this feature added in front of them. Rule 7 always answers, so
+# The fallback is ``inferProvider`` in frontend/src/catalog/catalogProviders.ts,
+# which is what every catalogue row, badge and dropdown has always shown, and
+# :func:`infer_provider` is its Python twin. Its last arm always answers, so
 # every entry has a provider and the facet -- unlike ``model`` -- never has an
 # "unset" bucket.
 #
-# Only rule 1 and the ``$.suno_id`` arm of rule 2 read ``metadata_json``; the
-# rest are the indexed ``source`` and ``model`` columns. Nothing here opens an
-# audio file or touches an analysis blob, which is what keeps the rule
-# affordable over ~200,000 rows.
+# :data:`PROVIDER_SQL` is ``COALESCE`` of the two and is what the list filter,
+# its count, the id list AND the provider facet all group or compare on, so
+# those four can never file one row under different slugs. The facet's
+# documented divergence from the filter is gone with them.
+#
+# WHY THE COLUMN. Stage 1 used to be ``json_extract(metadata_json, '$.provider')``
+# behind an ``instr`` prefilter. Evaluating that for a filtered list or count
+# means SQLite READS every row's ``metadata_json``, and the user's real rows
+# carry their provider's own record at ~34 KB each: 194,508 of them is ~6.6 GB
+# of text per filtered page. Measured on that library,
+# ``GET /entries?provider=suno&limit=200`` took 13.3 s where an unfiltered page
+# took 0.10 s. Nothing below opens ``metadata_json``, an audio file or an
+# analysis blob.
 
-#: ``model`` substring -> provider id, in priority order (rules 2-5).
-_PROVIDER_BY_MODEL_SUBSTRING: tuple[tuple[str, str], ...] = (
-    ("suno", "suno"),
-    ("magenta", "gemini-magenta"),
-    ("gemini", "gemini-magenta"),
-    ("udio", "udio"),
-    ("riffusion", "riffusion"),
+#: ``(word removed from the model first, substring, provider id)``, in priority
+#: order.
+#:
+#: The removal exists for exactly one arm. "udio" is a substring of "audio", so
+#: a bare test files every model whose name contains "audio" --
+#: ``stable-audio-3-medium``, ``audiocraft`` -- under Udio, labels it "Udio" in
+#: the catalogue, and counts it there in the facet. Deleting the word "audio"
+#: from the model before looking keeps ``udio-1``, ``Udio v1.5`` and even
+#: ``audio-udio-blend`` matching while ``stable-audio-3-medium`` does not.
+#: ``inferProvider`` in frontend/src/catalog/catalogProviders.ts spells the
+#: same rule (``model.toLowerCase().replace(/audio/g, '').includes('udio')``)
+#: and both sides walk the same parity table.
+_PROVIDER_BY_MODEL_SUBSTRING: tuple[tuple[str, str, str], ...] = (
+    ("", "suno", "suno"),
+    ("", "magenta", "gemini-magenta"),
+    ("", "gemini", "gemini-magenta"),
+    ("audio", "udio", "udio"),
+    ("", "riffusion", "riffusion"),
 )
 
 #: theDAW's own generations and studio renders.
@@ -525,8 +553,8 @@ DEFAULT_PROVIDER = "stable-audio"
 
 #: Display name and AI-ness per derived slug. Mirrors ``KNOWN_PROVIDERS`` in
 #: ``frontend/src/catalog/catalogProviders.ts``. A store or host would be
-#: ``False``; every engine rules 2-7 can name is a generator, and an import of
-#: unknown origin is not claimed to be one.
+#: ``False``; every engine the fallback can name is a generator, and an import
+#: of unknown origin is not claimed to be one.
 DERIVED_PROVIDERS: dict[str, tuple[str, bool]] = {
     "suno": ("Suno", True),
     "gemini-magenta": ("Magenta", True),
@@ -537,23 +565,21 @@ DERIVED_PROVIDERS: dict[str, tuple[str, bool]] = {
 }
 
 
-def infer_provider(
-    model: Optional[str],
-    source: Optional[str],
-    suno_id: Optional[str] = None,
-) -> str:
-    """Rules 2-7 above: which engine produced an entry, from what the row says.
+def infer_provider(model: Optional[str], source: Optional[str]) -> str:
+    """The FALLBACK above: which engine produced an entry, from its columns.
 
-    The Python twin of :data:`PROVIDER_SQL` minus its first rule -- a stored
-    ``$.provider`` is read by ``provider.detect_provider``, which outranks this
-    -- so an entry's label and the slug the SQL filter files it under are the
-    same string. Always answers.
+    The Python twin of :data:`PROVIDER_FALLBACK_SQL` -- exactly, which is why
+    it takes the two columns that expression reads and nothing else. Anything
+    only an entry's metadata knows (a stored ``$.provider``, a ``$.suno_id``)
+    is resolved into the ``provider`` column by :func:`resolved_provider_slug`
+    and is this function's business no more; ``provider.detect_provider``
+    answers it for Python. Always answers.
     """
-    if (source or "").strip().lower() == "suno" or str(suno_id or "").strip():
+    if (source or "").strip().lower() == "suno":
         return "suno"
     haystack = (model or "").lower()
-    for needle, provider in _PROVIDER_BY_MODEL_SUBSTRING:
-        if needle in haystack:
+    for remove, needle, provider in _PROVIDER_BY_MODEL_SUBSTRING:
+        if needle in (haystack.replace(remove, "") if remove else haystack):
             return provider
     if (source or "") == "import":
         return "import"
@@ -561,9 +587,7 @@ def infer_provider(
 
 
 def derived_provider_wire(
-    model: Optional[str],
-    source: Optional[str],
-    suno_id: Optional[str] = None,
+    model: Optional[str], source: Optional[str]
 ) -> dict[str, Any]:
     """The four provider wire fields for an entry nothing better identified.
 
@@ -572,7 +596,7 @@ def derived_provider_wire(
     under, so a filter offering that slug can never come back empty. There is
     no ``provider_id`` -- a derivation from a model string does not know one.
     """
-    slug = infer_provider(model, source, suno_id)
+    slug = infer_provider(model, source)
     label, is_ai = DERIVED_PROVIDERS.get(slug, (slug, False))
     return {
         "provider": slug,
@@ -582,56 +606,160 @@ def derived_provider_wire(
     }
 
 
-def _meta_json(key: str) -> str:
-    """Guarded ``json_extract`` of one fixed top-level metadata key, folded to
-    NULL when it is absent, empty, or the column is not valid JSON.
+def bounded_provider_slug(value: Any) -> Optional[str]:
+    """``value`` as a provider slug no longer than :data:`PROVIDER_SLUG_MAX`,
+    or None when nothing usable is left.
 
-    ``key`` is a literal from this module, never user input -- interpolating it
-    keeps the expression usable as a constant that callers can drop into any
-    query without having to thread its parameters through in the right order.
-    The ``json_valid`` guard is the one the search clause and the fts
-    projection already use: a hand-edited ``metadata_json`` degrades to "no
-    value" instead of aborting the statement.
-
-    The leading ``instr`` is what keeps this affordable at 200,000 rows. Almost
-    no entry carries either key, and parsing every row's ``metadata_json``
-    twice to discover that cost 582 ms on the provider facet -- over the 300 ms
-    budget in ``tests/test_library_facets.py`` -- against 20-60 ms with the
-    scan in front. It can only ever be a FALSE positive (the word appearing in
-    some other value), which merely runs the parse that would have run anyway;
-    it cannot be a false negative, because every writer here serialises with
-    ``json.dumps``, which spells a top-level key as exactly these bytes.
+    An unrecognised generator frame becomes its own slug, so without a bound a
+    file with a multi-kilobyte frame would mint a multi-kilobyte identifier --
+    and this one is compared in SQL and stored in an indexed column. The cut
+    can land on a separator, which no other code would produce, so the ends are
+    stripped afterwards. Idempotent: ``provider.py`` applies the same bound
+    where a slug is minted, and applying both is applying it once.
     """
-    return f"""CASE WHEN instr(e.metadata_json, '"{key}"') > 0
-                  AND json_valid(e.metadata_json)
-             THEN NULLIF(json_extract(e.metadata_json, '$.{key}'), '') END"""
+    slug = str(value or "").strip().lower()
+    if len(slug) > PROVIDER_SLUG_MAX:
+        slug = slug[:PROVIDER_SLUG_MAX]
+    return slug.strip("-") or None
 
 
-#: The provider rule as one SQL expression over an ``entries e``. Used by the
-#: list filter, its count, the id list and the provider facet, so those four
-#: can never file the same row under different slugs.
-PROVIDER_SQL = f"""CASE
-        WHEN {_meta_json("provider")} IS NOT NULL
-            THEN lower({_meta_json("provider")})
-        WHEN e.source = 'suno'
-             OR {_meta_json("suno_id")} IS NOT NULL
-             OR instr(lower(e.model), 'suno') > 0 THEN 'suno'
-        WHEN instr(lower(e.model), 'magenta') > 0
-             OR instr(lower(e.model), 'gemini') > 0 THEN 'gemini-magenta'
-        WHEN instr(lower(e.model), 'udio') > 0 THEN 'udio'
-        WHEN instr(lower(e.model), 'riffusion') > 0 THEN 'riffusion'
-        WHEN e.source = 'import' THEN 'import'
-        ELSE '{DEFAULT_PROVIDER}'
-    END"""
+def resolved_provider_slug(meta: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """What an entry's METADATA says its provider is, or None when it says
+    nothing -- the value of the ``entries.provider`` column.
+
+    This is the half of the provider rule a query must never pay for: a stored
+    ``$.provider`` and the legacy Suno markers, decided ONCE by
+    ``provider.detect_provider`` at the moment a writer is already holding the
+    metadata dict, and written into a column beside the row. The file's own
+    embedded tags are deliberately not consulted here -- reading those means
+    opening an audio file, which no writer of a row may do.
+
+    None leaves the column NULL and :data:`PROVIDER_FALLBACK_SQL` answering
+    for the row, which is the same answer the catalogue has always given it.
+    """
+    if not meta:
+        return None
+    try:
+        info = detect_provider({}, meta)
+    except Exception as e:  # noqa: BLE001 - a hand-edited blob never blocks a write
+        log.debug("library.db: provider resolution failed: %s", e)
+        return None
+    return bounded_provider_slug(info.provider) if info is not None else None
+
+
+#: The fallback half of the provider rule, over the ``source`` and ``model``
+#: COLUMNS alone -- no ``metadata_json``, no join, nothing an index cannot
+#: carry. ``{a}`` is the table alias prefix, so the one text below is both the
+#: expression the queries compare against and the expression the indexes in
+#: migration 9 are built on; they cannot drift, because there is only one.
+_PROVIDER_FALLBACK_TEMPLATE = """CASE
+        WHEN {a}source = 'suno'
+             OR instr(lower({a}model), 'suno') > 0 THEN 'suno'
+        WHEN instr(lower({a}model), 'magenta') > 0
+             OR instr(lower({a}model), 'gemini') > 0 THEN 'gemini-magenta'
+        WHEN instr(replace(lower({a}model), 'audio', ''), 'udio') > 0 THEN 'udio'
+        WHEN instr(lower({a}model), 'riffusion') > 0 THEN 'riffusion'
+        WHEN {a}source = 'import' THEN 'import'
+        ELSE '__DEFAULT__'
+    END""".replace("__DEFAULT__", DEFAULT_PROVIDER)
+
+#: ``NULLIF`` and not a bare COALESCE: "unresolved" is spelled NULL by every
+#: writer here, but an empty string is what a hand-edited row or a future
+#: writer could leave, and it must mean the same thing on both sides -- the
+#: Python fold in :meth:`LibraryDB._provider_facet` reads a blank column as
+#: unresolved, so the SQL has to as well or the two would file a row
+#: differently.
+_PROVIDER_RESOLVED_TEMPLATE = (
+    "COALESCE(NULLIF({a}provider, ''), " + _PROVIDER_FALLBACK_TEMPLATE + ")"
+)
+
+#: The fallback alone, over an ``entries e``.
+PROVIDER_FALLBACK_SQL = _PROVIDER_FALLBACK_TEMPLATE.format(a="e.")
+
+#: The WHOLE provider rule as one SQL expression over an ``entries e``: the
+#: resolved column when it has an answer, the fallback when it does not. Used
+#: by the list filter, its count, the id list and the provider facet, so those
+#: four can never file the same row under different slugs.
+PROVIDER_SQL = _PROVIDER_RESOLVED_TEMPLATE.format(a="e.")
+
+#: The same expression with no alias -- what the indexes are declared on.
+#: SQLite matches an indexed expression against the query's after name
+#: resolution, so the aliased and unaliased spellings are the same expression
+#: and the filter is an index SEEK rather than a table scan. The test
+#: ``test_library_provider_column.py`` asserts the plan, because a drift here
+#: is silent: the query would still be correct, just 60,000 rows slower.
+_PROVIDER_INDEX_EXPR = _PROVIDER_RESOLVED_TEMPLATE.format(a="")
+
+
+_MIGRATIONS.append(
+    (
+        9,
+        [
+            # The resolved provider. Nullable, no default, NO BACKFILL: an
+            # ``ALTER TABLE ... ADD COLUMN`` with no default is O(1) in rows
+            # (SQLite only rewrites the schema; existing records are read back
+            # with the column missing, which reads as NULL), so this costs the
+            # same on an empty library and on 200,000 entries and never opens
+            # one row's metadata. NULL rows keep being answered by the
+            # fallback, exactly as they were before the column existed, and
+            # are filled as requests return them.
+            #
+            # A build that does not know the column still reads and writes this
+            # database: nothing about the older schema changed. It cannot
+            # MAINTAIN the column, though -- its upsert does not name it -- so
+            # an entry edited under an older build keeps whatever slug it was
+            # last resolved to until a writer that knows the column touches it
+            # again, or ``reindex()`` rebuilds it from disk.
+            "ALTER TABLE entries ADD COLUMN provider TEXT",
+            # The raw column on its own. It answers the one question the two
+            # below cannot -- which rows are still unresolved -- and SQLite
+            # picks it for the provider facet over EVERY kind, where nothing
+            # constrains the leading ``kind`` column of the covering index
+            # (measured at 60,000 rows: 131 ms).
+            "CREATE INDEX IF NOT EXISTS idx_entries_provider ON entries(provider)",
+            # The filtered, sorted page. ``kind`` leads because every library
+            # tab but "all" constrains it; then the resolved slug, so
+            # ``provider = ?`` is an equality seek; then ``created_at DESC``,
+            # so the page comes back in order from an index WALK with no temp
+            # b-tree and a deep OFFSET stays index steps rather than row reads
+            # -- the same shape as ``idx_entries_kind_created``, which cannot
+            # serve this filter because the slug is not in it.
+            "CREATE INDEX IF NOT EXISTS idx_entries_provider_created "
+            f"ON entries(kind, {_PROVIDER_INDEX_EXPR}, created_at DESC)",
+            # The same page on the "all" tab, which sends no ``kind`` at all
+            # (``router._KIND_FILTERS['all']`` is None) and so cannot seek the
+            # index above -- its leading column is unconstrained. Measured at
+            # 60,000 realistic rows, a RARE slug on that tab took 317 ms
+            # without this index (the scan runs to the end of the table before
+            # it has 200 rows) against a 150 ms budget, and 0.2 ms with it.
+            "CREATE INDEX IF NOT EXISTS idx_entries_provider_any_kind "
+            f"ON entries({_PROVIDER_INDEX_EXPR}, created_at DESC)",
+            # The provider facet: every COLUMN the rule reads, in one COVERING
+            # index, so the group-by never visits the table. Deliberately NOT
+            # the expression -- SQLite does not treat an index on an expression
+            # as covering, so grouping on one costs a table lookup per row
+            # (measured at 60,000 rows: 348 ms on the expression against 6 ms
+            # here, and the facet's budget is 300 ms). ``provider`` joins the
+            # ``idx_entries_facet_model`` shape so the distinct
+            # ``(provider, model, source)`` triples -- a handful of rows -- can
+            # be folded into slugs in Python by the same rule the SQL spells.
+            # That is what closes the facet's old divergence from the filter:
+            # the resolved column is now part of the group key.
+            "CREATE INDEX IF NOT EXISTS idx_entries_facet_provider "
+            "ON entries(kind, provider, model, source, favorite)",
+        ],
+    )
+)
 
 
 # ---- Facets ----------------------------------------------------------------
 #
 # The filter dropdowns. ``model``, ``source`` and ``kind`` are columns and are
-# counted directly. ``provider`` is not a column: it is folded from
-# ``(model, source)`` through :func:`infer_provider` -- rules 2-7 of the same
-# rule the filter uses, minus the two arms that would cost a table scan. See
-# :meth:`LibraryDB._provider_facet` for what that does and does not guarantee.
+# counted directly. ``provider`` groups on the three columns
+# :data:`PROVIDER_SQL` reads -- the resolved ``provider`` plus the
+# ``(model, source)`` its fallback reads -- inside the covering
+# ``idx_entries_facet_provider`` index, and folds them into slugs by that same
+# rule. See :meth:`LibraryDB._provider_facet`.
 
 #: Facet fields the API accepts, in the order they are documented.
 FACET_FIELDS: tuple[str, ...] = ("model", "provider", "source", "kind")
@@ -684,6 +812,27 @@ _ANALYSIS_LIST_COLUMNS = (
     "embedded_tags_json",
     "ffprobe_json",
 )
+
+
+#: ``ALTER TABLE <table> ADD COLUMN <column> ...`` -- the one migration shape
+#: SQLite has no ``IF NOT EXISTS`` for. Anchored and whitespace-tolerant; it
+#: matches only the statements in :data:`_MIGRATIONS`, which this module writes.
+_ADD_COLUMN_RE = re.compile(
+    r"^\s*ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)\b",
+    re.IGNORECASE,
+)
+
+
+def _add_column_stmt(stmt: str) -> Optional[tuple[str, str]]:
+    """``(table, column)`` when ``stmt`` adds a column, else None.
+
+    Lets :meth:`LibraryDB._migrate` skip an ``ADD COLUMN`` whose column is
+    already there. Every other migration statement spells its own
+    ``IF NOT EXISTS``; this is the shape that cannot, and the shape that turns
+    an interrupted upgrade into a library nobody can open.
+    """
+    match = _ADD_COLUMN_RE.match(stmt)
+    return (match.group(1), match.group(2)) if match else None
 
 
 def _chunks(items: Sequence[Any], size: int) -> Iterator[Sequence[Any]]:
@@ -851,7 +1000,17 @@ def _entry_row(payload: dict[str, Any]) -> dict[str, Any]:
     upsert. A routine title/tag edit or a ``reindex()`` pass must not reset a
     track's analysis progress back to 'pending' (``tests/test_library_b12.py``
     pins this).
+
+    ``provider`` is the one column DERIVED here rather than read from a payload
+    key: it is resolved from the very ``metadata_json`` dict this row is
+    written with (:func:`resolved_provider_slug`), so every writer -- a
+    generation, an import, a folder registration, a user edit, ``reindex()`` --
+    fills it without having to know it exists, and the column can never
+    disagree with the metadata it was written beside. A payload whose metadata
+    names no provider writes NULL and :data:`PROVIDER_FALLBACK_SQL` answers for
+    that row.
     """
+    meta = payload.get("metadata_json") or {}
     return {
         "id": str(payload["id"]),
         "kind": str(payload.get("kind") or "audio"),
@@ -875,7 +1034,8 @@ def _entry_row(payload: dict[str, Any]) -> dict[str, Any]:
         else None,
         "notes": str(payload.get("notes") or ""),
         "timestamp": str(payload.get("timestamp") or ""),
-        "metadata_json": json.dumps(payload.get("metadata_json") or {}),
+        "provider": resolved_provider_slug(meta if isinstance(meta, Mapping) else None),
+        "metadata_json": json.dumps(meta),
     }
 
 
@@ -900,12 +1060,12 @@ _UPSERT_ENTRY_SQL = """
         id, kind, title, prompt, negative_prompt, model,
         duration_sec, steps, cfg, seed, mime, audio_filename,
         file_size_bytes, source, favorite, rating, notes,
-        timestamp, created_at, updated_at, metadata_json
+        timestamp, created_at, updated_at, provider, metadata_json
     ) VALUES (
         :id, :kind, :title, :prompt, :negative_prompt, :model,
         :duration_sec, :steps, :cfg, :seed, :mime, :audio_filename,
         :file_size_bytes, :source, :favorite, :rating, :notes,
-        :timestamp, :created_at, :updated_at, :metadata_json
+        :timestamp, :created_at, :updated_at, :provider, :metadata_json
     )
     ON CONFLICT(id) DO UPDATE SET
         kind = excluded.kind,
@@ -926,6 +1086,9 @@ _UPSERT_ENTRY_SQL = """
         notes = excluded.notes,
         timestamp = excluded.timestamp,
         updated_at = excluded.updated_at,
+        -- Written together with the metadata it was resolved from, so the two
+        -- can never describe different providers for one row.
+        provider = excluded.provider,
         metadata_json = excluded.metadata_json
     -- analysis_status / stems_status / midi_status are intentionally NOT
     -- listed above (neither INSERT column nor ON CONFLICT SET): a brand new
@@ -989,25 +1152,79 @@ class LibraryDB:
             return 0
 
     def _migrate(self) -> None:
+        """Bring the schema up to :data:`SCHEMA_VERSION`, one ALL-OR-NOTHING
+        step at a time.
+
+        Each step's statements AND its ``schema_version`` bump share ONE
+        explicit transaction. That is the difference between an interrupted
+        upgrade being resumable and the library refusing to open:
+
+        * SQLite DDL is transactional -- a rolled back ``ALTER TABLE`` /
+          ``CREATE INDEX`` leaves no trace -- so a step either happened or did
+          not, and the recorded version always matches the schema on disk.
+        * Python's sqlite3 in legacy transaction mode opens an implicit
+          transaction before DML only, NEVER before DDL, so without the
+          explicit ``BEGIN`` every ``ALTER`` and ``CREATE INDEX`` below would
+          commit on its own, ahead of the version bump that says they ran.
+          Building three indexes over a 200,000-entry library takes seconds to
+          minutes; a close, a crash or a kill inside that window left the
+          column added and the version still behind, and the next open re-ran
+          the bare ``ALTER`` and raised "duplicate column name" out of
+          ``__init__`` -- an unopenable library.
+
+        ``BEGIN`` is issued through the connection rather than relying on the
+        module's implicit handling precisely because the statements are DDL.
+        Once it has run, SQLite is out of autocommit, so the bump's INSERT
+        joins this transaction instead of starting its own.
+
+        :func:`_add_column_stmt` makes the second guarantee independent of the
+        first: a database ALREADY left half-migrated by an older, non-atomic
+        build is repaired rather than rejected, because an ``ADD COLUMN`` whose
+        column is present is skipped instead of raising. Every other statement
+        in ``_MIGRATIONS`` already carries ``IF NOT EXISTS``.
+        """
         with self._writelock:
             current = self._current_schema_version()
             for target_version, statements in _MIGRATIONS:
                 if target_version <= current:
                     continue
                 log.info("library.db: migrating to schema v%d", target_version)
-                for stmt in statements:
-                    self._conn.execute(stmt)
-                self._conn.execute(
-                    "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
-                    (str(target_version),),
-                )
-                if current == 0:
+                self._conn.execute("BEGIN")
+                try:
+                    for stmt in statements:
+                        column = _add_column_stmt(stmt)
+                        if column is not None and self._has_column(*column):
+                            log.info(
+                                "library.db: %s.%s is already there; "
+                                "finishing an interrupted migration",
+                                *column,
+                            )
+                            continue
+                        self._conn.execute(stmt)
                     self._conn.execute(
-                        "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('initialized_at', ?)",
-                        (str(_now()),),
+                        "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
+                        (str(target_version),),
                     )
-                self._conn.commit()
+                    if current == 0:
+                        self._conn.execute(
+                            "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('initialized_at', ?)",
+                            (str(_now()),),
+                        )
+                    self._conn.commit()
+                except Exception:
+                    self._conn.rollback()
+                    log.error(
+                        "library.db: migration to schema v%d failed and was "
+                        "rolled back; the database is still at v%d",
+                        target_version,
+                        current,
+                    )
+                    raise
                 current = target_version
+
+    def _has_column(self, table: str, column: str) -> bool:
+        rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(str(row[1]) == column for row in rows)
 
     # ---- Search index -------------------------------------------------------
 
@@ -1273,13 +1490,21 @@ class LibraryDB:
         read path record a fact it DERIVED about a row without the row looking
         edited.
 
-        Only safe for metadata keys nothing else mirrors. ``$.lyrics`` is
-        projected into the fts index and the entry columns are written from
-        their own payload fields, so a caller that changes either of those
-        must go through :meth:`upsert_entry` instead. Its one caller,
-        :meth:`~.store.LibraryStore.record_detected_providers`, adds only the
-        ``provider*`` keys -- which no column and no index reads, and which
-        :data:`PROVIDER_SQL` reads straight out of this column.
+        The ONE exception is the ``provider`` column, which is written in the
+        same statement from the same dict (:func:`resolved_provider_slug`).
+        That is not a second write to keep in step -- it is the same write:
+        :data:`PROVIDER_SQL` reads the column, so a metadata update that
+        renamed an entry's provider while leaving the column behind would
+        label the row one way and file it another, which is the exact
+        disagreement this method's caller exists to end. Neither is an edit:
+        no sort order, index or timestamp can notice either.
+
+        Otherwise only safe for metadata keys nothing else mirrors.
+        ``$.lyrics`` is projected into the fts index and the remaining entry
+        columns are written from their own payload fields, so a caller that
+        changes either of those must go through :meth:`upsert_entry` instead.
+        Its one caller, :meth:`~.store.LibraryStore.record_detected_providers`,
+        adds only the ``provider*`` keys.
 
         One transaction for the whole mapping, and NO ``library_revision``
         bump: the revision tells a client its cached pages are stale, and
@@ -1294,13 +1519,61 @@ class LibraryDB:
         Returns the number of rows actually updated.
         """
         rows = [
-            (json.dumps(dict(meta)), str(entry_id))
+            (
+                json.dumps(dict(meta)),
+                resolved_provider_slug(meta),
+                str(entry_id),
+            )
             for entry_id, meta in metadata_by_id.items()
         ]
         if not rows:
             return 0
         with self._txn(bump_revision=False) as cur:
-            cur.executemany("UPDATE entries SET metadata_json = ? WHERE id = ?", rows)
+            cur.executemany(
+                "UPDATE entries SET metadata_json = ?, provider = ? WHERE id = ?",
+                rows,
+            )
+            return int(cur.rowcount or 0)
+
+    def fill_entry_providers(self, provider_by_id: Mapping[str, str]) -> int:
+        """Fill the resolved ``provider`` column on rows that do not have one.
+
+        The lazy half of the column's life. A row imported or labeled before
+        the column existed carries its provider in ``metadata_json`` and NULL
+        in the column, so :data:`PROVIDER_SQL` answers for it with the
+        fallback. The read path already parsed that metadata to build the
+        response, so it knows the right slug for free: it hands the answer
+        here and the row is resolved, once, with no query to find candidates
+        and no walk of the library.
+
+        ``WHERE provider IS NULL`` is what makes it once-only and safe:
+
+        * a row already resolved is never rewritten, so this can never
+          overwrite an importer's, a user's or the write-through's answer --
+          the same never-overwrite rule the metadata blob lives under, spelled
+          in the WHERE clause so two threads racing on one row cannot both
+          win with different values;
+        * calling it again for the same entry updates nothing, so a second
+          view of the same page costs one statement and zero writes.
+
+        Like :meth:`set_entry_metadata` this writes no other column, rebuilds
+        no index, and does NOT bump ``library_revision``: the rows are the
+        ones the request is already returning, carrying the label being
+        stored, so no client's cache became stale. Returns how many rows were
+        actually filled.
+        """
+        rows = [
+            (slug, str(entry_id))
+            for entry_id, slug in provider_by_id.items()
+            if slug and str(entry_id)
+        ]
+        if not rows:
+            return 0
+        with self._txn(bump_revision=False) as cur:
+            cur.executemany(
+                "UPDATE entries SET provider = ? WHERE id = ? AND provider IS NULL",
+                rows,
+            )
             return int(cur.rowcount or 0)
 
     def get_entry(self, entry_id: str) -> Optional[dict[str, Any]]:
@@ -1783,32 +2056,44 @@ class LibraryDB:
     ) -> list[dict[str, Any]]:
         """Counts for the ``provider`` facet.
 
-        One query, grouped on the two COLUMNS the rule reads; the fold into
-        slugs runs in Python over the distinct ``(model, source)`` pairs -- a
-        handful of rows -- through :func:`infer_provider`, the same function
-        :data:`PROVIDER_SQL` is written from. That keeps the grouping inside
-        the covering ``idx_entries_facet_model`` index.
+        One query, grouped on the three COLUMNS the rule reads -- the resolved
+        ``provider`` and the ``(model, source)`` its fallback reads -- inside
+        the covering ``idx_entries_facet_provider`` index; the fold into slugs
+        runs in Python over the distinct triples, a handful of rows, and is
+        :data:`PROVIDER_SQL` spelled out: the column when it has an answer,
+        :func:`infer_provider` when it does not.
 
-        KNOWN GAP, deliberate: this is rules 2-7 only. The two metadata-backed
-        arms of the rule -- a stored ``$.provider`` and a ``$.suno_id`` -- are
-        not read here, so an entry labeled at import is COUNTED under the slug
-        its ``model`` / ``source`` imply while the FILTER returns it under its
-        stored one. Grouping on :data:`PROVIDER_SQL` instead closes the gap and
-        is what this method used to do for one revision, but it has to touch
-        ``metadata_json`` on every row, which means the table rather than the
-        index: measured at 200,000 rows it took 570 ms against the 300 ms
-        budget in ``tests/test_library_facets.py`` (20-60 ms here). Closing it
-        properly means resolving the provider ONCE into a column of its own,
-        which is a migration and a backfill, not a query change.
+        That fold is why a slug's count here and the number of rows
+        ``provider=<slug>`` returns are the same number. It was NOT before:
+        this used to group on ``(model, source)`` alone, because the other half
+        of the rule was a ``json_extract`` over ``metadata_json`` and grouping
+        on it meant reading every row's metadata -- 570 ms at 200,000 rows
+        against a 300 ms budget. So an entry labeled at import was COUNTED
+        under what its columns imply while the FILTER returned it under its
+        stored label, and the divergence was documented rather than fixed.
+        Resolving that half into a column put it in the group key for the price
+        of one more column in the index.
+
+        Grouping on :data:`PROVIDER_SQL` itself would be more obviously one
+        rule, and is affordable now in the sense that it opens no metadata --
+        but SQLite does not treat an index on an EXPRESSION as covering, so it
+        costs a table lookup per row: 348 ms at 60,000 rows against 6 ms here.
         """
+        # ``kind`` leads the group key although no slug depends on it: it leads
+        # the index too, so grouping by it keeps the whole aggregate inside the
+        # covering index in index ORDER -- no temp b-tree and no table lookup
+        # -- for the ``?kind=all`` tab, where nothing constrains that column.
+        # It costs one more distinct row per kind for the fold below to sum.
         rows = cur.execute(
-            f"SELECT e.model AS m, e.source AS s, COUNT(*) AS c "
-            f"FROM entries e {where} GROUP BY e.model, e.source",
+            "SELECT e.provider AS p, e.model AS m, e.source AS s, COUNT(*) AS c "
+            f"FROM entries e {where} GROUP BY e.kind, e.provider, e.model, e.source",
             params,
         ).fetchall()
         tally: dict[str, int] = {}
         for row in rows:
-            provider = infer_provider(row["m"], row["s"])
+            # `or` and not `is None`: the SQL side folds a blank column to
+            # unresolved with NULLIF, so this has to as well.
+            provider = row["p"] or infer_provider(row["m"], row["s"])
             tally[provider] = tally.get(provider, 0) + int(row["c"])
         ranked = sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))
         return [

@@ -36,10 +36,11 @@ from .db import (
     DEFAULT_SORT,
     EntryFilters,
     LibraryDB,
+    bounded_provider_slug,
     derived_provider_wire,
+    resolved_provider_slug,
 )
 from .provider import (
-    PROVIDER_SLUG_MAX,
     ProviderInfo,
     curated_fields,
     detect_provider,
@@ -463,9 +464,17 @@ def _resolve_audio_file(entry_dir: Path, meta: dict[str, Any]) -> Optional[Path]
 # shown as "suno" and filed under "import", so it answered to no provider
 # filter at all. :meth:`LibraryStore.record_detected_providers` closes that:
 # the FIRST read that derives a better answer writes it into the entry's
-# metadata -- once, never overwriting, metadata only -- and from then on rule 1
-# of PROVIDER_SQL files the row under the slug it is shown with. Still no
+# metadata -- once, never overwriting, metadata only -- and from then on
+# PROVIDER_SQL files the row under the slug it is shown with. Still no
 # backfill: only rows a request was already returning are ever touched.
+#
+# Where that answer LIVES is the resolved ``entries.provider`` column. Every
+# writer here fills it from the metadata it is already holding (the DB layer
+# does it inside ``_entry_row`` and ``set_entry_metadata``), and
+# :meth:`LibraryStore._fill_provider_column` resolves the rows that predate the
+# column as reads return them. Nothing re-reads a file to do it and nothing
+# looks for candidates: the metadata was parsed to build the response either
+# way.
 
 #: Curated embedded fields that fill one of the entry's OWN fields when the
 #: caller left it empty.
@@ -507,19 +516,27 @@ PROVIDER_TEXT_MAX = 200
 #: enough that remounting the volume repairs itself without a restart.
 PROVIDER_WRITE_RETRY_SECONDS = 300.0
 
-#: Ceiling on the provider SLUG -- ``provider.PROVIDER_SLUG_MAX``, imported
-#: rather than restated so the two bounds cannot drift apart. Unlike the label
-#: this is an identifier: it is compared in SQL, filed under, sent as a query
-#: parameter and stored in a column an ``instr`` scans. An unrecognised
-#: generator frame becomes its own slug, so without a bound a file with a
-#: multi-kilobyte frame would mint a multi-kilobyte identifier.
+#: How many rows ONE read may resolve into the ``provider`` column. A page is
+#: under this by construction (the endpoint's own ceiling is 500), so it never
+#: bites there; it exists for the legacy unpaged listing, which returns the
+#: WHOLE library and must stay a read of 200,000 rows rather than become a
+#: 200,000-row migration. Rows it skips are resolved by the paged reads that
+#: follow, each for the page it was already serving -- the same bound, and the
+#: same reason, as ``router.MAX_PROVIDER_WRITEBACK``.
+MAX_PROVIDER_COLUMN_FILL = 500
+
+#: Ceiling on the provider SLUG -- ``provider.PROVIDER_SLUG_MAX``. Unlike the
+#: label this is an identifier: it is compared in SQL, filed under, sent as a
+#: query parameter and stored in an INDEXED column. An unrecognised generator
+#: frame becomes its own slug, so without a bound a file with a multi-kilobyte
+#: frame would mint a multi-kilobyte identifier.
 #:
-#: ``provider.py`` applies this at the SOURCE, where a slug is minted. The
-#: bound here is the boundary check: every value that reaches storage or the
-#: wire passes through :func:`bounded_provider_info`, including one that
-#: arrived some other way -- a hand-edited ``metadata.json``, a row written by
-#: an older build. Both spell the same rule, and it is idempotent, so applying
-#: both is applying it once.
+#: ``provider.py`` applies this at the SOURCE, where a slug is minted;
+#: ``db.bounded_provider_slug`` applies it at the two boundaries where a slug
+#: reaches storage or the wire, so a value that arrived some other way -- a
+#: hand-edited ``metadata.json``, a row written by an older build -- is bounded
+#: too. One rule, spelled once, and idempotent, so applying it twice is
+#: applying it once.
 
 
 def _bounded_text(value: Any) -> Any:
@@ -540,16 +557,12 @@ def _bounded_text(value: Any) -> Any:
 def _bounded_slug(value: str) -> str:
     """A provider slug clipped to :data:`PROVIDER_SLUG_MAX`, still a slug.
 
-    The cut can land on a separator (``obscure-tracker-``), which is not a
-    slug any other code would produce, so the separators are stripped off the
-    ends afterwards. Idempotent -- clipping an already-clipped slug returns
-    it unchanged -- which is what lets this coexist with the same bound
-    applied at the source in ``provider.py`` without the two disagreeing.
+    One implementation, in the DB layer, because the same bound has to hold on
+    the value written into the indexed ``entries.provider`` column and on the
+    value put on the wire; two spellings of one rule is how they drift. Returns
+    "" rather than None here, which is what this module's callers test for.
     """
-    slug = value.strip().lower()
-    if len(slug) > PROVIDER_SLUG_MAX:
-        slug = slug[:PROVIDER_SLUG_MAX]
-    return slug.strip("-")
+    return bounded_provider_slug(value) or ""
 
 
 def bounded_provider_info(info: Optional[ProviderInfo]) -> Optional[ProviderInfo]:
@@ -649,14 +662,17 @@ def _provider_wire(
     of the ~200,000 entries already in the library is labeled as it is read,
     with no migration and no backfill.
 
-    Two steps, in the order :data:`~.db.PROVIDER_SQL` compares against, so an
-    entry's label is always the slug the list filter files it under:
+    Two steps, matching the two halves of :data:`~.db.PROVIDER_SQL` exactly, so
+    an entry's label is always the slug the list filter files it under:
 
-    1. a stored ``provider``, or the legacy Suno markers, via
-       :func:`~.provider.detect_provider` -- which also knows the track's own
-       provider id;
+    1. what the metadata names -- a stored ``provider`` or the legacy Suno
+       markers -- via :func:`~.provider.detect_provider`, which also knows the
+       track's own provider id. This is the same answer
+       :func:`~.db.resolved_provider_slug` writes into the ``provider`` column,
+       computed from the same dict by the same function;
     2. failing that, :func:`~.db.infer_provider` over ``model`` / ``source``,
-       the rule the catalogue has always shown these tracks under.
+       the twin of :data:`~.db.PROVIDER_FALLBACK_SQL` and the rule the
+       catalogue has always shown these tracks under.
 
     ``source`` and ``model`` are the ``entries`` columns, used when
     ``metadata.json`` carries none of its own -- the column is the truth for a
@@ -668,9 +684,10 @@ def _provider_wire(
     info = bounded_provider_info(detect_provider({}, meta))
     if info is not None:
         return bounded_provider_wire_fields(info)
-    return derived_provider_wire(
-        str(meta.get("model") or model or ""), row_source, meta.get("suno_id")
-    )
+    # No ``suno_id`` argument: an entry carrying one never reaches here,
+    # because `detect_provider` above answers "suno" for it. The fallback is
+    # the columns alone, in both languages.
+    return derived_provider_wire(str(meta.get("model") or model or ""), row_source)
 
 
 def _detected_provider_meta(info: ProviderInfo) -> dict[str, Any]:
@@ -896,7 +913,11 @@ def _int_or_none(v: Any) -> Optional[int]:
 
 
 def _record_from_db_row(
-    row: dict[str, Any], entry_dir: Path, api_prefix: str
+    row: dict[str, Any],
+    entry_dir: Path,
+    api_prefix: str,
+    *,
+    unresolved: Optional[dict[str, str]] = None,
 ) -> LibraryRecord:
     """Build a record from ONE ``entries`` row plus its directory.
 
@@ -905,6 +926,14 @@ def _record_from_db_row(
     never disagree with the unpaged one about what an entry looks like. Only
     the fields with no column -- tags, lyrics, mime, media dimensions -- come
     out of ``metadata_json``.
+
+    ``unresolved``, when given, collects ``{id: slug}`` for a row whose
+    metadata NAMES a provider that the row's ``provider`` column has not
+    recorded -- a row imported or labeled before the column existed. It is
+    filled here rather than by a second pass because the metadata has just
+    been parsed to build the record: the caller gets the answer for free and
+    adds no query to find it. See
+    :meth:`LibraryStore._fill_provider_column`.
     """
     entry_id = str(row["id"])
     kind = str(row.get("kind") or "audio")
@@ -914,6 +943,16 @@ def _record_from_db_row(
         meta = {}
     if not isinstance(meta, dict):
         meta = {}
+    if unresolved is not None and not str(row.get("provider") or "").strip():
+        # Resolved from the RAW stored dict, before the Suno-cache flattening
+        # below -- which is what `_entry_row` writes the column from. The
+        # column and the metadata it was resolved from must be two views of one
+        # answer, so both sides have to read the same dict; resolving from the
+        # flattened copy would make an entry's column depend on which writer
+        # got there first.
+        slug = resolved_provider_slug(meta)
+        if slug:
+            unresolved[entry_id] = slug
     meta = _flatten_suno_meta(meta)
     is_media = kind in ("video", "image")
     if is_media:
@@ -1434,6 +1473,7 @@ class LibraryStore:
             return self.list_entries(kinds)
         kind_set = set(kinds) if kinds is not None else None
         out: list[LibraryRecord] = []
+        unresolved: dict[str, str] = {}
         for row in self.db.list_entries():
             entry_id = str(row["id"])
             kind = str(row.get("kind") or "audio")
@@ -1446,7 +1486,19 @@ class LibraryStore:
             entry_dir = self._dir_for(entry_id)
             if entry_dir is None:
                 continue
-            out.append(_record_from_db_row(row, entry_dir, self.api_prefix))
+            out.append(
+                _record_from_db_row(
+                    row,
+                    entry_dir,
+                    self.api_prefix,
+                    unresolved=(
+                        unresolved
+                        if len(unresolved) < MAX_PROVIDER_COLUMN_FILL
+                        else None
+                    ),
+                )
+            )
+        self._fill_provider_column(unresolved)
         # The walk emits entries in sorted(root.iterdir()) order; sorting by
         # id mirrors that (entry ids are the directory names).
         out.sort(key=lambda r: r.id)
@@ -1472,17 +1524,31 @@ class LibraryStore:
         ``limit`` while the caller's ``total`` still counts the row. Catching
         that in the count would mean the per-row filesystem access this whole
         path exists to avoid.
+
+        Rows whose metadata names a provider the ``provider`` column has not
+        recorded yet are resolved here, bounded to this page — except under an
+        active provider filter, where a page must never rewrite its own result
+        set (see :meth:`_fill_provider_column`).
         """
         if self.db is None:
             raise RuntimeError("paged listing needs the library DB")
         out: list[LibraryRecord] = []
+        unresolved: dict[str, str] = {}
         for row in self.db.list_entries_page(
             filters, sort=sort, limit=limit, offset=offset
         ):
             entry_dir = self._dir_for(str(row["id"]))
             if entry_dir is None:
                 continue
-            out.append(_record_from_db_row(row, entry_dir, self.api_prefix))
+            out.append(
+                _record_from_db_row(
+                    row,
+                    entry_dir,
+                    self.api_prefix,
+                    unresolved=None if filters.provider else unresolved,
+                )
+            )
+        self._fill_provider_column(unresolved)
         return out
 
     def get_entry(self, entry_id: str) -> Optional[LibraryRecord]:
@@ -1741,6 +1807,47 @@ class LibraryStore:
                 failed,
             )
         return written
+
+    def _fill_provider_column(self, provider_by_id: Mapping[str, str]) -> int:
+        """Record, once, the provider that rows already carry in their metadata.
+
+        The lazy half of the ``entries.provider`` column. Rows written since
+        the column existed have it set by their own writer; rows older than it
+        carry the answer in ``metadata_json`` and NULL in the column, and are
+        resolved HERE -- the first time a request returns them, from the
+        metadata that request had already parsed. No query looks for
+        candidates, no file is opened and nothing walks the library, so an
+        untouched 200,000-entry library costs exactly one UPDATE per row that
+        is actually looked at, ever.
+
+        Until a row is resolved, :data:`~.db.PROVIDER_SQL` answers for it with
+        the fallback over its ``model`` / ``source`` columns. That is a
+        consistent answer, not a missing one: the list filter, its count and
+        the facet all read the same expression, so the row is returned by,
+        counted in and faceted under one slug at every moment -- the slug the
+        catalogue has always shown an unlabeled entry under. What changes when
+        it resolves is WHICH slug, and that is why a provider-FILTERED page
+        never fills: it would refile rows out of the result set the user is
+        looking at, exactly as a read-time relabel would (see
+        :meth:`~.router._attach_analysis`).
+
+        Never raises: a read-only volume or a locked database leaves the
+        column NULL and the fallback answering, which is what happened before
+        this existed. Returns how many rows were filled.
+        """
+        if not provider_by_id or self.db is None:
+            return 0
+        try:
+            return self.db.fill_entry_providers(provider_by_id)
+        except Exception as e:  # noqa: BLE001 - a read never fails on a write
+            log.debug(
+                "library.store: could not resolve the provider column for "
+                "%d entries: %s: %s",
+                len(provider_by_id),
+                type(e).__name__,
+                e,
+            )
+            return 0
 
     def _mirror_metadata(self, entry_id: str, meta: dict[str, Any]) -> bool:
         """Copy one entry's metadata into its ``metadata_json`` column.

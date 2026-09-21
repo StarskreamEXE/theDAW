@@ -524,21 +524,27 @@ def test_the_sql_filter_files_every_entry_under_its_wire_label(parity_store):
         )
 
 
-def test_the_provider_facet_reports_rules_two_to_seven(parity_store):
-    """The facet's contract, and the one gap it is documented to have.
+def test_the_provider_facet_counts_every_entry_under_the_slug_it_filters_as(
+    parity_store,
+):
+    """The facet counts a row under the slug the FILTER returns it under.
 
-    It folds ``(model, source)`` through ``infer_provider`` inside the covering
-    index, so the rule's two metadata-backed arms -- a stored ``$.provider``
-    and a ``$.suno_id`` -- are invisible to it: those entries are COUNTED under
-    what their columns imply while the FILTER returns them under the slug they
-    really carry. Pinned on both sides so the divergence is exactly this and
-    cannot widen unnoticed. See ``LibraryDB._provider_facet`` for the 570 ms
-    measurement that is the reason.
+    CHANGED by the resolved ``provider`` column (T11). This test used to pin
+    the opposite: the facet grouped on ``(model, source)`` alone, because the
+    rule's two metadata-backed arms -- a stored ``$.provider`` and a
+    ``$.suno_id`` -- could only be read by parsing every row's
+    ``metadata_json``, which cost 570 ms at 200,000 rows against the facet's
+    300 ms budget. So ``stored_label`` was counted under "import" while
+    ``provider=bandcamp`` was what actually returned it, and the divergence was
+    pinned rather than fixed.
+
+    Resolving those two arms ONCE into ``entries.provider`` made the whole rule
+    affordable to group on: the facet and the filter now read the same
+    ``PROVIDER_SQL``, out of the same index, so "counted as" and "filtered as"
+    are the same string for every row by construction. Asserted here as an
+    identity against the filter rather than against a second expression, since
+    an expression could agree with the facet and both be wrong.
     """
-    from collections import Counter
-
-    from backend.modules.library.db import infer_provider
-
     assert parity_store.db is not None
     facet = {
         row["value"]: row["count"]
@@ -546,27 +552,118 @@ def test_the_provider_facet_reports_rules_two_to_seven(parity_store):
             "provider"
         ]
     }
-    assert facet == dict(
-        Counter(
-            infer_provider(model, source)
-            for _id, model, source, _extra, _slug in PARITY_ROWS
-        )
-    )
-    # The gap, stated out loud from both ends.
-    assert "bandcamp" not in facet
+    wire = {r.id: r.provider for r in parity_store.list_entries()}
+    for slug, count in facet.items():
+        assert _ids(parity_store, provider=slug) == {
+            entry_id for entry_id, value in wire.items() if value == slug
+        }
+        assert count == len(_ids(parity_store, provider=slug))
+    # Every entry lands in exactly one bucket, and the gap this used to have
+    # is closed from both ends.
+    assert sum(facet.values()) == len(PARITY_ROWS)
+    assert facet["bandcamp"] == 1
     assert _ids(parity_store, provider="bandcamp") == {"stored_label"}
     assert _ids(parity_store, provider="import") == {"plain_import"}
     assert "legacy_suno_id" in _ids(parity_store, provider="suno")
 
 
+#: The fallback rule walked model-string by model-string, in both languages.
+#: The SAME table ``inferProvider`` walks in
+#: ``frontend/src/catalog/catalogProviders.test.ts``: three implementations of
+#: one rule, one list of cases, so a fix on one side that is not made on the
+#: others fails here. ``(model, source, slug)``.
+#:
+#: ``stable-audio-3-medium`` and ``audiocraft`` are the reason the udio arm
+#: deletes the word "audio" before it looks: "udio" is a substring of "audio",
+#: so a bare substring test filed every Stable Audio model under Udio.
+FALLBACK_PARITY_ROWS: tuple[tuple[object, object, str], ...] = (
+    ("chirp-v4", "suno", "suno"),
+    ("suno-v3", "generate", "suno"),
+    ("sunoesque", "import", "suno"),
+    ("magenta-rt", "generate", "gemini-magenta"),
+    ("gemini-x", "import", "gemini-magenta"),
+    ("udio-1", "import", "udio"),
+    ("Udio v1.5", "generate", "udio"),
+    ("stable-audio-3-medium", "generate", "stable-audio"),
+    ("audiocraft", "import", "import"),
+    ("audio-udio-blend", "import", "udio"),
+    ("riffusion", "import", "riffusion"),
+    ("imported", "import", "import"),
+    (None, "import", "import"),
+    ("stable-audio-3", "generate", "stable-audio"),
+    ("anything", "studio", "stable-audio"),
+    (None, None, "stable-audio"),
+)
+
+
+def test_the_fallback_rule_reads_every_model_string_the_frontend_does():
+    """The Python twin of ``PROVIDER_FALLBACK_SQL``, row by row."""
+    from backend.modules.library.db import infer_provider
+
+    for model, source, slug in FALLBACK_PARITY_ROWS:
+        assert infer_provider(model, source) == slug, (model, source)
+
+
+def test_the_sql_fallback_files_every_model_string_where_python_does(tmp_path: Path):
+    """The same table through SQL, on entries whose metadata names no provider
+    at all -- so the ``provider`` column is NULL for every one of them and the
+    fallback is what answers.
+
+    ``None`` is seeded as the column's own default (``model`` is NOT NULL
+    DEFAULT '' and ``source`` defaults to 'generate'), which is what a row with
+    no value actually holds; both spellings reach the same arm of the rule.
+    """
+    from backend.modules.library.db import infer_provider
+
+    root = tmp_path / "lib"
+    root.mkdir(parents=True, exist_ok=True)
+    expected: dict[str, str] = {}
+    for index, (model, source, slug) in enumerate(FALLBACK_PARITY_ROWS):
+        entry_id = f"fallback_{index:02d}"
+        _seed_entry(root, entry_id, {"model": model, "source": source or "generate"})
+        expected[entry_id] = slug
+    store = LibraryStore(root)
+    assert store.db is not None
+
+    # These rows name no provider, so the column is NULL and the fallback is
+    # what answers -- except ``source='suno'``, which is BOTH an arm of the
+    # fallback and a legacy metadata marker, and so resolves to the same slug
+    # from either side. Nowhere does the column contradict the fallback.
+    columns = {
+        str(r["id"]): r["provider"]
+        for r in store.db._conn.execute("SELECT id, provider FROM entries").fetchall()
+    }
+    assert columns["fallback_00"] == "suno"  # the ('chirp-v4', 'suno') row
+    assert {k: v for k, v in columns.items() if k != "fallback_00"} == {
+        entry_id: None for entry_id in expected if entry_id != "fallback_00"
+    }
+
+    for slug in sorted(set(expected.values())):
+        assert _ids(store, provider=slug) == {
+            entry_id for entry_id, value in expected.items() if value == slug
+        }
+    assert {r.id: r.provider for r in store.list_entries()} == expected
+    assert {
+        entry_id: infer_provider(model, source)
+        for entry_id, (model, source, _slug) in zip(expected, FALLBACK_PARITY_ROWS)
+    } == expected
+
+
 def test_infer_provider_still_mirrors_the_frontend_rules():
-    """Rules 2-7 alone, as the pure function the SQL CASE is written from."""
+    """The FALLBACK alone, as the pure function its SQL twin is written from.
+
+    ``suno_id`` is no longer an argument: it lives in an entry's metadata, and
+    everything only the metadata knows is resolved into the ``provider`` column
+    at write time instead of being asked of the columns at query time. The rows
+    that carry one are therefore excluded here with the stored-label row --
+    neither is this function's business any more.
+    """
     from backend.modules.library.db import infer_provider
 
     for _id, model, source, extra, slug in PARITY_ROWS:
-        if "provider" in extra:
-            continue  # rule 1 is not this function's business
-        assert infer_provider(model, source, extra.get("suno_id")) == slug
+        if "provider" in extra or "suno_id" in extra:
+            continue
+        assert infer_provider(model, source) == slug
 
 
 def test_list_endpoint_filters_and_counts_by_provider(client_with_root, tmp_path):
@@ -1210,10 +1307,11 @@ def test_a_huge_label_and_evidence_are_bounded_the_same_way_everywhere(
 
 def test_a_huge_slug_is_bounded_in_storage_and_on_the_wire(client_with_root, tmp_path):
     """The slug is an identifier, not prose: it is compared in SQL, filed
-    under, sent as a query parameter and scanned by an ``instr`` on every
-    filtered list. A multi-kilobyte generator frame must not mint a
-    multi-kilobyte identifier."""
-    from backend.modules.library.store import PROVIDER_SLUG_MAX, _bounded_slug
+    under, sent as a query parameter and stored in an INDEXED column. A
+    multi-kilobyte generator frame must not mint a multi-kilobyte
+    identifier."""
+    from backend.modules.library.provider import PROVIDER_SLUG_MAX
+    from backend.modules.library.store import _bounded_slug
 
     # The boundary belt on its own: whatever reaches storage or the wire is
     # bounded there too, not only where `provider.py` mints a slug -- a
