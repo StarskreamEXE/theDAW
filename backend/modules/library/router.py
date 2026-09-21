@@ -55,7 +55,8 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from .bundle import build_bundle_bytes
-from .db import DEFAULT_SORT, FACET_FIELDS, SORTS, EntryFilters
+from .db import DEFAULT_SORT, FACET_FIELDS, SORTS, EntryFilters, infer_provider
+from .provider import detect_provider, provider_wire_fields
 from .store import (
     AUDIO_EXTS,
     MAX_REINDEX_ANALYSIS_ENQUEUE,
@@ -237,6 +238,32 @@ def _analysis_payload(row: dict[str, Any]) -> tuple[dict[str, Any], dict[str, An
     return analysis, embedded
 
 
+def _derive_provider(entry: dict[str, Any], embedded: dict[str, Any]) -> None:
+    """Upgrade an entry's provider using the tags its analysis pass stored.
+
+    The store already labeled the entry (``store._provider_wire``): a stored
+    label or a legacy Suno marker where there was one, and otherwise the
+    ``model`` / ``source`` guess the catalogue has always shown. This is the
+    middle rank, and it only applies to the entries whose origin nothing but
+    the file itself knows -- a Suno track imported long before labeling
+    existed, whose surviving evidence is the tag blob in its analysis row.
+
+    The guess is replaced, a real label is not: an entry whose provider is
+    exactly what ``infer_provider`` produces carries no better information, so
+    the file's own tags outrank it. Nothing is written back and no audio file
+    is opened, which is how the existing library gets labeled with no backfill
+    and no re-analysis. Entries with no analysis row never reach here and keep
+    what the store gave them.
+    """
+    current = entry.get("provider")
+    if current and current != infer_provider(entry.get("model"), entry.get("source")):
+        return
+    info = detect_provider(embedded, None)
+    if info is None:
+        return
+    entry.update(provider_wire_fields(info))
+
+
 def _apply_analysis(entry: dict[str, Any], row: Optional[dict[str, Any]]) -> None:
     """Merge one analysis ``row`` onto one ``entry`` dict in place. No-op when
     ``row`` is ``None`` (entry not analyzed) or yields nothing renderable."""
@@ -247,6 +274,7 @@ def _apply_analysis(entry: dict[str, Any], row: Optional[dict[str, Any]]) -> Non
         entry["analysis"] = analysis
     if embedded:
         entry["embedded_tags"] = embedded
+        _derive_provider(entry, embedded)
 
 
 def _attach_analysis(
@@ -308,12 +336,14 @@ def _entry_filters(
     q: Optional[str],
     favorite: Optional[bool],
     source: Optional[str],
+    provider: Optional[str] = None,
 ) -> EntryFilters:
     kinds = _KIND_FILTERS[kind]
     return EntryFilters(
         kinds=frozenset(kinds) if kinds is not None else None,
         favorite=favorite,
         source=source,
+        provider=provider,
         q=q,
     )
 
@@ -338,13 +368,19 @@ def list_entries(
     sort: Optional[str] = None,
     favorite: Optional[bool] = None,
     source: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> dict[str, Any]:
     """The library list, in two shapes.
 
     With NONE of ``limit`` / ``offset`` / ``q`` / ``sort`` / ``favorite`` /
-    ``source`` this is byte-for-byte the endpoint it has always been: every
-    entry of the requested kind, plus ``count`` / ``root`` / ``kind``. Callers
-    that predate paging keep working unchanged.
+    ``source`` / ``provider`` this is byte-for-byte the endpoint it has always
+    been: every entry of the requested kind, plus ``count`` / ``root`` /
+    ``kind``. Callers that predate paging keep working unchanged.
+
+    ``provider`` narrows to one origin slug ("suno", "bandcamp", ...) and is a
+    DIFFERENT axis from ``source``, which still means generate / studio /
+    import. It matches entries labeled at import AND the legacy Suno entries
+    that predate labeling.
 
     With any of them it is paged: filtering, searching and sorting happen in
     SQL, records are built for the page only, and the response adds ``total``
@@ -361,7 +397,10 @@ def list_entries(
         raise HTTPException(400, f"limit must be 1..{MAX_PAGE_LIMIT}, got {limit}")
     store = get_store()
 
-    paged = any(v is not None for v in (limit, q, sort, favorite, source)) or offset > 0
+    paged = (
+        any(v is not None for v in (limit, q, sort, favorite, source, provider))
+        or offset > 0
+    )
     if not paged:
         entries = [
             r.to_dict() for r in store.list_entries_fast(kinds=_KIND_FILTERS[kind])
@@ -378,7 +417,7 @@ def list_entries(
     if store.db is None:
         raise HTTPException(503, "library DB not available")
     page_limit = limit if limit is not None else DEFAULT_PAGE_LIMIT
-    filters = _entry_filters(kind, q, favorite, source)
+    filters = _entry_filters(kind, q, favorite, source, provider)
     entries = [
         r.to_dict()
         for r in store.list_entries_page(
@@ -408,6 +447,7 @@ def list_entry_ids(
     sort: Optional[str] = None,
     favorite: Optional[bool] = None,
     source: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> dict[str, Any]:
     """Every id matching the filters, in the same order the paged list uses.
 
@@ -420,7 +460,7 @@ def list_entry_ids(
     store = get_store()
     if store.db is None:
         raise HTTPException(503, "library DB not available")
-    filters = _entry_filters(kind, q, favorite, source)
+    filters = _entry_filters(kind, q, favorite, source, provider)
     # One row past the cap comes back when there are more, so no second COUNT
     # is needed to tell "at the limit" from "over it".
     ids = store.db.list_entry_ids(
@@ -442,6 +482,7 @@ def entry_facets(
     q: Optional[str] = None,
     favorite: Optional[bool] = None,
     source: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> dict[str, Any]:
     """Value counts for the filter dropdowns, over the WHOLE filtered library.
 
@@ -475,7 +516,7 @@ def entry_facets(
     store = get_store()
     if store.db is None:
         raise HTTPException(503, "library DB not available")
-    filters = _entry_filters(kind, q, favorite, source)
+    filters = _entry_filters(kind, q, favorite, source, provider)
     return {
         "facets": store.db.facet_counts(filters, requested),
         "revision": store.db.library_revision(),

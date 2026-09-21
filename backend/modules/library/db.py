@@ -449,11 +449,16 @@ def _fts_match_expr(tokens: Sequence[str]) -> str:
 class EntryFilters:
     """What narrows a library listing. ``kinds=None`` means every kind (the
     ``?kind=all`` tab); an empty set matches nothing. ``q`` is free text, not a
-    query language."""
+    query language.
+
+    ``source`` and ``provider`` are different axes and both may be set:
+    ``source`` is the generate / studio / import column, ``provider`` is the
+    origin slug :data:`PROVIDER_SQL` resolves for every entry."""
 
     kinds: Optional[frozenset[str]] = None
     favorite: Optional[bool] = None
     source: Optional[str] = None
+    provider: Optional[str] = None
     q: Optional[str] = None
 
 
@@ -478,14 +483,155 @@ SORTS: tuple[str, ...] = tuple(_SORT_SQL)
 DEFAULT_SORT = "created_desc"
 
 
+# ---- Provider ---------------------------------------------------------------
+#
+# Which service an entry came from. ONE rule, written twice because two
+# languages have to answer it -- :data:`PROVIDER_SQL` for everything the
+# database answers, :func:`infer_provider` for everything Python answers -- and
+# the two must never disagree, because the same slug is both what a row is
+# labeled with and what the list filter is asked for.
+#
+#   1. a stored ``$.provider`` in ``metadata_json``: an entry labeled at import
+#      from what the file itself carried (backend/modules/library/provider.py)
+#   2. legacy Suno: ``source`` of 'suno', a ``$.suno_id``, or 'suno' in ``model``
+#   3. 'magenta' or 'gemini' in ``model``   -> gemini-magenta
+#   4. 'udio' in ``model``                  -> udio
+#   5. 'riffusion' in ``model``             -> riffusion
+#   6. ``source`` of 'import'               -> import
+#   7. otherwise                            -> stable-audio
+#
+# Rules 2-7 are ``inferProvider`` in frontend/src/catalog/catalogProviders.ts,
+# which is what every catalogue row, badge and dropdown has always shown; rule
+# 1 is what this feature added in front of them. Rule 7 always answers, so
+# every entry has a provider and the facet -- unlike ``model`` -- never has an
+# "unset" bucket.
+#
+# Only rule 1 and the ``$.suno_id`` arm of rule 2 read ``metadata_json``; the
+# rest are the indexed ``source`` and ``model`` columns. Nothing here opens an
+# audio file or touches an analysis blob, which is what keeps the rule
+# affordable over ~200,000 rows.
+
+#: ``model`` substring -> provider id, in priority order (rules 2-5).
+_PROVIDER_BY_MODEL_SUBSTRING: tuple[tuple[str, str], ...] = (
+    ("suno", "suno"),
+    ("magenta", "gemini-magenta"),
+    ("gemini", "gemini-magenta"),
+    ("udio", "udio"),
+    ("riffusion", "riffusion"),
+)
+
+#: theDAW's own generations and studio renders.
+DEFAULT_PROVIDER = "stable-audio"
+
+#: Display name and AI-ness per derived slug. Mirrors ``KNOWN_PROVIDERS`` in
+#: ``frontend/src/catalog/catalogProviders.ts``. A store or host would be
+#: ``False``; every engine rules 2-7 can name is a generator, and an import of
+#: unknown origin is not claimed to be one.
+DERIVED_PROVIDERS: dict[str, tuple[str, bool]] = {
+    "suno": ("Suno", True),
+    "gemini-magenta": ("Magenta", True),
+    "udio": ("Udio", True),
+    "riffusion": ("Riffusion", True),
+    "import": ("Imported", False),
+    DEFAULT_PROVIDER: ("Stable Audio", True),
+}
+
+
+def infer_provider(
+    model: Optional[str],
+    source: Optional[str],
+    suno_id: Optional[str] = None,
+) -> str:
+    """Rules 2-7 above: which engine produced an entry, from what the row says.
+
+    The Python twin of :data:`PROVIDER_SQL` minus its first rule -- a stored
+    ``$.provider`` is read by ``provider.detect_provider``, which outranks this
+    -- so an entry's label and the slug the SQL filter files it under are the
+    same string. Always answers.
+    """
+    if (source or "").strip().lower() == "suno" or str(suno_id or "").strip():
+        return "suno"
+    haystack = (model or "").lower()
+    for needle, provider in _PROVIDER_BY_MODEL_SUBSTRING:
+        if needle in haystack:
+            return provider
+    if (source or "") == "import":
+        return "import"
+    return DEFAULT_PROVIDER
+
+
+def derived_provider_wire(
+    model: Optional[str],
+    source: Optional[str],
+    suno_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """The four provider wire fields for an entry nothing better identified.
+
+    Used when neither a stored label nor the file's own embedded tags say
+    anything: the row still gets the slug the catalogue has always shown it
+    under, so a filter offering that slug can never come back empty. There is
+    no ``provider_id`` -- a derivation from a model string does not know one.
+    """
+    slug = infer_provider(model, source, suno_id)
+    label, is_ai = DERIVED_PROVIDERS.get(slug, (slug, False))
+    return {
+        "provider": slug,
+        "provider_label": label,
+        "provider_is_ai": is_ai,
+        "provider_id": None,
+    }
+
+
+def _meta_json(key: str) -> str:
+    """Guarded ``json_extract`` of one fixed top-level metadata key, folded to
+    NULL when it is absent, empty, or the column is not valid JSON.
+
+    ``key`` is a literal from this module, never user input -- interpolating it
+    keeps the expression usable as a constant that callers can drop into any
+    query without having to thread its parameters through in the right order.
+    The ``json_valid`` guard is the one the search clause and the fts
+    projection already use: a hand-edited ``metadata_json`` degrades to "no
+    value" instead of aborting the statement.
+
+    The leading ``instr`` is what keeps this affordable at 200,000 rows. Almost
+    no entry carries either key, and parsing every row's ``metadata_json``
+    twice to discover that cost 582 ms on the provider facet -- over the 300 ms
+    budget in ``tests/test_library_facets.py`` -- against 20-60 ms with the
+    scan in front. It can only ever be a FALSE positive (the word appearing in
+    some other value), which merely runs the parse that would have run anyway;
+    it cannot be a false negative, because every writer here serialises with
+    ``json.dumps``, which spells a top-level key as exactly these bytes.
+    """
+    return f"""CASE WHEN instr(e.metadata_json, '"{key}"') > 0
+                  AND json_valid(e.metadata_json)
+             THEN NULLIF(json_extract(e.metadata_json, '$.{key}'), '') END"""
+
+
+#: The provider rule as one SQL expression over an ``entries e``. Used by the
+#: list filter, its count, the id list and the provider facet, so those four
+#: can never file the same row under different slugs.
+PROVIDER_SQL = f"""CASE
+        WHEN {_meta_json("provider")} IS NOT NULL
+            THEN lower({_meta_json("provider")})
+        WHEN e.source = 'suno'
+             OR {_meta_json("suno_id")} IS NOT NULL
+             OR instr(lower(e.model), 'suno') > 0 THEN 'suno'
+        WHEN instr(lower(e.model), 'magenta') > 0
+             OR instr(lower(e.model), 'gemini') > 0 THEN 'gemini-magenta'
+        WHEN instr(lower(e.model), 'udio') > 0 THEN 'udio'
+        WHEN instr(lower(e.model), 'riffusion') > 0 THEN 'riffusion'
+        WHEN e.source = 'import' THEN 'import'
+        ELSE '{DEFAULT_PROVIDER}'
+    END"""
+
+
 # ---- Facets ----------------------------------------------------------------
 #
 # The filter dropdowns. ``model``, ``source`` and ``kind`` are columns and are
-# counted directly. ``provider`` is NOT stored anywhere -- it is derived from
-# ``(model, source)``, exactly as ``frontend/src/catalog/catalogProviders.ts``
-# derives it client-side, so the two can never disagree about which engine made
-# a track. Deriving it also means no migration, no backfill, and no second
-# place to keep in sync on every write.
+# counted directly. ``provider`` is not a column: it is folded from
+# ``(model, source)`` through :func:`infer_provider` -- rules 2-7 of the same
+# rule the filter uses, minus the two arms that would cost a table scan. See
+# :meth:`LibraryDB._provider_facet` for what that does and does not guarantee.
 
 #: Facet fields the API accepts, in the order they are documented.
 FACET_FIELDS: tuple[str, ...] = ("model", "provider", "source", "kind")
@@ -500,34 +646,6 @@ _FACET_COLUMNS: dict[str, str] = {
 #: How many values one field reports. A dropdown cannot show more, and an
 #: unbounded list is exactly the response this endpoint exists to avoid.
 MAX_FACET_VALUES = 200
-
-#: ``model`` substring -> provider id, in priority order. Mirrors
-#: ``inferProvider`` in the frontend's ``catalogProviders.ts``.
-_PROVIDER_BY_MODEL_SUBSTRING: tuple[tuple[str, str], ...] = (
-    ("suno", "suno"),
-    ("magenta", "gemini-magenta"),
-    ("gemini", "gemini-magenta"),
-    ("udio", "udio"),
-    ("riffusion", "riffusion"),
-)
-
-#: theDAW's own generations and studio renders.
-DEFAULT_PROVIDER = "stable-audio"
-
-
-def infer_provider(model: Optional[str], source: Optional[str]) -> str:
-    """Which engine produced an entry, from the two columns that record it.
-
-    Always answers, so the ``provider`` facet -- unlike ``model`` -- never has
-    an "unset" bucket.
-    """
-    haystack = (model or "").lower()
-    for needle, provider in _PROVIDER_BY_MODEL_SUBSTRING:
-        if needle in haystack:
-            return provider
-    if (source or "") == "import":
-        return "import"
-    return DEFAULT_PROVIDER
 
 
 #: How many ids one ``IN (...)`` list carries. SQLite's parameter ceiling is
@@ -1460,6 +1578,14 @@ class LibraryDB:
         if filters.source:
             clauses.append("e.source = ?")
             params.append(filters.source)
+        if filters.provider:
+            # One expression, one comparison: an entry is filed under exactly
+            # one slug, so no row can match two providers and none can be
+            # missed. Slugs are lowercase by construction (`provider.py`
+            # slugifies, `infer_provider` returns literals), so the parameter
+            # is folded to match.
+            clauses.append(f"{PROVIDER_SQL} = ?")
+            params.append(str(filters.provider).strip().lower())
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         return where, params
 
@@ -1599,12 +1725,25 @@ class LibraryDB:
     def _provider_facet(
         cur: sqlite3.Cursor, where: str, params: list[Any]
     ) -> list[dict[str, Any]]:
-        """Counts for the derived ``provider`` facet.
+        """Counts for the ``provider`` facet.
 
-        One query, grouped on the two columns the derivation reads; the fold
-        into provider ids runs in Python over the distinct ``(model, source)``
-        pairs -- a handful of rows -- so :func:`infer_provider` stays the single
-        definition of the rule rather than being restated as a SQL CASE.
+        One query, grouped on the two COLUMNS the rule reads; the fold into
+        slugs runs in Python over the distinct ``(model, source)`` pairs -- a
+        handful of rows -- through :func:`infer_provider`, the same function
+        :data:`PROVIDER_SQL` is written from. That keeps the grouping inside
+        the covering ``idx_entries_facet_model`` index.
+
+        KNOWN GAP, deliberate: this is rules 2-7 only. The two metadata-backed
+        arms of the rule -- a stored ``$.provider`` and a ``$.suno_id`` -- are
+        not read here, so an entry labeled at import is COUNTED under the slug
+        its ``model`` / ``source`` imply while the FILTER returns it under its
+        stored one. Grouping on :data:`PROVIDER_SQL` instead closes the gap and
+        is what this method used to do for one revision, but it has to touch
+        ``metadata_json`` on every row, which means the table rather than the
+        index: measured at 200,000 rows it took 570 ms against the 300 ms
+        budget in ``tests/test_library_facets.py`` (20-60 ms here). Closing it
+        properly means resolving the provider ONCE into a column of its own,
+        which is a migration and a backfill, not a query change.
         """
         rows = cur.execute(
             f"SELECT e.model AS m, e.source AS s, COUNT(*) AS c "

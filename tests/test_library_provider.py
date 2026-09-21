@@ -1,0 +1,510 @@
+"""Unit tests for backend.modules.library.provider.
+
+Every fixture here is a synthetic tag dict: invented ids, invented handles,
+no real user media and no real file is ever opened. The module under test
+is pure, so that is the whole surface.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from backend.modules.library.provider import (
+    URL_KEY_PRIORITY,
+    ProviderInfo,
+    curated_fields,
+    detect_provider,
+    is_analytics_key,
+    provider_wire_fields,
+)
+
+SAMPLE_ID = "11111111-2222-4333-8444-555555555555"
+PARENT_ID = "99999999-8888-4777-8666-555555555444"
+ZERO_UUID = "00000000-0000-0000-0000-000000000000"
+
+
+# --- explicit Suno signals, each one alone ----------------------------------
+
+
+def test_suno_detected_from_generator_alone():
+    info = detect_provider({"generator": "suno"})
+    assert info is not None
+    assert info.provider == "suno"
+    assert info.label == "Suno"
+    assert info.is_ai is True
+    assert info.confidence == "explicit"
+    assert info.evidence == "generator=suno"
+    assert info.provider_id is None
+
+
+def test_suno_detected_from_id_frame_alone():
+    info = detect_provider({"txxx_suno_id": SAMPLE_ID})
+    assert info is not None
+    assert info.provider == "suno"
+    assert info.provider_id == SAMPLE_ID
+    assert info.confidence == "explicit"
+    assert "txxx_suno_id" in info.evidence
+
+
+def test_suno_inferred_from_album_alone():
+    info = detect_provider({"album": "Suno AI"})
+    assert info is not None
+    assert info.provider == "suno"
+    assert info.confidence == "inferred"
+    assert info.evidence == "album=Suno AI"
+
+
+def test_suno_id_is_carried_when_generator_decides():
+    info = detect_provider({"generator": "suno", "txxx_suno_id": SAMPLE_ID})
+    assert info is not None
+    assert info.provider_id == SAMPLE_ID
+
+
+# --- legacy entries labeled before this feature -----------------------------
+
+
+def test_legacy_meta_source_suno():
+    info = detect_provider({}, {"source": "suno"})
+    assert info is not None
+    assert info.provider == "suno"
+    assert info.confidence == "explicit"
+    assert info.evidence == "meta.source=suno"
+
+
+def test_legacy_meta_suno_id_field():
+    info = detect_provider({}, {"source": "import", "suno_id": SAMPLE_ID})
+    assert info is not None
+    assert info.provider == "suno"
+    assert info.provider_id == SAMPLE_ID
+    assert info.confidence == "explicit"
+
+
+def test_legacy_meta_sunoid_tag():
+    info = detect_provider({}, {"tags": ["mixtape", f"sunoid:{SAMPLE_ID}"]})
+    assert info is not None
+    assert info.provider == "suno"
+    assert info.provider_id == SAMPLE_ID
+
+
+def test_legacy_meta_bare_suno_tag():
+    info = detect_provider({}, {"tags": "suno, drums"})
+    assert info is not None
+    assert info.provider == "suno"
+    assert info.provider_id is None
+
+
+def test_legacy_zero_uuid_is_not_a_provider_id():
+    info = detect_provider({}, {"source": "suno", "suno_id": ZERO_UUID})
+    assert info is not None
+    assert info.provider == "suno"
+    assert info.provider_id is None
+
+
+# --- stored provider wins ---------------------------------------------------
+
+
+def test_meta_provider_wins_over_embedded_tags():
+    info = detect_provider(
+        {"generator": "suno", "txxx_suno_id": SAMPLE_ID},
+        {
+            "provider": "bandcamp",
+            "provider_label": "Bandcamp",
+            "provider_is_ai": False,
+            "provider_id": "cassette-42",
+        },
+    )
+    assert info is not None
+    assert info.provider == "bandcamp"
+    assert info.label == "Bandcamp"
+    assert info.is_ai is False
+    assert info.provider_id == "cassette-42"
+    assert info.evidence == "meta.provider"
+
+
+def test_meta_provider_without_label_uses_the_table():
+    info = detect_provider({}, {"provider": "udio"})
+    assert info is not None
+    assert info.provider == "udio"
+    assert info.label == "Udio"
+    assert info.is_ai is True
+
+
+def test_meta_provider_wins_over_legacy_suno_markers():
+    info = detect_provider({}, {"provider": "soundcloud", "source": "suno"})
+    assert info is not None
+    assert info.provider == "soundcloud"
+    assert info.is_ai is False
+
+
+# --- domain inference -------------------------------------------------------
+
+
+def test_domain_inferred_from_comment_url():
+    info = detect_provider(
+        {"comment": "bought at https://someartist.bandcamp.com/track/a-song"}
+    )
+    assert info is not None
+    assert info.provider == "bandcamp"
+    assert info.is_ai is False
+    assert info.confidence == "inferred"
+    assert info.evidence.startswith("comment=")
+
+
+def test_domain_inferred_from_url_frame():
+    info = detect_provider({"website": "https://www.udio.com/songs/abc123"})
+    assert info is not None
+    assert info.provider == "udio"
+    assert info.is_ai is True
+    assert info.confidence == "inferred"
+
+
+def test_short_youtube_domain_matches():
+    info = detect_provider({"url": "https://youtu.be/abcdefghijk"})
+    assert info is not None
+    assert info.provider == "youtube"
+
+
+def test_source_url_outranks_a_commerce_url():
+    # WPAY points at a store that merely took the money; WOAS points at
+    # where the track actually lives.
+    info = detect_provider(
+        {
+            "payment_url": "https://someshop.bandcamp.com/album/a-record",
+            "publisher_url": "https://alabel.bandcamp.com",
+            "source_url": "https://soundcloud.com/neutral-handle/a-track",
+        }
+    )
+    assert info is not None
+    assert info.provider == "soundcloud"
+    assert info.confidence == "inferred"
+    assert info.evidence.startswith("source_url=")
+
+
+def test_file_url_outranks_the_comment_and_artist_url():
+    info = detect_provider(
+        {
+            "comment": "grab it at https://someshop.bandcamp.com/track/x",
+            "artist_url": "https://open.spotify.com/artist/neutral",
+            "file_url": "https://www.udio.com/songs/neutral",
+        }
+    )
+    assert info is not None
+    assert info.provider == "udio"
+    assert info.evidence.startswith("file_url=")
+
+
+def test_wxxx_frame_outranks_the_artist_url():
+    info = detect_provider(
+        {
+            "artist_url": "https://open.spotify.com/artist/neutral",
+            "wxxx_download": "https://someshop.bandcamp.com/track/x",
+        }
+    )
+    assert info is not None
+    assert info.provider == "bandcamp"
+    assert info.evidence.startswith("wxxx_download=")
+
+
+def test_commerce_url_alone_still_resolves():
+    info = detect_provider({"payment_url": "https://someshop.bandcamp.com/album/x"})
+    assert info is not None
+    assert info.provider == "bandcamp"
+    assert info.confidence == "inferred"
+    assert info.evidence == "payment_url=someshop.bandcamp.com"
+
+
+def test_url_priority_order_is_one_constant():
+    named = [key for key in URL_KEY_PRIORITY if key != "*"]
+    assert named == [
+        "source_url",
+        "file_url",
+        "artist_url",
+        "comment",
+        "publisher_url",
+        "commercial_url",
+        "payment_url",
+        "radio_url",
+        "copyright_url",
+    ]
+    # Unnamed url-ish frames (WXXX and friends) sit between the two groups.
+    assert 0 < URL_KEY_PRIORITY.index("*") < URL_KEY_PRIORITY.index("artist_url")
+
+
+def test_image_url_analytics_frame_never_infers_a_provider():
+    info = detect_provider({"txxx_suno_image_url": "https://cdn.suno.com/x.jpeg"})
+    assert info is None
+
+
+# --- other tools ------------------------------------------------------------
+
+
+def test_unknown_generator_becomes_its_own_provider():
+    info = detect_provider({"generator": "Harmony Forge 2"})
+    assert info is not None
+    assert info.provider == "harmony-forge-2"
+    assert info.label == "Harmony Forge 2"
+    assert info.is_ai is False
+    assert info.confidence == "explicit"
+
+
+@pytest.mark.parametrize(
+    ("value", "slug"),
+    [
+        ("Sunshine Audio", "sunshine-audio"),
+        ("David Synth", "david-synth"),
+        ("Treason Records", "treason-records"),
+        ("Nerogen", "nerogen"),
+    ],
+)
+def test_generic_markers_never_match_inside_a_word(value: str, slug: str):
+    # "shine", "avid", "reason", "nero" are encoder/DAW names, but only as
+    # whole words — these four are their own providers, not encoders.
+    info = detect_provider({"generator": value})
+    assert info is not None, value
+    assert info.provider == slug
+    assert info.label == value
+    assert info.confidence == "explicit"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Lavf58.76.100",
+        "Lavf61.7.100",
+        "LAME3.100",
+        "ffmpeg",
+        "iTunes 12.13",
+        "Logic Pro X 10.7",
+        "REAPER v7",
+        "FL Studio 21",
+        "Exact Audio Copy",
+    ],
+)
+def test_generic_encoders_are_not_providers(value: str):
+    assert detect_provider({"encoder": value}) is None, value
+
+
+def test_guessed_udio_id_frames_identify_nothing():
+    # Nobody has a Udio file, so no Udio frame name is in the table. A key
+    # we merely imagined must not label the entry.
+    assert detect_provider({"udio_id": SAMPLE_ID}) is None
+    assert detect_provider({"txxx_udio_id": SAMPLE_ID}) is None
+
+
+def test_udio_identified_by_generator_value():
+    info = detect_provider({"generator": "udio"})
+    assert info is not None
+    assert info.provider == "udio"
+    assert info.label == "Udio"
+    assert info.is_ai is True
+    assert info.confidence == "explicit"
+
+
+def test_udio_identified_by_domain():
+    info = detect_provider({"comment": "made on https://www.udio.com/songs/xyz"})
+    assert info is not None
+    assert info.provider == "udio"
+    assert info.confidence == "inferred"
+
+
+def test_no_tags_gives_none():
+    assert detect_provider({}) is None
+    assert detect_provider({}, {}) is None
+    assert detect_provider({"title": "A Song", "bpm": "128"}) is None
+
+
+# --- curated fields ---------------------------------------------------------
+
+
+def _suno_embedded() -> dict[str, str]:
+    return {
+        "generator": "suno",
+        "album": "Suno AI",
+        "txxx_suno_id": SAMPLE_ID,
+        "txxx_suno_prompt": "[Verse]\nsalt on the window",
+        "txxx_suno_style": "dream pop, tape hiss",
+        "txxx_suno_negative_tags": "brass",
+        "txxx_suno_model_name": "chirp-v9-flux",
+        "txxx_suno_model_version": "v9.2",
+        "txxx_suno_created_date": "2026-04-02T10:00:00Z",
+        "txxx_suno_handle": "neutral_handle",
+        "txxx_suno_bpm": "128",
+        "txxx_suno_key": "F minor",
+        "txxx_suno_parent_id": PARENT_ID,
+        "txxx_suno_lyrics_is_instrumental": "False",
+        # analytics — none of these may ever appear in the curated output
+        "txxx_suno_play_count": "4210",
+        "txxx_suno_upvote_count": "17",
+        "txxx_suno_skip_rate": "0.12",
+        "txxx_suno_popularity_class": "B",
+        "txxx_suno_engagement_score": "0.4",
+        "txxx_suno_user_id": "user-neutral",
+        "txxx_suno_image_url": "https://cdn.example.com/a.jpeg",
+        "txxx_suno_days_since_creation": "40",
+        "txxx_suno_is_following_creator": "False",
+    }
+
+
+def test_curated_maps_the_suno_fields():
+    embedded = _suno_embedded()
+    info = detect_provider(embedded)
+    out = curated_fields(embedded, info)
+    assert out["provider_id"] == SAMPLE_ID
+    assert out["prompt"] == "[Verse]\nsalt on the window"
+    assert out["lyrics"] == "[Verse]\nsalt on the window"
+    assert out["style"] == "dream pop, tape hiss"
+    assert out["negative_prompt"] == "brass"
+    assert out["model"] == "chirp-v9-flux"
+    assert out["model_version"] == "v9.2"
+    assert out["created_at"] == "2026-04-02T10:00:00Z"
+    assert out["artist"] == "neutral_handle"
+    assert out["bpm"] == 128
+    assert out["key"] == "F minor"
+    assert out["parent_id"] == PARENT_ID
+    assert out["is_instrumental"] is False
+
+
+def test_curated_never_leaks_analytics_or_empty_values():
+    embedded = _suno_embedded()
+    embedded["txxx_suno_style"] = ""
+    embedded["txxx_suno_style_prompt"] = "   "
+    allowed = {
+        "provider_id",
+        "prompt",
+        "style",
+        "negative_prompt",
+        "lyrics",
+        "model",
+        "model_version",
+        "created_at",
+        "artist",
+        "bpm",
+        "key",
+        "parent_id",
+        "is_instrumental",
+    }
+    out = curated_fields(embedded, detect_provider(embedded))
+    assert set(out) <= allowed
+    assert "style" not in out
+    assert all(v not in ("", None) for v in out.values())
+    for leaked in ("play_count", "skip_rate", "user_id", "image_url", "popularity"):
+        assert not any(leaked in key for key in out)
+
+
+def test_curated_drops_the_all_zero_parent_uuid():
+    embedded = {"generator": "suno", "txxx_suno_parent_id": ZERO_UUID}
+    out = curated_fields(embedded, detect_provider(embedded))
+    assert "parent_id" not in out
+
+
+def test_curated_falls_back_to_the_nested_ancestry_parent():
+    embedded = {
+        "generator": "suno",
+        "txxx_suno_parent_id": ZERO_UUID,
+        "txxx_suno_ancestry": {"parent_id": PARENT_ID},
+    }
+    out = curated_fields(embedded, detect_provider(embedded))
+    assert out["parent_id"] == PARENT_ID
+
+
+def test_curated_reads_nested_metadata_blob():
+    embedded = {
+        "generator": "suno",
+        "txxx_suno_metadata": {
+            "prompt": "a hymn for the tide",
+            "tags": "ambient",
+            "negative_tags": "vocals",
+            "model_badges": {"badge_kind": "flagged"},
+        },
+    }
+    out = curated_fields(embedded, detect_provider(embedded))
+    assert out["prompt"] == "a hymn for the tide"
+    assert out["style"] == "ambient"
+    assert out["negative_prompt"] == "vocals"
+    assert "model_badges" not in out
+
+
+def test_curated_reads_the_observed_lyrics_prompt_key():
+    embedded = {
+        "generator": "suno",
+        "txxx_suno_prompt": "a one-line brief",
+        "txxx_suno_lyrics_prompt": "[Verse]\nthe words as sung",
+    }
+    out = curated_fields(embedded, detect_provider(embedded))
+    assert out["lyrics"] == "[Verse]\nthe words as sung"
+    assert out["prompt"] == "a one-line brief"
+
+
+def test_curated_instrumental_true_means_no_lyrics():
+    embedded = {
+        "generator": "suno",
+        "txxx_suno_prompt": "[Instrumental]",
+        "txxx_suno_lyrics_is_instrumental": "True",
+    }
+    out = curated_fields(embedded, detect_provider(embedded))
+    assert out["is_instrumental"] is True
+    assert "lyrics" not in out
+    assert out["prompt"] == "[Instrumental]"
+
+
+def test_curated_is_empty_without_usable_tags():
+    assert curated_fields({}, None) == {}
+    assert curated_fields({"txxx_suno_play_count": "9"}, None) == {}
+
+
+def test_curated_prefers_the_detected_provider_id():
+    embedded = {"generator": "suno"}
+    info = ProviderInfo(
+        provider="suno",
+        label="Suno",
+        is_ai=True,
+        provider_id=SAMPLE_ID,
+        confidence="explicit",
+        evidence="meta.suno_id",
+    )
+    assert curated_fields(embedded, info)["provider_id"] == SAMPLE_ID
+
+
+def test_analytics_key_predicate():
+    for key in (
+        "txxx_suno_play_count",
+        "txxx_suno_popularity_class",
+        "txxx_suno_engagement_score",
+        "txxx_suno_skip_rate",
+        "txxx_suno_reaction.kind",
+        "txxx_suno_session_id",
+        "txxx_suno_cluster_label",
+        "txxx_suno_nearest_neighbors",
+        "txxx_suno_action_config.mode",
+        "txxx_suno_metadata.model_badges.kind",
+        "txxx_suno_image_url",
+        "txxx_suno_user_id",
+        "txxx_suno_is_following_creator",
+        "txxx_suno_days_since_creation",
+        "txxx_suno_persona.name",
+    ):
+        assert is_analytics_key(key), key
+    for key in ("prompt", "txxx_suno_style", "txxx_suno_id", "album", "key"):
+        assert not is_analytics_key(key), key
+
+
+# --- wire shape -------------------------------------------------------------
+
+
+def test_wire_fields_for_none():
+    assert provider_wire_fields(None) == {
+        "provider": None,
+        "provider_label": None,
+        "provider_is_ai": None,
+        "provider_id": None,
+    }
+
+
+def test_wire_fields_for_an_info():
+    info = detect_provider({"generator": "suno", "txxx_suno_id": SAMPLE_ID})
+    assert provider_wire_fields(info) == {
+        "provider": "suno",
+        "provider_label": "Suno",
+        "provider_is_ai": True,
+        "provider_id": SAMPLE_ID,
+    }

@@ -7,7 +7,7 @@ import { usePlayerStore } from '../state/playerStore';
 import { logError } from '../state/logStore';
 import { HoverTip } from '../components/ui/Tooltip';
 import { formatDuration, formatDate, formatSize } from './catalogFormat';
-import { CatalogueProviderBadge } from './CatalogueProviderBadge';
+import { ProviderBadge } from '../components/library/ProviderBadge';
 import { CoverArt } from './CoverArt';
 
 const ROW_HEIGHT = 52;
@@ -113,7 +113,9 @@ function Row({
 
         <div className="flex-1 min-w-0 flex flex-col gap-0.5">
           <div className="flex items-center gap-1.5">
-            <CatalogueProviderBadge model={entry.model} source={entry.source} className="shrink-0" />
+            {/* One badge for the entry's one provider: detected when the file
+                said who made it, derived from model/source when it did not. */}
+            <ProviderBadge entry={entry} className="shrink-0" />
             <span className="font-bold text-[10px] truncate text-zinc-200" title={entry.title}>
               {entry.title}
             </span>

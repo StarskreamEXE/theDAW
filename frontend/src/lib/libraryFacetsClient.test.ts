@@ -85,6 +85,7 @@ const reset = (): void => {
     kind: 'media',
     favorite: true,
     source: 'import',
+    provider: null,
   });
 
   assert.ok(answer, 'a 200 answers with the facets');
@@ -106,7 +107,7 @@ const reset = (): void => {
   reset();
   handler = async () => jsonResponse({ detail: 'Not Found' }, 404);
   const answer = await fetchLibraryFacets(['model'], {
-    q: '', sort: 'created_desc', kind: 'audio', favorite: null, source: null,
+    q: '', sort: 'created_desc', kind: 'audio', favorite: null, source: null, provider: null,
   });
   assert.equal(answer, null, 'a missing route is null, not a thrown error');
 }
@@ -116,7 +117,7 @@ const reset = (): void => {
   reset();
   handler = async () => jsonResponse({ facets: { model: 'not-a-list' }, revision: 'soon' });
   const answer = await fetchLibraryFacets(['model'], {
-    q: '', sort: 'created_desc', kind: 'audio', favorite: null, source: null,
+    q: '', sort: 'created_desc', kind: 'audio', favorite: null, source: null, provider: null,
   });
   assert.ok(answer, 'the envelope still parses');
   assert.deepEqual(answer.facets.model, [], 'a field that is not a list of values is empty, never garbage');
@@ -131,7 +132,7 @@ const reset = (): void => {
     return jsonResponse({}, 404);
   };
   const count = await fetchLibraryMatchCount({
-    q: '', sort: 'created_desc', kind: 'audio', favorite: true, source: null,
+    q: '', sort: 'created_desc', kind: 'audio', favorite: true, source: null, provider: null,
   });
   assert.equal(count, 4321, 'the server total IS the count');
   const url = new URL(calls[0], 'http://local');

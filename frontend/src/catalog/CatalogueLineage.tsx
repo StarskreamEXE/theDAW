@@ -3,7 +3,7 @@ import { GitBranch, CornerDownRight, Disc3, Network, Loader2 } from 'lucide-reac
 import type { LibraryEntry } from '../state/libraryEntry';
 import { useLibraryStore } from '../state/libraryStore';
 import { useAppUiStore } from '../state/appUiStore';
-import { CatalogueProviderBadge } from './CatalogueProviderBadge';
+import { ProviderBadge } from '../components/library/ProviderBadge';
 
 /** Shapes returned by GET /api/library/{id}/lineage?depth=N. */
 interface LineageNode {
@@ -182,7 +182,9 @@ export const CatalogueLineage: React.FC<Props> = ({ entry }) => {
             : opts.childOf === 'child' ? 'text-cyan-400/70'
             : opts.childOf === 'sibling' ? 'text-zinc-500'
             : 'text-indigo-400/70'}`} />
-        <CatalogueProviderBadge source={node?.source} className="shrink-0" />
+        {/* A lineage node knows its `source` and nothing else, so this badge
+            is the derived half of the same one provider the rows show. */}
+        <ProviderBadge entry={{ source: node?.source }} className="shrink-0" />
         <span className={`text-[9px] font-mono truncate flex-1 ${isCurrent ? 'text-amber-200 font-bold' : 'text-zinc-400'}`}>
           {title}
         </span>

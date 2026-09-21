@@ -23,6 +23,7 @@ const query = (over: Partial<LibraryFacetQuery> = {}): LibraryFacetQuery => ({
   kind: 'audio',
   favorite: null,
   source: null,
+  provider: null,
   ...over,
 });
 
@@ -36,6 +37,14 @@ const query = (over: Partial<LibraryFacetQuery> = {}): LibraryFacetQuery => ({
   assert.notEqual(base, facetCacheKey(['model'], query({ kind: 'all' }), 7), 'so is the kind');
   assert.notEqual(base, facetCacheKey(['model'], query({ favorite: true }), 7), 'so is favorites-only');
   assert.notEqual(base, facetCacheKey(['model'], query({ source: 'import' }), 7), 'so is the source');
+  // The request carries `provider=`, so it narrows the counts — two providers
+  // must not share one cached answer.
+  assert.notEqual(base, facetCacheKey(['model'], query({ provider: 'suno' }), 7), 'so is the provider');
+  assert.notEqual(
+    facetCacheKey(['model'], query({ provider: 'suno' }), 7),
+    facetCacheKey(['model'], query({ provider: 'udio' }), 7),
+    'and one provider is not answered from another one’s counts',
+  );
   assert.notEqual(base, facetCacheKey(['model', 'source'], query(), 7), 'so is the field list');
 
   assert.equal(

@@ -54,6 +54,13 @@ interface ServerRecord {
   lyrics_preview?: string;
   has_lyrics?: boolean;
   source: string;
+  // The provider the backend detected from the file's own embedded metadata.
+  // All four are null (not absent) on an entry with no detectable origin, and
+  // absent entirely on a backend that predates provider detection.
+  provider?: string | null;
+  provider_label?: string | null;
+  provider_is_ai?: boolean | null;
+  provider_id?: string | null;
   chimera_sources?: string[];
   play_count?: number;
   last_played_at?: number | null;
@@ -119,6 +126,13 @@ const toEntry = (r: ServerRecord): LibraryEntry => {
     source: (['generate', 'studio', 'import'].includes(r.source)
       ? r.source
       : 'generate') as LibraryEntry['source'],
+    // Detected provider, snake_case → camelCase. Normalized to null (never
+    // undefined) so "this backend answered, and the answer is none" and "this
+    // backend has no provider detection" both read as no badge, no filter.
+    provider: r.provider ?? null,
+    providerLabel: r.provider_label ?? null,
+    providerIsAi: r.provider_is_ai ?? null,
+    providerId: r.provider_id ?? null,
     chimeraSources: r.chimera_sources ?? [],
     playCount: r.play_count ?? 0,
     lastPlayedAt: r.last_played_at ?? null,
@@ -415,6 +429,11 @@ export interface LibraryQuery {
   favorite: boolean | null;
   /** 'generate' | 'studio' | 'import', or null for any source. */
   source: string | null;
+  /**
+   * A detected-provider slug ('suno', …), or null for any provider. Applied by
+   * the server so it covers the WHOLE library, not the rows already loaded.
+   */
+  provider: string | null;
 }
 
 export const DEFAULT_LIBRARY_QUERY: LibraryQuery = {
@@ -423,7 +442,27 @@ export const DEFAULT_LIBRARY_QUERY: LibraryQuery = {
   kind: 'audio',
   favorite: null,
   source: null,
+  provider: null,
 };
+
+/**
+ * The same query with every row-narrowing filter cleared — the text, the
+ * favourites toggle, the source AND the provider — keeping only the media
+ * kind (and the sort, which narrows nothing).
+ *
+ * This is what a COUNT is asked over: "how many imports are there" has to
+ * count imports in the whole library of that kind, not imports that also
+ * happen to match whatever the user has typed or picked. Every filter belongs
+ * in this list, so a new one cannot be forgotten at one call site and leak a
+ * wrong number into a sidebar or a delete confirmation.
+ */
+export const plainLibraryQuery = (query: LibraryQuery): LibraryQuery => ({
+  ...query,
+  q: '',
+  favorite: null,
+  source: null,
+  provider: null,
+});
 
 /** One page of a paged result set. */
 export interface LibraryPage {
@@ -473,6 +512,7 @@ const queryParams = (query: LibraryQuery): URLSearchParams => {
   if (query.sort) params.set('sort', query.sort);
   if (query.favorite === true) params.set('favorite', 'true');
   if (query.source) params.set('source', query.source);
+  if (query.provider) params.set('provider', query.provider);
   return params;
 };
 

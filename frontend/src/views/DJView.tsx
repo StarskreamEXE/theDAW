@@ -48,7 +48,7 @@ import { useDjAutomix } from '../state/djAutomixStore';
 import { useDjDeckLoad } from '../state/djDeckLoadStore';
 import { useLibraryStore } from '../state/libraryStore';
 import type { LibraryEntry } from '../state/libraryStore';
-import { fetchLibraryMatchCount } from '../lib/backendLocalProvider';
+import { fetchLibraryMatchCount, plainLibraryQuery } from '../lib/backendLocalProvider';
 import type { LibrarySortBy } from '../lib/libraryRows';
 import { useDjAnalysisStore } from '../state/djAnalysisStore';
 import { useDjCuesStore, HOTCUE_SLOTS } from '../state/djCuesStore';
@@ -2613,7 +2613,10 @@ const SourceTree: React.FC<{ source: Source; setSource: (s: Source) => void; lib
     }
     let live = true;
     const base = useLibraryStore.getState().getQuery();
-    const plain = { ...base, q: '', favorite: null, source: null };
+    // Every filter cleared, provider included: these three numbers count the
+    // whole library of this kind, so a provider left in would have printed
+    // "12 imports" for a library holding thousands.
+    const plain = plainLibraryQuery(base);
     void Promise.all([
       fetchLibraryMatchCount({ ...plain, favorite: true }),
       fetchLibraryMatchCount({ ...plain, source: 'generate' }),

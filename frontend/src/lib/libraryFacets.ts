@@ -39,6 +39,15 @@ export interface LibraryFacetQuery {
   readonly favorite: boolean | null;
   /** 'generate' | 'studio' | 'import', or null for any source. */
   readonly source: string | null;
+  /**
+   * A provider id ('suno', 'stable-audio', …), or null for any provider.
+   *
+   * The request carries it (`queryParams` puts every filter on the URL), so it
+   * narrows the counts the server returns — which means it also has to be part
+   * of the cache key below, or a second provider would be answered from the
+   * first one's cached counts.
+   */
+  readonly provider: string | null;
 }
 
 /** An option a <select> can render: a real value, its label, its count. */
@@ -75,6 +84,7 @@ export function facetCacheKey(
     query.kind,
     query.favorite === true ? 'fav' : '',
     query.source ?? '',
+    query.provider ?? '',
     String(revision),
   ].join('\u0000');
 }

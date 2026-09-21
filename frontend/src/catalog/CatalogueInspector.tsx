@@ -9,7 +9,7 @@ import { buildSpectrogramFormData } from '../state/spectrogramRequest';
 import { sunoActions } from '../suno/sunoActions';
 import { HoverTip, InfoTip } from '../components/ui/Tooltip';
 import { formatDuration, formatDate, formatSize } from './catalogFormat';
-import { CatalogueProviderBadge } from './CatalogueProviderBadge';
+import { ProviderBadge } from '../components/library/ProviderBadge';
 import { CatalogueLineage } from './CatalogueLineage';
 import { CoverArt } from './CoverArt';
 import { inferProvider } from './catalogProviders';
@@ -220,7 +220,9 @@ export const CatalogueInspector: React.FC<Props> = ({ entry }) => {
             </button>
           </HoverTip>
           <div className="flex-1" />
-          <CatalogueProviderBadge provider={provider} />
+          {/* One badge for the entry's one provider: detected when the file
+              said who made it, derived from model/source when it did not. */}
+          <ProviderBadge entry={entry} />
         </div>
 
         {/* Suno-only derive actions */}

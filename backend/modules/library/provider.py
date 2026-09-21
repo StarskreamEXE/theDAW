@@ -1,0 +1,816 @@
+"""Identify which service a library track came from, and curate its tags.
+
+A file the user drags in often already says where it was made or bought:
+Suno writes ``generator=suno`` plus a ``TXXX:suno_id`` uuid, a Bandcamp
+download carries a purchase URL, a DAW bounce carries nothing but an
+encoder string. This module turns those signals into one small, stable
+answer — :class:`ProviderInfo` — and picks the handful of embedded fields
+that describe the SONG out of the much larger pile of frames that describe
+how people reacted to it.
+
+Everything here is pure: dicts in, dicts out. No file reads, no database,
+no imports from ``store`` / ``router`` / ``db``. The library holds ~200k
+entries and the read path calls :func:`detect_provider` per entry, so the
+work stays table lookups over a dict that the caller already has.
+
+Adding a provider is one row in :data:`PROVIDER_RULES`.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Any, Mapping, Optional
+
+__all__ = [
+    "ANALYTICS_KEY_PATTERNS",
+    "CURATED_FIELDS",
+    "GENERIC_TOOL_MARKERS",
+    "GENERIC_TOOL_PREFIXES",
+    "PROVIDER_RULES",
+    "URL_KEY_PRIORITY",
+    "ProviderInfo",
+    "ProviderRule",
+    "curated_fields",
+    "detect_provider",
+    "is_analytics_key",
+    "provider_wire_fields",
+]
+
+
+@dataclass(frozen=True)
+class ProviderInfo:
+    """Where a track came from, and how sure we are about it."""
+
+    provider: str
+    """Stable lowercase slug: ``"suno"``, ``"udio"``, ``"bandcamp"``, ..."""
+
+    label: str
+    """Display name: ``"Suno"``."""
+
+    is_ai: bool
+    """True for a generation service, False for a store / host / unknown tool."""
+
+    provider_id: Optional[str]
+    """The provider's own track id, when the file carries one."""
+
+    confidence: str
+    """``"explicit"`` (a generator or id frame says so) or ``"inferred"``
+    (the album, a URL, or the comment says so)."""
+
+    evidence: str
+    """The deciding tag, e.g. ``"generator=suno"``."""
+
+
+@dataclass(frozen=True)
+class ProviderRule:
+    """One row of the provider table.
+
+    ``generator_values`` are matched against the value of the generator-ish
+    frames (``generator`` / ``encoder`` / ``encoded_by`` / ``software`` /
+    ``tool``); ``albums`` against the album frame; ``domains`` against any
+    host found in a url-ish frame or the comment. All three are VALUE
+    matches, which is all we may do for a provider nobody has a file from.
+
+    ``id_keys`` names actual frames, so a row may only fill it with a key
+    someone has observed in a real file. Suno is the only such row.
+    """
+
+    provider: str
+    label: str
+    is_ai: bool
+    generator_values: tuple[str, ...] = ()
+    albums: tuple[str, ...] = ()
+    domains: tuple[str, ...] = ()
+    id_keys: tuple[str, ...] = ()
+
+
+# The only provider whose frame names we have actually observed is Suno
+# (the lead sampled 60 files); every other row identifies its provider
+# through generic signals only — a generator string, the album, or a
+# domain. Do not invent frame names for a service nobody has a file from.
+PROVIDER_RULES: tuple[ProviderRule, ...] = (
+    ProviderRule(
+        provider="suno",
+        label="Suno",
+        is_ai=True,
+        generator_values=("suno",),
+        albums=("suno ai",),
+        domains=("suno.com", "suno.ai"),
+        id_keys=("txxx_suno_id",),
+    ),
+    ProviderRule(
+        provider="udio",
+        label="Udio",
+        is_ai=True,
+        generator_values=("udio",),
+        domains=("udio.com",),
+    ),
+    ProviderRule(
+        provider="riffusion",
+        label="Riffusion",
+        is_ai=True,
+        generator_values=("riffusion",),
+        domains=("riffusion.com",),
+    ),
+    ProviderRule(
+        provider="stability-ai",
+        label="Stability AI",
+        is_ai=True,
+        generator_values=("stability", "stability ai", "stability-ai"),
+        domains=("stability.ai",),
+    ),
+    ProviderRule(
+        provider="elevenlabs",
+        label="ElevenLabs",
+        is_ai=True,
+        generator_values=("elevenlabs", "eleven labs"),
+        domains=("elevenlabs.io",),
+    ),
+    ProviderRule(
+        provider="musicgen",
+        label="MusicGen",
+        is_ai=True,
+        generator_values=("musicgen", "audiocraft"),
+    ),
+    # theDAW's own exports: `tags.py` normalises both "theDAW" and
+    # "stable audio" spellings to this one generator string.
+    ProviderRule(
+        provider="stable-audio",
+        label="Stable Audio",
+        is_ai=True,
+        generator_values=("stable-audio", "stable audio", "thedaw"),
+    ),
+    ProviderRule(
+        provider="bandcamp",
+        label="Bandcamp",
+        is_ai=False,
+        generator_values=("bandcamp",),
+        domains=("bandcamp.com",),
+    ),
+    ProviderRule(
+        provider="soundcloud",
+        label="SoundCloud",
+        is_ai=False,
+        generator_values=("soundcloud",),
+        domains=("soundcloud.com",),
+    ),
+    ProviderRule(
+        provider="beatport",
+        label="Beatport",
+        is_ai=False,
+        generator_values=("beatport",),
+        domains=("beatport.com",),
+    ),
+    ProviderRule(
+        provider="splice",
+        label="Splice",
+        is_ai=False,
+        generator_values=("splice",),
+        domains=("splice.com",),
+    ),
+    ProviderRule(
+        provider="youtube",
+        label="YouTube",
+        is_ai=False,
+        domains=("youtube.com", "youtu.be", "music.youtube.com"),
+    ),
+    ProviderRule(
+        provider="spotify",
+        label="Spotify",
+        is_ai=False,
+        domains=("spotify.com", "open.spotify.com"),
+    ),
+    ProviderRule(
+        provider="apple-music",
+        label="Apple Music",
+        is_ai=False,
+        domains=("music.apple.com",),
+    ),
+)
+
+_RULES_BY_SLUG: dict[str, ProviderRule] = {r.provider: r for r in PROVIDER_RULES}
+
+# Frames whose value names a tool. The first non-empty one decides.
+GENERATOR_KEYS: tuple[str, ...] = (
+    "generator",
+    "tool",
+    "software",
+    "encoded_by",
+    "encoder",
+    "txxx_generator",
+    "txxx_tool",
+    "txxx_software",
+    "itunes_generator",
+    "itunes_tool",
+)
+
+# Which url-ish frame gets to decide where a track came from, best first.
+# WOAS ("source") and WOAF ("file") are the ones that point at the track
+# itself; a WXXX or any frame we have no name for is next; the artist's
+# home page and the comment are weaker; and the rights/commerce frames go
+# last, because a label's WPUB or a processor's WPAY says who gets paid,
+# not where the audio was made. ``"*"`` is the slot for every url-ish key
+# not named here.
+URL_KEY_PRIORITY: tuple[str, ...] = (
+    "source_url",
+    "file_url",
+    "*",
+    "artist_url",
+    "comment",
+    "publisher_url",
+    "commercial_url",
+    "payment_url",
+    "radio_url",
+    "copyright_url",
+)
+
+_URL_OTHER_RANK = URL_KEY_PRIORITY.index("*")
+_URL_RANK: dict[str, int] = {
+    key: index for index, key in enumerate(URL_KEY_PRIORITY) if key != "*"
+}
+
+# A tool string that says how the bytes were encoded, not where the music
+# came from. These never become a provider — an mp3 written by LAME inside
+# Ableton is still a file of unknown origin.
+#
+# Matched on WHOLE tokens, never as substrings: "Sunshine Audio" is not the
+# `shine` encoder, "David Synth" is not Avid, and "Treason Records" is not
+# Propellerhead Reason. A multi-word marker must appear as a contiguous run
+# of tokens ("fl studio" matches "FL Studio 21", not "studio fl").
+GENERIC_TOOL_MARKERS: tuple[str, ...] = (
+    "libav",
+    "ffmpeg",
+    "libmp3lame",
+    "xing",
+    "gstreamer",
+    "opusenc",
+    "oggenc",
+    "vorbis",
+    "faac",
+    "qaac",
+    "nero",
+    "winamp",
+    "foobar2000",
+    "dbpoweramp",
+    "exact audio copy",
+    "handbrake",
+    "mediahuman",
+    "itunes",
+    "windows media",
+    "audacity",
+    "reaper",
+    "ableton",
+    "ableton live",
+    "fl studio",
+    "image line",
+    "logic pro",
+    "garageband",
+    "pro tools",
+    "avid",
+    "cubase",
+    "nuendo",
+    "steinberg",
+    "studio one",
+    "presonus",
+    "bitwig",
+    "cakewalk",
+    "sonar",
+    "samplitude",
+    "mixcraft",
+    "reason",
+    "acid pro",
+    "adobe audition",
+    "sound forge",
+    "wavelab",
+    "waveform",
+    "traktor",
+    "serato",
+    "rekordbox",
+)
+
+# Encoder names that ship glued to their version as one token
+# ("Lavf58.76.100", "LAME3.100"). A bare token equal to the name counts too.
+GENERIC_TOOL_PREFIXES: tuple[str, ...] = (
+    "lavf",
+    "lavc",
+    "lame",
+    "flac",
+    "sox",
+    "shine",
+    "blade",
+    "gogo",
+    "x264",
+)
+
+# Analytics ABOUT the song (how it performed, who listened) rather than the
+# song itself. Never ingested, never curated, never read for detection.
+ANALYTICS_KEY_PATTERNS: tuple[str, ...] = (
+    r".*_count$",
+    r".*_class$",
+    r".*_score$",
+    r".*_rate$",
+    r"^txxx_suno_reaction\b.*",
+    r"^txxx_suno_session_.*",
+    r"^txxx_suno_cluster_.*",
+    r"^txxx_suno_nearest_neighbors$",
+    r"^txxx_suno_action_config\b.*",
+    r"^txxx_suno_metadata\.model_badges\b.*",
+    r".*_image_url$",
+    r"^txxx_suno_user_id$",
+    r"^txxx_suno_is_following_creator$",
+    r"^txxx_suno_days_since_creation$",
+    r"^txxx_suno_persona\b.*",
+)
+
+_ANALYTICS_RE = re.compile(
+    "|".join(f"(?:{p})" for p in ANALYTICS_KEY_PATTERNS), re.IGNORECASE
+)
+
+# Ordered source keys per curated field. First non-empty wins, left to right.
+# The Suno key names are the lead's observation of real files; the bare names
+# (``prompt``, ``artist``, ``bpm``, ...) are what `tags.py` surfaces for
+# everything else, so one table covers every provider.
+CURATED_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("provider_id", ("txxx_suno_id",)),
+    ("prompt", ("prompt", "txxx_suno_prompt", "txxx_suno_metadata.prompt")),
+    (
+        "style",
+        (
+            "txxx_suno_style",
+            "txxx_suno_style_prompt",
+            "txxx_suno_metadata.tags",
+            "style",
+            "style_prompt",
+        ),
+    ),
+    (
+        "negative_prompt",
+        (
+            "txxx_suno_negative_tags",
+            "txxx_suno_metadata.negative_tags",
+            "negative_prompt",
+        ),
+    ),
+    ("lyrics", ("lyrics", "txxx_suno_lyrics_prompt")),
+    ("model", ("txxx_suno_model_name", "model")),
+    (
+        "model_version",
+        ("txxx_suno_model_version", "txxx_suno_major_model_version", "model_version"),
+    ),
+    ("created_at", ("txxx_suno_created_date", "date")),
+    ("artist", ("artist", "txxx_suno_handle")),
+    ("bpm", ("txxx_suno_bpm", "txxx_suno_tempo", "bpm")),
+    ("key", ("txxx_suno_key", "key")),
+    ("parent_id", ("txxx_suno_parent_id", "txxx_suno_ancestry.parent_id")),
+    (
+        "is_instrumental",
+        ("txxx_suno_is_instrumental", "txxx_suno_lyrics_is_instrumental"),
+    ),
+)
+
+_INSTRUMENTAL_KEYS: tuple[str, ...] = (
+    "txxx_suno_is_instrumental",
+    "txxx_suno_lyrics_is_instrumental",
+)
+
+_VERSIONED_TOOL_RE: dict[str, re.Pattern[str]] = {
+    prefix: re.compile(re.escape(prefix) + r"[0-9][0-9a-z]*")
+    for prefix in GENERIC_TOOL_PREFIXES
+}
+
+_ZERO_UUID_RE = re.compile(r"^[0\-]+$")
+_HOST_RE = re.compile(r"(?:https?://|www\.)?((?:[a-z0-9][a-z0-9\-]*\.)+[a-z]{2,})")
+_TRUE_WORDS = frozenset({"true", "1", "yes", "y", "on"})
+_FALSE_WORDS = frozenset({"false", "0", "no", "n", "off"})
+
+
+def is_analytics_key(key: str) -> bool:
+    """True when ``key`` is provider analytics we never ingest."""
+    return bool(_ANALYTICS_RE.fullmatch(str(key).strip().lower()))
+
+
+def _text(value: Any) -> str:
+    """A trimmed string for a tag value, or "" for anything unusable.
+
+    ``extract_embedded_tags`` promotes JSON-looking frames to dicts/lists,
+    so a container here means "the value lives one level down" — the dotted
+    lookup handles that, and stringifying the container would be noise.
+    """
+    if value is None or isinstance(value, (dict, list, tuple, set)):
+        return ""
+    if isinstance(value, bool):
+        return "True" if value else "False"
+    return str(value).strip()
+
+
+def _is_blank(value: str) -> bool:
+    return not value or _ZERO_UUID_RE.match(value) is not None
+
+
+def _lookup(embedded: Mapping[str, Any], key: str) -> str:
+    """Value for ``key``, honouring dotted paths into JSON-valued frames.
+
+    ``txxx_suno_metadata.prompt`` is either a literal flat key or the
+    ``prompt`` member of the dict parsed out of ``txxx_suno_metadata``;
+    both spellings appear depending on how the frame was written.
+    """
+    if is_analytics_key(key):
+        return ""
+    if key in embedded:
+        text = _text(embedded[key])
+        if text:
+            return text
+    if "." not in key:
+        return ""
+    head, _, rest = key.partition(".")
+    node: Any = embedded.get(head)
+    for part in rest.split("."):
+        if not isinstance(node, Mapping):
+            return ""
+        node = node.get(part)
+    return _text(node)
+
+
+def _first(embedded: Mapping[str, Any], keys: tuple[str, ...]) -> tuple[str, str]:
+    """(value, key) for the first key with a usable value, else ("", "")."""
+    for key in keys:
+        value = _lookup(embedded, key)
+        if not _is_blank(value):
+            return value, key
+    return "", ""
+
+
+def _parse_bool(value: str) -> Optional[bool]:
+    low = value.strip().lower()
+    if low in _TRUE_WORDS:
+        return True
+    if low in _FALSE_WORDS:
+        return False
+    return None
+
+
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")
+    return slug
+
+
+def _tokens(value: str) -> list[str]:
+    """The alphanumeric words of a tool string, lowercased.
+
+    "FL Studio 21" -> ["fl", "studio", "21"]; "Lavf58.76.100" ->
+    ["lavf58", "76", "100"] — the version stays glued to the name, which
+    is why :data:`GENERIC_TOOL_PREFIXES` exists.
+    """
+    return re.findall(r"[a-z0-9]+", value.lower())
+
+
+def _has_token_run(tokens: list[str], needle: str) -> bool:
+    """True when ``needle``'s words appear as a contiguous run in ``tokens``."""
+    want = _tokens(needle)
+    if not want or len(want) > len(tokens):
+        return False
+    span = len(want)
+    return any(tokens[i : i + span] == want for i in range(len(tokens) - span + 1))
+
+
+def _is_versioned_tool_token(token: str) -> bool:
+    return any(
+        token == prefix or _VERSIONED_TOOL_RE[prefix].fullmatch(token)
+        for prefix in GENERIC_TOOL_PREFIXES
+    )
+
+
+def _is_generic_tool(value: str) -> bool:
+    tokens = _tokens(value)
+    if not tokens:
+        return True
+    if any(_is_versioned_tool_token(token) for token in tokens):
+        return True
+    return any(_has_token_run(tokens, marker) for marker in GENERIC_TOOL_MARKERS)
+
+
+def _rule_for_tool(value: str) -> Optional[ProviderRule]:
+    tokens = _tokens(value)
+    if not tokens:
+        return None
+    for rule in PROVIDER_RULES:
+        for candidate in rule.generator_values:
+            if candidate and _has_token_run(tokens, candidate):
+                return rule
+    return None
+
+
+def _rule_for_album(value: str) -> Optional[ProviderRule]:
+    low = value.strip().lower()
+    if not low:
+        return None
+    for rule in PROVIDER_RULES:
+        if low in rule.albums:
+            return rule
+    return None
+
+
+def _hosts(text: str) -> list[str]:
+    return [m.group(1) for m in _HOST_RE.finditer(text.lower())]
+
+
+def _rule_for_hosts(hosts: list[str]) -> tuple[Optional[ProviderRule], str]:
+    for host in hosts:
+        for rule in PROVIDER_RULES:
+            for domain in rule.domains:
+                if host == domain or host.endswith("." + domain):
+                    return rule, host
+    return None, ""
+
+
+def _url_key_rank(key: str) -> int:
+    """Position of ``key`` in :data:`URL_KEY_PRIORITY`; unnamed keys sit
+    in the middle slot reserved for them."""
+    if key in _URL_RANK:
+        return _URL_RANK[key]
+    return _URL_OTHER_RANK
+
+
+def _url_candidates(embedded: Mapping[str, Any]) -> list[tuple[str, str]]:
+    """(key, text) pairs that may contain an origin URL, best key first.
+
+    A track bought on one site can carry the label's ``publisher_url`` and
+    a ``payment_url`` for a processor that has nothing to do with where the
+    audio came from, so the ranking decides which frame gets to speak.
+    """
+    out: list[tuple[str, str]] = []
+    for key, raw in embedded.items():
+        low = str(key).lower()
+        if is_analytics_key(low):
+            continue
+        if low == "comment" or "url" in low or "website" in low or "wxxx" in low:
+            text = _text(raw)
+            if text:
+                out.append((low, text))
+    out.sort(key=lambda pair: _url_key_rank(pair[0]))
+    return out
+
+
+def _provider_id_from(
+    embedded: Mapping[str, Any],
+    meta: Optional[Mapping[str, Any]],
+    rule: Optional[ProviderRule],
+) -> Optional[str]:
+    if rule is not None:
+        value, _ = _first(embedded, rule.id_keys)
+        if value:
+            return value
+    if meta is not None and (rule is None or rule.provider == "suno"):
+        legacy = _text(meta.get("suno_id"))
+        if not _is_blank(legacy):
+            return legacy
+        tagged = _legacy_tag_id(meta)
+        if tagged:
+            return tagged
+    return None
+
+
+def _meta_tags(meta: Mapping[str, Any]) -> list[str]:
+    raw = meta.get("tags")
+    if isinstance(raw, str):
+        parts = raw.replace(";", ",").split(",")
+    elif isinstance(raw, (list, tuple, set)):
+        parts = [str(p) for p in raw]
+    else:
+        return []
+    return [p.strip().lower() for p in parts if str(p).strip()]
+
+
+def _legacy_tag_id(meta: Mapping[str, Any]) -> Optional[str]:
+    for tag in _meta_tags(meta):
+        if tag.startswith("sunoid:"):
+            value = tag.split(":", 1)[1].strip()
+            if not _is_blank(value):
+                return value
+    return None
+
+
+def _legacy_suno(meta: Mapping[str, Any]) -> Optional[str]:
+    """The legacy evidence that this entry is a Suno track, if any.
+
+    Entries imported before provider labeling existed were marked with a
+    ``source`` of "suno", a ``suno_id`` field, or a ``suno`` / ``sunoid:<id>``
+    tag. The read path relies on this so the ~200k entries already in the
+    library get labeled without touching a single audio file.
+    """
+    if _text(meta.get("source")).lower() == "suno":
+        return "meta.source=suno"
+    if not _is_blank(_text(meta.get("suno_id"))):
+        return "meta.suno_id"
+    for tag in _meta_tags(meta):
+        if tag == "suno":
+            return "meta.tags=suno"
+        if tag.startswith("sunoid:"):
+            return "meta.tags=sunoid"
+    return None
+
+
+def _from_meta_provider(
+    embedded: Mapping[str, Any], meta: Mapping[str, Any]
+) -> Optional[ProviderInfo]:
+    slug = _slugify(_text(meta.get("provider")))
+    if not slug:
+        return None
+    rule = _RULES_BY_SLUG.get(slug)
+    label = _text(meta.get("provider_label")) or (
+        rule.label if rule else _text(meta.get("provider"))
+    )
+    raw_is_ai = meta.get("provider_is_ai")
+    if isinstance(raw_is_ai, bool):
+        is_ai = raw_is_ai
+    else:
+        parsed = _parse_bool(_text(raw_is_ai))
+        is_ai = parsed if parsed is not None else bool(rule.is_ai if rule else False)
+    provider_id = _text(meta.get("provider_id"))
+    return ProviderInfo(
+        provider=slug,
+        label=label or slug,
+        is_ai=is_ai,
+        provider_id=(
+            provider_id
+            if not _is_blank(provider_id)
+            else _provider_id_from(embedded, meta, rule)
+        ),
+        confidence="explicit",
+        evidence="meta.provider",
+    )
+
+
+def detect_provider(
+    embedded: Mapping[str, str],
+    meta: Optional[Mapping[str, Any]] = None,
+) -> Optional[ProviderInfo]:
+    """Identify the service a track came from, or None when nothing says.
+
+    ``embedded`` is exactly what ``tags.extract_embedded_tags`` returns.
+    ``meta`` is the entry's stored metadata, which may carry an already
+    decided ``provider`` (it wins) or the legacy Suno markers.
+    """
+    embedded = embedded or {}
+    meta = meta or None
+
+    if meta is not None:
+        decided = _from_meta_provider(embedded, meta)
+        if decided is not None:
+            return decided
+
+    # 1. An id frame a provider writes under its own name.
+    for rule in PROVIDER_RULES:
+        value, key = _first(embedded, rule.id_keys)
+        if value:
+            return ProviderInfo(
+                provider=rule.provider,
+                label=rule.label,
+                is_ai=rule.is_ai,
+                provider_id=value,
+                confidence="explicit",
+                evidence=f"{key}={value}",
+            )
+
+    # 2. A generator-ish frame naming a provider we know.
+    tool_value, tool_key = _first(embedded, GENERATOR_KEYS)
+    if tool_value:
+        rule = _rule_for_tool(tool_value)
+        if rule is not None:
+            return ProviderInfo(
+                provider=rule.provider,
+                label=rule.label,
+                is_ai=rule.is_ai,
+                provider_id=_provider_id_from(embedded, meta, rule),
+                confidence="explicit",
+                evidence=f"{tool_key}={tool_value}",
+            )
+
+    # 3. Legacy entries labeled before this feature existed.
+    if meta is not None:
+        legacy = _legacy_suno(meta)
+        if legacy:
+            rule = _RULES_BY_SLUG["suno"]
+            return ProviderInfo(
+                provider=rule.provider,
+                label=rule.label,
+                is_ai=rule.is_ai,
+                provider_id=_provider_id_from(embedded, meta, rule),
+                confidence="explicit",
+                evidence=legacy,
+            )
+
+    # 4. A tool we have never heard of is still where this file came from —
+    #    unless it only describes the encoder or the DAW it was bounced from.
+    if tool_value and not _is_generic_tool(tool_value):
+        slug = _slugify(tool_value)
+        if slug:
+            return ProviderInfo(
+                provider=slug,
+                label=tool_value,
+                is_ai=False,
+                provider_id=None,
+                confidence="explicit",
+                evidence=f"{tool_key}={tool_value}",
+            )
+
+    # 5. Weaker signals: the album a store stamps on its downloads, or a
+    #    URL left in a url frame or the comment.
+    album = _lookup(embedded, "album")
+    rule = _rule_for_album(album)
+    if rule is not None:
+        return ProviderInfo(
+            provider=rule.provider,
+            label=rule.label,
+            is_ai=rule.is_ai,
+            provider_id=_provider_id_from(embedded, meta, rule),
+            confidence="inferred",
+            evidence=f"album={album}",
+        )
+
+    for key, text in _url_candidates(embedded):
+        rule, host = _rule_for_hosts(_hosts(text))
+        if rule is not None:
+            return ProviderInfo(
+                provider=rule.provider,
+                label=rule.label,
+                is_ai=rule.is_ai,
+                provider_id=_provider_id_from(embedded, meta, rule),
+                confidence="inferred",
+                evidence=f"{key}={host}",
+            )
+
+    return None
+
+
+def curated_fields(
+    embedded: Mapping[str, str],
+    info: Optional[ProviderInfo] = None,
+) -> dict[str, Any]:
+    """The song-describing subset of ``embedded``, under stable names.
+
+    Only keys with a real value are returned — never "", None, or an
+    all-zero uuid — and only from the closed set in :data:`CURATED_FIELDS`.
+    Analytics frames are unreachable by construction: they are not in the
+    table, and :func:`_lookup` refuses them anyway.
+    """
+    embedded = embedded or {}
+    out: dict[str, Any] = {}
+
+    instrumental: Optional[bool] = None
+    raw_instrumental, _ = _first(embedded, _INSTRUMENTAL_KEYS)
+    if raw_instrumental:
+        instrumental = _parse_bool(raw_instrumental)
+
+    for field, keys in CURATED_FIELDS:
+        value, _key = _first(embedded, keys)
+        if not value:
+            continue
+        if field == "is_instrumental":
+            if instrumental is not None:
+                out[field] = instrumental
+            continue
+        if field == "bpm":
+            try:
+                bpm = float(value)
+            except (TypeError, ValueError):
+                out[field] = value
+                continue
+            if bpm > 0:
+                out[field] = int(bpm) if bpm.is_integer() else bpm
+            continue
+        out[field] = value
+
+    if info is not None and info.provider_id and not _is_blank(info.provider_id):
+        out["provider_id"] = info.provider_id
+
+    # Suno's `prompt` frame holds the lyrics the song was sung from, so an
+    # entry with words gets both — unless the file says it is instrumental.
+    if (
+        info is not None
+        and info.provider == "suno"
+        and instrumental is not True
+        and "lyrics" not in out
+        and out.get("prompt")
+    ):
+        out["lyrics"] = out["prompt"]
+
+    return out
+
+
+def provider_wire_fields(info: Optional[ProviderInfo]) -> dict[str, Any]:
+    """The four provider keys every library API entry dict carries."""
+    if info is None:
+        return {
+            "provider": None,
+            "provider_label": None,
+            "provider_is_ai": None,
+            "provider_id": None,
+        }
+    return {
+        "provider": info.provider,
+        "provider_label": info.label,
+        "provider_is_ai": info.is_ai,
+        "provider_id": info.provider_id,
+    }

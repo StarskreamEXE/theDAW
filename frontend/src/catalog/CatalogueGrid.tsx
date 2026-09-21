@@ -7,7 +7,7 @@ import { useLibraryStore } from '../state/libraryStore';
 import { usePlayerStore } from '../state/playerStore';
 import { HoverTip } from '../components/ui/Tooltip';
 import { formatDuration, formatDate } from './catalogFormat';
-import { CatalogueProviderBadge } from './CatalogueProviderBadge';
+import { ProviderBadge } from '../components/library/ProviderBadge';
 import { playCatalogueEntry } from './CatalogueList';
 
 /** `gap-2` between cards, in CSS px. */
@@ -95,11 +95,9 @@ const Card: React.FC<{
         {hasChimera && (
           <GitBranch className="absolute top-1 left-1 w-3 h-3 text-cyan-400/80" />
         )}
-        <CatalogueProviderBadge
-          model={entry.model}
-          source={entry.source}
-          className="absolute bottom-1 left-1"
-        />
+        {/* One badge for the entry's one provider: detected when the file said
+            who made it, derived from model/source when it did not. */}
+        <ProviderBadge entry={entry} className="absolute bottom-1 left-1" />
       </div>
       <div className="p-1.5 flex flex-col gap-0.5">
         <div className="flex items-center justify-between gap-1">

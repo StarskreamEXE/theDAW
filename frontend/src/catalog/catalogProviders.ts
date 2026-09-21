@@ -1,18 +1,29 @@
 /**
- * catalogProviders — provider/platform registry for the cross-platform
- * Catalogue.
+ * catalogProviders — the app's ONE provider registry: the id, the label and
+ * the palette behind every "who made this track?" in the UI.
  *
- * A "provider" is the engine that produced a track: Stable Audio (theDAW's
- * native generations), Suno, Magenta, Udio, an external import, etc. The
- * library `LibraryEntry` has NO `provider` field — it only carries `model` and
- * `source`. So provider is always DERIVED via `inferProvider()`:
- *   model === 'suno'        → 'suno'
- *   everything else         → 'stable-audio'
- * (with a few extra heuristics for other engines if they ever appear).
+ * A provider is the service the audio came from: theDAW's own Stable Audio
+ * generations, Suno, Udio, an import. There used to be TWO answers to that
+ * question — a DETECTED provider the backend reads out of the file's own
+ * embedded metadata (`entry.provider` / `providerLabel` / `providerIsAi` /
+ * `providerId`) and a DERIVED one guessed here from `model` + `source`. They
+ * are one answer now:
  *
- * Known providers get nice labels/colors; unknown ids still render with a
- * neutral fallback so a brand-new engine works the instant it shows up, with
- * no code change.
+ *   inferProvider(entry) = entry.provider, when the backend sent one
+ *                        = the derivation below (model, then source) otherwise
+ *
+ * The backend fills `provider` with exactly that same precedence, so on a
+ * current backend the derivation is only a fallback — for an older backend,
+ * and for entry-shaped objects that carry no provider at all (a lineage node
+ * knows a `source` and nothing else). It is never a second opinion.
+ *
+ * That one id feeds the badge, the filter dropdown, the client-side search and
+ * the server's `provider=` parameter, so the value a user picks in one place
+ * means the same thing in all of them.
+ *
+ * Display names come from `entryProviderMeta`, which prefers the label the
+ * backend sent: this table cannot know the name of a provider it has never
+ * heard of, and the backend can.
  *
  * IMPORTANT: the Tailwind badge classes below are LITERAL strings, never
  * runtime-built. Tailwind's compiler purges any class name it can't see as a
@@ -24,6 +35,24 @@ export interface ProviderMeta {
   label: string;
   /** Tailwind color-family stem (e.g. 'purple') keyed into BADGE_CLASSES. */
   color: string;
+}
+
+/**
+ * The provider-bearing shape of a library entry. Every field is optional so a
+ * partial, entry-shaped object (a lineage node, a filter-bar probe) answers
+ * the same functions a full `LibraryEntry` does.
+ */
+export interface ProviderEntryFields {
+  /** The backend's detected slug; wins over the derivation. */
+  provider?: string | null;
+  /** The backend's display name for that slug. */
+  providerLabel?: string | null;
+  /** Whether the backend calls this provider an AI generation service. */
+  providerIsAi?: boolean | null;
+  /** The provider's own track id, when the file carried one. */
+  providerId?: string | null;
+  model?: string | null;
+  source?: string | null;
 }
 
 /** Built-in providers. Extend freely; unknown ids fall back gracefully. */
@@ -69,17 +98,29 @@ export const providerBadgeClass = (id: string | null | undefined): string => {
   return BADGE_CLASSES[color] ?? BADGE_CLASSES.zinc;
 };
 
+/** A possibly-absent string field, trimmed down to '' or its content. */
+const trimmed = (v: unknown): string => (typeof v === 'string' ? v.trim() : '');
+
 /**
- * Derive the provider of a library entry from whatever signal we have.
+ * THE provider id of an entry.
  *
- * Per the spec: `model === 'suno'` → 'suno', everything else → 'stable-audio'.
- * A couple of extra `model` heuristics map other engines if their names ever
- * land in the library, and `source === 'import'` keeps imported audio honest.
+ * The detected slug wins whenever the backend sent one — it read the file's
+ * own metadata, which beats any guess made from a model name. With no detected
+ * slug the historical derivation answers, unchanged:
+ *   model contains 'suno'                → 'suno'
+ *   model contains 'magenta' / 'gemini'  → 'gemini-magenta'
+ *   model contains 'udio' / 'riffusion'  → that engine
+ *   source === 'import'                  → 'import'
+ *   everything else                      → 'stable-audio'
+ *
+ * The detected slug is passed through as the backend spelled it (trimmed
+ * only): the same string is compared against other entries' ids AND sent back
+ * as `provider=`, so re-casing it here could stop the server matching its own
+ * stored value.
  */
-export const inferProvider = (e: {
-  model?: string | null;
-  source?: string | null;
-}): string => {
+export const inferProvider = (e: ProviderEntryFields): string => {
+  const detected = trimmed(e.provider);
+  if (detected) return detected;
   const hay = `${e.model ?? ''}`.toLowerCase();
   if (hay === 'suno' || hay.includes('suno')) return 'suno';
   if (hay.includes('magenta') || hay.includes('gemini')) return 'gemini-magenta';
@@ -88,6 +129,41 @@ export const inferProvider = (e: {
   if (e.source === 'import') return 'import';
   // theDAW's native generations + studio renders are all Stable Audio.
   return 'stable-audio';
+};
+
+/**
+ * Display metadata for an ENTRY: this table's row for its id, except that a
+ * label the backend sent wins. A provider the table has never heard of is the
+ * whole reason — the backend knows its name, we only know the slug.
+ */
+export const entryProviderMeta = (e: ProviderEntryFields): ProviderMeta => {
+  const id = inferProvider(e);
+  const base = providerMeta(id);
+  const sent = trimmed(e.providerLabel);
+  // Never mutate the shared table row: spread into a new object.
+  return sent && sent !== base.label ? { ...base, label: sent } : base;
+};
+
+/**
+ * The ids this file can name that ARE an AI generation service — every id the
+ * derivation produces except `import` and `unknown`.
+ */
+const AI_PROVIDER_IDS = new Set([
+  'stable-audio', 'suno', 'gemini-magenta', 'magenta', 'udio', 'riffusion',
+]);
+
+/**
+ * Is this entry's provider an AI generation service?
+ *
+ * The backend's `providerIsAi` is the answer whenever it sent one: it can tell
+ * an AI service from a store or a host, and it ships that flag with every
+ * provider it detects. Without a flag, the engines above are AI — so every
+ * derived id is, except an import and the unknown bucket — and a slug this
+ * app has never heard of is not CLAIMED to be AI on a guess.
+ */
+export const entryProviderIsAi = (e: ProviderEntryFields): boolean => {
+  if (typeof e.providerIsAi === 'boolean') return e.providerIsAi;
+  return AI_PROVIDER_IDS.has(inferProvider(e).toLowerCase());
 };
 
 /** A reasonable default provider list to seed filter dropdowns before

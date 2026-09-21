@@ -36,6 +36,22 @@ export interface LibraryEntry {
    */
   lyrics: string;
   source: 'generate' | 'studio' | 'import';
+  /**
+   * The service the audio actually came from, detected by the backend from the
+   * file's own embedded metadata: a stable lowercase slug ('suno', 'udio',
+   * 'bandcamp', …). Null/undefined when nothing in the file identified an
+   * origin — which is the normal case for theDAW's own generations.
+   *
+   * Orthogonal to `source`, which stays 'generate' | 'studio' | 'import' and
+   * says how the entry entered the library, not who made the audio.
+   */
+  provider?: string | null;
+  /** Display name for `provider`, e.g. 'Suno'. */
+  providerLabel?: string | null;
+  /** True when the provider is an AI generation service (vs a store/host). */
+  providerIsAi?: boolean | null;
+  /** The provider's own track id, when the file carried one. */
+  providerId?: string | null;
   chimeraSources?: string[];
   /** Persistent play counter, incremented when the track starts in the player. */
   playCount?: number;

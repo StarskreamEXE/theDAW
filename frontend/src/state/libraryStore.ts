@@ -51,6 +51,7 @@ import {
   type LibraryFacetField,
   type LibraryFacets,
 } from '../lib/libraryFacets';
+import { hasProvider, providerSearchText } from '../lib/providerLabel';
 import {
   firstIndexOfPage,
   missingPages,
@@ -93,6 +94,14 @@ export interface LibraryState {
   kindFilter: string;
   /** 'generate' | 'studio' | 'import', or null for every source. */
   sourceFilter: string | null;
+  /**
+   * A provider id ('suno', 'stable-audio', …), or null for every provider.
+   * The id is `inferProvider`'s: the slug the backend detected in the file's
+   * own metadata, or the model/source derivation when it detected none. Sent
+   * to the backend as `provider=`, so it filters the WHOLE library rather than
+   * the rows already loaded. Orthogonal to `sourceFilter`.
+   */
+  providerFilter: string | null;
   playingId: string | null;
   selectedEntryId: string | null;
 
@@ -134,6 +143,7 @@ export interface LibraryState {
   setSortBy: (s: LibraryState['sortBy']) => void;
   setKindFilter: (kind: string) => void;
   setSourceFilter: (source: string | null) => void;
+  setProviderFilter: (provider: string | null) => void;
   setPlayingId: (id: string | null) => void;
   setSelectedEntry: (id: string | null) => void;
   /** Count a play for an entry: optimistic local bump + persist server-side. */
@@ -248,6 +258,10 @@ const applyClientQuery = (rows: readonly LibraryEntry[], state: LibraryState): L
   let filtered = [...rows];
   if (state.onlyFavorites) filtered = filtered.filter((e) => e.favorite);
   if (state.sourceFilter) filtered = filtered.filter((e) => e.source === state.sourceFilter);
+  // The provider filter is normally applied by the server; an UNPAGED backend
+  // has no such filter, so it is re-applied here for exactly the same reason
+  // the source filter above is.
+  if (state.providerFilter) filtered = filtered.filter((e) => hasProvider(e, state.providerFilter));
   const query = state.searchQuery.trim();
   if (query) {
     const q = query.toLowerCase();
@@ -264,6 +278,11 @@ const applyClientQuery = (rows: readonly LibraryEntry[], state: LibraryState): L
         e.model,
         e.notes,
         e.source,
+        // The provider reads like a source to a searching user, so "suno"
+        // finds Suno tracks here exactly as "import" finds imports. Same
+        // helper the Catalogue's own haystack uses, so a query that hits a row
+        // there hits it here.
+        providerSearchText(e),
         e.mimeType,
         e.rating ?? '',
         ...e.tags,
@@ -476,6 +495,7 @@ export const useLibraryStore = create<LibraryState>()((set, get) => {
     sortBy: 'newest',
     kindFilter: DEFAULT_LIBRARY_QUERY.kind,
     sourceFilter: null,
+    providerFilter: null,
     playingId: null,
     selectedEntryId: null,
 
@@ -497,6 +517,7 @@ export const useLibraryStore = create<LibraryState>()((set, get) => {
         kind: s.kindFilter || 'audio',
         favorite: s.onlyFavorites ? true : null,
         source: s.sourceFilter,
+        provider: s.providerFilter,
       };
     },
 
@@ -885,6 +906,11 @@ export const useLibraryStore = create<LibraryState>()((set, get) => {
     setSourceFilter: (source) => {
       if (get().sourceFilter === source) return;
       set({ sourceFilter: source });
+      applyQueryChange();
+    },
+    setProviderFilter: (provider) => {
+      if (get().providerFilter === provider) return;
+      set({ providerFilter: provider });
       applyQueryChange();
     },
     setPlayingId: (id) => set({ playingId: id }),

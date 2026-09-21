@@ -3,7 +3,7 @@ import { Database, Loader2, Minimize2 } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { useLibraryStore } from '../state/libraryStore';
 import { useCatalogueUiStore, selectSearchState } from './catalogueUiStore';
-import { catalogueServerQuery, filterAndSort, isServerOnly } from './catalogSearch';
+import { applyCatalogueServerQuery, filterAndSort, isServerOnly } from './catalogSearch';
 import { CatalogueFilterBar } from './CatalogueFilterBar';
 import { CatalogueList } from './CatalogueList';
 import { CatalogueGrid } from './CatalogueGrid';
@@ -17,15 +17,15 @@ import type { LibraryEntry } from '../state/libraryEntry';
  * and a detailed lineage viewer. No new store, no IndexedDB.
  *
  * ── Where the filtering happens ───────────────────────────────────────────
- * The library is paged now, so the Catalogue's query text, favourites, source
- * and sort go to the BACKEND through the shared store and the list renders the
- * result set by index — 200,000 entries scroll without being in memory.
+ * The library is paged now, so the Catalogue's query text, favourites, source,
+ * provider and sort go to the BACKEND through the shared store and the list
+ * renders the result set by index — 200,000 entries scroll without being in
+ * memory.
  *
- * Its remaining knobs (a field-scoped target, the stricter match modes, the
- * derived provider, an exact model, a rating, a duration window) have no
- * server equivalent. With any of those set, the view refines the rows it has
- * loaded and says so above the list, rather than quietly claiming to have
- * searched the whole library.
+ * Its remaining knobs (a field-scoped target, the stricter match modes, an
+ * exact model, a rating, a duration window) have no server equivalent. With
+ * any of those set, the view refines the rows it has loaded and says so above
+ * the list, rather than quietly claiming to have searched the whole library.
  *
  * Layout: filter bar header · list|grid body · slide-in inspector on the right
  * when an entry is selected · right-click context menu.
@@ -67,17 +67,13 @@ export const CatalogueView: React.FC<{ onCollapse?: () => void }> = ({ onCollaps
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Drive the SERVER query from the filter bar. The store debounces the text,
-  // so typing costs one request per pause rather than one per keystroke.
+  // Drive the SERVER query from the filter bar — text, favourites, sort,
+  // source AND provider, all through the one sync path. The store debounces
+  // the text, so typing costs one request per pause rather than one per
+  // keystroke, and each setter is a no-op when the value already matches, so
+  // opening the tab does not throw the page cache away and fetch it again.
   useEffect(() => {
-    const query = catalogueServerQuery(searchState);
-    const lib = useLibraryStore.getState();
-    // Each setter is a no-op when the value already matches, so opening the
-    // tab does not throw the page cache away and fetch it again.
-    if (lib.searchQuery !== query.q) lib.setSearchQuery(query.q);
-    lib.setOnlyFavorites(query.onlyFavorites);
-    lib.setSortBy(query.sortBy);
-    lib.setSourceFilter(query.source);
+    applyCatalogueServerQuery(searchState, useLibraryStore.getState());
   }, [searchState]);
 
   // Everything the backend applied is already in the result set; only the

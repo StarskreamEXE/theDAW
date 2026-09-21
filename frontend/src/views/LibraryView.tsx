@@ -21,10 +21,16 @@ import { SuggestPlaylistModal } from '../components/library/SuggestPlaylistModal
 import { StemsRunModal, type StemsRunOptions } from '../components/library/StemsRunModal';
 import { AssetInspectorModal } from '../components/library/AssetInspectorModal';
 import { TrackInfo } from '../components/library/TrackInfo';
+import { ProviderBadge } from '../components/library/ProviderBadge';
 import { MicRecorder } from '../components/audio/MicRecorder';
 import { Section } from '../components/ui/Section';
 import { useLibraryStore, LibraryIdCapError, type LibraryEntry } from '../state/libraryStore';
-import { describeBulkConflict, LibraryBulkConflictError, fetchLibraryMatchCount } from '../lib/backendLocalProvider';
+import {
+  describeBulkConflict,
+  LibraryBulkConflictError,
+  fetchLibraryMatchCount,
+  plainLibraryQuery,
+} from '../lib/backendLocalProvider';
 import { useLibraryCounts, type LibraryCountKey } from '../state/libraryCountsStore';
 import { useGenerateParamsStore } from '../state/generateParamsStore';
 import { useEditorStore, computePeaks } from '../state/editorStore';
@@ -256,7 +262,12 @@ const TrackCard: React.FC<TrackCardActions & { entry: LibraryEntry }> = ({
           </span>
         )}
         <div className="flex items-center justify-between gap-2">
-          <span className="text-[8px] font-mono text-purple-400/80 uppercase tracking-wider truncate">{entry.model}</span>
+          <span className="flex items-center gap-1 min-w-0">
+            {/* The entry's one provider: what the file said about its origin
+                when it said anything, derived from model/source otherwise. */}
+            <ProviderBadge entry={entry} className="shrink-0" />
+            <span className="text-[8px] font-mono text-purple-400/80 uppercase tracking-wider truncate">{entry.model}</span>
+          </span>
           <div className="flex items-center gap-3 shrink-0">
             {(entry.playCount ?? 0) > 0 && (
               <span className="text-[8px] font-mono text-purple-300/70 flex items-center gap-0.5" title={`Played ${entry.playCount}x`}>
@@ -1450,8 +1461,11 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
   const refreshMaintenanceCounts = React.useCallback(async (): Promise<MaintenanceCounts | null> => {
     const store = useLibraryStore.getState();
     if (!store.paged || !store.bulkDeleteSupported) return null;
-    const base = store.getQuery();
-    const kindOnly = { ...base, q: '', favorite: null, source: null };
+    // `provider` is cleared alongside q/favorite/source: these counts are what
+    // the bulk-delete filter below actually targets, and that filter carries no
+    // provider. Leaving it in would print a count the server then refuses.
+    // One helper does that clearing for every counting call site in the app.
+    const kindOnly = plainLibraryQuery(store.getQuery());
     try {
       const [everyKind, thisKind, favourites] = await Promise.all([
         fetchLibraryMatchCount({ ...kindOnly, kind: 'all' }),

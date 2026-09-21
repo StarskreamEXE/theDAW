@@ -29,9 +29,16 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, Iterable, Iterator, Mapping, Optional
 
-from .db import DEFAULT_DELETE_BATCH, DEFAULT_SORT, EntryFilters, LibraryDB
+from .db import (
+    DEFAULT_DELETE_BATCH,
+    DEFAULT_SORT,
+    EntryFilters,
+    LibraryDB,
+    derived_provider_wire,
+)
+from .provider import curated_fields, detect_provider, provider_wire_fields
 from backend.lib import paths
 
 log = logging.getLogger(__name__)
@@ -123,6 +130,15 @@ class LibraryRecord:
     # embedded picture at import. None when the track has none, so the UI
     # can draw its placeholder without probing the route for a 404.
     cover_url: Optional[str] = None
+    # Where the track came from -- Suno, Bandcamp, a DAW nobody recognises --
+    # as decided by `provider.py` from what the file itself carried. All four
+    # are None for a track whose origin nothing says, which is the normal case
+    # for the user's own renders. `source` is a DIFFERENT axis and is
+    # unchanged: it stays generate / studio / import.
+    provider: Optional[str] = None
+    provider_label: Optional[str] = None
+    provider_is_ai: Optional[bool] = None
+    provider_id: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -155,6 +171,10 @@ class LibraryRecord:
             "height": self.height,
             "has_alpha": self.has_alpha,
             "cover_url": self.cover_url,
+            "provider": self.provider,
+            "provider_label": self.provider_label,
+            "provider_is_ai": self.provider_is_ai,
+            "provider_id": self.provider_id,
         }
 
 
@@ -344,6 +364,127 @@ def _resolve_audio_file(entry_dir: Path, meta: dict[str, Any]) -> Optional[Path]
     return None
 
 
+# ---- Provider labeling ------------------------------------------------------
+#
+# `provider.py` decides WHAT a track's provider is. The two helpers below are
+# the only places the library acts on that answer, so an entry labeled at
+# import and the same entry labeled while being read can never disagree.
+#
+# Neither one opens a file or reads another row. :func:`_apply_provider_labels`
+# runs once per imported entry, over tags its caller has already read;
+# :func:`_provider_wire` runs per entry on the read path, over the metadata
+# that entry already carries. That is what makes labeling the existing library
+# free: no backfill pass, no re-analysis, nothing re-read from disk.
+
+#: Curated embedded fields that fill one of the entry's OWN fields when the
+#: caller left it empty.
+_CURATED_ENTRY_FIELDS: tuple[str, ...] = (
+    "prompt",
+    "negative_prompt",
+    "model",
+    "lyrics",
+)
+
+#: Curated embedded fields stored beside the entry under their own name.
+#: `created_at`, `bpm` and `key` are deliberately absent: `created_at` is what
+#: the timestamp fallback in :func:`_record_from_metadata` reads, and bpm/key
+#: belong to the analysis row, which MEASURES them from the audio rather than
+#: taking the file's word for it. Both remain readable in `embedded_tags`.
+_CURATED_EXTRA_FIELDS: tuple[str, ...] = (
+    "provider_id",
+    "style",
+    "model_version",
+    "artist",
+    "parent_id",
+    "is_instrumental",
+)
+
+
+def _is_unset(value: Any) -> bool:
+    """Whether a metadata field is absent rather than answered. ``False`` is an
+    answer (an explicitly non-instrumental track), so only None and the empty
+    string count as unset."""
+    return value is None or value == ""
+
+
+def _apply_provider_labels(
+    record_meta: dict[str, Any],
+    embedded: Mapping[str, Any],
+    meta_in: Mapping[str, Any],
+) -> None:
+    """Label one entry being built from a file, in place.
+
+    ``record_meta`` is the ``metadata.json`` about to be written, ``embedded``
+    whatever the tag reader returned for the file, and ``meta_in`` the caller's
+    own metadata, which wins over anything the file claims about itself.
+
+    An empty ``embedded`` is still worth a call: the legacy markers a
+    pre-existing entry carries (``source`` of "suno", a ``suno_id``, a ``suno``
+    tag) live in ``record_meta``. When nothing identifies the track, NOTHING is
+    written -- an unlabeled entry keeps the metadata it always had.
+
+    Shared by every import path, so a track uploaded through ``import_blob``
+    and the same track registered in place come out labeled identically.
+    """
+    info = detect_provider(embedded, record_meta)
+    if info is None:
+        return
+    record_meta.update(provider_wire_fields(info))
+
+    curated = curated_fields(embedded, info)
+    for name in _CURATED_ENTRY_FIELDS:
+        # The caller's explicit value wins; otherwise the curated value wins
+        # over the raw frame the generic `_pick` fallback found, because the
+        # curated table knows which of a provider's frames actually holds it.
+        if _is_unset(curated.get(name)) or not _is_unset(meta_in.get(name)):
+            continue
+        record_meta[name] = curated[name]
+    for name in _CURATED_EXTRA_FIELDS:
+        if not _is_unset(record_meta.get(name)) or _is_unset(curated.get(name)):
+            continue
+        record_meta[name] = curated[name]
+
+    # The provider is a tag too, so the existing tag filter and the search
+    # index find these tracks without a new mechanism. Compared case-folded:
+    # a user who already tagged the track "Suno" does not get a second one.
+    tags = list(record_meta.get("tags") or [])
+    if info.provider not in {str(tag).strip().lower() for tag in tags}:
+        record_meta["tags"] = [*tags, info.provider]
+
+
+def _provider_wire(
+    meta: Mapping[str, Any], *, source: str = "", model: str = ""
+) -> dict[str, Any]:
+    """The four provider wire fields for one entry, from its stored row.
+
+    Derivation only -- no file is opened, no second row is read -- so every one
+    of the ~200,000 entries already in the library is labeled as it is read,
+    with no migration and no backfill.
+
+    Two steps, in the order :data:`~.db.PROVIDER_SQL` compares against, so an
+    entry's label is always the slug the list filter files it under:
+
+    1. a stored ``provider``, or the legacy Suno markers, via
+       :func:`~.provider.detect_provider` -- which also knows the track's own
+       provider id;
+    2. failing that, :func:`~.db.infer_provider` over ``model`` / ``source``,
+       the rule the catalogue has always shown these tracks under.
+
+    ``source`` and ``model`` are the ``entries`` columns, used when
+    ``metadata.json`` carries none of its own -- the column is the truth for a
+    row rebuilt from the DB.
+    """
+    row_source = str(meta.get("source") or source or "")
+    if source and not meta.get("source"):
+        meta = {**meta, "source": source}
+    info = detect_provider({}, meta)
+    if info is not None:
+        return provider_wire_fields(info)
+    return derived_provider_wire(
+        str(meta.get("model") or model or ""), row_source, meta.get("suno_id")
+    )
+
+
 def _flatten_suno_meta(meta: dict[str, Any]) -> dict[str, Any]:
     """Suno API-compatible format normalization: if metadata came from a Suno
     External API cache (has an "inferred" dict), flatten inferred fields to
@@ -467,6 +608,7 @@ def _record_from_metadata(
         lyrics=str(meta.get("lyrics") or ""),
         spectrogram_paths=dict(meta.get("spectrogram_paths") or {}),
         cover_url=_cover_url_if_present(entry_dir, api_prefix, entry_id),
+        **_provider_wire(meta),
     )
 
 
@@ -530,6 +672,7 @@ def _media_record_from_metadata(
         width=_int_or_none(meta.get("width")),
         height=_int_or_none(meta.get("height")),
         has_alpha=bool(meta.get("has_alpha", False)),
+        **_provider_wire(meta),
     )
 
 
@@ -609,6 +752,14 @@ def _record_from_db_row(
         height=_int_or_none(meta.get("height")) if is_media else None,
         has_alpha=bool(meta.get("has_alpha", False)) if is_media else False,
         cover_url=cover_url,
+        # The row's columns are the truth here: `source` is what a legacy Suno
+        # entry was marked with and `model` is what the derivation reads.
+        # metadata.json usually repeats both, but need not.
+        **_provider_wire(
+            meta,
+            source=str(row.get("source") or ""),
+            model=str(row.get("model") or ""),
+        ),
     )
 
 
@@ -649,15 +800,26 @@ def _chimera_edges(entry_id: str, meta: dict[str, Any]) -> list[tuple[str, str, 
 
 
 def _reference_metadata(
-    src: Path, entry_id: str, meta_in: dict[str, Any]
+    src: Path,
+    entry_id: str,
+    meta_in: dict[str, Any],
+    *,
+    embedded: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     """The ``metadata.json`` for a reference-in-place entry. Shared by
-    :meth:`LibraryStore.register_reference` and the bulk importer."""
+    :meth:`LibraryStore.register_reference` and the bulk importer.
+
+    ``embedded`` is the file's tags when the caller has already read them.
+    The bulk importer passes none by default and MUST keep doing so: reading
+    tags means opening every one of 200,000 source files, which is the same
+    reason it leaves ``extract_covers`` off. Labeling still runs without them,
+    from the markers ``meta_in`` carries.
+    """
     # Unreachable from folder import, which filters on AUDIO_EXTS — but this
     # is public, so an unknown container gets the honest generic answer
     # rather than being labelled an MP3.
     mime = AUDIO_MIME_BY_EXT.get(src.suffix.lower(), "application/octet-stream")
-    return {
+    meta: dict[str, Any] = {
         "id": entry_id,
         "source_path": str(src.resolve()),
         "filename": src.name,
@@ -680,6 +842,10 @@ def _reference_metadata(
         "saved_at": time.time(),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    if embedded:
+        meta["embedded_tags"] = dict(embedded)
+    _apply_provider_labels(meta, embedded or {}, meta_in)
+    return meta
 
 
 @dataclass
@@ -1349,6 +1515,10 @@ class LibraryStore:
             "title": _pick("title", ["title"], title_default),
             "prompt": _pick("prompt", ["prompt"], ""),
             "negative_prompt": _pick("negative_prompt", ["negative_prompt"], ""),
+            # Read like every other field the caller may supply: without this
+            # key an uploader's own lyrics were dropped on the floor, and the
+            # curated ones a provider file carries had nothing to fill.
+            "lyrics": _pick("lyrics", ["lyrics"], ""),
             "model": _pick("model", ["model", "generator"], "import"),
             "duration": meta_in.get("duration", 0.0),
             "steps": meta_in.get("steps", 0),
@@ -1364,6 +1534,9 @@ class LibraryStore:
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "embedded_tags": embedded,
         }
+        # Who made this, and the fields of the file that describe the SONG.
+        # `source` above is untouched: an import stays an import.
+        _apply_provider_labels(record_meta, embedded, meta_in)
         _write_metadata(entry_dir, record_meta)
         record = _record_from_metadata(entry_dir, record_meta, self.api_prefix)
         assert record is not None, "freshly imported entry must resolve"
@@ -1392,14 +1565,26 @@ class LibraryStore:
         (reference-in-place). Only a small metadata.json is written into the
         library; the audio is served / analysed straight from ``source_path``.
         Used by the folder -> playlist feature. Returns None when the path is
-        not a file."""
+        not a file.
+
+        The file's own tags are read here, the way they are for an upload: this
+        path already opens the file for its cover art, so a track registered in
+        place is identified and curated exactly like one copied in. The BULK
+        sibling below does neither, by design."""
+        from .tags import extract_embedded_tags
+
         src = Path(source_path)
         if not src.is_file():
             return None
         entry_id = uuid.uuid4().hex
         entry_dir = self.root / entry_id
         entry_dir.mkdir(parents=True, exist_ok=True)
-        record_meta = _reference_metadata(src, entry_id, dict(metadata or {}))
+        record_meta = _reference_metadata(
+            src,
+            entry_id,
+            dict(metadata or {}),
+            embedded=extract_embedded_tags(src),
+        )
         # The audio stays where it is, but its artwork is copied in: the cover
         # has to live under the library root for the route to serve it. A
         # folder import runs this per file — a track with no picture costs a
@@ -1438,7 +1623,11 @@ class LibraryStore:
           one each.
         * ``extract_covers`` is off: reading embedded artwork means opening and
           parsing every source file. :meth:`get_cover_path` picks it up lazily
-          when a cover is actually asked for.
+          when a cover is actually asked for. It gates the file's TAGS for the
+          same reason -- with it off, an entry is labeled from what the caller
+          says about it and from nothing else, and a provider that only the
+          file knows about is picked up later, at read time, from the tags the
+          analysis pass stores. Nothing here re-reads 200,000 files.
         * ``defer_jobs`` is on: 200,000 queued analysis jobs would saturate the
           serial background queue for days. The user runs analysis when they
           want it.
@@ -1449,6 +1638,8 @@ class LibraryStore:
         read AND extended with what this call registers, so a caller looping
         over batches pays for the lookup scan once.
         """
+        from .tags import extract_embedded_tags
+
         if self.db is None:
             raise RuntimeError("bulk import needs the library DB")
         result = BulkImportResult()
@@ -1485,7 +1676,12 @@ class LibraryStore:
                 entry_id = uuid.uuid4().hex
                 entry_dir = self.root / entry_id
                 entry_dir.mkdir(parents=True, exist_ok=True)
-                record_meta = _reference_metadata(src, entry_id, {"source": source})
+                record_meta = _reference_metadata(
+                    src,
+                    entry_id,
+                    {"source": source},
+                    embedded=extract_embedded_tags(src) if extract_covers else None,
+                )
                 if extract_covers:
                     extract_cover_for(entry_dir, src)
                 _write_metadata(entry_dir, record_meta)
