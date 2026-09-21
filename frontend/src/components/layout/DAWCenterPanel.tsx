@@ -33,7 +33,10 @@ import { SessionView } from '../../views/SessionView';
 const WaveformEditor = lazy(() => import('../audio/WaveformEditor').then((m) => ({ default: m.WaveformEditor })));
 const AdvancedView = lazy(() => import('../../views/AdvancedView').then((m) => ({ default: m.AdvancedView })));
 const MixView = lazy(() => import('../../views/MixView').then((m) => ({ default: m.MixView })));
-const LineageView = lazy(() => import('../library/LineageModal').then((m) => ({ default: m.LineageView })));
+// LEARN is hosted by LearnHost: on a small library it renders the classic graph
+// from ../library/LineageModal exactly as before; on a large one (where that graph
+// asks for the whole library and cannot load) it opens the scale-safe view instead.
+const LineageView = lazy(() => import('../../lineagescale/LearnHost').then((m) => ({ default: m.LineageView })));
 const VJView = lazy(() => import('../../views/VJView').then((m) => ({ default: m.VJView })));
 const DJView = lazy(() => import('../../views/DJView').then((m) => ({ default: m.DJView })));
 const SwayView = lazy(() => import('../../views/SwayView').then((m) => ({ default: m.SwayView })));
