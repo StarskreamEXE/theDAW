@@ -1,0 +1,1025 @@
+"""Tests for ``backend.modules.lineagescale``.
+
+Everything runs against the synthetic library in
+``tests/lineagescale_fixtures.py``. Nothing here opens the user's library,
+starts a server, or touches port 8600: the router's ``get_store`` is replaced
+with a stub whose only attribute is the fixture database.
+
+The pure algorithms are tested without FastAPI and the routes are tested
+through ``TestClient``, which is the split ``graph.py`` exists to make
+possible.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+import threading
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from backend.modules.lineagescale import graph, router as lineage_router
+from tests.lineagescale_fixtures import (
+    HUB_CHILDREN,
+    METADATA_PAD_BYTES,
+    THRESHOLD_EXACT_CHILDREN,
+    THRESHOLD_OVER_CHILDREN,
+    UNKNOWN_KIND,
+    FixtureLibrary,
+    StubStore,
+    build_fixture_library,
+    build_small_library,
+    entry_rows,
+    link_rows,
+    metadata_blob_size,
+)
+
+PREFIX = "/api/lineage-scale"
+
+
+# --------------------------------------------------------------- fixtures
+
+
+@pytest.fixture(scope="session")
+def library(tmp_path_factory: pytest.TempPathFactory) -> Iterator[FixtureLibrary]:
+    """The big synthetic library. Built once: ~13,000 padded rows."""
+    path = tmp_path_factory.mktemp("lineagescale") / "library.db"
+    fixture = build_fixture_library(path)
+    yield fixture
+    fixture.close()
+
+
+@pytest.fixture(scope="session")
+def small_library(tmp_path_factory: pytest.TempPathFactory) -> Iterator[FixtureLibrary]:
+    path = tmp_path_factory.mktemp("lineagescale-small") / "library.db"
+    fixture = build_small_library(path)
+    yield fixture
+    fixture.close()
+
+
+@pytest.fixture(autouse=True)
+def _clear_stats_cache() -> Iterator[None]:
+    """The stats cache is module-level on purpose. Two fixtures in one
+    session can land on the same ``library_revision``, so no test may inherit
+    another's answer."""
+    lineage_router._stats_cache.clear()
+    yield
+    lineage_router._stats_cache.clear()
+
+
+def _client(monkeypatch: pytest.MonkeyPatch, fixture: FixtureLibrary) -> TestClient:
+    store = StubStore(fixture.db)
+    monkeypatch.setattr(lineage_router, "get_library_store", lambda: store)
+    app = FastAPI()
+    app.include_router(lineage_router.router, prefix=PREFIX)
+    return TestClient(app)
+
+
+@contextmanager
+def _traced(
+    monkeypatch: pytest.MonkeyPatch, fixture: FixtureLibrary
+) -> Iterator[list[str]]:
+    """Every statement every connection the module opens issues.
+
+    The library-wide pass runs on its own read-only connection now, so
+    watching only the app's connection would watch an empty room.
+    """
+    statements: list[str] = []
+    real_connect = sqlite3.connect
+
+    def traced_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        conn = real_connect(*args, **kwargs)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", traced_connect)
+    shared = fixture.db._conn  # noqa: SLF001 - the fixture's own connection
+    shared.set_trace_callback(statements.append)
+    try:
+        yield statements
+    finally:
+        shared.set_trace_callback(None)
+
+
+def _in_memory_fetch(fixture: FixtureLibrary) -> graph.FetchLinks:
+    """``fetch_links`` backed by a dict, for the pure walk tests."""
+    index: dict[str, list[tuple[str, str, str]]] = {}
+    for from_id, to_id, kind in link_rows(fixture.db):
+        index.setdefault(from_id, []).append((from_id, to_id, kind))
+        index.setdefault(to_id, []).append((from_id, to_id, kind))
+
+    def fetch(ids: Any) -> list[tuple[str, str, str]]:
+        out: list[tuple[str, str, str]] = []
+        for node_id in ids:
+            out.extend(index.get(node_id, ()))
+        return out
+
+    return fetch
+
+
+def _stats(fixture: FixtureLibrary) -> graph.LibraryStats:
+    return graph.compute_library_stats(
+        link_rows(fixture.db), entry_rows(fixture.db), revision=1
+    )
+
+
+# ------------------------------------------------------- the role table
+
+
+def test_the_role_table_covers_every_kind_this_repository_writes():
+    """The table is the single source of truth, so a kind a writer in this
+    repo produces and the table has never heard of is a bug in the table."""
+    assert set(graph.KIND_ROLES) == {
+        "cover_of",
+        "edit_of",
+        "derived_from",
+        "upsample_of",
+        "overpaint_of",
+        "underpaint_of",
+        "speed_change_of",
+        "stem_of",
+        "mashup_source",
+        "chimera_source_of",
+        "midi_of",
+        "rendered_as_notation",
+        "tabbed_as_notation",
+        "arranged_as_notation",
+        "charted_as_chords",
+    }
+    assert graph.ANCESTRY_KINDS == {
+        "cover_of",
+        "edit_of",
+        "derived_from",
+        "upsample_of",
+        "overpaint_of",
+        "underpaint_of",
+        "speed_change_of",
+        "stem_of",
+    }
+    assert graph.USES_KINDS == {"mashup_source", "chimera_source_of"}
+    for info in graph.KIND_ROLES.values():
+        assert info.writer, f"{info.kind} has no writer recorded"
+        assert info.source_end in (graph.SOURCE_END_TO, graph.SOURCE_END_FROM)
+
+
+def test_an_unrecognised_kind_is_not_assumed_to_be_ancestry():
+    assert graph.role_of(UNKNOWN_KIND) == graph.ROLE_OTHER
+    assert graph.role_of("cover_of") == graph.ROLE_ANCESTRY
+    assert graph.role_of("mashup_source") == graph.ROLE_USES
+    assert graph.role_of("midi_of") == graph.ROLE_ARTIFACT
+
+
+def test_orientation_follows_each_writer_and_not_the_column_order():
+    """Two writers in this repository point opposite ways. Getting this
+    wrong makes a song its own ancestor's child."""
+    # Promoted lineage: (child, parent, kind).
+    assert graph.orient("child", "parent", "derived_from") == ("child", "parent")
+    assert graph.orient("mashup", "source", "mashup_source") == ("mashup", "source")
+    # library/store.py: (source_label, entry_id, "chimera_source_of").
+    assert graph.orient("label", "song", "chimera_source_of") == ("song", "label")
+    # notation/midi: (song, artifact_id, kind).
+    assert graph.orient("song", "score", "rendered_as_notation") == ("score", "song")
+    # stems/engine.py writes (parent, f"{parent}__{name}", "stem_of") ...
+    assert graph.orient("aaa", "aaa__vocals", "stem_of") == ("aaa__vocals", "aaa")
+    # ... while the promoted writer writes (child, parent).
+    assert graph.orient("aaa", "bbb", "stem_of") == ("aaa", "bbb")
+
+
+def test_a_link_from_a_song_to_itself_is_not_a_relationship():
+    assert graph.orient("same", "same", "derived_from") is None
+
+
+def test_the_strongest_role_wins_when_one_pair_carries_several_kinds():
+    assert graph.role_for_kinds(("cover_of", "mashup_source")) == graph.ROLE_ANCESTRY
+    assert graph.role_for_kinds(("mashup_source",)) == graph.ROLE_USES
+
+
+# ------------------------------------------------------------ duplicates
+
+
+def test_three_links_between_one_pair_are_one_edge_carrying_three_kinds(library):
+    """The real library stores one stem as derived_from + edit_of + stem_of.
+    Drawn as three arrows it is three relationships that do not exist."""
+    walk = graph.build_neighbourhood(
+        library.ids.duplicate_child,
+        up=1,
+        down=0,
+        budget=100,
+        fetch_links=_in_memory_fetch(library),
+    )
+    edges = [e for e in walk.edges if e.parent == library.ids.duplicate_parent]
+    assert len(edges) == 1
+    assert edges[0].kinds == ("edit_of", "derived_from", "stem_of")
+    assert edges[0].role == graph.ROLE_ANCESTRY
+    # kinds[0] is what the UI colours by: the specific kind, not the generic
+    # one that co-occurs with everything.
+    assert edges[0].kinds[0] == "edit_of"
+
+
+# --------------------------------------------------------- neighbourhood
+
+
+def test_generations_are_negative_upward_and_positive_downward(library):
+    walk = graph.build_neighbourhood(
+        library.ids.hub,
+        up=1,
+        down=1,
+        budget=1500,
+        fetch_links=_in_memory_fetch(library),
+    )
+    assert walk.generation[library.ids.hub] == 0
+    assert walk.generation[library.ids.hub_parent] == -1
+    down = graph.build_neighbourhood(
+        library.ids.threshold_exact,
+        up=0,
+        down=1,
+        budget=1500,
+        fetch_links=_in_memory_fetch(library),
+    )
+    children = [n for n, g in down.generation.items() if g == 1]
+    assert len(children) == THRESHOLD_EXACT_CHILDREN
+
+
+def test_exactly_twelve_relatives_stay_nodes_and_thirteen_become_a_group(library):
+    fetch = _in_memory_fetch(library)
+    exact = graph.build_neighbourhood(
+        library.ids.threshold_exact, up=0, down=1, budget=1500, fetch_links=fetch
+    )
+    assert exact.groups == []
+    assert len(exact.order) == THRESHOLD_EXACT_CHILDREN + 1
+
+    over = graph.build_neighbourhood(
+        library.ids.threshold_over, up=0, down=1, budget=1500, fetch_links=fetch
+    )
+    assert len(over.order) == 1, "a grouped fan costs no nodes"
+    assert len(over.groups) == 1
+    group = over.groups[0]
+    assert group.count == THRESHOLD_OVER_CHILDREN
+    assert group.parent_id == library.ids.threshold_over
+    assert group.direction == graph.DOWN
+    assert group.kind == "cover_of"
+    # The contract says up to five, so five is the number, not whatever the
+    # constant happens to say.
+    assert graph.GROUP_SAMPLE_IDS == 5
+    assert len(group.sample_ids) == 5
+    assert set(group.sample_ids) <= {
+        f"threshold-over-c{i:02d}" for i in range(THRESHOLD_OVER_CHILDREN)
+    }
+
+
+def test_a_hub_of_eight_hundred_children_costs_three_groups_not_eight_hundred(
+    library,
+):
+    walk = graph.build_neighbourhood(
+        library.ids.hub,
+        up=1,
+        down=1,
+        budget=1500,
+        fetch_links=_in_memory_fetch(library),
+    )
+    assert len(walk.order) == 2, "the focus and its one parent"
+    assert {(g.kind, g.count) for g in walk.groups} == {
+        ("cover_of", 400),
+        ("edit_of", 250),
+        ("upsample_of", 150),
+    }
+    assert sum(g.count for g in walk.groups) == HUB_CHILDREN
+    assert walk.truncated is False
+
+
+def test_a_uses_link_is_never_walked_through(library):
+    """A mashup welds two unrelated trees. Its sources are shown; their
+    ancestors are not, at any depth, or the neighbourhood becomes the
+    81,501-song component."""
+    walk = graph.build_neighbourhood(
+        library.ids.mashup,
+        up=8,
+        down=8,
+        budget=1500,
+        fetch_links=_in_memory_fetch(library),
+    )
+    assert set(walk.order) == {
+        library.ids.mashup,
+        library.ids.mashup_parent_a,
+        library.ids.mashup_parent_b,
+    }
+    assert library.ids.mashup_grandparent_a not in walk.generation
+    assert library.ids.mashup_grandparent_b not in walk.generation
+    assert set(walk.generation.values()) == {0, -1}
+    # The sources still say how much is behind them.
+    assert walk.hidden[library.ids.mashup_parent_a]["up"] == 1
+    for edge in walk.edges:
+        assert edge.role == graph.ROLE_USES
+        assert edge.kinds == ("mashup_source",)
+
+
+def test_a_uses_link_is_not_even_followed_from_a_node_that_is_not_the_focus(
+    library,
+):
+    """Focus a song one hop above a mashup: the mashup is a derivative of
+    nothing here, so no ``uses`` edge may appear at all."""
+    walk = graph.build_neighbourhood(
+        library.ids.mashup_grandparent_a,
+        up=8,
+        down=8,
+        budget=1500,
+        fetch_links=_in_memory_fetch(library),
+    )
+    assert library.ids.mashup not in walk.generation
+    assert all(e.role == graph.ROLE_ANCESTRY for e in walk.edges)
+
+
+def test_an_unknown_kind_is_shown_one_hop_and_never_recursed(library):
+    walk = graph.build_neighbourhood(
+        library.ids.unknown_child,
+        up=8,
+        down=0,
+        budget=1500,
+        fetch_links=_in_memory_fetch(library),
+    )
+    assert library.ids.unknown_parent in walk.generation
+    assert library.ids.unknown_grandparent not in walk.generation
+    edge = next(e for e in walk.edges if e.parent == library.ids.unknown_parent)
+    assert edge.role == graph.ROLE_OTHER
+    assert edge.kinds == (UNKNOWN_KIND,)
+
+
+def test_artifact_links_are_counted_but_never_drawn(library):
+    walk = graph.build_neighbourhood(
+        library.ids.artifact_song,
+        up=8,
+        down=8,
+        budget=1500,
+        fetch_links=_in_memory_fetch(library),
+    )
+    assert walk.order == [library.ids.artifact_song]
+    assert walk.edges == []
+    assert walk.hidden == {}
+    summary = _stats(library).summary
+    for artifact_kind in ("midi_of", "rendered_as_notation", "charted_as_chords"):
+        assert summary["by_kind"][artifact_kind] >= 1
+
+
+def test_the_budget_stops_the_walk_and_admits_it(library):
+    walk = graph.build_neighbourhood(
+        library.ids.threshold_exact,
+        up=0,
+        down=1,
+        budget=graph.MIN_BUDGET,
+        fetch_links=_in_memory_fetch(library),
+    )
+    assert walk.truncated is False, "13 nodes is under the floor of 50"
+
+    fetch = _in_memory_fetch(library)
+    whole = graph.build_neighbourhood(
+        library.ids.budget_root, up=0, down=3, budget=1500, fetch_links=fetch
+    )
+    assert len(whole.order) == library.expected["budget_descendants"] + 1
+    assert whole.truncated is False
+
+    wide = graph.build_neighbourhood(
+        library.ids.budget_root, up=0, down=3, budget=60, fetch_links=fetch
+    )
+    assert wide.truncated is True
+    assert len(wide.order) == 60
+    assert wide.budget == 60
+    # What the budget cut is still counted, so the UI can say how much.
+    assert sum(c["down"] for c in wide.hidden.values()) > 0
+
+
+def test_hidden_counts_what_the_view_left_out(library):
+    """ "+N more" has to be a number the user can act on: what was cut, not
+    what is already on screen."""
+    fetch = _in_memory_fetch(library)
+    walk = graph.build_neighbourhood(
+        library.ids.deep_tip, up=2, down=1, budget=1500, fetch_links=fetch
+    )
+    boundary = min(walk.generation, key=lambda node: walk.generation[node])
+    assert walk.generation[boundary] == -2
+    assert walk.hidden[boundary] == {"up": 1, "down": 0}
+    # Everything that IS on screen is not also counted as missing.
+    for node_id, counts in walk.hidden.items():
+        assert counts["up"] >= 0 and counts["down"] >= 0
+        assert node_id in walk.generation
+    grouped = graph.build_neighbourhood(
+        library.ids.threshold_over, up=0, down=1, budget=1500, fetch_links=fetch
+    )
+    assert grouped.hidden == {}, "a group already carries its own count"
+
+
+def test_a_two_cycle_does_not_loop(library):
+    walk = graph.build_neighbourhood(
+        library.ids.cycle_a,
+        up=8,
+        down=8,
+        budget=1500,
+        fetch_links=_in_memory_fetch(library),
+    )
+    assert set(walk.order) == {library.ids.cycle_a, library.ids.cycle_b}
+    assert len(walk.edges) == 2, "each is a cover of the other: two real edges"
+
+
+def test_depth_and_budget_are_clamped_to_the_contract(library):
+    fetch = _in_memory_fetch(library)
+    walk = graph.build_neighbourhood(
+        library.ids.deep_tip, up=99, down=-4, budget=99_999, fetch_links=fetch
+    )
+    assert walk.up == graph.MAX_DEPTH
+    assert walk.down == 0
+    assert walk.budget == graph.MAX_BUDGET
+    tiny = graph.build_neighbourhood(
+        library.ids.deep_tip, up=1, down=0, budget=1, fetch_links=fetch
+    )
+    assert tiny.budget == graph.MIN_BUDGET
+
+
+def test_a_locally_separated_stem_is_a_derivative_not_an_ancestor(library):
+    """``stems/engine.py`` writes stem_of the other way round. Read with the
+    promoted writer's direction, a song's own stems become its parents."""
+    fetch = _in_memory_fetch(library)
+    walk = graph.build_neighbourhood(
+        library.ids.local_stem_parent, up=2, down=2, budget=1500, fetch_links=fetch
+    )
+    assert walk.generation[library.ids.local_stem_id] == 1
+
+    promoted = graph.build_neighbourhood(
+        library.ids.promoted_stem_child, up=2, down=2, budget=1500, fetch_links=fetch
+    )
+    assert promoted.generation[library.ids.promoted_stem_parent] == -1
+
+
+# ----------------------------------------------------------- the library
+
+
+def test_the_summary_counts_the_library(library):
+    summary = _stats(library).summary
+    expected = library.expected
+    assert summary["entries"] == expected["entries"]
+    assert summary["with_lineage"] == expected["with_lineage"]
+    assert summary["standalone"] == expected["standalone"]
+    assert summary["links_raw"] == expected["links_raw"]
+    # The duplicate pair's three rows are one relationship.
+    assert summary["links_distinct"] == expected["links_raw"] - 2
+    assert summary["full_view_ok"] is False
+    assert sum(summary["by_kind"].values()) == summary["links_raw"]
+    assert summary["revision"] == 1
+
+
+def test_a_song_with_only_artifacts_is_standalone(library):
+    """A MIDI file is not a relative. Counting it as lineage would say
+    thousands of untouched songs have a family."""
+    summary = _stats(library).summary
+    assert summary["standalone"] == len(library.ids.standalone) + 1
+
+
+def test_a_connected_component_is_not_a_family(library):
+    """The measured fact the whole design rests on: ``uses`` links weld
+    unrelated trees into one huge component."""
+    summary = _stats(library).summary
+    assert summary["largest_connected"] == library.expected["largest_connected"]
+    assert summary["largest_tree"] == library.expected["largest_tree"]
+    assert summary["largest_connected"] > summary["largest_tree"] * 4
+
+
+def test_full_view_ok_is_true_while_the_library_is_still_small(small_library):
+    summary = _stats(small_library).summary
+    assert summary["full_view_ok"] is True
+    assert summary["entries"] == 4
+    assert summary["standalone"] == 1
+    assert summary["largest_tree"] == 3
+
+
+def test_the_longest_chain_survives_two_thousand_generations_and_a_cycle(library):
+    """Recursion would die at the default limit of 1,000 long before it got
+    to the real library's depth; a cycle would never come back at all."""
+    deepest = _stats(library).rankings["deepest"]
+    assert deepest[0].id == library.ids.deep_deepest_leaf
+    assert deepest[0].count == library.expected["deepest_depth"]
+    assert deepest[0].detail
+
+    cyclic, _via = graph.longest_ancestry_chains(
+        {"a": [("b", "cover_of")], "b": [("a", "cover_of")]}
+    )
+    assert cyclic == {"a": 1, "b": 0} or cyclic == {"a": 0, "b": 1}
+
+
+def test_most_derived_counts_distinct_children(library):
+    rows = _stats(library).rankings["most_derived"]
+    assert rows[0].id == library.ids.hub
+    assert rows[0].count == HUB_CHILDREN
+    assert "cover_of 400" in rows[0].detail
+
+
+def test_most_derived_counts_one_child_linked_three_ways_once():
+    """derived_from + edit_of + stem_of between one pair is one child. Counted
+    per row it would be three, and the real library has 66,098 songs with 3-5
+    outgoing links."""
+    stats = graph.compute_library_stats(
+        [
+            ("child", "parent", "derived_from"),
+            ("child", "parent", "edit_of"),
+            ("child", "parent", "stem_of"),
+        ],
+        [("child", 2.0), ("parent", 1.0)],
+        revision=7,
+    )
+    assert stats.summary["links_raw"] == 3
+    assert stats.summary["links_distinct"] == 1
+    assert stats.rankings["most_derived"][0].id == "parent"
+    assert stats.rankings["most_derived"][0].count == 1
+
+
+def test_mashup_sources_counts_distinct_products(library):
+    rows = _stats(library).rankings["mashup_sources"]
+    assert rows[0].id == library.ids.mashup_popular_source
+    assert rows[0].count == library.expected["popular_source_users"]
+
+
+def test_recent_is_the_song_whose_newest_child_is_newest(library):
+    rows = _stats(library).rankings["recent"]
+    assert rows[0].id == library.ids.recent_parent
+    assert rows[0].detail.endswith("Z")
+
+
+def test_a_ranked_list_breaks_ties_on_the_id_so_it_never_reshuffles(library):
+    """Thousands of songs share a count. Without a tie-break the order is
+    whatever the pass happened to build, and the landing page reshuffles
+    under the user between two identical loads."""
+    rows = _stats(library).rankings["most_derived"]
+    for previous, current in zip(rows, rows[1:]):
+        assert previous.count >= current.count
+        if previous.count == current.count:
+            assert previous.id < current.id
+    again = _stats(library).rankings["most_derived"]
+    assert [r.id for r in rows] == [r.id for r in again]
+
+
+# ---------------------------------------------------------------- routes
+
+
+def test_the_module_loads_through_the_real_autoloader_with_all_four_routes():
+    from backend.modules.loader import load_modules
+
+    modules_dir = Path(__file__).resolve().parents[1] / "backend" / "modules"
+    app = FastAPI()
+    manifests = load_modules(app, modules_dir)
+
+    assert app.state.module_load_errors.get("lineagescale") is None
+    manifest = next(m for m in manifests if m["name"] == "lineagescale")
+    assert manifest["api_prefix"] == PREFIX
+    # ``app.routes`` holds one opaque wrapper per included router in this
+    # FastAPI; the generated schema is where the mounted paths are readable
+    # (the same place ``tests/test_editor_tools.py`` looks).
+    paths = set(app.openapi()["paths"])
+    assert paths >= {
+        f"{PREFIX}/summary",
+        f"{PREFIX}/rankings",
+        f"{PREFIX}/{{entry_id}}/neighbourhood",
+        f"{PREFIX}/{{entry_id}}/relatives",
+    }
+
+
+def test_the_summary_route_answers_the_contract(monkeypatch, library):
+    client = _client(monkeypatch, library)
+    body = client.get(f"{PREFIX}/summary").json()
+    assert set(body) == {
+        "entries",
+        "with_lineage",
+        "standalone",
+        "links_raw",
+        "links_distinct",
+        "by_kind",
+        "largest_connected",
+        "largest_tree",
+        "full_view_ok",
+        "revision",
+    }
+    assert body["entries"] == library.expected["entries"]
+    # ``revision`` is the identity of the link signature, not the library
+    # write counter: an identity to compare for equality, never for order.
+    with lineage_router._Snapshot(library.db) as snap:
+        assert body["revision"] == lineage_router._link_signature(snap).identity
+
+
+def test_the_rankings_route_answers_every_list_and_refuses_the_rest(
+    monkeypatch, library
+):
+    client = _client(monkeypatch, library)
+    for name in graph.RANKING_LISTS:
+        response = client.get(f"{PREFIX}/rankings", params={"list": name, "limit": 5})
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["list"] == name
+        assert len(body["rows"]) <= 5
+        for row in body["rows"]:
+            assert set(row) == {"id", "title", "model", "count", "detail"}
+            assert row["title"]
+    assert client.get(f"{PREFIX}/rankings", params={"list": "nope"}).status_code == 400
+
+
+def test_the_neighbourhood_route_answers_the_contract(monkeypatch, library):
+    client = _client(monkeypatch, library)
+    response = client.get(
+        f"{PREFIX}/{library.ids.hub}/neighbourhood",
+        params={"up": 1, "down": 1, "budget": 400},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["focus"] == library.ids.hub
+    assert body["budget"] == 400
+    assert body["truncated"] is False
+    focus_node = next(n for n in body["nodes"] if n["id"] == library.ids.hub)
+    assert set(focus_node) == {
+        "id",
+        "title",
+        "model",
+        "source",
+        "duration_sec",
+        "play_count",
+        "in_library",
+        "generation",
+    }
+    assert focus_node["generation"] == 0
+    assert focus_node["in_library"] is True
+    assert {g["kind"] for g in body["groups"]} == {
+        "cover_of",
+        "edit_of",
+        "upsample_of",
+    }
+    for edge in body["edges"]:
+        assert set(edge) == {"from", "to", "kinds", "role"}
+
+
+def test_an_id_that_is_only_a_link_endpoint_is_a_node_out_of_the_library(
+    monkeypatch, library
+):
+    client = _client(monkeypatch, library)
+    body = client.get(f"{PREFIX}/{library.ids.dangling_song}/neighbourhood").json()
+    ghost = next(n for n in body["nodes"] if n["id"] == library.ids.dangling_source)
+    assert ghost["in_library"] is False
+    assert ghost["title"] == library.ids.dangling_source
+    assert ghost["generation"] == -1
+    # ... and it is a real destination, not a dead end.
+    assert (
+        client.get(f"{PREFIX}/{library.ids.dangling_source}/neighbourhood").status_code
+        == 200
+    )
+
+
+def test_an_unknown_id_is_a_404(monkeypatch, library):
+    client = _client(monkeypatch, library)
+    assert client.get(f"{PREFIX}/no-such-song/neighbourhood").status_code == 404
+    assert client.get(f"{PREFIX}/no-such-song/relatives").status_code == 404
+
+
+def test_the_relatives_route_pages_sorts_and_counts(monkeypatch, library):
+    client = _client(monkeypatch, library)
+    base = f"{PREFIX}/{library.ids.hub}/relatives"
+    first = client.get(base, params={"direction": "down", "limit": 100}).json()
+    assert first["total"] == HUB_CHILDREN
+    assert len(first["rows"]) == 100
+    for row in first["rows"]:
+        assert set(row) == {
+            "id",
+            "title",
+            "model",
+            "duration_sec",
+            "play_count",
+            "kinds",
+        }
+
+    second = client.get(
+        base, params={"direction": "down", "limit": 100, "offset": 100}
+    ).json()
+    assert second["total"] == HUB_CHILDREN
+    assert {r["id"] for r in first["rows"]}.isdisjoint(
+        {r["id"] for r in second["rows"]}
+    )
+
+    titles = [r["title"] for r in first["rows"]]
+    assert titles == sorted(titles, key=str.casefold)
+
+    only_covers = client.get(
+        base, params={"direction": "down", "kind": "cover_of"}
+    ).json()
+    assert only_covers["total"] == 400
+    assert all(row["kinds"] == ["cover_of"] for row in only_covers["rows"])
+
+    up = client.get(base, params={"direction": "up"}).json()
+    assert [r["id"] for r in up["rows"]] == [library.ids.hub_parent]
+
+
+def test_the_relatives_route_refuses_a_direction_sort_or_kind_it_cannot_serve(
+    monkeypatch, library
+):
+    client = _client(monkeypatch, library)
+    base = f"{PREFIX}/{library.ids.hub}/relatives"
+    assert client.get(base, params={"direction": "sideways"}).status_code == 400
+    assert client.get(base, params={"sort": "vibes"}).status_code == 400
+    assert client.get(base, params={"kind": "not_a_kind"}).status_code == 400
+    capped = client.get(base, params={"direction": "down", "limit": 5_000}).json()
+    assert len(capped["rows"]) == graph.MAX_RELATIVES_LIMIT
+
+
+def test_relatives_merges_duplicate_kinds_into_one_row(monkeypatch, library):
+    client = _client(monkeypatch, library)
+    body = client.get(
+        f"{PREFIX}/{library.ids.duplicate_child}/relatives",
+        params={"direction": "up"},
+    ).json()
+    assert body["total"] == 1
+    assert body["rows"][0]["kinds"] == ["edit_of", "derived_from", "stem_of"]
+
+
+def test_the_library_database_being_absent_is_a_503(monkeypatch):
+    """Two guards, on purpose: the route refuses a store with no database,
+    and a session refuses a database it cannot read. Either one alone still
+    answers 503, so this asserts on every route rather than on one line."""
+    store = StubStore(None)
+    monkeypatch.setattr(lineage_router, "get_library_store", lambda: store)
+    app = FastAPI()
+    app.include_router(lineage_router.router, prefix=PREFIX)
+    client = TestClient(app)
+    assert client.get(f"{PREFIX}/summary").status_code == 503
+    assert client.get(f"{PREFIX}/rankings").status_code == 503
+    assert client.get(f"{PREFIX}/anything/neighbourhood").status_code == 503
+    assert client.get(f"{PREFIX}/anything/relatives").status_code == 503
+
+
+# ----------------------------------------------------------------- costs
+
+
+def test_the_padding_in_the_fixture_is_real(library):
+    """If the blob were thin, the test below would prove nothing."""
+    assert METADATA_PAD_BYTES >= 8_000
+    assert metadata_blob_size(library.db, library.ids.hub) >= 8_000
+
+
+def test_no_statement_this_module_issues_reads_a_json_blob(monkeypatch, library):
+    """Real rows carry ~34 KB of ``metadata_json``. One ``SELECT *`` over the
+    entries table is the difference between a fast route and a 13-second one,
+    and it is invisible in a test library of thin synthetic rows."""
+    client = _client(monkeypatch, library)
+    with _traced(monkeypatch, library) as statements:
+        client.get(f"{PREFIX}/summary")
+        client.get(f"{PREFIX}/rankings", params={"list": "most_derived"})
+        client.get(f"{PREFIX}/{library.ids.hub}/neighbourhood")
+        client.get(
+            f"{PREFIX}/{library.ids.hub}/relatives", params={"direction": "down"}
+        )
+
+    assert statements, "the trace callback saw nothing, so it proved nothing"
+    assert any("FROM relations" in s for s in statements), "the pass never ran"
+    for statement in statements:
+        lowered = " ".join(statement.lower().split())
+        assert "_json" not in lowered, f"reads a blob column: {statement}"
+        assert "select *" not in lowered, f"selects every column: {statement}"
+
+
+def test_the_per_song_routes_never_read_a_whole_table(monkeypatch, library):
+    """The cost rule, as an invariant rather than a stopwatch: one song's
+    routes touch ``entries`` and ``relations`` only through an indexed
+    filter. A whole-table read looks fine on a small test library and is the
+    13-second route on the user's."""
+    client = _client(monkeypatch, library)
+    with _traced(monkeypatch, library) as statements:
+        client.get(f"{PREFIX}/{library.ids.hub}/neighbourhood")
+        client.get(
+            f"{PREFIX}/{library.ids.hub}/relatives", params={"direction": "down"}
+        )
+
+    reads = [" ".join(statement.lower().split()) for statement in statements]
+    assert reads, "the trace callback saw nothing, so it proved nothing"
+    assert any("from relations" in sql for sql in reads), "no links were read"
+    assert any("from entries" in sql for sql in reads), "no entries were read"
+    for sql in reads:
+        if "from entries" in sql or "from relations" in sql:
+            assert " where " in sql, f"whole-table read: {sql}"
+
+
+def test_a_hub_neighbourhood_and_a_relatives_page_are_fast(monkeypatch, library):
+    """800 children is the real library's biggest fan. Both routes have to
+    stay indexed and page-sized."""
+    client = _client(monkeypatch, library)
+    neighbourhood = f"{PREFIX}/{library.ids.hub}/neighbourhood"
+    relatives = f"{PREFIX}/{library.ids.hub}/relatives"
+    client.get(neighbourhood)
+    client.get(relatives, params={"direction": "down"})
+
+    started = time.perf_counter()
+    assert client.get(neighbourhood).status_code == 200
+    neighbourhood_ms = (time.perf_counter() - started) * 1000
+
+    started = time.perf_counter()
+    assert client.get(relatives, params={"direction": "down"}).status_code == 200
+    relatives_ms = (time.perf_counter() - started) * 1000
+
+    assert neighbourhood_ms < 250, f"neighbourhood took {neighbourhood_ms:.0f} ms"
+    assert relatives_ms < 250, f"relatives took {relatives_ms:.0f} ms"
+
+
+def test_the_summary_is_computed_once_and_then_served_from_the_cache(
+    monkeypatch, library
+):
+    client = _client(monkeypatch, library)
+    started = time.perf_counter()
+    cold = client.get(f"{PREFIX}/summary")
+    cold_seconds = time.perf_counter() - started
+    assert cold.status_code == 200
+    assert cold_seconds < 3.0, f"first summary took {cold_seconds:.2f} s"
+
+    started = time.perf_counter()
+    warm = client.get(f"{PREFIX}/summary")
+    warm_ms = (time.perf_counter() - started) * 1000
+    assert warm.json() == cold.json()
+    assert warm_ms < 20, f"cached summary took {warm_ms:.0f} ms"
+
+
+def test_a_new_song_invalidates_the_cached_pass(monkeypatch, tmp_path):
+    """A library that changed must not keep answering with yesterday's
+    numbers, and one that did not must not pay for the pass again."""
+    fixture = build_small_library(tmp_path / "library.db")
+    try:
+        client = _client(monkeypatch, fixture)
+        before = client.get(f"{PREFIX}/summary").json()
+        assert before["entries"] == 4
+
+        fixture.db.upsert_entry({"id": "small-newcomer", "title": "newcomer"})
+        after = client.get(f"{PREFIX}/summary").json()
+        assert after["revision"] != before["revision"]
+        assert after["entries"] == 5
+        assert after["standalone"] == 2
+    finally:
+        fixture.close()
+
+
+# -------------------------------------------- the pass, and what wakes it
+
+
+def test_the_library_wide_pass_does_not_hold_the_app_write_lock(library):
+    """The pass reads every link -- 3.6 s on the real library. Taken on
+    ``LibraryDB``'s connection it holds that database's write lock for the
+    whole time and every write in the app queues behind it: a play-count
+    bump, a save, an import, the read-path write-through.
+
+    The lock is held here for real, by another thread, and released as soon
+    as the assertion has been made, so a regression is a failed assertion
+    rather than a hung test run.
+    """
+    lock = library.db._writelock  # noqa: SLF001 - the fixture's own lock
+    holding = threading.Event()
+    release = threading.Event()
+    result: dict[str, Any] = {}
+
+    def hold_the_lock() -> None:
+        with lock:
+            holding.set()
+            release.wait(60)
+
+    def run_the_pass() -> None:
+        # ``_summary_sync`` is exactly what the route awaits; calling it
+        # directly keeps the framework out of the measurement.
+        result["summary"] = lineage_router._summary_sync(library.db)
+
+    holder = threading.Thread(target=hold_the_lock, daemon=True)
+    holder.start()
+    assert holding.wait(10), "could not take the library write lock"
+
+    worker = threading.Thread(target=run_the_pass, daemon=True)
+    worker.start()
+    worker.join(timeout=20)
+    blocked = worker.is_alive()
+
+    release.set()
+    holder.join(10)
+    worker.join(30)
+
+    assert not blocked, "the pass waited for the library write lock"
+    assert result["summary"]["entries"] == library.expected["entries"]
+
+
+def test_the_pass_opens_its_own_connection_and_closes_it(tmp_path):
+    """An open handle keeps the file locked on Windows, so deleting it is
+    the proof there is no leak."""
+    path = tmp_path / "library.db"
+    fixture = build_small_library(path)
+    with lineage_router._Snapshot(fixture.db) as snap:
+        assert snap.isolated, "the pass should not be sharing the app connection"
+        assert lineage_router._link_signature(snap).entries == 4
+    assert lineage_router._summary_sync(fixture.db)["entries"] == 4
+    fixture.close()
+    path.unlink()
+    assert not path.exists()
+
+
+def test_a_database_that_cannot_be_opened_read_only_still_answers(
+    monkeypatch, tmp_path
+):
+    """The fallback is not decoration: an in-memory database in a test, or a
+    SQLite build that refuses read-only WAL, still has to get an answer."""
+    fixture = build_small_library(tmp_path / "library.db")
+    try:
+        monkeypatch.setattr(lineage_router, "_open_readonly", lambda db: None)
+        with lineage_router._Snapshot(fixture.db) as snap:
+            assert snap.isolated is False
+        assert lineage_router._summary_sync(fixture.db)["entries"] == 4
+    finally:
+        fixture.close()
+
+
+def test_a_play_count_or_a_title_edit_does_not_rerun_the_pass(monkeypatch, tmp_path):
+    """``library_revision`` moves on every write, so keying the cache on it
+    means a user pressing play with the landing page open pays a full pass
+    each time. The link graph did not change, so the numbers must not be
+    recomputed -- and the new title must still be on screen, because the
+    cache holds ids and counts and never a display column."""
+    fixture = build_small_library(tmp_path / "library.db")
+    try:
+        client = _client(monkeypatch, fixture)
+        client.get(f"{PREFIX}/rankings", params={"list": "most_derived"})
+        passes = lineage_router._stats_cache.passes
+        revision_before = fixture.db.library_revision()
+
+        fixture.db.increment_play_count("small-child")
+        fixture.db.upsert_entry({"id": "small-root", "title": "a brand new name"})
+        assert fixture.db.library_revision() > revision_before, (
+            "the library write counter must have moved, or this proves nothing"
+        )
+
+        body = client.get(f"{PREFIX}/rankings", params={"list": "most_derived"}).json()
+        assert lineage_router._stats_cache.passes == passes, "the pass ran again"
+        assert "a brand new name" in {row["title"] for row in body["rows"]}
+    finally:
+        fixture.close()
+
+
+def test_a_new_link_does_rerun_the_pass(monkeypatch, tmp_path):
+    fixture = build_small_library(tmp_path / "library.db")
+    try:
+        client = _client(monkeypatch, fixture)
+        first = client.get(f"{PREFIX}/summary").json()
+        passes = lineage_router._stats_cache.passes
+
+        fixture.db.add_relation(
+            from_id="small-solo", to_id="small-root", kind="cover_of"
+        )
+        second = client.get(f"{PREFIX}/summary").json()
+
+        assert lineage_router._stats_cache.passes == passes + 1
+        assert second["revision"] != first["revision"]
+        assert second["links_raw"] == first["links_raw"] + 1
+        assert second["standalone"] == 0
+    finally:
+        fixture.close()
+
+
+def test_two_first_calls_at_once_compute_once(library):
+    """Four threads arriving on a cold cache must not start four passes over
+    half a million links."""
+    lineage_router._stats_cache.clear()
+    passes = lineage_router._stats_cache.passes
+    answers: list[dict[str, Any]] = []
+    errors: list[BaseException] = []
+
+    def call() -> None:
+        try:
+            answers.append(lineage_router._summary_sync(library.db))
+        except BaseException as exc:  # noqa: BLE001 - re-raised through `errors`
+            errors.append(exc)
+
+    threads = [threading.Thread(target=call, daemon=True) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+        assert not thread.is_alive()
+
+    assert not errors, errors
+    assert lineage_router._stats_cache.passes == passes + 1
+    assert len(answers) == 4
+    assert all(answer == answers[0] for answer in answers)
+
+
+def test_the_link_signature_is_cheap(library):
+    """It runs on every request, so it has to be index lookups rather than a
+    second pass wearing a hat."""
+    with lineage_router._Snapshot(library.db) as snap:
+        plan = [
+            " ".join(str(part) for part in row)
+            for row in snap.read("EXPLAIN QUERY PLAN " + lineage_router._SIGNATURE_SQL)
+        ]
+        assert plan
+        for step in plan:
+            if "relations" in step or "entries" in step:
+                assert "INDEX" in step or "SEARCH" in step, step
+        lineage_router._link_signature(snap)
+        started = time.perf_counter()
+        for _ in range(5):
+            lineage_router._link_signature(snap)
+        each_ms = (time.perf_counter() - started) * 1000 / 5
+    assert each_ms < 5, f"the signature cost {each_ms:.2f} ms"
