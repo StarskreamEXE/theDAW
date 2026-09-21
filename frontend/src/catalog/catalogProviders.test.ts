@@ -81,6 +81,52 @@ import {
   assert.equal(inferProvider({ model: 'suno', source: 'import' }), 'suno');
 }
 
+// ── a Suno song known only by its `source` ────────────────────────────────────
+// The regression: a lineage node carries `source` and nothing else, and a song
+// promoted from a Suno cache has a `chirp-*` model, so neither the model string
+// nor a wire `provider` says "suno". Both used to fall through to Stable Audio.
+{
+  assert.equal(inferProvider({ source: 'suno' }), 'suno', 'a lineage node: source only');
+  assert.equal(inferProvider({ source: 'SUNO' }), 'suno', 'case-free, like the model arm');
+  assert.equal(inferProvider({ model: 'chirp-v4', source: 'suno' }), 'suno', 'a promoted cache song');
+  assert.equal(inferProvider({ model: '', source: 'suno' }), 'suno');
+  assert.equal(entryProviderMeta({ source: 'suno' }).label, 'Suno');
+  assert.equal(entryProviderIsAi({ source: 'suno' }), true);
+  // and it must not swallow its neighbours
+  assert.equal(inferProvider({ model: 'chirp-v4', source: 'import' }), 'import');
+  assert.equal(inferProvider({ model: 'chirp-v4', source: 'generate' }), 'stable-audio');
+}
+
+// ── parity with the backend's fallback (backend/modules/library/db.py, ────────
+// `infer_provider`, rules 2-7). The two are separate implementations of ONE
+// rule; this table is the same cases the Python parity test walks. If a rule is
+// added on one side, this fails until the other side has it.
+{
+  const cases: Array<[string | null, string | null, string]> = [
+    // model,            source,       expected
+    ['chirp-v4',         'suno',       'suno'],
+    ['suno-v3',          'generate',   'suno'],
+    ['sunoesque',        'import',     'suno'],
+    ['magenta-rt',       'generate',   'gemini-magenta'],
+    ['gemini-x',         'import',     'gemini-magenta'],
+    ['udio-1',           'import',     'udio'],
+    ['Udio v1.5',        'generate',   'udio'],
+    // "udio" inside "audio" is not Udio
+    ['stable-audio-3-medium', 'generate', 'stable-audio'],
+    ['audiocraft',       'import',     'import'],
+    ['audio-udio-blend', 'import',     'udio'],
+    ['riffusion',        'import',     'riffusion'],
+    ['imported',         'import',     'import'],
+    [null,               'import',     'import'],
+    ['stable-audio-3',   'generate',   'stable-audio'],
+    ['anything',         'studio',     'stable-audio'],
+    [null,               null,         'stable-audio'],
+  ];
+  for (const [model, source, want] of cases) {
+    assert.equal(inferProvider({ model, source }), want, `model=${model} source=${source}`);
+  }
+}
+
 // ── labels ───────────────────────────────────────────────────────────────────
 {
   assert.equal(entryProviderMeta({ model: 'sa3' }).label, 'Stable Audio', 'the table names a derived id');

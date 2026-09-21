@@ -122,9 +122,15 @@ export const inferProvider = (e: ProviderEntryFields): string => {
   const detected = trimmed(e.provider);
   if (detected) return detected;
   const hay = `${e.model ?? ''}`.toLowerCase();
-  if (hay === 'suno' || hay.includes('suno')) return 'suno';
+  // `source === 'suno'` is the backend's own legacy-Suno arm (db.py infer_provider,
+  // rule 2). It has to be here too: a promoted Suno song's model is `chirp-*`, not
+  // "suno", and a lineage node carries `source` and nothing else -- without this
+  // arm every Suno song in a lineage fell through to the Stable Audio default.
+  if (`${e.source ?? ''}`.toLowerCase() === 'suno' || hay.includes('suno')) return 'suno';
   if (hay.includes('magenta') || hay.includes('gemini')) return 'gemini-magenta';
-  if (hay.includes('udio')) return 'udio';
+  // "udio" must not be found inside "audio": `stable-audio-3` is not Udio. The
+  // backend strips the same word before it looks (db.py, the same rule).
+  if (hay.replace(/audio/g, '').includes('udio')) return 'udio';
   if (hay.includes('riffusion')) return 'riffusion';
   if (e.source === 'import') return 'import';
   // theDAW's native generations + studio renders are all Stable Audio.
