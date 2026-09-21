@@ -143,6 +143,10 @@ def run_analysis(entry_id: str) -> dict:
             entry_id,
             Path(audio_path),
             metadata_path=metadata_path,
+            # The store whose metadata lock the entry's other writers take:
+            # this runs on FastAPI's threadpool alongside user edits of the
+            # same entry, and metadata.json is the source of truth.
+            store=store,
         )
         return payload
     finally:

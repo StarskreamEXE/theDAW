@@ -10,6 +10,8 @@ from __future__ import annotations
 import pytest
 
 from backend.modules.library.provider import (
+    PROVIDER_RULES,
+    PROVIDER_SLUG_MAX,
     URL_KEY_PRIORITY,
     ProviderInfo,
     curated_fields,
@@ -618,3 +620,79 @@ def test_wire_fields_for_an_info():
         "provider_is_ai": True,
         "provider_id": SAMPLE_ID,
     }
+
+
+# --- the slug is bounded ----------------------------------------------------
+
+
+def test_a_multi_kilobyte_generator_yields_a_bounded_slug():
+    """An unrecognised ``generator`` frame becomes the entry's provider, and
+    that slug is then stored in metadata.json, copied into the
+    ``metadata_json`` column, returned on every listed row, and compared by
+    SQL. A frame holding kilobytes must not become kilobytes of identity."""
+    raw = "Unbounded Frame " * 320
+    assert len(raw) > 5000
+    info = detect_provider({"generator": raw})
+    assert info is not None
+    assert len(info.provider) <= PROVIDER_SLUG_MAX
+    # Truncation lands on a separator here; it is trimmed back off, so the
+    # slug reads as words and never ends in "-".
+    assert (
+        info.provider
+        == "unbounded-frame-unbounded-frame-unbounded-frame-unbounded-frame"
+    )
+    assert not info.provider.endswith("-")
+    # Only the slug is bounded here — the label is the raw value the file
+    # carried, which the store clips to its own PROVIDER_TEXT_MAX on write.
+    assert info.label == raw.strip()
+    assert info.confidence == "explicit"
+
+
+def test_a_bounded_slug_never_ends_in_a_separator():
+    # 64 chars of "a" then a separator then more: the cut is inside the word
+    # in one case and on the separator in the other. Neither may end in "-".
+    for filler in ("a" * 63, "a" * 64, "a" * 65, "ab " * 400):
+        info = detect_provider({"generator": f"{filler} Machine {'x' * 4000}"})
+        assert info is not None, filler
+        assert 0 < len(info.provider) <= PROVIDER_SLUG_MAX, filler
+        assert not info.provider.endswith("-"), filler
+        assert not info.provider.startswith("-"), filler
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "   ", "---", "!!!", "  ***  ", "///", "…", "™ ®"],
+)
+def test_an_all_punctuation_generator_is_no_provider(value: str):
+    """An empty slug means "this frame identifies nothing" — the passthrough
+    rule must yield None rather than a provider with an empty id."""
+    assert detect_provider({"generator": value}) is None
+
+
+def test_a_multi_kilobyte_stored_provider_is_bounded_too():
+    """The other place a slug is produced: a value already sitting in an
+    entry's metadata, which wins over every embedded signal."""
+    info = detect_provider({"generator": "suno"}, {"provider": "Runaway Value " * 400})
+    assert info is not None
+    assert 0 < len(info.provider) <= PROVIDER_SLUG_MAX
+    assert not info.provider.endswith("-")
+
+
+@pytest.mark.parametrize(
+    ("tags", "slug"),
+    [
+        ({"generator": "suno"}, "suno"),
+        ({"generator": "udio"}, "udio"),
+        ({"generator": "Harmony Forge 2"}, "harmony-forge-2"),
+        ({"album": "Suno AI"}, "suno"),
+    ],
+)
+def test_known_and_short_slugs_are_unaffected_by_the_bound(tags: dict, slug: str):
+    info = detect_provider(tags)
+    assert info is not None
+    assert info.provider == slug
+
+
+def test_every_table_slug_is_inside_the_bound():
+    for rule in PROVIDER_RULES:
+        assert 0 < len(rule.provider) <= PROVIDER_SLUG_MAX, rule.provider

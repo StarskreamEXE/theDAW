@@ -5,7 +5,9 @@ these tests cover the three places that answer is used:
 
 * the import paths, which store the label and the curated embedded fields,
 * the read path, which derives a label for entries that were imported long
-  before this feature existed -- without opening a single audio file,
+  before this feature existed -- without opening a single audio file -- and
+  persists that answer once, so the label and the SQL filter agree from then
+  on,
 * the list filter, which has to match a newly labeled entry and a legacy
   Suno entry with the same ``provider=suno``.
 
@@ -16,6 +18,8 @@ are invented for this file and name nothing in anyone's library.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -292,7 +296,8 @@ def test_bulk_reference_import_opens_no_source_file(tmp_path: Path, monkeypatch)
 def test_read_time_derivation_from_stored_embedded_tags(client_with_root, tmp_path):
     """No provider in metadata, no audio read: the label comes from the tags
     the analysis pass already stored. This is how the existing library is
-    labeled -- no backfill."""
+    labeled -- no backfill; the answer is persisted once, per returned row,
+    by the read that derived it (see the write-through section below)."""
     _seed_entry(tmp_path, "entry_derived", {"source": "import"})
     store = library_router_module.get_store()
     assert store.db is not None
@@ -586,3 +591,937 @@ def test_list_endpoint_filters_and_counts_by_provider(client_with_root, tmp_path
     empty = client_with_root.get("/api/library/entries?provider=udio").json()
     assert empty["entries"] == []
     assert empty["total"] == 0
+
+
+# ---- Read-time write-through -----------------------------------------------
+#
+# The label an entry is SHOWN with is derived in Python from the tag blob in
+# its analysis row; the ``provider=`` filter is SQL over the entry row alone.
+# Until the derived answer is stored, those two disagree about the same entry
+# forever and it answers to NO provider filter: not the slug it is shown under
+# (SQL does not return it) and not the slug SQL files it under (the catalogue
+# re-applies the filter to the rows it loaded and drops it). These cover the
+# write that ends the disagreement, and everything it must not do.
+
+#: The entry the defect was found on: a stock Suno MP3 imported long before
+#: labeling existed, so the row itself says "imported" / "import" and the only
+#: surviving evidence is the tag blob the analysis pass stored.
+STOCK_ID = "entry_stock_suno"
+
+
+def _stock_suno_embedded(tmp_path: Path) -> dict:
+    """The tag blob a stock Suno download leaves, straight out of the reader
+    rather than hand-written, so the fixture cannot invent a frame name."""
+    from backend.modules.library.tags import extract_embedded_tags
+
+    _suno_bytes(tmp_path, name="stock.mp3")
+    return extract_embedded_tags(tmp_path / "stock.mp3")
+
+
+def _seed_stock_suno(root: Path, entry_id: str = STOCK_ID) -> None:
+    _seed_entry(root, entry_id, {"source": "import", "model": "imported"})
+
+
+def _analyze_as_stock_suno(store: LibraryStore, tmp_path: Path, entry_id: str) -> None:
+    assert store.db is not None
+    store.db.upsert_analysis(
+        entry_id, {"embedded_tags": _stock_suno_embedded(tmp_path)}
+    )
+
+
+def _filtered(client: TestClient, slug: str) -> dict:
+    return client.get(f"/api/library/entries?provider={slug}&limit=50").json()
+
+
+@pytest.fixture
+def write_spy(monkeypatch) -> list[dict]:
+    """Every call the read path makes to the persistence, in order."""
+    calls: list[dict] = []
+    real = LibraryStore.record_detected_providers
+
+    def spy(self, detected):
+        calls.append(dict(detected))
+        return real(self, detected)
+
+    monkeypatch.setattr(LibraryStore, "record_detected_providers", spy)
+    return calls
+
+
+def test_a_stock_suno_import_becomes_findable_after_one_unfiltered_read(
+    client_with_root, tmp_path
+):
+    """The defect, end to end.
+
+    Before: the entry is shown as Suno and filed under ``import``, so
+    ``provider=suno`` cannot see it. One ordinary list read later it is filed
+    where it is shown, and only there."""
+    _seed_stock_suno(tmp_path)
+    store = library_router_module.get_store()
+    _analyze_as_stock_suno(store, tmp_path, STOCK_ID)
+
+    before_suno = _filtered(client_with_root, "suno")
+    before_import = _filtered(client_with_root, "import")
+    assert before_suno["total"] == 0
+    assert before_suno["entries"] == []
+    assert [e["id"] for e in before_import["entries"]] == [STOCK_ID]
+    # A filtered page shows rows as the filter filed them -- it does not
+    # relabel its own result set out from under the filter that chose it.
+    assert before_import["entries"][0]["provider"] == "import"
+    assert before_import["total"] == len(before_import["entries"]) == 1
+
+    listed = client_with_root.get("/api/library/entries?limit=50").json()
+    assert [e["provider"] for e in listed["entries"]] == ["suno"]
+
+    after_suno = _filtered(client_with_root, "suno")
+    after_import = _filtered(client_with_root, "import")
+    assert [e["id"] for e in after_suno["entries"]] == [STOCK_ID]
+    assert after_suno["total"] == len(after_suno["entries"]) == 1
+    assert after_suno["entries"][0]["provider_id"] == SUNO_ID
+    assert after_import["entries"] == []
+    assert after_import["total"] == 0
+
+
+def test_the_write_through_stores_the_wire_fields_and_why(client_with_root, tmp_path):
+    _seed_stock_suno(tmp_path)
+    store = library_router_module.get_store()
+    _analyze_as_stock_suno(store, tmp_path, STOCK_ID)
+    client_with_root.get("/api/library/entries?limit=50")
+
+    meta = _read_meta(store.root, STOCK_ID)
+    assert meta["provider"] == "suno"
+    assert meta["provider_label"] == "Suno"
+    assert meta["provider_is_ai"] is True
+    assert meta["provider_id"] == SUNO_ID
+    assert meta["provider_confidence"] == "explicit"
+    assert meta["provider_evidence"]
+    # Both copies of an entry's metadata agree; the column is what the SQL
+    # filter reads.
+    assert store.db is not None
+    row = store.db.get_entry(STOCK_ID)
+    assert row is not None
+    assert json.loads(row["metadata_json"])["provider"] == "suno"
+    # Import-time behaviour is NOT repeated here: no provider tag is added.
+    assert meta["tags"] == []
+
+
+def test_the_write_through_never_overwrites_a_stored_provider(
+    client_with_root, tmp_path
+):
+    _seed_entry(
+        tmp_path,
+        "entry_pinned_wt",
+        {
+            "source": "import",
+            "model": "imported",
+            "provider": "bandcamp",
+            "provider_label": "Bandcamp",
+            "provider_is_ai": False,
+        },
+    )
+    store = library_router_module.get_store()
+    _analyze_as_stock_suno(store, tmp_path, "entry_pinned_wt")
+
+    body = client_with_root.get("/api/library/entries?limit=50").json()
+
+    assert [e["provider"] for e in body["entries"]] == ["bandcamp"]
+    meta = _read_meta(store.root, "entry_pinned_wt")
+    assert meta["provider"] == "bandcamp"
+    assert "provider_evidence" not in meta
+    assert _filtered(client_with_root, "bandcamp")["total"] == 1
+
+
+def test_a_second_read_writes_nothing(client_with_root, tmp_path, write_spy):
+    _seed_stock_suno(tmp_path)
+    store = library_router_module.get_store()
+    _analyze_as_stock_suno(store, tmp_path, STOCK_ID)
+
+    client_with_root.get("/api/library/entries?limit=50")
+    assert [sorted(call) for call in write_spy] == [[STOCK_ID]]
+    path = store.root / STOCK_ID / "metadata.json"
+    raw = path.read_bytes()
+    mtime = path.stat().st_mtime_ns
+    assert store.db is not None
+    row_json = store.db.get_entry(STOCK_ID)["metadata_json"]
+
+    second = client_with_root.get("/api/library/entries?limit=50").json()
+
+    # The label is still right, and nothing was written to produce it: the
+    # persistence was not reached a second time at all.
+    assert [e["provider"] for e in second["entries"]] == ["suno"]
+    assert len(write_spy) == 1
+    assert path.read_bytes() == raw
+    assert path.stat().st_mtime_ns == mtime
+    assert store.db.get_entry(STOCK_ID)["metadata_json"] == row_json
+
+
+def test_the_write_through_is_not_a_user_edit(client_with_root, tmp_path, monkeypatch):
+    """``updated_at``, ``timestamp``, sort position, the user-edit write path
+    and the background queues: none of them may notice this."""
+    from backend.modules.library import store as store_module
+
+    _seed_entry(tmp_path, "aaa_before", {"source": "generate"})
+    _seed_stock_suno(tmp_path)
+    _seed_entry(tmp_path, "zzz_after", {"source": "generate"})
+    store = library_router_module.get_store()
+    assert store.db is not None
+    _analyze_as_stock_suno(store, tmp_path, STOCK_ID)
+
+    before_row = store.db.get_entry(STOCK_ID)
+    before_order = [
+        e["id"]
+        for e in client_with_root.get("/api/library/entries?limit=50").json()["entries"]
+    ]
+    before_meta = _read_meta(store.root, STOCK_ID)
+
+    enqueued: list[str] = []
+    for name in (
+        "_maybe_enqueue_analysis",
+        "_maybe_enqueue_stems",
+        "_maybe_enqueue_shards",
+        "_maybe_enqueue_midi",
+        "_maybe_enqueue_lyrics",
+        "_maybe_enqueue_score",
+    ):
+        monkeypatch.setattr(
+            store_module, name, lambda *a, _n=name, **k: enqueued.append(_n)
+        )
+    upserts: list[str] = []
+    monkeypatch.setattr(
+        type(store.db),
+        "upsert_entry",
+        lambda self, payload: upserts.append(str(payload.get("id"))),
+    )
+
+    # The read above already wrote for STOCK_ID, so a second untouched entry
+    # provides the write that happens with the spies installed.
+    _seed_stock_suno(tmp_path, "entry_stock_two")
+    store.db.upsert_entries_bulk(
+        [
+            {
+                "id": "entry_stock_two",
+                "source": "import",
+                "model": "imported",
+                "title": "entry_stock_two",
+                "metadata_json": _read_meta(store.root, "entry_stock_two"),
+            }
+        ]
+    )
+    _analyze_as_stock_suno(store, tmp_path, "entry_stock_two")
+    two_before = store.db.get_entry("entry_stock_two")
+    two_meta_before = _read_meta(store.root, "entry_stock_two")
+
+    after = client_with_root.get("/api/library/entries?limit=50").json()
+
+    # Nothing enqueued, and not one row went through the user-edit path.
+    assert enqueued == []
+    assert upserts == []
+    # The write added the provider keys and changed NOTHING else in the file:
+    # the entry's own timestamps are byte-identical.
+    two_meta_after = _read_meta(store.root, "entry_stock_two")
+    assert two_meta_after["provider"] == "suno"
+    assert {
+        k: v for k, v in two_meta_after.items() if not k.startswith("provider")
+    } == two_meta_before
+    # Neither row's DB timestamps moved.
+    two_after = store.db.get_entry("entry_stock_two")
+    assert two_after["updated_at"] == two_before["updated_at"]
+    assert two_after["timestamp"] == two_before["timestamp"]
+    assert store.db.get_entry(STOCK_ID)["updated_at"] == before_row["updated_at"]
+    assert _read_meta(store.root, STOCK_ID) == before_meta
+    # Sort position is unchanged for every entry that existed before.
+    assert [
+        e["id"] for e in after["entries"] if e["id"] in before_order
+    ] == before_order
+
+
+def test_a_failing_write_still_returns_the_labeled_response(
+    client_with_root, tmp_path, monkeypatch
+):
+    _seed_stock_suno(tmp_path)
+    store = library_router_module.get_store()
+    _analyze_as_stock_suno(store, tmp_path, STOCK_ID)
+
+    def boom(self, detected):
+        raise RuntimeError("read-only library")
+
+    monkeypatch.setattr(LibraryStore, "record_detected_providers", boom)
+
+    body = client_with_root.get("/api/library/entries?limit=50").json()
+    single = client_with_root.get(f"/api/library/entries/{STOCK_ID}").json()
+
+    assert [e["provider"] for e in body["entries"]] == ["suno"]
+    assert body["entries"][0]["provider_id"] == SUNO_ID
+    assert body["total"] == 1
+    assert single["provider"] == "suno"
+    # Degraded to exactly the old behaviour: derived every read, stored never.
+    assert "provider" not in _read_meta(store.root, STOCK_ID)
+
+
+def test_the_single_entry_read_writes_through_too(client_with_root, tmp_path):
+    _seed_stock_suno(tmp_path)
+    store = library_router_module.get_store()
+    _analyze_as_stock_suno(store, tmp_path, STOCK_ID)
+
+    assert _filtered(client_with_root, "suno")["total"] == 0
+    body = client_with_root.get(f"/api/library/entries/{STOCK_ID}").json()
+
+    assert body["provider"] == "suno"
+    assert _read_meta(store.root, STOCK_ID)["provider"] == "suno"
+    assert [e["id"] for e in _filtered(client_with_root, "suno")["entries"]] == [
+        STOCK_ID
+    ]
+
+
+def test_recording_the_same_detection_twice_is_a_no_op(tmp_path):
+    from backend.modules.library.provider import detect_provider
+
+    root = tmp_path / "lib"
+    root.mkdir(parents=True, exist_ok=True)
+    _seed_stock_suno(root)
+    store = LibraryStore(root)
+    info = detect_provider(_stock_suno_embedded(tmp_path), None)
+    assert info is not None
+    assert store.db is not None
+
+    assert store.record_detected_providers({STOCK_ID: info}) == 1
+    path = root / STOCK_ID / "metadata.json"
+    raw = path.read_bytes()
+    row_json = store.db.get_entry(STOCK_ID)["metadata_json"]
+
+    # Second time: the entry already carries an answer, so there is nothing
+    # left to write -- which is what makes two simultaneous readers safe.
+    assert store.record_detected_providers({STOCK_ID: info}) == 0
+    assert path.read_bytes() == raw
+    assert store.db.get_entry(STOCK_ID)["metadata_json"] == row_json
+    # An id with no entry folder is skipped, never invented.
+    assert store.record_detected_providers({"no_such_entry": info}) == 0
+    assert store.db.get_entry("no_such_entry") is None
+
+
+def test_two_concurrent_recorders_serialize_and_exactly_one_writes(tmp_path):
+    """The metadata lock makes the two orderings the only two outcomes.
+
+    Both threads ask to record the same detection for the same entry. The
+    lock serializes the whole read-merge-write-mirror of one entry, so the
+    second thread's never-overwrite check runs against what the first
+    already stored: one writes, one finds nothing to do, neither raises, and
+    the file is a complete document either way."""
+    from backend.modules.library.provider import detect_provider
+
+    root = tmp_path / "lib"
+    root.mkdir(parents=True, exist_ok=True)
+    _seed_stock_suno(root)
+    store = LibraryStore(root)
+    info = detect_provider(_stock_suno_embedded(tmp_path), None)
+    assert info is not None
+    assert store.db is not None
+
+    start = threading.Barrier(2)
+    errors: list[BaseException] = []
+    written: list[int] = []
+
+    def record() -> None:
+        start.wait(timeout=10)
+        try:
+            written.append(store.record_detected_providers({STOCK_ID: info}))
+        except BaseException as e:  # the assertion below is that there is none
+            errors.append(e)
+
+    threads = [threading.Thread(target=record) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert errors == []
+    # Exactly one write happened: the loser saw the winner's stored answer.
+    assert sorted(written) == [0, 1]
+    meta = _read_meta(root, STOCK_ID)
+    assert meta["provider"] == "suno"
+    assert meta["provider_id"] == SUNO_ID
+    stored = json.loads(store.db.get_entry(STOCK_ID)["metadata_json"])
+    assert stored["provider"] == "suno"
+
+
+def test_a_concurrent_user_edit_is_never_lost(tmp_path, monkeypatch):
+    """The lost update the lock exists to stop.
+
+    A user PATCH lands between the write-through's read and its write. Disk
+    is the source of truth, so an overwrite here is unrecoverable --
+    ``reindex()`` would copy the loss into the DB rather than repair it. The
+    write-through is held at the instant after its read; without the lock the
+    edit proceeds and is then overwritten by the stale copy, with it the edit
+    cannot start until the write-through is done. Either way BOTH the user's
+    fields and the provider keys must survive, on disk and in the column.
+    """
+    from backend.modules.library import store as store_module
+    from backend.modules.library.provider import detect_provider
+
+    root = tmp_path / "lib"
+    root.mkdir(parents=True, exist_ok=True)
+    _seed_stock_suno(root)
+    store = LibraryStore(root)
+    info = detect_provider(_stock_suno_embedded(tmp_path), None)
+    assert info is not None
+    assert store.db is not None
+
+    read_done = threading.Event()
+    edit_done = threading.Event()
+    real_read = store_module._read_metadata
+
+    def hooked_read(entry_dir):
+        meta = real_read(entry_dir)
+        if threading.current_thread().name == "write-through":
+            # Read taken. Give the editor every chance to get in front of
+            # the write that follows. Bounded, because when the lock works
+            # the editor is blocked and this wait must still end.
+            read_done.set()
+            edit_done.wait(timeout=2.0)
+        return meta
+
+    monkeypatch.setattr(store_module, "_read_metadata", hooked_read)
+
+    edit = {
+        "rating": "like",
+        "notes": "the user typed this",
+        "tags": ["mine"],
+        "lyrics": "the user pasted these words",
+    }
+    failures: list[BaseException] = []
+
+    def write_through() -> None:
+        try:
+            store.record_detected_providers({STOCK_ID: info})
+        except BaseException as e:
+            failures.append(e)
+
+    def user_edit() -> None:
+        try:
+            read_done.wait(timeout=5.0)
+            store.update_entry(STOCK_ID, dict(edit))
+        except BaseException as e:
+            failures.append(e)
+        finally:
+            edit_done.set()
+
+    threads = [
+        threading.Thread(target=write_through, name="write-through"),
+        threading.Thread(target=user_edit, name="editor"),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+    assert not any(t.is_alive() for t in threads)
+    assert failures == []
+
+    on_disk = _read_meta(root, STOCK_ID)
+    in_column = json.loads(store.db.get_entry(STOCK_ID)["metadata_json"])
+    for field, value in edit.items():
+        assert on_disk[field] == value, f"{field} lost on disk"
+        assert in_column[field] == value, f"{field} lost in metadata_json"
+    assert on_disk["provider"] == "suno"
+    assert in_column["provider"] == "suno"
+
+
+# ---- Atomic metadata writes ------------------------------------------------
+
+
+def _big_payload(marker: str) -> dict:
+    """A document too large to land in one filesystem write, so an
+    interleaved writer shows up as mixed bytes rather than a lucky atom."""
+    return {
+        "id": "shared_entry",
+        "title": marker,
+        "lyrics": marker * 6000,
+        "notes": marker * 3000,
+        "tags": [marker],
+    }
+
+
+def test_concurrent_metadata_writes_never_interleave(tmp_path):
+    """Two writers of one entry used to share ``metadata.json.tmp``: their
+    bytes mixed in that one file and the mixture was renamed over the real
+    one. A reader must only ever see one whole document or the other."""
+    from backend.modules.library import store as store_module
+
+    entry_dir = tmp_path / "entry"
+    entry_dir.mkdir(parents=True, exist_ok=True)
+    payloads = [_big_payload("a"), _big_payload("b")]
+    store_module._write_metadata(entry_dir, payloads[0])
+
+    stop = threading.Event()
+    problems: list[str] = []
+    wrote: list[int] = []
+
+    def writer(payload: dict) -> None:
+        for _ in range(60):
+            try:
+                store_module._write_metadata(entry_dir, payload)
+                wrote.append(1)
+            except PermissionError:
+                # Windows refuses a rename ONTO a file another thread has
+                # open, which the reader below is doing continuously. That
+                # is a sharing rule, not damage: the temp file is cleaned
+                # up and the document on disk is left whole. Pre-existing
+                # behaviour of this writer, and the read path swallows it.
+                pass
+            except BaseException as e:
+                problems.append(f"write failed: {type(e).__name__}: {e}")
+                return
+
+    def reader() -> None:
+        while not stop.is_set():
+            try:
+                seen = _read_meta(entry_dir.parent, "entry")
+            except json.JSONDecodeError as e:
+                problems.append(f"torn document: {e}")
+                return
+            except OSError:
+                # Windows can refuse the open during the rename itself;
+                # that is a sharing rule, not a damaged file.
+                continue
+            if seen not in payloads:
+                problems.append(f"mixed document: title={seen.get('title')!r}")
+                return
+
+    threads = [threading.Thread(target=writer, args=(p,)) for p in payloads]
+    watcher = threading.Thread(target=reader)
+    watcher.start()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    stop.set()
+    watcher.join(timeout=30)
+
+    assert problems == []
+    # Not vacuous: writes really did land while the reader was watching.
+    assert sum(wrote) > 0
+    assert _read_meta(entry_dir.parent, "entry") in payloads
+    # Every temp file is either renamed into place or removed.
+    assert list(entry_dir.glob("*.tmp")) == []
+
+
+def test_a_failed_metadata_write_leaves_no_orphan_temp_file(tmp_path, monkeypatch):
+    from backend.modules.library import store as store_module
+
+    entry_dir = tmp_path / "entry"
+    entry_dir.mkdir(parents=True, exist_ok=True)
+    store_module._write_metadata(entry_dir, {"id": "entry", "title": "before"})
+
+    def boom(self, target):
+        raise OSError("no rename for you")
+
+    monkeypatch.setattr(Path, "replace", boom)
+
+    with pytest.raises(OSError):
+        store_module._write_metadata(entry_dir, {"id": "entry", "title": "after"})
+
+    assert list(entry_dir.glob("*.tmp")) == []
+    assert _read_meta(tmp_path, "entry")["title"] == "before"
+
+
+# ---- What the write-through costs a client ---------------------------------
+
+
+def test_the_write_through_does_not_move_the_library_revision(
+    client_with_root, tmp_path
+):
+    """The revision means "your cached pages are stale". This write changes
+    no column a list shows, no tag, no index and no ordering, and the very
+    response that triggers it already carries the new label -- so firing it
+    would only make a first scroll throw its cache away. A real edit still
+    fires it."""
+    _seed_stock_suno(tmp_path)
+    store = library_router_module.get_store()
+    assert store.db is not None
+    _analyze_as_stock_suno(store, tmp_path, STOCK_ID)
+
+    before = store.db.library_revision()
+    body = client_with_root.get("/api/library/entries?limit=50").json()
+
+    assert [e["provider"] for e in body["entries"]] == ["suno"]
+    assert _read_meta(store.root, STOCK_ID)["provider"] == "suno"
+    assert store.db.library_revision() == before
+    assert body["revision"] == before
+
+    store.update_entry(STOCK_ID, {"notes": "a real edit"})
+    assert store.db.library_revision() > before
+
+
+def test_a_damaged_metadata_file_is_skipped_once_and_never_rewritten(
+    client_with_root, tmp_path, caplog
+):
+    _seed_stock_suno(tmp_path)
+    store = library_router_module.get_store()
+    assert store.db is not None
+    _analyze_as_stock_suno(store, tmp_path, STOCK_ID)
+    # Damaged AFTER the row exists: the list still returns it from the DB.
+    path = store.root / STOCK_ID / "metadata.json"
+    path.write_text('{"id": "entry_stock_suno", "tit', encoding="utf-8")
+    raw = path.read_bytes()
+
+    with caplog.at_level("WARNING"):
+        bodies = [
+            client_with_root.get("/api/library/entries?limit=50").json()
+            for _ in range(3)
+        ]
+
+    for body in bodies:
+        assert [e["id"] for e in body["entries"]] == [STOCK_ID]
+        # The label is still derived for display; only the storing is skipped.
+        assert body["entries"][0]["provider"] == "suno"
+    # Never rewritten from a guess, and never re-read after the first failure.
+    assert path.read_bytes() == raw
+    failed_reads = [r for r in caplog.records if "failed to read" in r.getMessage()]
+    assert len(failed_reads) == 1
+
+
+def test_a_huge_label_and_evidence_are_bounded_the_same_way_everywhere(
+    client_with_root, tmp_path
+):
+    """An unrecognised generator frame becomes the label verbatim and the
+    evidence quotes it. A multi-kilobyte frame must not end up in every list
+    response, nor forever in the metadata the provider filter scans."""
+    from backend.modules.library.store import PROVIDER_TEXT_MAX
+
+    _seed_entry(tmp_path, "entry_huge", {"source": "import", "model": "imported"})
+    store = library_router_module.get_store()
+    assert store.db is not None
+    store.db.upsert_analysis(
+        "entry_huge", {"embedded_tags": {"generator": "Obscure Tracker " * 400}}
+    )
+
+    body = client_with_root.get("/api/library/entries?limit=50").json()
+    shown = body["entries"][0]["provider_label"]
+    meta = _read_meta(store.root, "entry_huge")
+
+    assert 0 < len(shown) <= PROVIDER_TEXT_MAX
+    assert meta["provider_label"] == shown
+    assert 0 < len(meta["provider_evidence"]) <= PROVIDER_TEXT_MAX
+    # And the bound survives its own round trip: the label read back out of
+    # storage is the same string that was stored and shown, not a re-clipped
+    # or re-stripped near-miss.
+    again = client_with_root.get("/api/library/entries/entry_huge").json()
+    assert again["provider_label"] == shown
+    assert _read_meta(store.root, "entry_huge")["provider_label"] == shown
+
+
+def test_a_huge_slug_is_bounded_in_storage_and_on_the_wire(client_with_root, tmp_path):
+    """The slug is an identifier, not prose: it is compared in SQL, filed
+    under, sent as a query parameter and scanned by an ``instr`` on every
+    filtered list. A multi-kilobyte generator frame must not mint a
+    multi-kilobyte identifier."""
+    from backend.modules.library.store import PROVIDER_SLUG_MAX, _bounded_slug
+
+    # The boundary belt on its own: whatever reaches storage or the wire is
+    # bounded there too, not only where `provider.py` mints a slug -- a
+    # hand-edited metadata.json or a row from an older build goes through
+    # this and no other check.
+    assert _bounded_slug("obscure-tracker-" * 40) == _bounded_slug(
+        _bounded_slug("obscure-tracker-" * 40)
+    )
+    assert len(_bounded_slug("obscure-tracker-" * 40)) <= PROVIDER_SLUG_MAX
+    assert not _bounded_slug("obscure-tracker-" * 40).endswith("-")
+
+    _seed_entry(tmp_path, "entry_slug", {"source": "import", "model": "imported"})
+    store = library_router_module.get_store()
+    assert store.db is not None
+    store.db.upsert_analysis(
+        "entry_slug", {"embedded_tags": {"generator": "Obscure Tracker " * 400}}
+    )
+
+    body = client_with_root.get("/api/library/entries?limit=50").json()
+    slug = body["entries"][0]["provider"]
+    meta = _read_meta(store.root, "entry_slug")
+
+    assert 0 < len(slug) <= PROVIDER_SLUG_MAX
+    assert meta["provider"] == slug
+    # Still a slug after the cut: no dangling separator where it landed.
+    assert not slug.startswith("-") and not slug.endswith("-")
+    # Bounding an already-bounded slug changes nothing, so the same bound
+    # applied at the source produces the same string, not a second cut.
+    assert _bounded_slug(slug) == slug
+    # And the filter files it under exactly the slug it is shown with.
+    assert [e["id"] for e in _filtered(client_with_root, slug)["entries"]] == [
+        "entry_slug"
+    ]
+
+
+def test_a_slug_that_bounds_away_to_nothing_labels_nothing(tmp_path):
+    from backend.modules.library.provider import ProviderInfo
+    from backend.modules.library.store import (
+        bounded_provider_info,
+        bounded_provider_wire_fields,
+    )
+
+    void = ProviderInfo(
+        provider="---",
+        label="Nothing",
+        is_ai=False,
+        provider_id=None,
+        confidence="explicit",
+        evidence="generator=---",
+    )
+
+    assert bounded_provider_info(void) is None
+    assert bounded_provider_wire_fields(void) == {
+        "provider": None,
+        "provider_label": None,
+        "provider_is_ai": None,
+        "provider_id": None,
+    }
+
+
+# ---- A filtered page does not rewrite its own result set --------------------
+
+
+def test_a_provider_filtered_read_neither_relabels_nor_writes(
+    client_with_root, tmp_path, write_spy
+):
+    """Under an active provider filter the rows shown are the rows that
+    filter matched, labeled as SQL filed them. Relabeling them would show
+    rows the filter does not match, refile them out from under the user's
+    cursor mid-scroll, make ``total`` disagree with the rows it was counted
+    for, and skip entries at the next offset."""
+    _seed_stock_suno(tmp_path)
+    store = library_router_module.get_store()
+    _analyze_as_stock_suno(store, tmp_path, STOCK_ID)
+
+    filtered = _filtered(client_with_root, "import")
+
+    assert [e["id"] for e in filtered["entries"]] == [STOCK_ID]
+    assert filtered["entries"][0]["provider"] == "import"
+    assert filtered["total"] == len(filtered["entries"]) == 1
+    # Nothing was written, so the page a client caches stays the page the
+    # filter would return for it.
+    assert write_spy == []
+    assert "provider" not in _read_meta(store.root, STOCK_ID)
+    # The analysis itself is still attached; only the relabeling is skipped.
+    assert filtered["entries"][0]["embedded_tags"]["generator"] == "suno"
+
+    # An unfiltered read is what labels the library, and then the filters
+    # agree with the label.
+    client_with_root.get("/api/library/entries?limit=50")
+    assert _read_meta(store.root, STOCK_ID)["provider"] == "suno"
+    assert _filtered(client_with_root, "import")["entries"] == []
+    assert [e["id"] for e in _filtered(client_with_root, "suno")["entries"]] == [
+        STOCK_ID
+    ]
+
+
+# ---- Self-repair when only the mirror failed --------------------------------
+
+
+def test_a_failed_mirror_is_repaired_by_the_next_read(
+    client_with_root, tmp_path, monkeypatch, write_spy
+):
+    """The half-written row, and why it cannot be left alone.
+
+    The file write lands and the DB mirror fails: disk says "labeled", the
+    column does not, and the never-overwrite rule would make that permanent
+    -- no later read could repair the column, and the row would answer to no
+    provider filter for good. The next read mirrors the DISK dict instead.
+    """
+    _seed_stock_suno(tmp_path)
+    store = library_router_module.get_store()
+    assert store.db is not None
+    _analyze_as_stock_suno(store, tmp_path, STOCK_ID)
+
+    real_mirror = type(store.db).set_entry_metadata
+    calls: list[int] = []
+
+    def flaky(self, metadata_by_id):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("database is locked")
+        return real_mirror(self, metadata_by_id)
+
+    monkeypatch.setattr(type(store.db), "set_entry_metadata", flaky)
+
+    first = client_with_root.get("/api/library/entries?limit=50").json()
+    # Disk was labeled; the column was not, so the filter is still wrong.
+    assert first["entries"][0]["provider"] == "suno"
+    assert _read_meta(store.root, STOCK_ID)["provider"] == "suno"
+    assert (
+        json.loads(store.db.get_entry(STOCK_ID)["metadata_json"]).get("provider")
+        is None
+    )
+    assert _filtered(client_with_root, "suno")["total"] == 0
+
+    second = client_with_root.get("/api/library/entries?limit=50").json()
+
+    # Repaired from disk, which is the source of truth -- not re-merged.
+    assert second["entries"][0]["provider"] == "suno"
+    assert json.loads(store.db.get_entry(STOCK_ID)["metadata_json"])["provider"] == (
+        "suno"
+    )
+    assert [e["id"] for e in _filtered(client_with_root, "suno")["entries"]] == [
+        STOCK_ID
+    ]
+
+    # And now it is settled: the third read asks the store for nothing.
+    before = len(write_spy)
+    third = client_with_root.get("/api/library/entries?limit=50").json()
+    assert third["entries"][0]["provider"] == "suno"
+    assert len(write_spy) == before
+
+
+def test_a_different_stored_slug_is_never_touched_by_the_repair(tmp_path, monkeypatch):
+    """Somebody else's answer wins and costs nothing to keep winning."""
+    from backend.modules.library import store as store_module
+    from backend.modules.library.provider import detect_provider
+
+    root = tmp_path / "lib"
+    root.mkdir(parents=True, exist_ok=True)
+    _seed_entry(
+        root,
+        "entry_theirs",
+        {
+            "source": "import",
+            "model": "imported",
+            "provider": "bandcamp",
+            "provider_label": "Bandcamp",
+            "provider_is_ai": False,
+        },
+    )
+    store = LibraryStore(root)
+    info = detect_provider(_stock_suno_embedded(tmp_path), None)
+    assert info is not None
+    assert store.db is not None
+    before = (root / "entry_theirs" / "metadata.json").read_bytes()
+
+    assert store.record_detected_providers({"entry_theirs": info}) == 0
+    assert (root / "entry_theirs" / "metadata.json").read_bytes() == before
+    assert (
+        json.loads(store.db.get_entry("entry_theirs")["metadata_json"])["provider"]
+        == "bandcamp"
+    )
+
+    # Settled: a second call does not open the file at all.
+    reads: list[str] = []
+    real_checked = store_module._read_metadata_checked
+    monkeypatch.setattr(
+        store_module,
+        "_read_metadata_checked",
+        lambda d: (reads.append(str(d)), real_checked(d))[1],
+    )
+
+    assert store.record_detected_providers({"entry_theirs": info}) == 0
+    assert reads == []
+
+
+# ---- Transient vs durable failures -----------------------------------------
+
+
+def test_a_transient_read_error_is_not_memoized(tmp_path, monkeypatch):
+    """An OSError is a sharing violation, an antivirus pass, a drive
+    blinking -- it says nothing durable about the entry, so blacklisting it
+    for the life of the process would take a healthy track out of service."""
+    from backend.modules.library.provider import detect_provider
+
+    root = tmp_path / "lib"
+    root.mkdir(parents=True, exist_ok=True)
+    _seed_stock_suno(root)
+    store = LibraryStore(root)
+    info = detect_provider(_stock_suno_embedded(tmp_path), None)
+    assert info is not None
+
+    real_read_text = Path.read_text
+    fail_once = {"left": 1}
+
+    def flaky_read_text(self, *args, **kwargs):
+        if self.name == "metadata.json" and fail_once["left"]:
+            fail_once["left"] -= 1
+            raise OSError("temporarily unavailable")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky_read_text)
+
+    assert store.record_detected_providers({STOCK_ID: info}) == 0
+    assert store._unparsable_meta == {}
+    assert store._provider_settled == set()
+    # The very next call succeeds: nothing was remembered.
+    assert store.record_detected_providers({STOCK_ID: info}) == 1
+    assert _read_meta(root, STOCK_ID)["provider"] == "suno"
+
+
+def test_a_repaired_metadata_file_is_read_again(tmp_path):
+    """The damaged-file memo is keyed on the bytes it gave up on, so fixing
+    the file is enough -- no restart."""
+    from backend.modules.library.provider import detect_provider
+
+    root = tmp_path / "lib"
+    root.mkdir(parents=True, exist_ok=True)
+    _seed_stock_suno(root)
+    store = LibraryStore(root)
+    info = detect_provider(_stock_suno_embedded(tmp_path), None)
+    assert info is not None
+    good = (root / STOCK_ID / "metadata.json").read_bytes()
+
+    (root / STOCK_ID / "metadata.json").write_text('{"id": "trunc', encoding="utf-8")
+    assert store.record_detected_providers({STOCK_ID: info}) == 0
+    assert STOCK_ID in store._unparsable_meta
+
+    (root / STOCK_ID / "metadata.json").write_bytes(good)
+    assert store.record_detected_providers({STOCK_ID: info}) == 1
+    assert _read_meta(root, STOCK_ID)["provider"] == "suno"
+
+
+def test_a_read_only_library_is_not_re_attempted_every_request(tmp_path, monkeypatch):
+    """A full volume or a read-only library fails every row of every page.
+    Each entry is retried on a timer, not on every request."""
+    from backend.modules.library import store as store_module
+    from backend.modules.library.provider import detect_provider
+
+    root = tmp_path / "lib"
+    root.mkdir(parents=True, exist_ok=True)
+    _seed_stock_suno(root)
+    store = LibraryStore(root)
+    info = detect_provider(_stock_suno_embedded(tmp_path), None)
+    assert info is not None
+
+    attempts: list[int] = []
+    real_write = store_module._write_metadata
+
+    def refuse(entry_dir, payload):
+        attempts.append(1)
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(store_module, "_write_metadata", refuse)
+
+    for _ in range(5):
+        assert store.record_detected_providers({STOCK_ID: info}) == 0
+    assert len(attempts) == 1
+
+    # Once the retry window has passed, the entry is tried again -- and when
+    # the volume is writable again it simply works.
+    store._provider_write_failed[STOCK_ID] = (
+        time.monotonic() - store_module.PROVIDER_WRITE_RETRY_SECONDS - 1
+    )
+    monkeypatch.setattr(store_module, "_write_metadata", real_write)
+    assert store.record_detected_providers({STOCK_ID: info}) == 1
+    assert _read_meta(root, STOCK_ID)["provider"] == "suno"
+
+
+def test_a_detection_with_no_provider_id_keeps_the_one_the_entry_has(tmp_path):
+    """The merge must not erase a field by writing None over it."""
+    from backend.modules.library.provider import detect_provider
+
+    root = tmp_path / "lib"
+    root.mkdir(parents=True, exist_ok=True)
+    _seed_entry(
+        root,
+        "entry_keeps_id",
+        {"source": "import", "model": "imported", "provider_id": "kept-0001"},
+    )
+    store = LibraryStore(root)
+    # A generator frame with no id frame beside it: provider_id is None.
+    info = detect_provider({"generator": "udio"}, None)
+    assert info is not None and info.provider_id is None
+
+    assert store.record_detected_providers({"entry_keeps_id": info}) == 1
+    meta = _read_meta(root, "entry_keeps_id")
+    assert meta["provider"] == "udio"
+    assert meta["provider_id"] == "kept-0001"

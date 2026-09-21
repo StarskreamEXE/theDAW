@@ -27,7 +27,7 @@ import shutil
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Optional
 
@@ -38,7 +38,13 @@ from .db import (
     LibraryDB,
     derived_provider_wire,
 )
-from .provider import curated_fields, detect_provider, provider_wire_fields
+from .provider import (
+    PROVIDER_SLUG_MAX,
+    ProviderInfo,
+    curated_fields,
+    detect_provider,
+    provider_wire_fields,
+)
 from backend.lib import paths
 
 log = logging.getLogger(__name__)
@@ -295,22 +301,95 @@ def _is_entry_dir(path: Path) -> bool:
         return False
 
 
-def _read_metadata(entry_dir: Path) -> Optional[dict[str, Any]]:
+#: Why :func:`_read_metadata_checked` came back empty. ``""`` means it did
+#: not: the value is a real dict.
+META_READ_OK = ""
+META_READ_MISSING = "missing"
+#: The file could not be OPENED or read. Transient by nature -- on Windows a
+#: sharing violation during another writer's rename, an antivirus pass, a
+#: momentarily unavailable network drive -- so a caller must not conclude
+#: anything durable about the entry from it.
+META_READ_IO = "io"
+#: The file was read and is not JSON. That is a property of the bytes on disk
+#: and stays true until someone changes them.
+META_READ_PARSE = "parse"
+
+
+def _meta_stamp(entry_dir: Path) -> Optional[tuple[int, int]]:
+    """``(mtime_ns, size)`` of an entry's ``metadata.json``, or None.
+
+    The cheap identity of the bytes a previous read gave up on: a memo keyed
+    with this retries the moment the file is repaired, and costs one stat
+    rather than a full read plus a log line while it is not.
+    """
+    try:
+        st = _metadata_path(entry_dir).stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+def _read_metadata_checked(
+    entry_dir: Path,
+) -> tuple[Optional[dict[str, Any]], str]:
+    """:func:`_read_metadata`, plus WHY it failed.
+
+    Callers that remember a failure need to tell a damaged file (durable)
+    from a file they could not open this instant (transient); blacklisting
+    an entry for a sharing violation would take it out of service for the
+    life of the process. Returns one of the ``META_READ_*`` reasons.
+    """
     p = _metadata_path(entry_dir)
     if not p.is_file():
-        return None
+        return None, META_READ_MISSING
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
+        text = p.read_text(encoding="utf-8")
+    except OSError as e:
         log.warning("library.store: failed to read %s: %s", p, e)
-        return None
+        return None, META_READ_IO
+    try:
+        return json.loads(text), META_READ_OK
+    except json.JSONDecodeError as e:
+        log.warning("library.store: failed to read %s: %s", p, e)
+        return None, META_READ_PARSE
+
+
+def _read_metadata(entry_dir: Path) -> Optional[dict[str, Any]]:
+    return _read_metadata_checked(entry_dir)[0]
 
 
 def _write_metadata(entry_dir: Path, payload: dict[str, Any]) -> None:
+    """Write one entry's ``metadata.json`` atomically.
+
+    The temp file is UNIQUE per write, not the fixed ``metadata.json.tmp``
+    this used to reuse. Two writers of the same entry shared that one path:
+    both opened it, their bytes interleaved, and whichever finished second
+    renamed the mixture over the real file -- permanent corruption of the
+    title, tags, lyrics and prompt of an entry nobody was even editing. The
+    process id and thread id make the name readable in a directory listing
+    when something does go wrong; the random tail makes it unique regardless.
+    (``tags.write_cover_image`` names its temp file the same way, for the same
+    reason.)
+
+    The name stays in the entry's own directory so ``Path.replace`` is a
+    same-filesystem rename, which is atomic: a reader sees the old file or the
+    new one, never a partial write. A failed write takes its temp file with
+    it rather than leaving an orphan behind for the next backup or bundle to
+    pick up.
+    """
     p = _metadata_path(entry_dir)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    tmp.replace(p)
+    tmp = p.with_name(
+        f"{p.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}.tmp"
+    )
+    try:
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(p)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 # One table, because these two drifted apart: the folder importer accepted ten
@@ -366,15 +445,27 @@ def _resolve_audio_file(entry_dir: Path, meta: dict[str, Any]) -> Optional[Path]
 
 # ---- Provider labeling ------------------------------------------------------
 #
-# `provider.py` decides WHAT a track's provider is. The two helpers below are
-# the only places the library acts on that answer, so an entry labeled at
-# import and the same entry labeled while being read can never disagree.
+# `provider.py` decides WHAT a track's provider is. The helpers below are the
+# only places the library acts on that answer, so an entry labeled at import
+# and the same entry labeled while being read can never disagree.
 #
-# Neither one opens a file or reads another row. :func:`_apply_provider_labels`
-# runs once per imported entry, over tags its caller has already read;
-# :func:`_provider_wire` runs per entry on the read path, over the metadata
-# that entry already carries. That is what makes labeling the existing library
-# free: no backfill pass, no re-analysis, nothing re-read from disk.
+# Neither derivation opens a file or reads another row.
+# :func:`_apply_provider_labels` runs once per imported entry, over tags its
+# caller has already read; :func:`_provider_wire` runs per entry on the read
+# path, over the metadata that entry already carries. That is what makes
+# labeling the existing library free: no backfill pass, no re-analysis, no
+# audio re-read.
+#
+# Derivation alone was not enough, because two things have to agree about one
+# entry: the label it is SHOWN with (Python, here) and the slug the list filter
+# FILES it under (:data:`~.db.PROVIDER_SQL`, which sees only the entry's own
+# row). An entry whose sole evidence is the tag blob in its analysis row was
+# shown as "suno" and filed under "import", so it answered to no provider
+# filter at all. :meth:`LibraryStore.record_detected_providers` closes that:
+# the FIRST read that derives a better answer writes it into the entry's
+# metadata -- once, never overwriting, metadata only -- and from then on rule 1
+# of PROVIDER_SQL files the row under the slug it is shown with. Still no
+# backfill: only rows a request was already returning are ever touched.
 
 #: Curated embedded fields that fill one of the entry's OWN fields when the
 #: caller left it empty.
@@ -398,6 +489,100 @@ _CURATED_EXTRA_FIELDS: tuple[str, ...] = (
     "parent_id",
     "is_instrumental",
 )
+
+
+#: Ceiling on the free text a provider answer may carry: the display label and
+#: the evidence that decided it. Both can come straight out of an arbitrary
+#: embedded frame of an imported file -- an unrecognised ``generator`` value
+#: becomes its own label, and the evidence quotes the frame that named it -- so
+#: a file with a multi-kilobyte tag would otherwise put that text in every list
+#: response, in ``metadata.json`` forever, and in the ``metadata_json`` column
+#: that PROVIDER_SQL's ``instr`` scans on every filtered list. 200 characters is
+#: far more than any real provider name or frame needs.
+PROVIDER_TEXT_MAX = 200
+
+
+#: How long a provider write-through failure keeps an entry out of the way.
+#: Long enough that a read-only library costs nothing per request, short
+#: enough that remounting the volume repairs itself without a restart.
+PROVIDER_WRITE_RETRY_SECONDS = 300.0
+
+#: Ceiling on the provider SLUG -- ``provider.PROVIDER_SLUG_MAX``, imported
+#: rather than restated so the two bounds cannot drift apart. Unlike the label
+#: this is an identifier: it is compared in SQL, filed under, sent as a query
+#: parameter and stored in a column an ``instr`` scans. An unrecognised
+#: generator frame becomes its own slug, so without a bound a file with a
+#: multi-kilobyte frame would mint a multi-kilobyte identifier.
+#:
+#: ``provider.py`` applies this at the SOURCE, where a slug is minted. The
+#: bound here is the boundary check: every value that reaches storage or the
+#: wire passes through :func:`bounded_provider_info`, including one that
+#: arrived some other way -- a hand-edited ``metadata.json``, a row written by
+#: an older build. Both spell the same rule, and it is idempotent, so applying
+#: both is applying it once.
+
+
+def _bounded_text(value: Any) -> Any:
+    """One free-text provider field, clipped to :data:`PROVIDER_TEXT_MAX`.
+    Non-strings (None) pass through untouched.
+
+    The clip is stripped, because the cut can land mid-word and leave a
+    trailing space: ``provider._text`` strips whatever it reads back, so an
+    unstripped clip would be stored one way and shown another the next time
+    the entry is read. Clipping to a form that survives its own round trip is
+    what makes stored and shown the same string.
+    """
+    if isinstance(value, str) and len(value) > PROVIDER_TEXT_MAX:
+        return value[:PROVIDER_TEXT_MAX].strip()
+    return value
+
+
+def _bounded_slug(value: str) -> str:
+    """A provider slug clipped to :data:`PROVIDER_SLUG_MAX`, still a slug.
+
+    The cut can land on a separator (``obscure-tracker-``), which is not a
+    slug any other code would produce, so the separators are stripped off the
+    ends afterwards. Idempotent -- clipping an already-clipped slug returns
+    it unchanged -- which is what lets this coexist with the same bound
+    applied at the source in ``provider.py`` without the two disagreeing.
+    """
+    slug = value.strip().lower()
+    if len(slug) > PROVIDER_SLUG_MAX:
+        slug = slug[:PROVIDER_SLUG_MAX]
+    return slug.strip("-")
+
+
+def bounded_provider_info(info: Optional[ProviderInfo]) -> Optional[ProviderInfo]:
+    """One detection with every free-text field bounded, or None.
+
+    The ONE place a provider answer is bounded, so the slug filed in SQL, the
+    label shown in a list row and the values written to ``metadata.json`` are
+    always the same strings. Returns None when the slug bounds away to
+    nothing -- a detection with no usable identifier is not an answer, and
+    must upgrade neither the wire nor the stored metadata.
+    """
+    if info is None:
+        return None
+    slug = _bounded_slug(info.provider)
+    if not slug:
+        return None
+    return replace(
+        info,
+        provider=slug,
+        label=_bounded_text(info.label),
+        evidence=_bounded_text(info.evidence),
+    )
+
+
+def bounded_provider_wire_fields(info: Optional[ProviderInfo]) -> dict[str, Any]:
+    """:func:`~.provider.provider_wire_fields` over a bounded detection.
+
+    Every path that SHOWS or STORES a provider answer goes through this one
+    function -- the import labeler, the read-path derivation, the write-through
+    and the router -- so the slug and label in an entry's metadata and the slug
+    and label in the response are always the same strings.
+    """
+    return provider_wire_fields(bounded_provider_info(info))
 
 
 def _is_unset(value: Any) -> bool:
@@ -426,10 +611,13 @@ def _apply_provider_labels(
     Shared by every import path, so a track uploaded through ``import_blob``
     and the same track registered in place come out labeled identically.
     """
-    info = detect_provider(embedded, record_meta)
+    # Bounded up front, so the slug stored, the slug tagged and the slug on
+    # the wire are one string -- and a detection whose slug bounds away to
+    # nothing labels nothing at all.
+    info = bounded_provider_info(detect_provider(embedded, record_meta))
     if info is None:
         return
-    record_meta.update(provider_wire_fields(info))
+    record_meta.update(bounded_provider_wire_fields(info))
 
     curated = curated_fields(embedded, info)
     for name in _CURATED_ENTRY_FIELDS:
@@ -477,12 +665,36 @@ def _provider_wire(
     row_source = str(meta.get("source") or source or "")
     if source and not meta.get("source"):
         meta = {**meta, "source": source}
-    info = detect_provider({}, meta)
+    info = bounded_provider_info(detect_provider({}, meta))
     if info is not None:
-        return provider_wire_fields(info)
+        return bounded_provider_wire_fields(info)
     return derived_provider_wire(
         str(meta.get("model") or model or ""), row_source, meta.get("suno_id")
     )
+
+
+def _detected_provider_meta(info: ProviderInfo) -> dict[str, Any]:
+    """What a read-time detection leaves in an entry's metadata.
+
+    The four wire fields exactly as :func:`~.provider.provider_wire_fields`
+    produced them -- so the label the row is shown with and the label stored
+    for :data:`~.db.PROVIDER_SQL` are the same four values, not two
+    independently computed ones -- plus how the answer was reached, which
+    matters once a slug can come from a uuid frame or from a domain in a
+    comment. Nothing else: no tag, no timestamp, no curated field. Import-time
+    behaviour (:func:`_apply_provider_labels`) is where those belong.
+
+    Keys whose value is None are DROPPED rather than written. This dict is
+    merged over an entry's stored metadata, and a detection that could not
+    find a provider id ("no answer") must not erase one the entry already
+    has: absent means absent, not "known to be nothing".
+    """
+    fields = {
+        **bounded_provider_wire_fields(info),
+        "provider_confidence": info.confidence,
+        "provider_evidence": _bounded_text(info.evidence),
+    }
+    return {k: v for k, v in fields.items() if v is not None}
 
 
 def _flatten_suno_meta(meta: dict[str, Any]) -> dict[str, Any]:
@@ -1099,6 +1311,53 @@ class LibraryStore:
         #: than one per request. See :meth:`get_cover_path`.
         self._cover_attempts: set[str] = set()
 
+        #: Serializes read-modify-write of any entry's ``metadata.json``.
+        #:
+        #: Every library endpoint is a sync ``def``, so FastAPI runs them
+        #: concurrently on its threadpool, and the writers here are all
+        #: read -> mutate -> write of a whole JSON document. Unlocked, a user
+        #: PATCH that lands between another writer's read and write is
+        #: overwritten ON DISK by the stale copy -- and disk is the source of
+        #: truth, so ``reindex()`` cannot repair it; it would faithfully copy
+        #: the loss into the DB. An ``RLock`` because these calls nest
+        #: (:meth:`update_entry` re-reads through :meth:`get_entry` while
+        #: holding it).
+        #:
+        #: LOCK ORDER: this lock is always taken BEFORE ``LibraryDB._writelock``
+        #: (a holder may call :meth:`_sync_record_to_db` or
+        #: :meth:`~.db.LibraryDB.set_entry_metadata` inside its critical
+        #: section) and never the other way round -- ``db.py`` imports nothing
+        #: from this module and holds no reference to a store, so no DB call
+        #: can call back in here and invert the order. Background job enqueues
+        #: stay OUTSIDE the critical section.
+        self._meta_lock = threading.RLock()
+
+        #: Entry id -> the ``(mtime_ns, size)`` of the ``metadata.json`` that
+        #: would not PARSE. A damaged file is skipped rather than rewritten,
+        #: and remembering it keeps that skip from costing a failed read and a
+        #: log line on every subsequent request. Keyed on the file's stamp, not
+        #: just the id, so a repaired file is picked up on the next read
+        #: instead of staying blacklisted for the life of the process -- and
+        #: only ever written for a PARSE failure: an OSError here is a sharing
+        #: violation during another writer's rename, an antivirus pass, a
+        #: network drive blinking, and says nothing durable about the entry.
+        self._unparsable_meta: dict[str, tuple[int, int]] = {}
+
+        #: Entry id -> the monotonic time its provider write LAST failed with
+        #: an OSError. A read-only library or a full volume fails every row of
+        #: every page; without this, each list request would re-attempt up to
+        #: 500 doomed file writes. Retried after
+        #: :data:`PROVIDER_WRITE_RETRY_SECONDS` so the entry recovers on its
+        #: own once the volume is writable again.
+        self._provider_write_failed: dict[str, float] = {}
+
+        #: Entry ids whose provider question is settled for this process: the
+        #: stored answer is already right, or it is somebody else's answer and
+        #: will never be touched. Checked before anything is read from disk, so
+        #: a row the read path keeps re-deriving costs nothing after the first
+        #: look.
+        self._provider_settled: set[str] = set()
+
     # ---- Read ---------------------------------------------------------------
 
     def _iter_disk_entries(
@@ -1321,37 +1580,41 @@ class LibraryStore:
         entry_dir = self._dir_for(entry_id)
         if entry_dir is None:
             return None
-        meta = _read_metadata(entry_dir)
-        if meta is None:
-            return None
-        for key in USER_MUTABLE_FIELDS:
-            if key not in patch:
-                continue
-            meta[key] = patch[key]
-        # Sanitize types we expose.
-        if "favorite" in meta:
-            meta["favorite"] = bool(meta["favorite"])
-        if "tags" in meta:
-            meta["tags"] = [str(t) for t in (meta["tags"] or [])]
-        if "notes" in meta:
-            meta["notes"] = str(meta["notes"] or "")
-        if "lyrics" in meta:
-            meta["lyrics"] = str(meta["lyrics"] or "")
-        if "notation_artist" in meta:
-            meta["notation_artist"] = str(meta["notation_artist"] or "")
-        if "notation_title" in meta:
-            meta["notation_title"] = str(meta["notation_title"] or "")
-        if "chimera_sources" in meta:
-            raw = meta["chimera_sources"] or []
-            if not isinstance(raw, list):
-                raw = []
-            meta["chimera_sources"] = [str(s) for s in raw]
-        if meta.get("rating") not in ("like", "dislike", None):
-            meta["rating"] = None
-        _write_metadata(entry_dir, meta)
-        record = self.get_entry(entry_id)
-        if record is not None:
-            self._sync_record_to_db(record, meta)
+        # One writer at a time per entry, across the WHOLE read-modify-write:
+        # this edit must not be built on a copy another writer is about to
+        # replace, and must not be replaced by one. See `_meta_lock`.
+        with self._meta_lock:
+            meta = _read_metadata(entry_dir)
+            if meta is None:
+                return None
+            for key in USER_MUTABLE_FIELDS:
+                if key not in patch:
+                    continue
+                meta[key] = patch[key]
+            # Sanitize types we expose.
+            if "favorite" in meta:
+                meta["favorite"] = bool(meta["favorite"])
+            if "tags" in meta:
+                meta["tags"] = [str(t) for t in (meta["tags"] or [])]
+            if "notes" in meta:
+                meta["notes"] = str(meta["notes"] or "")
+            if "lyrics" in meta:
+                meta["lyrics"] = str(meta["lyrics"] or "")
+            if "notation_artist" in meta:
+                meta["notation_artist"] = str(meta["notation_artist"] or "")
+            if "notation_title" in meta:
+                meta["notation_title"] = str(meta["notation_title"] or "")
+            if "chimera_sources" in meta:
+                raw = meta["chimera_sources"] or []
+                if not isinstance(raw, list):
+                    raw = []
+                meta["chimera_sources"] = [str(s) for s in raw]
+            if meta.get("rating") not in ("like", "dislike", None):
+                meta["rating"] = None
+            _write_metadata(entry_dir, meta)
+            record = self.get_entry(entry_id)
+            if record is not None:
+                self._sync_record_to_db(record, meta)
         # Favoriting a track gives it the full treatment — stems, MIDI, and a
         # score — so a starred track is always fully analyzed and notated. Each
         # job is idempotent (skipped if the artifact exists) and runs on the
@@ -1362,6 +1625,170 @@ class LibraryStore:
             _maybe_enqueue_midi(self, entry_id, source="favorite", force=True)
             _maybe_enqueue_score(self, entry_id, source="favorite", force=True)
         return record
+
+    def record_detected_providers(self, detected: Mapping[str, ProviderInfo]) -> int:
+        """Persist a provider the READ path worked out, once, per entry.
+
+        Sits beside :meth:`update_entry` rather than inside it because this is
+        not an edit and must not look like one. A user PATCH rewrites columns
+        through ``upsert_entry`` (moving ``updated_at``), rebuilds the tag and
+        search indexes, and can enqueue stems/lyrics/midi/score. None of that
+        happens here: the entry's ``metadata.json`` gains the ``provider*``
+        keys and :meth:`~.db.LibraryDB.set_entry_metadata` writes the same
+        dict into the row's ``metadata_json`` column, so the two copies of an
+        entry's metadata stay in agreement and nothing else moves. No job is
+        enqueued, no notification is fired, ``timestamp`` is untouched, and no
+        sort order can notice.
+
+        Why it exists: the label an entry is SHOWN with is derived in Python
+        from its analysis row's tag blob, while the ``provider=`` list filter
+        is SQL over the entry row alone (:data:`~.db.PROVIDER_SQL`). Until the
+        derived answer is stored, those two disagree forever and the entry
+        answers to no provider filter. Writing it once ends the disagreement.
+
+        Bounded and idempotent:
+
+        * only the ids the caller passes -- the rows a request was already
+          returning -- are considered; nothing here searches for candidates,
+        * an entry whose stored metadata already names a provider is skipped,
+          so the user's answer, the importer's answer, and this method's own
+          answer from an earlier read are all safe, and a second call for the
+          same entry writes nothing,
+        * a REFERENCE-IN-PLACE entry keeps its source file untouched: the only
+          file written is ``metadata.json`` inside the entry's own folder
+          under the library root, and there is no code path here that reads
+          ``source_path``,
+        * an entry whose ``metadata.json`` cannot be PARSED is skipped and
+          remembered against that file's stamp, so a damaged file is never
+          rewritten from a guess, is not re-read on the next request, and is
+          picked up again the moment it is repaired. An entry that merely
+          could not be OPENED this instant is skipped and NOT remembered,
+        * an entry whose file write fails keeps its place for
+          :data:`PROVIDER_WRITE_RETRY_SECONDS` before being tried again, so a
+          read-only library costs one attempt per row per five minutes rather
+          than one per row per request.
+
+        The DB mirror is one small transaction PER ENTRY rather than one per
+        batch. That is deliberate: batching it outside the per-entry lock is
+        what would let two threads update one row's column out of order, and
+        the writes are tiny -- no revision bump, no index, no tag rebuild.
+
+        Concurrency: ``_meta_lock`` is held across ONE entry's read, merge,
+        file write and DB mirror, and released before the next -- so a
+        500-row first view can never hold a user's PATCH off for the length
+        of a batch, and the never-overwrite test is made on the read INSIDE
+        the lock rather than on an earlier snapshot. The DB mirror sits in
+        the same critical section as the file write so the two copies of one
+        entry's metadata cannot be updated out of order by two threads.
+
+        Returns how many entries were written. Per-entry filesystem failures
+        are counted and reported once at debug level, never per row; the
+        caller (a read) swallows the rest, so a read-only library or a locked
+        database costs nothing but today's behaviour.
+        """
+        if not detected:
+            return 0
+        written = 0
+        failed = 0
+        now = time.monotonic()
+        for entry_id, info in detected.items():
+            if info is None or entry_id in self._provider_settled:
+                continue
+            last_failure = self._provider_write_failed.get(entry_id)
+            if last_failure is not None:
+                if now - last_failure < PROVIDER_WRITE_RETRY_SECONDS:
+                    continue
+                del self._provider_write_failed[entry_id]
+            entry_dir = self._dir_for(entry_id)
+            if entry_dir is None:
+                continue
+            if self._unparsable_meta.get(entry_id) == _meta_stamp(entry_dir):
+                # Same damaged bytes as last time: one stat, no read, no log.
+                continue
+            with self._meta_lock:
+                stamp = _meta_stamp(entry_dir)
+                meta, why = _read_metadata_checked(entry_dir)
+                if meta is None:
+                    if why == META_READ_PARSE and stamp is not None:
+                        # Damaged: remembered against THESE bytes, so a
+                        # repaired file is read again rather than blacklisted.
+                        self._unparsable_meta[entry_id] = stamp
+                    # An IO error says nothing durable -- never memoized.
+                    continue
+                stored = meta.get("provider")
+                if not _is_unset(stored):
+                    if not self._mirror_settled_provider(entry_id, meta, stored, info):
+                        failed += 1
+                    continue
+                merged = {**meta, **_detected_provider_meta(info)}
+                try:
+                    _write_metadata(entry_dir, merged)
+                except OSError:
+                    self._provider_write_failed[entry_id] = now
+                    failed += 1
+                    continue
+                # The durable copy is written; the entry counts as recorded.
+                written += 1
+                # Disk first, then the mirror, both inside the lock -- the
+                # order update_entry uses. If the mirror fails the row is
+                # labeled on disk and not yet in the column, which the NEXT
+                # read repairs (see _mirror_settled_provider).
+                if not self._mirror_metadata(entry_id, merged):
+                    failed += 1
+        if failed:
+            log.debug(
+                "library.store: could not record a detected provider for %d entries",
+                failed,
+            )
+        return written
+
+    def _mirror_metadata(self, entry_id: str, meta: dict[str, Any]) -> bool:
+        """Copy one entry's metadata into its ``metadata_json`` column.
+
+        Its own try/except, because the mirror of ONE row failing must not
+        abort the rest of a page: the next row's disk write is independent and
+        should still happen. Returns whether the column now matches disk.
+        """
+        if self.db is None:
+            return True
+        try:
+            self.db.set_entry_metadata({entry_id: meta})
+        except Exception as e:
+            log.debug("library.store: metadata mirror failed for %s: %s", entry_id, e)
+            return False
+        return True
+
+    def _mirror_settled_provider(
+        self,
+        entry_id: str,
+        meta: dict[str, Any],
+        stored: Any,
+        info: ProviderInfo,
+    ) -> bool:
+        """Handle an entry whose DISK metadata already names a provider.
+
+        Two cases, and the difference matters:
+
+        * The stored slug IS what was just detected. Then the only reason the
+          read path keeps deriving it is that the ``metadata_json`` COLUMN is
+          behind -- an earlier mirror failed after its file write, and the
+          never-overwrite rule would otherwise make that permanent: disk says
+          "labeled", so no later read could ever repair the column, and the
+          row would answer to no provider filter for good. The disk dict is
+          mirrored as-is (never a fresh merge -- disk is the source of truth)
+          to close the gap.
+        * The stored slug is something ELSE. That is a real answer, the
+          user's or an importer's, and it wins. Nothing is written, ever.
+
+        Either way the entry is settled for this process, so no later request
+        reads its file again -- including when the repair itself fails, which
+        is one attempt per process by design and otherwise waits for a restart
+        or a ``reindex()``. Returns whether the column is in agreement.
+        """
+        self._provider_settled.add(entry_id)
+        if str(stored).strip().lower() != info.provider.strip().lower():
+            return True
+        return self._mirror_metadata(entry_id, meta)
 
     def delete_entry(self, entry_id: str) -> bool:
         entry_dir = self._dir_for(entry_id)
@@ -1537,7 +1964,11 @@ class LibraryStore:
         # Who made this, and the fields of the file that describe the SONG.
         # `source` above is untouched: an import stays an import.
         _apply_provider_labels(record_meta, embedded, meta_in)
-        _write_metadata(entry_dir, record_meta)
+        # New entry id: nothing else can be mid-write on this
+        # file. Locked anyway, so that EVERY metadata.json write
+        # in this module happens under the lock.
+        with self._meta_lock:
+            _write_metadata(entry_dir, record_meta)
         record = _record_from_metadata(entry_dir, record_meta, self.api_prefix)
         assert record is not None, "freshly imported entry must resolve"
         record.id = entry_id
@@ -1590,7 +2021,11 @@ class LibraryStore:
         # folder import runs this per file — a track with no picture costs a
         # tag read, and one with a picture pays the normalise it needs.
         extract_cover_for(entry_dir, src)
-        _write_metadata(entry_dir, record_meta)
+        # New entry id: nothing else can be mid-write on this
+        # file. Locked anyway, so that EVERY metadata.json write
+        # in this module happens under the lock.
+        with self._meta_lock:
+            _write_metadata(entry_dir, record_meta)
         record = _record_from_metadata(entry_dir, record_meta, self.api_prefix)
         if record is None:
             return None
@@ -1684,7 +2119,11 @@ class LibraryStore:
                 )
                 if extract_covers:
                     extract_cover_for(entry_dir, src)
-                _write_metadata(entry_dir, record_meta)
+                # New entry id: nothing else can be mid-write on this
+                # file. Locked anyway, so that EVERY metadata.json write
+                # in this module happens under the lock.
+                with self._meta_lock:
+                    _write_metadata(entry_dir, record_meta)
                 record = _record_from_metadata(entry_dir, record_meta, self.api_prefix)
                 if record is None:
                     result.note_failure(f"unreadable after registering: {src}")
@@ -1802,7 +2241,11 @@ class LibraryStore:
             "saved_at": time.time(),
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
-        _write_metadata(entry_dir, record_meta)
+        # New entry id: nothing else can be mid-write on this
+        # file. Locked anyway, so that EVERY metadata.json write
+        # in this module happens under the lock.
+        with self._meta_lock:
+            _write_metadata(entry_dir, record_meta)
         record = _media_record_from_metadata(
             entry_dir, record_meta, self.api_prefix, kind
         )

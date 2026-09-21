@@ -230,6 +230,9 @@ async def ensure_shards(entry_id: str, *, force: bool = False) -> list[dict[str,
                 entry_id,
                 audio,
                 metadata_path=entry_dir / "metadata.json",
+                # The store whose metadata lock guards that file against the
+                # user editing the same entry while this runs.
+                store=_library(),
             )
         return await asyncio.to_thread(extract_shards, db, entry_id, audio, entry_dir)
 

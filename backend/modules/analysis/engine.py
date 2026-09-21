@@ -10,16 +10,26 @@ key, pitch, bars, rms), then write results to:
 This module is callable from sync code; the BackgroundQueue wraps it in
 an async shim. We deliberately avoid asyncio inside the engine so it can
 also be invoked directly from a manual ``/run`` endpoint.
+
+Analysis is a BACKGROUND writer of an entry's ``metadata.json``, so it
+routinely overlaps a user editing the same entry in the UI. That file is the
+library's source of truth, which is why :func:`persist_analysis` does its
+read-modify-write under the library store's metadata lock and writes through
+the store's own atomic writer rather than keeping a second, unsynchronized
+copy of that logic here. See :func:`_metadata_guard`.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any, Optional
 
+from backend.modules.library import store as library_store
 from backend.modules.library.db import LibraryDB
 
 from .bars import estimate_bars, estimate_loudness_lufs, estimate_rms_db
@@ -28,6 +38,12 @@ from .key import detect_key
 from .pitch import detect_pitch_stats
 
 log = logging.getLogger(__name__)
+
+#: Set once this process has written an entry's ``metadata.json`` with no
+#: store to lock against (see :func:`_metadata_guard`). One debug line per
+#: process, not one per analysis: on a library this size that would be tens
+#: of thousands of identical lines.
+_logged_unguarded_write = False
 
 
 # Bump when the analysis pipeline changes in a way that should re-run already-
@@ -132,6 +148,116 @@ def analyze_audio(
     return out
 
 
+def _is_within(child: Path, parent: Path) -> bool:
+    """Whether ``child`` lies under ``parent``.
+
+    Case-insensitively on Windows, where the same directory reaches us as
+    ``C:\\Users\\...`` from one caller and ``c:\\users\\...`` from another.
+    Same idiom as ``backend/modules/candidates/store.py``'s ``_is_within``.
+    """
+    try:
+        target = os.path.normcase(str(child.resolve()))
+        root = os.path.normcase(str(parent.resolve()))
+    except OSError:
+        return False
+    return target.startswith(root + os.sep)
+
+
+def _store_guarding(
+    metadata_path: Path, store: Optional[library_store.LibraryStore]
+) -> Optional[library_store.LibraryStore]:
+    """The :class:`~backend.modules.library.store.LibraryStore` that owns
+    ``metadata_path``, or None when this process has none.
+
+    A caller that hands us its store is preferred; otherwise we look for the
+    app's singleton. It is looked up, never BUILT: constructing a
+    ``LibraryStore`` opens the library database and auto-reindexes when that
+    database is empty, which on this library means walking 200,000 entries --
+    absurd for a writer that only needs a mutex, and it would point at the
+    real library from a test or a CLI. So a process that has not already
+    built one (a script, a unit test with its own root) simply gets None.
+
+    Either way the store has to actually own the file: its lock only
+    serializes writers holding THAT object, so a store rooted somewhere else
+    would be a mutex nobody else takes -- the appearance of safety.
+    """
+    if store is not None and _is_within(metadata_path, Path(store.root)):
+        return store
+    try:
+        from backend.modules.library import router as library_router
+    except ImportError:  # pragma: no cover - the library module is always there
+        return None
+    # The module-level singleton `get_store()` memoizes. Read directly so an
+    # absent one stays absent (see above); `get_store()` would create it.
+    existing = getattr(library_router, "_store", None)
+    if existing is not None and _is_within(metadata_path, Path(existing.root)):
+        return existing
+    return None
+
+
+def _metadata_guard(
+    metadata_path: Path, store: Optional[library_store.LibraryStore]
+) -> contextlib.AbstractContextManager[Any]:
+    """The mutex that serializes writes to one entry's ``metadata.json``.
+
+    ``LibraryStore._meta_lock`` when this process has the store that owns the
+    file -- the same lock ``update_entry`` takes, which is the whole point:
+    analysis runs in the background while the user rates, tags and edits
+    lyrics on the very entry being analyzed, and two unsynchronized
+    read-modify-writes of one JSON document lose whichever edit was read
+    first. On disk, permanently: ``reindex()`` rebuilds the database FROM
+    these files, so it would copy the loss rather than repair it.
+
+    Otherwise a null guard. The write itself is still atomic and still uses
+    a unique temp file, so an unguarded write can corrupt nothing; what it
+    cannot do is stop a concurrent writer's edit from being overwritten.
+    """
+    owner = _store_guarding(metadata_path, store)
+    if owner is not None:
+        return owner._meta_lock  # noqa: SLF001 — the documented shared lock
+    global _logged_unguarded_write
+    if not _logged_unguarded_write:
+        _logged_unguarded_write = True
+        log.debug(
+            "analysis.engine: no library store owns %s — writing it atomically "
+            "but unlocked (no store in this process)",
+            metadata_path,
+        )
+    return contextlib.nullcontext()
+
+
+def _read_entry_metadata(metadata_path: Path) -> Optional[dict[str, Any]]:
+    """One entry's ``metadata.json`` as a dict, or None when it is unusable.
+
+    None means DAMAGED -- missing, unreadable, not JSON, or JSON that is not
+    an object -- and the caller must then leave the file ALONE. Writing over
+    it would replace an entry's whole record (title, tags, rating, notes,
+    lyrics, prompt) with a document holding nothing but the analysis we just
+    computed, which is worse than the damage and is not repairable from the
+    database. Same policy as
+    :meth:`~backend.modules.library.store.LibraryStore.record_detected_providers`.
+
+    Called INSIDE :func:`_metadata_guard`'s critical section; a read taken
+    before the lock is exactly the stale copy the lock exists to prevent.
+    """
+    try:
+        loaded = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        log.warning(
+            "analysis.engine: %s is unreadable (%s) — leaving it untouched",
+            metadata_path,
+            e,
+        )
+        return None
+    if not isinstance(loaded, dict):
+        log.warning(
+            "analysis.engine: %s does not hold a JSON object — leaving it untouched",
+            metadata_path,
+        )
+        return None
+    return loaded
+
+
 def persist_analysis(
     db: LibraryDB,
     entry_id: str,
@@ -139,9 +265,27 @@ def persist_analysis(
     *,
     metadata_path: Optional[Path] = None,
     embedded_tags: Optional[dict[str, Any]] = None,
+    store: Optional[library_store.LibraryStore] = None,
 ) -> None:
     """Write analysis payload to SQLite + (optionally) the per-entry
-    metadata.json so the data is portable even if the DB is wiped."""
+    metadata.json so the data is portable even if the DB is wiped.
+
+    ``metadata_path`` is an entry's own ``metadata.json``; the entry
+    directory it is written back through is its parent.
+
+    ``store`` is the library store that owns that entry, when the caller has
+    one — it supplies the lock the file's other writers take. Omitted, the
+    app's existing singleton is used if it owns the file; see
+    :func:`_metadata_guard` for what happens when neither is available.
+
+    The analysis itself is mirrored to the database by ``upsert_analysis``
+    into the ``analysis`` table, which is what every reader of an analysis
+    uses (``library/router.py`` builds ``entry["analysis"]`` from that row).
+    ``$.analysis`` inside the ``entries.metadata_json`` column is read by
+    nothing — no SQL, no Python, no frontend — so this deliberately does not
+    mirror the metadata document into that column: it is a durable backup of
+    the analysis for a wiped database, not a second source of truth.
+    """
     db_payload = {
         "bpm": payload.get("bpm"),
         "beats": payload.get("beats") or [],
@@ -167,24 +311,31 @@ def persist_analysis(
     db.upsert_analysis(entry_id, db_payload)
 
     if metadata_path is not None and metadata_path.is_file():
-        try:
-            meta = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            meta = {}
-        meta["analysis"] = {
-            k: v for k, v in payload.items() if k != "ffprobe" and k != "beats"
-        }
-        meta["analysis"]["beats_count"] = len(payload.get("beats") or [])
-        try:
-            tmp = metadata_path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-            tmp.replace(metadata_path)
-        except OSError as e:
-            log.warning(
-                "analysis.engine: failed to write metadata.json for %s: %s",
-                entry_id,
-                e,
-            )
+        # One writer at a time per entry, across the WHOLE read-modify-write,
+        # and the read taken inside it — the store's writers hold this same
+        # lock over the same span.
+        with _metadata_guard(metadata_path, store):
+            meta = _read_entry_metadata(metadata_path)
+            if meta is not None:
+                meta["analysis"] = {
+                    k: v for k, v in payload.items() if k != "ffprobe" and k != "beats"
+                }
+                meta["analysis"]["beats_count"] = len(payload.get("beats") or [])
+                try:
+                    # The store's writer, not a second copy of it: a unique
+                    # temp file in the entry's own directory, atomically
+                    # renamed into place, removed if anything fails. The
+                    # fixed ``metadata.json.tmp`` this used to write was
+                    # shared with every other writer of the same entry —
+                    # their bytes mixed in that one file and the mixture was
+                    # renamed over the real document.
+                    library_store._write_metadata(metadata_path.parent, meta)  # noqa: SLF001
+                except OSError as e:
+                    log.warning(
+                        "analysis.engine: failed to write metadata.json for %s: %s",
+                        entry_id,
+                        e,
+                    )
 
 
 def analyze_and_persist(
@@ -194,9 +345,13 @@ def analyze_and_persist(
     *,
     metadata_path: Optional[Path] = None,
     settings: Optional[dict[str, Any]] = None,
+    store: Optional[library_store.LibraryStore] = None,
 ) -> dict[str, Any]:
     """End-to-end: run analysis, persist to DB + metadata.json, update
     the entry's ``analysis_status`` to 'complete'.
+
+    ``store`` is passed straight to :func:`persist_analysis`, which needs it
+    to take the same metadata lock the store's own writers take.
 
     Returns the full analysis payload (useful for the manual /run
     endpoint to echo back to the caller)."""
@@ -261,6 +416,7 @@ def analyze_and_persist(
             payload,
             metadata_path=metadata_path,
             embedded_tags=embedded,
+            store=store,
         )
         _set_status(db, entry_id, "complete")
         return payload

@@ -56,13 +56,15 @@ from pydantic import BaseModel
 
 from .bundle import build_bundle_bytes
 from .db import DEFAULT_SORT, FACET_FIELDS, SORTS, EntryFilters, infer_provider
-from .provider import detect_provider, provider_wire_fields
+from .provider import ProviderInfo, detect_provider
 from .store import (
     AUDIO_EXTS,
     MAX_REINDEX_ANALYSIS_ENQUEUE,
     ImportJob,
     LibraryStore,
     _read_metadata,
+    bounded_provider_info,
+    bounded_provider_wire_fields,
     default_library_root,
     get_import_jobs,
 )
@@ -84,6 +86,14 @@ DEFAULT_PAGE_LIMIT = 200
 #: Ceiling on ``GET /entries/ids``. Select-all over more than this is refused
 #: (413) rather than answered with a list the client cannot hold.
 MAX_SELECTABLE_IDS = 50_000
+
+#: How many entries ONE request may persist a read-time provider detection
+#: for (:func:`_record_detected_providers`). A paged list is under this by
+#: construction, so it never bites there; it exists for the legacy unpaged
+#: shape, which returns the WHOLE library and must stay a read of 200,000 rows
+#: instead of becoming a 200,000-file migration. Rows it skips are written by
+#: the paged reads that follow, each one for the page it was already serving.
+MAX_PROVIDER_WRITEBACK = MAX_PAGE_LIMIT
 
 #: Ceiling on the ``ids`` form of ``POST /entries/bulk-delete``. Above this the
 #: caller has to say what it wants with a filter instead of naming every row,
@@ -238,7 +248,9 @@ def _analysis_payload(row: dict[str, Any]) -> tuple[dict[str, Any], dict[str, An
     return analysis, embedded
 
 
-def _derive_provider(entry: dict[str, Any], embedded: dict[str, Any]) -> None:
+def _derive_provider(
+    entry: dict[str, Any], embedded: dict[str, Any]
+) -> Optional[ProviderInfo]:
     """Upgrade an entry's provider using the tags its analysis pass stored.
 
     The store already labeled the entry (``store._provider_wire``): a stored
@@ -250,31 +262,90 @@ def _derive_provider(entry: dict[str, Any], embedded: dict[str, Any]) -> None:
 
     The guess is replaced, a real label is not: an entry whose provider is
     exactly what ``infer_provider`` produces carries no better information, so
-    the file's own tags outrank it. Nothing is written back and no audio file
-    is opened, which is how the existing library gets labeled with no backfill
-    and no re-analysis. Entries with no analysis row never reach here and keep
-    what the store gave them.
+    the file's own tags outrank it. No audio file is opened, which is how the
+    existing library gets labeled with no backfill and no re-analysis. Entries
+    with no analysis row never reach here and keep what the store gave them.
+
+    Returns the detection when it CHANGED any of the four wire fields, so the
+    caller can persist it once (:func:`_record_detected_providers`), and None
+    otherwise. That write is the whole point: the label lives in Python and
+    the ``provider=`` filter lives in SQL over the entry row, so until the
+    derived answer is stored the two file the same entry under different
+    slugs and it answers to no provider filter at all. Once stored, rule 1 of
+    ``PROVIDER_SQL`` agrees with what is shown, this function returns None for
+    that entry, and no further request writes anything.
     """
     current = entry.get("provider")
     if current and current != infer_provider(entry.get("model"), entry.get("source")):
-        return
-    info = detect_provider(embedded, None)
+        return None
+    info = bounded_provider_info(detect_provider(embedded, None))
     if info is None:
-        return
-    entry.update(provider_wire_fields(info))
+        return None
+    fields = bounded_provider_wire_fields(info)
+    changed = any(entry.get(key) != value for key, value in fields.items())
+    entry.update(fields)
+    return info if changed else None
 
 
-def _apply_analysis(entry: dict[str, Any], row: Optional[dict[str, Any]]) -> None:
+def _apply_analysis(
+    entry: dict[str, Any],
+    row: Optional[dict[str, Any]],
+    *,
+    derive_provider: bool = True,
+) -> Optional[ProviderInfo]:
     """Merge one analysis ``row`` onto one ``entry`` dict in place. No-op when
-    ``row`` is ``None`` (entry not analyzed) or yields nothing renderable."""
+    ``row`` is ``None`` (entry not analyzed) or yields nothing renderable.
+
+    With ``derive_provider=False`` the analysis and the embedded tags are
+    still attached and the entry keeps the provider the store gave it. See
+    :func:`_attach_analysis`.
+
+    Returns what :func:`_derive_provider` decided is worth persisting, or None.
+    """
     if not row:
-        return
+        return None
     analysis, embedded = _analysis_payload(row)
     if analysis:
         entry["analysis"] = analysis
-    if embedded:
-        entry["embedded_tags"] = embedded
-        _derive_provider(entry, embedded)
+    if not embedded:
+        return None
+    entry["embedded_tags"] = embedded
+    if not derive_provider:
+        return None
+    return _derive_provider(entry, embedded)
+
+
+def _record_detected_providers(
+    store: LibraryStore, detected: dict[str, ProviderInfo]
+) -> None:
+    """Persist read-time detections, and never let that spoil the read.
+
+    The write is the store's narrow, metadata-only one: it does not move
+    ``updated_at`` or ``timestamp``, does not re-index, does not enqueue a
+    job, and refuses to overwrite a provider an entry already carries. Any
+    failure -- a read-only library, a locked database, a vanished entry
+    folder -- is dropped, because the response is already correct without it;
+    the entry simply keeps deriving its label on every read, which is what it
+    did before this existed.
+
+    ONE warning per request, never one per row, and at warning rather than
+    debug: a swallow this broad would otherwise hide a real bug in this path
+    (a TypeError, a renamed attribute) behind a silent, permanently
+    unpersisted label. The exception type is logged with the message so the
+    difference between "the disk said no" and "this code is wrong" is visible
+    in an ordinary log.
+    """
+    if not detected:
+        return
+    try:
+        store.record_detected_providers(detected)
+    except Exception as e:
+        log.warning(
+            "library.router: provider write-through skipped for %d entries: %s: %s",
+            len(detected),
+            type(e).__name__,
+            e,
+        )
 
 
 def _attach_analysis(
@@ -282,11 +353,24 @@ def _attach_analysis(
     entries: list[dict[str, Any]],
     *,
     ids: Optional[list[str]] = None,
+    derive_provider: bool = True,
 ) -> None:
     """Bulk-enrich a LIST of entries with their analysis. ONE query for the
     whole list (no N+1), then an in-memory join by id. ``ids`` narrows that
     query to the page, instead of loading every analyzed entry in the
-    library."""
+    library.
+
+    ``derive_provider=False`` for a request that asked for ONE provider. A
+    provider-filtered page must not rewrite its own result set: the rows were
+    chosen by SQL under one slug, and relabeling them afterwards would show
+    rows the filter does not match, drop them from under the user's cursor as
+    the write-through refiles them, make ``total`` (counted after) disagree
+    with the rows, and skip entries at the next offset -- with no revision
+    bump to tell the client, correctly, since nothing it caches changed. So
+    under an active provider filter every row is labeled exactly as SQL filed
+    it and nothing is written. The unfiltered list and the single-entry read
+    are what label the library.
+    """
     if store.db is None:
         return
     rows = (
@@ -294,8 +378,12 @@ def _attach_analysis(
     )
     if not rows:
         return
+    detected: dict[str, ProviderInfo] = {}
     for e in entries:
-        _apply_analysis(e, rows.get(e["id"]))
+        info = _apply_analysis(e, rows.get(e["id"]), derive_provider=derive_provider)
+        if info is not None and len(detected) < MAX_PROVIDER_WRITEBACK:
+            detected[str(e["id"])] = info
+    _record_detected_providers(store, detected)
 
 
 def _trim_lyrics(entry: dict[str, Any]) -> None:
@@ -316,10 +404,16 @@ def _trim_lyrics(entry: dict[str, Any]) -> None:
 def _attach_analysis_one(store: LibraryStore, entry: dict[str, Any]) -> None:
     """Enrich a SINGLE entry via a targeted ``get_analysis(id)`` lookup — so a
     single-entry GET never loads the entire analysis table (which the bulk
-    helper would). Used by the per-id endpoint that inspectors hit on select."""
+    helper would). Used by the per-id endpoint that inspectors hit on select.
+
+    Persists a read-time detection exactly as the list does, so an entry
+    opened in the inspector and the same entry seen in a page end up filed
+    under the same slug whichever was read first."""
     if store.db is None:
         return
-    _apply_analysis(entry, store.db.get_analysis(entry["id"]))
+    info = _apply_analysis(entry, store.db.get_analysis(entry["id"]))
+    if info is not None:
+        _record_detected_providers(store, {str(entry["id"]): info})
 
 
 _KIND_FILTERS: dict[str, Optional[set[str]]] = {
@@ -426,7 +520,10 @@ def list_entries(
     ]
     ids = [str(e["id"]) for e in entries]
     _attach_play_counts(store, entries, ids=ids)
-    _attach_analysis(store, entries, ids=ids)
+    # A provider-filtered page is labeled exactly as SQL filed it, and nothing
+    # is written: see _attach_analysis for why relabeling a filtered result
+    # set would be incoherent.
+    _attach_analysis(store, entries, ids=ids, derive_provider=provider is None)
     for entry in entries:
         _trim_lyrics(entry)
     return {

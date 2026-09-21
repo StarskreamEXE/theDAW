@@ -42,6 +42,7 @@ __all__ = [
     "GENERIC_TOOL_MARKERS",
     "GENERIC_TOOL_PREFIXES",
     "PROVIDER_RULES",
+    "PROVIDER_SLUG_MAX",
     "URL_KEY_PRIORITY",
     "ProviderInfo",
     "ProviderRule",
@@ -514,8 +515,33 @@ def _parse_bool(value: str) -> Optional[bool]:
     return None
 
 
+#: Longest provider slug this module will produce.
+#:
+#: A slug is not a label: it is an identity that gets stored in every one of
+#: an entry's ``metadata.json``, copied into the ``metadata_json`` column,
+#: returned on every row of every list response, and compared by SQL. Nothing
+#: legitimate needs more than this -- every slug in the provider table is
+#: under ten characters. Unbounded, a file whose ``generator`` frame holds a
+#: multi-kilobyte blob (a pasted document, a serialized blob, a corrupt
+#: frame) turns that blob into the entry's permanent identity and carries it
+#: through all four places. 64 leaves room for a genuinely long product name
+#: while keeping a row's provider a thing you can read.
+PROVIDER_SLUG_MAX = 64
+
+
 def _slugify(value: str) -> str:
+    """``value`` as a stable lowercase slug, bounded by
+    :data:`PROVIDER_SLUG_MAX`.
+
+    Truncation trims back off any separator it lands on, so a slug never ends
+    in ``-`` and two values differing only past the bound still slugify to a
+    readable name rather than to ``...-``. The result is empty only when the
+    input had no alphanumerics at all, and empty means NO PROVIDER: both
+    callers treat a falsy slug as "this frame identifies nothing".
+    """
     slug = re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")
+    if len(slug) > PROVIDER_SLUG_MAX:
+        slug = slug[:PROVIDER_SLUG_MAX].rstrip("-")
     return slug
 
 

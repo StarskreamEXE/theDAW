@@ -36,7 +36,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Optional, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
 
 log = logging.getLogger(__name__)
 
@@ -1118,6 +1118,18 @@ class LibraryDB:
     # single SQL step and ``_writelock`` serializes writers, so the sequence
     # is strictly increasing and never repeats a value. A rolled-back
     # transaction rolls the bump back with it.
+    #
+    # ``_txn(bump_revision=False)`` is the ONE exception, and it is not a
+    # loophole: the revision is a cache-invalidation signal, not a write
+    # counter. A client reads it as "the library moved under us" and throws
+    # away every cached page and facet answer it holds
+    # (``applyPage`` in frontend/src/state/libraryStore.ts). A write that
+    # changes nothing a client caches -- no column any list shows, no tag, no
+    # index, no ordering -- must not fire it, or an ordinary first scroll
+    # through the library becomes cache thrash. Reserved for exactly that:
+    # today only :meth:`set_entry_metadata`, whose added keys are read by SQL
+    # and were already in the response that caused the write. Anything that
+    # changes what a client could be showing keeps the default.
     _BUMP_REVISION_SQL = """
         INSERT INTO schema_meta (key, value) VALUES ('library_revision', '1')
         ON CONFLICT(key) DO UPDATE
@@ -1125,12 +1137,13 @@ class LibraryDB:
     """
 
     @contextmanager
-    def _txn(self) -> Iterator[sqlite3.Cursor]:
+    def _txn(self, *, bump_revision: bool = True) -> Iterator[sqlite3.Cursor]:
         with self._writelock:
             cur = self._conn.cursor()
             try:
                 yield cur
-                cur.execute(self._BUMP_REVISION_SQL)
+                if bump_revision:
+                    cur.execute(self._BUMP_REVISION_SQL)
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
@@ -1246,6 +1259,49 @@ class LibraryDB:
             )
             self._fts_index(cur, unique_ids)
         return len(rows)
+
+    def set_entry_metadata(
+        self, metadata_by_id: Mapping[str, Mapping[str, Any]]
+    ) -> int:
+        """Replace ``metadata_json`` on rows that ALREADY exist, and nothing else.
+
+        Deliberately narrower than :meth:`upsert_entry`, which is the path a
+        user edit takes: no column is written, so ``updated_at`` keeps the
+        value the last real edit left on it and every sort order stays where
+        it was; the tag index, the prompt corpus and the fts index are not
+        rebuilt; and an id with no row inserts nothing. That is what lets the
+        read path record a fact it DERIVED about a row without the row looking
+        edited.
+
+        Only safe for metadata keys nothing else mirrors. ``$.lyrics`` is
+        projected into the fts index and the entry columns are written from
+        their own payload fields, so a caller that changes either of those
+        must go through :meth:`upsert_entry` instead. Its one caller,
+        :meth:`~.store.LibraryStore.record_detected_providers`, adds only the
+        ``provider*`` keys -- which no column and no index reads, and which
+        :data:`PROVIDER_SQL` reads straight out of this column.
+
+        One transaction for the whole mapping, and NO ``library_revision``
+        bump: the revision tells a client its cached pages are stale, and
+        nothing a client caches changed here. The rows whose metadata this
+        writes were in the response that decided to write it, already
+        carrying the values being stored, so a client holding that page is
+        not holding a stale label. What does change is which slug the SQL
+        filter files the row under, and that is only ever read by a fresh
+        request -- changing the provider filter clears the page cache and
+        refetches on its own. See the note on ``_BUMP_REVISION_SQL``.
+
+        Returns the number of rows actually updated.
+        """
+        rows = [
+            (json.dumps(dict(meta)), str(entry_id))
+            for entry_id, meta in metadata_by_id.items()
+        ]
+        if not rows:
+            return 0
+        with self._txn(bump_revision=False) as cur:
+            cur.executemany("UPDATE entries SET metadata_json = ? WHERE id = ?", rows)
+            return int(cur.rowcount or 0)
 
     def get_entry(self, entry_id: str) -> Optional[dict[str, Any]]:
         with self._writelock:
