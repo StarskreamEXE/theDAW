@@ -2332,6 +2332,29 @@ class LibraryDB:
             cur.close()
         return {str(r["sp"]) for r in rows if r["sp"]}
 
+    def entry_id_for_source_path(self, source_path: str, source: str) -> Optional[str]:
+        """The id of the reference-in-place entry already pointing at
+        ``source_path``, or None.
+
+        The single-file counterpart to :meth:`registered_source_paths`, which
+        answers the same question for a whole folder import with one scan.
+        Scanning the library per file would be the 13.3 s blob read all over
+        again, so this is narrowed by ``source`` first -- ``idx_entries_source``
+        -- and only those rows' metadata are opened. A performance set's
+        handful of rows is nothing; the whole library would not be.
+        """
+        with self._writelock:
+            cur = self._conn.cursor()
+            row = cur.execute(
+                "SELECT id FROM entries WHERE source = ? "
+                "  AND json_valid(metadata_json) "
+                "  AND json_extract(metadata_json, '$.source_path') = ? "
+                "LIMIT 1",
+                (source, source_path),
+            ).fetchone()
+            cur.close()
+        return str(row["id"]) if row else None
+
     def library_revision(self) -> int:
         """The counter ``_txn`` bumps once per committed write. 0 before the
         first one. Cheaper than :meth:`library_counts` when only the revision

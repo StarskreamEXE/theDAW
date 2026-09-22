@@ -11,6 +11,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { analyzeEntries } from './djAnalysisStore';
+import { useLogStore } from './logStore';
 
 export interface SetlistEntry {
   /** Library entry id, or null for an ad-hoc URL/label (e.g. VJ
@@ -79,13 +80,22 @@ interface SetlistState {
 
 const STORAGE_KEY = 'thedaw.setlists.v1';
 
+/** Backend-bundled sets are `zad-<slug>-<hash>`; locally-created ones `set-…`. */
+const BUNDLED_ID_PREFIX = 'zad-';
+
+/** A bundled track the read-only listing could not name yet: no entry id, and
+ *  not one of the user's own ad-hoc/VJ rows (those carry a `url`). */
+function isPendingBundled(entry: SetlistEntry): boolean {
+  return entry.entryId === null && !entry.url && entry.kind === 'audio';
+}
+
 function nextId(): string {
   return `set-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 }
 
 export const useSetlistStore = create<SetlistState>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       setlists: {},
       activeId: null,
       create: (name) => {
@@ -181,27 +191,68 @@ export const useSetlistStore = create<SetlistState>()(
         }
       },
       registerBundled: async (id) => {
-        // The startup listing is read-only, so a bundled set arrives with
-        // `entryId: null` on every track it has never registered. Opening the
-        // set is the moment those become library entries. The backend keys the
-        // set id off the timeline, not off the entry ids, so the answer lands
-        // back on the same list. Idempotent: reopening registers nothing.
+        // Only a bundled set has anything to register: a locally-created list
+        // (`set-…` id) has no folder behind it, so there is no request to make.
+        const cur = get().setlists[id];
+        if (!cur) return null;
+        if (!id.startsWith(BUNDLED_ID_PREFIX)) return cur.entries;
+        // A track the user added by hand carries a `url` or an id already;
+        // only a bundled track the listing left unregistered is pending.
+        const pending = cur.entries.filter(isPendingBundled).length;
+        if (pending === 0) return cur.entries;
         try {
           const res = await fetch(`/api/library/setlists/${encodeURIComponent(id)}/register`, {
             method: 'POST',
           });
-          if (!res.ok) return null; // not a bundled set (or the backend is cold)
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
           const body = (await res.json()) as { setlist?: { entries?: SetlistEntry[] } };
-          const entries = Array.isArray(body.setlist?.entries) ? body.setlist.entries : null;
-          if (!entries) return null;
+          const incoming = Array.isArray(body.setlist?.entries) ? body.setlist.entries : null;
+          if (!incoming) throw new Error('no entries in the answer');
+          // Patch ids INTO the set the user has; never replace the array. They
+          // may have reordered it, removed a track, or dragged their own in
+          // (DJView "Sets" editing), and none of that is the backend's to
+          // overwrite. Matched by label, taken in order so two tracks sharing
+          // a title still land on their own entry.
+          const byLabel = new Map<string, string[]>();
+          for (const entry of incoming) {
+            if (!entry?.entryId) continue;
+            const queue = byLabel.get(entry.label) ?? [];
+            queue.push(entry.entryId);
+            byLabel.set(entry.label, queue);
+          }
+          let patched: SetlistEntry[] = cur.entries;
+          const filled: string[] = [];
           set((s) => {
-            const cur = s.setlists[id];
-            if (!cur) return s;
-            return { setlists: { ...s.setlists, [id]: { ...cur, entries } } };
+            const live = s.setlists[id];
+            if (!live) return s;
+            patched = live.entries.map((e) => {
+              if (!isPendingBundled(e)) return e;
+              const got = byLabel.get(e.label)?.shift();
+              if (!got) return e;
+              filled.push(got);
+              return { ...e, entryId: got };
+            });
+            return {
+              setlists: {
+                ...s.setlists,
+                [id]: { ...live, entries: patched, updatedAt: Date.now() },
+              },
+            };
           });
-          analyzeEntries(entries.map((e) => e.entryId));
-          return entries;
-        } catch {
+          if (filled.length > 0) analyzeEntries(filled);
+          return patched;
+        } catch (err) {
+          // Silence here looked exactly like success: the set simply stayed
+          // unplayable. Say so once, where the user already reads failures.
+          useLogStore
+            .getState()
+            .append(
+              'warn',
+              'setlists',
+              `Could not register ${pending} track${pending === 1 ? '' : 's'} of "${cur.name}": ${
+                err instanceof Error ? err.message : 'request failed'
+              }`,
+            );
           return null;
         }
       },

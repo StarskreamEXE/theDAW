@@ -22,6 +22,7 @@ Every path here is under ``tmp_path``: no test reads the developer's own
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -169,3 +170,76 @@ def test_opening_a_set_registers_it_once_and_is_idempotent(
 def test_registering_a_set_that_is_not_there_is_a_404(client: TestClient) -> None:
     response = client.post(f"{PREFIX}/setlists/zad-nope-00000000/register")
     assert response.status_code == 404
+
+
+def test_two_clients_opening_the_same_set_register_each_file_once(
+    client: TestClient, perf_sets: Path
+) -> None:
+    """Two tabs, one set, one entry per file.
+
+    Both callers read the same empty sidecar, so without a claim on the file
+    they each call ``register_reference`` and the library grows a second copy
+    of every track -- invisible until the user sees each one twice. The route
+    holds a per-folder lock, and the store refuses to register a
+    ``source_path`` it already has, so the loser of the race reuses the
+    winner's entries.
+    """
+    _write_set(perf_sets, "NIGHT RIDE", tracks=3)
+    set_id = _get_setlists(client)[0]["id"]
+
+    start = threading.Barrier(2)
+    answers: list[Any] = []
+    failures: list[BaseException] = []
+
+    def register() -> None:
+        try:
+            start.wait(timeout=10)
+            answers.append(client.post(f"{PREFIX}/setlists/{set_id}/register"))
+        except BaseException as exc:  # noqa: BLE001 - re-raised below
+            failures.append(exc)
+
+    threads = [threading.Thread(target=register) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not failures, failures
+    assert [a.status_code for a in answers] == [200, 200]
+    per_call = [
+        [entry["entryId"] for entry in a.json()["setlist"]["entries"]] for a in answers
+    ]
+    assert per_call[0] == per_call[1], "the two callers registered different entries"
+    assert len(set(per_call[0])) == 3
+
+    listing = client.get(f"{PREFIX}/entries?limit=100")
+    assert listing.status_code == 200, listing.text[:400]
+    body = listing.json()
+    assert body["total"] == 3, (
+        f"{body['total']} entries for 3 files: the same file was registered twice"
+    )
+    store = library_router_module.get_store()
+    assert len(store.db.registered_source_paths()) == 3
+
+
+def test_the_register_route_refuses_a_cross_site_caller(
+    client: TestClient, perf_sets: Path
+) -> None:
+    """It writes, so it carries the same guard as ``/import-folder``."""
+    _write_set(perf_sets, "NIGHT RIDE", tracks=2)
+    set_id = _get_setlists(client)[0]["id"]
+
+    refused = client.post(
+        f"{PREFIX}/setlists/{set_id}/register",
+        headers={"Sec-Fetch-Site": "cross-site", "Origin": "https://evil.example"},
+    )
+
+    assert refused.status_code == 403
+    assert _revision() == _revision(), "sanity"
+    assert not list(perf_sets.rglob(SIDECAR)), "a refused caller still registered"
+
+
+def test_the_404_does_not_echo_the_id_back(client: TestClient) -> None:
+    response = client.post(f"{PREFIX}/setlists/zad-%3Cscript%3E-1/register")
+    assert response.status_code == 404
+    assert "script" not in response.text

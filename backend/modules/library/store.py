@@ -2191,6 +2191,21 @@ class LibraryStore:
         src = Path(source_path)
         if not src.is_file():
             return None
+        # Registering the same file twice must not make two entries of it. The
+        # bulk sibling has always skipped an already-registered ``source_path``
+        # (a re-run over a folder is a no-op); doing it here too is what makes
+        # two callers racing on one file -- two browser tabs opening the same
+        # performance set -- land on one entry instead of two, whatever order
+        # they interleave in. The claim is the DB row, not a lock.
+        wanted_source = str((metadata or {}).get("source") or "folder")
+        if self.db is not None:
+            existing = self.db.entry_id_for_source_path(
+                str(src.resolve()), wanted_source
+            )
+            if existing:
+                record = self.get_entry(existing)
+                if record is not None:
+                    return record
         entry_id = uuid.uuid4().hex
         entry_dir = self.root / entry_id
         entry_dir.mkdir(parents=True, exist_ok=True)

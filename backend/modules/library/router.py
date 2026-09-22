@@ -37,6 +37,7 @@ import logging
 import mimetypes
 import re
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Optional
 
@@ -1573,7 +1574,22 @@ def list_bundled_setlists() -> dict[str, Any]:
     return {"setlists": setlists}
 
 
-@router.post("/setlists/{set_id}/register")
+#: One lock per performance-set folder, so two clients opening the same set at
+#: once cannot both read the same stale sidecar and register its tracks twice.
+#: The store de-duplicates on ``source_path`` as well (and that is the guarantee
+#: that survives two processes); this keeps the sidecar write coherent and keeps
+#: the second caller off the file system while the first is registering.
+_PERF_SET_LOCKS: dict[str, threading.Lock] = {}
+_PERF_SET_LOCKS_GUARD = threading.Lock()
+
+
+def _perf_set_lock(set_dir: Path) -> threading.Lock:
+    key = str(set_dir.resolve())
+    with _PERF_SET_LOCKS_GUARD:
+        return _PERF_SET_LOCKS.setdefault(key, threading.Lock())
+
+
+@router.post("/setlists/{set_id}/register", dependencies=[Depends(refuse_cross_site)])
 def register_bundled_setlist(set_id: str) -> dict[str, Any]:
     """Register one bundled set's audio files — the write half of the route
     above, run when the user opens the set rather than when the tab loads.
@@ -1590,11 +1606,14 @@ def register_bundled_setlist(set_id: str) -> dict[str, Any]:
             listed = _load_perf_set(store, set_dir)
             if listed is None or listed["id"] != set_id:
                 continue
-            registered = _load_perf_set(store, set_dir, register=True)
+            with _perf_set_lock(set_dir):
+                registered = _load_perf_set(store, set_dir, register=True)
             if registered is not None:
                 return {"setlist": registered}
             break
-    raise HTTPException(404, f"no bundled performance set with id {set_id!r}")
+    # No id in the message: it comes from the caller, and an error page is the
+    # last place to echo one back.
+    raise HTTPException(404, "no such bundled performance set")
 
 
 @router.post("/reindex")

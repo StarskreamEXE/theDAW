@@ -2587,6 +2587,10 @@ const TrackBrowser: React.FC<{ source: Source; setSource: (s: Source) => void; o
 /** Source tree — every entry is live: filtered views over the library
  *  (Library / Favorites / Generated / Imports), real Online Download, and the
  *  user's Sets. No placeholder/streaming stubs. */
+/** Backend-bundled sets are `zad-…`; only those have tracks a register call
+ *  can fill in (see `state/setlistStore`). */
+const isBundledSetId = (id: string): boolean => id.startsWith('zad-');
+
 const SourceTree: React.FC<{ source: Source; setSource: (s: Source) => void; libCount: number }> = ({ source, setSource, libCount }) => {
   const entries = useLibraryStore((s) => s.entries);
   const libRevision = useLibraryStore((s) => s.revision);
@@ -2717,8 +2721,12 @@ const SourceTree: React.FC<{ source: Source; setSource: (s: Source) => void; lib
           // A bundled set nobody has opened lists with `entryId: null` on every
           // track -- GET /setlists is read-only, and the entries are created
           // when the set is opened -- so those count here too, or a fresh set
-          // could never be Auto-DJ'd without being clicked first.
-          const pending = s.entries.filter((e) => e.entryId === null).length;
+          // could never be Auto-DJ'd without being clicked first. Only tracks
+          // that CAN be registered count: an ad-hoc/VJ row (a `url`, or a
+          // non-audio slot) has no entry waiting for it and never will.
+          const pending = isBundledSetId(s.id)
+            ? s.entries.filter((e) => e.entryId === null && !e.url && e.kind === 'audio').length
+            : 0;
           const playable = s.entries.filter((e) => e.entryId).length + pending >= 2;
           // Row is a div (not the Item <button>) so the green ▶ Auto-DJ action
           // can sit as a sibling button — nesting a button inside a button is
