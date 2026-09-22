@@ -48,6 +48,7 @@ from backend.assistant_routes import mcp_relay_router
 from backend.assistant_routes import router as assistant_router
 from backend.modules.loader import load_modules
 from backend.lib import pairing, paths
+from backend.lib.atomic import atomic_write
 from backend.lib.cross_site import refuse_cross_site, require_loopback_or_launch_token
 from backend.lib.launch_token import child_env
 
@@ -678,7 +679,10 @@ def _save_generation_artifacts_sync(
         "saved_at": time.time(),
         **(metadata or {}),
     }
-    metadata_path.write_text(json.dumps(metadata_payload, indent=2), encoding="utf-8")
+    # Atomic, like every other metadata.json writer: a reader (the library
+    # walk, the analysis pass) sees the old document or the new one, never a
+    # half-written file, and a crash mid-write cannot leave one behind.
+    atomic_write(metadata_path, json.dumps(metadata_payload, indent=2))
 
     return {
         "artifact_dir": str(item_dir),

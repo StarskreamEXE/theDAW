@@ -132,8 +132,12 @@ def set_review(asset_id: str, reviewed: bool, notes_text: str) -> dict:
         try:
             import json
 
-            (src.parent / "vocal_metadata.json").write_text(
-                json.dumps(payload, indent=2), encoding="utf-8"
+            from backend.lib.atomic import atomic_write
+
+            # Atomic: two review clicks in a row (or a click during a read) can
+            # never interleave into a half-written document.
+            atomic_write(
+                src.parent / "vocal_metadata.json", json.dumps(payload, indent=2)
             )
         except Exception as e:
             log.info("vocal: review persist failed for %s: %s", asset_id, e)
