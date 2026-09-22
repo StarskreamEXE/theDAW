@@ -2210,7 +2210,7 @@ A seventh module, **AI Analyzer** (`/api/edit/analyzer`), is an experimental dec
 
 ## 29. Catalogue
 
-The **Catalogue** view (`CatalogueView`, lazy-loaded in the shell) is a cross-provider gallery over the Library. It presents grid and list layouts, a filter bar, an inspector with on-demand spectrograms, a lineage panel, and **provider badges** that classify each entry (Suno, Magenta, import, and forward-compatible slots for other providers) from its `model` and `source` fields. Its context menu runs Suno cover and mashup directly from a Library entry (§26). It reads the same backend Library API (§13) and the per-entry lineage route `GET /api/library/{id}/lineage`.
+The **Catalogue** view (`CatalogueView`, lazy-loaded in the shell) is a cross-provider gallery over the Library. It presents grid and list layouts, a filter bar, an inspector with on-demand spectrograms, a lineage panel, and **provider badges** that classify each entry from its embedded tags first and its `model` and `source` fields second: Stable Audio (theDAW's own generations), Suno, Udio, Riffusion, Magenta, Import, and theDAW (made here, origin unspecified — performance sets, renders, VJ output). A Suno, Udio or Riffusion frame in an imported file is labeled as such and its embedded prompt, style and lyrics are ingested; the badge is filterable. Its context menu runs Suno cover and mashup directly from a Library entry (§26). It reads the same backend Library API (§13) and the per-entry lineage route `GET /api/library/{id}/lineage`.
 
 ---
 
