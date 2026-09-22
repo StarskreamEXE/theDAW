@@ -696,3 +696,23 @@ def test_known_and_short_slugs_are_unaffected_by_the_bound(tags: dict, slug: str
 def test_every_table_slug_is_inside_the_bound():
     for rule in PROVIDER_RULES:
         assert 0 < len(rule.provider) <= PROVIDER_SLUG_MAX, rule.provider
+
+
+def test_a_thedaw_generator_is_thedaw_and_not_an_ai_provider():
+    """ "theDAW" in a generator/encoder frame says the file was made IN theDAW
+    and nothing about its origin -- a DJ set and a VJ clip carry it too -- so
+    it is the same ``thedaw`` slug the column fallback's last arm answers, and
+    it is not claimed to be a generator. Only the explicit Stable Audio
+    spellings are the AI provider."""
+    info = detect_provider({"generator": "theDAW"})
+    assert info is not None
+    assert info.provider == "thedaw"
+    assert info.label == "theDAW"
+    assert info.is_ai is False
+
+    for value in ("stable-audio", "Stable Audio"):
+        info = detect_provider({"generator": value})
+        assert info is not None, value
+        assert info.provider == "stable-audio", value
+        assert info.label == "Stable Audio", value
+        assert info.is_ai is True, value

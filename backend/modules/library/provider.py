@@ -198,13 +198,24 @@ PROVIDER_RULES: tuple[ProviderRule, ...] = (
         is_ai=True,
         generator_values=("musicgen", "audiocraft"),
     ),
-    # theDAW's own exports: `tags.py` normalises both "theDAW" and
-    # "stable audio" spellings to this one generator string.
+    # theDAW's own exports. Only the explicit Stable Audio spellings name the
+    # generator; a frame that says "theDAW" says the file was made IN theDAW
+    # and nothing about its origin -- a DJ performance set and a VJ clip carry
+    # it too -- so it gets theDAW's own slug, the same one the column
+    # fallback's last arm answers (`db.DEFAULT_PROVIDER`), and is not claimed
+    # to be a generator. Label and AI-ness mirror `db.DERIVED_PROVIDERS` and
+    # `KNOWN_PROVIDERS` in `frontend/src/catalog/catalogProviders.ts`.
     ProviderRule(
         provider="stable-audio",
         label="Stable Audio",
         is_ai=True,
-        generator_values=("stable-audio", "stable audio", "thedaw"),
+        generator_values=("stable-audio", "stable audio"),
+    ),
+    ProviderRule(
+        provider="thedaw",
+        label="theDAW",
+        is_ai=False,
+        generator_values=("thedaw",),
     ),
     ProviderRule(
         provider="bandcamp",

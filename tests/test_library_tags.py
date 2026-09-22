@@ -6,6 +6,7 @@ from pathlib import Path
 
 from backend.modules.library.tags import (
     KNOWN_AI_TAGS,
+    _detect_generator,
     _id3_link_payload,
     _stringify,
     extract_embedded_tags,
@@ -308,3 +309,18 @@ def test_woas_url_alone_identifies_an_ai_provider(tmp_path: Path):
     assert info is not None
     assert info.provider == "suno"
     assert info.is_ai is True
+
+
+def test_a_thedaw_encoder_signature_is_thedaw_not_stable_audio():
+    """The generator signature has to agree with the provider rule: "theDAW"
+    means made in theDAW, origin unspecified (``thedaw``), not the Stable
+    Audio generator.
+
+    The explicit ``stable-audio`` spelling is covered by
+    ``test_library_provider.py`` on ``detect_provider``, not here: every
+    spelling of it contains "udio", whose signature is declared earlier in
+    ``GENERATOR_SIGNATURES``, so this table answers "udio" for it. That is a
+    pre-existing shadowing this test does not assert either way.
+    """
+    assert _detect_generator({"encoder": "theDAW 1.0"}) == "thedaw"
+    assert _detect_generator({"encoder": "suno v4"}) == "suno"

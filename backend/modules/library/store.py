@@ -837,7 +837,17 @@ def _record_from_metadata(
         lyrics=str(meta.get("lyrics") or ""),
         spectrogram_paths=dict(meta.get("spectrogram_paths") or {}),
         cover_url=_cover_url_if_present(entry_dir, api_prefix, entry_id),
-        **_provider_wire(meta),
+        # The SAME defaults the record's own fields use above. `metadata.json`
+        # for a native generation carries no `source` key at all (see
+        # `backend/server.py`), and the DB row for it holds 'generate', so
+        # deriving from "" here would label the entry `thedaw` on the wire
+        # while `PROVIDER_SQL`, the list path and the `provider=` filter all
+        # said stable-audio for the same entry.
+        **_provider_wire(
+            meta,
+            source=str(meta.get("source") or "generate"),
+            model=str(model),
+        ),
     )
 
 
@@ -901,7 +911,12 @@ def _media_record_from_metadata(
         width=_int_or_none(meta.get("width")),
         height=_int_or_none(meta.get("height")),
         has_alpha=bool(meta.get("has_alpha", False)),
-        **_provider_wire(meta),
+        # The same defaults this record's own `source` / `model` fields use.
+        **_provider_wire(
+            meta,
+            source=str(meta.get("source") or "import"),
+            model=str(meta.get("model") or "import"),
+        ),
     )
 
 

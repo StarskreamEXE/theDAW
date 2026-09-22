@@ -1649,3 +1649,108 @@ def test_a_detection_with_no_provider_id_keeps_the_one_the_entry_has(tmp_path):
     meta = _read_meta(root, "entry_keeps_id")
     assert meta["provider"] == "udio"
     assert meta["provider_id"] == "kept-0001"
+
+
+# ---- metadata.json that carries no `source` -------------------------------
+
+
+def _seed_entry_without(root: Path, entry_id: str, meta: dict, *drop: str) -> Path:
+    """``_seed_entry`` with some keys removed from the written metadata.
+
+    ``backend/server.py`` writes a native generation's ``metadata.json``
+    without a ``source`` key at all, so the read path has to supply the same
+    default the record does rather than derive a provider from "".
+    """
+    entry_dir = _seed_entry(root, entry_id, meta)
+    payload = json.loads((entry_dir / "metadata.json").read_text(encoding="utf-8"))
+    for key in drop:
+        payload.pop(key, None)
+    (entry_dir / "metadata.json").write_text(json.dumps(payload), encoding="utf-8")
+    return entry_dir
+
+
+def test_a_generation_whose_metadata_omits_source_is_still_stable_audio(
+    tmp_path: Path,
+):
+    """The record defaults a missing ``source`` to 'generate', so the provider
+    derived beside it must read the same default: the wire label, the SQL
+    filter and the ``provider`` facet all have to say stable-audio for the
+    same entry."""
+    root = tmp_path / "lib"
+    root.mkdir(parents=True, exist_ok=True)
+    _seed_entry_without(root, "no_source_generate", {"model": "medium"}, "source")
+    store = LibraryStore(root)
+
+    record = store.get_entry("no_source_generate")
+    assert record is not None
+    assert record.source == "generate"
+    assert record.provider == "stable-audio"
+    assert record.provider_label == "Stable Audio"
+    assert record.provider_is_ai is True
+    assert _ids(store, provider="stable-audio") == {"no_source_generate"}
+    assert _ids(store, provider="thedaw") == set()
+
+
+def test_a_media_entry_whose_metadata_omits_source_is_still_an_import(
+    tmp_path: Path,
+):
+    """The media record defaults a missing ``source`` to 'import'; the
+    provider derived beside it reads the same default."""
+    root = tmp_path / "lib"
+    root.mkdir(parents=True, exist_ok=True)
+    entry_dir = _seed_entry_without(
+        root,
+        "no_source_media",
+        {"kind": "image", "filename": "still.png", "model": ""},
+        "source",
+    )
+    (entry_dir / "still.png").write_bytes(b"")
+    store = LibraryStore(root)
+
+    record = store.get_entry("no_source_media")
+    assert record is not None
+    assert record.source == "import"
+    assert record.provider == "import"
+    assert record.provider_label == "Imported"
+    assert record.provider_is_ai is False
+    assert _ids(store, provider="import") == {"no_source_media"}
+    assert _ids(store, provider="thedaw") == set()
+
+
+def test_the_sql_else_arm_answers_thedaw_for_a_blank_source(tmp_path: Path):
+    """Every writer here spells a falsy ``source`` as 'generate', so the two
+    ``FALLBACK_PARITY_ROWS`` with no source are skipped above. The column can
+    still hold '' -- a hand-edited row, a future writer -- and the ELSE arm is
+    what answers for it, so the row is inserted directly to prove it.
+
+    ``source`` is ``NOT NULL``, so a NULL row cannot exist in the table; the
+    NULL half of the same arm is asserted on the shared expression itself, a
+    line below.
+    """
+    from backend.modules.library.db import LibraryDB, PROVIDER_FALLBACK_SQL
+
+    db = LibraryDB(tmp_path / "library.db", enable_fts=False)
+    db._conn.execute(
+        "INSERT INTO entries (id, kind, title, model, source, provider, "
+        "created_at, updated_at, metadata_json) "
+        "VALUES ('blank_source', 'audio', 'blank_source', 'anything', '', "
+        "NULL, 1.0, 1.0, '{}')"
+    )
+    db._conn.commit()
+
+    assert set(db.list_entry_ids(EntryFilters(provider="thedaw"), 10)) == {
+        "blank_source"
+    }
+    assert set(db.list_entry_ids(EntryFilters(provider="stable-audio"), 10)) == set()
+    assert db.facet_counts(EntryFilters(), ["provider"])["provider"] == [
+        {"value": "thedaw", "count": 1}
+    ]
+
+    # The same arm over a NULL source and a NULL model, on the same expression
+    # text the indexes and the filter are built from.
+    null_row = db._conn.execute(
+        f"SELECT {PROVIDER_FALLBACK_SQL} AS provider FROM "
+        "(SELECT NULL AS source, NULL AS model) e"
+    ).fetchone()
+    assert null_row["provider"] == "thedaw"
+    db.close()

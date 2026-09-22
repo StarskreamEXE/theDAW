@@ -128,7 +128,12 @@ GENERATOR_SIGNATURES: dict[str, str] = {
     "musicgen": "musicgen",
     "stable_audio": "stable-audio",
     "stable-audio": "stable-audio",
-    "thedaw": "stable-audio",
+    # Made IN theDAW, origin unspecified -- NOT the Stable Audio generator.
+    # Matches the `thedaw` rule in `provider.py` and the fallback's last arm
+    # in `db.py`. The explicit "stable_audio" / "stable-audio" spellings above
+    # are tried first, so a theDAW export that names the model still lands on
+    # stable-audio.
+    "thedaw": "thedaw",
     "audacity": "audacity",
     "logic pro": "logic-pro",
     "ableton": "ableton-live",
