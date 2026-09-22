@@ -108,6 +108,13 @@ _STORED_PROVIDERS = ("paper-lantern", "north-dial", "quiet-shelf")
 RARE_PROVIDER = "brass-kettle"
 _RARE_EVERY = 3_001
 
+#: A word every title carries ("fixture track 000123"), so a ``q=`` probe
+#: matches all 20,000 rows -- the worst case for a search, and the only weight
+#: at which the non-fts5 fallback's unindexed ``LIKE`` over every row's
+#: ``lyrics`` shows up. Exported so the guard cannot probe with a word this
+#: module stopped writing.
+SEARCH_WORD = "fixture"
+
 #: Songs that got separated / converted / engraved. A handful of each, so the
 #: ``/_all/*`` routes answer about hundreds of rows rather than three without
 #: the fixture paying for thousands of child rows it never reads.
@@ -547,6 +554,7 @@ __all__ = [
     "METADATA_PAD_BYTES",
     "RARE_ID",
     "RARE_PROVIDER",
+    "SEARCH_WORD",
     "STANDALONE",
     "STEM_ID",
     "ScaleLibrary",

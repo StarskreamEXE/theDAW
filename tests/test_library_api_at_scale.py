@@ -37,6 +37,18 @@ hardware does.
 
 Every id, title, provider slug and path here is invented by the fixture
 module. Nothing reads, writes or names anything in anyone's library.
+
+**Run it with a basetemp on a drive that has room.** The fixture writes about
+400 MB (a ~340 MB database plus a 20,000-directory tree), and pytest's default
+basetemp is on the system drive, which is how a run of this module once filled
+a developer's ``C:`` to zero. Pass the flag::
+
+    uv run pytest --basetemp=D:/theDAW-pytest-tmp/s3r2 tests/test_library_api_at_scale.py
+
+On Windows the module refuses to build on ``%SystemDrive%`` -- it skips, loudly,
+naming that flag -- rather than filling it (see :func:`_require_roomy_basetemp`).
+The check is Windows-only: on the Linux runner, whose single drive is its root
+filesystem and whose image is thrown away after the job, nothing changes.
 """
 
 from __future__ import annotations
@@ -54,6 +66,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from backend.lib import known_paths
 from backend.modules.assets import router as assets_router_module
 from backend.modules.library import router as library_router_module
 from backend.modules.lineagescale import router as lineagescale_router_module
@@ -62,6 +75,7 @@ from tests.library_scale_fixture import (
     ENTRIES,
     HUB_ID,
     RARE_PROVIDER,
+    SEARCH_WORD,
     STEM_ID,
     ScaleLibrary,
     build_scale_library,
@@ -96,11 +110,6 @@ SIZE_ALLOWLIST: dict[str, str] = {
         "which is exactly the shape that crashed the browser at 194,508 -- "
         "pinned by its own test below rather than capped here"
     ),
-    f"{LIBRARY_PREFIX}/entries/ids": (
-        "a bare id list the client needs in full for select-all; 20,000 ids "
-        "at ~14 bytes is ~0.3 MB, and it carries no per-entry payload that "
-        "could grow"
-    ),
     f"{LIBRARY_PREFIX}/{{entry_id}}/bundle": (
         "a zip of one entry AND the vendored Unity package: its size is a "
         "function of what is checked into this repository, not of how big "
@@ -126,14 +135,21 @@ BLOB_COLUMNS = (
 )
 
 #: The routes rule 3 covers: everything whose cost must be independent of how
-#: fat a row is.
+#: fat a row is. Each list route is probed searched as well as unsearched:
+#: ``LibraryDB._search_clause`` has a documented non-fts5 fallback whose
+#: ``LIKE`` on ``json_extract(e.metadata_json, '$.lyrics')`` opens every row's
+#: blob, and an unsearched sweep never reaches it. :data:`SEARCH_WORD` is in
+#: every fixture title, so the searched probes match all 20,000 rows.
 LIST_ROUTE_PATHS = (
     f"{LIBRARY_PREFIX}/entries?limit=50",
     f"{LIBRARY_PREFIX}/entries?limit=50&provider={RARE_PROVIDER}",
     f"{LIBRARY_PREFIX}/entries?limit=50&sort=plays_desc",
     f"{LIBRARY_PREFIX}/entries?limit=50&favorite=true",
+    f"{LIBRARY_PREFIX}/entries?limit=50&q={SEARCH_WORD}",
     f"{LIBRARY_PREFIX}/entries/ids",
+    f"{LIBRARY_PREFIX}/entries/ids?q={SEARCH_WORD}",
     f"{LIBRARY_PREFIX}/entries/facets?fields=model,provider,source,kind",
+    f"{LIBRARY_PREFIX}/entries/facets?fields=provider&q={SEARCH_WORD}",
     f"{LIBRARY_PREFIX}/entries/facets?fields=provider&provider={RARE_PROVIDER}",
     f"{LINEAGE_PREFIX}/summary",
     f"{LINEAGE_PREFIX}/rankings",
@@ -146,15 +162,77 @@ def _normalise(statement: str) -> str:
     return " ".join(statement.lower().split())
 
 
+def _match_total(path: str, body: Any) -> int:
+    """How many rows a list route's answer says its filters matched.
+
+    ``/entries`` and ``/entries/ids`` both report ``total``; ``/entries/facets``
+    reports counts per value, which sum to the matched set (its cap applies per
+    field, and a probe of one field cannot reach it here).
+    """
+    if "/entries/facets" in path:
+        return sum(
+            int(value["count"])
+            for values in body["facets"].values()
+            for value in values
+        )
+    return int(body["total"])
+
+
+#: Any column whose name ends in ``_json`` -- the blob columns of
+#: :data:`BLOB_COLUMNS` and whichever one a table grows next.
+_JSON_COLUMN_RE = re.compile(r"\b\w*_json\b")
+
+
+def _names_a_json_column_outside_the_projection(statement: str) -> bool:
+    """A blob column named somewhere OTHER than the select list.
+
+    Both exceptions below are about a projection over rows already chosen: the
+    page's ~50 whole rows, or the page's ids. Neither is about a PREDICATE that
+    opens a blob, and a predicate is what decides how many rows get read. The
+    non-fts5 search fallback is exactly that shape -- ``SELECT e.* ... WHERE
+    (... json_extract(e.metadata_json, '$.lyrics') LIKE ?) ... LIMIT ? OFFSET
+    ?`` -- and it opens all 20,000 blobs to return 50 rows, so the page shape
+    must not buy it an exception.
+
+    The shipped page statement stays clean: ``list_entries_page``'s only
+    non-trivial predicate is ``PROVIDER_SQL``, and that expression (``db.py``,
+    ``_PROVIDER_RESOLVED_TEMPLATE`` over ``_PROVIDER_FALLBACK_TEMPLATE``) reads
+    ``e.provider``, ``e.model`` and ``e.source`` and nothing else -- the whole
+    reason the provider column exists. Read it before relaxing this.
+    """
+    # Every select list replaced by a marker that keeps the SQL's shape and
+    # carries no column name, so `json_extract(metadata_json, ?) AS j0` in a
+    # projection is invisible here and the same call in a WHERE is not.
+    remainder = _SELECT_LIST_RE.sub(" select from ", statement)
+    return bool(_JSON_COLUMN_RE.search(remainder))
+
+
+#: A ``LIMIT`` of any kind, and the paged list's ``LIMIT ? OFFSET ?`` shape.
+#: The second is what ``list_entries_page`` (``db.py``) actually emits, so an
+#: exception written against it cannot be borrowed by a statement that merely
+#: contains the word "limit" somewhere -- in a column name, a string literal,
+#: or a subquery that bounds nothing the outer scan does.
+_LIMIT_RE = re.compile(r"\blimit\b\s*(?:\?|\d+)")
+_PAGE_LIMIT_RE = re.compile(r"\blimit\b\s*(?:\?|\d+)\s*offset\s*(?:\?|\d+)")
+
+
 def _is_paged_list_row_read(statement: str) -> bool:
     """The paged list's OWN row read: the page's ~50 rows, and only those.
 
     ``LibraryDB`` projects chosen metadata keys (lyrics, and friends) for the
     ids already on the page with ``json_extract(metadata_json, ?) AS j<n>``.
     That is bounded by the page size, not by the table, which is the whole
-    distinction this exception draws.
+    distinction this exception draws -- so the bound is required here rather
+    than assumed: the ids are named (``WHERE id IN (...)``) or the statement
+    carries a ``LIMIT``. The same projection over the whole table, which is
+    what a new caller reaching for it without a page would write, opens 20,000
+    blobs and is not this exception.
     """
-    return "json_extract(metadata_json" in statement and " as j" in statement
+    if "json_extract(metadata_json" not in statement or " as j" not in statement:
+        return False
+    if _names_a_json_column_outside_the_projection(statement):
+        return False
+    return "where id in" in statement or bool(_LIMIT_RE.search(statement))
 
 
 def _is_single_entry_read(statement: str) -> bool:
@@ -166,9 +244,21 @@ def _is_single_entry_read(statement: str) -> bool:
     return "from entries" in statement and "where id =" in statement
 
 
-#: ``SELECT *`` or ``SELECT <alias>.*``. ``count(*)`` and a named column
-#: list both fail to match, which is the point.
-_ENTRIES_STAR_RE = re.compile(r"select\s+(?:[a-z_][a-z_0-9]*\.)?\*")
+#: The select list: everything between ``SELECT`` and its ``FROM``. Non-greedy
+#: and found repeatedly, so a subquery's own select list is examined as itself
+#: rather than swallowing the outer one.
+_SELECT_LIST_RE = re.compile(r"\bselect\b(.*?)\bfrom\b")
+
+#: A star ANYWHERE in a select list -- ``*``, ``e.*``, or ``e.id, e.*``, which
+#: an anchored ``select\s+\*`` pattern reads straight past. ``count(*)`` does
+#: not match (the lookbehind excludes a star that opens a function's argument
+#: list) and neither does a named column list, which is the point.
+_STAR_RE = re.compile(r"\.\*|(?<![\w.(])\*")
+
+#: ``FROM entries``, the table -- bounded so it is not also satisfied by
+#: ``FROM entries_fts``, the contentless fts5 index, which holds no blob and
+#: whose rows are not rows of ``entries``.
+_ENTRIES_TABLE_RE = re.compile(r"\bfrom\s+entries\b")
 
 
 def _selects_every_entries_column(statement: str) -> bool:
@@ -181,18 +271,33 @@ def _selects_every_entries_column(statement: str) -> bool:
     cannot see them, and a facet or a count quietly routed through
     ``list_entries()`` would read 20,000 blobs and pass.
     """
-    return "from entries" in statement and bool(_ENTRIES_STAR_RE.search(statement))
+    if not _ENTRIES_TABLE_RE.search(statement):
+        return False
+    return any(
+        _STAR_RE.search(select_list)
+        for select_list in _SELECT_LIST_RE.findall(statement)
+    )
 
 
 def _is_paged_star_row_read(statement: str) -> bool:
     """The paged list's whole-row read, bounded by its own ``LIMIT``.
 
     ``list_entries_page`` is ``SELECT e.* ... LIMIT ? OFFSET ?``: whole rows,
-    blob and all, for the page's ~50 ids. The ``LIMIT`` is the entire reason
-    it is allowed, so this exception requires one -- ``list_entries()``'s
-    unbounded ``SELECT * FROM entries`` carries none and stays an offender.
+    blob and all, for the page's ~50 ids. The page is the entire reason it is
+    allowed, so a blob column named anywhere but the select list forfeits it
+    (:func:`_names_a_json_column_outside_the_projection`): a WHERE that opens
+    every row's blob to pick 50 is the 13.3 s bug with a LIMIT bolted on. Past
+    that this exception requires the page's shape -- ``LIMIT`` followed
+    by ``OFFSET``, both bound -- and not merely the word "limit" somewhere in
+    the statement, which any whole-table ``SELECT e.*`` can carry in a column
+    name or a literal. ``list_entries()``'s unbounded ``SELECT * FROM
+    entries`` has neither and stays an offender.
     """
-    return _selects_every_entries_column(statement) and "limit" in statement
+    if _names_a_json_column_outside_the_projection(statement):
+        return False
+    return _selects_every_entries_column(statement) and bool(
+        _PAGE_LIMIT_RE.search(statement)
+    )
 
 
 #: The exception set, explicit and closed. Anything else that opens a blob
@@ -229,7 +334,11 @@ def _blob_offenders(statements: list[str]) -> list[str]:
 #: callback sees them once normalised. That cache is a module singleton, so a
 #: warm slot skips both passes -- and a trace test that only checks "no blob
 #: column" then passes having exercised nothing at all. The trace test
-#: asserts both of these appeared.
+#: asserts both of these appeared, and compares them for EQUALITY: the first
+#: is a prefix of ``_link_fetcher``'s bounded ``... WHERE from_id IN (?, ...)``
+#: (``lineagescale/router.py``), which neighbourhood and relatives run on
+#: every call, so a substring test is satisfied by a warm cache and proves
+#: nothing about the whole-table pass it is named for.
 LINEAGE_STATS_STREAMS = (
     "select from_id, to_id, kind from relations",
     "select id, created_at from entries",
@@ -341,6 +450,29 @@ _REVISION_AT_START: list[int] = []
 # ---------------------------------------------------------------------------
 
 
+def _require_roomy_basetemp(base: Path) -> None:
+    """Refuse to build ~400 MB on the Windows system drive.
+
+    Nothing in pytest pins where ``tmp_path_factory`` lands, and the default is
+    under the system drive's temp directory -- which is how a run of this module
+    once took a developer's ``C:`` to zero bytes free. On Windows, where that
+    drive is the one with the OS and the page file on it, an unset
+    ``--basetemp`` skips the module and says which flag to pass. Elsewhere (the
+    Linux runner, whose root filesystem is the only one it has and whose image
+    is discarded after the job) the check does not apply.
+    """
+    if os.name != "nt":
+        return
+    system_drive = os.environ.get("SystemDrive", "C:").rstrip("\\/")
+    if base.resolve().drive.upper() != system_drive.upper():
+        return
+    pytest.skip(
+        f"this fixture writes ~400 MB and the basetemp is on {system_drive} "
+        "(the system drive). Re-run with a basetemp on another drive, e.g. "
+        "--basetemp=D:/theDAW-pytest-tmp/s3r2, and delete it afterwards."
+    )
+
+
 @pytest.fixture(scope="module")
 def scale_library(tmp_path_factory: pytest.TempPathFactory) -> Iterator[ScaleLibrary]:
     """The 20,000-entry library, built once for the whole module.
@@ -351,6 +483,7 @@ def scale_library(tmp_path_factory: pytest.TempPathFactory) -> Iterator[ScaleLib
     the same ``finally`` -- ``remove_database`` only ever knew about the
     database -- rather than waiting for whoever clears the basetemp.
     """
+    _require_roomy_basetemp(tmp_path_factory.getbasetemp())
     root = tmp_path_factory.mktemp("library-at-scale")
     built: ScaleLibrary | None = None
     try:
@@ -371,10 +504,18 @@ def client(scale_library: ScaleLibrary) -> Iterator[TestClient]:
     the store, which opens the database and may backfill an index. That cost
     is real but it is a cold-start cost, and charging it to whichever route
     happens to be alphabetically first would make the budgets meaningless.
+
+    The known-paths store is redirected into the fixture root as well. The
+    assets routes in the sweep resolve every row's installed path, which reads
+    ``paths.data_path("known_paths.json")`` -- the developer's own file, with
+    the folders they have opened in it. A guard has no business reading that,
+    and a probe whose answer depends on it measures a different library on
+    every machine.
     """
     with pytest.MonkeyPatch.context() as patch:
         patch.setenv("theDAW_GENERATIONS_DIR", str(scale_library.root))
         patch.setattr(library_router_module, "_store", None)
+        known_paths.set_store_path_for_tests(scale_library.root / "known_paths.json")
         with TestClient(_build_app()) as test_client:
             test_client.get(f"{LIBRARY_PREFIX}/summary")
             _REVISION_AT_START.append(
@@ -383,6 +524,7 @@ def client(scale_library: ScaleLibrary) -> Iterator[TestClient]:
             try:
                 yield test_client
             finally:
+                known_paths.set_store_path_for_tests(None)
                 store = library_router_module._store
                 database = getattr(store, "db", None)
                 if database is not None:
@@ -512,11 +654,40 @@ def test_the_read_probes_did_not_write(client: TestClient) -> None:
     also means the budgets above all measured the same library.
     """
     assert _REVISION_AT_START, "the client fixture never recorded a revision"
+    # Selected on its own (``-k read_probes``) the comparison below is
+    # tautological: no probe ran, so of course nothing was written. The sweep
+    # records one entry per case, so requiring them proves the thing this test
+    # claims. Other tests add keys of their own, hence >= rather than ==.
+    assert len(_MEASURED) >= len(ROUTE_CASES), (
+        f"only {len(_MEASURED)} of {len(ROUTE_CASES)} probes ran before this "
+        "test, so it would pass without any GET having been made. Run the "
+        "module, or select this test together with "
+        "test_every_get_route_answers_within_budget."
+    )
     store = library_router_module.get_store()
     assert store.db.library_revision() == _REVISION_AT_START[0], (
         "a GET committed a write during the probe sweep. A read probe must "
         "not: it makes the sweep order matter, and it means one of these "
         "routes is doing repair work on a page load."
+    )
+
+
+def test_the_probes_read_no_known_paths_but_the_fixtures(
+    client: TestClient, scale_library: ScaleLibrary
+) -> None:
+    """The assets routes in the sweep must not read the developer's own file.
+
+    ``/api/assets`` resolves each row's installed path through
+    ``known_paths.installed_asset_path``, which without a redirect opens
+    ``paths.data_path("known_paths.json")``: the real file, holding the folders
+    this machine's user has browsed to. The client fixture points the store at
+    the fixture root; this is the assertion that it still does.
+    """
+    expected = (scale_library.root / "known_paths.json").resolve()
+    resolved = Path(known_paths._store_path()).resolve()  # noqa: SLF001
+    assert resolved == expected, (
+        f"the known-paths store resolved to {resolved}, not the fixture's "
+        f"{expected}: the assets probes are reading a real user's file"
     )
 
 
@@ -567,6 +738,28 @@ def test_the_blob_rule_flags_a_blob_read_and_spares_the_exceptions() -> None:
         "FROM entries e ORDER BY e.created_at DESC",
         "SELECT * FROM entries ORDER BY created_at DESC",
         "SELECT e.* FROM entries e WHERE e.source = ? ORDER BY e.created_at DESC",
+        # a star that is not the first thing after SELECT: the whole row, plus
+        # a named column, which an anchored pattern reads straight past
+        "SELECT e.id, e.* FROM entries e ORDER BY e.created_at DESC",
+        # the word "limit" without the page: a whole-table read that borrows
+        # the paged exception by naming a column
+        "SELECT e.* FROM entries e WHERE e.play_limit IS NULL",
+        # the page's projection over the whole table instead of the page's ids
+        "SELECT id, json_extract(metadata_json, ?) AS j0 FROM entries",
+        # the non-fts5 search fallback's PAGE: the page shape is intact and
+        # the select list is just the star, but the predicate opens all 20,000
+        # blobs to return 50 rows
+        "SELECT e.* FROM entries e WHERE (e.title LIKE ? OR COALESCE(CASE WHEN "
+        "json_valid(e.metadata_json) THEN json_extract(e.metadata_json, "
+        "'$.lyrics') END, '') LIKE ?) ORDER BY e.created_at DESC LIMIT ? OFFSET ?",
+        # the same fallback in the paged list's own projection shape: the ids
+        # are named, but the predicate is still a whole-table blob read
+        "SELECT id, json_extract(metadata_json, ?) AS j0 FROM entries WHERE "
+        "json_extract(metadata_json, '$.lyrics') LIKE ? AND id IN (?, ?)",
+        # the non-fts5 search fallback's LIKE, which opens every row's lyrics
+        "SELECT COUNT(*) AS c FROM entries e WHERE (e.title LIKE ? OR "
+        "COALESCE(CASE WHEN json_valid(e.metadata_json) THEN "
+        "json_extract(e.metadata_json, '$.lyrics') END, '') LIKE ?)",
     ]
     allowed = [
         # the paged list's projection: bounded by the ids on the page
@@ -581,6 +774,14 @@ def test_the_blob_rule_flags_a_blob_read_and_spares_the_exceptions() -> None:
         "SELECT COUNT(*) FROM entries",
         "SELECT id, created_at FROM entries",
         "SELECT provider, COUNT(*) FROM entries GROUP BY provider",
+        # the contentless fts5 index is not the entries table: its rows hold
+        # no blob, so a star over it reads nothing this rule is about
+        "SELECT * FROM entries_fts WHERE entries_fts MATCH ?",
+        # the paged list, searched: the outer select list is the star, the
+        # subquery's is a rowid, and the page shape is intact
+        "SELECT e.* FROM entries e WHERE e.rowid IN (SELECT rowid FROM "
+        "entries_fts WHERE entries_fts MATCH ?) ORDER BY e.created_at DESC "
+        "LIMIT ? OFFSET ?",
     ]
     assert _blob_offenders(offending) == [_normalise(s) for s in offending]
     assert _blob_offenders(allowed) == []
@@ -600,7 +801,16 @@ def test_the_list_routes_never_open_a_blob_column(
         for path in LIST_ROUTE_PATHS:
             # 200, not "under 500": a route that rejected the probe as a 422
             # runs no SQL at all, and an empty trace proves nothing.
-            assert client.get(path).status_code == 200, path
+            response = client.get(path)
+            assert response.status_code == 200, path
+            if f"q={SEARCH_WORD}" in path:
+                # Same reasoning one step further in: a search that matched
+                # nothing is a predicate the planner may have answered from an
+                # index without ever reaching the fallback's LIKE.
+                assert _match_total(path, response.json()) > 0, (
+                    f"{path} matched no row, so it priced no search: "
+                    f"{SEARCH_WORD!r} is in every title the fixture writes"
+                )
 
     assert statements, "the trace callback saw nothing, so it proved nothing"
     normalised = [_normalise(s) for s in statements]
@@ -612,7 +822,11 @@ def test_the_list_routes_never_open_a_blob_column(
     # a few bounded entry reads, and a "no blob column" assertion passes
     # having priced nothing. Both whole-table passes must appear.
     for stream in LINEAGE_STATS_STREAMS:
-        assert any(stream in s for s in normalised), (
+        # Equality, not containment: see LINEAGE_STATS_STREAMS -- the bounded
+        # link fetch starts with the same 45 characters as the whole-table
+        # pass, so `in` answers yes for a route that read nothing but an
+        # index.
+        assert stream in normalised, (
             f"the lineage stats pass never ran: no statement was {stream!r}. "
             "That cache is a module singleton and the sweep above warms it, "
             "so a trace without this proves nothing about /summary or "
