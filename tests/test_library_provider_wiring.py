@@ -403,15 +403,13 @@ def test_a_thedaw_frame_never_refiles_a_native_generation(
     assert "provider" not in _read_meta(store.root, "entry_native")
 
 
-def test_a_thedaw_frame_does_not_outrank_an_import_either(
-    client_with_root, tmp_path, write_spy
-):
-    """Same rule, the other derivation that beats the fallback.
+def test_a_thedaw_frame_outranks_an_import(client_with_root, tmp_path, write_spy):
+    """The other side of the same clause: it turns on the derivation's ROLE.
 
-    'import' is a real answer about where the row came from, so a theDAW frame
-    inside the file does not replace it. Only an entry whose derivation IS the
-    fallback has nothing to lose, and for that entry the detection agrees with
-    what it is already shown as -- so this rule never produces a write.
+    'import' says the row came from outside and nothing about who made the
+    music; "made in theDAW" is more specific and neither is claimed to be a
+    generator, so here the frame is the better answer -- applied, and persisted
+    so the ``provider=`` filter files the entry where it is shown.
     """
     _seed_entry(tmp_path, "entry_imported", {"source": "import", "model": "imported"})
     store = library_router_module.get_store()
@@ -419,13 +417,13 @@ def test_a_thedaw_frame_does_not_outrank_an_import_either(
     store.db.upsert_analysis(
         "entry_imported", {"embedded_tags": {"encoder": "theDAW 1.0"}}
     )
-    before = _provider_column(store, "entry_imported")
 
     body = client_with_root.get("/api/library/entries/entry_imported").json()
-    assert body["provider"] == "import"
+    assert body["provider"] == "thedaw"
+    assert body["provider_label"] == "theDAW"
     assert body["provider_is_ai"] is False
-    assert write_spy == []
-    assert _provider_column(store, "entry_imported") == before
+    assert [call for call in write_spy if "entry_imported" in call]
+    assert _provider_column(store, "entry_imported") == "thedaw"
 
 
 def test_a_real_provider_frame_still_outranks_a_derivation(
@@ -449,6 +447,175 @@ def test_a_real_provider_frame_still_outranks_a_derivation(
     assert body["provider_id"] == SUNO_ID
     assert [call for call in write_spy if "entry_suno_gen" in call]
     assert _provider_column(store, "entry_suno_gen") == "suno"
+
+
+#: An invented tool name no rule claims and no generic-encoder marker matches,
+#: so ``detect_provider`` mints a slug for it (step 4). Names nothing real.
+UNKNOWN_TOOL = "Acme Mastering Suite"
+UNKNOWN_TOOL_SLUG = "acme-mastering-suite"
+
+
+def test_a_minted_tool_slug_never_refiles_a_generation(
+    client_with_root, tmp_path, write_spy
+):
+    """A tool frame describes what TOUCHED the file, not what made the music.
+
+    Step 4 of ``detect_provider`` mints a slug from any tool string it does not
+    recognise, and that slug is non-AI. An entry the columns call a generation
+    already has a better answer, and it is an AI one, so a bounce through some
+    unknown mastering tool must not turn it into a non-AI provider in the
+    filter, the facet and the badge -- nor be persisted there.
+    """
+    _seed_entry(tmp_path, "entry_tooled", {"source": "generate", "model": "medium"})
+    store = library_router_module.get_store()
+    assert store.db is not None
+    store.db.upsert_analysis(
+        "entry_tooled", {"embedded_tags": {"encoder": UNKNOWN_TOOL}}
+    )
+    before = _provider_column(store, "entry_tooled")
+
+    single = client_with_root.get("/api/library/entries/entry_tooled").json()
+    assert single["provider"] == "stable-audio"
+    assert single["provider_is_ai"] is True
+
+    listed = client_with_root.get("/api/library/entries?limit=10").json()["entries"]
+    assert [e["provider"] for e in listed] == ["stable-audio"]
+
+    assert write_spy == []
+    assert _provider_column(store, "entry_tooled") == before
+    assert "provider" not in _read_meta(store.root, "entry_tooled")
+
+
+def test_a_minted_tool_slug_still_answers_for_an_import(
+    client_with_root, tmp_path, write_spy
+):
+    """Non-AI over a non-AI derivation is fine: 'import' says nothing about
+    who made the track, and the file at least names the tool. The rule only
+    protects an AI derivation."""
+    _seed_entry(tmp_path, "entry_tooled_imp", {"source": "import", "model": "imported"})
+    store = library_router_module.get_store()
+    assert store.db is not None
+    store.db.upsert_analysis(
+        "entry_tooled_imp", {"embedded_tags": {"encoder": UNKNOWN_TOOL}}
+    )
+
+    body = client_with_root.get("/api/library/entries/entry_tooled_imp").json()
+    assert body["provider"] == UNKNOWN_TOOL_SLUG
+    assert body["provider_label"] == UNKNOWN_TOOL
+    assert body["provider_is_ai"] is False
+    assert [call for call in write_spy if "entry_tooled_imp" in call]
+    assert _provider_column(store, "entry_tooled_imp") == UNKNOWN_TOOL_SLUG
+
+
+def test_a_thedaw_detection_over_a_thedaw_derivation_writes_nothing(
+    client_with_root, tmp_path, write_spy
+):
+    """The pass-through branch, pinned.
+
+    Where the derivation IS the fallback the detection is allowed through --
+    and it agrees with what the entry is already shown as, so nothing about
+    the four wire fields changed and no write follows. This is the claim the
+    rank rule's docstring makes; without a test it is only a claim.
+    """
+    _seed_entry(tmp_path, "entry_set", {"source": "performance-set", "model": "medium"})
+    store = library_router_module.get_store()
+    assert store.db is not None
+    store.db.upsert_analysis("entry_set", {"embedded_tags": {"encoder": "theDAW 1.0"}})
+    before = _provider_column(store, "entry_set")
+
+    body = client_with_root.get("/api/library/entries/entry_set").json()
+    assert body["provider"] == "thedaw"
+    assert body["provider_is_ai"] is False
+    assert write_spy == []
+    assert _provider_column(store, "entry_set") == before
+
+
+# ---- Import-time labeling under the same rank rule -------------------------
+
+
+def _import_with_encoder(store: LibraryStore, tmp_path: Path, encoder: str, **meta):
+    return store.import_blob(
+        audio_bytes=_tagged_mp3(tmp_path / "bounce.mp3", encoder=encoder),
+        filename="bounce.mp3",
+        mime_type="audio/mpeg",
+        metadata=dict(meta),
+    )
+
+
+def test_import_of_a_generation_ignores_a_thedaw_frame(tmp_path: Path):
+    """The import labeler applies the SAME rank rule as the read path.
+
+    A theDAW bounce re-imported as a generation keeps the generation's own
+    label: no provider fields in its ``metadata.json``, and no ``thedaw`` tag
+    inviting the tag filter to disagree with the provider filter.
+    """
+    store = LibraryStore(tmp_path / "lib")
+    record = _import_with_encoder(store, tmp_path, "theDAW 1.0", source="generate")
+
+    assert record.provider == "stable-audio"
+    assert record.provider_is_ai is True
+    assert record.tags == []
+    meta = _read_meta(store.root, record.id)
+    assert "provider" not in meta
+    assert "provider_label" not in meta
+    assert "thedaw" not in (meta.get("tags") or [])
+
+
+def test_import_of_a_generation_ignores_a_minted_tool_slug(tmp_path: Path):
+    store = LibraryStore(tmp_path / "lib")
+    record = _import_with_encoder(store, tmp_path, UNKNOWN_TOOL, source="generate")
+
+    assert record.provider == "stable-audio"
+    assert record.provider_is_ai is True
+    assert record.tags == []
+    assert "provider" not in _read_meta(store.root, record.id)
+
+
+def test_import_with_a_thedaw_frame_beats_the_import_label(tmp_path: Path):
+    """Clause (a) turns on the derivation's ROLE, not on the slug.
+
+    'import' is not an AI derivation, so a theDAW frame is the better answer
+    and is stored and tagged -- the same answer the router gives the same entry
+    on a read (``test_a_thedaw_frame_outranks_an_import``), which is the point
+    of both labelers asking one function.
+    """
+    store = LibraryStore(tmp_path / "lib")
+    record = _import_with_encoder(store, tmp_path, "theDAW 1.0", source="import")
+
+    assert record.provider == "thedaw"
+    assert record.provider_label == "theDAW"
+    assert record.provider_is_ai is False
+    assert "thedaw" in record.tags
+    assert _read_meta(store.root, record.id)["provider"] == "thedaw"
+
+
+def test_import_with_a_minted_tool_frame_beats_the_import_label(tmp_path: Path):
+    """The import labeler's positive case for a non-AI detection: an unknown
+    tool names something, and 'import' does not."""
+    store = LibraryStore(tmp_path / "lib")
+    record = _import_with_encoder(store, tmp_path, UNKNOWN_TOOL, source="import")
+
+    assert record.provider == UNKNOWN_TOOL_SLUG
+    assert record.provider_label == UNKNOWN_TOOL
+    assert record.provider_is_ai is False
+    assert UNKNOWN_TOOL_SLUG in record.tags
+    assert _read_meta(store.root, record.id)["provider"] == UNKNOWN_TOOL_SLUG
+
+
+def test_import_of_a_generation_still_takes_a_real_service_frame(tmp_path: Path):
+    """Unchanged: a named service outranks the derivation either way."""
+    store = LibraryStore(tmp_path / "lib")
+    record = store.import_blob(
+        audio_bytes=_suno_bytes(tmp_path),
+        filename="song.mp3",
+        mime_type="audio/mpeg",
+        metadata={"source": "generate"},
+    )
+
+    assert record.provider == "suno"
+    assert record.provider_is_ai is True
+    assert record.provider_id == SUNO_ID
+    assert "suno" in record.tags
 
 
 # ---- List filter -----------------------------------------------------------
@@ -1847,7 +2014,6 @@ def test_the_source_default_never_reaches_the_step_that_fills_the_column(
     on_disk = _read_meta(root, "no_source_probe")
     assert "source" not in on_disk
     assert seen and all("source" not in meta for meta in seen)
-    assert seen[0] == on_disk
 
     # And the two halves still agree: the metadata names no provider, so the
     # column is NULL and the fallback answers for the row -- which is the same
@@ -1858,6 +2024,27 @@ def test_the_source_default_never_reaches_the_step_that_fills_the_column(
     assert row is not None
     assert row["provider"] is None
     assert _ids(store, provider="stable-audio") == {"no_source_probe"}
+
+
+def test_a_stored_source_of_suno_answers_suno_on_the_wire_and_in_the_column():
+    """The one rule today that reads ``meta["source"]``, on both sides.
+
+    ``provider._legacy_suno`` treats a stored ``source`` of "suno" as evidence,
+    so a dict that CARRIES one has to get the same answer from the wire
+    derivation and from the function that fills the ``provider`` column --
+    which is what handing both the same unmodified dict buys.
+    """
+    from backend.modules.library.db import resolved_provider_slug
+    from backend.modules.library.store import _provider_wire
+
+    meta = {"id": "legacy_suno_dict", "model": "medium", "source": "suno"}
+    wire = _provider_wire(meta, source="generate", model="medium")
+
+    assert wire["provider"] == "suno"
+    assert wire["provider_is_ai"] is True
+    assert resolved_provider_slug(meta) == "suno"
+    # And the dict is still the caller's: nothing was injected into it.
+    assert meta == {"id": "legacy_suno_dict", "model": "medium", "source": "suno"}
 
 
 def test_the_sql_else_arm_answers_thedaw_for_a_blank_source(tmp_path: Path):

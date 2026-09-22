@@ -44,6 +44,7 @@ from .provider import (
     ProviderInfo,
     curated_fields,
     detect_provider,
+    detection_outranks,
     provider_wire_fields,
 )
 from backend.lib import paths
@@ -623,12 +624,25 @@ def _apply_provider_labels(
 
     Shared by every import path, so a track uploaded through ``import_blob``
     and the same track registered in place come out labeled identically.
+
+    A detection the ``(model, source)`` derivation outranks
+    (:func:`~.provider.detection_outranks`, the same rule the read path's
+    ``router._derive_provider`` applies) writes NOTHING -- not the wire fields,
+    not the curated fields, not the provider tag. The entry keeps the label its
+    columns imply, which is the label the list filter, the facet and the badge
+    already show it under. ``record_meta`` is what the caller is about to
+    write, so its ``model`` / ``source`` are the columns the row will have.
     """
     # Bounded up front, so the slug stored, the slug tagged and the slug on
     # the wire are one string -- and a detection whose slug bounds away to
     # nothing labels nothing at all.
     info = bounded_provider_info(detect_provider(embedded, record_meta))
     if info is None:
+        return
+    derived = derived_provider_wire(record_meta.get("model"), record_meta.get("source"))
+    if not detection_outranks(
+        info, str(derived["provider"]), bool(derived["provider_is_ai"])
+    ):
         return
     record_meta.update(bounded_provider_wire_fields(info))
 

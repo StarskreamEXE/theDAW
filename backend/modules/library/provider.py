@@ -40,7 +40,9 @@ __all__ = [
     "ANALYTICS_KEY_PATTERNS",
     "CURATED_FIELDS",
     "GENERIC_TOOL_MARKERS",
+    "FALLBACK_PROVIDER",
     "GENERIC_TOOL_PREFIXES",
+    "ORIGIN_TOOL_FRAME",
     "PROVIDER_RULES",
     "PROVIDER_SLUG_MAX",
     "URL_KEY_PRIORITY",
@@ -48,6 +50,7 @@ __all__ = [
     "ProviderRule",
     "curated_fields",
     "detect_provider",
+    "detection_outranks",
     "is_analytics_key",
     "provider_wire_fields",
 ]
@@ -75,6 +78,20 @@ class ProviderInfo:
 
     evidence: str
     """The deciding tag, e.g. ``"generator=suno"``."""
+
+    origin: str = ""
+    """Which KIND of signal decided this, when a consumer has to rank the
+    answer against another one: :data:`ORIGIN_TOOL_FRAME` for a slug MINTED
+    from an unrecognised tool/encoder frame, "" for every answer that came
+    from a row of :data:`PROVIDER_RULES` (a named service, store or tool) or
+    from the entry's own stored label.
+
+    Not a wire field: :func:`provider_wire_fields` does not carry it and no
+    metadata stores it. It exists so :func:`detection_outranks` can tell "this
+    file names Suno" from "this file names a tool nobody has heard of", which
+    are the same ``confidence`` but not the same strength of claim. Last and
+    defaulted, so every existing construction of this class is unchanged.
+    """
 
 
 @dataclass(frozen=True)
@@ -108,6 +125,71 @@ class ProviderRule:
     fingerprint: Optional[Callable[[Mapping[str, Any]], Optional[tuple[str, str]]]] = (
         None
     )
+
+
+#: :attr:`ProviderInfo.origin` for a slug minted from a tool/encoder frame no
+#: row of :data:`PROVIDER_RULES` claims -- step 4 of :func:`detect_provider`.
+ORIGIN_TOOL_FRAME = "tool_frame"
+
+#: The slug the ``(model, source)`` fallback answers for an entry it cannot
+#: place: made in theDAW, origin unspecified, not a generator.
+#:
+#: The canonical definition is ``db.DEFAULT_PROVIDER``. It cannot be imported
+#: here -- ``db`` imports THIS module, and this module imports nothing of the
+#: package -- so the string is spelled twice, exactly as the ``thedaw`` row of
+#: :data:`PROVIDER_RULES` above already spells it. ``test_library_provider.py``
+#: asserts the two are the same string, so they cannot drift.
+FALLBACK_PROVIDER = "thedaw"
+
+
+def detection_outranks(info: ProviderInfo, derived: str, derived_is_ai: bool) -> bool:
+    """Whether a file's own tags beat the ``(model, source)`` derivation.
+
+    ONE rank rule for both labelers -- the import-time one
+    (``store._apply_provider_labels``) and the read-time one
+    (``router._derive_provider``) -- so a track cannot be labeled one way when
+    it is imported and another way when it is read.
+
+    ``derived`` / ``derived_is_ai`` are the derivation's slug and role, which
+    the caller has from ``db.derived_provider_wire`` (or ``db.infer_provider``
+    plus ``db.DERIVED_PROVIDERS``). They are passed in rather than computed
+    here because that table lives in ``db``, which imports this module.
+
+    A detection wins by default: a file that names Suno, Udio, Riffusion,
+    Magenta, Bandcamp -- any row of :data:`PROVIDER_RULES` -- outranks a guess
+    made from a model string, which is the whole reason the read path looks at
+    embedded tags at all. Two detections lose:
+
+    a. **The fallback slug, against an AI derivation.** ``thedaw`` means "made
+       in theDAW, origin unspecified" and is not a generator, while a theDAW
+       generator frame is on every file this app writes -- including its own
+       Stable Audio generations. Against an AI derivation the frame says
+       nothing the columns do not already say better, and letting it win would
+       refile a native generation as non-AI. Against any NON-AI derivation it
+       wins: "made in theDAW" is more specific than "imported", and neither
+       claims a generator.
+    b. **A tool frame over an AI derivation.** Step 4 mints a slug from any
+       tool/encoder string it does not recognise (:data:`ORIGIN_TOOL_FRAME`),
+       and such a string describes what TOUCHED the file, not what made the
+       music. An entry the columns call a generation has a better answer
+       already, and it is an AI one; a bounce through some mastering tool must
+       not turn it into a non-AI provider in the filter, the facet and the
+       badge -- nor be persisted there by the read path's write-through.
+
+    Note what is NOT a reason to lose: being non-AI. A Bandcamp or Imported
+    answer from a named rule still outranks a generation guess, because it came
+    from a signature someone observed rather than from an unknown string.
+
+    ``derived`` is not read by either clause today -- both turn on the
+    derivation's ROLE -- and is kept because a rule about a specific pair of
+    slugs is the obvious next one, and because the two labelers should be
+    handing this function the same two facts about the derivation either way.
+    """
+    if info.provider == FALLBACK_PROVIDER and derived_is_ai:
+        return False
+    if info.origin == ORIGIN_TOOL_FRAME and not info.is_ai and derived_is_ai:
+        return False
+    return True
 
 
 # A canonical uuid and nothing else: 8-4-4-4-12 hex, any case.
@@ -814,6 +896,7 @@ def detect_provider(
                 provider_id=None,
                 confidence="explicit",
                 evidence=f"{tool_key}={tool_value}",
+                origin=ORIGIN_TOOL_FRAME,
             )
 
     # 5. Weaker signals: the album a store stamps on its downloads, or a

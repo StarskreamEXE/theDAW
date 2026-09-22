@@ -10,12 +10,15 @@ from __future__ import annotations
 import pytest
 
 from backend.modules.library.provider import (
+    FALLBACK_PROVIDER,
+    ORIGIN_TOOL_FRAME,
     PROVIDER_RULES,
     PROVIDER_SLUG_MAX,
     URL_KEY_PRIORITY,
     ProviderInfo,
     curated_fields,
     detect_provider,
+    detection_outranks,
     is_analytics_key,
     provider_wire_fields,
 )
@@ -716,3 +719,80 @@ def test_a_thedaw_generator_is_thedaw_and_not_an_ai_provider():
         assert info.provider == "stable-audio", value
         assert info.label == "Stable Audio", value
         assert info.is_ai is True, value
+
+
+# --- the rank rule, used by both labelers -----------------------------------
+
+
+def test_the_fallback_slug_here_is_the_one_the_column_rule_uses():
+    """``FALLBACK_PROVIDER`` is spelled in this module because ``db`` imports
+    it and not the other way round. If the two ever drift, one labeler starts
+    protecting a slug the other has never heard of."""
+    from backend.modules.library.db import DEFAULT_PROVIDER
+
+    assert FALLBACK_PROVIDER == DEFAULT_PROVIDER
+
+
+def _info(provider: str, *, is_ai: bool, origin: str = "") -> ProviderInfo:
+    return ProviderInfo(
+        provider=provider,
+        label=provider,
+        is_ai=is_ai,
+        provider_id=None,
+        confidence="explicit",
+        evidence="encoder=test",
+        origin=origin,
+    )
+
+
+def test_a_named_service_detection_always_outranks_the_derivation():
+    for slug, is_ai in (("suno", True), ("udio", True), ("bandcamp", False)):
+        for derived, derived_is_ai in (
+            ("stable-audio", True),
+            ("import", False),
+            (FALLBACK_PROVIDER, False),
+        ):
+            assert detection_outranks(
+                _info(slug, is_ai=is_ai), derived, derived_is_ai
+            ), (slug, derived)
+
+
+def test_the_fallback_slug_loses_only_to_an_ai_derivation():
+    """ "Made in theDAW" is more specific than "imported" and neither claims a
+    generator, so the frame wins there. Against a generation it says nothing
+    the columns do not say better, and winning would refile it as non-AI."""
+    info = _info(FALLBACK_PROVIDER, is_ai=False)
+    assert detection_outranks(info, "stable-audio", True) is False
+    assert detection_outranks(info, "suno", True) is False
+    assert detection_outranks(info, "import", False) is True
+    assert detection_outranks(info, FALLBACK_PROVIDER, False) is True
+
+
+def test_a_minted_tool_slug_loses_only_to_an_ai_derivation():
+    minted = _info("acme-mastering-suite", is_ai=False, origin=ORIGIN_TOOL_FRAME)
+    assert detection_outranks(minted, "stable-audio", True) is False
+    assert detection_outranks(minted, "suno", True) is False
+    assert detection_outranks(minted, "import", False) is True
+    assert detection_outranks(minted, FALLBACK_PROVIDER, False) is True
+    # The same slug from a RULE rather than a tool frame is a signature
+    # someone observed, so it is not second-guessed.
+    assert detection_outranks(_info("bandcamp", is_ai=False), "stable-audio", True)
+
+
+def test_step_four_marks_its_answer_and_the_named_rules_do_not():
+    minted = detect_provider({"encoder": "Acme Mastering Suite"})
+    assert minted is not None
+    assert minted.provider == "acme-mastering-suite"
+    assert minted.is_ai is False
+    assert minted.origin == ORIGIN_TOOL_FRAME
+    for tags in ({"generator": "suno"}, {"generator": "theDAW"}):
+        named = detect_provider(tags)
+        assert named is not None, tags
+        assert named.origin == "", tags
+    # Not a wire field: what a row shows and stores is unchanged by it.
+    assert set(provider_wire_fields(minted)) == {
+        "provider",
+        "provider_label",
+        "provider_is_ai",
+        "provider_id",
+    }

@@ -56,14 +56,13 @@ from pydantic import BaseModel
 
 from .bundle import build_bundle_bytes
 from .db import (
-    DEFAULT_PROVIDER,
     DEFAULT_SORT,
     FACET_FIELDS,
     SORTS,
     EntryFilters,
-    infer_provider,
+    derived_provider_wire,
 )
-from .provider import ProviderInfo, detect_provider
+from .provider import ProviderInfo, detect_provider, detection_outranks
 from .store import (
     AUDIO_EXTS,
     MAX_REINDEX_ANALYSIS_ENQUEUE,
@@ -268,8 +267,10 @@ def _derive_provider(
     existed, whose surviving evidence is the tag blob in its analysis row.
 
     The guess is replaced, a real label is not: an entry whose provider is
-    exactly what ``infer_provider`` produces carries no better information, so
-    the file's own tags outrank it. No audio file is opened, which is how the
+    exactly what the ``(model, source)`` fallback produces carries no better
+    information, so the file's own tags outrank it -- as far as
+    :func:`~.provider.detection_outranks` lets them. No audio file is opened,
+    which is how the
     existing library gets labeled with no backfill and no re-analysis. Entries
     with no analysis row never reach here and keep what the store gave them.
 
@@ -283,21 +284,22 @@ def _derive_provider(
     that entry, and no further request writes anything.
     """
     current = entry.get("provider")
-    derived = infer_provider(entry.get("model"), entry.get("source"))
+    derived_wire = derived_provider_wire(entry.get("model"), entry.get("source"))
+    derived = str(derived_wire["provider"])
     if current and current != derived:
         return None
     info = bounded_provider_info(detect_provider(embedded, None))
     if info is None:
         return None
-    # The fallback's LAST arm is not a detection. ``thedaw`` means "made in
-    # theDAW, origin unspecified" and is not an AI provider, while a theDAW
-    # encoder/generator frame is on every file this app writes -- including its
-    # own Stable Audio generations, whose columns derive ``stable-audio``.
-    # Letting the frame win would refile a native generation as non-AI in the
-    # filter, the facet and the badge, and the write-through below would make
-    # that permanent. So it only applies where the derivation is the fallback
-    # too, which is where it changes nothing and no write follows.
-    if info.provider == DEFAULT_PROVIDER and derived != DEFAULT_PROVIDER:
+    # The same rank rule the import labeler uses
+    # (``store._apply_provider_labels``), so an entry is not labeled one way
+    # when it is imported and another way when it is read. It is what keeps a
+    # theDAW encoder frame -- on every file this app writes, including its own
+    # Stable Audio generations -- and a slug minted from some unknown mastering
+    # tool from refiling a generation as a non-AI provider in the filter, the
+    # facet and the badge, which the write-through below would then make
+    # permanent.
+    if not detection_outranks(info, derived, bool(derived_wire["provider_is_ai"])):
         return None
     fields = bounded_provider_wire_fields(info)
     changed = any(entry.get(key) != value for key, value in fields.items())
