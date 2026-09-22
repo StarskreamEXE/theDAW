@@ -106,8 +106,8 @@ const ranked = (
   }
   assert.ok(html.includes('Night Drive'), 'and its rows are the songs');
   assert.ok(
-    html.includes('aria-label="Night Drive, 812, 812 descendants. Focus this song."'),
-    'a ranked row says what it is and what clicking it does',
+    html.includes('aria-label="Night Drive, Stable Audio, 812, 812 descendants. Focus this song."'),
+    'a ranked row says what it is, who made it, and what clicking it does',
   );
 
   // The search box is a REAL control: stable id, name, and a <label htmlFor>.
