@@ -179,20 +179,33 @@ def test_infer_provider_matches_the_frontend_rules():
     assert infer_provider("riffusion", "generate") == "riffusion"
     assert infer_provider("", "import") == "import"
     assert infer_provider("medium", "generate") == "stable-audio"
-    assert infer_provider(None, None) == "stable-audio"
+    assert infer_provider("mixdown", "studio") == "stable-audio"
+    # T13: only a generation (or a studio bounce of one) is Stable Audio.
+    # Everything else theDAW made -- a DJ set, VJ media, an unknown source --
+    # is theDAW's own, and is not an AI generation.
+    assert infer_provider("", "performance-set") == "thedaw"
+    assert infer_provider(None, "vj") == "thedaw"
+    assert infer_provider(None, None) == "thedaw"
 
 
 def test_provider_facet_folds_model_and_source_together(seeded_db: LibraryDB):
     facet = seeded_db.facet_counts(EntryFilters(), ["provider"])["provider"]
-    # a1..a3 (model 'medium') + a5 (model '' from a folder) -> stable-audio;
-    # a4 (model 'suno') -> suno; v1 (source 'import') -> import.
-    assert _pairs(facet) == [("stable-audio", 4), ("import", 1), ("suno", 1)]
+    # a1, a2 (source 'generate') -> stable-audio; a3 and a5 (source 'folder')
+    # -> thedaw, NOT stable-audio, since T13: a folder scan is not a Stable
+    # Audio generation. a4 (model 'suno') -> suno; v1 ('import') -> import.
+    assert _pairs(facet) == [
+        ("stable-audio", 2),
+        ("thedaw", 2),
+        ("import", 1),
+        ("suno", 1),
+    ]
 
 
 def test_provider_facet_honours_the_filters(seeded_db: LibraryDB):
     folder = EntryFilters(source="folder")
+    # a3 + a5 are 'folder', which is neither 'generate' nor 'studio' -> thedaw.
     assert _pairs(seeded_db.facet_counts(folder, ["provider"])["provider"]) == [
-        ("stable-audio", 2),
+        ("thedaw", 2),
         ("suno", 1),
     ]
 
@@ -201,9 +214,19 @@ def test_provider_never_reports_a_null_bucket(tmp_path: Path):
     """Every entry has a provider (the derivation always answers), so unlike
     ``model`` the provider facet has no 'unset' group."""
     db = LibraryDB(tmp_path / "prov.db")
-    db.upsert_entries_bulk([_payload("p1", model="", source="")])
+    # p1's blank source is stored as the column's default, 'generate' (the
+    # column is NOT NULL DEFAULT 'generate'), so it is a Stable Audio
+    # generation; p2 names a source the rule has never heard of and is theDAW's
+    # own. Neither is an 'unset' bucket.
+    db.upsert_entries_bulk(
+        [
+            _payload("p1", model="", source=""),
+            _payload("p2", model="", source="performance-set"),
+        ]
+    )
     assert _pairs(db.facet_counts(EntryFilters(), ["provider"])["provider"]) == [
-        ("stable-audio", 1)
+        ("stable-audio", 1),
+        ("thedaw", 1),
     ]
 
 

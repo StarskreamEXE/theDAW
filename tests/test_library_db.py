@@ -55,6 +55,14 @@ def _make_entry_payload(entry_id: str, **overrides) -> dict:
 # ---------------------------------------------------------------------------
 
 
+#: The step that ADDS ``entries.provider`` and builds the provider indexes --
+#: the ``ADD COLUMN`` these tests reproduce a half-finished run of. Named by its
+#: own version rather than as ``SCHEMA_VERSION - 1``: step 10 rebuilt those
+#: indexes when the provider fallback's last arm changed, so the current
+#: version is no longer the one that adds a column.
+PROVIDER_COLUMN_VERSION = 9
+
+
 def _open_at(path: Path, version: int) -> LibraryDB:
     """A database migrated only as far as ``version`` -- what an older build of
     theDAW left behind."""
@@ -105,7 +113,7 @@ def test_an_interrupted_migration_is_finished_on_the_next_open(tmp_path: Path):
     instead.
     """
     path = tmp_path / "library.db"
-    old = _open_at(path, SCHEMA_VERSION - 1)
+    old = _open_at(path, PROVIDER_COLUMN_VERSION - 1)
     _insert_old_row(old, "survivor")
     # Exactly what a kill between the ALTER and the bump leaves behind.
     old._conn.execute("ALTER TABLE entries ADD COLUMN provider TEXT")
@@ -151,26 +159,34 @@ def test_a_migration_that_fails_part_way_leaves_the_database_untouched(
     neither the column, nor an index, nor a bumped version -- otherwise the
     recorded version stops describing what is on disk."""
     path = tmp_path / "library.db"
-    old = _open_at(path, SCHEMA_VERSION - 1)
+    old = _open_at(path, PROVIDER_COLUMN_VERSION - 1)
     _insert_old_row(old, "survivor")
     before = [tuple(r) for r in old._conn.execute("SELECT * FROM entries")]
     old.close()
 
-    final = db_module._MIGRATIONS[-1]
-    assert final[0] == SCHEMA_VERSION
+    # The provider step, whose first statement is the ADD COLUMN and whose
+    # remaining ones build the indexes this asserts the absence of.
+    steps = db_module._MIGRATIONS
+    provider_step = next(s for s in steps if s[0] == PROVIDER_COLUMN_VERSION)
     monkeypatch.setattr(
         db_module,
         "_MIGRATIONS",
         [
-            *db_module._MIGRATIONS[:-1],
-            (final[0], [final[1][0], "CREATE INDEX no_such_table_idx ON nope(x)"]),
+            *(s for s in steps if s[0] < PROVIDER_COLUMN_VERSION),
+            (
+                PROVIDER_COLUMN_VERSION,
+                [
+                    provider_step[1][0],
+                    "CREATE INDEX no_such_table_idx ON nope(x)",
+                ],
+            ),
         ],
     )
     with pytest.raises(Exception):
         LibraryDB(path)
 
-    survivor = _open_at(path, SCHEMA_VERSION - 1)
-    assert survivor.schema_version() == SCHEMA_VERSION - 1
+    survivor = _open_at(path, PROVIDER_COLUMN_VERSION - 1)
+    assert survivor.schema_version() == PROVIDER_COLUMN_VERSION - 1
     assert not survivor._has_column("entries", "provider")
     assert _schema(survivor._conn) == set()
     assert [tuple(r) for r in survivor._conn.execute("SELECT * FROM entries")] == before

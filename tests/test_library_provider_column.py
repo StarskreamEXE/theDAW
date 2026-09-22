@@ -53,6 +53,40 @@ _PAD_CHUNK = "lorem ipsum dolor sit amet consectetur adipiscing elit "
 #: A slug carried by ~10 of the 60,000 rows. Invented for this file.
 RARE_SLUG = "quiet-shelf"
 
+#: The step that ADDED the column and its indexes, and the step that REBUILT
+#: those indexes when the fallback's last arm changed from 'stable-audio' to
+#: 'thedaw' (T13). Two of the four indexes are declared ON that expression, and
+#: SQLite matches an expression index by the text it was built from, so a
+#: library upgraded without step 10 would keep indexes that answer the old rule
+#: -- silently, since the queries stay correct and only lose the seek.
+PROVIDER_COLUMN_VERSION = 9
+PROVIDER_REINDEX_VERSION = 10
+
+#: The expression the v9 indexes were built from, spelled out because it no
+#: longer exists anywhere in the module: this is what a library that migrated
+#: BEFORE step 10 has on disk, and rebuilding it is the whole of step 10.
+V9_INDEX_EXPR = """COALESCE(NULLIF(provider, ''), CASE
+        WHEN source = 'suno'
+             OR instr(lower(model), 'suno') > 0 THEN 'suno'
+        WHEN instr(lower(model), 'magenta') > 0
+             OR instr(lower(model), 'gemini') > 0 THEN 'gemini-magenta'
+        WHEN instr(replace(lower(model), 'audio', ''), 'udio') > 0 THEN 'udio'
+        WHEN instr(lower(model), 'riffusion') > 0 THEN 'riffusion'
+        WHEN source = 'import' THEN 'import'
+        ELSE 'stable-audio'
+    END)"""
+
+#: The four indexes step 9 builds and step 10 rebuilds.
+PROVIDER_INDEXES = (
+    "idx_entries_provider",
+    "idx_entries_provider_created",
+    "idx_entries_provider_any_kind",
+    "idx_entries_facet_provider",
+)
+
+#: The two of them declared on the expression rather than on columns.
+EXPRESSION_INDEXES = ("idx_entries_provider_created", "idx_entries_provider_any_kind")
+
 
 def _payload(entry_id: str, **overrides) -> dict:
     payload: dict = {
@@ -108,6 +142,13 @@ def _indexes(conn: sqlite3.Connection) -> set[str]:
     }
 
 
+def _index_sql(conn: sqlite3.Connection, name: str) -> str:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?", (name,)
+    ).fetchone()
+    return str(row[0]) if row and row[0] else ""
+
+
 def _row_dump(conn: sqlite3.Connection, columns: str) -> list[tuple]:
     return [
         tuple(r) for r in conn.execute(f"SELECT {columns} FROM entries ORDER BY id")
@@ -143,10 +184,12 @@ def v8_library(tmp_path: Path) -> Path:
     it with the real, current build -- which is the upgrade being tested.
     """
     current = db_module._MIGRATIONS
-    db_module._MIGRATIONS = current[:-1]
+    db_module._MIGRATIONS = [
+        step for step in current if step[0] < PROVIDER_COLUMN_VERSION
+    ]
     try:
         db = LibraryDB(tmp_path / "library.db")
-        assert db.schema_version() == SCHEMA_VERSION - 1
+        assert db.schema_version() == PROVIDER_COLUMN_VERSION - 1
         _seed_v8_rows(db)
     finally:
         db_module._MIGRATIONS = current
@@ -209,12 +252,7 @@ def test_the_migration_adds_the_column_and_its_indexes_without_touching_a_row(
     # entry is still unresolved and still answered by the fallback.
     assert _column(db, "old_labeled") is None
     assert _column(db, "old_legacy") is None
-    assert {
-        "idx_entries_provider",
-        "idx_entries_provider_created",
-        "idx_entries_provider_any_kind",
-        "idx_entries_facet_provider",
-    } <= _indexes(db._conn)
+    assert set(PROVIDER_INDEXES) <= _indexes(db._conn)
     db.close()
 
 
@@ -233,12 +271,7 @@ def test_the_migration_is_idempotent_and_a_fresh_library_is_born_with_it(
 
     fresh = LibraryDB(tmp_path / "fresh.db")
     assert fresh.schema_version() == SCHEMA_VERSION
-    assert {
-        "idx_entries_provider",
-        "idx_entries_provider_created",
-        "idx_entries_provider_any_kind",
-        "idx_entries_facet_provider",
-    } <= _indexes(fresh._conn)
+    assert set(PROVIDER_INDEXES) <= _indexes(fresh._conn)
     fresh.close()
 
 
@@ -265,6 +298,153 @@ def test_a_build_that_does_not_know_the_column_still_reads_and_writes(
     # ... and the row an older build wrote is filed under the fallback, which
     # is the answer it has always had.
     assert "from_old" in set(db.list_entry_ids(EntryFilters(provider="import"), 10))
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# Step 10: the fallback's text changed, so the indexes built on it are rebuilt
+# ---------------------------------------------------------------------------
+
+
+def _seed_v9_rows(db: LibraryDB) -> None:
+    """Three rows as the v9 build left them: a DJ performance set and a
+    generation with the column unresolved, and one row already resolved from
+    its own metadata."""
+    db._conn.executemany(
+        "INSERT INTO entries (id, kind, title, model, source, provider, "
+        "created_at, updated_at, metadata_json) "
+        "VALUES (?, 'audio', ?, ?, ?, ?, 1.0, 1.0, '{}')",
+        [
+            ("v9_set", "v9_set", "", "performance-set", None),
+            ("v9_generated", "v9_generated", "medium", "generate", None),
+            ("v9_labeled", "v9_labeled", "medium", "import", "bandcamp"),
+        ],
+    )
+    db._conn.commit()
+
+
+@pytest.fixture
+def v9_library(tmp_path: Path) -> Path:
+    """A library migrated by the v9 build: the column and all four indexes are
+    there, and the two expression indexes carry the OLD fallback text.
+
+    The statements in step 9 interpolate the module's live expression, so
+    running them today builds the NEW text -- which is not what a library
+    upgraded before step 10 has on disk. The two expression indexes are
+    therefore dropped and rebuilt here from :data:`V9_INDEX_EXPR`, a literal,
+    so the fixture is the real historical state rather than a re-run of the
+    current code.
+    """
+    current = db_module._MIGRATIONS
+    db_module._MIGRATIONS = [
+        step for step in current if step[0] <= PROVIDER_COLUMN_VERSION
+    ]
+    try:
+        db = LibraryDB(tmp_path / "library.db")
+        assert db.schema_version() == PROVIDER_COLUMN_VERSION
+        _seed_v9_rows(db)
+    finally:
+        db_module._MIGRATIONS = current
+    for name in EXPRESSION_INDEXES:
+        db._conn.execute(f"DROP INDEX {name}")
+    db._conn.execute(
+        f"CREATE INDEX idx_entries_provider_created "
+        f"ON entries(kind, {V9_INDEX_EXPR}, created_at DESC)"
+    )
+    db._conn.execute(
+        f"CREATE INDEX idx_entries_provider_any_kind "
+        f"ON entries({V9_INDEX_EXPR}, created_at DESC)"
+    )
+    db._conn.commit()
+    for name in EXPRESSION_INDEXES:
+        assert "ELSE 'stable-audio'" in _index_sql(db._conn, name), name
+    db.close()
+    return tmp_path / "library.db"
+
+
+V9_COLUMNS = "id, kind, title, model, source, provider, created_at, metadata_json"
+
+
+def test_step_ten_rebuilds_the_expression_indexes_and_rewrites_no_row(
+    v9_library: Path,
+):
+    """The reason a text change to the fallback is a SCHEMA change.
+
+    SQLite records an expression index's text as it was written and matches a
+    query's expression against that text, so an index built from the old rule
+    can neither serve the new comparison nor hold the right slug for a row.
+    Step 10 rebuilds all four provider indexes from the current expression --
+    and touches nothing else: no row is rewritten, and a row whose ``provider``
+    column was already resolved from its own metadata keeps it, because that
+    answer came from real metadata and is still right. Only the FALLBACK, which
+    is computed per query and never stored, changes what it says.
+    """
+    old = sqlite3.connect(str(v9_library))
+    old.row_factory = sqlite3.Row
+    before = _row_dump(old, V9_COLUMNS)
+    old.close()
+
+    db = LibraryDB(v9_library)
+    assert db.schema_version() == SCHEMA_VERSION == PROVIDER_REINDEX_VERSION
+    assert _row_dump(db._conn, V9_COLUMNS) == before
+    assert set(PROVIDER_INDEXES) <= _indexes(db._conn)
+
+    for name in EXPRESSION_INDEXES:
+        sql = _index_sql(db._conn, name)
+        assert db_module._PROVIDER_INDEX_EXPR in sql, name
+        assert "ELSE 'thedaw'" in sql, name
+        assert "ELSE 'stable-audio'" not in sql, name
+
+    # And the rule the rebuilt indexes answer is the new one: the DJ set is
+    # theDAW's own, the generation is still Stable Audio, and the row that was
+    # already resolved is untouched by either.
+    assert set(db.list_entry_ids(EntryFilters(provider="thedaw"), 10)) == {"v9_set"}
+    assert set(db.list_entry_ids(EntryFilters(provider="stable-audio"), 10)) == {
+        "v9_generated"
+    }
+    assert set(db.list_entry_ids(EntryFilters(provider="bandcamp"), 10)) == {
+        "v9_labeled"
+    }
+    assert _column(db, "v9_set") is None
+    db.close()
+
+
+def test_a_failed_step_ten_leaves_the_old_indexes_in_place(
+    v9_library: Path, monkeypatch
+):
+    """Step 10 drops four indexes before it builds them, so a failure half way
+    through must roll the drops back -- otherwise the crash that interrupted an
+    upgrade would leave a 200,000-entry library with no provider index at all
+    and every provider filter a table scan."""
+    steps = db_module._MIGRATIONS
+    step = next(s for s in steps if s[0] == PROVIDER_REINDEX_VERSION)
+    monkeypatch.setattr(
+        db_module,
+        "_MIGRATIONS",
+        [
+            *(s for s in steps if s[0] < PROVIDER_REINDEX_VERSION),
+            (
+                PROVIDER_REINDEX_VERSION,
+                [step[1][0], "CREATE INDEX no_such_table_idx ON nope(x)"],
+            ),
+        ],
+    )
+    with pytest.raises(Exception):
+        LibraryDB(v9_library)
+
+    survivor = sqlite3.connect(str(v9_library))
+    survivor.row_factory = sqlite3.Row
+    assert set(PROVIDER_INDEXES) <= _indexes(survivor)
+    for name in EXPRESSION_INDEXES:
+        assert "ELSE 'stable-audio'" in _index_sql(survivor, name), name
+    survivor.close()
+
+    # A clean reopen with the real statement list still finishes the upgrade.
+    monkeypatch.undo()
+    db = LibraryDB(v9_library)
+    assert db.schema_version() == SCHEMA_VERSION
+    for name in EXPRESSION_INDEXES:
+        assert db_module._PROVIDER_INDEX_EXPR in _index_sql(db._conn, name), name
     db.close()
 
 
@@ -587,6 +767,8 @@ BUDGET_CASES = [
     ("audio/common", frozenset({"audio"}), "bandcamp"),
     ("audio/suno", frozenset({"audio"}), "suno"),
     ("audio/import", frozenset({"audio"}), "import"),
+    # The fallback's last arm since T13: every 'folder' row in the fixture.
+    ("audio/thedaw", frozenset({"audio"}), "thedaw"),
     ("audio/rare", frozenset({"audio"}), RARE_SLUG),
     ("all/common", None, "bandcamp"),
     ("all/rare", None, RARE_SLUG),
@@ -627,6 +809,15 @@ def test_the_filtered_page_is_an_index_seek_at_sixty_thousand_realistic_rows(
     would be SILENT -- the queries stay correct and go 60,000 rows slower.
     This is what notices.
     """
+    # The text first: the indexes this plan is about are declared on the
+    # module's expression, and step 10 exists so that an upgraded library's are
+    # rebuilt from it. A drift between the two is what makes the seek below
+    # quietly become a scan.
+    for name in EXPRESSION_INDEXES:
+        assert db_module._PROVIDER_INDEX_EXPR in _index_sql(realistic_db._conn, name), (
+            name
+        )
+
     filters = EntryFilters(kinds=frozenset({"audio"}), provider="bandcamp")
     plans = {
         "page": _traced(realistic_db, lambda: realistic_db.list_entries_page(filters)),

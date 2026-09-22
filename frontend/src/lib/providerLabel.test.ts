@@ -31,9 +31,18 @@ import { hasProvider, providerDisplay, providerSearchText } from './providerLabe
   // the Catalogue drew a derived one beside it. One provider, one badge.
   const bare = providerDisplay({});
   assert.ok(bare, 'an entry with no provider field still resolves');
-  assert.equal(bare.slug, 'stable-audio', 'theDAW’s own generations are Stable Audio');
-  assert.equal(bare.label, 'Stable Audio');
-  assert.equal(bare.isAi, true, 'a generation engine is AI');
+  // T13: an entry that says nothing is theDAW's own, not a Stable Audio
+  // generation, and is not announced as AI.
+  assert.equal(bare.slug, 'thedaw', 'made in theDAW, by nothing the rule can name');
+  assert.equal(bare.label, 'theDAW');
+  assert.equal(bare.isAi, false, 'nothing said a model made it');
+  assert.equal(bare.accessibleName, 'Source: theDAW');
+
+  const generated = providerDisplay({ model: 'sa3', source: 'generate' });
+  assert.ok(generated);
+  assert.equal(generated.slug, 'stable-audio', 'theDAW’s own GENERATIONS are Stable Audio');
+  assert.equal(generated.label, 'Stable Audio');
+  assert.equal(generated.isAi, true, 'a generation engine is AI');
 
   const imported = providerDisplay({ source: 'import', model: 'import' });
   assert.ok(imported);
@@ -45,7 +54,7 @@ import { hasProvider, providerDisplay, providerSearchText } from './providerLabe
   // A label/flag with no slug does not stop the derivation answering.
   const partial = providerDisplay({ providerLabel: 'Suno', providerIsAi: true, providerId: 'abc' });
   assert.ok(partial);
-  assert.equal(partial.slug, 'stable-audio', 'a label alone is not a provider id');
+  assert.equal(partial.slug, 'thedaw', 'a label alone is not a provider id');
 }
 
 // ── a fully-populated AI provider ────────────────────────────────────────────
@@ -152,7 +161,11 @@ import { hasProvider, providerDisplay, providerSearchText } from './providerLabe
   assert.ok(both.includes('apple-music'), 'the slug is searchable too');
   // A derived provider is searchable as well: typing "stable" finds theDAW's
   // own generations, exactly as "suno" finds the detected ones.
-  assert.ok(providerSearchText({ model: 'sa3' }).toLowerCase().includes('stable audio'));
+  assert.ok(
+    providerSearchText({ model: 'sa3', source: 'generate' })
+      .toLowerCase()
+      .includes('stable audio'),
+  );
 }
 
 // ── hasProvider ──────────────────────────────────────────────────────────────
@@ -166,8 +179,11 @@ import { hasProvider, providerDisplay, providerSearchText } from './providerLabe
   assert.equal(hasProvider(null, 'suno'), false, 'and neither does a missing entry');
 
   // The derived half is a first-class member of the same filter.
-  assert.equal(hasProvider({ model: 'sa3' }, 'stable-audio'), true);
-  assert.equal(hasProvider({ model: 'sa3' }, 'suno'), false);
+  assert.equal(hasProvider({ model: 'sa3', source: 'generate' }, 'stable-audio'), true);
+  assert.equal(hasProvider({ model: 'sa3', source: 'generate' }, 'suno'), false);
+  // T13: a DJ set is filterable as theDAW's own, and is NOT stable-audio.
+  assert.equal(hasProvider({ source: 'performance-set' }, 'thedaw'), true);
+  assert.equal(hasProvider({ source: 'performance-set' }, 'stable-audio'), false);
   assert.equal(hasProvider({ source: 'import', model: 'import' }, 'import'), true);
 }
 
