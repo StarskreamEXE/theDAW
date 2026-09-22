@@ -22,7 +22,8 @@ import {
   rememberedMode, shouldReadSummary, summaryFromFailure, summaryFromProbe, summaryRearmed,
   type LearnViewProps,
 } from './LearnHost.tsx';
-import { LineageScaleView } from './LineageScaleView.tsx';
+import { LineageScaleView, classicPerTrackProps } from './LineageScaleView.tsx';
+import { LineageModal } from '../components/library/LineageModal.tsx';
 import type { LineageSummary } from './lineageScaleClient.ts';
 
 const summaryOf = (withLineage: number, fullViewOk: boolean): LineageSummary => ({
@@ -402,6 +403,51 @@ const surface = (props: Partial<React.ComponentProps<typeof LearnHostSurface>>):
   const html = surface({ ...failed, scaleView: spyView('scale', []), classicView: Forbidden });
   assert.ok(html.includes('HTTP 500'), html);
   assert.ok(/<button[^>]*>Retry<\/button>/.test(html));
+}
+
+// ── the classic graph of ONE SONG is never taken away ───────────────────────
+//
+// The user's complaint, in full: "why would i not be able to see a classic
+// graph for individual tracks??? that makes no sense". It did not: hiding the
+// whole classic component on a big library took the per-track graph with it,
+// and only the WHOLE-LIBRARY half of that component is the one that dies.
+//
+// So on the big fixture both halves are pinned at once: the whole-library
+// element still cannot be constructed (the throwing stand-in proves it), and
+// the per-track element CAN — built here, for the song the host handed down,
+// with the two library-wide tabs refused.
+{
+  const seen: LearnViewProps[] = [];
+  const html = surface({
+    read: true,
+    summary: BIG,
+    chosen: 'classic',
+    scaleView: spyView('scale', seen),
+    classicView: Forbidden, // the WHOLE-LIBRARY view: still never built
+    rootEntryId: 'song-7',
+    visible: true,
+  });
+  assert.ok(html.includes('data-view="scale"'), 'the scale view is what the tab opens');
+  assert.deepEqual(seen[0], { rootEntryId: 'song-7', visible: true }, 'holding the focused song');
+
+  // And that song's own classic graph, built for real.
+  const perTrack = renderToStaticMarkup(
+    <LineageModal {...classicPerTrackProps('song-7', true)} onClose={() => {}} />,
+  );
+  assert.ok(perTrack.includes('Track'), `the classic per-track graph renders: ${perTrack}`);
+  assert.ok(perTrack.includes('rooted at song-7'), 'rooted at the song in focus');
+  const refused = (perTrack.match(/<button[^>]*aria-disabled="true"[^>]*>/g) ?? []);
+  assert.equal(refused.length, 2, 'with the two whole-library tabs refused, and only those');
+  for (const b of refused) {
+    assert.ok(b.includes('library too large'), 'each saying why, on the control itself');
+  }
+
+  // The scale view is where that action lives, for whatever song is focused.
+  const scale = renderToStaticMarkup(<LineageScaleView rootEntryId="song-7" visible={false} />);
+  assert.ok(
+    scale.includes('aria-label="Classic graph for song-7"'),
+    'and the scale view offers it by name',
+  );
 }
 
 console.log('LearnHost: all assertions passed');

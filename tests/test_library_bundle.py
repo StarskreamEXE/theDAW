@@ -181,7 +181,13 @@ def test_lineage_endpoint_walks_relations(tmp_path: Path):
 
     router._store = store  # noqa: SLF001 — wire the store the router will pick up
     result = router.get_lineage(a.id, depth=3)
+    deep = router.get_lineage(a.id, depth=4)
     router._store = None  # noqa: SLF001 — reset
+
+    # The depth the per-track view actually asks for, on a family that fits:
+    # the same three songs, and nothing claiming anything was left out.
+    assert {n["id"] for n in deep["nodes"]} == {a.id, b.id, c.id}
+    assert deep["truncated"] is False
 
     node_ids = {n["id"] for n in result["nodes"]}
     assert a.id in node_ids
@@ -189,6 +195,9 @@ def test_lineage_endpoint_walks_relations(tmp_path: Path):
     assert c.id in node_ids
     kinds = {e["kind"] for e in result["edges"]}
     assert kinds == {"chimera_source_of"}
+    # A family this small is nowhere near the cap, so the answer is whole.
+    assert result["truncated"] is False
+    assert result["node_cap"] == router.LINEAGE_MAX_NODES
 
 
 def test_full_graph_endpoint(tmp_path: Path):
@@ -209,3 +218,62 @@ def test_full_graph_endpoint(tmp_path: Path):
     router._store = None  # noqa: SLF001
     assert result["count"] == 2
     assert len(result["edges"]) == 1
+
+
+def test_lineage_endpoint_caps_a_huge_family(tmp_path: Path):
+    """A hub with more relatives than can be drawn is cut, not shipped whole.
+
+    The per-track BFS is the ONE lineage request that stays safe on a library
+    too big for the whole-library graph, so it must be bounded in its own
+    right: a node cap, the flag that says the answer was cut, and the cap it
+    was cut at. What survives the cut is the root's OWN family first — the
+    BFS admits a hop entirely before it looks at the next one, so nothing
+    further away can take a place from an immediate neighbour."""
+    store = LibraryStore(tmp_path)
+    assert store.db is not None
+    root = store.import_blob(
+        b"RIFF\x00\x00\x00\x00WAVE", "root.wav", "audio/wav", metadata={"title": "R"}
+    )
+    # A star: 700 children off the root, and one grandchild two hops out.
+    store.db.add_relations_bulk(
+        (root.id, f"child-{i:04d}", "derived_from") for i in range(700)
+    )
+    store.db.add_relation("child-0000", "grandchild-far", "derived_from")
+
+    from backend.modules.library import router
+
+    # Every statement the walk issues, so the columns it reads are checked and
+    # not assumed: a 600-node family must never open a blob column.
+    statements: list[str] = []
+    store.db._conn.set_trace_callback(statements.append)  # noqa: SLF001
+    router._store = store  # noqa: SLF001 — wire the store the router will pick up
+    try:
+        result = router.get_lineage(root.id, depth=4)
+    finally:
+        router._store = None  # noqa: SLF001 — reset
+        store.db._conn.set_trace_callback(None)  # noqa: SLF001
+
+    entry_reads = [s for s in statements if "FROM entries" in s]
+    assert entry_reads, "the walk does read the entries table"
+    for sql in entry_reads:
+        assert "metadata_json" not in sql, f"a blob column was opened: {sql}"
+        assert "SELECT *" not in sql, f"the whole row was read: {sql}"
+    assert len(entry_reads) < len(result["nodes"]), (
+        "the nodes are read in bulk, not one statement per node"
+    )
+
+    assert result["node_cap"] == router.LINEAGE_MAX_NODES
+    assert result["truncated"] is True
+    assert len(result["nodes"]) == router.LINEAGE_MAX_NODES
+
+    node_ids = {n["id"] for n in result["nodes"]}
+    assert root.id in node_ids
+    assert all(i.startswith("child-") for i in node_ids - {root.id}), (
+        "the cut keeps the root's own children, not something further out"
+    )
+    assert "grandchild-far" not in node_ids
+
+    # Nothing dangles: every surviving edge joins two surviving nodes.
+    for edge in result["edges"]:
+        assert edge["from_id"] in node_ids
+        assert edge["to_id"] in node_ids

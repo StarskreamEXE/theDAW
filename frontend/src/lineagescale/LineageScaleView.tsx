@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { Suspense, lazy, useCallback, useEffect, useMemo, useState } from 'react';
 import { DEFAULT_LIBRARY_QUERY, fetchLibraryList } from '../lib/backendLocalProvider';
 import { FocusGraph } from './FocusGraph';
 import { LineageLanding, type SearchHit } from './LineageLanding';
@@ -26,6 +26,31 @@ import {
  * Nothing in here touches the old view, its route, or its tab. It is a second
  * way to read the same relationships, built for the size they actually are.
  */
+
+/**
+ * The classic graph, for ONE song. Lazy for the reason the LEARN host is:
+ * this module is large and pulls the force-graph engines behind it, so it is
+ * not so much as fetched until the user asks for this song's picture.
+ */
+const ClassicPerTrackGraph = lazy(() =>
+  import('../components/library/LineageModal').then((m) => ({ default: m.LineageModal })),
+);
+
+/**
+ * What the "Classic graph" action mounts: the classic view rooted at the song
+ * in focus, inside this tab, with the two whole-library tabs refused — that
+ * drawing is the one this view exists because the library cannot take.
+ *
+ * Exported so the LEARN tab's test can construct that element and show it CAN
+ * be drawn on a library where the whole-library one cannot.
+ */
+export const classicPerTrackProps = (focusId: string, visible = true) => ({
+  open: true,
+  mode: 'embedded' as const,
+  visible,
+  rootEntryId: focusId,
+  wholeLibraryAllowed: false,
+});
 
 const SEARCH_LIMIT = 20;
 const BUDGETS = [100, 200, 400, 800, 1500] as const;
@@ -142,6 +167,9 @@ export const LineageScaleView: React.FC<LineageScaleViewProps> = ({ visible = tr
   const [graphAttempt, setGraphAttempt] = useState(0);
 
   const [panel, setPanel] = useState<{ heading: string; request: RelativesRequest } | null>(null);
+  // The classic per-track graph, open over this view's body. It is state and
+  // not a route so that closing it lands back on exactly this focus.
+  const [classicOpen, setClassicOpen] = useState(false);
 
   const crumb = currentCrumb(trail);
   const focusId = crumb?.id ?? null;
@@ -235,6 +263,7 @@ export const LineageScaleView: React.FC<LineageScaleViewProps> = ({ visible = tr
 
   const goHome = useCallback(() => {
     setPanel(null);
+    setClassicOpen(false);
     setData(null);
     setTrail([]);
   }, []);
@@ -414,9 +443,51 @@ export const LineageScaleView: React.FC<LineageScaleViewProps> = ({ visible = tr
           >
             In library
           </button>
+          <button
+            type="button"
+            onClick={() => setClassicOpen(true)}
+            aria-label={`Classic graph for ${crumb?.title ?? focusId}`}
+            aria-pressed={classicOpen}
+            title="The classic lineage graph of this song's own family"
+            className="rounded border border-white/10 px-2 py-1 text-[9px] font-mono uppercase tracking-widest text-zinc-300 hover:border-white/25 hover:text-white"
+          >
+            Classic graph
+          </button>
         </span>
       </header>
 
+      {classicOpen ? (
+        <div className="flex min-h-0 grow flex-col">
+          <div className="flex items-center gap-2 border-b border-white/5 px-3 py-1">
+            <p className="grow truncate text-[9px] font-mono text-zinc-500">
+              {`The classic graph of ${crumb?.title ?? focusId} and its own family.`}
+            </p>
+            <button
+              type="button"
+              onClick={() => setClassicOpen(false)}
+              aria-label="Back to the lineage view"
+              className="rounded border border-white/10 px-2 py-0.5 text-[9px] font-mono uppercase tracking-widest text-zinc-400 hover:border-white/25 hover:text-zinc-100"
+            >
+              Back to lineage
+            </button>
+          </div>
+          <div className="relative min-h-0 grow">
+            <Suspense
+              fallback={
+                <p className="absolute inset-0 flex items-center justify-center text-[10px] font-mono text-zinc-500">
+                  Loading the classic graph…
+                </p>
+              }
+            >
+              <ClassicPerTrackGraph
+                {...classicPerTrackProps(focusId, visible)}
+                onClose={() => setClassicOpen(false)}
+              />
+            </Suspense>
+          </div>
+        </div>
+      ) : (
+      <>
       <div className="flex items-center gap-2 border-b border-white/5 px-3 py-1">
         <p className="grow text-[9px] font-mono text-zinc-500">
           {graphLoading
@@ -466,6 +537,8 @@ export const LineageScaleView: React.FC<LineageScaleViewProps> = ({ visible = tr
           </div>
         )}
       </div>
+      </>
+      )}
     </div>
   );
 };

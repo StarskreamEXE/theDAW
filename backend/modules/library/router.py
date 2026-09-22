@@ -60,6 +60,9 @@ from .db import (
     FACET_FIELDS,
     SORTS,
     EntryFilters,
+    LibraryDB,
+    _chunks,
+    _MAX_SQL_PARAMS,
     derived_provider_wire,
 )
 from .provider import ProviderInfo, detect_provider, detection_outranks
@@ -1627,12 +1630,59 @@ def download_bundle(entry_id: str) -> Response:
     )
 
 
+#: The most nodes one song's lineage answer may carry.
+#:
+#: This BFS is the lineage request that stays available on a library too large
+#: for the whole-library graph, so it has to be bounded in its own right: one
+#: hub with tens of thousands of relatives must not be able to hand the browser
+#: the very answer the whole-library route was withdrawn for.
+#:
+#: The cut follows the walk, so it takes from the far edge of the family, never
+#: from the near one: a hop is admitted in full before the next hop is looked
+#: at, and the root's own parents and children are the first hop. When the cap
+#: bites, the answer says so (``truncated``) and names the cap it was cut at.
+LINEAGE_MAX_NODES = 600
+
+#: The columns a lineage node carries — and therefore the only ones read.
+#: ``entries`` also holds ``metadata_json``, so a whole-row read would drag one
+#: blob per node through the connection for a payload that ships four fields.
+_LINEAGE_NODE_COLUMNS = ("id", "title", "source", "duration_sec")
+_LINEAGE_NODE_SELECT = ", ".join(_LINEAGE_NODE_COLUMNS)
+
+
+def _lineage_entry_rows(db: LibraryDB, ids: list[str]) -> dict[str, dict[str, Any]]:
+    """Those four columns for these ids, in chunked bulk reads.
+
+    One statement per chunk rather than one per node: the cap allows 600
+    relatives, and 600 round trips to read four fields each is the shape this
+    mirrors from ``lineagescale``'s ``_entry_rows``."""
+    out: dict[str, dict[str, Any]] = {}
+    unique = list(dict.fromkeys(ids))
+    if not unique:
+        return out
+    with db._writelock:  # noqa: SLF001 — the DB exposes no bulk projection
+        cur = db._conn.cursor()  # noqa: SLF001
+        try:
+            for chunk in _chunks(unique, _MAX_SQL_PARAMS):
+                marks = ", ".join("?" * len(chunk))
+                rows = cur.execute(
+                    f"SELECT {_LINEAGE_NODE_SELECT} FROM entries WHERE id IN ({marks})",
+                    list(chunk),
+                ).fetchall()
+                for row in rows:
+                    out[str(row["id"])] = {k: row[k] for k in _LINEAGE_NODE_COLUMNS}
+        finally:
+            cur.close()
+    return out
+
+
 @router.get("/{entry_id}/lineage")
 def get_lineage(entry_id: str, depth: int = 3) -> dict[str, Any]:
     """Return nodes + edges within ``depth`` hops of ``entry_id``.
 
     BFS over the ``relations`` table in both directions (parents AND
-    children). Cheap because edges are indexed both ways."""
+    children). Cheap because edges are indexed both ways, and bounded by
+    :data:`LINEAGE_MAX_NODES` so an enormous family is cut rather than sent."""
     store = get_store()
     if store.db is None:
         raise HTTPException(503, "library DB not available")
@@ -1644,25 +1694,36 @@ def get_lineage(entry_id: str, depth: int = 3) -> dict[str, Any]:
     seen_ids: set[str] = {entry_id}
     edges: list[dict[str, Any]] = []
     frontier: list[str] = [entry_id]
+    truncated = False
     for _ in range(depth):
         next_frontier: list[str] = []
         for node_id in frontier:
             outgoing = store.db.list_relations(from_id=node_id)
             incoming = store.db.list_relations(to_id=node_id)
             for e in outgoing + incoming:
-                edges.append(e)
                 for nb in (e["from_id"], e["to_id"]):
-                    if nb not in seen_ids:
-                        seen_ids.add(nb)
-                        next_frontier.append(nb)
+                    if nb in seen_ids:
+                        continue
+                    if len(seen_ids) >= LINEAGE_MAX_NODES:
+                        truncated = True
+                        continue
+                    seen_ids.add(nb)
+                    next_frontier.append(nb)
+                # An edge to a node the cap refused would dangle, so it is
+                # kept only once BOTH of its ends are in the answer.
+                if e["from_id"] in seen_ids and e["to_id"] in seen_ids:
+                    edges.append(e)
+        # The hop that hit the cap is finished — so the near family is whole —
+        # and then the walk stops rather than filling up on distant cousins.
         frontier = next_frontier
-        if not frontier:
+        if truncated or not frontier:
             break
 
     # Materialize node payloads for everything we touched.
+    rows_by_id = _lineage_entry_rows(store.db, list(seen_ids))
     nodes: list[dict[str, Any]] = []
     for node_id in seen_ids:
-        node_row = store.db.get_entry(node_id)
+        node_row = rows_by_id.get(node_id)
         if node_row is not None:
             nodes.append(
                 {
@@ -1689,7 +1750,13 @@ def get_lineage(entry_id: str, depth: int = 3) -> dict[str, Any]:
         seen_edges.add(key)
         deduped_edges.append(e)
 
-    return {"root": entry_id, "nodes": nodes, "edges": deduped_edges}
+    return {
+        "root": entry_id,
+        "nodes": nodes,
+        "edges": deduped_edges,
+        "truncated": truncated,
+        "node_cap": LINEAGE_MAX_NODES,
+    }
 
 
 @router.get("/_all/stems")

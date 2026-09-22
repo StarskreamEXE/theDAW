@@ -24,7 +24,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 
 import { ProviderBadge } from '../components/library/ProviderBadge.tsx';
 import { FocusGraph } from './FocusGraph.tsx';
-import { GraphPane } from './LineageScaleView.tsx';
+import { GraphPane, classicPerTrackProps } from './LineageScaleView.tsx';
 import { LineageLanding } from './LineageLanding.tsx';
 import { RelativesPanelBody } from './RelativesPanel.tsx';
 import LineageScaleView from './LineageScaleView.tsx';
@@ -626,6 +626,33 @@ const ALONE = 'This song stands alone';
   const withSource = badge({ model: 'chirp-v4', source: 'suno' });
   assert.ok(/suno/i.test(withSource), withSource);
   assert.ok(/suno/i.test(badge({ model: '', source: 'suno' })), 'a legacy import');
+}
+
+// ── the CLASSIC graph, for the song in focus ────────────────────────────────
+//
+// The whole-library graph is what a 195,000-song library cannot draw. One
+// song's family is a different request — bounded by the server's node cap —
+// and there is no size at which it stops working. So this view, which IS the
+// large-library view, offers it for whatever song is in focus.
+{
+  const focused = renderToStaticMarkup(<LineageScaleView rootEntryId="song-7" visible={false} />);
+  assert.ok(
+    focused.includes('aria-label="Classic graph for song-7"'),
+    `the focused song has a named action that opens its classic graph: ${focused}`,
+  );
+  assert.ok(/<button[^>]*aria-label="Classic graph for song-7"/.test(focused), 'a real button');
+
+  // The landing page has no song in focus, so there is nothing to draw.
+  const landing = renderToStaticMarkup(<LineageScaleView visible={false} />);
+  assert.ok(!landing.includes('Classic graph for'), 'and nothing offers it with nothing focused');
+
+  // What that action mounts: the classic modal, per-track, with the two
+  // whole-library tabs refused.
+  const props = classicPerTrackProps('song-7', true);
+  assert.equal(props.rootEntryId, 'song-7', 'rooted at the focused song');
+  assert.equal(props.wholeLibraryAllowed, false, 'and never the library-wide drawing');
+  assert.equal(props.mode, 'embedded', 'inside the LEARN tab, not a modal over the app');
+  assert.equal(props.open, true);
 }
 
 console.log('LineageScaleView: all assertions passed');
