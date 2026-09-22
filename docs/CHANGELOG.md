@@ -8,7 +8,7 @@ Newest first.
 
 ## 2026-09-22
 
-### Media roots: the library serves files it never owned
+### Media roots: the library serves files it never owned (verified by tests: tests/test_library_media_roots.py)
 
 - An entry whose audio was never written under `data/generations/` is served
   from your own media folders. `theDAW_MEDIA_ROOTS` names them and wins
@@ -23,10 +23,12 @@ Newest first.
   from the environment variable is logged and dropped, and the rest still index.
 - The routes and the settings keys answer only to this machine. A LAN caller
   reads "Hidden on this device" in place of the folder list and cannot set it.
-- AIFF, WMA and APE are remuxed to WAV once for the browser and cached under
-  `data/playable-cache/<id>/` instead of beside your file.
+- When served from a media root, AIFF, WMA and APE are remuxed to WAV once
+  for the browser and cached under `data/playable-cache/<id>/` instead of
+  beside your file; an entry's own audio still remuxes into its entry folder's
+  `_playable/`.
 
-### LEARN: every number on the landing page opens a list
+### LEARN: every number on the landing page opens a list (verified by tests: tests/test_lineagescale_explore.py)
 
 - Songs with lineage and songs without, any relationship kind as parent, child
   or either end with the per-song count, rankings for any kind in either role,
@@ -35,7 +37,7 @@ Newest first.
 - A row badges the provider and carries Focus and Copy id. Search reuses the
   library's own search. A mashup cluster is counted apart: it is not a family.
 
-### LEARN: the classic graph of one song, in the tab
+### LEARN: the classic graph of one song, in the tab (verified by tests: LineageScaleView.test.tsx, LearnHost.test.tsx)
 
 - **Classic graph** opens the classic view on the song in focus, inside LEARN,
   on a library far too large for the whole-library drawing. The Genealogy and

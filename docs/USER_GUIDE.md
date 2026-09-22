@@ -852,9 +852,9 @@ What opens:
 - **A ranking** for any kind in either role, "most links of kind K as a parent" or "as a child" (`/explore/rankings`), not only the four presets the landing page shows.
 - **Families** by size (`/explore/families`) and the members of one family (`/explore/families/{id}/members`). A family is a connected component over ancestry links only. A mashup cluster welds unrelated trees into one component tens of thousands of songs wide, so it is counted on its own and is not a family.
 
-Every list searches, sorts, and pages. A page is 50 rows and the server counts the rest, so the browser holds 50 rows whether the list is 50 songs or 173,000; the page box commits on Enter or when it loses focus. Search runs through the Library's own fts5-backed search (§13.3), so there is no second index to keep current. A row shows the provider badge, the title, the number the list was ranked by, and two named buttons: **Focus** draws that song's neighbourhood, **Copy id** copies its entry id. A family row opens the family instead.
+Every list pages; the songs, kind, and family-member lists also search and sort. A ranking is count-ordered only and the family list is size-ordered only — neither has a search box. A page is 50 rows and the server counts the rest, so the browser holds 50 rows whether the list is 50 songs or 173,000; the page box commits on Enter or when it loses focus. Search is a title substring match, sanitised by the Library's own search tokeniser so the two cannot disagree about what counts as a token — but it matches titles only, not prompts, tags, or lyrics. A row shows the provider badge, the title, the number the list was ranked by, and two named buttons: **Focus** draws that song's neighbourhood, **Copy id** copies its entry id. A family row opens the family instead.
 
-The whole-graph counts are computed once per change to the link graph and cached, and the pass is warmed by a background thread a few seconds after startup, so opening a list does not read the relations table.
+The whole-graph counts are computed once per change to the link graph and cached, and the pass is warmed by a background thread about twenty seconds after startup, so opening a list does not read the relations table.
 
 ### 12.5 The classic graph of one song, inside LEARN
 
@@ -905,7 +905,7 @@ Waveform editor mixdowns, MIX outputs, mic recordings, imports, and Chimera rend
 
 ### 13.2 List and Grid Views
 
-Toggle between a dense **List** view (one row per entry) and a **Grid** view (tile cards) through the icons in the section header. List view shows title, prompt preview, model chip, duration, date, file size, and a per-entry action cluster. Each row also carries a **provider badge** — Stable Audio, theDAW, Suno, Udio, Riffusion, Magenta, or Import — classified from the file's embedded tags first and its `model` and `source` fields second; a `chirp-*` model is Suno's own model family, so those entries badge as Suno (§29).
+Toggle between a dense **List** view (one row per entry) and a **Grid** view (tile cards) through the icons in the section header. List view shows title, prompt preview, model chip, duration, date, file size, and a per-entry action cluster. Each row also carries a **provider badge** — Stable Audio, theDAW, Suno, Udio, Riffusion, Magenta, Imported, or Unknown — classified from the file's embedded tags first and its `model` and `source` fields second; a `chirp-*` model is Suno's own model family, so those entries badge as Suno (§29).
 
 ### 13.3 Search, Filter, Sort
 
@@ -1015,11 +1015,11 @@ An entry can exist whose audio was never written under `data/generations/`: cata
 
 Set them in **Settings → Storage → Media roots**, or in the `theDAW_MEDIA_ROOTS` environment variable (folders separated by `;` on Windows, `:` elsewhere). The environment variable wins outright: when it is set, the Settings list is not consulted at all. A root must be an absolute path to a folder that exists, and a folder inside another root is dropped because the outer walk already reaches it. A root typed into Settings that breaks those rules is refused there with the reason; a bad entry in the environment variable is logged and dropped, and the remaining roots still index.
 
-One background scan indexes every root. A file is matched to an entry by its name, in two shapes: the entry's full 36-character id anywhere in the name, or the first eight hex digits of that id in square brackets immediately before the extension — the short tag a library export writes (`Some Title [c27de18c].flac`). When both shapes claim one entry the full id wins; between two short tags the newest file wins. The walk runs on its own thread, because a few hundred thousand files on a spinning disk takes minutes, and until it finishes a lookup answers exactly as it did before any roots existed.
+One background scan indexes every root. A file is matched to an entry by its name, in two shapes: the entry's full 36-character id anywhere in the name, or the first eight hex digits of that id in square brackets immediately before the extension — the short tag a library export writes (`Some Title [c27de18c].flac`). When both shapes claim one entry the full id wins; between two short tags the newest file wins. (Entry ids are uuids; an entry whose id is not a uuid is not matched by either shape.) The walk runs on its own thread, because a few hundred thousand files on a spinning disk takes minutes, and until it finishes a lookup answers exactly as it did before any roots existed.
 
 Nothing is copied. A file found this way is played in place: no bytes are written into the entry's folder and its metadata is not touched. The library asks the entry's own folder first, the media-root index second, and only then a remote copy.
 
-The panel reports the index — how many files, how old, whether a walk is running — and a **Rescan** button walks the roots again on a background thread and answers immediately. The roots are also re-checked periodically, so a folder that changed is picked up without pressing it.
+The panel reports the index — how many files, how old, whether a walk is running — and a **Rescan** button walks the roots again on a background thread and answers immediately. A root is re-checked at most every 30 seconds while audio is being served, and a rescan starts when the root folder itself changed (gained or lost a top-level child). Files added deeper inside a root need **Rescan**.
 
 AIFF, WMA, and APE are containers the browser has no demuxer for. When one of those is served from a media root it is remuxed to WAV once (header only, nothing re-encoded, no bit depth lost) and the copy is cached under `data/playable-cache/<entry id>/` rather than beside your file. That cache is derived state and can be deleted at any time; it is rebuilt on the next play.
 
