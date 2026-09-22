@@ -25,7 +25,7 @@ from backend.lib.atomic import atomic_write
 log = logging.getLogger(__name__)
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -150,6 +150,16 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         # `overrides` (and for every slot above), never a fragment.
         "overrides": {},
     },
+    "library": {
+        # Folders (absolute paths) holding the user's own copies of library
+        # media, named after the entry they belong to -- either the full id or
+        # the "[xxxxxxxx]" short tag. The library resolves an entry with no
+        # file of its own from these before it asks any remote source. Read by
+        # backend/modules/library/media_roots.py, which also honours the
+        # theDAW_MEDIA_ROOTS env var (env wins). Same persistence + hygiene
+        # rules as models.extra_folders below: str-only, stripped, de-duped.
+        "media_roots": [],
+    },
     "models": {
         # Extra folders (absolute paths) the app scans for ML models, on top
         # of its built-in locations. Unlimited length; the user adds as many
@@ -266,6 +276,11 @@ def _merge_defaults(payload: dict[str, Any]) -> dict[str, Any]:
         # section, already filled from DEFAULT_SETTINGS above; this branch
         # re-persists the bumped schema with the field present.
         merged.setdefault("models", deepcopy(DEFAULT_SETTINGS["models"]))
+    if old_version < 10:
+        # Migration v9 → v10: add the `library` section (media_roots). New
+        # section, already filled from DEFAULT_SETTINGS above; this branch
+        # re-persists the bumped schema with the field present.
+        merged.setdefault("library", deepcopy(DEFAULT_SETTINGS["library"]))
 
     # Hygiene lives in the store, not only on the PATCH path: a hand-edited,
     # restored, or externally written settings.json gets the same str-only /
@@ -273,6 +288,9 @@ def _merge_defaults(payload: dict[str, Any]) -> dict[str, Any]:
     # and non-str items are dropped; a non-list normalises to [].
     merged["models"]["extra_folders"] = _normalize_extra_folders(
         merged["models"].get("extra_folders")
+    )
+    merged["library"]["media_roots"] = _normalize_extra_folders(
+        merged["library"].get("media_roots")
     )
 
     merged["schema_version"] = SCHEMA_VERSION
@@ -345,7 +363,10 @@ class SettingsStore:
                 for k, v in value.items():
                     if k not in allowed_keys:
                         continue
-                    if section == "models" and k == "extra_folders":
+                    if (section, k) in (
+                        ("models", "extra_folders"),
+                        ("library", "media_roots"),
+                    ):
                         # List-valued key: sanitise it (str-only, stripped,
                         # de-duped, no cap). A non-list is malformed and is
                         # ignored so it can't wipe the existing list.

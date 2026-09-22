@@ -114,6 +114,15 @@ export interface ModelsSettings {
   extra_folders: string[];
 }
 
+/** Library storage. `media_roots` are folders holding the user's own copies
+ *  of library media, named after the entry they belong to (the full id, or the
+ *  `[xxxxxxxx]` short tag). The backend resolves an entry that has no file of
+ *  its own from these before it asks any remote source. Replaced wholesale by
+ *  a patch, like `models.extra_folders`. */
+export interface LibrarySettings {
+  media_roots: string[];
+}
+
 export interface FeatureSettings {
   schema_version: number;
   app: AppSettings;
@@ -125,6 +134,7 @@ export interface FeatureSettings {
   notation: NotationSettings;
   io: IoSettings;
   models: ModelsSettings;
+  library: LibrarySettings;
 }
 
 export const DEFAULT_FEATURE_SETTINGS: FeatureSettings = {
@@ -173,6 +183,9 @@ export const DEFAULT_FEATURE_SETTINGS: FeatureSettings = {
   models: {
     extra_folders: [],
   },
+  library: {
+    media_roots: [],
+  },
 };
 
 interface FeatureToggleState {
@@ -201,12 +214,14 @@ type DeepPartial<T> = {
  * slot and drop the label. Writers send complete slot objects; the io store's
  * helpers are what build them.
  */
-export type FeatureSettingsPatch = DeepPartial<Omit<FeatureSettings, 'io' | 'models'>> & {
+export type FeatureSettingsPatch = DeepPartial<Omit<FeatureSettings, 'io' | 'models' | 'library'>> & {
   io?: Partial<IoSettings>;
   // `models.extra_folders` is a list assigned wholesale, so it is kept out of
   // DeepPartial (which would fragment the array into partial index keys) and
   // sent as a complete array, mirroring the backend's replace semantics.
   models?: Partial<ModelsSettings>;
+  // `library.media_roots` is a list assigned wholesale for the same reason.
+  library?: Partial<LibrarySettings>;
 };
 
 function mergeSettings(base: FeatureSettings, patch: FeatureSettingsPatch): FeatureSettings {
@@ -226,6 +241,9 @@ function mergeSettings(base: FeatureSettings, patch: FeatureSettingsPatch): Feat
     // Wholesale replace, and tolerant of the key being absent from the server
     // payload (older backend / T01 not yet merged) — falls back to [].
     models: { ...DEFAULT_FEATURE_SETTINGS.models, ...(base.models ?? {}), ...(patch.models ?? {}) },
+    // Same wholesale-replace rule, same tolerance for an older backend that
+    // does not send the section at all.
+    library: { ...DEFAULT_FEATURE_SETTINGS.library, ...(base.library ?? {}), ...(patch.library ?? {}) },
   };
   if (patch.schema_version != null) next.schema_version = patch.schema_version;
   return next;

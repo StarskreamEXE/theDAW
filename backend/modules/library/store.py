@@ -31,6 +31,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Optional
 
+from . import media_roots
 from .db import (
     DEFAULT_DELETE_BATCH,
     DEFAULT_SORT,
@@ -1652,7 +1653,16 @@ class LibraryStore:
         if entry_dir is None:
             return None
         meta = _read_metadata(entry_dir) or {}
-        return _resolve_audio_file(entry_dir, meta)
+        resolved = _resolve_audio_file(entry_dir, meta)
+        if resolved is not None:
+            return resolved
+        # The entry is real but its bytes were never written here. The user's
+        # own media folders are asked next -- referenced in place, exactly as
+        # a folder import's `source_path` is: nothing is copied in, nothing is
+        # written to the entry, and the metadata is not touched. An id that is
+        # not an entry at all still answers None above, so this cannot invent
+        # a library member out of a stray file.
+        return media_roots.lookup(entry_id, extensions=AUDIO_EXTS)
 
     def get_media_path(self, entry_id: str) -> Optional[Path]:
         """Resolve the video/image file for a media entry (None for audio
@@ -1663,7 +1673,10 @@ class LibraryStore:
         meta = _read_metadata(entry_dir) or {}
         if str(meta.get("kind") or "audio") not in ("video", "image"):
             return None
-        return _resolve_media_file(entry_dir, meta)
+        resolved = _resolve_media_file(entry_dir, meta)
+        if resolved is not None:
+            return resolved
+        return media_roots.lookup(entry_id, extensions=_MEDIA_EXTS)
 
     def get_thumb_path(self, entry_id: str) -> Optional[Path]:
         """Resolve the poster thumbnail for a media entry, if one exists."""

@@ -3,11 +3,172 @@
  * Open), the Hugging Face cache as an expandable row, and the VJ export folder.
  */
 import React, { useEffect, useRef, useState } from 'react';
-import { ChevronRight, FolderOpen, HardDrive, Loader2, RefreshCw } from 'lucide-react';
-import { postJson } from '../../../lib/apiJson';
+import { ChevronRight, FolderOpen, HardDrive, Loader2, Plus, RefreshCw, Trash2 } from 'lucide-react';
+import { getJson, postJson } from '../../../lib/apiJson';
 import { fetchHfCache, fetchLocations, formatBytes, openLocation, type HfRepo, type StorageLocation } from '../../../lib/storageClient';
 import { useFeatureToggleStore } from '../../../state/featureToggleStore';
-import { BTN_GHOST, CARD, SectionHeader } from './shared';
+import { PathInput } from '../../ui/PathInput';
+import { BTN_GHOST, BTN_PURPLE, BTN_ROSE, CARD, SectionHeader } from './shared';
+
+const MEDIA_ROOTS_TIP =
+  "Folders holding your own copies of library media, named after the entry they belong to \u2014 the full id, or the [xxxxxxxx] short tag before the extension. An entry with no file of its own is served from here instead of from the internet. Nothing is copied or moved: the file is played where it sits. The environment variable theDAW_MEDIA_ROOTS overrides this list when it is set.";
+
+/** What `GET /api/library/media-roots` reports about the index. */
+interface MediaRootIndexStatus {
+  roots: string[];
+  ready: boolean;
+  scanning: boolean;
+  files: number;
+  short_ids: number;
+  age_seconds: number | null;
+}
+
+const describeIndex = (status: MediaRootIndexStatus | null): string => {
+  if (!status) return 'Index status unavailable.';
+  if (status.scanning) return 'Scanning\u2026 the library falls back to its old behaviour until this lands.';
+  if (!status.ready) return 'Not indexed yet.';
+  const age = status.age_seconds == null ? '' : ` \u00b7 ${Math.round(status.age_seconds)}s ago`;
+  return `${status.files.toLocaleString()} file(s) indexed${age}`;
+};
+
+/**
+ * Settings \u2192 Storage \u2192 Media roots: the folder list the library resolves an
+ * entry's file from before it asks anything remote, plus the index's own state
+ * and a Rescan button.
+ *
+ * The list is PATCHed wholesale (the backend assigns the key wholesale) and the
+ * store's echoed value is the new truth, so a rejected save rolls back visibly
+ * \u2014 the same contract Model folders uses.
+ */
+const MediaRootsRows: React.FC = () => {
+  const roots = useFeatureToggleStore((s) => s.settings.library?.media_roots ?? []);
+  const patch = useFeatureToggleStore((s) => s.patch);
+
+  const [draft, setDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [hint, setHint] = useState<string | null>(null);
+  const [status, setStatus] = useState<MediaRootIndexStatus | null>(null);
+  const [rescanning, setRescanning] = useState(false);
+
+  const loadStatus = React.useCallback(async () => {
+    try {
+      setStatus(await getJson<MediaRootIndexStatus>('/api/library/media-roots'));
+    } catch {
+      setStatus(null);
+    }
+  }, []);
+  useEffect(() => { void loadStatus(); }, [loadStatus]);
+
+  // A scan of a few hundred thousand files takes minutes, so while one is
+  // running the status is re-read on a timer rather than left stale until the
+  // user reopens Settings.
+  useEffect(() => {
+    if (!status?.scanning) return;
+    const id = window.setInterval(() => { void loadStatus(); }, 2000);
+    return () => window.clearInterval(id);
+  }, [status?.scanning, loadStatus]);
+
+  const commit = async (next: string[]): Promise<boolean> => {
+    setSaving(true);
+    const ok = await patch({ library: { media_roots: next } });
+    setSaving(false);
+    return ok;
+  };
+
+  const onAdd = async () => {
+    if (saving) return;
+    const path = draft.trim();
+    if (!path) return;
+    if (roots.includes(path)) {
+      setHint('Already in the list');
+      return;
+    }
+    setHint(null);
+    if (await commit([...roots, path])) setDraft('');
+  };
+
+  const onRescan = async () => {
+    setRescanning(true);
+    try {
+      setStatus(await postJson<MediaRootIndexStatus>('/api/library/media-roots/rescan'));
+    } catch {
+      /* the status line already says what is known */
+    } finally {
+      setRescanning(false);
+      void loadStatus();
+    }
+  };
+
+  return (
+    <div className={`${CARD} px-2 py-1 flex flex-col gap-1`}>
+      <div className="flex items-center gap-2">
+        <span id="settings-media-roots-label" title={MEDIA_ROOTS_TIP} className="text-[9px] font-mono uppercase tracking-wider text-zinc-400 shrink-0 cursor-help">
+          Media roots
+        </span>
+        <span className="text-[10px] font-mono text-zinc-500 truncate flex-1 min-w-0">{describeIndex(status)}</span>
+        <button
+          type="button"
+          onClick={() => void onRescan()}
+          disabled={rescanning || status?.scanning === true}
+          className={BTN_GHOST}
+          title="Walk every media root again and rebuild the index"
+        >
+          {rescanning || status?.scanning ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+          Rescan
+        </button>
+      </div>
+
+      <div className="flex items-end gap-1.5">
+        <PathInput
+          inline
+          id="settings-media-root-path"
+          name="settings-media-root-path"
+          label="Folder"
+          value={draft}
+          onChange={(v) => { setDraft(v); if (hint) setHint(null); }}
+          kind="folder"
+          disabled={saving}
+          onEnter={() => void onAdd()}
+          placeholder="D:\\music"
+          description={MEDIA_ROOTS_TIP}
+          className="flex-1"
+        />
+        <button
+          type="button"
+          onClick={() => void onAdd()}
+          disabled={saving || !draft.trim()}
+          className={BTN_PURPLE}
+          title="Add this folder to the media roots"
+        >
+          <Plus className="w-3 h-3" /> Add
+        </button>
+      </div>
+      <p role="status" className="text-[11px] font-mono text-amber-300 empty:hidden">{hint}</p>
+
+      {roots.length > 0 ? (
+        <div className="flex flex-col gap-1">
+          {roots.map((folder) => (
+            <div key={folder} className="flex items-center gap-2 px-1.5 py-0.5 rounded border border-white/5">
+              <span className="text-[11px] font-mono text-zinc-300 truncate flex-1 min-w-0" title={folder}>{folder}</span>
+              <button
+                type="button"
+                onClick={() => { void commit(roots.filter((f) => f !== folder)); }}
+                disabled={saving}
+                className={BTN_ROSE}
+                aria-label={`Remove ${folder} from the media roots`}
+                title="Stop resolving entries from this folder (nothing on disk is touched)"
+              >
+                <Trash2 className="w-3 h-3" /> Remove
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="text-[11px] font-mono text-zinc-500">No media roots yet \u2014 entries with no file of their own stay unplayable.</p>
+      )}
+    </div>
+  );
+};
 
 const VJ_FOLDER_TIP =
   'Where VJ recordings are saved. A relative path sits inside the project; Browse fills an absolute folder such as D:\\Renders. Each take adds its record-bar subfolder, then ffmpeg transcodes to the chosen codec.';
@@ -139,6 +300,9 @@ export const StorageSection: React.FC = () => {
             {hfRepos.length === 0 && <p className="text-[11px] text-zinc-400 px-1.5 py-0.5">The cache is empty.</p>}
           </div>
         </div>
+
+        {/* Media roots: where an entry's own copy is found on this PC */}
+        <MediaRootsRows />
 
         {/* VJ recordings folder */}
         <div className={`${CARD} px-2 py-1`}>

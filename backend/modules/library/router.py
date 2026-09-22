@@ -54,6 +54,7 @@ from fastapi import (
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
+from . import media_roots
 from .bundle import build_bundle_bytes
 from .db import (
     DEFAULT_SORT,
@@ -78,6 +79,7 @@ from .store import (
     get_import_jobs,
 )
 from .tags import MAX_EMBEDDED_COVER_BYTES
+from backend.core.startup import register_startup_hook
 from backend.lib import known_paths, paths
 from backend.lib.cross_site import refuse_cross_site
 
@@ -861,6 +863,32 @@ def _playable_audio(audio_path: Path, entry_dir: Optional[Path]) -> tuple[Path, 
         return audio_path, guessed
 
 
+#: Entries whose remote copy answered 4xx, with the detail that was served.
+#: Bounded and process-lifetime: the point is that a host which has refused
+#: once is not asked again by the same run, not that the answer is permanent.
+_CDN_REFUSED_CAP = 4096
+_cdn_refused: dict[str, str] = {}
+
+
+def _unreachable_detail(entry_id: str, reason: str) -> str:
+    """What the player shows the user: WHY there is no audio, not just 404."""
+    return (
+        f"Audio for entry {entry_id!r}: no local file in any media root and "
+        f"the remote copy is not accessible ({reason})."
+    )
+
+
+def _remember_cdn_refusal(entry_id: str, detail: str) -> None:
+    """Record a settled refusal, logging once per entry. Oldest out first so
+    a long session over a large library cannot grow this without bound."""
+    if entry_id in _cdn_refused:
+        return
+    if len(_cdn_refused) >= _CDN_REFUSED_CAP:
+        _cdn_refused.pop(next(iter(_cdn_refused)))
+    _cdn_refused[entry_id] = detail
+    log.warning("library: %s", detail)
+
+
 @router.get("/audio/{entry_id}")
 async def stream_audio(entry_id: str) -> Response:
     # CHANGED: support CDN-backed entries — if no local file exists but
@@ -878,12 +906,16 @@ async def stream_audio(entry_id: str) -> Response:
             media_type=media_type,
             filename=served.name,
         )
-    # No local file — check for a CDN URL in metadata.
-    # CHANGED: on first CDN fetch, persist the MP3 locally so subsequent
-    # plays/sends are instant (no re-download). The entry becomes a
-    # normal local file after this one-time lazy download.
+    # No local file, in the entry or in any media root — the remote copy is
+    # the last resort. On the first successful fetch the bytes are persisted
+    # next to the entry, so a working CDN costs one download ever.
     entry_dir = store._dir_for(entry_id)  # noqa: SLF001
     if entry_dir is not None:
+        refused = _cdn_refused.get(entry_id)
+        if refused is not None:
+            # Asked once, told no. A player that retries eight times must not
+            # become eight requests to a host that has already refused.
+            raise HTTPException(404, refused)
         meta = _read_metadata(entry_dir)
         cdn_url = (meta or {}).get("cdn_audio_url")
         if cdn_url:
@@ -905,9 +937,32 @@ async def stream_audio(entry_id: str) -> Response:
                     media_type="audio/mpeg",
                     headers={"X-Audio-Source": "cdn-proxy"},
                 )
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                detail = _unreachable_detail(
+                    entry_id, f"the host answered HTTP {status}"
+                )
+                if 400 <= status < 500:
+                    # A 4xx is the host's settled answer (a CDN closed to
+                    # anonymous requests answers 403 forever), so it is
+                    # remembered and logged once for this entry rather than
+                    # re-asked on every play.
+                    _remember_cdn_refusal(entry_id, detail)
+                else:
+                    log.warning("library: CDN proxy failed for %s: %s", entry_id, exc)
+                raise HTTPException(404, detail) from exc
             except Exception as exc:  # noqa: BLE001
+                # A timeout or a dropped connection is not settled: it is
+                # logged and the next request is free to try again.
                 log.warning("library: CDN proxy failed for %s: %s", entry_id, exc)
-    raise HTTPException(404, f"Audio for entry {entry_id!r} not found")
+                raise HTTPException(
+                    404, _unreachable_detail(entry_id, f"the fetch failed: {exc}")
+                ) from exc
+    raise HTTPException(
+        404,
+        f"Audio for entry {entry_id!r} not found: no file in the entry, none in "
+        "any media root, and no remote copy recorded.",
+    )
 
 
 @router.get("/audio/{entry_id}/cover")
@@ -1055,6 +1110,25 @@ def delete_stem(stem_id: str) -> dict[str, Any]:
             log.warning("library: failed to delete stem file %s: %s", audio_path, e)
     store.db.delete_stem(stem_id)
     return {"deleted": stem_id}
+
+
+@router.get("/media-roots", dependencies=[Depends(refuse_cross_site)])
+def media_roots_status() -> dict[str, Any]:
+    """The media-root index: which folders, how many files, how old, and
+    whether a walk is running. Cross-site-refused because it names folders on
+    this machine."""
+    return media_roots.status()
+
+
+@router.post("/media-roots/rescan", dependencies=[Depends(refuse_cross_site)])
+def rescan_media_roots() -> dict[str, Any]:
+    """Walk the roots again on a daemon thread and answer immediately.
+    ``started`` is False when a scan was already running — a second walk over
+    the same tree would only slow the first."""
+    started = media_roots.start_scan(force=True)
+    payload = media_roots.status()
+    payload["started"] = started
+    return payload
 
 
 @router.get("/media/{entry_id}")
@@ -2028,6 +2102,20 @@ async def import_entry(
         metadata=meta_dict,
     )
     return record.to_dict()
+
+
+def _startup_index_media_roots() -> None:
+    """Index the user's media folders once the app is up.
+
+    A daemon thread, like the lineage-scale warm: a few hundred thousand
+    files on a spinning disk is minutes of walking, and no request may wait
+    for it. Until it lands every lookup answers None, which is exactly the
+    behaviour the library had before the index existed.
+    """
+    media_roots.start_scan()
+
+
+register_startup_hook("library-media-roots", _startup_index_media_roots)
 
 
 # Optional local extension. ``suno_routes`` (bulk provider-cache ingestion) is

@@ -5,6 +5,23 @@
 import { describeHttpError } from './httpError';
 import { pairingHeader } from './pairing';
 
+/** The failure these helpers throw. The message is exactly what it always was
+ *  (`describeApiError`: the route's own `detail`/`error`, or a described
+ *  status), so every `e.message` reader is untouched — but the STATUS is
+ *  carried alongside it now. A caller that must tell "the server refused this
+ *  request on purpose" from "the request failed" cannot get that out of the
+ *  message: `describeApiError` returns the detail verbatim when there is one,
+ *  and the status never appears in it. */
+export class ApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+  }
+}
+
 async function handle<T>(r: Response): Promise<T> {
   if (!r.ok) {
     // describeHttpError reads the body once, prefers a FastAPI `detail`, and
@@ -17,7 +34,7 @@ async function handle<T>(r: Response): Promise<T> {
     //
     // `error` is read here as well as `detail` because a few of this app's own
     // routes answer with that key.
-    throw new Error(await describeApiError(r));
+    throw new ApiError(await describeApiError(r), r.status);
   }
   return (await r.json()) as T;
 }
