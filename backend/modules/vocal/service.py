@@ -124,32 +124,52 @@ def set_review(asset_id: str, reviewed: bool, notes_text: str) -> dict:
 
     Disk first, cache second: if the document cannot be written this returns
     ``ok: False`` and changes nothing, because a cache that disagrees with the
-    file is a review flag that silently disappears at the next restart."""
+    file is a review flag that silently disappears at the next restart.
+
+    A failure also carries a ``code`` so the route can pick a status without
+    reading the sentence: ``missing_artifact`` is the client's wrong asset id
+    (404), ``write_failed`` is this machine's problem (500, worth a retry)."""
     art = _artifact_obj(asset_id)
     if art is None:
-        return {"ok": False, "error": "no artifact for asset"}
+        return {
+            "ok": False,
+            "code": "missing_artifact",
+            "error": "no artifact for asset",
+        }
+    src = _resolve_path(asset_id)
+    if src is None:
+        # The document lives next to the audio, so an asset whose file cannot
+        # be resolved has nowhere to hold the gate. Caching the review anyway
+        # and answering ok is the same lie as a failed write: the app would
+        # show a flag the library does not hold, and the next restart would
+        # forget it. Nothing is mutated on the way out.
+        return {
+            "ok": False,
+            "code": "write_failed",
+            "error": "no file to save the review next to",
+        }
     art.review.reviewed = bool(reviewed)
     art.review.notes = str(notes_text or "")
     payload = art.model_dump()
-    src = _resolve_path(asset_id)
-    if src is not None:
-        try:
-            import json
+    try:
+        import json
 
-            from backend.lib.atomic import atomic_write
+        from backend.lib.atomic import atomic_write
 
-            # Atomic: two review clicks in a row (or a click during a read) can
-            # never interleave into a half-written document.
-            atomic_write(
-                src.parent / "vocal_metadata.json", json.dumps(payload, indent=2)
-            )
-        except Exception as e:
-            log.info("vocal: review persist failed for %s: %s", asset_id, e)
-            # The document on disk is still the previous review, so the cache
-            # must be too: updating it here would make the app show a gate the
-            # library does not hold, and answering ok would tell the user their
-            # click was saved when the next restart will forget it.
-            return {"ok": False, "error": f"could not save the review: {e}"}
+        # Atomic: two review clicks in a row (or a click during a read) can
+        # never interleave into a half-written document.
+        atomic_write(src.parent / "vocal_metadata.json", json.dumps(payload, indent=2))
+    except Exception as e:
+        log.info("vocal: review persist failed for %s: %s", asset_id, e)
+        # The document on disk is still the previous review, so the cache
+        # must be too: updating it here would make the app show a gate the
+        # library does not hold, and answering ok would tell the user their
+        # click was saved when the next restart will forget it.
+        return {
+            "ok": False,
+            "code": "write_failed",
+            "error": f"could not save the review: {e}",
+        }
     _artifacts[asset_id] = payload
     return {"ok": True, "review": payload["review"]}
 

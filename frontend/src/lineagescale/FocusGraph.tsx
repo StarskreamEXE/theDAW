@@ -239,6 +239,17 @@ export const FocusGraph: React.FC<FocusGraphProps> = ({
                   <span className="truncate text-[9px] font-mono text-zinc-600">
                     not a song — cannot be opened
                   </span>
+                  {/* Not being focusable does not make the relatives the
+                      server left out disappear: this badge is the only thing
+                      that says the picture around this node is partial. */}
+                  {badge && (
+                    <span
+                      title={hiddenAccessibleName(hidden, title)}
+                      className="absolute right-1 top-1 rounded border border-amber-400/40 bg-amber-500/10 px-1 text-[8px] font-mono text-amber-200"
+                    >
+                      {badge}
+                    </span>
+                  )}
                 </div>
               );
             }

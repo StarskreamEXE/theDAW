@@ -179,6 +179,33 @@ def _kinds_from_helper(text: str, helper: str) -> set[str]:
     return set(re.findall(r""",\s*["']([A-Za-z0-9_]+)["']\s*\)""", body))
 
 
+def _kind_argument_texts(call: str) -> list[str]:
+    """The source text of every ``kind=`` argument in a call site.
+
+    The value ends at the first comma or closing bracket OUTSIDE any bracket it
+    opened itself, so ``kind="a", engine="b"`` yields only ``"a"`` while
+    ``kind="a" if p else "b"`` yields the whole conditional.
+    """
+    out: list[str] = []
+    for match in re.finditer(r"kind\s*=\s*", call):
+        rest = call[match.end() :]
+        depth = 0
+        end = len(rest)
+        for index, char in enumerate(rest):
+            if char in "([{":
+                depth += 1
+            elif char in ")]}":
+                if depth == 0:
+                    end = index
+                    break
+                depth -= 1
+            elif char == "," and depth == 0:
+                end = index
+                break
+        out.append(rest[:end])
+    return out
+
+
 def _kinds_written_by(path: Path) -> tuple[set[str], list[str]]:
     """``(kinds, unresolved)`` for one writer file.
 
@@ -219,9 +246,23 @@ def _kinds_written_by(path: Path) -> tuple[set[str], list[str]]:
                     window,
                 ):
                     found |= _kinds_from_helper(text, helper)
+        # A kind argument may carry MORE quoted tokens than the literal regex
+        # attributed to it -- `kind="a" if p else "b"` registers only "a", and
+        # the kind that got away would reach the database with no row in the
+        # role table while this scan still passed. So every quoted token in the
+        # argument's own text has to be accounted for.
+        leftover: set[str] = set()
+        for value in _kind_argument_texts(call):
+            leftover |= set(re.findall(r"""["']([A-Za-z0-9_]+)["']""", value))
+        leftover -= found
         if found:
             kinds |= found
-        else:
+        if leftover:
+            unresolved.append(
+                f"{path.as_posix()}:{number}: {line.strip()} "
+                f"(kinds the scan could not attribute: {sorted(leftover)})"
+            )
+        elif not found:
             unresolved.append(f"{path.as_posix()}:{number}: {line.strip()}")
     return kinds, unresolved
 
@@ -232,7 +273,7 @@ def test_the_role_table_covers_every_kind_this_repository_writes():
 
     The expected set is READ OFF THE WRITERS rather than typed out here: a
     hand-written list can only ever repeat what the table already says, which
-    is how ``cover`` and ``mashup`` (``backend/modules/suno/router.py:342``)
+    is how ``cover`` and ``mashup`` (``backend/modules/suno/router.py:346``)
     sat outside the table under a test with this name.
     """
     root = Path(__file__).resolve().parents[1]
@@ -300,6 +341,99 @@ def test_the_role_table_covers_every_kind_this_repository_writes():
     for info in graph.KIND_ROLES.values():
         assert info.writer, f"{info.kind} has no writer recorded"
         assert info.source_end in (graph.SOURCE_END_TO, graph.SOURCE_END_FROM)
+
+
+#: Every file that points a reader at the line of ``suno/router.py`` where the
+#: bare ``cover``/``mashup`` kinds are written. A citation is documentation that
+#: rots silently: the call moved down four lines and all five kept naming 342,
+#: which sends the next reader to an unrelated comment.
+_SUNO_WRITER_CITERS = (
+    "backend/modules/lineagescale/graph.py",
+    "frontend/src/lineagescale/lineageScaleModel.ts",
+    "frontend/src/lineagescale/lineageScaleModel.test.ts",
+    "tests/test_lineagescale.py",
+)
+
+_SUNO_CITATION_RE = re.compile(r"backend/modules/suno/router\.py:(\d+)")
+
+
+def test_every_citation_of_the_suno_relation_writer_points_at_the_call():
+    """A ``suno/router.py:<line>`` pointer must land ON the ``add_relation``
+    call. Checked rather than trusted, because the drift is invisible: the
+    number still looks like a line number after the code moves."""
+    root = Path(__file__).resolve().parents[1]
+    target = (root / "backend/modules/suno/router.py").read_text(encoding="utf-8")
+    lines = target.splitlines()
+
+    cited: list[tuple[str, int]] = []
+    for relative in _SUNO_WRITER_CITERS:
+        path = root / relative
+        assert path.is_file(), f"{relative} is gone; the citation moved with it"
+        for number in _SUNO_CITATION_RE.findall(path.read_text(encoding="utf-8")):
+            cited.append((relative, int(number)))
+
+    assert cited, "the citations vanished; find where they went before deleting this"
+    for relative, number in cited:
+        assert 1 <= number <= len(lines), (
+            f"{relative} cites suno/router.py:{number}, past the end of a "
+            f"{len(lines)}-line file"
+        )
+        assert "add_relation(" in lines[number - 1], (
+            f"{relative} cites suno/router.py:{number}, which is "
+            f"{lines[number - 1].strip()!r} and not the add_relation call; "
+            "the writer moved, so update every citation"
+        )
+    # All of them, not just the one file that happened to be read first.
+    assert {relative for relative, _ in cited} == set(_SUNO_WRITER_CITERS)
+
+
+def test_a_conditional_kind_argument_is_unresolved_and_not_half_read(tmp_path):
+    """``kind="a" if p else "b"`` registers only ``"a"`` under the literal
+    regex, so the second kind would reach the database with no row in the role
+    table and this scan would still pass. A quoted token the scan did not
+    account for therefore fails loudly."""
+    partial = tmp_path / "conditional_writer.py"
+    partial.write_text(
+        "def w(store, a, b, flag):\n"
+        "    store.db.add_relation(from_id=a, to_id=b, "
+        'kind="alpha" if flag else "beta")\n',
+        encoding="utf-8",
+    )
+    kinds, unresolved = _kinds_written_by(partial)
+    assert len(unresolved) == 1, unresolved
+    assert "beta" in unresolved[0], unresolved
+    assert "alpha" in kinds, "what it DID read is still reported"
+
+    # An ordinary literal call site stays resolved: the new check must not turn
+    # every writer into a failure.
+    plain = tmp_path / "plain_writer.py"
+    plain.write_text(
+        "def w(store, a, b):\n"
+        '    store.db.add_relation(from_id=a, to_id=b, kind="alpha")\n',
+        encoding="utf-8",
+    )
+    assert _kinds_written_by(plain) == ({"alpha"}, [])
+
+    # A kind that is resolved from a guarded variable carries no quoted token
+    # of its own at the call site, so it must not be reported as a leftover.
+    guarded = tmp_path / "guarded_writer.py"
+    guarded.write_text(
+        "def w(store, a, b, mode):\n"
+        '    if mode in ("cover", "mashup"):\n'
+        "        store.db.add_relation(from_id=a, to_id=b, kind=mode)\n",
+        encoding="utf-8",
+    )
+    assert _kinds_written_by(guarded) == ({"cover", "mashup"}, [])
+
+    # And a literal kind followed by another quoted argument is not a leftover
+    # either: only the kind argument's own text is read.
+    neighboured = tmp_path / "neighboured_writer.py"
+    neighboured.write_text(
+        "def w(store, a, b):\n"
+        '    store.db.add_relation(from_id=a, to_id=b, kind="alpha", engine="beta")\n',
+        encoding="utf-8",
+    )
+    assert _kinds_written_by(neighboured) == ({"alpha"}, [])
 
 
 def test_an_unrecognised_kind_is_not_assumed_to_be_ancestry():

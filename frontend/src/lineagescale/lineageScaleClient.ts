@@ -13,9 +13,7 @@
  * graph read, it is bounded by `budget`, and the landing page reads two small
  * summaries. That is the whole point of the module.
  */
-import { getJson } from '../lib/apiJson';
-import { describeHttpError } from '../lib/httpError';
-import { pairingHeader } from '../lib/pairing';
+import { describeApiError, getJson, pairingHeaderFor } from '../lib/apiJson';
 
 /** Route prefix. Relative, so it goes through the Vite proxy to :8600. */
 export const LINEAGE_SCALE_BASE = '/api/lineage-scale';
@@ -252,24 +250,17 @@ export type SummaryProbe =
   | { kind: 'ok'; summary: LineageSummary }
   | { kind: 'absent' };
 
-/** apiJson's rule, applied to this one request: the LAN pairing secret rides
- *  along only when the resolved URL is this page's own origin. A host with no
- *  `window` (a node test, SSR) sends no header, which is also correct. */
-function sameOriginPairingHeader(url: string): Record<string, string> {
-  try {
-    return new URL(url, window.location.href).origin === window.location.origin
-      ? pairingHeader()
-      : {};
-  } catch {
-    return {};
-  }
-}
-
 export async function fetchLineageSummaryProbe(): Promise<SummaryProbe> {
   const url = summaryUrl();
-  const res = await fetch(url, { headers: sameOriginPairingHeader(url) });
+  // apiJson's own header rule and its own failure description, imported rather
+  // than copied: the header must ride along on exactly the requests `getJson`
+  // would send it with, and a failure must read the same `{detail}`/`{error}`
+  // body `getJson` reads. Both were duplicated here, and the copies had
+  // already drifted -- the probe's reader ignored `error`, so this app's own
+  // routes came out of it as a bare `HTTP 500`.
+  const res = await fetch(url, { headers: pairingHeaderFor(url) });
   if (res.status === 404) return { kind: 'absent' };
-  if (!res.ok) throw new Error(await describeHttpError(res));
+  if (!res.ok) throw new Error(await describeApiError(res));
   return { kind: 'ok', summary: (await res.json()) as LineageSummary };
 }
 

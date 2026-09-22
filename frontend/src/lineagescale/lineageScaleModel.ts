@@ -125,7 +125,7 @@ export const KIND_WORDING: Record<string, KindWording> = {
     downSentence: '{n} covers of {title}', upSentence: '{n} songs {title} is a cover of',
   },
   /**
-   * The Suno poller writes a bare `cover` (backend/modules/suno/router.py:342)
+   * The Suno poller writes a bare `cover` (backend/modules/suno/router.py:346)
    * where the promoted writer writes `cover_of`. Same relationship, so the
    * same words — the backend has already turned both into (child, parent), so
    * `down` still means derivatives here.

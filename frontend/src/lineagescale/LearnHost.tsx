@@ -95,6 +95,65 @@ export function decideLearnMode(
   return { mode: remembered ?? 'classic', classicAllowed: true, reason: '' };
 }
 
+/* ────────────────────── what one summary probe settles ───────────────────── */
+
+/**
+ * Everything one attempt at `/summary` leaves behind, as a single value.
+ *
+ * Why it is a value and not three `useState` calls updated inline: the two
+ * interesting transitions — a probe that REJECTED, and the re-arm behind the
+ * Retry button — used to live inside an effect and a callback, where a render
+ * test cannot reach them (`renderToStaticMarkup` runs no effects). As plain
+ * functions they are checked directly, and the host below is only the wiring.
+ */
+export interface SummaryReadState {
+  /** What the route said, or null when there was none (a 404, or a failure). */
+  summary: LineageSummary | null;
+  /** The message from a failure that was NOT a 404, or null. */
+  failure: string | null;
+  /** Has an attempt finished, either way? */
+  read: boolean;
+}
+
+/** Nothing asked yet — and what a Retry goes back to. */
+export const UNREAD_SUMMARY: SummaryReadState = {
+  summary: null,
+  failure: null,
+  read: false,
+};
+
+/**
+ * A probe that RESOLVED. `absent` is a 404: an older backend has no such
+ * route, which is not an error the user needs to see, so no failure is carried
+ * and `decideLearnMode` reads it as today's behaviour.
+ */
+export const summaryFromProbe = (probe: SummaryProbe): SummaryReadState => ({
+  summary: probe.kind === 'ok' ? probe.summary : null,
+  failure: null,
+  read: true,
+});
+
+/**
+ * A probe that REJECTED — anything but a 404. The library's size is unknown,
+ * so the failure is carried and the classic view is never mounted on a guess.
+ */
+export const summaryFromFailure = (error: unknown): SummaryReadState => ({
+  summary: null,
+  failure: error instanceof Error ? error.message : String(error),
+  read: true,
+});
+
+/**
+ * Retry: drop the banner and set `read` back to false, which is the only gate
+ * `shouldReadSummary` has, so the request goes out again. Whatever summary was
+ * already read is kept — there is no second attempt counter to hold in step.
+ */
+export const summaryRearmed = (prev: SummaryReadState): SummaryReadState => ({
+  ...prev,
+  failure: null,
+  read: false,
+});
+
 /* ───────────────────────────── remembered choice ─────────────────────────── */
 
 const isMode = (v: unknown): v is LearnMode => v === 'scale' || v === 'classic';
@@ -297,10 +356,9 @@ export const LearnHost: React.FC<LearnHostProps> = ({
   scaleView,
   classicView,
 }) => {
-  const [summary, setSummary] = useState<LineageSummary | null>(null);
-  const [failure, setFailure] = useState<string | null>(null);
-  const [read, setRead] = useState(false);
+  const [state, setState] = useState<SummaryReadState>(UNREAD_SUMMARY);
   const [chosen, setChosen] = useState<LearnMode | null>(() => rememberedMode());
+  const { summary, failure, read } = state;
 
   useEffect(() => {
     if (!shouldReadSummary(visible, read)) return undefined;
@@ -308,19 +366,11 @@ export const LearnHost: React.FC<LearnHostProps> = ({
     (loadSummary ?? fetchLineageSummaryProbe)()
       .then((probe) => {
         if (!live) return;
-        // 'absent' is a 404: an older backend has no such route. That is not
-        // an error the user needs to see; it is the old behaviour, so take it.
-        setSummary(probe.kind === 'ok' ? probe.summary : null);
-        setFailure(null);
-        setRead(true);
+        setState(summaryFromProbe(probe));
       })
       .catch((e: unknown) => {
-        // NOT a 404. The size is unknown, so the classic view is not mounted
-        // on a guess; the new view stays up and says what happened.
         if (!live) return;
-        setSummary(null);
-        setFailure(e instanceof Error ? e.message : String(e));
-        setRead(true);
+        setState(summaryFromFailure(e));
       });
     return () => {
       live = false;
@@ -332,12 +382,7 @@ export const LearnHost: React.FC<LearnHostProps> = ({
     rememberMode(mode);
   }, []);
 
-  // `read` back to false is what re-arms the effect above; `shouldReadSummary`
-  // is the only gate, so there is no second attempt counter to keep in step.
-  const onRetry = useCallback(() => {
-    setFailure(null);
-    setRead(false);
-  }, []);
+  const onRetry = useCallback(() => setState(summaryRearmed), []);
 
   return (
     <LearnHostSurface

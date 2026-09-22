@@ -87,7 +87,7 @@ _KINDS: tuple[LinkKind, ...] = (
     # the SOURCE. Read with the promoted writer's direction these came out
     # backwards, dashed, and out of the ancestry rankings.
     LinkKind(
-        "cover", ROLE_ANCESTRY, SOURCE_END_FROM, "backend/modules/suno/router.py:342"
+        "cover", ROLE_ANCESTRY, SOURCE_END_FROM, "backend/modules/suno/router.py:346"
     ),
     LinkKind("edit_of", ROLE_ANCESTRY, SOURCE_END_TO, "suno_promote.py:1633"),
     LinkKind("derived_from", ROLE_ANCESTRY, SOURCE_END_TO, "suno_promote.py:1633"),
@@ -104,7 +104,7 @@ _KINDS: tuple[LinkKind, ...] = (
     # The Suno poller's bare sibling, written the other way round: from_id is
     # the source clip, to_id is the mashup built from it.
     LinkKind(
-        "mashup", ROLE_USES, SOURCE_END_FROM, "backend/modules/suno/router.py:342"
+        "mashup", ROLE_USES, SOURCE_END_FROM, "backend/modules/suno/router.py:346"
     ),
     # The opposite way round: ``(label, entry_id, "chimera_source_of")`` --
     # from_id is the source label, to_id is the song built from it.

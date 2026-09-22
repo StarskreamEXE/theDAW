@@ -154,7 +154,7 @@ const node = (id: string, generation: number, extra: Partial<NeighbourNode> = {}
     ['underpaint_of', 'Underpaints', 'Underpaint of'],
     ['speed_change_of', 'Speed changes', 'Speed change of'],
     ['mashup_source', 'Used in mashups', 'Mashup sources'],
-    // The Suno poller's bare kinds (backend/modules/suno/router.py:342) read
+    // The Suno poller's bare kinds (backend/modules/suno/router.py:346) read
     // with the same words as their `_of` siblings: the same relationship.
     ['cover', 'Covers', 'Cover of'],
     ['mashup', 'Used in mashups', 'Mashup sources'],

@@ -527,6 +527,24 @@ const ALONE = 'This song stands alone';
   );
   // The focus itself is still a button.
   assert.ok(buttonTags(html).some((tag) => tag.includes('data-node-id="song-1"')));
+
+  // Not being focusable does not make its hidden relatives disappear. The
+  // server counts what it left out for THIS node, and "+N more" is the only
+  // thing that says the picture is partial — dropping it because the node is
+  // drawn as a label rather than a button is a silently incomplete graph.
+  const withHiddenLabel = renderToStaticMarkup(
+    <FocusGraph
+      data={{ ...withLabel, hidden: { [label]: { up: 7, down: 0 } } }}
+      focusId="song-1"
+      onFocusNode={() => {}}
+      onOpenGroup={() => {}}
+    />,
+  );
+  assert.ok(withHiddenLabel.includes('+7 more'), withHiddenLabel);
+  assert.ok(
+    withHiddenLabel.includes(`7 more sources of ${label}`),
+    'and the badge still says what it stands for',
+  );
 }
 
 /* ═══════ a relative's provider badge gets model AND source ════════════════ */

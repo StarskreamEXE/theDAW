@@ -26,11 +26,13 @@ const {
 const withFetch = async <T>(
   response: Response,
   run: () => Promise<T>,
-): Promise<{ url: string; value: T | null; error: string | null }> => {
+): Promise<{ url: string; headers: Record<string, string>; value: T | null; error: string | null }> => {
   const original = globalThis.fetch;
   let url = '';
-  globalThis.fetch = (async (input: RequestInfo | URL) => {
+  let headers: Record<string, string> = {};
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     url = String(input);
+    headers = { ...((init?.headers as Record<string, string> | undefined) ?? {}) };
     return response;
   }) as typeof fetch;
   try {
@@ -38,9 +40,9 @@ const withFetch = async <T>(
     // reads `url` in source order, so building it inline would capture the
     // empty string that was there before fetch ran.
     const value = await run();
-    return { url, value, error: null };
+    return { url, headers, value, error: null };
   } catch (e) {
-    return { url, value: null, error: e instanceof Error ? e.message : String(e) };
+    return { url, headers, value: null, error: e instanceof Error ? e.message : String(e) };
   } finally {
     globalThis.fetch = original;
   }
@@ -239,6 +241,62 @@ const params = (url: string): Record<string, string> => {
   } finally {
     globalThis.fetch = original;
   }
+}
+
+// ── the probe obeys apiJson's rules because it USES them ───────────────────
+//
+// The probe cannot go through `getJson` (it needs the status), but everything
+// else about it must be the same request `getJson` would have made. It had its
+// own copy of the pairing-header rule and a DIFFERENT body reader, so this
+// app's own `{"error": "..."}` bodies — which `getJson` surfaces — came out of
+// the probe as "HTTP 500". Both now come from `lib/apiJson.ts`.
+{
+  // A window is required for the same-origin comparison the header rule makes;
+  // node has none, which is why the assertion below needs one built by hand.
+  const token = 'pair-token-9';
+  const fakeWindow = {
+    location: { href: 'http://localhost:5173/learn', origin: 'http://localhost:5173' },
+    localStorage: { getItem: () => token, setItem: () => {} },
+  };
+  const host = globalThis as { window?: unknown };
+  const hadWindow = 'window' in host;
+  const previous = host.window;
+  host.window = fakeWindow;
+  try {
+    const body = {
+      entries: 4, with_lineage: 3, standalone: 1,
+      links_raw: 2, links_distinct: 2, by_kind: { cover_of: 1 },
+      largest_connected: 3, largest_tree: 3, full_view_ok: true, revision: 1,
+    };
+    const paired = await withFetch(json(body), () => fetchLineageSummaryProbe());
+    assert.equal(paired.error, null);
+    assert.equal(
+      paired.headers['X-TheDAW-Pair'],
+      token,
+      'the LAN pairing secret rides along, exactly as it does for getJson',
+    );
+
+    // The same request through `getJson` carries the same header: one rule,
+    // one implementation, so the probe cannot drift away from it again.
+    const viaGetJson = await withFetch(json(body), () => fetchLineageSummary());
+    assert.deepEqual(viaGetJson.headers, paired.headers);
+  } finally {
+    if (hadWindow) host.window = previous;
+    else delete host.window;
+  }
+
+  // This app's own routes answer `{"error": "..."}`. `getJson` reads that key;
+  // the probe read only `detail`, so a real reason arrived as a bare status.
+  const spoken = await withFetch(
+    json({ error: 'the library is still opening' }, 500),
+    () => fetchLineageSummaryProbe(),
+  );
+  assert.equal(spoken.value, null);
+  assert.equal(
+    spoken.error,
+    'the library is still opening',
+    'the route’s own words reach the user, the same as through getJson',
+  );
 }
 
 console.log('lineageScaleClient: all assertions passed');

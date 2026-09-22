@@ -22,8 +22,11 @@ async function handle<T>(r: Response): Promise<T> {
   return (await r.json()) as T;
 }
 
-/** `describeHttpError`, plus this app's non-standard `{error: "..."}` bodies. */
-async function describeApiError(r: Response): Promise<string> {
+/** `describeHttpError`, plus this app's non-standard `{error: "..."}` bodies.
+ *  Exported because a caller that needs the STATUS (the lineage-scale summary
+ *  probe) cannot go through `getJson`, and must still describe a failure the
+ *  same way rather than keep its own reader that misses the `error` key. */
+export async function describeApiError(r: Response): Promise<string> {
   const body = await r.clone().text();
   try {
     const parsed = JSON.parse(body) as { detail?: unknown; error?: unknown };
@@ -41,7 +44,7 @@ async function describeApiError(r: Response): Promise<string> {
  *  this origin -- but attach it only when the resolved URL's origin matches
  *  the page's own origin, so a future absolute-URL (or protocol-relative,
  *  or slash-backslash) call site can't ship it cross-origin by accident. */
-function pairingHeaderFor(url: string): Record<string, string> {
+export function pairingHeaderFor(url: string): Record<string, string> {
   try {
     return new URL(url, window.location.href).origin === window.location.origin ? pairingHeader() : {};
   } catch {

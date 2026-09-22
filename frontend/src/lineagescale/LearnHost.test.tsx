@@ -17,9 +17,9 @@ import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
 import {
-  LearnHost, LearnHostSurface, LearnSwitch, LineageView,
+  LearnHost, LearnHostSurface, LearnSwitch, LineageView, UNREAD_SUMMARY,
   classicUnavailableReason, classicUnknownSizeReason, decideLearnMode, rememberMode,
-  rememberedMode, shouldReadSummary,
+  rememberedMode, shouldReadSummary, summaryFromFailure, summaryFromProbe, summaryRearmed,
   type LearnViewProps,
 } from './LearnHost.tsx';
 import { LineageScaleView } from './LineageScaleView.tsx';
@@ -348,6 +348,60 @@ const surface = (props: Partial<React.ComponentProps<typeof LearnHostSurface>>):
   assert.ok(failed.includes('HTTP 500'), 'and it says what happened');
   assert.ok(/<button[^>]*>Retry<\/button>/.test(failed), 'with a way to try again');
   assert.ok(failed.includes('disabled=""'), 'and the classic option is refused, not offered');
+}
+
+// ── what a probe LEAVES BEHIND, and what Retry does to it ──────────────────
+//
+// The host's effect and its Retry button used to hold this logic inline, where
+// `renderToStaticMarkup` — which runs no effects — could never reach it: the
+// rejected-probe branch and the re-arm were the two pieces of this file with no
+// test at all. They are plain functions now, so both are checked here, and the
+// host is only the wiring that calls them.
+{
+  // A route that answered: the summary is known, there is no failure, and the
+  // read is done.
+  assert.deepEqual(summaryFromProbe({ kind: 'ok', summary: SMALL }), {
+    summary: SMALL, failure: null, read: true,
+  });
+  // A 404: no summary and STILL no failure — that is the older-backend case,
+  // and `decideLearnMode` reads it as the classic view, as it always did.
+  assert.deepEqual(summaryFromProbe({ kind: 'absent' }), {
+    summary: null, failure: null, read: true,
+  });
+  assert.equal(decideLearnMode(null, null, false).mode, 'classic');
+
+  // A REJECTED probe: the size is unknown, so the failure is carried and the
+  // decision it feeds is the new view with the classic one refused.
+  const failed = summaryFromFailure(new Error('HTTP 500'));
+  assert.deepEqual(failed, { summary: null, failure: 'HTTP 500', read: true });
+  assert.deepEqual(
+    decideLearnMode(failed.summary, null, failed.failure !== null),
+    { mode: 'scale', classicAllowed: false, reason: classicUnknownSizeReason },
+  );
+  assert.equal(
+    summaryFromFailure('the connection went away').failure,
+    'the connection went away',
+    'a rejection that is not an Error still says something',
+  );
+
+  // Retry: the banner goes, and `read` back to false is what re-arms the one
+  // gate the effect has.
+  const rearmed = summaryRearmed(failed);
+  assert.deepEqual(rearmed, { summary: null, failure: null, read: false });
+  assert.deepEqual(rearmed, UNREAD_SUMMARY, 'a retry is the un-read state again');
+  assert.ok(shouldReadSummary(true, rearmed.read), 'so the summary is asked for again');
+  assert.ok(!shouldReadSummary(true, failed.read), 'while a settled read asks for nothing');
+  assert.equal(
+    summaryRearmed({ summary: SMALL, failure: null, read: true }).summary,
+    SMALL,
+    'and a retry does not throw away a summary that was already read',
+  );
+
+  // The failure state, rendered: the banner and its Retry are what the user
+  // gets, and the classic view is still not built.
+  const html = surface({ ...failed, scaleView: spyView('scale', []), classicView: Forbidden });
+  assert.ok(html.includes('HTTP 500'), html);
+  assert.ok(/<button[^>]*>Retry<\/button>/.test(html));
 }
 
 console.log('LearnHost: all assertions passed');
