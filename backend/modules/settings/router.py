@@ -38,12 +38,6 @@ def get_store() -> SettingsStore:
 router = APIRouter()
 
 
-@router.get("")
-@router.get("/")
-def get_settings() -> dict[str, Any]:
-    return get_store().get_all()
-
-
 #: Keys whose value is a list of FOLDERS ON THIS MACHINE. Setting one points a
 #: background walker (the media-root index, the model scan) at a directory of
 #: the caller's choosing, so they are held to the strict tier even though the
@@ -51,11 +45,44 @@ def get_settings() -> dict[str, Any]:
 _FOLDER_LIST_KEYS = (("library", "media_roots"), ("models", "extra_folders"))
 
 
+def _caller_may_see_folders(request: Request) -> bool:
+    """The PATCH guard as a question rather than an answer.
+
+    Expressed by catching the guard's own refusal so there is exactly ONE
+    statement of the rule: a second predicate spelling out "loopback or launch
+    token" here would be a second place to keep in step with
+    ``backend/lib/cross_site.py``.
+    """
+    try:
+        require_loopback_or_launch_token(request)
+    except HTTPException:
+        return False
+    return True
+
+
 def _folder_lists_touched(payload: dict[str, Any]) -> bool:
     return any(
         isinstance(payload.get(section), dict) and key in payload[section]
         for section, key in _FOLDER_LIST_KEYS
     )
+
+
+@router.get("")
+@router.get("/")
+def get_settings(request: Request) -> dict[str, Any]:
+    """The full settings payload, minus the folder lists for a caller that is
+    not allowed to SET them. Naming every media root and model folder on this
+    machine is reconnaissance for anyone on the LAN, and a panel that cannot
+    write them has no use for their contents."""
+    payload = get_store().get_all()
+    if _caller_may_see_folders(request):
+        return payload
+    for section, key in _FOLDER_LIST_KEYS:
+        values = payload.get(section)
+        if isinstance(values, dict) and isinstance(values.get(key), list):
+            values[key] = []
+            values[f"{key}_redacted"] = True
+    return payload
 
 
 @router.patch("")

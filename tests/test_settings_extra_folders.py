@@ -197,3 +197,50 @@ def test_router_get_and_patch_end_to_end(tmp_path, monkeypatch):
         "D:/x",
         "E:/y",
     ]
+
+
+def _settings_client(tmp_path, monkeypatch, peer):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from backend.modules.settings import router as settings_router
+    from backend.modules.settings.store import SettingsStore
+
+    store = SettingsStore(tmp_path / "settings.json")
+    folder = tmp_path / "music"
+    folder.mkdir(exist_ok=True)
+    store.patch(
+        {
+            "library": {"media_roots": [str(folder)]},
+            "models": {"extra_folders": [str(folder)]},
+        }
+    )
+    monkeypatch.setattr(settings_router, "_store", store)
+    app = FastAPI()
+    app.include_router(settings_router.router, prefix="/api/settings")
+    return TestClient(app, client=peer), str(folder)
+
+
+def test_a_lan_get_does_not_hand_out_folder_names(tmp_path, monkeypatch):
+    lan, folder = _settings_client(tmp_path, monkeypatch, ("10.20.30.40", 51000))
+
+    body = lan.get("/api/settings").json()
+
+    assert body["library"]["media_roots"] == []
+    assert body["models"]["extra_folders"] == []
+    assert body["library"]["media_roots_redacted"] is True
+    assert body["models"]["extra_folders_redacted"] is True
+    assert folder not in lan.get("/api/settings").text
+    # Everything else is still readable -- this is the feature-toggle panel.
+    assert "stems" in body
+
+
+def test_this_machine_sees_its_own_folder_lists(tmp_path, monkeypatch):
+    local, folder = _settings_client(tmp_path, monkeypatch, ("127.0.0.1", 51000))
+
+    body = local.get("/api/settings").json()
+
+    assert body["library"]["media_roots"] == [folder]
+    assert body["models"]["extra_folders"] == [folder]
+    assert "media_roots_redacted" not in body["library"]
+    assert "extra_folders_redacted" not in body["models"]

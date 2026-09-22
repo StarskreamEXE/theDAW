@@ -191,12 +191,30 @@ def validate_roots(values: list[str]) -> list[str]:
     return roots
 
 
+def _accept_roots(values: list[str], source: str) -> list[str]:
+    """``validate_roots`` per entry, dropping (and naming) the ones it refuses.
+
+    Reading roots must never raise -- a bad entry in the environment or in a
+    hand-edited settings.json would otherwise take the whole index down, and
+    with it every entry that HAS a good root. The PATCH path still answers 400
+    so a root typed into Settings is rejected where the user can see it; this
+    is the same rule applied where there is nobody to tell.
+    """
+    kept: list[str] = []
+    for value in values:
+        try:
+            kept.extend(validate_roots([value]))
+        except ValueError as exc:
+            log.warning("media_roots: ignoring a root from %s (%s)", source, exc)
+    return normalize_roots(kept)
+
+
 def configured_roots() -> list[str]:
     """The folders to index, env first. Never raises: a settings store that
     cannot be read is the same as no roots configured."""
     raw = os.getenv(ENV_VAR)
     if raw:
-        return normalize_roots(raw.split(os.pathsep))
+        return _accept_roots(raw.split(os.pathsep), ENV_VAR)
     try:
         from backend.modules.settings.router import get_store as get_settings_store
 
@@ -206,7 +224,10 @@ def configured_roots() -> list[str]:
         return []
     if not isinstance(value, list):
         return []
-    return normalize_roots([v for v in value if isinstance(v, str)])
+    return _accept_roots(
+        [v for v in value if isinstance(v, str)],
+        f"settings.{SETTINGS_SECTION}.{SETTINGS_KEY}",
+    )
 
 
 def _signature(roots: list[str]) -> tuple[tuple[str, Optional[float]], ...]:
@@ -221,15 +242,32 @@ def _signature(roots: list[str]) -> tuple[tuple[str, Optional[float]], ...]:
     return tuple(out)
 
 
-def playable_cache_dir(entry_id: str) -> Path:
-    """Where a remux of an out-of-tree file is cached.
+#: An entry id that is safe to use as ONE path segment. Every id this library
+#: mints is a uuid or "<job>_<index>"; anything else arrives off the wire.
+_SAFE_SEGMENT_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def playable_cache_dir(entry_id: str) -> Optional[Path]:
+    """Where a remux of an out-of-tree file is cached, or None.
 
     An entry whose audio lives in a media root is REFERENCED, not owned: the
     library must not write a decoded WAV into its folder just because the
     browser cannot open AIFF. The cache goes in the writable data tree
     instead, keyed by entry, so it is still one remux per file and still
     deletable by hand.
+
+    None when the id cannot be a folder name. ``entry_id`` comes straight off
+    the URL, and ``data_path(PLAYABLE_CACHE_DIRNAME, "../..")`` is a folder
+    somewhere else entirely -- a caller that gets None serves the original
+    bytes instead, which costs a browser-unplayable file and nothing else.
     """
+    if (
+        not entry_id
+        or entry_id in (".", "..")
+        or not _SAFE_SEGMENT_RE.fullmatch(entry_id)
+    ):
+        log.debug("media_roots: %r cannot be a cache folder name", entry_id)
+        return None
     from backend.lib import paths
 
     return paths.data_path(PLAYABLE_CACHE_DIRNAME, entry_id)

@@ -826,23 +826,64 @@ def _playable_cache_for(
     return media_roots.playable_cache_dir(entry_id)
 
 
-def _playable_audio(audio_path: Path, entry_dir: Optional[Path]) -> tuple[Path, str]:
+def _resolve_for_stream(
+    store: LibraryStore, entry_id: str
+) -> tuple[Optional[Path], Optional[Path]]:
+    """``(audio file, folder its remux may be cached in)`` for one entry.
+
+    Every filesystem call the stream path needs before it can answer lives
+    here -- the entry dir, the media-root index and its stat, the containment
+    check -- because ``stream_audio`` is ``async def`` and hands this to a
+    thread. Called inline it would run ON the event loop, where one stat of a
+    sleeping external drive stalls every other request in the process.
+    """
+    audio_path = store.get_audio_path(entry_id)
+    if audio_path is None or not audio_path.is_file():
+        return None, None
+    entry_dir = store._dir_for(entry_id)  # noqa: SLF001
+    return audio_path, _playable_cache_for(audio_path, entry_dir, entry_id)
+
+
+def _entry_dir_and_meta(
+    store: LibraryStore, entry_id: str
+) -> tuple[Optional[Path], Optional[dict[str, Any]]]:
+    """The entry's folder and its metadata, for the remote-copy path. Same
+    reason as ``_resolve_for_stream``: ``_dir_for`` stats and
+    ``_read_metadata`` reads a file, and neither may do it on the loop."""
+    entry_dir = store._dir_for(entry_id)  # noqa: SLF001
+    if entry_dir is None:
+        return None, None
+    return entry_dir, _read_metadata(entry_dir)
+
+
+def _playable_audio(audio_path: Path, cache_parent: Optional[Path]) -> tuple[Path, str]:
     """``(path, media_type)`` the browser can actually open.
 
     libsndfile reads AIFF natively, so the fix is a remux to WAV — both are
     PCM, so only the header and the byte order change. Nothing is re-encoded
     and no bit depth is lost; the source's own subtype is carried over.
 
-    Cached next to the entry, so a file costs this once rather than once per
-    play, and re-done if the source is ever replaced. Any failure falls back
-    to serving the original: a file the browser refuses is no worse than one
-    that 500s, and the log says which happened.
+    Cached under ``cache_parent`` (see ``_playable_cache_for``), so a file
+    costs this once rather than once per play, and re-done if the source is
+    ever replaced. ``cache_parent`` is required and has no fallback: there is
+    no folder this may write to by default. Any failure falls back to serving
+    the original: a file the browser refuses is no worse than one that 500s,
+    and the log says which happened.
     """
     guessed = mimetypes.guess_type(str(audio_path))[0] or "audio/wav"
     if audio_path.suffix.lower() not in _BROWSER_UNPLAYABLE_SUFFIXES:
         return audio_path, guessed
+    if cache_parent is None:
+        # Nowhere this may write. The source's own folder is NOT a fallback:
+        # it belongs to the user, and a remux dropped beside their file is the
+        # bug this cache exists to avoid. The browser gets the original and
+        # says it cannot play it, which is the honest answer.
+        log.info(
+            "library: no cache folder for %s; serving the original", audio_path.name
+        )
+        return audio_path, guessed
 
-    cache_dir = (entry_dir or audio_path.parent) / _PLAYABLE_CACHE_DIRNAME
+    cache_dir = cache_parent / _PLAYABLE_CACHE_DIRNAME
     cached = cache_dir / f"{audio_path.stem}.wav"
     try:
         if cached.is_file() and cached.stat().st_mtime >= audio_path.stat().st_mtime:
@@ -918,20 +959,19 @@ def _remember_cdn_refusal(entry_id: str, detail: str) -> None:
 async def stream_audio(entry_id: str) -> Response:
     # CHANGED: support CDN-backed entries — if no local file exists but
     # metadata has a cdn_audio_url, proxy the audio from Suno CDN on demand.
-    store = get_store()
-    # Resolving is filesystem work -- the entry dir, then the media-root index
-    # and one stat on its hit -- and this handler is `async def`, so it runs ON
-    # the event loop unless it is handed to a thread. A sleeping external drive
-    # would otherwise stall every other request in the process.
-    audio_path = await asyncio.to_thread(store.get_audio_path, entry_id)
-    if audio_path is not None and audio_path.is_file():
+    # Even building the store is filesystem work the first time (it walks the
+    # library root), and this handler is `async def`, so everything below runs
+    # ON the event loop unless it is handed to a thread. A sleeping external
+    # drive would otherwise stall every other request in the process.
+    store = await asyncio.to_thread(get_store)
+    audio_path, cache_parent = await asyncio.to_thread(
+        _resolve_for_stream, store, entry_id
+    )
+    if audio_path is not None:
         # Decoding a long AIFF is seconds of blocking work; off the event loop
         # it goes, or every other request on the server stalls behind it.
-        entry_dir_for_cache = store._dir_for(entry_id)  # noqa: SLF001
         served, media_type = await asyncio.to_thread(
-            _playable_audio,
-            audio_path,
-            _playable_cache_for(audio_path, entry_dir_for_cache, entry_id),
+            _playable_audio, audio_path, cache_parent
         )
         return FileResponse(
             path=str(served),
@@ -941,14 +981,13 @@ async def stream_audio(entry_id: str) -> Response:
     # No local file, in the entry or in any media root — the remote copy is
     # the last resort. On the first successful fetch the bytes are persisted
     # next to the entry, so a working CDN costs one download ever.
-    entry_dir = store._dir_for(entry_id)  # noqa: SLF001
+    entry_dir, meta = await asyncio.to_thread(_entry_dir_and_meta, store, entry_id)
     if entry_dir is not None:
         refused = _cdn_refused.get(entry_id)
         if refused is not None:
             # Asked once, told no. A player that retries eight times must not
             # become eight requests to a host that has already refused.
             raise HTTPException(404, refused)
-        meta = _read_metadata(entry_dir)
         cdn_url = (meta or {}).get("cdn_audio_url")
         if cdn_url:
             try:
