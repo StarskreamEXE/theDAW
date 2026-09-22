@@ -112,6 +112,8 @@ export interface IoSettings {
  *  wholesale by a patch (like `io`), never element-merged. */
 export interface ModelsSettings {
   extra_folders: string[];
+  /** Blanked for the same reason as `media_roots_redacted`. */
+  extra_folders_redacted?: boolean;
 }
 
 /** Library storage. `media_roots` are folders holding the user's own copies
@@ -121,6 +123,10 @@ export interface ModelsSettings {
  *  a patch, like `models.extra_folders`. */
 export interface LibrarySettings {
   media_roots: string[];
+  /** The backend blanked the list because this caller may not set it (a LAN
+   *  device, not the machine theDAW runs on -- see settings/router.py's
+   *  `_redacted_for`). Absent means the list is the real one. */
+  media_roots_redacted?: boolean;
 }
 
 export interface FeatureSettings {

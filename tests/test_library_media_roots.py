@@ -633,6 +633,8 @@ def _on_the_event_loop() -> bool:
 def test_streaming_does_no_filesystem_work_on_the_event_loop(
     client, tmp_path, monkeypatch
 ):
+    import os
+
     lib = tmp_path / "lib"
     entry_dir = lib / UUID_A
     entry_dir.mkdir(parents=True)
@@ -647,6 +649,7 @@ def test_streaming_does_no_filesystem_work_on_the_event_loop(
     on_loop: list[str] = []
     real_is_file = Path.is_file
     real_dir_for = LibraryStore._dir_for
+    real_stat = os.stat
 
     def _is_file(self):
         if _on_the_event_loop():
@@ -658,8 +661,17 @@ def test_streaming_does_no_filesystem_work_on_the_event_loop(
             on_loop.append(f"_dir_for({entry_id})")
         return real_dir_for(self, entry_id)
 
+    def _stat(path, *args, **kwargs):
+        if _on_the_event_loop():
+            on_loop.append(f"stat({path})")
+        return real_stat(path, *args, **kwargs)
+
     monkeypatch.setattr(Path, "is_file", _is_file)
     monkeypatch.setattr(LibraryStore, "_dir_for", _dir_for)
+    # Every stat, including the one Starlette's FileResponse takes to size the
+    # body: a response that stats on the loop is the same stall as a resolve
+    # that does.
+    monkeypatch.setattr(os, "stat", _stat)
 
     assert client.get(f"/api/library/audio/{UUID_A}").status_code == 200
     assert on_loop == []
@@ -711,6 +723,11 @@ def test_the_playable_cache_refuses_an_id_that_is_a_path(tmp_path, monkeypatch):
     assert media_roots.playable_cache_dir("a\\b") is None
     assert media_roots.playable_cache_dir("C:sneaky") is None
     assert media_roots.playable_cache_dir("") is None
+    # Every run of dots, not just the two the filesystem names.
+    assert media_roots.playable_cache_dir(".") is None
+    assert media_roots.playable_cache_dir("..") is None
+    assert media_roots.playable_cache_dir("...") is None
+    assert media_roots.playable_cache_dir(".....") is None
 
     ok = media_roots.playable_cache_dir(UUID_A)
     assert ok is not None and ok.name == UUID_A

@@ -60,6 +60,25 @@ def _caller_may_see_folders(request: Request) -> bool:
     return True
 
 
+def _redacted_for(request: Request, settings: dict[str, Any]) -> dict[str, Any]:
+    """``settings`` with the folder lists emptied for a caller that may not set
+    them, each marked ``<key>_redacted``.
+
+    Applied to EVERY answer this router gives, not only the GET: a PATCH
+    replies with the whole document, so a caller refused the write could
+    otherwise read the lists back by toggling something harmless. The payload
+    from the store is already a deep copy, so this edits nobody's state.
+    """
+    if _caller_may_see_folders(request):
+        return settings
+    for section, key in _FOLDER_LIST_KEYS:
+        values = settings.get(section)
+        if isinstance(values, dict) and isinstance(values.get(key), list):
+            values[key] = []
+            values[f"{key}_redacted"] = True
+    return settings
+
+
 def _folder_lists_touched(payload: dict[str, Any]) -> bool:
     return any(
         isinstance(payload.get(section), dict) and key in payload[section]
@@ -74,15 +93,7 @@ def get_settings(request: Request) -> dict[str, Any]:
     not allowed to SET them. Naming every media root and model folder on this
     machine is reconnaissance for anyone on the LAN, and a panel that cannot
     write them has no use for their contents."""
-    payload = get_store().get_all()
-    if _caller_may_see_folders(request):
-        return payload
-    for section, key in _FOLDER_LIST_KEYS:
-        values = payload.get(section)
-        if isinstance(values, dict) and isinstance(values.get(key), list):
-            values[key] = []
-            values[f"{key}_redacted"] = True
-    return payload
+    return _redacted_for(request, get_store().get_all())
 
 
 @router.patch("")
@@ -91,7 +102,7 @@ def patch_settings(
     request: Request, payload: dict[str, Any] = Body(...)
 ) -> dict[str, Any]:
     if not isinstance(payload, dict):
-        return get_store().get_all()
+        return _redacted_for(request, get_store().get_all())
     if _folder_lists_touched(payload):
         # 403 unless this machine's own UI or the desktop shell is asking.
         require_loopback_or_launch_token(request)
@@ -108,4 +119,4 @@ def patch_settings(
                 media_roots["media_roots"] = validate_roots(value)
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
-    return get_store().patch(payload)
+    return _redacted_for(request, get_store().patch(payload))

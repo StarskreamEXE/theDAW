@@ -263,7 +263,9 @@ def playable_cache_dir(entry_id: str) -> Optional[Path]:
     """
     if (
         not entry_id
-        or entry_id in (".", "..")
+        # "." and ".." are the two the filesystem names, but "..." and every
+        # longer run are just as much "not a folder anyone meant".
+        or entry_id.strip(".") == ""
         or not _SAFE_SEGMENT_RE.fullmatch(entry_id)
     ):
         log.debug("media_roots: %r cannot be a cache folder name", entry_id)

@@ -10,6 +10,22 @@ import { useFeatureToggleStore } from '../../../state/featureToggleStore';
 import { PathInput } from '../../ui/PathInput';
 import { BTN_GHOST, BTN_PURPLE, BTN_ROSE, CARD, SectionHeader } from './shared';
 
+export const MEDIA_ROOTS_EMPTY =
+  'No media roots yet — entries with no file of their own stay unplayable.';
+/** Shown when the backend redacted the list: this device cannot see or set it. */
+export const MEDIA_ROOTS_HIDDEN =
+  'Hidden on this device — manage media roots on the theDAW PC.';
+
+/** What an empty media-root list says. Empty means two different things: the
+ *  backend blanks the list for a caller that may not set it (a phone on the
+ *  LAN -- settings/router.py `_redacted_for`), and telling that user "none
+ *  yet" would be a lie about the PC's library, plus an invitation to add one
+ *  the PATCH guard then refuses. A function so the branch can be tested
+ *  without a DOM: zustand answers a server render from its INITIAL state, so
+ *  `renderToString` cannot see a seeded store. */
+export const mediaRootsEmptyText = (redacted: boolean): string =>
+  redacted ? MEDIA_ROOTS_HIDDEN : MEDIA_ROOTS_EMPTY;
+
 const MEDIA_ROOTS_TIP =
   "Folders holding your own copies of library media, named after the entry they belong to \u2014 the full id, or the [xxxxxxxx] short tag before the extension. An entry with no file of its own is served from here instead of from the internet. Nothing is copied or moved: the file is played where it sits. The environment variable theDAW_MEDIA_ROOTS overrides this list when it is set.";
 
@@ -44,8 +60,12 @@ const describeIndex = (status: MediaRootIndexStatus | null): string => {
  * store's echoed value is the new truth, so a rejected save rolls back visibly
  * \u2014 the same contract Model folders uses.
  */
-const MediaRootsRows: React.FC = () => {
+export const MediaRootsRows: React.FC = () => {
   const roots = useFeatureToggleStore((s) => s.settings.library?.media_roots ?? []);
+  // The backend blanks the list for a caller that may not set it, so an empty
+  // list here can mean two different things. Saying "none yet" to someone on a
+  // phone would be a lie about the PC's library.
+  const redacted = useFeatureToggleStore((s) => s.settings.library?.media_roots_redacted === true);
   const patch = useFeatureToggleStore((s) => s.patch);
 
   const [draft, setDraft] = useState('');
@@ -168,7 +188,7 @@ const MediaRootsRows: React.FC = () => {
           ))}
         </div>
       ) : (
-        <p className="text-[11px] font-mono text-zinc-500">No media roots yet \u2014 entries with no file of their own stay unplayable.</p>
+        <p className="text-[11px] font-mono text-zinc-500">{mediaRootsEmptyText(redacted)}</p>
       )}
     </div>
   );

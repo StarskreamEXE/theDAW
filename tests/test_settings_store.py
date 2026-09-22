@@ -197,3 +197,46 @@ def test_a_relative_media_root_is_refused_with_a_reason(tmp_path, monkeypatch):
 
     assert bad.status_code == 400
     assert "absolute" in bad.json()["detail"]
+
+
+def test_a_lan_patch_does_not_read_the_folder_lists_back(tmp_path, monkeypatch):
+    """A PATCH answers with the whole settings document. Refusing to SET the
+    folder lists is worthless if a LAN caller can read them back by toggling
+    something harmless."""
+    from backend.modules.settings import router as settings_router
+    from backend.modules.settings.store import SettingsStore
+
+    folder = tmp_path / "music"
+    folder.mkdir()
+    store = SettingsStore(tmp_path / "settings.json")
+    store.patch(
+        {
+            "library": {"media_roots": [str(folder)]},
+            "models": {"extra_folders": [str(folder)]},
+        }
+    )
+    monkeypatch.setattr(settings_router, "_store", store)
+
+    # The needle is the path as it appears in JSON: on Windows a raw
+    # "D:\music" never matches the escaped "D:\\music" in the body, and an
+    # `in answer.text` written the naive way would pass no matter what.
+    needle = json.dumps(str(folder))[1:-1]
+
+    lan = _settings_app(tmp_path, monkeypatch, ("10.20.30.40", 51000))
+    monkeypatch.setattr(settings_router, "_store", store)
+    answer = lan.patch("/api/settings", json={"stems": {"auto_on_import": True}})
+
+    assert answer.status_code == 200
+    assert needle in json.dumps(str(folder)), "the needle escapes like the body"
+    assert needle not in answer.text
+    assert answer.json()["library"]["media_roots"] == []
+    assert answer.json()["library"]["media_roots_redacted"] is True
+    assert answer.json()["models"]["extra_folders_redacted"] is True
+    # The change itself still landed.
+    assert answer.json()["stems"]["auto_on_import"] is True
+
+    local = _settings_app(tmp_path, monkeypatch, ("127.0.0.1", 51000))
+    monkeypatch.setattr(settings_router, "_store", store)
+    mine = local.patch("/api/settings", json={"stems": {"auto_on_import": False}})
+    assert needle in mine.text
+    assert mine.json()["library"]["media_roots"] == [str(folder)]
