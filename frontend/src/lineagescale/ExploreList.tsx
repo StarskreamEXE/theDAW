@@ -1,8 +1,9 @@
 import React from 'react';
 import { ProviderBadge } from '../components/library/ProviderBadge';
+import { entryProviderMeta } from '../catalog/catalogProviders';
 import { formatDuration } from './lineageScaleModel';
 import {
-  clampPageOffset, pageOf, pageTotal, rangeLabel, rowCountLabel,
+  offsetForPageInput, pageOf, pageTotal, rangeLabel, rowCountLabel,
 } from './exploreModel';
 import type { ExplorePage, ExploreRow, ExploreSpec } from './exploreModel';
 
@@ -43,9 +44,14 @@ const Row: React.FC<{
 }> = ({ spec, row, onFocus, onCopyId, onOpenFamily }) => {
   const isFamily = spec.list === 'families';
   const count = rowCountLabel(spec, row);
-  const primaryLabel = isFamily
-    ? `Open the family of ${row.title}`
-    : `${row.title}. Focus this song.`;
+  // The same name the landing page's rows announce: the provider is half of
+  // what tells two songs with the same title apart, and it is on the badge
+  // beside the row, so leaving it out of the name hides it from a screen
+  // reader only.
+  const focusLabel = `${row.title}, ${
+    entryProviderMeta({ model: row.model, source: row.source }).label
+  }. Focus this song.`;
+  const primaryLabel = isFamily ? `Open the family of ${row.title}` : focusLabel;
   return (
     <tr className="border-b border-white/5 hover:bg-white/5">
       <td className={`${cell} w-8`}>
@@ -73,7 +79,7 @@ const Row: React.FC<{
       <td className={`${cell} text-right whitespace-nowrap`}>
         <button
           type="button"
-          aria-label={`${row.title}. Focus this song.`}
+          aria-label={focusLabel}
           onClick={() => onFocus(row.id, row.title)}
           className="rounded border border-white/10 px-1.5 py-0.5 text-[9px] font-mono uppercase tracking-widest text-zinc-300 hover:border-purple-400/60 hover:text-white"
         >
@@ -89,6 +95,53 @@ const Row: React.FC<{
         </button>
       </td>
     </tr>
+  );
+};
+
+/**
+ * The page number, committed on Enter or on leaving the box — never on a
+ * keystroke.
+ *
+ * Typed per keystroke, "12" is a request for page 1 and then page 12: two
+ * pages read, the first one thrown away, and a list that jumps under the
+ * hands of anyone who types a second digit slowly. The draft is local until
+ * it is committed, and a draft that means nothing (empty, a stray character)
+ * commits nothing and snaps back.
+ */
+const PageInput: React.FC<{
+  id: string;
+  page: number;
+  pages: number;
+  limit: number;
+  total: number;
+  onOffset: (offset: number) => void;
+}> = ({ id, page, pages, limit, total, onOffset }) => {
+  const [draft, setDraft] = React.useState(String(page));
+  // The page can move without this box (Prev/Next, a new list): follow it.
+  React.useEffect(() => setDraft(String(page)), [page]);
+  const commit = (): void => {
+    const offset = offsetForPageInput(draft, limit, total);
+    if (offset === null) setDraft(String(page));
+    else onOffset(offset);
+  };
+  return (
+    <input
+      id={id}
+      name={id}
+      type="number"
+      min={1}
+      max={pages}
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          commit();
+        }
+      }}
+      className="w-16 rounded border border-white/10 bg-black/60 px-1 py-0.5 text-[10px] font-mono tabular-nums text-zinc-200 focus:border-purple-400/60 focus:outline-none"
+    />
   );
 };
 
@@ -170,15 +223,13 @@ export const ExploreList: React.FC<ExploreListProps> = ({
         >
           Page
         </label>
-        <input
+        <PageInput
           id={pageInputId}
-          name={pageInputId}
-          type="number"
-          min={1}
-          max={pages}
-          value={current}
-          onChange={(e) => onOffset(clampPageOffset(Number(e.target.value), limit, page.total))}
-          className="w-16 rounded border border-white/10 bg-black/60 px-1 py-0.5 text-[10px] font-mono tabular-nums text-zinc-200 focus:border-purple-400/60 focus:outline-none"
+          page={current}
+          pages={pages}
+          limit={limit}
+          total={page.total}
+          onOffset={onOffset}
         />
         <span className="text-[9px] font-mono tabular-nums text-zinc-500">{`of ${pages}`}</span>
         <button

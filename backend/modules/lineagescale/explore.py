@@ -36,22 +36,25 @@ Three shapes of question, three answers:
   same key ``/summary``'s cache uses, so a play-count bump does not invalidate
   it. The pass is warmed by a daemon thread a few seconds after startup, like
   the summary's, so the first list a user opens does not pay for it.
-* *Which songs hold a link of kind K?* An indexed ``EXISTS`` for the page, and
-  a per-kind count table for the total and the ``count`` sort, built lazily
-  from ONE filtered read of ``relations`` and kept for the last few kinds
-  asked about (:class:`_KindCache`).
+* *Which songs hold a link of kind K?* The SAME pass. There is no index on
+  ``relations(kind)``, so asking that question per kind would be a full read of
+  the table EVERY time a kind list is opened -- 475,174 rows on the real
+  library, unindexed, under this module's lock, for a question the pass has
+  already walked past. So every kind's count tables are built in the one pass
+  and kept with it, and the startup warm covers them too: opening a kind list
+  after the warm issues no read of ``relations`` at all.
 
-What the index costs to hold: the entry-id set, two count dictionaries over
-linked entries, two ranked id lists and the family membership -- tens of MB on
-a 200,000-song library, one slot, replaced whole when the links change. The
-adjacency the pass builds is transient and freed before the index is stored,
-exactly as ``compute_library_stats`` already does for ``/summary``.
+What the index costs to hold: the entry-id set, the family membership, two
+count dictionaries over linked entries, and two per-kind count dictionaries.
+The per-kind tables are the big ones -- at most TWO dict entries per distinct
+(kind, child, parent), so at the real library's 475,174 links at most ~950,000
+entries, tens of MB, with every key shared with the entry-id set rather than
+copied. Counts only: no id lists are stored, and the order a ``count`` sort
+needs is computed on demand and memoised per (kind, role) as references.
 
-There is no index on ``relations(kind)``, so the per-kind count table costs one
-filtered read of the table. ``CREATE INDEX idx_relations_kind ON
-relations(kind, from_id, to_id)`` would make it a covering range scan over one
-kind's rows instead; it needs a schema migration, which is not this module's to
-add (see the ticket's follow-ups).
+One slot, replaced whole when the links change. The adjacency the pass builds
+is transient and freed before the index is stored, exactly as
+``compute_library_stats`` already does for ``/summary``.
 """
 
 from __future__ import annotations
@@ -61,7 +64,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence
+from typing import Any, Iterable, Optional, Sequence
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -85,7 +88,6 @@ from .router import (
     _db,
     _entry_rows,
     _link_signature,
-    get_library_store,
     router as _parent_router,
 )
 
@@ -127,11 +129,6 @@ _SORT_COLUMNS = {
     SORT_CREATED: "e.created_at",
     SORT_PLAYS: "e.play_count",
 }
-
-#: How many kinds' count tables are kept. A user reads one list at a time;
-#: this is enough to page back and forth between two or three of them without
-#: re-reading ``relations``, and small enough to bound what is held.
-KIND_CACHE_SLOTS = 3
 
 #: Seconds after startup before the explorer's pass runs. Later than the
 #: summary's warm (``router.WARM_DELAY_SEC``) on purpose: the two read the same
@@ -287,6 +284,18 @@ class _ExploreIndex:
     families: tuple[_Family, ...]
     family_of: dict[str, int]
     entry_ids: frozenset[str]
+    #: kind -> {entry id: links of that kind where the song is the SOURCE}.
+    kind_parent: dict[str, dict[str, int]]
+    #: kind -> {entry id: links of that kind where the song is the DERIVED one}.
+    kind_child: dict[str, dict[str, int]]
+    #: kind -> how many songs are on EITHER end. Precomputed because the answer
+    #: is a set union over both tables and ``total`` is on every page.
+    kind_any_total: dict[str, int]
+    #: (kind, role) -> that table's ids in count order. Filled on demand, never
+    #: by the pass: it is 8 bytes an id for a kind somebody actually opened,
+    #: against a list per kind for kinds nobody asks about. Two threads racing
+    #: here compute the same tuple, so the last writer wins with the same value.
+    ranked_kinds: dict[tuple[str, str], tuple[str, ...]]
 
     def links(self, entry_id: str) -> int:
         return self.parent_counts.get(entry_id, 0) + self.child_counts.get(entry_id, 0)
@@ -295,6 +304,46 @@ class _ExploreIndex:
         merged = dict.fromkeys(self.ranked_parent)
         merged.update(dict.fromkeys(self.ranked_child))
         return list(merged)
+
+    def kind_count(self, kind: str, role: str, entry_id: str) -> int:
+        """Links of ``kind`` this song holds in ``role``."""
+        parents = self.kind_parent.get(kind) or {}
+        children = self.kind_child.get(kind) or {}
+        if role == "parent":
+            return parents.get(entry_id, 0)
+        if role == "child":
+            return children.get(entry_id, 0)
+        return parents.get(entry_id, 0) + children.get(entry_id, 0)
+
+    def kind_total(self, kind: str, role: str) -> int:
+        """Songs holding at least one link of ``kind`` in ``role``."""
+        if role == "parent":
+            return len(self.kind_parent.get(kind) or {})
+        if role == "child":
+            return len(self.kind_child.get(kind) or {})
+        return self.kind_any_total.get(kind, 0)
+
+    def kind_ranked(self, kind: str, role: str) -> tuple[str, ...]:
+        """Those songs, most links of that kind first, ties by id."""
+        key = (kind, role)
+        cached = self.ranked_kinds.get(key)
+        if cached is not None:
+            return cached
+        if role == "parent":
+            ids: Iterable[str] = (self.kind_parent.get(kind) or {}).keys()
+        elif role == "child":
+            ids = (self.kind_child.get(kind) or {}).keys()
+        else:
+            merged = dict.fromkeys(self.kind_parent.get(kind) or {})
+            merged.update(dict.fromkeys(self.kind_child.get(kind) or {}))
+            ids = merged.keys()
+        order = tuple(
+            sorted(
+                ids, key=lambda key_id: (-self.kind_count(kind, role, key_id), key_id)
+            )
+        )
+        self.ranked_kinds[key] = order
+        return order
 
 
 def _build_index(snap: _Snapshot, revision: int) -> _ExploreIndex:
@@ -311,17 +360,37 @@ def _build_index(snap: _Snapshot, revision: int) -> _ExploreIndex:
 
     pairs: set[tuple[str, str]] = set()
     ancestry: list[tuple[str, str]] = []
+    kind_parent: dict[str, dict[str, int]] = {}
+    kind_child: dict[str, dict[str, int]] = {}
+    # Dedup is PER KIND here, not per pair: the same (child, parent) is stored
+    # several times over -- one stem is derived_from + edit_of + stem_of -- and
+    # each of those kinds counts that pair once. The pair-level set below is a
+    # different question (how many RELATIONSHIPS there are) and keeps its own.
+    counted: set[tuple[str, str, str]] = set()
     for row in snap.stream("SELECT from_id, to_id, kind FROM relations"):
         kind = str(row["kind"])
-        role = role_of(kind)
-        if role == ROLE_ARTIFACT:
-            continue
         pair = orient(str(row["from_id"]), str(row["to_id"]), kind)
-        if pair is None or pair in pairs:
+        if pair is None:
+            continue
+        child, parent = pair
+        triple = (kind, child, parent)
+        if triple not in counted:
+            counted.add(triple)
+            if parent in entry_ids:
+                slot = kind_parent.setdefault(kind, {})
+                slot[parent] = slot.get(parent, 0) + 1
+            if child in entry_ids:
+                slot = kind_child.setdefault(kind, {})
+                slot[child] = slot.get(child, 0) + 1
+        # An artifact rendering is not lineage: it is counted for its own kind
+        # list above and then left out of everything the landing page counts.
+        role = role_of(kind)
+        if role == ROLE_ARTIFACT or pair in pairs:
             continue
         pairs.add(pair)
         if role == ROLE_ANCESTRY:
             ancestry.append(pair)
+    del counted
 
     parent_counts: dict[str, int] = {}
     child_counts: dict[str, int] = {}
@@ -392,6 +461,16 @@ def _build_index(snap: _Snapshot, revision: int) -> _ExploreIndex:
         families=families,
         family_of=family_of,
         entry_ids=frozenset(entry_ids),
+        kind_parent=kind_parent,
+        kind_child=kind_child,
+        kind_any_total={
+            kind: len(
+                (kind_parent.get(kind) or {}).keys()
+                | (kind_child.get(kind) or {}).keys()
+            )
+            for kind in set(kind_parent) | set(kind_child)
+        },
+        ranked_kinds={},
     )
 
 
@@ -431,70 +510,15 @@ class _IndexCache:
             self._value = None
 
 
-class _KindCache:
-    """Per-(kind, role) count tables, for the last few kinds asked about.
-
-    One filtered read of ``relations`` per kind, oriented in Python by
-    :func:`~.graph.orient` -- which is what makes the locally separated stems
-    come out on the right end without a second rule living here.
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._slots: dict[tuple[int, str], dict[str, dict[str, int]]] = {}
-        self.reads = 0
-
-    def get(
-        self, snap: _Snapshot, index: _ExploreIndex, kind: str
-    ) -> dict[str, dict[str, int]]:
-        key = (index.revision, kind)
-        with self._lock:
-            hit = self._slots.get(key)
-            if hit is not None:
-                return hit
-            parents: dict[str, int] = {}
-            children: dict[str, int] = {}
-            either: dict[str, int] = {}
-            seen: set[tuple[str, str]] = set()
-            rows = snap.read(
-                "SELECT from_id, to_id FROM relations WHERE kind = ?", [kind]
-            )
-            self.reads += 1
-            for row in rows:
-                from_id, to_id = str(row["from_id"]), str(row["to_id"])
-                pair = orient(from_id, to_id, kind)
-                if pair is None or pair in seen:
-                    continue
-                seen.add(pair)
-                child, parent = pair
-                if parent in index.entry_ids:
-                    parents[parent] = parents.get(parent, 0) + 1
-                    either[parent] = either.get(parent, 0) + 1
-                if child in index.entry_ids:
-                    children[child] = children.get(child, 0) + 1
-                    either[child] = either.get(child, 0) + 1
-            table = {"parent": parents, "child": children, "any": either}
-            while len(self._slots) >= KIND_CACHE_SLOTS:
-                self._slots.pop(next(iter(self._slots)))
-            self._slots[key] = table
-            return table
-
-    def clear(self) -> None:
-        with self._lock:
-            self._slots.clear()
-
-
 _index_cache = _IndexCache()
-_kind_cache = _KindCache()
 #: The tests read this; it is the same object as :data:`_index_cache`.
 _family_cache = _index_cache
 
 
 def clear_caches() -> None:
-    """Drop both caches. For tests, which build several libraries in one
+    """Drop the index. For tests, which build several libraries in one
     process and must never inherit one another's answers."""
     _index_cache.clear()
-    _kind_cache.clear()
 
 
 # ------------------------------------------------------------------- songs
@@ -611,7 +635,11 @@ def _songs_by_links(
     with a zero in the count.
     """
     if which == "standalone":
-        return _songs_by_column(snap, index, which, q, SORT_TITLE, "asc", offset, limit)
+        # Every standalone song has zero links, so the tiebreak IS the order --
+        # but the direction the caller asked for still decides which way it runs.
+        return _songs_by_column(
+            snap, index, which, q, SORT_TITLE, direction, offset, limit
+        )
     candidates = index.linked_ids()
     if q is not None and q.strip():
         matched = _ids_matching(snap, q)
@@ -707,9 +735,8 @@ def _kinds_sync(
 ) -> dict[str, Any]:
     with _Snapshot(db) as snap:
         index = _index_cache.get(snap)
-        table = _kind_cache.get(snap, index, kind)[role]
         if sort == SORT_COUNT:
-            ranked = sorted(table, key=lambda key: (-table[key], key))
+            ranked = list(index.kind_ranked(kind, role))
             if direction == "asc":
                 ranked.reverse()
             if q is not None and q.strip():
@@ -721,7 +748,12 @@ def _kinds_sync(
             total = len(ranked)
             page = ranked[offset : offset + limit]
             rows = _rows_for(
-                snap, page, count={entry_id: table[entry_id] for entry_id in page}
+                snap,
+                page,
+                count={
+                    entry_id: index.kind_count(kind, role, entry_id)
+                    for entry_id in page
+                },
             )
         else:
             predicate, params = _kind_predicate(kind, role)
@@ -737,12 +769,12 @@ def _kinds_sync(
                 _row_payload(
                     {key: row[key] for key in _ENTRY_COLUMNS},
                     str(row["id"]),
-                    count=table.get(str(row["id"]), 0),
+                    count=index.kind_count(kind, role, str(row["id"])),
                 )
                 for row in found
             ]
             total = (
-                len(table)
+                index.kind_total(kind, role)
                 if not like_sql
                 else int(
                     snap.read(
@@ -805,15 +837,23 @@ def _rankings_sync(
             )
             total = len(ranked)
             page = list(ranked[offset : offset + limit])
+            rows = _rows_for(
+                snap,
+                page,
+                count={entry_id: counts.get(entry_id, 0) for entry_id in page},
+            )
         else:
-            table = _kind_cache.get(snap, index, kind)[role]
-            counts = table
-            ordered = sorted(table, key=lambda key: (-table[key], key))
+            ordered = index.kind_ranked(kind, role)
             total = len(ordered)
-            page = ordered[offset : offset + limit]
-        rows = _rows_for(
-            snap, page, count={entry_id: counts.get(entry_id, 0) for entry_id in page}
-        )
+            page = list(ordered[offset : offset + limit])
+            rows = _rows_for(
+                snap,
+                page,
+                count={
+                    entry_id: index.kind_count(kind, role, entry_id)
+                    for entry_id in page
+                },
+            )
     return {
         "kind": kind,
         "role": role,
@@ -978,13 +1018,24 @@ _warm_thread: Optional[threading.Thread] = None
 def warm_explore_cache() -> bool:
     """Run the explorer's pass once, off any request.
 
+    The store is looked up through ``router`` at call time, so whoever owns
+    ``get_library_store`` when this runs is whose library is read -- a test's
+    fixture, never the one this module happened to import.
+
     The same deal ``router.warm_stats_cache`` makes, for the same reasons and
     with the same two refusals: no library database, no warm; no read-only
     connection, no warm -- a background pass has no business holding
     ``LibraryDB``'s write lock for the seconds this takes.
     """
     try:
-        store = get_library_store()
+        # Through the router MODULE, at call time -- never a name bound at
+        # import. A background pass that reads a store this module captured on
+        # import is a pass over whatever library was configured then, which in
+        # a test is the real one sitting behind the fixture's monkeypatch.
+        # `_db()` already resolves this way, which is why the routes were safe.
+        from . import router as _router
+
+        store = _router.get_library_store()
         db = getattr(store, "db", None)
         if db is None:
             log.info("lineagescale: explore warm skipped, no library database")

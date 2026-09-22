@@ -5,6 +5,17 @@ routes behind those lists. Everything runs against a synthetic library built
 here, through the real :class:`~backend.modules.library.db.LibraryDB` schema.
 Nothing opens the user's library, starts a server or binds a port.
 
+NOTHING HERE MAY REACH THE USER'S LIBRARY. The routes resolve the store
+through ``lineage_router.get_library_store``, which every test replaces with a
+stub over the fixture database -- but a name bound at import time slips past
+that, and one did: ``explore.warm_explore_cache`` captured
+``get_library_store`` on import and a test of the warm therefore ran a full
+pass over the real library. Two tripwires make that unrepeatable, on EVERY test
+in this file (``_no_real_library``): the app's cached ``LibraryStore`` is
+replaced with one that raises on any use, and ``default_library_root`` -- the
+only thing that names the user's directory -- is replaced with a function that
+raises. An escape is now a loud failure instead of a 200,000-song read.
+
 The load-bearing assertion in this file is not a row count: it is that the
 explorer's populations ARE the summary's populations. ``/summary`` says 8,595
 songs are in the largest family and N are standalone; a list that opens off
@@ -25,8 +36,10 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from backend.modules.library import router as library_router, store as library_store
 from backend.modules.library.db import LibraryDB
 from backend.modules.lineagescale import explore, router as lineage_router
+from backend.modules.lineagescale.graph import KIND_ORDER
 from tests.lineagescale_fixtures import StubStore
 
 PREFIX = "/api/lineage-scale"
@@ -113,6 +126,42 @@ def library(tmp_path_factory: pytest.TempPathFactory) -> Iterator[LibraryDB]:
             cur.close()
     yield db
     db.close()
+
+
+class _PoisonStore:
+    """What ``library_router.get_store()`` returns while these tests run.
+
+    Any code path that reaches the app's own store instead of the fixture's --
+    a stale import-time binding, a forgotten monkeypatch -- touches this and
+    fails, instead of quietly opening the user's 200,000-song library.
+    """
+
+    used = False
+
+    def __getattr__(self, name: str) -> Any:
+        type(self).used = True
+        raise AssertionError(
+            f"a lineagescale explore test reached the app's LibraryStore ({name!r}); "
+            "it must go through the fixture's stub"
+        )
+
+
+@pytest.fixture(autouse=True)
+def _no_real_library(monkeypatch: pytest.MonkeyPatch) -> Iterator[_PoisonStore]:
+    """The user's library is unreachable for the length of every test here."""
+
+    def _explode(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError(
+            "default_library_root() was consulted: something is about to open "
+            "the user's real library"
+        )
+
+    poison = _PoisonStore()
+    _PoisonStore.used = False
+    monkeypatch.setattr(library_router, "_store", poison)
+    monkeypatch.setattr(library_store, "default_library_root", _explode)
+    monkeypatch.setattr(library_router, "default_library_root", _explode, raising=False)
+    yield poison
 
 
 @pytest.fixture(autouse=True)
@@ -452,6 +501,25 @@ def test_family_members_404_for_a_song_with_no_family(client: TestClient) -> Non
     assert client.get(f"{EXPLORE}/families/nobody/members").status_code == 404
 
 
+def test_standalone_by_links_still_honours_the_direction(client: TestClient) -> None:
+    """Every standalone song has zero links, so the tiebreak is the order --
+    and asking for it backwards must still turn it round."""
+    asc = _ids(
+        client.get(
+            f"{EXPLORE}/songs",
+            params={"set": "standalone", "sort": "links", "dir": "asc"},
+        ).json()
+    )
+    desc = _ids(
+        client.get(
+            f"{EXPLORE}/songs",
+            params={"set": "standalone", "sort": "links", "dir": "desc"},
+        ).json()
+    )
+    assert asc == ["s2", "s0", "s1"]
+    assert desc == list(reversed(asc))
+
+
 # ------------------------------------------------------------------ budget
 
 
@@ -508,6 +576,55 @@ def test_the_explorer_reads_on_its_own_connection_and_closes_it(
             conn.execute("SELECT 1")
 
 
+def test_after_the_warm_no_kind_list_reads_the_relations_rows(
+    monkeypatch: pytest.MonkeyPatch, library: LibraryDB
+) -> None:
+    """Opening a kind list must not scan ``relations``.
+
+    There is no index on ``relations(kind)``, so "the songs with a link of kind
+    K" asked of the database is a full read of the table -- 475,174 rows on the
+    real library, for every kind row a user clicks. The one pass counts every
+    kind as it goes instead, so after the warm these eighteen requests read
+    entries and nothing else. The link signature is the one statement allowed
+    to name ``relations``: it is two covering counts and it is what tells the
+    cache the graph has not changed.
+    """
+    store = StubStore(library)
+    monkeypatch.setattr(lineage_router, "get_library_store", lambda: store)
+    app = FastAPI()
+    app.include_router(lineage_router.router, prefix=PREFIX)
+    explore.clear_caches()
+    assert explore.warm_explore_cache() is True
+    with TestClient(app) as client, _traced(monkeypatch, library) as statements:
+        for kind in KIND_ORDER:
+            assert (
+                client.get(
+                    f"{EXPLORE}/kinds/{kind}", params={"role": "any"}
+                ).status_code
+                == 200
+            )
+            assert (
+                client.get(
+                    f"{EXPLORE}/kinds/{kind}",
+                    params={"role": "parent", "sort": "count"},
+                ).status_code
+                == 200
+            )
+        assert (
+            client.get(
+                f"{EXPLORE}/rankings", params={"kind": "cover_of", "role": "parent"}
+            ).status_code
+            == 200
+        )
+    assert statements, "the trace saw nothing, so it proves nothing"
+    for sql in statements:
+        lowered = " ".join(sql.lower().split())
+        assert "from_id" not in lowered, sql
+        assert "to_id" not in lowered, sql
+        if "relations" in lowered:
+            assert "count(*) from relations" in lowered, sql
+
+
 def test_a_second_page_does_not_repeat_the_library_wide_pass(
     client: TestClient,
 ) -> None:
@@ -522,12 +639,43 @@ def test_a_second_page_does_not_repeat_the_library_wide_pass(
     assert explore._family_cache.passes == after_first
 
 
-def test_the_warm_hook_fills_the_cache_off_a_request(
-    monkeypatch: pytest.MonkeyPatch, library: LibraryDB
+def test_the_warm_hook_fills_the_cache_from_the_fixture_and_nothing_else(
+    monkeypatch: pytest.MonkeyPatch, library: LibraryDB, _no_real_library: _PoisonStore
 ) -> None:
+    """The warm reads whoever owns the store WHEN IT RUNS.
+
+    It used to read the one this module imported, which is the app's -- so this
+    test used to run a library-wide pass over the user's real library. What is
+    asserted is therefore not "the cache filled" but "the cache filled WITH THE
+    FIXTURE": the index describes twelve synthetic songs, the app's store was
+    never touched, and nothing asked where the real library lives.
+    """
     store = StubStore(library)
     monkeypatch.setattr(lineage_router, "get_library_store", lambda: store)
     explore.clear_caches()
     before = explore._family_cache.passes
     assert explore.warm_explore_cache() is True
     assert explore._family_cache.passes == before + 1
+
+    index = explore._family_cache._value
+    assert index is not None
+    assert index.entries_total == len(ENTRY_IDS)
+    assert set(index.entry_ids) == set(ENTRY_IDS)
+    assert _PoisonStore.used is False
+
+
+def test_the_warm_cannot_fall_back_to_the_app_store(
+    _no_real_library: _PoisonStore,
+) -> None:
+    """With no stub installed, the warm finds the app's store -- and stops.
+
+    This is the escape the review caught, from the other side: the warm must
+    resolve ``get_library_store`` through the router module at call time, so
+    the only store it can ever reach is the one the process has installed. Here
+    that is the poison, so the pass never runs and no library is opened.
+    """
+    explore.clear_caches()
+    before = explore._family_cache.passes
+    assert explore.warm_explore_cache() is False
+    assert explore._family_cache.passes == before
+    assert _PoisonStore.used is True

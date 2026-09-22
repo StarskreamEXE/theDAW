@@ -20,6 +20,7 @@ import assert from 'node:assert/strict';
 import {
   EXPLORE_PAGE,
   clampPageOffset,
+  offsetForPageInput,
   exploreSorts,
   exploreTitle,
   filterEdgesByKinds,
@@ -58,6 +59,17 @@ assert.equal(clampPageOffset(9, 50, 120), 100);
 assert.equal(clampPageOffset(0, 50, 120), 0);
 assert.equal(clampPageOffset(Number.NaN, 50, 120), 0);
 assert.equal(clampPageOffset(2, 50, 0), 0);
+
+// A typed page number means nothing until it parses: an empty box mid-edit
+// must not be read as page 1.
+assert.equal(offsetForPageInput('12', 50, 1000), 550);
+assert.equal(offsetForPageInput(' 3 ', 50, 1000), 100);
+assert.equal(offsetForPageInput('900', 50, 1000), 950, 'past the end is the last page');
+assert.equal(offsetForPageInput('', 50, 1000), null);
+assert.equal(offsetForPageInput('   ', 50, 1000), null);
+assert.equal(offsetForPageInput('-', 50, 1000), null);
+assert.equal(offsetForPageInput('abc', 50, 1000), null);
+assert.equal(offsetForPageInput('0', 50, 1000), 0);
 
 assert.equal(rangeLabel(0, 50, 173877, 50), '1–50 of 173,877');
 assert.equal(rangeLabel(173850, 50, 173877, 27), '173,851–173,877 of 173,877');
@@ -156,6 +168,13 @@ assert.deepEqual(specForHeadline('largest_connected'), {
   role: 'parent',
 });
 assert.equal(specForHeadline('nonsense'), null);
+
+// "More…" under a preset continues THAT question: the recent list is newest
+// first, so the list it opens is too.
+const recent = specForRanking('recent');
+assert.equal(recent?.list, 'songs');
+assert.equal(defaultSortFor(recent!), 'created');
+assert.equal(defaultDirFor(recent!), 'desc');
 
 assert.equal(specForRanking('most_derived')?.list, 'rankings');
 assert.equal(specForRanking('mashup_sources')?.list, 'rankings');

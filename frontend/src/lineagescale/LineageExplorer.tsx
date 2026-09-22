@@ -59,6 +59,9 @@ export const LineageExplorer: React.FC<LineageExplorerProps> = ({
 }) => {
   const sorts = exploreSorts(spec);
   const showKind = spec.list === 'kind' || spec.list === 'rankings';
+  // A ranking and the family list have no `q` on the wire, so there is no box
+  // for one: a search field that filters nothing is worse than no field.
+  const showSearch = spec.list !== 'rankings' && spec.list !== 'families';
   const showDir = spec.list !== 'rankings';
   const qId = `${idPrefix}-q`;
   const kindId = `${idPrefix}-kind`;
@@ -107,18 +110,22 @@ export const LineageExplorer: React.FC<LineageExplorerProps> = ({
       </header>
 
       <div className="flex flex-wrap items-center gap-2">
-        <label htmlFor={qId} className={LABEL_CLASS}>
-          Search
-        </label>
-        <input
-          id={qId}
-          name={qId}
-          type="search"
-          value={q}
-          placeholder="title…"
-          onChange={(e) => onQuery(e.target.value)}
-          className={`w-48 ${FIELD_CLASS} placeholder-zinc-600`}
-        />
+        {showSearch && (
+          <>
+            <label htmlFor={qId} className={LABEL_CLASS}>
+              Search
+            </label>
+            <input
+              id={qId}
+              name={qId}
+              type="search"
+              value={q}
+              placeholder="title…"
+              onChange={(e) => onQuery(e.target.value)}
+              className={`w-48 ${FIELD_CLASS} placeholder-zinc-600`}
+            />
+          </>
+        )}
 
         {showKind && (
           <>

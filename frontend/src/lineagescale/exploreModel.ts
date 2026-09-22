@@ -79,7 +79,15 @@ export interface ExplorePage {
 
 /** One openable list. Every stat card and every kind row names one of these. */
 export type ExploreSpec =
-  | { list: 'songs'; set: SongSet }
+  | {
+      list: 'songs';
+      set: SongSet;
+      /** The sort this list opens on, when the thing that opened it asked a
+       *  narrower question than "the songs with lineage" — "More…" under
+       *  "Recently extended" continues THAT question. */
+      sort?: ExploreSort;
+      dir?: ExploreDir;
+    }
   | { list: 'kind'; kind: string; role: ExploreRole }
   | { list: 'rankings'; kind: string; role: 'parent' | 'child' }
   | { list: 'families' }
@@ -104,6 +112,25 @@ export const clampPageOffset = (page: number, limit: number, total: number): num
   const wanted = Number.isFinite(page) ? Math.trunc(page) : 1;
   return (Math.min(Math.max(1, wanted), last) - 1) * size;
 };
+
+/**
+ * The offset a typed page number means, or null when it means nothing yet.
+ *
+ * Null is "leave the list where it is": an empty box mid-edit, or a stray
+ * character, must not send the pager to page 1 — which is what committing on
+ * every keystroke did.
+ */
+export function offsetForPageInput(
+  raw: string,
+  limit: number,
+  total: number,
+): number | null {
+  const text = raw.trim();
+  if (!text) return null;
+  const parsed = Number(text);
+  if (!Number.isFinite(parsed)) return null;
+  return clampPageOffset(parsed, limit, total);
+}
 
 /** "1–50 of 173,877" — where you are, in the numbers the landing page used. */
 export const rangeLabel = (
@@ -317,7 +344,9 @@ export function specForRanking(list: string): ExploreSpec | null {
     case 'mashup_sources':
       return { list: 'rankings', kind: 'mashup_source', role: 'parent' };
     case 'recent':
-      return { list: 'songs', set: 'with_lineage' };
+      // Newest first, or the "More…" under "Recently extended" would answer a
+      // different question from the list it is under.
+      return { list: 'songs', set: 'with_lineage', sort: 'created', dir: 'desc' };
     default:
       return null;
   }
@@ -325,6 +354,7 @@ export function specForRanking(list: string): ExploreSpec | null {
 
 /** The sort a list opens on: the one its route ranks by. */
 export function defaultSortFor(spec: ExploreSpec): ExploreSort {
+  if (spec.list === 'songs' && spec.sort) return spec.sort;
   const sorts = exploreSorts(spec);
   if (spec.list === 'songs' && sorts.includes('links')) return 'links';
   return sorts[0];
@@ -332,5 +362,6 @@ export function defaultSortFor(spec: ExploreSpec): ExploreSort {
 
 /** Counts read biggest-first; names read A to Z. */
 export function defaultDirFor(spec: ExploreSpec): ExploreDir {
+  if (spec.list === 'songs' && spec.dir) return spec.dir;
   return defaultSortFor(spec) === 'title' ? 'asc' : 'desc';
 }

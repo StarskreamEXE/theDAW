@@ -29,6 +29,9 @@ export interface ExploreQuery {
   limit?: number;
 }
 
+/** The lists whose route filters on a title substring. */
+const SEARCHABLE: ReadonlySet<string> = new Set(['songs', 'kind', 'family']);
+
 /** An entry id is user data and can hold anything; it is always escaped. */
 const idPath = (id: string): string => encodeURIComponent(id);
 
@@ -41,7 +44,12 @@ const paging = (query: ExploreQuery): [string, string][] => [
 export function exploreUrl(query: ExploreQuery): string {
   const { spec } = query;
   const params = new URLSearchParams(paging(query));
-  if (query.q && query.q.trim()) params.set('q', query.q.trim());
+  // `q` goes only where a route reads it. `/rankings` and `/families` have no
+  // `q` parameter: sending one is a query string that promises a filter the
+  // answer does not have.
+  if (SEARCHABLE.has(spec.list) && query.q && query.q.trim()) {
+    params.set('q', query.q.trim());
+  }
   if (query.sort) params.set('sort', query.sort);
   if (query.dir) params.set('dir', query.dir);
   switch (spec.list) {

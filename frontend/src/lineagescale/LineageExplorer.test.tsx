@@ -20,6 +20,7 @@
 import assert from 'node:assert/strict';
 import { renderToStaticMarkup } from 'react-dom/server';
 
+import { entryProviderMeta } from '../catalog/catalogProviders.ts';
 import { LineageExplorer } from './LineageExplorer.tsx';
 import type { ExplorePage, ExploreRow, ExploreSpec } from './exploreModel.ts';
 
@@ -73,8 +74,20 @@ const html = render(songs, {
   page: page([row('a', { links: 3 }), row('b', { links: 1, model: '', source: 'suno' })], 173877),
 });
 
+const labelOf = (model: string, source: string): string =>
+  entryProviderMeta({ model, source }).label;
+
 assert.ok(html.includes('Songs with lineage'), 'the panel names the list it opened');
-assert.ok(named(html, 'song a. Focus this song.'), 'every row focuses');
+// The same name the landing page's rows announce: the provider is half of what
+// tells two songs with one title apart, and it is on the badge beside the row.
+assert.ok(
+  named(html, `song a, ${labelOf('stable-audio', 'generate')}. Focus this song.`),
+  'every row focuses, and says whose song it is',
+);
+assert.ok(
+  named(html, `song b, ${labelOf('', 'suno')}. Focus this song.`),
+  'a legacy import is named by its source, not mislabelled by its empty model',
+);
 assert.ok(named(html, 'Copy the id of song a'), 'every row copies its id');
 assert.ok(html.includes('3 relationships'), 'the count the list ranked by is shown');
 
@@ -99,6 +112,20 @@ for (const tag of buttonTags(html)) {
   assert.ok(/aria-label="/.test(tag) || />/.test(tag), tag);
 }
 assert.ok(named(html, 'Close this list'), 'the panel can be left');
+
+// A search box is offered only where a route reads `q`.
+assert.match(html, /<input[^>]*id="lineage-explorer-q"/, 'a song list is searchable');
+
+const rankingHtml = render({ list: 'rankings', kind: 'any', role: 'parent' });
+assert.ok(
+  !/id="lineage-explorer-q"/.test(rankingHtml),
+  'a ranking has no title filter on the wire, so it offers no box for one',
+);
+assert.ok(!/for="lineage-explorer-q"/.test(rankingHtml));
+const familyListHtml = render({ list: 'families' });
+assert.ok(!/id="lineage-explorer-q"/.test(familyListHtml), 'nor does the family list');
+// The family MEMBERS list does read `q`, so it keeps its box.
+assert.match(render({ list: 'family', id: 'r1' }), /<input[^>]*id="lineage-explorer-q"/);
 
 /* ──────────────────────────── kind and role selects ──────────────────────── */
 
@@ -149,5 +176,9 @@ const families = render(
 );
 assert.ok(families.includes('8,618 songs'));
 assert.ok(named(families, 'Open the family of song r1'), 'a family row opens its members');
+assert.ok(
+  named(families, `song r1, ${labelOf('stable-audio', 'generate')}. Focus this song.`),
+  'and still focuses the song itself',
+);
 
 console.log('LineageExplorer.test.tsx: ok');
