@@ -1407,13 +1407,32 @@ def _perf_sets_root() -> Path:
     return paths.data_path(_PERF_SETS_DIRNAME)
 
 
-def _load_perf_set(store: LibraryStore, set_dir: Path) -> Optional[dict[str, Any]]:
+def _perf_set_dirs(root: Path) -> list[Path]:
+    """Every folder under `root` that holds a `performance.json`, in a stable
+    order, so the listing and the register route walk the same sets."""
+    return [
+        p
+        for p in sorted(q for q in root.iterdir() if q.is_dir())
+        if (p / "performance.json").is_file()
+    ]
+
+
+def _load_perf_set(
+    store: LibraryStore, set_dir: Path, *, register: bool = False
+) -> Optional[dict[str, Any]]:
     """Turn one `<set_dir>/performance.json` into a frontend Setlist dict.
 
     Audio files are registered reference-in-place as library entries so the
     DJ decks + analysis pipeline treat them like any other track. A sidecar
     `.thedaw-import.json` in the set folder maps filename -> entryId so
-    repeated calls reuse entries instead of duplicating them."""
+    repeated calls reuse entries instead of duplicating them.
+
+    That registration is a *write* -- one committed ``upsert_entry`` per track
+    plus the sidecar -- so it happens only under ``register=True``, from the
+    POST below, when the user opens the set. The default read reports what the
+    sidecar already knows and leaves a never-opened track as
+    ``entryId: None``, which the frontend's ``SetlistEntry`` already allows
+    (`state/setlistStore.ts`: ``entryId: string | null``)."""
     perf_path = set_dir / "performance.json"
     try:
         perf = json.loads(perf_path.read_text(encoding="utf-8"))
@@ -1436,6 +1455,10 @@ def _load_perf_set(store: LibraryStore, set_dir: Path) -> Optional[dict[str, Any
 
     resolved_set_dir = set_dir.resolve()
     entries: list[dict[str, Any]] = []
+    #: What the set IS, independent of whether its tracks have been registered
+    #: yet: the id below is hashed from this, not from the entry ids, so the
+    #: id a listing hands the frontend is the id registration hands back.
+    signature: list[Any] = []
     for t in tracks:
         if not isinstance(t, dict):
             continue
@@ -1462,20 +1485,20 @@ def _load_perf_set(store: LibraryStore, set_dir: Path) -> Optional[dict[str, Any
         if not audio_path.is_file():
             log.warning("performance set %s: missing audio %r", set_dir.name, fname)
             continue
+        label = t.get("title") or audio_path.stem
         entry_id = sidecar.get(fname)
         if not (isinstance(entry_id, str) and store.get_entry(entry_id) is not None):
-            rec = store.register_reference(
-                str(audio_path),
-                {
-                    "source": "performance-set",
-                    "title": t.get("title") or audio_path.stem,
-                },
-            )
-            if rec is None:
-                continue
-            entry_id = rec.id
-            sidecar[fname] = entry_id
-            sidecar_dirty = True
+            entry_id = None
+            if register:
+                rec = store.register_reference(
+                    str(audio_path),
+                    {"source": "performance-set", "title": label},
+                )
+                if rec is None:
+                    continue
+                entry_id = rec.id
+                sidecar[fname] = entry_id
+                sidecar_dirty = True
         perf_block: dict[str, Any] = {}
         for src_key, dst_key in (
             ("cue_in_s", "cueIn"),
@@ -1487,12 +1510,13 @@ def _load_perf_set(store: LibraryStore, set_dir: Path) -> Optional[dict[str, Any
                 perf_block[dst_key] = float(v)
         entry: dict[str, Any] = {
             "entryId": entry_id,
-            "label": t.get("title") or audio_path.stem,
+            "label": label,
             "kind": "audio",
         }
         if perf_block:
             entry["perf"] = perf_block
         entries.append(entry)
+        signature.append([fname, label, perf_block])
 
     if sidecar_dirty:
         try:
@@ -1506,8 +1530,11 @@ def _load_perf_set(store: LibraryStore, set_dir: Path) -> Optional[dict[str, Any
     # Deterministic id including a content hash: a rebuilt set (new timeline)
     # gets a NEW id, so the frontend's merge-by-id import picks it up instead
     # of keeping a stale copy. Old copies stay in localStorage (harmless).
+    # Hashed over the timeline, NOT over the entry ids: listing a set and then
+    # registering it must produce the same id, or the frontend would file the
+    # opened set as a second, duplicate list.
     digest = hashlib.sha1(
-        json.dumps([e for e in entries], sort_keys=True).encode("utf-8")
+        json.dumps(signature, sort_keys=True).encode("utf-8")
     ).hexdigest()[:8]
     slug = re.sub(r"[^a-z0-9]+", "-", str(name).lower()).strip("-") or "set"
     mtime_ms = int(perf_path.stat().st_mtime * 1000)
@@ -1527,19 +1554,47 @@ def list_bundled_setlists() -> dict[str, Any]:
     `data/performance-sets/<Set>/performance.json` folders (dropped there by
     Z-AutoDJ or by hand) and returns them in the frontend Setlist shape.
     The frontend calls this on startup and merges by id (setlistStore
-    `importBundled`); an empty list is a valid, cheap response."""
+    `importBundled`); an empty list is a valid, cheap response.
+
+    Read-only, and it has to be: this fires on every startup, and registering
+    a set's tracks here put one committed write per file behind a page load
+    (caught by `tests/test_library_api_at_scale.py`). A set nobody has opened
+    still lists -- with `entryId: null` on each track the sidecar does not
+    know yet. `POST /setlists/{set_id}/register` fills those in."""
     root = _perf_sets_root()
     if not root.is_dir():
         return {"setlists": []}
     store = get_store()
     setlists: list[dict[str, Any]] = []
-    for set_dir in sorted(p for p in root.iterdir() if p.is_dir()):
-        if not (set_dir / "performance.json").is_file():
-            continue
+    for set_dir in _perf_set_dirs(root):
         loaded = _load_perf_set(store, set_dir)
         if loaded is not None:
             setlists.append(loaded)
     return {"setlists": setlists}
+
+
+@router.post("/setlists/{set_id}/register")
+def register_bundled_setlist(set_id: str) -> dict[str, Any]:
+    """Register one bundled set's audio files — the write half of the route
+    above, run when the user opens the set rather than when the tab loads.
+
+    Idempotent: a track the sidecar already maps to a live entry is reused,
+    so opening the same set twice registers nothing the second time. The
+    returned Setlist has the same id and the same shape the listing returns,
+    with the `entryId`s filled in, so the frontend can drop it straight over
+    the copy it merged at startup."""
+    root = _perf_sets_root()
+    if root.is_dir():
+        store = get_store()
+        for set_dir in _perf_set_dirs(root):
+            listed = _load_perf_set(store, set_dir)
+            if listed is None or listed["id"] != set_id:
+                continue
+            registered = _load_perf_set(store, set_dir, register=True)
+            if registered is not None:
+                return {"setlist": registered}
+            break
+    raise HTTPException(404, f"no bundled performance set with id {set_id!r}")
 
 
 @router.post("/reindex")

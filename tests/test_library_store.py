@@ -125,11 +125,21 @@ def test_load_perf_set_rejects_traversal_and_absolute_paths(tmp_path: Path):
         encoding="utf-8",
     )
 
-    result = router._load_perf_set(store, set_dir)
+    # The default read is the one behind ``GET /setlists``: it filters the same
+    # way, and it registers nothing (see ``tests/test_library_setlists.py``).
+    listed = router._load_perf_set(store, set_dir)
+
+    assert listed is not None
+    assert [entry["label"] for entry in listed["entries"]] == ["good"]
+    assert listed["entries"][0]["entryId"] is None
+
+    result = router._load_perf_set(store, set_dir, register=True)
 
     assert result is not None
     assert [entry["label"] for entry in result["entries"]] == ["good"]
     assert result["entries"][0]["entryId"]
+    # Same set, whether or not its tracks have been registered yet.
+    assert result["id"] == listed["id"]
 
 
 def test_update_entry_writes_only_user_mutable_fields(tmp_path: Path):

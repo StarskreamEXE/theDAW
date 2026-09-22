@@ -70,6 +70,11 @@ interface SetlistState {
   setNotes: (id: string, notes: string) => void;
   /** Merge starter sets shipped by the local backend into browser storage. */
   importBundled: () => Promise<void>;
+  /** Register a bundled set's audio files as library entries — the write the
+   *  listing above deliberately does not do. Called when the user opens the
+   *  set; returns its entries with `entryId`s filled in (or null when there
+   *  is no such bundled set, e.g. a locally-created list). */
+  registerBundled: (id: string) => Promise<SetlistEntry[] | null>;
 }
 
 const STORAGE_KEY = 'thedaw.setlists.v1';
@@ -173,6 +178,31 @@ export const useSetlistStore = create<SetlistState>()(
           });
         } catch {
           /* Starter sets are optional; ignore failures while the backend warms. */
+        }
+      },
+      registerBundled: async (id) => {
+        // The startup listing is read-only, so a bundled set arrives with
+        // `entryId: null` on every track it has never registered. Opening the
+        // set is the moment those become library entries. The backend keys the
+        // set id off the timeline, not off the entry ids, so the answer lands
+        // back on the same list. Idempotent: reopening registers nothing.
+        try {
+          const res = await fetch(`/api/library/setlists/${encodeURIComponent(id)}/register`, {
+            method: 'POST',
+          });
+          if (!res.ok) return null; // not a bundled set (or the backend is cold)
+          const body = (await res.json()) as { setlist?: { entries?: SetlistEntry[] } };
+          const entries = Array.isArray(body.setlist?.entries) ? body.setlist.entries : null;
+          if (!entries) return null;
+          set((s) => {
+            const cur = s.setlists[id];
+            if (!cur) return s;
+            return { setlists: { ...s.setlists, [id]: { ...cur, entries } } };
+          });
+          analyzeEntries(entries.map((e) => e.entryId));
+          return entries;
+        } catch {
+          return null;
         }
       },
     }),

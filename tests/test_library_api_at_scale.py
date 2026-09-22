@@ -66,7 +66,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from backend.lib import known_paths
+from backend.lib import known_paths, paths
 from backend.modules.assets import router as assets_router_module
 from backend.modules.library import router as library_router_module
 from backend.modules.lineagescale import router as lineagescale_router_module
@@ -526,6 +526,16 @@ def client(scale_library: ScaleLibrary) -> Iterator[TestClient]:
     """
     with pytest.MonkeyPatch.context() as patch:
         patch.setenv("theDAW_GENERATIONS_DIR", str(scale_library.root))
+        # ``theDAW_GENERATIONS_DIR`` only moves the library tree. Everything
+        # that reaches for ``paths.data_path`` -- ``GET /setlists`` scanning
+        # ``<data>/performance-sets`` is the one that bit -- still read this
+        # machine's own ``data/``, so the sweep measured whatever the
+        # developer happened to have there and CI measured an empty folder.
+        # ``theDAW_DATA_DIR`` is read on every call (``backend/lib/paths.py``),
+        # so setting it here redirects the whole tree with nothing reimported.
+        data_root = scale_library.root / "data"
+        data_root.mkdir(parents=True, exist_ok=True)
+        patch.setenv("theDAW_DATA_DIR", str(data_root))
         patch.setattr(library_router_module, "_store", None)
         # Through the patch context, not the setter: the setter leaves the
         # redirect standing if anything below raises -- TestClient, the
@@ -709,6 +719,33 @@ def test_the_probes_read_no_known_paths_but_the_fixtures(
     assert resolved == expected, (
         f"the known-paths store resolved to {resolved}, not the fixture's "
         f"{expected}: the assets probes are reading a real user's file"
+    )
+
+
+def test_the_probes_read_nothing_under_the_real_data_dir(
+    client: TestClient, scale_library: ScaleLibrary
+) -> None:
+    """``known_paths.json`` was not the only leak, and naming files one at a
+    time was never going to find the next one.
+
+    ``paths.data_path`` is not redirected by ``theDAW_GENERATIONS_DIR``, so
+    every route that reaches for the data tree rather than the library tree
+    read this machine's own folder. ``GET /setlists`` is how that surfaced:
+    it scans ``<data>/performance-sets`` and, on a checkout that has sets in
+    it, registered 25 of the developer's files into the fixture -- a probe
+    whose answer, and whose cost, depended on whose machine it ran on. The
+    whole data root is redirected now, so the sweep reads the fixture or
+    nothing.
+    """
+    root = scale_library.root.resolve()
+    data_root = paths.data_dir().resolve()
+    assert data_root.is_relative_to(root), (
+        f"the data root resolved to {data_root}, outside the fixture's "
+        f"{root}: the probes are reading this machine's own data tree"
+    )
+    perf_sets = library_router_module._perf_sets_root().resolve()  # noqa: SLF001
+    assert perf_sets.is_relative_to(root), (
+        f"the setlists probe scans {perf_sets}, outside the fixture's {root}"
     )
 
 

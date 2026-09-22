@@ -2594,6 +2594,7 @@ const SourceTree: React.FC<{ source: Source; setSource: (s: Source) => void; lib
   const setlists = useSetlistStore((s) => s.setlists);
   const createSetlist = useSetlistStore((s) => s.create);
   const setActive = useSetlistStore((s) => s.setActive);
+  const registerBundled = useSetlistStore((s) => s.registerBundled);
   const sets = Object.values(setlists).sort((a, b) => b.updatedAt - a.updatedAt);
 
   /**
@@ -2713,7 +2714,12 @@ const SourceTree: React.FC<{ source: Source; setSource: (s: Source) => void; lib
           // Auto-DJ needs ≥2 real entries. Not `disabled` — browsers suppress
           // the tooltip on a disabled control and drop it from tab order, so
           // the "Add at least 2 tracks" hint would never reach the user.
-          const playable = s.entries.filter((e) => e.entryId).length >= 2;
+          // A bundled set nobody has opened lists with `entryId: null` on every
+          // track -- GET /setlists is read-only, and the entries are created
+          // when the set is opened -- so those count here too, or a fresh set
+          // could never be Auto-DJ'd without being clicked first.
+          const pending = s.entries.filter((e) => e.entryId === null).length;
+          const playable = s.entries.filter((e) => e.entryId).length + pending >= 2;
           // Row is a div (not the Item <button>) so the green ▶ Auto-DJ action
           // can sit as a sibling button — nesting a button inside a button is
           // invalid DOM. Clicking the name opens/activates the set; the ▶
@@ -2727,7 +2733,7 @@ const SourceTree: React.FC<{ source: Source; setSource: (s: Source) => void; lib
               <span className={`w-1 h-1 rounded-full shrink-0 ${isActive ? 'bg-purple-300' : 'bg-zinc-700'}`} />
               <button
                 type="button"
-                onClick={() => { setActive(s.id); setSource({ kind: 'set', id: s.id }); }}
+                onClick={() => { setActive(s.id); setSource({ kind: 'set', id: s.id }); void registerBundled(s.id); }}
                 title={`Open set "${s.name}"`}
                 className="flex-1 min-w-0 truncate text-left bg-transparent"
               >
@@ -2736,7 +2742,17 @@ const SourceTree: React.FC<{ source: Source; setSource: (s: Source) => void; lib
               <span className="text-[8px] text-zinc-600 shrink-0" title={`${s.entries.length} tracks`}>{s.entries.length}</span>
               <button
                 type="button"
-                onClick={() => { if (!playable) return; setActive(s.id); setSource({ kind: 'set', id: s.id }); useDjAutomix.getState().requestStart(); }}
+                onClick={async () => {
+                  if (!playable) return;
+                  setActive(s.id);
+                  setSource({ kind: 'set', id: s.id });
+                  // Opening is what registers a bundled set's files; Automix
+                  // needs the entry ids, so start only once they are back.
+                  const registered = await registerBundled(s.id);
+                  if ((registered ?? s.entries).filter((e) => e.entryId).length >= 2) {
+                    useDjAutomix.getState().requestStart();
+                  }
+                }}
                 aria-disabled={!playable}
                 title={!playable ? 'Add at least 2 tracks to Auto-DJ this set' : `Auto-DJ "${s.name}" — load, beatmatch & crossfade the whole set hands-free`}
                 aria-label={`Play set ${s.name} with Auto-DJ`}
