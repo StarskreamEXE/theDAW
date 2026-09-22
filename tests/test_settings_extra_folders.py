@@ -100,7 +100,7 @@ def test_v8_file_gains_models_without_losing_existing_choices():
 
     merged = _merge_defaults(old)
 
-    assert merged["schema_version"] == SCHEMA_VERSION == 9
+    assert merged["schema_version"] == SCHEMA_VERSION == 10
     assert merged["models"] == {"extra_folders": []}
     assert merged["models"] is not DEFAULT_SETTINGS["models"], "must be a deep copy"
     assert merged["app"]["launch_mode"] == "desktop"
@@ -126,7 +126,7 @@ def test_v8_partial_file_migrates_and_persists_the_key(tmp_path):
     SettingsStore(path)
 
     on_disk = json.loads(path.read_text(encoding="utf-8"))
-    assert on_disk["schema_version"] == SCHEMA_VERSION == 9
+    assert on_disk["schema_version"] == SCHEMA_VERSION == 10
     assert on_disk["models"]["extra_folders"] == []
 
 
@@ -176,7 +176,11 @@ def test_router_get_and_patch_end_to_end(tmp_path, monkeypatch):
 
     app = FastAPI()
     app.include_router(settings_router.router, prefix="/api/settings")
-    client = TestClient(app)
+    # `models.extra_folders` names folders on this machine, so the PATCH is
+    # held to the loopback-or-launch-token tier (settings/router.py). The
+    # default TestClient peer is the string "testclient", which is not an
+    # address at all -- this machine's own UI is what this test stands for.
+    client = TestClient(app, client=("127.0.0.1", 51000))
 
     body = client.get("/api/settings").json()
     assert "extra_folders" in body["models"]

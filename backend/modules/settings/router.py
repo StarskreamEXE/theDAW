@@ -16,7 +16,9 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from fastapi import APIRouter, Body
+from fastapi import APIRouter, Body, HTTPException, Request
+
+from backend.lib.cross_site import require_loopback_or_launch_token
 
 from .store import SettingsStore, default_settings_path
 
@@ -42,9 +44,41 @@ def get_settings() -> dict[str, Any]:
     return get_store().get_all()
 
 
+#: Keys whose value is a list of FOLDERS ON THIS MACHINE. Setting one points a
+#: background walker (the media-root index, the model scan) at a directory of
+#: the caller's choosing, so they are held to the strict tier even though the
+#: rest of this route is a feature-toggle panel the phone companion uses.
+_FOLDER_LIST_KEYS = (("library", "media_roots"), ("models", "extra_folders"))
+
+
+def _folder_lists_touched(payload: dict[str, Any]) -> bool:
+    return any(
+        isinstance(payload.get(section), dict) and key in payload[section]
+        for section, key in _FOLDER_LIST_KEYS
+    )
+
+
 @router.patch("")
 @router.patch("/")
-def patch_settings(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+def patch_settings(
+    request: Request, payload: dict[str, Any] = Body(...)
+) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return get_store().get_all()
+    if _folder_lists_touched(payload):
+        # 403 unless this machine's own UI or the desktop shell is asking.
+        require_loopback_or_launch_token(request)
+        media_roots = payload.get("library")
+        if isinstance(media_roots, dict) and "media_roots" in media_roots:
+            from backend.modules.library.media_roots import validate_roots
+
+            value = media_roots["media_roots"]
+            if not isinstance(value, list):
+                raise HTTPException(400, "media_roots must be a list of folders")
+            try:
+                # Normalised here so what is stored is what will be walked:
+                # one canonical spelling each, no root nested in another.
+                media_roots["media_roots"] = validate_roots(value)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
     return get_store().patch(payload)

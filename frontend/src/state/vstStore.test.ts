@@ -14,7 +14,7 @@ const DESKTOP_ONLY = "This request must come from theDAW's desktop shell.";
 let nextResponse: Response = new Response('{"plugins":[]}', { status: 200 });
 globalThis.fetch = (async () => nextResponse.clone()) as typeof fetch;
 
-const { useVstStore, isDesktopOnlyRefusal, resetDesktopOnlyNotice } = await import('./vstStore.ts');
+const { useVstStore, isDesktopOnlyRefusal, resetDesktopOnlyNotice, vstBrowserEmptyText } = await import('./vstStore.ts');
 const { useStatusBarStore } = await import('./statusBarStore.ts');
 const { useLogStore } = await import('./logStore.ts');
 const { ApiError } = await import('../lib/apiJson.ts');
@@ -91,6 +91,21 @@ const reset = (body: string, status: number): void => {
   assert.equal(s.scanned, true);
   assert.equal(s.error, null);
   assert.equal(s.unavailableReason, null);
+}
+
+// --- the MIX effects browser says WHY the list is empty ----------------------
+{
+  // Scanning wins: the list is not empty yet, it is unknown.
+  assert.equal(vstBrowserEmptyText(true, null), 'Scanning…');
+  assert.equal(vstBrowserEmptyText(true, DESKTOP_ONLY), 'Scanning…');
+  // A refusal is explained, not left as a blank panel.
+  assert.equal(
+    vstBrowserEmptyText(false, DESKTOP_ONLY),
+    `VST hosting is desktop-only. ${DESKTOP_ONLY}`,
+  );
+  // Nothing refused: the message that was always there.
+  assert.equal(vstBrowserEmptyText(false, null), 'No VST3 plugins found. Click Rescan.');
+  assert.equal(vstBrowserEmptyText(false, '   '), 'No VST3 plugins found. Click Rescan.');
 }
 
 console.log('vstStore.test.ts: all assertions passed');

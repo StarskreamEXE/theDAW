@@ -81,7 +81,10 @@ from .store import (
 from .tags import MAX_EMBEDDED_COVER_BYTES
 from backend.core.startup import register_startup_hook
 from backend.lib import known_paths, paths
-from backend.lib.cross_site import refuse_cross_site
+from backend.lib.cross_site import (
+    refuse_cross_site,
+    require_loopback_or_launch_token,
+)
 
 log = logging.getLogger(__name__)
 
@@ -796,9 +799,31 @@ def get_entry_audio_path(entry_id: str) -> dict[str, Any]:
 # AIFF is the one that bites here (a whole DJ performance-set library is .aiff),
 # but the rule is the check, not the list.
 _BROWSER_UNPLAYABLE_SUFFIXES = frozenset({".aiff", ".aif", ".aifc", ".wma", ".ape"})
-# Remuxed copies live beside the entry, in their own folder so they can never be
-# mistaken for the source and never match AUDIO_EXTS scans of the entry dir.
+# Remuxed copies of an entry's OWN audio live beside it, in their own folder so
+# they can never be mistaken for the source and never match AUDIO_EXTS scans of
+# the entry dir. A file the library only REFERENCES (a media root, a folder
+# import's source_path) is cached elsewhere entirely -- see `_playable_cache_for`.
 _PLAYABLE_CACHE_DIRNAME = "_playable"
+
+
+def _playable_cache_for(
+    audio_path: Path, entry_dir: Optional[Path], entry_id: str
+) -> Optional[Path]:
+    """Which folder may hold the browser-playable remux of ``audio_path``.
+
+    The entry's own folder ONLY when the file is actually in it. An entry
+    resolved from a media root is referenced, not owned: writing a decoded WAV
+    into its folder would put bytes in a directory the user never asked us to
+    fill (and would make the entry look like it has audio of its own). Those
+    land in the data tree instead, keyed by entry id.
+    """
+    if entry_dir is None:
+        return None
+    if media_roots.path_is_within(audio_path, entry_dir):
+        return entry_dir
+    # Keyed by the id the caller asked for, never by `entry_dir.name` -- the
+    # nested generate layout names that folder "00", which every job has.
+    return media_roots.playable_cache_dir(entry_id)
 
 
 def _playable_audio(audio_path: Path, entry_dir: Optional[Path]) -> tuple[Path, str]:
@@ -894,12 +919,19 @@ async def stream_audio(entry_id: str) -> Response:
     # CHANGED: support CDN-backed entries — if no local file exists but
     # metadata has a cdn_audio_url, proxy the audio from Suno CDN on demand.
     store = get_store()
-    audio_path = store.get_audio_path(entry_id)
+    # Resolving is filesystem work -- the entry dir, then the media-root index
+    # and one stat on its hit -- and this handler is `async def`, so it runs ON
+    # the event loop unless it is handed to a thread. A sleeping external drive
+    # would otherwise stall every other request in the process.
+    audio_path = await asyncio.to_thread(store.get_audio_path, entry_id)
     if audio_path is not None and audio_path.is_file():
         # Decoding a long AIFF is seconds of blocking work; off the event loop
         # it goes, or every other request on the server stalls behind it.
+        entry_dir_for_cache = store._dir_for(entry_id)  # noqa: SLF001
         served, media_type = await asyncio.to_thread(
-            _playable_audio, audio_path, store._dir_for(entry_id)
+            _playable_audio,
+            audio_path,
+            _playable_cache_for(audio_path, entry_dir_for_cache, entry_id),
         )
         return FileResponse(
             path=str(served),
@@ -1112,15 +1144,21 @@ def delete_stem(stem_id: str) -> dict[str, Any]:
     return {"deleted": stem_id}
 
 
-@router.get("/media-roots", dependencies=[Depends(refuse_cross_site)])
+@router.get("/media-roots", dependencies=[Depends(require_loopback_or_launch_token)])
 def media_roots_status() -> dict[str, Any]:
     """The media-root index: which folders, how many files, how old, and
-    whether a walk is running. Cross-site-refused because it names folders on
-    this machine."""
+    whether a walk is running.
+
+    Loopback-or-launch-token, not merely cross-site-refused: this names
+    folders on this machine, and ``refuse_cross_site`` passes any caller that
+    simply sends no browser headers -- which a LAN script does by default."""
     return media_roots.status()
 
 
-@router.post("/media-roots/rescan", dependencies=[Depends(refuse_cross_site)])
+@router.post(
+    "/media-roots/rescan",
+    dependencies=[Depends(require_loopback_or_launch_token)],
+)
 def rescan_media_roots() -> dict[str, Any]:
     """Walk the roots again on a daemon thread and answer immediately.
     ``started`` is False when a scan was already running — a second walk over

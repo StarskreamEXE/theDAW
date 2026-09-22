@@ -533,7 +533,9 @@ async def audio(job_id: str) -> Response:
         try:
             from backend.modules.library.router import get_store
 
-            audio_path = get_store().get_audio_path(entry_id)
+            # Off the event loop: the path may live in a media root whose
+            # stat can block (see library.router.stream_audio).
+            audio_path = await asyncio.to_thread(get_store().get_audio_path, entry_id)
             if audio_path and audio_path.is_file():
                 return Response(
                     content=audio_path.read_bytes(), media_type="audio/mpeg"

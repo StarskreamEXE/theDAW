@@ -21,11 +21,15 @@ interface MediaRootIndexStatus {
   files: number;
   short_ids: number;
   age_seconds: number | null;
+  /** Why the last walk produced no index, or null. A failed scan and a scan
+   *  that never started both report ready:false; only this tells them apart. */
+  error: string | null;
 }
 
 const describeIndex = (status: MediaRootIndexStatus | null): string => {
   if (!status) return 'Index status unavailable.';
   if (status.scanning) return 'Scanning\u2026 the library falls back to its old behaviour until this lands.';
+  if (status.error) return `Last scan failed: ${status.error}`;
   if (!status.ready) return 'Not indexed yet.';
   const age = status.age_seconds == null ? '' : ` \u00b7 ${Math.round(status.age_seconds)}s ago`;
   return `${status.files.toLocaleString()} file(s) indexed${age}`;

@@ -27,11 +27,14 @@ UUID_B = "aa11bb22-3c4d-4e5f-8aa9-0b1c2d3e4f50"
 
 @pytest.fixture(autouse=True)
 def _clean_index(monkeypatch):
-    """Every test starts with no index, no roots and no scan in flight."""
+    """Every test starts with no index, no roots, no scan in flight and no
+    remembered CDN refusals (all three are process-lifetime state)."""
     monkeypatch.delenv(media_roots.ENV_VAR, raising=False)
     media_roots.reset()
+    library_router_module._cdn_refused.clear()
     yield
     media_roots.reset()
+    library_router_module._cdn_refused.clear()
 
 
 def _write(path: Path, data: bytes = b"RIFF\x00\x00\x00\x00WAVE") -> Path:
@@ -59,8 +62,9 @@ def test_index_maps_id8_and_full_id_across_nested_folders(tmp_path, monkeypatch)
 
     assert media_roots.lookup(UUID_A) == id8
     assert media_roots.lookup(UUID_B) == full
-    # A full-id file answers its own first eight hex too.
-    assert media_roots.lookup(UUID_B[:8]) == full
+    # The short-id table is consulted for a uuid entry id ONLY. Eight hex
+    # digits are not an entry id, and nothing in the app looks one up.
+    assert media_roots.lookup(UUID_B[:8]) is None
     assert media_roots.status()["files"] == 2
 
 
@@ -250,7 +254,9 @@ def client(tmp_path, monkeypatch) -> TestClient:
     monkeypatch.setenv("theDAW_GENERATIONS_DIR", str(tmp_path / "lib"))
     app = FastAPI()
     app.include_router(library_router_module.router, prefix="/api/library")
-    return TestClient(app)
+    # A loopback TCP peer: the media-root routes are this machine's own UI
+    # only, and TestClient's default peer ("testclient") is not an address.
+    return TestClient(app, client=("127.0.0.1", 51000))
 
 
 def test_media_roots_status_and_rescan_routes(client, tmp_path, monkeypatch):
@@ -345,3 +351,263 @@ def test_cdn_403_is_remembered_and_not_refetched(client, tmp_path, monkeypatch):
     assert second.status_code == 404
     assert second.json()["detail"] == first.json()["detail"]
     assert calls == ["https://cdn.example/x.mp3"]
+
+
+# ---- r2: the remux never lands in the entry --------------------------------
+
+
+def _write_aiff(path: Path) -> Path:
+    """A real 50 ms stereo AIFF, so the remux path does real work on a real
+    file rather than a mocked branch."""
+    import numpy as np
+    import soundfile as sf
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(
+        str(path),
+        np.zeros((2205, 2), dtype="float32"),
+        44100,
+        format="AIFF",
+        subtype="PCM_16",
+    )
+    return path
+
+
+def test_remuxing_a_media_root_file_never_writes_into_the_entry(
+    client, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("theDAW_DATA_DIR", str(tmp_path / "data"))
+    lib = tmp_path / "lib"
+    entry_dir = lib / UUID_A
+    entry_dir.mkdir(parents=True)
+    (entry_dir / "metadata.json").write_text(
+        json.dumps({"title": "aiff master"}), encoding="utf-8"
+    )
+    root = tmp_path / "media"
+    _write_aiff(root / f"aiff master [{UUID_A[:8]}].aiff")
+    _roots_env(monkeypatch, root)
+    media_roots.scan_now()
+
+    r = client.get(f"/api/library/audio/{UUID_A}")
+
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "audio/wav"
+    # The entry is untouched: no _playable folder, no copied bytes.
+    assert sorted(p.name for p in entry_dir.iterdir()) == ["metadata.json"]
+    cached = list(media_roots.playable_cache_dir(UUID_A).rglob("*.wav"))
+    assert len(cached) == 1, cached
+    assert cached[0].stat().st_size > 0
+
+
+# ---- r2: the routes are loopback-only --------------------------------------
+
+
+@pytest.fixture
+def lan_client(tmp_path, monkeypatch) -> TestClient:
+    """A TestClient whose TCP peer is a LAN address, not this machine."""
+    monkeypatch.setattr(library_router_module, "_store", None)
+    monkeypatch.setenv("theDAW_GENERATIONS_DIR", str(tmp_path / "lib"))
+    app = FastAPI()
+    app.include_router(library_router_module.router, prefix="/api/library")
+    return TestClient(app, client=("10.20.30.40", 51000))
+
+
+def test_media_root_routes_refuse_a_lan_caller(lan_client, client):
+    assert lan_client.get("/api/library/media-roots").status_code == 403
+    assert lan_client.post("/api/library/media-roots/rescan").status_code == 403
+    # This machine's own UI is unaffected.
+    assert client.get("/api/library/media-roots").status_code == 200
+    assert client.post("/api/library/media-roots/rescan").status_code == 200
+
+
+# ---- r2: roots are normalised, validated, de-duped -------------------------
+
+
+def test_spellings_of_one_root_collapse_to_one(tmp_path, monkeypatch):
+    root = tmp_path / "music"
+    _write(root / f"song [{UUID_A[:8]}].mp3")
+    import os
+
+    spellings = [str(root), str(root) + os.sep, str(root).swapcase()]
+    monkeypatch.setenv(media_roots.ENV_VAR, os.pathsep.join(spellings))
+
+    assert len(media_roots.configured_roots()) == 1
+
+    media_roots.scan_now()
+    assert media_roots.status()["files"] == 1
+    assert media_roots.status()["ambiguous"] == 0
+
+
+def test_a_nested_root_is_dropped(tmp_path, monkeypatch):
+    outer = tmp_path / "music"
+    inner = outer / "albums"
+    inner.mkdir(parents=True)
+    _roots_env(monkeypatch, inner, outer)
+
+    assert media_roots.configured_roots() == [
+        media_roots.normalize_roots([str(outer)])[0]
+    ]
+
+
+def test_validate_roots_refuses_a_relative_or_missing_folder(tmp_path):
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError) as rel:
+        media_roots.validate_roots(["music/here"])
+    assert "absolute" in str(rel.value)
+
+    with _pytest.raises(ValueError) as missing:
+        media_roots.validate_roots([str(tmp_path / "nope")])
+    assert "folder" in str(missing.value)
+
+    ok = media_roots.validate_roots([str(tmp_path)])
+    assert ok == media_roots.normalize_roots([str(tmp_path)])
+
+
+# ---- r2: a failed scan says so ---------------------------------------------
+
+
+def test_a_failed_scan_is_reported(tmp_path, monkeypatch):
+    _roots_env(monkeypatch, tmp_path)
+
+    def _boom(roots):
+        raise OSError("the disk went away")
+
+    monkeypatch.setattr(media_roots, "_build_index", _boom)
+    media_roots.scan_now()
+
+    st = media_roots.status()
+    assert st["ready"] is False
+    assert st["scanning"] is False
+    assert "the disk went away" in (st["error"] or "")
+
+
+def test_a_good_scan_clears_the_previous_failure(tmp_path, monkeypatch):
+    _write(tmp_path / f"song [{UUID_A[:8]}].mp3")
+    _roots_env(monkeypatch, tmp_path)
+    media_roots._set_error("stale failure")
+
+    media_roots.scan_now()
+
+    assert media_roots.status()["error"] is None
+
+
+# ---- r2: the short id is for uuid entry ids only ---------------------------
+
+
+def test_a_non_uuid_entry_id_never_matches_a_short_id_file(tmp_path, monkeypatch):
+    root = tmp_path / "media"
+    # "job_local" starts with eight characters that are not hex, but an id
+    # like "deadbeef_00" would be -- and must still not match.
+    _write(root / "whatever [deadbeef].mp3")
+    _roots_env(monkeypatch, root)
+    media_roots.scan_now()
+
+    assert media_roots.lookup("deadbeef_00") is None
+    assert media_roots.lookup("job_local_00") is None
+    assert media_roots.lookup("deadbeef") is None
+
+
+# ---- r2: the roots are never stat-ed on the caller's thread ----------------
+
+
+def test_the_signature_refresh_runs_off_the_calling_thread(tmp_path, monkeypatch):
+    root = tmp_path / "media"
+    target = _write(root / f"song [{UUID_A[:8]}].mp3")
+    _roots_env(monkeypatch, root)
+    media_roots.scan_now()
+
+    seen: list[str] = []
+    done = threading.Event()
+    real_signature = media_roots._signature
+
+    def _slow_signature(roots):
+        seen.append(threading.current_thread().name)
+        time.sleep(2.0)
+        done.set()
+        return real_signature(roots)
+
+    monkeypatch.setattr(media_roots, "_signature", _slow_signature)
+    # Force the next lookup to consider the roots stale-checkable.
+    media_roots._last_signature_check = 0.0
+
+    began = time.monotonic()
+    assert media_roots.lookup(UUID_A) == target
+    elapsed = time.monotonic() - began
+
+    assert elapsed < 1.0, f"the lookup waited {elapsed:.2f}s on a root stat"
+    assert done.wait(10), "the refresh never ran"
+    assert seen, "the refresh never ran"
+    assert threading.current_thread().name not in seen
+
+
+# ---- r2: only a settled refusal is remembered ------------------------------
+
+
+class _Resp5xx:
+    status_code = 503
+
+    def raise_for_status(self):
+        import httpx
+
+        raise httpx.HTTPStatusError("503", request=None, response=self)
+
+
+def _cdn_entry(lib, entry_id):
+    entry_dir = lib / entry_id
+    entry_dir.mkdir(parents=True)
+    (entry_dir / "metadata.json").write_text(
+        json.dumps({"title": "gone", "cdn_audio_url": "https://cdn.example/x.mp3"}),
+        encoding="utf-8",
+    )
+    return entry_dir
+
+
+def test_a_5xx_from_the_cdn_is_retried_next_time(client, tmp_path, monkeypatch):
+    _cdn_entry(tmp_path / "lib", UUID_B)
+    calls: list[str] = []
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            calls.append(url)
+            return _Resp5xx()
+
+    monkeypatch.setattr(library_router_module.httpx, "AsyncClient", _Client)
+
+    assert client.get(f"/api/library/audio/{UUID_B}").status_code == 404
+    assert client.get(f"/api/library/audio/{UUID_B}").status_code == 404
+    assert len(calls) == 2, "a 5xx is not the host's settled answer"
+
+
+def test_a_dropped_connection_is_retried_next_time(client, tmp_path, monkeypatch):
+    _cdn_entry(tmp_path / "lib", UUID_A)
+    calls: list[str] = []
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url):
+            calls.append(url)
+            raise OSError("connection reset")
+
+    monkeypatch.setattr(library_router_module.httpx, "AsyncClient", _Client)
+
+    assert client.get(f"/api/library/audio/{UUID_A}").status_code == 404
+    assert client.get(f"/api/library/audio/{UUID_A}").status_code == 404
+    assert len(calls) == 2

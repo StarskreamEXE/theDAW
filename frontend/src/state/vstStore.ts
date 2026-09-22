@@ -17,6 +17,19 @@ export const isDesktopOnlyRefusal = (e: unknown): boolean => {
   return e.status >= 400 && e.status < 500 && /desktop shell|desktop app/i.test(e.message);
 };
 
+/** What the MIX effects browser shows where the plugin tiles would be.
+ *
+ *  An empty list with no explanation is the browser build's worst answer: the
+ *  user clicks Rescan, nothing happens, and nothing ever says that VST hosting
+ *  needs the desktop app. `unavailableReason` carries the backend's own words
+ *  when the scan was refused rather than failed. */
+export const vstBrowserEmptyText = (scanning: boolean, unavailableReason: string | null): string => {
+  if (scanning) return 'Scanning…';
+  const reason = unavailableReason?.trim();
+  if (reason) return `VST hosting is desktop-only. ${reason}`;
+  return 'No VST3 plugins found. Click Rescan.';
+};
+
 /** The quiet notice is shown once per session, not once per scan: MIX and the
  *  editor both call `scan()`, and the browser's answer will not change. */
 let desktopOnlyNoticeShown = false;

@@ -9,7 +9,7 @@ import {
 } from 'lucide-react';
 import { effectiveZoom } from '../lib/canvasScale';
 import { useEffectChainStore, EFFECT_LABELS, EFFECT_DEFAULTS, MIX_RACK_IDS } from '../state/effectChainStore';
-import { useVstStore } from '../state/vstStore';
+import { useVstStore, vstBrowserEmptyText } from '../state/vstStore';
 import { useVstEditorStore, vstEntryName } from '../state/vstEditorStore';
 import type { Vst3PluginInfo } from '../lib/vstClient';
 import { useAdvancedEditorSourceStore } from '../state/advancedEditorStore';
@@ -571,6 +571,8 @@ interface MixRegArgs {
   // VST3 plugins (hosted via pedalboard) — shown in the effects browser and
   // added to the chain as 'vst3' nodes.
   vstPlugins: Vst3PluginInfo[]; vstScanning: boolean; rescanVst: () => void;
+  /** Why the list is empty here (the backend's words), or null. See vstStore. */
+  vstUnavailableReason: string | null;
   addVstToChain: (p: Vst3PluginInfo) => void; vstInChain: Set<string>;
   // .gan web-plugins (generic loader): installed list + the one open in the stage.
   ganPlugins: GanPluginSummary[]; ganActiveId: string | null; ganActiveUrl: string | null;
@@ -797,7 +799,7 @@ function buildMixRegistry(p: MixRegArgs): WidgetRegistry {
           {p.vstPlugins.length === 0 ? (
             <div className="flex-1 flex flex-col items-center justify-center opacity-30 italic gap-2 py-8">
               <Plug className="w-7 h-7" />
-              <span className="text-[10px]">{p.vstScanning ? 'Scanning…' : 'No VST3 plugins found. Click Rescan.'}</span>
+              <span className="text-[10px] text-center px-4">{vstBrowserEmptyText(p.vstScanning, p.vstUnavailableReason)}</span>
             </div>
           ) : (
             <div className="flex flex-wrap gap-3 content-start justify-center p-1.5">
@@ -1209,6 +1211,7 @@ export const MixView: React.FC = () => {
   // VST3 plugins for the effects browser (hosted via pedalboard).
   const vstPlugins = useVstStore((s) => s.plugins);
   const vstScanning = useVstStore((s) => s.scanning);
+  const vstUnavailableReason = useVstStore((s) => s.unavailableReason);
   const scanVst = useVstStore((s) => s.scan);
   // .gan web-plugins (generic loader) for the MIX effect stage.
   const ganPlugins = useGanStore((s) => s.plugins);
@@ -1616,7 +1619,7 @@ export const MixView: React.FC = () => {
     activeCategory, setActiveCategory, allEffectCount: allEffects.length + PSYCHO_MODULES.length + STUDIO_MODULES.length + vstPlugins.length + 1,
     quickMaster, setQuickParam, applyQuickMaster, masterEntry: !!masterEntry,
     activeEffects, viewMode, setViewMode, addEffect, chainEffectIds,
-    vstPlugins, vstScanning, rescanVst: () => void scanVst(true), addVstToChain: addAndEditVst, vstInChain,
+    vstPlugins, vstScanning, vstUnavailableReason, rescanVst: () => void scanVst(true), addVstToChain: addAndEditVst, vstInChain,
     ganPlugins: ganPluginsVisible, ganActiveId, ganActiveUrl, ganActiveName, ganBusy,
     onOpenGan: () => void handleOpenGan(), onImportGan: () => void handleImportGan(),
     onPickGan: handlePickGan, onRevealGan: handleRevealGan,

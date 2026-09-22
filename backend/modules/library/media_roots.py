@@ -62,12 +62,15 @@ SETTINGS_KEY = "media_roots"
 #: them changed. Cheap (one stat per root), but not per request.
 SIGNATURE_CHECK_SEC = 30.0
 
+#: Folder under the writable data tree holding browser-playable remuxes of
+#: files the library only references. See :func:`playable_cache_dir`.
+PLAYABLE_CACHE_DIRNAME = "playable-cache"
+
 _UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
 #: ``[c27de18c]`` immediately before the extension, and nowhere else.
 _ID8_RE = re.compile(r"\[([0-9a-fA-F]{8})\]\s*$")
-_HEX8_RE = re.compile(r"^[0-9a-fA-F]{8}$")
 
 
 def media_extensions() -> frozenset[str]:
@@ -103,21 +106,89 @@ _index: Optional[MediaIndex] = None
 _scanning = False
 _scan_thread: Optional[threading.Thread] = None
 _last_signature_check = 0.0
+#: Why the last walk produced no index. Without this a failed scan and a scan
+#: that has not started are the same "ready: false" and the Settings panel can
+#: only say "not indexed yet" about a disk that went away.
+_last_error: Optional[str] = None
+
+
+def _set_error(message: Optional[str]) -> None:
+    global _last_error
+    with _lock:
+        _last_error = message
 
 
 # ---- configuration ---------------------------------------------------------
 
 
-def _clean(values: Iterator[str]) -> list[str]:
-    out: list[str] = []
+def normalize_roots(values: list[str]) -> list[str]:
+    """One canonical spelling per folder, in first-seen order.
+
+    ``D:\\music``, ``D:\\music\\`` and ``d:\\music`` are one root, and walking
+    them three times would index every file three times and report two
+    "collisions" that are the same file. Case is folded for the comparison
+    only -- the stored string keeps the spelling the user typed, minus the
+    trailing separator -- because Windows paths are case-insensitive but what
+    the Settings panel shows should still look like what was entered.
+
+    A root INSIDE another root is dropped for the same reason: the outer walk
+    already reaches it.
+    """
+    cleaned: list[tuple[str, str]] = []
     seen: set[str] = set()
     for value in values:
-        folder = value.strip().strip('"')
-        if not folder or folder in seen:
+        raw = value.strip().strip('"')
+        if not raw:
             continue
-        seen.add(folder)
-        out.append(folder)
+        absolute = os.path.normpath(os.path.abspath(os.path.expanduser(raw)))
+        key = os.path.normcase(absolute)
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append((absolute, key))
+    out: list[str] = []
+    for absolute, key in cleaned:
+        parent = next(
+            (
+                other
+                for _, other in cleaned
+                if other != key and key.startswith(other.rstrip(os.sep) + os.sep)
+            ),
+            None,
+        )
+        if parent is not None:
+            log.info(
+                "media_roots: %s is inside %s; the outer root covers it",
+                absolute,
+                parent,
+            )
+            continue
+        out.append(absolute)
     return out
+
+
+def validate_roots(values: list[str]) -> list[str]:
+    """``normalize_roots``, refusing anything that cannot be walked.
+
+    Raises ``ValueError`` naming the offending entry. A relative path is
+    refused rather than resolved, because the CWD a background thread resolves
+    it against is not the one the user was thinking of, and a path that is not
+    a folder right now is a typo far more often than it is a drive about to be
+    plugged in.
+    """
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError(f"{value!r} is not a folder path")
+        raw = value.strip().strip('"')
+        if not raw:
+            continue
+        if not os.path.isabs(os.path.expanduser(raw)):
+            raise ValueError(f"{raw!r} is not an absolute path")
+    roots = normalize_roots(values)
+    for root in roots:
+        if not os.path.isdir(root):
+            raise ValueError(f"{root!r} is not a folder on this machine")
+    return roots
 
 
 def configured_roots() -> list[str]:
@@ -125,7 +196,7 @@ def configured_roots() -> list[str]:
     cannot be read is the same as no roots configured."""
     raw = os.getenv(ENV_VAR)
     if raw:
-        return _clean(iter(raw.split(os.pathsep)))
+        return normalize_roots(raw.split(os.pathsep))
     try:
         from backend.modules.settings.router import get_store as get_settings_store
 
@@ -135,7 +206,7 @@ def configured_roots() -> list[str]:
         return []
     if not isinstance(value, list):
         return []
-    return _clean(str(v) for v in value if isinstance(v, str))
+    return normalize_roots([v for v in value if isinstance(v, str)])
 
 
 def _signature(roots: list[str]) -> tuple[tuple[str, Optional[float]], ...]:
@@ -148,6 +219,31 @@ def _signature(roots: list[str]) -> tuple[tuple[str, Optional[float]], ...]:
         except OSError:
             out.append((root, None))
     return tuple(out)
+
+
+def playable_cache_dir(entry_id: str) -> Path:
+    """Where a remux of an out-of-tree file is cached.
+
+    An entry whose audio lives in a media root is REFERENCED, not owned: the
+    library must not write a decoded WAV into its folder just because the
+    browser cannot open AIFF. The cache goes in the writable data tree
+    instead, keyed by entry, so it is still one remux per file and still
+    deletable by hand.
+    """
+    from backend.lib import paths
+
+    return paths.data_path(PLAYABLE_CACHE_DIRNAME, entry_id)
+
+
+def path_is_within(path: Path, parent: Path) -> bool:
+    """Whether ``path`` sits inside ``parent``. False (never raises) for two
+    paths on different drives, which is exactly the case this exists for."""
+    try:
+        return os.path.normcase(os.path.abspath(str(path))).startswith(
+            os.path.normcase(os.path.abspath(str(parent))).rstrip(os.sep) + os.sep
+        )
+    except (OSError, ValueError):  # pragma: no cover - defensive
+        return False
 
 
 # ---- the walk --------------------------------------------------------------
@@ -280,15 +376,18 @@ def _build_index(roots: list[str]) -> MediaIndex:
 
 
 def _run_scan(roots: list[str]) -> None:
-    global _index, _scanning
+    global _index, _scanning, _last_error
+    built: Optional[MediaIndex] = None
+    failure: Optional[str] = None
     try:
         built = _build_index(roots)
-    except Exception:  # noqa: BLE001 -- a daemon thread must not raise
+    except Exception as exc:  # noqa: BLE001 -- a daemon thread must not raise
         log.warning("media_roots: the scan failed", exc_info=True)
-        built = None
+        failure = f"{type(exc).__name__}: {exc}"
     with _lock:
         if built is not None:
             _index = built
+        _last_error = failure
         _scanning = False
 
 
@@ -326,46 +425,69 @@ def _index_empty(roots: list[str]) -> None:
     _index = MediaIndex(roots=tuple(roots), signature=_signature(roots))
 
 
-def scan_now() -> MediaIndex:
+def scan_now() -> Optional[MediaIndex]:
     """Walk synchronously and install the result. For tests and for a caller
-    that has already decided to wait -- no request path calls this."""
-    global _index, _scanning
+    that has already decided to wait -- no request path calls this. Returns
+    None when the walk failed; the reason is in :func:`status`."""
+    global _index, _scanning, _last_error
     roots = configured_roots()
     with _lock:
         _scanning = True
     try:
         built = _build_index(roots)
-    finally:
+    except Exception as exc:  # noqa: BLE001 -- same contract as the thread
+        log.warning("media_roots: the scan failed", exc_info=True)
         with _lock:
+            _last_error = f"{type(exc).__name__}: {exc}"
             _scanning = False
+        return None
     with _lock:
         _index = built
+        _last_error = None
+        _scanning = False
     return built
 
 
 def reset() -> None:
     """Forget the index and any scan state. Tests only."""
-    global _index, _scanning, _scan_thread, _last_signature_check
+    global _index, _scanning, _scan_thread, _last_signature_check, _last_error
     with _lock:
         _index = None
         _scanning = False
         _scan_thread = None
         _last_signature_check = 0.0
+        _last_error = None
 
 
 def _maybe_refresh(current: MediaIndex) -> None:
-    """Notice that a root changed and start a rescan in the background. The
-    caller keeps reading the index it already has -- a stale hit is a real
-    file, and a miss costs exactly what a miss cost before."""
+    """Notice that a root changed and start a rescan -- on a thread of its own.
+
+    ``lookup`` is called from ``stream_audio``, which is ``async def``: one
+    ``os.stat`` of a sleeping external drive on the event loop stalls every
+    other request in the process. So the caller only arms the check; the stat
+    and the rescan decision happen elsewhere. The caller keeps reading the
+    index it already has -- a stale hit is a real file, and a miss costs
+    exactly what a miss cost before.
+    """
     global _last_signature_check
     now = time.monotonic()
     if now - _last_signature_check < SIGNATURE_CHECK_SEC:
         return
+    # Claimed BEFORE the thread starts, so a burst of lookups arms it once.
     _last_signature_check = now
-    roots = configured_roots()
-    if _signature(roots) != current.signature:
-        log.info("media_roots: a root changed; rescanning in the background")
-        start_scan(force=True)
+    signature = current.signature
+
+    def _check() -> None:
+        try:
+            if _signature(configured_roots()) != signature:
+                log.info("media_roots: a root changed; rescanning in the background")
+                start_scan(force=True)
+        except Exception:  # noqa: BLE001 -- a daemon thread must not raise
+            log.debug("media_roots: the staleness check failed", exc_info=True)
+
+    threading.Thread(
+        target=_check, name="library-media-roots-check", daemon=True
+    ).start()
 
 
 # ---- lookup ----------------------------------------------------------------
@@ -391,7 +513,11 @@ def lookup(
     _maybe_refresh(index)
     key = entry_id.strip().lower()
     found = index.by_full_id.get(key)
-    if found is None and len(key) >= 8 and _HEX8_RE.match(key[:8]):
+    if found is None and _UUID_RE.fullmatch(key):
+        # Only a uuid entry id has a "first eight hex" to match on. A generate
+        # id ("job_alpha_00") has eight leading characters like anything else,
+        # and letting those index into the short-id table is how an unrelated
+        # "[deadbeef]" file becomes somebody's audio.
         found = index.by_id8.get(key[:8])
     if found is None:
         return None
@@ -410,10 +536,12 @@ def status() -> dict:
     with _lock:
         index = _index
         scanning = _scanning
+        error = _last_error
     return {
         "roots": configured_roots(),
         "ready": index is not None,
         "scanning": scanning,
+        "error": error,
         "files": index.files if index is not None else 0,
         "full_ids": len(index.by_full_id) if index is not None else 0,
         "short_ids": len(index.by_id8) if index is not None else 0,

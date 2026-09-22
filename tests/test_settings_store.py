@@ -141,3 +141,59 @@ def test_migrated_schema_is_persisted(tmp_path):
     on_disk = json.loads(path.read_text(encoding="utf-8"))
     assert on_disk["schema_version"] == SCHEMA_VERSION
     assert on_disk["io"]["midi_inputs"] == {"mode": "all", "ports": []}
+
+
+# ---------------------------------------------------------------------------
+# The two list-valued keys name folders on this machine. A LAN caller must not
+# be able to point the media-root index (or the model scan) anywhere it likes.
+# ---------------------------------------------------------------------------
+
+
+def _settings_app(tmp_path, monkeypatch, peer):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from backend.modules.settings import router as settings_router
+    from backend.modules.settings.store import SettingsStore
+
+    monkeypatch.setattr(
+        settings_router, "_store", SettingsStore(tmp_path / "settings.json")
+    )
+    app = FastAPI()
+    app.include_router(settings_router.router, prefix="/api/settings")
+    return TestClient(app, client=peer)
+
+
+def test_a_lan_caller_cannot_set_the_folder_lists(tmp_path, monkeypatch):
+    lan = _settings_app(tmp_path, monkeypatch, ("10.20.30.40", 51000))
+
+    roots = lan.patch("/api/settings", json={"library": {"media_roots": ["C:\\"]}})
+    assert roots.status_code == 403
+    models = lan.patch("/api/settings", json={"models": {"extra_folders": ["C:\\"]}})
+    assert models.status_code == 403
+    # Everything else still works from the LAN (the phone toggles features).
+    assert (
+        lan.patch("/api/settings", json={"stems": {"auto_on_import": True}}).status_code
+        == 200
+    )
+
+
+def test_this_machine_can_set_the_media_roots(tmp_path, monkeypatch):
+    local = _settings_app(tmp_path, monkeypatch, ("127.0.0.1", 51000))
+    folder = tmp_path / "music"
+    folder.mkdir()
+
+    ok = local.patch("/api/settings", json={"library": {"media_roots": [str(folder)]}})
+    assert ok.status_code == 200
+    assert len(ok.json()["library"]["media_roots"]) == 1
+
+
+def test_a_relative_media_root_is_refused_with_a_reason(tmp_path, monkeypatch):
+    local = _settings_app(tmp_path, monkeypatch, ("127.0.0.1", 51000))
+
+    bad = local.patch(
+        "/api/settings", json={"library": {"media_roots": ["music/here"]}}
+    )
+
+    assert bad.status_code == 400
+    assert "absolute" in bad.json()["detail"]
