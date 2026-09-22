@@ -35,7 +35,7 @@ Newest first.
   families by size and the members of one family — each of them a list now,
   searchable, sortable and paged at 50 rows.
 - A row badges the provider and carries Focus and Copy id. Search reuses the
-  library's own search. A mashup cluster is counted apart: it is not a family.
+  library's own search tokeniser, over titles. A mashup cluster is counted apart: it is not a family.
 
 ### LEARN: the classic graph of one song, in the tab (verified by tests: LineageScaleView.test.tsx, LearnHost.test.tsx)
 
