@@ -47,10 +47,14 @@ Three shapes of question, three answers:
 What the index costs to hold: the entry-id set, the family membership, two
 count dictionaries over linked entries, and two per-kind count dictionaries.
 The per-kind tables are the big ones -- at most TWO dict entries per distinct
-(kind, child, parent), so at the real library's 475,174 links at most ~950,000
-entries, tens of MB, with every key shared with the entry-id set rather than
-copied. Counts only: no id lists are stored, and the order a ``count`` sort
-needs is computed on demand and memoised per (kind, role) as references.
+(kind, child, parent). Measured on the real library (194,529 entries,
+475,446 kind-count entries, 2026-09-22): the finished index retains 85 MB
+and the pass peaks at 203 MB while its transient adjacency is alive, 7.0 s
+on a read-only connection. Every key is shared with the entry-id set rather
+than copied. Counts only: no id lists are stored; the order a ``count`` sort
+needs is computed on demand and memoised per (kind, role) as references,
+which grows that slot by up to one reference per ranked id for the life of
+the index.
 
 One slot, replaced whole when the links change. The adjacency the pass builds
 is transient and freed before the index is stored, exactly as

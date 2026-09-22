@@ -6,6 +6,44 @@ by build, test, or observed behaviour.
 
 Newest first.
 
+## 2026-09-22
+
+### Media roots: the library serves files it never owned
+
+- An entry whose audio was never written under `data/generations/` is served
+  from your own media folders. `theDAW_MEDIA_ROOTS` names them and wins
+  outright; otherwise Settings → Storage → Media roots does. One background
+  scan indexes every file whose name carries the entry's full id, or its first
+  eight hex digits in brackets right before the extension.
+- The file is referenced in place. Nothing is copied into the entry, its
+  metadata is not touched, and the roots are asked after the entry's own folder
+  and before any remote copy.
+- The Settings panel reports the index and rescans on demand. A root must be an
+  absolute folder that exists and may not sit inside another root; one refused
+  from the environment variable is logged and dropped, and the rest still index.
+- The routes and the settings keys answer only to this machine. A LAN caller
+  reads "Hidden on this device" in place of the folder list and cannot set it.
+- AIFF, WMA and APE are remuxed to WAV once for the browser and cached under
+  `data/playable-cache/<id>/` instead of beside your file.
+
+### LEARN: every number on the landing page opens a list
+
+- Songs with lineage and songs without, any relationship kind as parent, child
+  or either end with the per-song count, rankings for any kind in either role,
+  families by size and the members of one family — each of them a list now,
+  searchable, sortable and paged at 50 rows.
+- A row badges the provider and carries Focus and Copy id. Search reuses the
+  library's own search. A mashup cluster is counted apart: it is not a family.
+
+### LEARN: the classic graph of one song, in the tab
+
+- **Classic graph** opens the classic view on the song in focus, inside LEARN,
+  on a library far too large for the whole-library drawing. The Genealogy and
+  3D tabs stay refused there and say why.
+- The family is capped at 600 nodes, with a bounded number of relation rows per
+  hop, and the cut takes from the far edge. When it bites the view says
+  "Showing the nearest N of a larger family."
+
 ## 2026-09-15
 
 ### Magenta RealTime 2 loads on one card (verified by build + tests; measured on a 2080 Ti)

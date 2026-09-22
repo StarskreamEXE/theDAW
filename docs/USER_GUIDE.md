@@ -841,6 +841,28 @@ theDAW carries several other rich visualizations, each documented in its own sec
 
 ![The cymatics and ferrofluid-orb visualizer](screenshots/ferro-orb.png)
 
+### 12.4 The lineage explorer: every number opens a list
+
+On a library of a few hundred thousand songs there is no whole-library picture to draw, so LEARN opens on a landing page of counted headlines, relationship-kind rows, and ranked lists. Every number on that page is a button: pressing one opens the list of songs it counted, read one page at a time from `GET /api/lineage-scale/explore/*`.
+
+What opens:
+
+- **Songs with lineage** and **songs without**, the two numbers under the Songs card. Together they are the whole library.
+- **One relationship kind**, with the song as parent, as child, or on either end (`/explore/kinds/{kind}`). Each row carries that song's own count for the kind and role asked for.
+- **A ranking** for any kind in either role, "most links of kind K as a parent" or "as a child" (`/explore/rankings`), not only the four presets the landing page shows.
+- **Families** by size (`/explore/families`) and the members of one family (`/explore/families/{id}/members`). A family is a connected component over ancestry links only. A mashup cluster welds unrelated trees into one component tens of thousands of songs wide, so it is counted on its own and is not a family.
+
+Every list searches, sorts, and pages. A page is 50 rows and the server counts the rest, so the browser holds 50 rows whether the list is 50 songs or 173,000; the page box commits on Enter or when it loses focus. Search runs through the Library's own fts5-backed search (§13.3), so there is no second index to keep current. A row shows the provider badge, the title, the number the list was ranked by, and two named buttons: **Focus** draws that song's neighbourhood, **Copy id** copies its entry id. A family row opens the family instead.
+
+The whole-graph counts are computed once per change to the link graph and cached, and the pass is warmed by a background thread a few seconds after startup, so opening a list does not read the relations table.
+
+### 12.5 The classic graph of one song, inside LEARN
+
+The classic lineage view stays reachable on a library too large for the library-wide drawing. The header's **Classic graph** button mounts it inside LEARN, rooted at the song in focus; pressing it again closes it. Its two whole-library tabs, Genealogy and the 3D graph, are refused there and say why on the controls themselves ("library too large for the whole-library graph; use the per-track graph"), and the whole-library request is never sent.
+
+The per-track answer is bounded by the server rather than by the browser. `GET /api/library/{entry_id}/lineage` walks parents and children breadth-first, stops at 600 nodes, and reads at most 4,000 relation rows for any one hop. The cut follows the walk, so a hop is admitted whole before the next is looked at: the near family is complete and distant relatives are what is dropped. When the cap bites, the answer is marked truncated and the view shows "Showing the nearest N of a larger family."
+
+
 ---
 
 ![The 2D lineage family tree in LEARN](screenshots/learn-2d.png)
@@ -883,7 +905,7 @@ Waveform editor mixdowns, MIX outputs, mic recordings, imports, and Chimera rend
 
 ### 13.2 List and Grid Views
 
-Toggle between a dense **List** view (one row per entry) and a **Grid** view (tile cards) through the icons in the section header. List view shows title, prompt preview, model chip, duration, date, file size, and a per-entry action cluster.
+Toggle between a dense **List** view (one row per entry) and a **Grid** view (tile cards) through the icons in the section header. List view shows title, prompt preview, model chip, duration, date, file size, and a per-entry action cluster. Each row also carries a **provider badge** — Stable Audio, theDAW, Suno, Udio, Riffusion, Magenta, or Import — classified from the file's embedded tags first and its `model` and `source` fields second; a `chirp-*` model is Suno's own model family, so those entries badge as Suno (§29).
 
 ### 13.3 Search, Filter, Sort
 
@@ -986,6 +1008,23 @@ Shown until the first generation. It contains a **Go generate something** button
 The library splits its contents into four sub-tabs: **Tracks**, **Stems**, **MIDI**, and **Video**. Stems and MIDI are first-class items rather than attachments to a parent track. Each row plays through the shared engine, can be favorited, and can be deleted on its own without touching the source track.
 
 A stem row plays its separated audio and shows the separation model. Its right-click menu sends the stem to a new editor track, to the tail of the first track, to Init audio, to Inpaint, or to the Chimera stack, and offers a `.wav` download. A MIDI row plays through the synth and can be sent to the Piano Roll, the Step Sequencer, or (rendered to audio) to the editor, Init audio, Inpaint, or Chimera, with a `.mid` download. Favoriting or deleting a stem or MIDI row affects only that row, never its parent entry.
+
+### 13.13 Media roots: entries whose audio lives outside the library
+
+An entry can exist whose audio was never written under `data/generations/`: catalogued from a provider that kept the file behind a URL, imported as metadata, or restored from a backup that carried the database and not the files. **Media roots** are the folders on this machine the library searches for those files.
+
+Set them in **Settings → Storage → Media roots**, or in the `theDAW_MEDIA_ROOTS` environment variable (folders separated by `;` on Windows, `:` elsewhere). The environment variable wins outright: when it is set, the Settings list is not consulted at all. A root must be an absolute path to a folder that exists, and a folder inside another root is dropped because the outer walk already reaches it. A root typed into Settings that breaks those rules is refused there with the reason; a bad entry in the environment variable is logged and dropped, and the remaining roots still index.
+
+One background scan indexes every root. A file is matched to an entry by its name, in two shapes: the entry's full 36-character id anywhere in the name, or the first eight hex digits of that id in square brackets immediately before the extension — the short tag a library export writes (`Some Title [c27de18c].flac`). When both shapes claim one entry the full id wins; between two short tags the newest file wins. The walk runs on its own thread, because a few hundred thousand files on a spinning disk takes minutes, and until it finishes a lookup answers exactly as it did before any roots existed.
+
+Nothing is copied. A file found this way is played in place: no bytes are written into the entry's folder and its metadata is not touched. The library asks the entry's own folder first, the media-root index second, and only then a remote copy.
+
+The panel reports the index — how many files, how old, whether a walk is running — and a **Rescan** button walks the roots again on a background thread and answers immediately. The roots are also re-checked periodically, so a folder that changed is picked up without pressing it.
+
+AIFF, WMA, and APE are containers the browser has no demuxer for. When one of those is served from a media root it is remuxed to WAV once (header only, nothing re-encoded, no bit depth lost) and the copy is cached under `data/playable-cache/<entry id>/` rather than beside your file. That cache is derived state and can be deleted at any time; it is rebuilt on the next play.
+
+The routes (`GET /api/library/media-roots`, `POST /api/library/media-roots/rescan`) and the settings keys that set the list answer only to this machine: loopback, or the desktop shell's launch token. A phone or LAN companion reads "Hidden on this device — manage media roots on the theDAW PC" in place of the folders and cannot set them. Naming every media folder on a machine is reconnaissance for anyone on the network, and a panel that cannot write the list has no use for its contents.
+
 
 ---
 
@@ -1790,6 +1829,8 @@ The **Models** section sits directly below the pinned Restart/Shutdown controls 
 - **Hugging Face cache breakdown** expands to a per-repo size table, each row openable in Explorer.
 
 **No usable model?** Pressing CREATE (or LOAD) with nothing installed, or with a selection that local-only would block, never fails silently: the run stops with a plain-language explanation and Settings opens straight to the Models section, which pulses to show where the fix lives.
+
+**Media roots** sit one section over, under **Settings → Storage**: the folders the library searches for an entry whose audio was never written under `data/generations/`. Files there are referenced in place and never copied, and both the list and its routes can only be read or set from this machine (§13.13).
 
 | Method · Path | Purpose |
 |---|---|
