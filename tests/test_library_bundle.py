@@ -277,3 +277,79 @@ def test_lineage_endpoint_caps_a_huge_family(tmp_path: Path):
     for edge in result["edges"]:
         assert edge["from_id"] in node_ids
         assert edge["to_id"] in node_ids
+
+
+def test_lineage_endpoint_bounds_the_work_one_hop_can_do(tmp_path: Path):
+    """A hub with 9,000 relatives is READ within a bound, not read whole.
+
+    The node cap alone bounds the ANSWER, not the work: walking a hub by
+    asking for its relations a node at a time and materialising every row
+    builds tens of thousands of dicts before the cap refuses the 601st node,
+    and the user has an 81,000-song welded component. So each hop reads its
+    relations in one bounded, projected statement, and a hop that fills that
+    bound says the answer was cut."""
+    store = LibraryStore(tmp_path)
+    assert store.db is not None
+    root = store.import_blob(
+        b"RIFF\x00\x00\x00\x00WAVE", "hub.wav", "audio/wav", metadata={"title": "Hub"}
+    )
+    store.db.add_relations_bulk(
+        (root.id, f"r-{i:05d}", "derived_from") for i in range(9000)
+    )
+
+    from backend.modules.library import router
+
+    statements: list[str] = []
+    store.db._conn.set_trace_callback(statements.append)  # noqa: SLF001
+    router._store = store  # noqa: SLF001
+    try:
+        result = router.get_lineage(root.id, depth=4)
+    finally:
+        router._store = None  # noqa: SLF001
+        store.db._conn.set_trace_callback(None)  # noqa: SLF001
+
+    assert result["truncated"] is True
+    assert len(result["nodes"]) <= router.LINEAGE_MAX_NODES
+    assert len(result["edges"]) <= router.LINEAGE_MAX_EDGES_PER_HOP
+
+    relation_reads = [s for s in statements if "FROM relations" in s]
+    assert relation_reads, "the walk does read the relations table"
+    for sql in relation_reads:
+        assert "SELECT *" not in sql, f"the whole row was read: {sql}"
+        assert "metadata_json" not in sql, f"a blob column was opened: {sql}"
+        assert "LIMIT" in sql, f"the read is unbounded: {sql}"
+    assert len(relation_reads) <= 4, (
+        f"one bounded read per hop, not one per node: {len(relation_reads)}"
+    )
+
+
+def test_lineage_endpoint_says_so_when_the_depth_ran_out(tmp_path: Path):
+    """Relatives left unwalked because the DEPTH ended are left out too.
+
+    ``truncated`` is the answer's one word for "there is more of this family
+    than you are looking at", so it cannot mean only "a cap bit"."""
+    store = LibraryStore(tmp_path)
+    assert store.db is not None
+    root = store.import_blob(
+        b"RIFF\x00\x00\x00\x00WAVE", "a.wav", "audio/wav", metadata={"title": "A"}
+    )
+    # A chain five hops long, walked two.
+    previous = root.id
+    for i in range(5):
+        nxt = f"chain-{i}"
+        store.db.add_relation(previous, nxt, "derived_from")
+        previous = nxt
+
+    from backend.modules.library import router
+
+    router._store = store  # noqa: SLF001
+    try:
+        shallow = router.get_lineage(root.id, depth=2)
+        whole = router.get_lineage(root.id, depth=9)
+    finally:
+        router._store = None  # noqa: SLF001
+
+    assert len(shallow["nodes"]) == 3, "the root and two hops of it"
+    assert shallow["truncated"] is True, "and the chain goes on past them"
+    assert len(whole["nodes"]) == 6
+    assert whole["truncated"] is False, "walked to its end, nothing left out"

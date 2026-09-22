@@ -20,11 +20,14 @@
 //     them is wrapped in a <label> (a <label> does not name a non-native
 //     control — project CLAUDE.md rule 3).
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { renderToStaticMarkup } from 'react-dom/server';
 
 import { ProviderBadge } from '../components/library/ProviderBadge.tsx';
 import { FocusGraph } from './FocusGraph.tsx';
-import { GraphPane, classicPerTrackProps } from './LineageScaleView.tsx';
+import { ClassicGraphAction, GraphPane, classicPerTrackProps } from './LineageScaleView.tsx';
 import { LineageLanding } from './LineageLanding.tsx';
 import { RelativesPanelBody } from './RelativesPanel.tsx';
 import LineageScaleView from './LineageScaleView.tsx';
@@ -645,6 +648,32 @@ const ALONE = 'This song stands alone';
   // The landing page has no song in focus, so there is nothing to draw.
   const landing = renderToStaticMarkup(<LineageScaleView visible={false} />);
   assert.ok(!landing.includes('Classic graph for'), 'and nothing offers it with nothing focused');
+
+  // It is a TOGGLE, and it says which way it is: a control reporting
+  // `aria-pressed` that can only ever be pressed lies to anything reading it.
+  let toggled = 0;
+  const closed = renderToStaticMarkup(
+    <ClassicGraphAction label="Night Drive" open={false} onToggle={() => { toggled += 1; }} />,
+  );
+  assert.ok(closed.includes('aria-pressed="false"'), `closed: ${closed}`);
+  assert.ok(closed.includes('aria-label="Classic graph for Night Drive"'));
+  const opened = renderToStaticMarkup(
+    <ClassicGraphAction label="Night Drive" open onToggle={() => { toggled += 1; }} />,
+  );
+  assert.ok(opened.includes('aria-pressed="true"'), `open: ${opened}`);
+  assert.equal(toggled, 0, 'and nothing is toggled by rendering it');
+
+  // And the view wires it BOTH ways. The button's own state is checked above;
+  // this is the other half — the source-text guard the repo already uses for
+  // invariants a static render cannot reach (see lineageWrapperGuards.test.ts).
+  const source = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), 'LineageScaleView.tsx'),
+    'utf8',
+  );
+  assert.ok(
+    source.includes('onToggle={() => setClassicOpen((v) => !v)}'),
+    'the action must close what it opens, or aria-pressed is a lie',
+  );
 
   // What that action mounts: the classic modal, per-track, with the two
   // whole-library tabs refused.

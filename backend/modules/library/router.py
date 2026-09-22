@@ -1643,6 +1643,62 @@ def download_bundle(entry_id: str) -> Response:
 #: bites, the answer says so (``truncated``) and names the cap it was cut at.
 LINEAGE_MAX_NODES = 600
 
+#: The most relation rows ONE hop of the walk may read.
+#:
+#: :data:`LINEAGE_MAX_NODES` bounds the ANSWER; this bounds the WORK. Asking a
+#: hub for its relations one node at a time and materialising every row builds
+#: a dict per relation before the node cap can refuse anything — and a welded
+#: mashup component in this library runs to 81,000 songs. One projected,
+#: limited statement per hop makes both the work and the memory a function of
+#: these constants and not of one song's degree.
+LINEAGE_MAX_EDGES_PER_HOP = 4000
+
+#: The columns a lineage edge carries on the wire. ``relations`` also holds
+#: ``metadata_json``; nothing drawing this graph reads it.
+_LINEAGE_EDGE_COLUMNS = ("from_id", "to_id", "kind")
+_LINEAGE_EDGE_SELECT = ", ".join(_LINEAGE_EDGE_COLUMNS)
+
+
+def _lineage_relation_rows(
+    db: LibraryDB, ids: list[str], limit: int
+) -> tuple[list[dict[str, Any]], bool]:
+    """Up to ``limit`` relation rows touching ``ids``, in EITHER direction.
+
+    Returns the rows and whether the limit is what stopped the read — which is
+    the walk's signal that this hop was cut. One statement per chunk of ids,
+    with the ids listed on both sides of the ``OR``, so the parameter budget is
+    halved."""
+    out: list[dict[str, Any]] = []
+    unique = list(dict.fromkeys(ids))
+    if not unique or limit <= 0:
+        return out, False
+    hit_limit = False
+    chunk_size = max(1, _MAX_SQL_PARAMS // 2)
+    with db._writelock:  # noqa: SLF001 — the DB exposes no bounded projection
+        cur = db._conn.cursor()  # noqa: SLF001
+        try:
+            for chunk in _chunks(unique, chunk_size):
+                remaining = limit - len(out)
+                if remaining <= 0:
+                    hit_limit = True
+                    break
+                marks = ", ".join("?" * len(chunk))
+                # One row past the budget, so "there was more" is read off the
+                # answer rather than guessed from a full page.
+                rows = cur.execute(
+                    f"SELECT {_LINEAGE_EDGE_SELECT} FROM relations "
+                    f"WHERE from_id IN ({marks}) OR to_id IN ({marks}) LIMIT ?",
+                    [*chunk, *chunk, remaining + 1],
+                ).fetchall()
+                if len(rows) > remaining:
+                    hit_limit = True
+                    rows = rows[:remaining]
+                out.extend({k: row[k] for k in _LINEAGE_EDGE_COLUMNS} for row in rows)
+        finally:
+            cur.close()
+    return out, hit_limit
+
+
 #: The columns a lineage node carries — and therefore the only ones read.
 #: ``entries`` also holds ``metadata_json``, so a whole-row read would drag one
 #: blob per node through the connection for a payload that ships four fields.
@@ -1696,28 +1752,34 @@ def get_lineage(entry_id: str, depth: int = 3) -> dict[str, Any]:
     frontier: list[str] = [entry_id]
     truncated = False
     for _ in range(depth):
+        hop_rows, hop_cut = _lineage_relation_rows(
+            store.db, frontier, LINEAGE_MAX_EDGES_PER_HOP
+        )
+        if hop_cut:
+            truncated = True
         next_frontier: list[str] = []
-        for node_id in frontier:
-            outgoing = store.db.list_relations(from_id=node_id)
-            incoming = store.db.list_relations(to_id=node_id)
-            for e in outgoing + incoming:
-                for nb in (e["from_id"], e["to_id"]):
-                    if nb in seen_ids:
-                        continue
-                    if len(seen_ids) >= LINEAGE_MAX_NODES:
-                        truncated = True
-                        continue
-                    seen_ids.add(nb)
-                    next_frontier.append(nb)
-                # An edge to a node the cap refused would dangle, so it is
-                # kept only once BOTH of its ends are in the answer.
-                if e["from_id"] in seen_ids and e["to_id"] in seen_ids:
-                    edges.append(e)
-        # The hop that hit the cap is finished — so the near family is whole —
+        for e in hop_rows:
+            for nb in (e["from_id"], e["to_id"]):
+                if nb in seen_ids:
+                    continue
+                if len(seen_ids) >= LINEAGE_MAX_NODES:
+                    truncated = True
+                    continue
+                seen_ids.add(nb)
+                next_frontier.append(nb)
+            # An edge to a node the cap refused would dangle, so it is
+            # kept only once BOTH of its ends are in the answer.
+            if e["from_id"] in seen_ids and e["to_id"] in seen_ids:
+                edges.append(e)
+        # The hop that hit a bound is finished — so the near family is whole —
         # and then the walk stops rather than filling up on distant cousins.
         frontier = next_frontier
         if truncated or not frontier:
             break
+    # Relatives the DEPTH never reached are left out just as surely as ones a
+    # cap refused, and `truncated` is this answer's only word for "there is
+    # more of this family than you are looking at".
+    truncated = truncated or bool(frontier)
 
     # Materialize node payloads for everything we touched.
     rows_by_id = _lineage_entry_rows(store.db, list(seen_ids))

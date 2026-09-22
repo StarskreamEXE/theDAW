@@ -52,6 +52,28 @@ export const classicPerTrackProps = (focusId: string, visible = true) => ({
   wholeLibraryAllowed: false,
 });
 
+/**
+ * The header action that opens — and closes — the classic graph of the song
+ * in focus. It reports `aria-pressed`, so it has to be able to un-press:
+ * a toggle that only ever goes one way lies to anything reading that state.
+ */
+export const ClassicGraphAction: React.FC<{
+  label: string;
+  open: boolean;
+  onToggle: () => void;
+}> = ({ label, open, onToggle }) => (
+  <button
+    type="button"
+    onClick={onToggle}
+    aria-label={`Classic graph for ${label}`}
+    aria-pressed={open}
+    title="The classic lineage graph of this song's own family"
+    className="rounded border border-white/10 px-2 py-1 text-[9px] font-mono uppercase tracking-widest text-zinc-300 hover:border-white/25 hover:text-white"
+  >
+    Classic graph
+  </button>
+);
+
 const SEARCH_LIMIT = 20;
 const BUDGETS = [100, 200, 400, 800, 1500] as const;
 const DEPTHS: number[] = [];
@@ -443,16 +465,11 @@ export const LineageScaleView: React.FC<LineageScaleViewProps> = ({ visible = tr
           >
             In library
           </button>
-          <button
-            type="button"
-            onClick={() => setClassicOpen(true)}
-            aria-label={`Classic graph for ${crumb?.title ?? focusId}`}
-            aria-pressed={classicOpen}
-            title="The classic lineage graph of this song's own family"
-            className="rounded border border-white/10 px-2 py-1 text-[9px] font-mono uppercase tracking-widest text-zinc-300 hover:border-white/25 hover:text-white"
-          >
-            Classic graph
-          </button>
+          <ClassicGraphAction
+            label={crumb?.title ?? focusId}
+            open={classicOpen}
+            onToggle={() => setClassicOpen((v) => !v)}
+          />
         </span>
       </header>
 

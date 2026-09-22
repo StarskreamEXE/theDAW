@@ -20,7 +20,8 @@ import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
 import {
-  LineageModal, LineageView, defaultLineageTab, shouldFetchWholeLibrary, truncationNotice,
+  LineageModal, LineageView, WHOLE_LIBRARY_REFUSED, WHOLE_LIBRARY_REFUSED_ID,
+  defaultLineageTab, shouldFetchWholeLibrary, truncationNotice,
 } from './LineageModal.tsx';
 
 const render = (props: Partial<React.ComponentProps<typeof LineageModal>>): string =>
@@ -66,6 +67,7 @@ const render = (props: Partial<React.ComponentProps<typeof LineageModal>>): stri
   assert.ok(html.includes('Track'));
   assert.ok(!html.includes('aria-disabled'), 'and none of them is refused');
   assert.ok(!html.includes('disabled=""'));
+  assert.ok(!html.includes(WHOLE_LIBRARY_REFUSED_ID), 'and nothing explains a refusal there is not');
 
   // The embedded variant the LEARN tab mounts defaults the same way.
   const embedded = renderToStaticMarkup(<LineageView rootEntryId="song-7" visible={false} />);
@@ -85,13 +87,29 @@ const render = (props: Partial<React.ComponentProps<typeof LineageModal>>): stri
   const refused = buttons.filter((b) => b.includes('aria-disabled="true"'));
   assert.equal(refused.length, 2, 'exactly the two library tabs are refused');
   for (const b of refused) {
-    assert.ok(b.includes('disabled=""'), 'refused by the attribute, not only by styling');
+    assert.ok(
+      !b.includes('disabled=""'),
+      `native disabled takes the tab out of the tab order, so the reason never
+       reaches a keyboard or screen-reader user: ${b}`,
+    );
+    assert.ok(
+      b.includes(`aria-describedby="${WHOLE_LIBRARY_REFUSED_ID}"`),
+      `and it must point at the reason instead: ${b}`,
+    );
     assert.ok(
       b.includes('library too large for the whole-library graph'),
-      `the reason is on the control itself: ${b}`,
+      `the reason is on the control itself too, as its title: ${b}`,
     );
     assert.ok(b.includes('use the per-track graph'), 'and it says what to do instead');
   }
+
+  // The note those two point at is on the page, once, and readable.
+  const notes = html.match(new RegExp(`id="${WHOLE_LIBRARY_REFUSED_ID}"`, 'g')) ?? [];
+  assert.equal(notes.length, 1, 'the explanation is rendered exactly once');
+  assert.ok(
+    html.includes(`>${WHOLE_LIBRARY_REFUSED}<`),
+    'and its text is visible, not only an attribute',
+  );
 }
 
 // ── "you are seeing part of a larger family" ────────────────────────────────

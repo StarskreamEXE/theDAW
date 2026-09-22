@@ -40,6 +40,9 @@ type LineageTab = 'track' | 'genealogy' | 'graph3d';
 export const WHOLE_LIBRARY_REFUSED =
   'library too large for the whole-library graph; use the per-track graph';
 
+/** The note carrying that reason — named so the refused tabs can point at it. */
+export const WHOLE_LIBRARY_REFUSED_ID = 'lineage-whole-library-refused';
+
 /**
  * Which tab opens. A song opens on its own graph; only a library-wide open
  * starts on the genealogy — and only where the library can be drawn at all,
@@ -556,6 +559,14 @@ export const LineageModal: React.FC<LineageModalProps> = ({ open, rootEntryId, o
         <div className="absolute inset-0 bg-black/80 backdrop-blur-sm" onClick={onClose} />
       )}
       <div className={modalShellClass}>
+        {!wholeLibraryAllowed && (
+          <p
+            id={WHOLE_LIBRARY_REFUSED_ID}
+            className="shrink-0 border-b border-white/5 px-4 py-1 text-[9px] font-mono text-amber-200/80"
+          >
+            {WHOLE_LIBRARY_REFUSED}
+          </p>
+        )}
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-white/5 shrink-0">
           <div className="flex items-center gap-2">
@@ -597,6 +608,7 @@ export const LineageModal: React.FC<LineageModalProps> = ({ open, rootEntryId, o
               icon={<GitFork className="w-3 h-3" />}
               disabled={!wholeLibraryAllowed}
               title={wholeLibraryAllowed ? undefined : WHOLE_LIBRARY_REFUSED}
+              describedBy={WHOLE_LIBRARY_REFUSED_ID}
             >
               Genealogy
             </TabButton>
@@ -606,6 +618,7 @@ export const LineageModal: React.FC<LineageModalProps> = ({ open, rootEntryId, o
               icon={<Workflow className="w-3 h-3" />}
               disabled={!wholeLibraryAllowed}
               title={wholeLibraryAllowed ? undefined : WHOLE_LIBRARY_REFUSED}
+              describedBy={WHOLE_LIBRARY_REFUSED_ID}
             >
               3D graph
             </TabButton>
@@ -791,18 +804,28 @@ interface TabButtonProps {
   onClick: () => void;
   icon: React.ReactNode;
   children: React.ReactNode;
-  /** A tab that cannot be opened here — refused by the attribute AND said
-   *  out loud in `title`, never merely greyed. */
+  /** A tab that cannot be opened here.
+   *
+   *  NOT the native `disabled` attribute: that takes the control out of the
+   *  tab order, so a keyboard or screen-reader user never reaches it and
+   *  never hears why it is refused — and `title` on a disabled button is not
+   *  surfaced either. It stays focusable, announces itself refused with
+   *  `aria-disabled`, points at the visible note with `aria-describedby`, and
+   *  the handler is what actually refuses the click. */
   disabled?: boolean;
   title?: string;
+  describedBy?: string;
 }
 
-const TabButton: React.FC<TabButtonProps> = ({ active, onClick, icon, children, disabled = false, title }) => (
+const TabButton: React.FC<TabButtonProps> = ({ active, onClick, icon, children, disabled = false, title, describedBy }) => (
   <button
     type="button"
-    onClick={onClick}
-    disabled={disabled}
+    onClick={() => {
+      if (disabled) return;
+      onClick();
+    }}
     aria-disabled={disabled || undefined}
+    aria-describedby={disabled ? describedBy : undefined}
     title={title}
     className={`flex items-center gap-1.5 px-2 py-1 rounded text-[9px] font-black uppercase tracking-widest border transition-colors ${
       disabled
