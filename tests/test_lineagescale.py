@@ -13,6 +13,7 @@ possible.
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -41,6 +42,9 @@ from tests.lineagescale_fixtures import (
 )
 
 PREFIX = "/api/lineage-scale"
+
+#: The only logger whose records say anything about this module.
+_ROUTER_LOGGER = "backend.modules.lineagescale.router"
 
 
 # --------------------------------------------------------------- fixtures
@@ -132,26 +136,155 @@ def _stats(fixture: FixtureLibrary) -> graph.LibraryStats:
 # ------------------------------------------------------- the role table
 
 
+#: Every file under ``backend/`` that calls a relation writer, and what each
+#: one is for. Asserted to BE the complete list, so a writer that moves, or a
+#: new one, fails this test by name instead of quietly adding a kind the role
+#: table has never heard of.
+#:
+#: ``library/db.py`` is the writer's own definition, not a call site, so it is
+#: excluded by matching only ``.add_relation(`` / ``.add_relations_bulk(``.
+_RELATION_WRITER_FILES = (
+    "backend/modules/library/store.py",
+    "backend/modules/midi/runner.py",
+    "backend/modules/notation/engine.py",
+    "backend/modules/notation/router.py",
+    "backend/modules/stems/engine.py",
+    "backend/modules/suno/router.py",
+)
+
+_WRITER_CALL_RE = re.compile(r"\.add_relations?(?:_bulk)?\(")
+#: ``kind="literal"`` in a call site.
+_KIND_LITERAL_RE = re.compile(r"""kind\s*=\s*["']([A-Za-z0-9_]+)["']""")
+#: ``kind=name`` — a variable, resolved below.
+_KIND_NAME_RE = re.compile(r"kind\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*[,)]")
+#: ``add_relations_bulk(name)`` — a list of ``(from, to, kind)`` tuples.
+_BULK_NAME_RE = re.compile(r"add_relations_bulk\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)")
+#: How far above a call site a binding for its kind is looked for.
+_RESOLVE_WINDOW = 40
+
+
+def _kinds_from_helper(text: str, helper: str) -> set[str]:
+    """String literals in the LAST position of a 3-tuple inside ``helper``.
+
+    ``library/store.py`` writes ``(str(label), entry_id, "chimera_source_of")``
+    from ``_chimera_edges`` and passes the tuples on, so the kind is a literal
+    in the helper rather than at the call site.
+    """
+    match = re.search(rf"^def {re.escape(helper)}\(", text, re.MULTILINE)
+    if match is None:
+        return set()
+    rest = text[match.start() :]
+    end = re.search(r"\n(?=\S)", rest[1:])
+    body = rest if end is None else rest[: end.start() + 1]
+    return set(re.findall(r""",\s*["']([A-Za-z0-9_]+)["']\s*\)""", body))
+
+
+def _kinds_written_by(path: Path) -> tuple[set[str], list[str]]:
+    """``(kinds, unresolved)`` for one writer file.
+
+    Three ways a call site names its kind, and nothing else is guessed:
+      1. ``kind="literal"``;
+      2. ``kind=name`` guarded by ``name in ("a", "b")`` within
+         :data:`_RESOLVE_WINDOW` lines above (``suno/router.py``'s ``mode``);
+      3. the kind comes from a same-file helper the binding names --
+         ``for ..., kind in _helper(...)`` or ``rows.extend(_helper(...))``.
+
+    A call site none of those resolve is UNRESOLVED and fails the test: a new
+    way of passing a kind must be read by a human, not silently skipped.
+    """
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    kinds: set[str] = set()
+    unresolved: list[str] = []
+    for number, line in enumerate(lines, start=1):
+        if not _WRITER_CALL_RE.search(line):
+            continue
+        window = "\n".join(lines[max(0, number - _RESOLVE_WINDOW) : number])
+        # The call's own arguments may wrap onto the following lines.
+        call = "\n".join(lines[number - 1 : number + 6])
+        found = set(_KIND_LITERAL_RE.findall(call))
+        if not found:
+            names = _KIND_NAME_RE.findall(call) + _BULK_NAME_RE.findall(call)
+            for name in names:
+                guard = re.findall(
+                    rf"\b{re.escape(name)}\b\s+(?:not\s+)?in\s+[({{\[]([^)}}\]]*)[)}}\]]",
+                    window,
+                )
+                for group in guard:
+                    found |= set(re.findall(r"""["']([A-Za-z0-9_]+)["']""", group))
+                for helper in re.findall(
+                    rf"(?:for[^\n]*\b{re.escape(name)}\b[^\n]*\bin\s+|"
+                    rf"\b{re.escape(name)}\s*\.\s*(?:extend|append)\(\s*)"
+                    rf"([A-Za-z_][A-Za-z0-9_]*)\(",
+                    window,
+                ):
+                    found |= _kinds_from_helper(text, helper)
+        if found:
+            kinds |= found
+        else:
+            unresolved.append(f"{path.as_posix()}:{number}: {line.strip()}")
+    return kinds, unresolved
+
+
 def test_the_role_table_covers_every_kind_this_repository_writes():
     """The table is the single source of truth, so a kind a writer in this
-    repo produces and the table has never heard of is a bug in the table."""
-    assert set(graph.KIND_ROLES) == {
-        "cover_of",
-        "edit_of",
-        "derived_from",
-        "upsample_of",
-        "overpaint_of",
-        "underpaint_of",
-        "speed_change_of",
-        "stem_of",
-        "mashup_source",
-        "chimera_source_of",
-        "midi_of",
-        "rendered_as_notation",
-        "tabbed_as_notation",
-        "arranged_as_notation",
-        "charted_as_chords",
-    }
+    repo produces and the table has never heard of is a bug in the table.
+
+    The expected set is READ OFF THE WRITERS rather than typed out here: a
+    hand-written list can only ever repeat what the table already says, which
+    is how ``cover`` and ``mashup`` (``backend/modules/suno/router.py:342``)
+    sat outside the table under a test with this name.
+    """
+    root = Path(__file__).resolve().parents[1]
+
+    # The list of writer files is itself an assertion: a writer that moved, or
+    # a new one, must break this test rather than go unread.
+    found_files = sorted(
+        path.relative_to(root).as_posix()
+        for path in (root / "backend").rglob("*.py")
+        if _WRITER_CALL_RE.search(path.read_text(encoding="utf-8"))
+    )
+    assert found_files == sorted(_RELATION_WRITER_FILES), (
+        "the set of relation writers under backend/ changed; read the new one "
+        "and give every kind it writes a row in graph.KIND_ROLES"
+    )
+
+    written: set[str] = set()
+    unresolved: list[str] = []
+    for relative in _RELATION_WRITER_FILES:
+        path = root / relative
+        assert path.is_file(), f"{relative} is gone; find where its writer went"
+        kinds, missed = _kinds_written_by(path)
+        written |= kinds
+        unresolved.extend(missed)
+
+    assert not unresolved, (
+        "a relation writer passes its kind in a way this scan cannot read; "
+        f"read it and extend the scan: {unresolved}"
+    )
+    # A broken regex must not pass by finding nothing: the two bare kinds this
+    # test was rewritten for, and the helper-supplied one, are the proof the
+    # scan reached all three shapes of call site.
+    assert {"cover", "mashup", "chimera_source_of"} <= written, written
+
+    missing = sorted(kind for kind in written if kind not in graph.KIND_ROLES)
+    assert not missing, (
+        f"these kinds are written under backend/ and are not in the role "
+        f"table, so they read as role 'other' with a guessed direction: "
+        f"{missing}"
+    )
+
+    # The bare Suno kinds point the OTHER way round from their `_of` siblings.
+    assert graph.KIND_ROLES["cover"].source_end == graph.SOURCE_END_FROM
+    assert graph.KIND_ROLES["mashup"].source_end == graph.SOURCE_END_FROM
+    assert graph.orient("parent", "child", "cover") == ("child", "parent")
+    assert graph.orient("source", "mashup_song", "mashup") == (
+        "mashup_song",
+        "source",
+    )
+    # Display order keeps the specific kind ahead of the generic one.
+    assert graph.KIND_ORDER["cover"] < graph.KIND_ORDER["derived_from"]
+
     assert graph.ANCESTRY_KINDS == {
         "cover_of",
         "edit_of",
@@ -161,8 +294,9 @@ def test_the_role_table_covers_every_kind_this_repository_writes():
         "underpaint_of",
         "speed_change_of",
         "stem_of",
+        "cover",
     }
-    assert graph.USES_KINDS == {"mashup_source", "chimera_source_of"}
+    assert graph.USES_KINDS == {"mashup_source", "chimera_source_of", "mashup"}
     for info in graph.KIND_ROLES.values():
         assert info.writer, f"{info.kind} has no writer recorded"
         assert info.source_end in (graph.SOURCE_END_TO, graph.SOURCE_END_FROM)
@@ -411,6 +545,53 @@ def test_hidden_counts_what_the_view_left_out(library):
         library.ids.threshold_over, up=0, down=1, budget=1500, fetch_links=fetch
     )
     assert grouped.hidden == {}, "a group already carries its own count"
+
+
+def test_a_relative_folded_at_one_parent_and_drawn_at_another_keeps_both_edges():
+    """A fold is per (node, direction, kind), not a verdict on the relative.
+
+    So one of a folded fan can still be reached by another path and drawn --
+    and when it is, it must arrive attached. Without its line back to the
+    parent that folded it, the song appears in the picture as if that
+    relationship did not exist.
+    """
+    rows = [("a-parent", "f", "derived_from"), ("b-parent", "f", "derived_from")]
+    fan = [f"g-{i:02d}" for i in range(graph.GROUP_THRESHOLD + 1)]
+    for child in fan:
+        rows.append((child, "a-parent", "cover_of"))
+    # The first of the fan is ALSO an ordinary child of the other parent.
+    shared = fan[0]
+    rows.append((shared, "b-parent", "edit_of"))
+
+    index: dict[str, list[tuple[str, str, str]]] = {}
+    for from_id, to_id, kind in rows:
+        index.setdefault(from_id, []).append((from_id, to_id, kind))
+        index.setdefault(to_id, []).append((from_id, to_id, kind))
+
+    walk = graph.build_neighbourhood(
+        "f",
+        up=0,
+        down=3,
+        budget=1500,
+        fetch_links=lambda ids: [row for i in ids for row in index.get(i, ())],
+    )
+
+    # The fan is still folded: one group, and only the shared song was drawn.
+    assert [(g.parent_id, g.kind, g.count) for g in walk.groups] == [
+        ("a-parent", "cover_of", len(fan))
+    ]
+    assert set(walk.order) == {"f", "a-parent", "b-parent", shared}
+
+    pairs = {(edge.child, edge.parent): edge.kinds for edge in walk.edges}
+    assert (shared, "b-parent") in pairs, "the path that drew it"
+    assert (shared, "a-parent") in pairs, (
+        "the parent that folded it lost its line to a song that IS on screen"
+    )
+    assert pairs[(shared, "a-parent")] == ("cover_of",)
+    # And nothing is drawn to a relative that stayed folded.
+    for child, parent in pairs:
+        assert child in walk.generation and parent in walk.generation
+    assert not any(node in pairs for node in ((f, "a-parent") for f in fan[1:]))
 
 
 def test_a_two_cycle_does_not_loop(library):
@@ -692,10 +873,15 @@ def test_the_relatives_route_pages_sorts_and_counts(monkeypatch, library):
             "id",
             "title",
             "model",
+            # `source` is not decoration: the provider badge needs it, and a
+            # legacy Suno import has an empty model, so a row without it is
+            # badged Stable Audio.
+            "source",
             "duration_sec",
             "play_count",
             "kinds",
         }
+        assert row["source"] == "generate"
 
     second = client.get(
         base, params={"direction": "down", "limit": 100, "offset": 100}
@@ -866,6 +1052,103 @@ def test_a_new_song_invalidates_the_cached_pass(monkeypatch, tmp_path):
         assert after["standalone"] == 2
     finally:
         fixture.close()
+
+
+class _LockThatLetsAWriteIn:
+    """The real lock, plus the one interleaving that matters.
+
+    A signature read taken BEFORE the lock has already gone stale by the time
+    the pass runs: any write landing in between is inside the pass's rows and
+    outside its identity. The first acquisition IS that moment, so the write
+    happens there.
+    """
+
+    def __init__(self, inner: Any, on_first_enter: Any) -> None:
+        self._inner = inner
+        self._on_first_enter = on_first_enter
+        self.entries = 0
+
+    def __enter__(self) -> bool:
+        self._inner.acquire()
+        self.entries += 1
+        if self.entries == 1:
+            self._on_first_enter()
+        return True
+
+    def __exit__(self, *exc_info: Any) -> bool:
+        self._inner.release()
+        return False
+
+    def locked(self) -> bool:
+        return self._inner.locked()
+
+
+def test_the_signature_is_read_inside_the_lock_so_it_matches_the_rows(
+    monkeypatch, tmp_path
+):
+    """The cache key has to describe the state the pass actually walked.
+
+    Read before the lock, it can be older: the numbers then say one library
+    and the identity stamped on them says another, so the next caller finds a
+    mismatch and pays for the whole pass again -- and two callers straddling
+    one write each run a pass, with the one holding the older identity
+    overwriting the other's correct answer.
+    """
+    fixture = build_small_library(tmp_path / "library.db")
+    try:
+        real_signature = lineage_router._link_signature
+        held_while_reading: list[bool] = []
+
+        def hooked(snap: Any) -> Any:
+            held_while_reading.append(lineage_router._stats_cache._lock.locked())
+            return real_signature(snap)
+
+        def write_a_link() -> None:
+            fixture.db.add_relation(
+                from_id="small-solo", to_id="small-root", kind="cover_of"
+            )
+
+        monkeypatch.setattr(lineage_router, "_link_signature", hooked)
+        monkeypatch.setattr(
+            lineage_router._stats_cache,
+            "_lock",
+            _LockThatLetsAWriteIn(lineage_router._stats_cache._lock, write_a_link),
+        )
+
+        body = lineage_router._summary_sync(fixture.db)
+
+        assert held_while_reading == [True], (
+            "the signature was read outside the lock, where a write can slip "
+            "between it and the pass"
+        )
+        # The write landed before the pass, so the numbers include it ...
+        assert body["links_raw"] == 3
+        # ... and so must the identity they are stored under.
+        with lineage_router._Snapshot(fixture.db) as snap:
+            assert body["revision"] == real_signature(snap).identity, (
+                "the cached numbers describe a newer library than their own "
+                "revision, so the next caller recomputes all of it"
+            )
+    finally:
+        fixture.close()
+
+
+def test_the_read_only_connection_waits_out_a_busy_database(library):
+    """A WAL checkpoint makes a reader briefly busy, and that has to be a wait
+    rather than a 500 for a lock which clears in milliseconds.
+
+    Pinned as this module's own number, not the driver's: ``sqlite3.connect``
+    happens to set a 5 s busy_timeout from its default ``timeout`` argument,
+    so without the pragma this passes only by accident and stops passing the
+    day anyone passes ``timeout=0``.
+    """
+    with lineage_router._Snapshot(library.db) as snap:
+        assert snap.isolated, "this pragma is about the module's OWN connection"
+        assert (
+            snap.read("PRAGMA busy_timeout")[0][0]
+            == lineage_router.READONLY_BUSY_TIMEOUT_MS
+        )
+    assert lineage_router.READONLY_BUSY_TIMEOUT_MS > 0
 
 
 # -------------------------------------------- the pass, and what wakes it
@@ -1097,9 +1380,13 @@ def test_the_startup_warm_does_nothing_without_a_library_database(monkeypatch, c
     _run_startup_warm(monkeypatch)
 
     assert lineage_router._stats_cache.passes == before
-    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
-        "a library that is simply absent is not a failure"
-    )
+    # This module's own logger only: an unrelated WARNING from anywhere else
+    # in the app is not evidence about this warm.
+    assert not [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and r.name == _ROUTER_LOGGER
+    ], "a library that is simply absent is not a failure"
 
 
 def test_a_warm_that_fails_logs_once_and_leaves_the_routes_working(
@@ -1121,7 +1408,11 @@ def test_a_warm_that_fails_logs_once_and_leaves_the_routes_working(
 
         _run_startup_warm(monkeypatch)
 
-        complaints = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        complaints = [
+            r
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == _ROUTER_LOGGER
+        ]
         assert len(complaints) == 1, complaints
 
         failing["on"] = False

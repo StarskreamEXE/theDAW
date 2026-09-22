@@ -332,7 +332,11 @@ async def _register_completed_job(job: dict[str, Any]) -> Optional[str]:
 
     entry_id = rec.id
 
-    # Lineage edges for derived tracks (cover/mashup).
+    # Lineage edges for derived tracks (cover/mashup). NOTE the direction:
+    # from_id is the PARENT and to_id is the new entry, the opposite way round
+    # from the promoted-lineage writer. Both bare kinds are registered with
+    # that orientation in `backend/modules/lineagescale/graph.py` (KIND_ROLES);
+    # a kind written here and missing there reads backwards in the graph.
     if mode in ("cover", "mashup"):
         parents = _gather_parent_clip_ids(job, meta)
         for parent_clip_id in parents:

@@ -3,7 +3,7 @@ import { ProviderBadge } from '../components/library/ProviderBadge';
 import type { NeighbourGroup, Neighbourhood } from './lineageScaleClient';
 import { boundsOfBoxes, edgeLabelPoint, edgePath, layoutFocus, type LayoutBox } from './focusLayout';
 import {
-  edgeColorForKinds, edgeKindsLabel, edgeWidthForRole, formatCount, formatDuration,
+  canFocusNode, edgeColorForKinds, edgeKindsLabel, edgeWidthForRole, formatCount, formatDuration,
   groupAccessibleName, groupLabel, hiddenAccessibleName, hiddenFor, hiddenLabel,
   isCrossReferenceRole, mergeEdges, nodeAccessibleName, nodeTitle,
 } from './lineageScaleModel';
@@ -220,6 +220,28 @@ export const FocusGraph: React.FC<FocusGraphProps> = ({
             const badge = hiddenLabel(hidden);
             const isFocus = node.id === focusId;
             const duration = formatDuration(node.duration_sec);
+            if (!canFocusNode(node.id)) {
+              // A '/' in the id is a path separator to the route, so focusing
+              // this node could only ever 404. It is drawn, named by its id,
+              // and left out of the tab order rather than offered as a button
+              // that fails. (These are link endpoints, not songs: a chimera
+              // source label is an arbitrary string.)
+              return (
+                <div
+                  key={box.id}
+                  data-node-id={node.id}
+                  data-generation={node.generation}
+                  data-unfocusable="true"
+                  style={{ left: box.x, top: box.y, width: box.w, height: box.h }}
+                  className="absolute flex flex-col justify-center gap-0.5 overflow-hidden rounded border border-dashed border-white/10 bg-black/60 px-2 py-1 text-left text-zinc-500"
+                >
+                  <span className="truncate text-[11px] leading-tight">{node.id}</span>
+                  <span className="truncate text-[9px] font-mono text-zinc-600">
+                    not a song — cannot be opened
+                  </span>
+                </div>
+              );
+            }
             return (
               <button
                 key={box.id}

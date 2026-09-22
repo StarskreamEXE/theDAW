@@ -18,7 +18,8 @@ import { renderToStaticMarkup } from 'react-dom/server';
 
 import {
   LearnHost, LearnHostSurface, LearnSwitch, LineageView,
-  classicUnavailableReason, decideLearnMode, rememberMode, rememberedMode, shouldReadSummary,
+  classicUnavailableReason, classicUnknownSizeReason, decideLearnMode, rememberMode,
+  rememberedMode, shouldReadSummary,
   type LearnViewProps,
 } from './LearnHost.tsx';
 import { LineageScaleView } from './LineageScaleView.tsx';
@@ -242,7 +243,7 @@ const surface = (props: Partial<React.ComponentProps<typeof LearnHostSurface>>):
       visible={false}
       loadSummary={async () => {
         asked += 1;
-        return BIG;
+        return { kind: 'ok', summary: BIG } as const;
       }}
       scaleView={Forbidden}
       classicView={Forbidden}
@@ -303,6 +304,50 @@ const surface = (props: Partial<React.ComponentProps<typeof LearnHostSurface>>):
     import('./LearnHost.tsx').then((m) => ({ default: m.LineageView })),
   );
   assert.ok(typeof lazyShape === 'object', 'the tab’s lazy() form typechecks and builds');
+}
+
+// ── ONLY a 404 is "an older backend" ────────────────────────────────────────
+//
+// Any other failure leaves the library's size UNKNOWN, and unknown must never
+// be read as small: on a 195,000-song library that mounts the classic view and
+// brings back "Maximum call stack size exceeded". So the decision splits on the
+// status, not on "did it work".
+{
+  // A 404: no such route. Exactly today's behaviour, nothing alarming said.
+  assert.deepEqual(
+    decideLearnMode(null, null, false),
+    { mode: 'classic', classicAllowed: true, reason: '' },
+  );
+  // Anything else: the new view stays up and the classic one is refused.
+  assert.deepEqual(
+    decideLearnMode(null, null, true),
+    { mode: 'scale', classicAllowed: false, reason: classicUnknownSizeReason },
+  );
+  assert.equal(
+    decideLearnMode(null, 'classic', true).mode,
+    'scale',
+    'a remembered choice cannot override a library of unknown size either',
+  );
+
+  // The 404 branch, through the host: classic mounts, no banner.
+  const absent = surface({ summary: null, failure: null, scaleView: Forbidden, classicView: spyView('classic', []) });
+  assert.ok(absent.includes('data-view="classic"'), absent);
+  assert.ok(!absent.includes('Could not read'), 'a 404 is not an error to show');
+
+  // The failure branch: the SCALE view mounts, the classic one is not built,
+  // the reason is on screen, and there is a Retry.
+  const seen: LearnViewProps[] = [];
+  const failed = surface({
+    summary: null,
+    failure: 'HTTP 500',
+    scaleView: spyView('scale', seen),
+    classicView: Forbidden,
+  });
+  assert.equal(seen.length, 1, 'the scale view is the one that mounted');
+  assert.ok(failed.includes('Could not read'), failed);
+  assert.ok(failed.includes('HTTP 500'), 'and it says what happened');
+  assert.ok(/<button[^>]*>Retry<\/button>/.test(failed), 'with a way to try again');
+  assert.ok(failed.includes('disabled=""'), 'and the classic option is refused, not offered');
 }
 
 console.log('LearnHost: all assertions passed');

@@ -14,6 +14,8 @@
  * summaries. That is the whole point of the module.
  */
 import { getJson } from '../lib/apiJson';
+import { describeHttpError } from '../lib/httpError';
+import { pairingHeader } from '../lib/pairing';
 
 /** Route prefix. Relative, so it goes through the Vite proxy to :8600. */
 export const LINEAGE_SCALE_BASE = '/api/lineage-scale';
@@ -162,6 +164,9 @@ export interface RelativeRow {
   id: string;
   title: string;
   model: string;
+  /** The entry's `source` column. Travels WITH `model`: the provider badge
+   *  needs both, and a legacy Suno import has an empty model. */
+  source: string;
   duration_sec: number;
   play_count: number;
   kinds: string[];
@@ -226,6 +231,47 @@ export const relativesUrl = (req: RelativesRequest): string => {
 
 export const fetchLineageSummary = (): Promise<LineageSummary> =>
   getJson<LineageSummary>(summaryUrl());
+
+/**
+ * `/summary`, with ONE failure told apart from all the others.
+ *
+ * `absent` means the route is not there: a backend built before this module
+ * exists, which is the only failure that may send the LEARN tab to the classic
+ * whole-library view. Every other failure — a 500, a 503 while the library is
+ * still coming up, a dropped connection — leaves the size of the library
+ * UNKNOWN, and on a 195,000-song library mounting the classic view then is the
+ * crash this module was built to escape. So those throw, and the caller shows
+ * an error with a retry instead of guessing.
+ *
+ * `getJson` cannot serve this: it turns a failure into an `Error` whose message
+ * is the FastAPI `detail`, so the status is gone by the time a caller sees it.
+ * Hence plain `fetch` here, with the same pairing header and the same body
+ * description apiJson applies (`lib/apiJson.ts`, `lib/httpError.ts`).
+ */
+export type SummaryProbe =
+  | { kind: 'ok'; summary: LineageSummary }
+  | { kind: 'absent' };
+
+/** apiJson's rule, applied to this one request: the LAN pairing secret rides
+ *  along only when the resolved URL is this page's own origin. A host with no
+ *  `window` (a node test, SSR) sends no header, which is also correct. */
+function sameOriginPairingHeader(url: string): Record<string, string> {
+  try {
+    return new URL(url, window.location.href).origin === window.location.origin
+      ? pairingHeader()
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+export async function fetchLineageSummaryProbe(): Promise<SummaryProbe> {
+  const url = summaryUrl();
+  const res = await fetch(url, { headers: sameOriginPairingHeader(url) });
+  if (res.status === 404) return { kind: 'absent' };
+  if (!res.ok) throw new Error(await describeHttpError(res));
+  return { kind: 'ok', summary: (await res.json()) as LineageSummary };
+}
 
 export const fetchRankings = (list: RankingList, limit = 50): Promise<RankingsResult> =>
   getJson<RankingsResult>(rankingsUrl(list, limit));

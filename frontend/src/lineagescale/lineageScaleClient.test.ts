@@ -18,7 +18,7 @@ import assert from 'node:assert/strict';
 const {
   BUDGET_MAX, BUDGET_MIN, DEPTH_MAX, LINEAGE_SCALE_BASE, RELATIVES_LIMIT_MAX,
   clampBudget, clampDepth, clampInt,
-  fetchLineageSummary, fetchNeighbourhood, fetchRankings, fetchRelatives,
+  fetchLineageSummary, fetchLineageSummaryProbe, fetchNeighbourhood, fetchRankings, fetchRelatives,
   neighbourhoodUrl, rankingsUrl, relativesUrl, summaryUrl,
 } = await import('./lineageScaleClient.ts');
 
@@ -194,6 +194,51 @@ const params = (url: string): Record<string, string> => {
 
   const bare = await withFetch(new Response('', { status: 500 }), () => fetchLineageSummary());
   assert.ok(bare.error && bare.error.length > 0, 'a bodiless failure still says something');
+}
+
+// ── the summary PROBE: a 404 is not "it failed" ─────────────────────────────
+//
+// `getJson` turns every failure into an Error whose message is the FastAPI
+// detail, so the status is gone by the time a caller sees it. The LEARN host
+// needs that one status: a 404 means the backend predates this module and the
+// classic whole-library view is right; anything else leaves the library's size
+// unknown, and mounting the classic view on a guess is the crash this module
+// exists to escape. So the probe reports 'absent' for 404 ONLY and throws for
+// everything else.
+{
+  const body = {
+    entries: 4, with_lineage: 3, standalone: 1,
+    links_raw: 2, links_distinct: 2, by_kind: { cover_of: 1 },
+    largest_connected: 3, largest_tree: 3, full_view_ok: true, revision: 1,
+  };
+  const ok = await withFetch(json(body), () => fetchLineageSummaryProbe());
+  assert.equal(ok.error, null);
+  assert.equal(ok.url, '/api/lineage-scale/summary');
+  assert.deepEqual(ok.value, { kind: 'ok', summary: body });
+
+  const absent = await withFetch(json({ detail: 'Not Found' }, 404), () => fetchLineageSummaryProbe());
+  assert.equal(absent.error, null, 'a 404 is an answer, not a failure');
+  assert.deepEqual(absent.value, { kind: 'absent' });
+
+  for (const status of [500, 503, 502, 422]) {
+    const bad = await withFetch(json({ detail: `boom ${status}` }, status), () => fetchLineageSummaryProbe());
+    assert.equal(bad.value, null, `${status} must not read as absent`);
+    assert.ok(bad.error && bad.error.length > 0, `${status} must say something`);
+  }
+
+  // A dropped request throws too — it is not a 404 either.
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    throw new Error('network down');
+  }) as typeof fetch;
+  try {
+    await fetchLineageSummaryProbe();
+    assert.fail('a dropped request must not resolve');
+  } catch (e) {
+    assert.match(e instanceof Error ? e.message : String(e), /network down/);
+  } finally {
+    globalThis.fetch = original;
+  }
 }
 
 console.log('lineageScaleClient: all assertions passed');

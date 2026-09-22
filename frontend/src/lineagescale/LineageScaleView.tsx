@@ -11,7 +11,7 @@ import {
 } from './lineageScaleClient';
 import {
   canGoBack, currentCrumb, formatCount, groupHeading, nodeTitle, popCrumb, pushCrumb,
-  relativesRequestForNode, type Crumb,
+  relativesRequestForNode, standsAlone, type Crumb,
 } from './lineageScaleModel';
 
 /**
@@ -44,6 +44,70 @@ export async function searchLibraryTitles(query: string, limit = SEARCH_LIMIT): 
   }
   return hits;
 }
+
+export interface GraphPaneProps {
+  /** The neighbourhood, or null while nothing has been read yet. */
+  data: Neighbourhood | null;
+  focusId: string;
+  loading: boolean;
+  error: string | null;
+  onRetry: () => void;
+  onHome: () => void;
+  onFocusNode: (id: string, title: string) => void;
+  onOpenGroup: (group: NeighbourGroup) => void;
+}
+
+/**
+ * The graph half of the focus view, as a function of what is known — so each
+ * of its four states is a render test rather than a browser (the same shape as
+ * `LearnHostSurface` and `RelativesPanelBody`).
+ *
+ * The "stands alone" caption is `standsAlone`, not a node count: see that
+ * function. A hub whose whole family is folded has one node and a pile of
+ * groups, and captioning it "stands alone" hid the groups it did have.
+ */
+export const GraphPane: React.FC<GraphPaneProps> = ({
+  data, focusId, loading, error, onRetry, onHome, onFocusNode, onOpenGroup,
+}) => {
+  if (error) {
+    return (
+      <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-6 text-center">
+        <p className="text-[11px] text-rose-300">{error}</p>
+        <span className="flex gap-2">
+          <button
+            type="button"
+            onClick={onRetry}
+            className="rounded border border-white/10 px-2 py-1 text-[9px] font-mono uppercase tracking-widest text-zinc-200 hover:border-white/25 hover:text-white"
+          >
+            Try again
+          </button>
+          <button
+            type="button"
+            onClick={onHome}
+            className="rounded border border-white/10 px-2 py-1 text-[9px] font-mono uppercase tracking-widest text-zinc-400 hover:border-white/25 hover:text-zinc-100"
+          >
+            All songs
+          </button>
+        </span>
+      </div>
+    );
+  }
+  if (data === null) {
+    return (
+      <p className="absolute inset-0 flex items-center justify-center text-[10px] font-mono text-zinc-500">
+        {loading ? 'Loading…' : 'Nothing to draw.'}
+      </p>
+    );
+  }
+  if (standsAlone(data)) {
+    return (
+      <p className="absolute inset-0 flex items-center justify-center px-12 text-center text-[10px] italic text-zinc-500">
+        This song stands alone — nothing was made from it, and it was made from nothing in this library.
+      </p>
+    );
+  }
+  return <FocusGraph data={data} focusId={focusId} onFocusNode={onFocusNode} onOpenGroup={onOpenGroup} />;
+};
 
 export interface LineageScaleViewProps {
   /** False while the tab is mounted but hidden: nothing is fetched then. */
@@ -379,37 +443,16 @@ export const LineageScaleView: React.FC<LineageScaleViewProps> = ({ visible = tr
 
       <div className="flex min-h-0 grow">
         <div className="relative min-w-0 grow">
-          {graphError ? (
-            <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-6 text-center">
-              <p className="text-[11px] text-rose-300">{graphError}</p>
-              <span className="flex gap-2">
-                <button
-                  type="button"
-                  onClick={() => setGraphAttempt((n) => n + 1)}
-                  className="rounded border border-white/10 px-2 py-1 text-[9px] font-mono uppercase tracking-widest text-zinc-200 hover:border-white/25 hover:text-white"
-                >
-                  Try again
-                </button>
-                <button
-                  type="button"
-                  onClick={goHome}
-                  className="rounded border border-white/10 px-2 py-1 text-[9px] font-mono uppercase tracking-widest text-zinc-400 hover:border-white/25 hover:text-zinc-100"
-                >
-                  All songs
-                </button>
-              </span>
-            </div>
-          ) : data === null ? (
-            <p className="absolute inset-0 flex items-center justify-center text-[10px] font-mono text-zinc-500">
-              {graphLoading ? 'Loading…' : 'Nothing to draw.'}
-            </p>
-          ) : data.nodes.length <= 1 ? (
-            <p className="absolute inset-0 flex items-center justify-center px-12 text-center text-[10px] italic text-zinc-500">
-              This song stands alone — nothing was made from it, and it was made from nothing in this library.
-            </p>
-          ) : (
-            <FocusGraph data={data} focusId={focusId} onFocusNode={focusSong} onOpenGroup={openGroup} />
-          )}
+          <GraphPane
+            data={data}
+            focusId={focusId}
+            loading={graphLoading}
+            error={graphError}
+            onRetry={() => setGraphAttempt((n) => n + 1)}
+            onHome={goHome}
+            onFocusNode={focusSong}
+            onOpenGroup={openGroup}
+          />
         </div>
 
         {panel && (

@@ -120,7 +120,11 @@ def validate_roundtrip(asset_id: str) -> dict:
 
 def set_review(asset_id: str, reviewed: bool, notes_text: str) -> dict:
     """Update the artifact's review gate in place (rewrite vocal_metadata.json and
-    the in-process cache) without adding another Library artifact row."""
+    the in-process cache) without adding another Library artifact row.
+
+    Disk first, cache second: if the document cannot be written this returns
+    ``ok: False`` and changes nothing, because a cache that disagrees with the
+    file is a review flag that silently disappears at the next restart."""
     art = _artifact_obj(asset_id)
     if art is None:
         return {"ok": False, "error": "no artifact for asset"}
@@ -141,6 +145,11 @@ def set_review(asset_id: str, reviewed: bool, notes_text: str) -> dict:
             )
         except Exception as e:
             log.info("vocal: review persist failed for %s: %s", asset_id, e)
+            # The document on disk is still the previous review, so the cache
+            # must be too: updating it here would make the app show a gate the
+            # library does not hold, and answering ok would tell the user their
+            # click was saved when the next restart will forget it.
+            return {"ok": False, "error": f"could not save the review: {e}"}
     _artifacts[asset_id] = payload
     return {"ok": True, "review": payload["review"]}
 

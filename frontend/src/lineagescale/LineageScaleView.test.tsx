@@ -23,6 +23,7 @@ import assert from 'node:assert/strict';
 import { renderToStaticMarkup } from 'react-dom/server';
 
 import { FocusGraph } from './FocusGraph.tsx';
+import { GraphPane } from './LineageScaleView.tsx';
 import { LineageLanding } from './LineageLanding.tsx';
 import { RelativesPanelBody } from './RelativesPanel.tsx';
 import LineageScaleView from './LineageScaleView.tsx';
@@ -285,8 +286,8 @@ const neighbourhood: Neighbourhood = {
   const page: RelativesPage = {
     total: 312,
     rows: [
-      { id: 'c1', title: 'Cover One', model: 'stable-audio', duration_sec: 61, play_count: 9, kinds: ['cover_of'] },
-      { id: 'c2', title: 'Cover Two', model: 'stable-audio', duration_sec: 0, play_count: 0, kinds: ['cover_of', 'edit_of'] },
+      { id: 'c1', title: 'Cover One', model: 'stable-audio', source: 'generate', duration_sec: 61, play_count: 9, kinds: ['cover_of'] },
+      { id: 'c2', title: 'Cover Two', model: 'stable-audio', source: 'generate', duration_sec: 0, play_count: 0, kinds: ['cover_of', 'edit_of'] },
     ],
   };
   const heading = groupHeading(group, 'Night Drive');
@@ -330,7 +331,7 @@ const neighbourhood: Neighbourhood = {
     <RelativesPanelBody
       heading="Covers (312)"
       request={{ entryId: 'song-7', direction: 'down', kind: 'cover_of', sort: 'plays', offset: 300, limit: 100 }}
-      page={{ total: 312, rows: [{ id: 'c301', title: 'Last', model: 'm', duration_sec: 0, play_count: 0, kinds: ['cover_of'] }] }}
+      page={{ total: 312, rows: [{ id: 'c301', title: 'Last', model: 'm', source: 'generate', duration_sec: 0, play_count: 0, kinds: ['cover_of'] }] }}
       loading={false} error={null}
       onSort={() => {}} onOffset={() => {}} onFocus={() => {}} onClose={() => {}} onRetry={() => {}}
     />,
@@ -425,6 +426,137 @@ const neighbourhood: Neighbourhood = {
   assert.ok(html.includes('Lineage at scale'));
   assert.ok(html.includes('No lineage summary yet.'), 'and a hidden tab has not fetched anything');
   assert.ok(!html.includes('aria-label="Back to the previously focused song"'), 'there is nothing to go back to');
+}
+
+
+/* ═════════════════ the graph pane: every state it can be in ═══════════════ */
+
+const ALONE = 'This song stands alone';
+
+{
+  // A hub whose whole family is folded: ONE node, and a pile of group boxes.
+  // `nodes.length <= 1` captioned this "stands alone" and never drew them.
+  const folded: Neighbourhood = {
+    focus: 'hub',
+    nodes: [node('hub', 0)],
+    edges: [],
+    groups: [{
+      id: 'hub|down|cover_of', parent_id: 'hub', direction: 'down',
+      kind: 'cover_of', count: 800, sample_ids: ['c1'],
+    }],
+    hidden: {},
+    truncated: false,
+    budget: 400,
+  };
+  const html = renderToStaticMarkup(
+    <GraphPane
+      data={folded}
+      focusId="hub"
+      loading={false}
+      error={null}
+      onRetry={() => {}}
+      onHome={() => {}}
+      onFocusNode={() => {}}
+      onOpenGroup={() => {}}
+    />,
+  );
+  assert.ok(!html.includes(ALONE), 'a song with 800 folded covers does not stand alone');
+  assert.ok(
+    html.includes('data-group-id="hub|down|cover_of"'),
+    'its group box must be on screen',
+  );
+  assert.ok(
+    buttonTags(html).some((tag) => tag.includes(`aria-label="${groupAccessibleName(folded.groups[0], 'hub')}"`)),
+    'and it is a named button',
+  );
+
+  // Truly nothing: one node, no groups, no hidden counts.
+  const solo = renderToStaticMarkup(
+    <GraphPane
+      data={{ ...folded, groups: [] }}
+      focusId="hub"
+      loading={false}
+      error={null}
+      onRetry={() => {}}
+      onHome={() => {}}
+      onFocusNode={() => {}}
+      onOpenGroup={() => {}}
+    />,
+  );
+  assert.ok(solo.includes(ALONE));
+
+  // A hidden count is a relative: not alone either.
+  const withHidden = renderToStaticMarkup(
+    <GraphPane
+      data={{ ...folded, groups: [], hidden: { hub: { up: 0, down: 412 } } }}
+      focusId="hub"
+      loading={false}
+      error={null}
+      onRetry={() => {}}
+      onHome={() => {}}
+      onFocusNode={() => {}}
+      onOpenGroup={() => {}}
+    />,
+  );
+  assert.ok(!withHidden.includes(ALONE), '+412 more is 412 relatives');
+}
+
+/* ══════════ an id with a '/' is drawn, but never offered as a button ═══════ */
+
+{
+  const label = 'samples/kick 03.wav';
+  const withLabel: Neighbourhood = {
+    focus: 'song-1',
+    nodes: [node('song-1', 0), node(label, -1, { in_library: false })],
+    edges: [{ from: 'song-1', to: label, kinds: ['chimera_source_of'], role: 'uses' }],
+    groups: [],
+    hidden: {},
+    truncated: false,
+    budget: 400,
+  };
+  const html = renderToStaticMarkup(
+    <FocusGraph data={withLabel} focusId="song-1" onFocusNode={() => {}} onOpenGroup={() => {}} />,
+  );
+  // Drawn, and named by the only name it has ...
+  assert.ok(html.includes(label), 'the label is on screen');
+  assert.ok(html.includes('data-unfocusable="true"'));
+  // ... but not a button: `/{entry_id}/neighbourhood` would 404 on it.
+  assert.ok(
+    !buttonTags(html).some((tag) => tag.includes(`data-node-id="${label}"`)),
+    'a node that can only 404 must not be clickable',
+  );
+  // The focus itself is still a button.
+  assert.ok(buttonTags(html).some((tag) => tag.includes('data-node-id="song-1"')));
+}
+
+/* ═══════ a relative's provider badge gets model AND source ════════════════ */
+
+{
+  const page: RelativesPage = {
+    total: 1,
+    rows: [{
+      id: 'legacy', title: 'Legacy Suno Track', model: '', source: 'suno',
+      duration_sec: 61, play_count: 0, kinds: ['cover_of'],
+    }],
+  };
+  const html = renderToStaticMarkup(
+    <RelativesPanelBody
+      heading="Covers of Night Drive"
+      request={{ entryId: 'nd', direction: 'down', kind: 'cover_of', sort: 'title', offset: 0, limit: 100 }}
+      page={page}
+      loading={false}
+      error={null}
+      onSort={() => {}}
+      onOffset={() => {}}
+      onFocus={() => {}}
+      onClose={() => {}}
+      onRetry={() => {}}
+    />,
+  );
+  // A legacy Suno import has an empty model; badged on the model alone it
+  // reads "Stable Audio" (the bug 30f8732 fixed in the catalogue).
+  assert.ok(!/Stable\s*Audio/i.test(html), `badged as Stable Audio: ${html}`);
+  assert.ok(/suno/i.test(html), 'the row must say Suno');
 }
 
 console.log('LineageScaleView: all assertions passed');

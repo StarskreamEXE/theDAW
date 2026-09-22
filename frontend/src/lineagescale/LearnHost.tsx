@@ -1,5 +1,5 @@
 import React, { Suspense, lazy, useCallback, useEffect, useState } from 'react';
-import { fetchLineageSummary, type LineageSummary } from './lineageScaleClient';
+import { fetchLineageSummaryProbe, type LineageSummary, type SummaryProbe } from './lineageScaleClient';
 import { formatCount } from './lineageScaleModel';
 
 /**
@@ -17,6 +17,12 @@ import { formatCount } from './lineageScaleModel';
  * `/summary`'s `full_view_ok` (with_lineage <= 2000). A backend that does not
  * have this module at all answers 404 — an older build — and that falls back
  * to exactly today's behaviour, the classic view, with nothing alarming shown.
+ *
+ * ONLY a 404 means that. Any other failure — a 500, a 503 while the library is
+ * still opening, a dropped request — leaves the library's size unknown, and
+ * "unknown" must never be read as "small": on the real library that mounts the
+ * classic view and brings back the crash. So a non-404 failure stays on the new
+ * view, says so, and offers a retry.
  *
  * The props are the ones `DAWCenterPanel` already passes to `LineageView`, so
  * mounting this instead is a one-line change at the import.
@@ -51,13 +57,24 @@ export const classicUnavailableReason = (summary: LineageSummary): string =>
   `The classic graph draws every song at once. This library has ${formatCount(summary.with_lineage)} connected songs, so it cannot load here.`;
 
 /**
+ * Why the classic view is refused when the summary could not be read at all.
+ * Not knowing the size is not permission to try the drawing that dies.
+ */
+export const classicUnknownSizeReason =
+  'The lineage summary could not be read, so this library’s size is unknown. The classic graph is not offered until it is.';
+
+/**
  * Which view to open, once the summary has been asked for. The caller shows
  * its own loading state until then and mounts NEITHER view, because rendering
  * the classic one is what starts the 128 MB request.
  *
- *  * `summary === null` — unreadable: a 404 from a backend that predates this
- *    module, or any other failure. That is the classic view, which is exactly
- *    what this tab did before, with nothing alarming said.
+ *  * `failed` — the route answered something other than 404. The size is
+ *    unknown, so the new view stays up with its own error state and the
+ *    classic one is refused. This case is NOT the old behaviour and must not
+ *    be collapsed into it.
+ *  * `summary === null` and not `failed` — a 404: a backend that predates this
+ *    module. That is the classic view, exactly what this tab did before, with
+ *    nothing alarming said.
  *  * `full_view_ok` → the classic view by default, so a small library sees no
  *    change at all. The user may switch, and that choice is remembered.
  *  * not `full_view_ok` → the new view, and the classic one is refused. A
@@ -66,7 +83,11 @@ export const classicUnavailableReason = (summary: LineageSummary): string =>
 export function decideLearnMode(
   summary: LineageSummary | null,
   remembered: LearnMode | null,
+  failed = false,
 ): LearnDecision {
+  if (failed) {
+    return { mode: 'scale', classicAllowed: false, reason: classicUnknownSizeReason };
+  }
   if (!summary) return { mode: 'classic', classicAllowed: true, reason: '' };
   if (!summary.full_view_ok) {
     return { mode: 'scale', classicAllowed: false, reason: classicUnavailableReason(summary) };
@@ -178,8 +199,15 @@ export const shouldReadSummary = (visible: boolean, alreadyRead: boolean): boole
 export interface LearnHostSurfaceProps extends LearnViewProps {
   /** Has the summary request finished (either way)? */
   read: boolean;
-  /** What it said, or null when it could not be read. */
+  /** What it said, or null when there was none (a 404, or a failure). */
   summary: LineageSummary | null;
+  /**
+   * The message from a failure that was NOT a 404, or null. Set means the
+   * library's size is unknown, so the classic view stays unmounted.
+   */
+  failure?: string | null;
+  /** Ask for the summary again after a failure. */
+  onRetry?: () => void;
   /** The session's remembered choice, if any. */
   chosen: LearnMode | null;
   onSelect: (mode: LearnMode) => void;
@@ -198,9 +226,10 @@ export interface LearnHostSurfaceProps extends LearnViewProps {
  * whole-library request can happen.
  */
 export const LearnHostSurface: React.FC<LearnHostSurfaceProps> = ({
-  read, summary, chosen, onSelect, rootEntryId = null, visible = true, scaleView, classicView,
+  read, summary, failure = null, onRetry, chosen, onSelect,
+  rootEntryId = null, visible = true, scaleView, classicView,
 }) => {
-  const decision = decideLearnMode(summary, chosen);
+  const decision = decideLearnMode(summary, chosen, failure !== null);
   const Scale = scaleView ?? DefaultScaleView;
   const Classic = classicView ?? DefaultClassicView;
 
@@ -222,6 +251,23 @@ export const LearnHostSurface: React.FC<LearnHostSurfaceProps> = ({
         reason={decision.reason}
         onSelect={onSelect}
       />
+      {failure !== null && (
+        <div
+          role="status"
+          className="flex items-center gap-2 border-b border-amber-400/30 bg-amber-500/10 px-2 py-1"
+        >
+          <p className="min-w-0 grow truncate text-[9px] font-mono text-amber-200">
+            {`Could not read this library’s lineage summary: ${failure}`}
+          </p>
+          <button
+            type="button"
+            onClick={onRetry}
+            className="shrink-0 rounded border border-amber-400/40 px-2 py-0.5 text-[9px] font-mono uppercase tracking-widest text-amber-100 hover:border-amber-300/70 hover:text-white"
+          >
+            Retry
+          </button>
+        </div>
+      )}
       <div className="relative min-h-0 grow">
         <Suspense fallback={<Waiting what="Loading…" />}>
           {decision.mode === 'classic'
@@ -234,8 +280,12 @@ export const LearnHostSurface: React.FC<LearnHostSurfaceProps> = ({
 };
 
 export interface LearnHostProps extends LearnViewProps {
-  /** Swapped in tests. The default reads `/api/lineage-scale/summary`. */
-  loadSummary?: () => Promise<LineageSummary>;
+  /**
+   * Swapped in tests. The default reads `/api/lineage-scale/summary` and
+   * reports `{kind: 'absent'}` for a 404 ONLY; anything else it rejects with,
+   * which is what keeps the classic view unmounted on an unknown library.
+   */
+  loadSummary?: () => Promise<SummaryProbe>;
   scaleView?: React.ComponentType<LearnViewProps>;
   classicView?: React.ComponentType<LearnViewProps>;
 }
@@ -248,22 +298,29 @@ export const LearnHost: React.FC<LearnHostProps> = ({
   classicView,
 }) => {
   const [summary, setSummary] = useState<LineageSummary | null>(null);
+  const [failure, setFailure] = useState<string | null>(null);
   const [read, setRead] = useState(false);
   const [chosen, setChosen] = useState<LearnMode | null>(() => rememberedMode());
 
   useEffect(() => {
     if (!shouldReadSummary(visible, read)) return undefined;
     let live = true;
-    (loadSummary ?? fetchLineageSummary)()
-      .then((s) => {
+    (loadSummary ?? fetchLineageSummaryProbe)()
+      .then((probe) => {
         if (!live) return;
-        setSummary(s);
+        // 'absent' is a 404: an older backend has no such route. That is not
+        // an error the user needs to see; it is the old behaviour, so take it.
+        setSummary(probe.kind === 'ok' ? probe.summary : null);
+        setFailure(null);
         setRead(true);
       })
-      .catch(() => {
-        // An older backend has no such route. That is not an error the user
-        // needs to see; it is the old behaviour, so take it.
-        if (live) setRead(true);
+      .catch((e: unknown) => {
+        // NOT a 404. The size is unknown, so the classic view is not mounted
+        // on a guess; the new view stays up and says what happened.
+        if (!live) return;
+        setSummary(null);
+        setFailure(e instanceof Error ? e.message : String(e));
+        setRead(true);
       });
     return () => {
       live = false;
@@ -275,10 +332,19 @@ export const LearnHost: React.FC<LearnHostProps> = ({
     rememberMode(mode);
   }, []);
 
+  // `read` back to false is what re-arms the effect above; `shouldReadSummary`
+  // is the only gate, so there is no second attempt counter to keep in step.
+  const onRetry = useCallback(() => {
+    setFailure(null);
+    setRead(false);
+  }, []);
+
   return (
     <LearnHostSurface
       read={read}
       summary={summary}
+      failure={failure}
+      onRetry={onRetry}
       chosen={chosen}
       onSelect={onSelect}
       rootEntryId={rootEntryId}

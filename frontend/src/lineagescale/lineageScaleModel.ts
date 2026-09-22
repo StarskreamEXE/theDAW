@@ -124,6 +124,16 @@ export const KIND_WORDING: Record<string, KindWording> = {
     down: 'Covers', up: 'Cover of',
     downSentence: '{n} covers of {title}', upSentence: '{n} songs {title} is a cover of',
   },
+  /**
+   * The Suno poller writes a bare `cover` (backend/modules/suno/router.py:342)
+   * where the promoted writer writes `cover_of`. Same relationship, so the
+   * same words — the backend has already turned both into (child, parent), so
+   * `down` still means derivatives here.
+   */
+  cover: {
+    down: 'Covers', up: 'Cover of',
+    downSentence: '{n} covers of {title}', upSentence: '{n} songs {title} is a cover of',
+  },
   edit_of: {
     down: 'Edits', up: 'Edit of',
     downSentence: '{n} edits of {title}', upSentence: '{n} songs {title} is an edit of',
@@ -153,6 +163,11 @@ export const KIND_WORDING: Record<string, KindWording> = {
     downSentence: '{n} speed changes of {title}', upSentence: '{n} songs {title} is a speed change of',
   },
   mashup_source: {
+    down: 'Used in mashups', up: 'Mashup sources',
+    downSentence: '{n} mashups use {title}', upSentence: '{n} songs {title} was mashed up from',
+  },
+  /** The poller's bare sibling of `mashup_source`; see `cover` above. */
+  mashup: {
     down: 'Used in mashups', up: 'Mashup sources',
     downSentence: '{n} mashups use {title}', upSentence: '{n} songs {title} was mashed up from',
   },
@@ -281,6 +296,43 @@ export const hiddenLabel = (h: HiddenCount): string => {
   const total = hiddenTotal(h);
   return total > 0 ? `+${formatCount(total)} more` : '';
 };
+
+/**
+ * Can this node be focused — i.e. asked for by id?
+ *
+ * No, if its id contains a '/'. `/{entry_id}/neighbourhood` takes the id as a
+ * PATH segment, and a '/' inside it is a path separator before any route
+ * matching happens, so the request 404s however carefully the client escapes
+ * it. Real entry ids never contain one (uuid4 hex, or "{job}_{index}"), but a
+ * node can also be a bare link endpoint — a chimera source LABEL is an
+ * arbitrary string from the entry's metadata. Those are drawn as plain labels
+ * rather than as buttons that are guaranteed to fail.
+ */
+export const canFocusNode = (id: string): boolean => !id.includes('/');
+
+/** True when the server left ANY relative unexpanded anywhere in this walk. */
+export const hasHiddenRelatives = (
+  hidden: Record<string, HiddenCount> | undefined,
+): boolean => {
+  for (const count of Object.values(hidden ?? {})) {
+    if (hiddenTotal(count) > 0) return true;
+  }
+  return false;
+};
+
+/**
+ * "This song stands alone" — true only when the walk found NOTHING.
+ *
+ * `nodes.length <= 1` alone is wrong, and wrong in the loudest case there is:
+ * a hub whose relatives are ALL folded comes back as `nodes: [focus]` plus a
+ * list of groups, so the one song with 800 covers would be captioned as having
+ * no family while its group boxes went undrawn. A folded group and a hidden
+ * count are both relatives; either one means this song is not alone.
+ */
+export const standsAlone = (
+  data: Pick<Neighbourhood, 'nodes' | 'groups' | 'hidden'>,
+): boolean =>
+  data.nodes.length <= 1 && data.groups.length === 0 && !hasHiddenRelatives(data.hidden);
 
 /** The badge said in full: which side the hidden relatives are on. */
 export const hiddenAccessibleName = (h: HiddenCount, title: string): string => {

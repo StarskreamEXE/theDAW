@@ -47,8 +47,11 @@ ROLE_ANCESTRY = "ancestry"
 ROLE_USES = "uses"
 #: Not a song (a MIDI file, a score, a chord chart). Counted, never drawn.
 ROLE_ARTIFACT = "artifact"
-#: A kind no writer in this repository produces. Treated like ``uses``:
-#: shown one hop, never recursed. Ancestry is NOT assumed.
+#: A kind :data:`KIND_ROLES` has never heard of -- a hand-written row, a
+#: writer added after this table, a library carried over from another build.
+#: Treated like ``uses``: shown one hop, never recursed. Ancestry is NOT
+#: assumed. Every kind this repository's own writers produce is in the table,
+#: and ``tests/test_lineagescale.py`` scans those writers to keep it that way.
 ROLE_OTHER = "other"
 
 #: ``to_id`` is the source, ``from_id`` is the derived song.
@@ -78,6 +81,14 @@ _KINDS: tuple[LinkKind, ...] = (
     # Promoted lineage. The writer appends ``(child, parent, relation)``, so
     # from_id is the derived song and to_id is its source.
     LinkKind("cover_of", ROLE_ANCESTRY, SOURCE_END_TO, "suno_promote.py:1633"),
+    # The Suno poller writes its own bare kind for a derived track, and it
+    # points the OTHER way: ``add_relation(from_id=<parent>, to_id=<the new
+    # entry>, kind=mode)`` with ``mode`` in ("cover", "mashup"), so from_id is
+    # the SOURCE. Read with the promoted writer's direction these came out
+    # backwards, dashed, and out of the ancestry rankings.
+    LinkKind(
+        "cover", ROLE_ANCESTRY, SOURCE_END_FROM, "backend/modules/suno/router.py:342"
+    ),
     LinkKind("edit_of", ROLE_ANCESTRY, SOURCE_END_TO, "suno_promote.py:1633"),
     LinkKind("derived_from", ROLE_ANCESTRY, SOURCE_END_TO, "suno_promote.py:1633"),
     LinkKind("upsample_of", ROLE_ANCESTRY, SOURCE_END_TO, "suno_promote.py:1633"),
@@ -90,6 +101,11 @@ _KINDS: tuple[LinkKind, ...] = (
     LinkKind("stem_of", ROLE_ANCESTRY, SOURCE_END_TO, "suno_promote.py:1633"),
     # A mashup points at each of its sources: from_id is the mashup.
     LinkKind("mashup_source", ROLE_USES, SOURCE_END_TO, "suno_promote.py:1633"),
+    # The Suno poller's bare sibling, written the other way round: from_id is
+    # the source clip, to_id is the mashup built from it.
+    LinkKind(
+        "mashup", ROLE_USES, SOURCE_END_FROM, "backend/modules/suno/router.py:342"
+    ),
     # The opposite way round: ``(label, entry_id, "chimera_source_of")`` --
     # from_id is the source label, to_id is the song built from it.
     LinkKind(
@@ -492,6 +508,20 @@ def build_neighbourhood(
                             )
                         )
                         grouped.setdefault((node, direction), set()).update(relatives)
+                        # A relative folded in here can still be DRAWN later,
+                        # by another path -- the fold is per (node, direction,
+                        # kind), not a decision about the relative itself.
+                        # Record the pair now so that node keeps its line back
+                        # to this parent instead of arriving unattached. The
+                        # edge is emitted only when BOTH ends were drawn (see
+                        # ``edges`` below), so a relative that stays folded
+                        # still ships no edge and the fold still saves the
+                        # payload it was there to save.
+                        for relative in relatives:
+                            pair = _relative_pair(node, relative, direction)
+                            pair_kinds.setdefault(pair, set()).update(
+                                candidates[relative][0]
+                            )
                         continue
                     for relative in relatives:
                         if len(order) >= budget:
@@ -530,6 +560,9 @@ def build_neighbourhood(
             role=role_for_kinds(sort_kinds(kinds)),
         )
         for (child, parent), kinds in pair_kinds.items()
+        # Both ends have to be on screen. A pair recorded for a relative that
+        # was folded into a group and never drawn is not a line to nowhere.
+        if child in generation and parent in generation
     ]
     return Neighbourhood(
         focus=focus_id,

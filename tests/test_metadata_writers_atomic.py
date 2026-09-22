@@ -83,11 +83,19 @@ def test_vocal_review_gate_is_written_atomically(tmp_path: Path, monkeypatch) ->
     assert doc["review"] == {"reviewed": True, "notes": "good take"}
     assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
 
-    # set_review swallows persistence failures by design; the document on disk
-    # must still be the last GOOD one and no temp file may remain.
+    # A persistence failure is REPORTED, not swallowed into an ok: the document
+    # on disk is still the last good one, so the in-process cache must be too.
+    # Answering ok here told the user their click was saved while disk held the
+    # old review flag, and the next restart forgot it.
     monkeypatch.setattr(atomic, "atomic_replace", _boom)
     res2 = service.set_review("a1", False, "changed my mind")
-    assert res2["ok"] is True
+    assert res2["ok"] is False
+    assert "could not save the review" in res2["error"]
     doc2 = json.loads((tmp_path / "vocal_metadata.json").read_text(encoding="utf-8"))
     assert doc2["review"] == {"reviewed": True, "notes": "good take"}
     assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".tmp")] == []
+    # The cache still holds the last payload that reached disk.
+    assert service._artifacts["a1"]["review"] == {
+        "reviewed": True,
+        "notes": "good take",
+    }

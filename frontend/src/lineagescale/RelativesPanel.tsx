@@ -156,7 +156,10 @@ export const RelativesPanelBody: React.FC<RelativesPanelBodyProps> = ({
                       {row.play_count > 0 ? ` · ${formatCount(row.play_count)} plays` : ''}
                     </span>
                   </span>
-                  <ProviderBadge entry={{ model: row.model }} className="shrink-0" />
+                  {/* model AND source: a legacy Suno import has an empty
+                      model, and a badge given only the model calls it Stable
+                      Audio. Same fix as 30f8732 in the catalogue. */}
+                  <ProviderBadge entry={{ model: row.model, source: row.source }} className="shrink-0" />
                 </button>
               </li>
             );

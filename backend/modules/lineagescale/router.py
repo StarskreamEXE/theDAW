@@ -92,6 +92,13 @@ MAX_SQL_PARAMS = 900
 #: as Python tuples before the first one is counted is 150 MB for nothing.
 STREAM_BATCH = 10_000
 
+#: How long this module's read-only connection waits out a transient
+#: ``SQLITE_BUSY`` (a WAL checkpoint) before giving up. Waiting is the right
+#: answer: the alternative is a 500 for a lock that clears in milliseconds.
+#: Far longer than a checkpoint on a library this size, and short enough that
+#: a database which really is stuck fails rather than holding the request.
+READONLY_BUSY_TIMEOUT_MS = 5000
+
 #: Exactly the entry columns this module is allowed to read. Never a blob.
 _ENTRY_COLUMNS = (
     "id",
@@ -151,6 +158,16 @@ def _open_readonly(db: Any) -> Optional[sqlite3.Connection]:
         # lazily, and read-only access to a WAL database is the part that
         # can still fail (it needs the shared-memory index).
         conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+        # A reader in WAL mode is not blocked by a writer, but it IS blocked
+        # for the moment a checkpoint moves the WAL back into the database
+        # file. That has to be a wait, not an immediate SQLITE_BUSY and a 500
+        # for a lock which clears in milliseconds -- so the wait is stated
+        # here rather than inherited: ``sqlite3.connect`` does set
+        # busy_timeout from its own ``timeout`` argument (5 s by default),
+        # but that is the driver's default and not this module's decision,
+        # and a caller that ever passes ``timeout=0`` would silently turn
+        # every checkpoint into a failed request.
+        conn.execute(f"PRAGMA busy_timeout = {READONLY_BUSY_TIMEOUT_MS}")
     except sqlite3.Error as exc:
         log.info("lineagescale: read-only connection unavailable (%s)", exc)
         if conn is not None:
@@ -407,10 +424,16 @@ class _StatsCache:
         pass and True for every call served from the slot, which is what
         ``/summary`` reports as ``warm``.
         """
-        # Read outside the lock: the signature is the cheap part, and two
-        # callers arriving together should both get as far as the lock.
-        signature = _link_signature(snap)
         with self._lock:
+            # Read INSIDE the lock, immediately before the pass. A signature
+            # taken before the lock can be older than the rows the pass then
+            # walks: the stored numbers would describe a newer library than
+            # the identity stamped on them, so the next caller -- reading the
+            # newer signature -- finds a mismatch and pays for the pass all
+            # over again. Worse with two callers straddling one write: each
+            # runs a pass and the one holding the older identity overwrites
+            # the other's correct answer.
+            signature = _link_signature(snap)
             cached = self._value
             if cached is not None and cached.revision == signature.identity:
                 return cached, True
@@ -600,6 +623,11 @@ def _relatives_sync(
                 "id": rid,
                 "title": (entries.get(rid) or {}).get("title") or rid,
                 "model": (entries.get(rid) or {}).get("model") or "",
+                # `source` travels with `model` or the badge lies: a legacy
+                # Suno import has model "" and source "suno", and a badge
+                # given only the model calls it Stable Audio (the same bug
+                # 30f8732 fixed in the catalogue).
+                "source": (entries.get(rid) or {}).get("source") or "",
                 "duration_sec": float(
                     (entries.get(rid) or {}).get("duration_sec") or 0.0
                 ),
@@ -683,6 +711,12 @@ def warm_stats_cache() -> bool:
       build that refuses read-only WAL) because a request has to be
       answered; a background warm does not, and holding that lock for a
       3.6 s pass nobody asked for would stall every write in the app.
+
+    What it does NOT avoid, and does not need to: a request arriving while
+    the warm is mid-pass waits on the stats cache's own single-flight lock
+    until that pass finishes. That wait is bounded by the pass the request
+    would have run itself on a cold cache, and it ends with the answer
+    already computed, so the request is never slower for the warm existing.
     """
     try:
         store = get_library_store()

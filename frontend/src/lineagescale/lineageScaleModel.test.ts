@@ -25,7 +25,8 @@ import type { NeighbourEdge, NeighbourNode } from './lineageScaleClient.ts';
 import {
   canGoBack, currentCrumb, edgeColorForKinds, edgeKindIsPaletted, edgeKindsLabel,
   edgeWidthForRole, focusNodeOf, formatCount, formatDuration, generationWords,
-  KIND_WORDING, groupAccessibleName, groupHeading, groupLabel, hiddenAccessibleName, hiddenFor,
+  KIND_WORDING, canFocusNode, groupAccessibleName, groupHeading, groupLabel,
+  hasHiddenRelatives, hiddenAccessibleName, hiddenFor, standsAlone,
   hiddenLabel, hiddenTotal, isCrossReferenceRole, kindRows, kindSentence, kindWords, mergeEdges,
   nodeAccessibleName, nodeTitle, popCrumb, pushCrumb, relativeRowAccessibleWords, relativeRowWords,
   relativesRequestForGroup, relativesRequestForNode, summaryHeadlines,
@@ -153,6 +154,10 @@ const node = (id: string, generation: number, extra: Partial<NeighbourNode> = {}
     ['underpaint_of', 'Underpaints', 'Underpaint of'],
     ['speed_change_of', 'Speed changes', 'Speed change of'],
     ['mashup_source', 'Used in mashups', 'Mashup sources'],
+    // The Suno poller's bare kinds (backend/modules/suno/router.py:342) read
+    // with the same words as their `_of` siblings: the same relationship.
+    ['cover', 'Covers', 'Cover of'],
+    ['mashup', 'Used in mashups', 'Mashup sources'],
     ['chimera_source_of', 'Used in chimeras', 'Chimera sources'],
     ['all', 'Derivatives', 'Sources'],
   ];
@@ -348,6 +353,48 @@ const node = (id: string, generation: number, extra: Partial<NeighbourNode> = {}
     'the kind table is biggest-first and capped',
   );
   assert.deepEqual(kindRows({}), []);
+}
+
+// ── "stands alone" is about relatives, not about node count ─────────────────
+{
+  assert.equal(standsAlone({ nodes: [{ id: 'f' }], groups: [], hidden: {} } as never), true);
+  assert.equal(standsAlone({ nodes: [], groups: [], hidden: {} } as never), true);
+
+  // The headline case: a hub whose whole family is folded comes back as ONE
+  // node plus groups. Calling that "stands alone" hid every group box it had.
+  const allFolded = {
+    nodes: [{ id: 'f' }],
+    groups: [{
+      id: 'f|down|cover_of', parent_id: 'f', direction: 'down',
+      kind: 'cover_of', count: 800, sample_ids: [],
+    }],
+    hidden: {},
+  };
+  assert.equal(standsAlone(allFolded as never), false, 'a folded group IS a family');
+
+  // A hidden count is a relative too.
+  assert.equal(
+    standsAlone({ nodes: [{ id: 'f' }], groups: [], hidden: { f: { up: 0, down: 7 } } } as never),
+    false,
+  );
+  assert.equal(
+    standsAlone({ nodes: [{ id: 'f' }], groups: [], hidden: { f: { up: 0, down: 0 } } } as never),
+    true,
+    'a zero count is not a relative',
+  );
+  assert.equal(hasHiddenRelatives(undefined), false);
+  assert.equal(hasHiddenRelatives({ a: { up: 0, down: 0 }, b: { up: 3, down: 0 } }), true);
+}
+
+// ── an id with a '/' in it cannot be asked for by route ─────────────────────
+{
+  assert.equal(canFocusNode('9f3a1c2e'), true);
+  assert.equal(canFocusNode('job_01'), true);
+  // A chimera source label is an arbitrary string out of the entry's metadata;
+  // `/{entry_id}/neighbourhood` takes the id as a PATH segment, so a '/' is a
+  // separator before any route matching and the request can only 404.
+  assert.equal(canFocusNode('samples/kick 03.wav'), false);
+  assert.equal(canFocusNode('a/b'), false);
 }
 
 console.log('lineageScaleModel: all assertions passed');
