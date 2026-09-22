@@ -33,7 +33,7 @@ const summary: LineageSummary = {
 };
 
 const rows: RankingRow[] = [
-  { id: 'n1', title: 'Night Drive', model: 'stable-audio', count: 312, detail: '312 covers' },
+  { id: 'n1', title: 'Night Drive', model: 'stable-audio', source: 'generate', count: 312, detail: '312 covers' },
 ];
 
 const html = renderToStaticMarkup(
