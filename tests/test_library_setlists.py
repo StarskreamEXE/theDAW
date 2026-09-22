@@ -114,6 +114,7 @@ def test_the_listing_lists_unregistered_sets_without_writing(
     )
     # The shape the frontend reads is otherwise unchanged.
     first = setlists[0]["entries"][0]
+    assert first["file"] == "track0.wav"
     assert first["label"] == "Track 0"
     assert first["kind"] == "audio"
     assert first["perf"] == {"cueIn": 0.0, "mixOut": 30.0}
@@ -229,13 +230,15 @@ def test_the_register_route_refuses_a_cross_site_caller(
     _write_set(perf_sets, "NIGHT RIDE", tracks=2)
     set_id = _get_setlists(client)[0]["id"]
 
+    before = _revision()
+
     refused = client.post(
         f"{PREFIX}/setlists/{set_id}/register",
         headers={"Sec-Fetch-Site": "cross-site", "Origin": "https://evil.example"},
     )
 
     assert refused.status_code == 403
-    assert _revision() == _revision(), "sanity"
+    assert _revision() == before, "a refused caller still committed a write"
     assert not list(perf_sets.rglob(SIDECAR)), "a refused caller still registered"
 
 

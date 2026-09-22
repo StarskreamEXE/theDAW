@@ -142,6 +142,35 @@ def test_load_perf_set_rejects_traversal_and_absolute_paths(tmp_path: Path):
     assert result["id"] == listed["id"]
 
 
+def test_register_reference_twice_reuses_the_entry(tmp_path: Path):
+    """The same file registered twice is one entry, not two.
+
+    The bulk importer has always skipped a ``source_path`` it already has, so
+    a re-run over a folder is a no-op; the per-file path now does the same.
+    It is what stops two clients opening one performance set from putting two
+    copies of every track in the library, and it holds without any lock --
+    the claim is the row, not the caller's timing.
+    """
+    store = LibraryStore(tmp_path)
+    src = tmp_path / "outside" / "track.wav"
+    src.parent.mkdir()
+    src.write_bytes(b"RIFF\x00\x00\x00\x00WAVEdata")
+
+    first = store.register_reference(str(src), {"source": "performance-set"})
+    assert first is not None
+    assert store.db is not None
+    after_first = store.db.library_counts()
+
+    second = store.register_reference(str(src), {"source": "performance-set"})
+
+    assert second is not None
+    assert second.id == first.id
+    assert store.db.library_counts() == after_first
+    assert store.db.entry_id_for_source_path(str(src.resolve()), "performance-set") == (
+        first.id
+    )
+
+
 def test_update_entry_writes_only_user_mutable_fields(tmp_path: Path):
     _seed_generate_entry(tmp_path, "job1", 0)
     store = LibraryStore(tmp_path)

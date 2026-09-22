@@ -29,8 +29,8 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 
 const BUNDLED_ID = 'zad-night-ride-abcd1234';
 
-const track = (label: string, entryId: string | null = null): SetlistEntry =>
-  ({ entryId, label, kind: 'audio' });
+const track = (label: string, entryId: string | null = null, file?: string): SetlistEntry =>
+  ({ entryId, label, kind: 'audio', ...(file ? { file } : {}) });
 
 const seed = (id: string, entries: SetlistEntry[]): void => {
   const setlist: Setlist = {
@@ -58,8 +58,9 @@ const reset = (): void => {
   useLogStore.setState({ entries: [] });
 };
 
-/** What the backend answers: every bundled track, in ITS order, registered. */
-const registered = (labels: string[]): Reply => ({
+/** What the backend answers: every bundled track, in ITS order, registered.
+ *  `files`, when given, is the file name each row came from. */
+const registered = (labels: string[], files?: string[]): Reply => ({
   status: 200,
   body: {
     setlist: {
@@ -69,6 +70,7 @@ const registered = (labels: string[]): Reply => ({
         entryId: `entry-${i}`,
         label,
         kind: 'audio',
+        ...(files ? { file: files[i] } : {}),
       })),
     },
   },
@@ -108,6 +110,42 @@ async function twoTracksSharingALabelGetTheirOwnEntry(): Promise<void> {
 
   await useSetlistStore.getState().registerBundled(BUNDLED_ID);
 
+  assert.deepEqual(entriesOf(BUNDLED_ID).map((e) => e.entryId), ['entry-0', 'entry-1']);
+}
+
+async function sameLabelReorderedStillBindsToItsOwnFile(): Promise<void> {
+  reset();
+  // Two untitled tracks, and the user moved the SECOND file to the top before
+  // opening the set. Matching by label alone in the backend's order would hand
+  // each row the other one's entry -- the wrong audio on the wrong slot.
+  seed(BUNDLED_ID, [track('Untitled', null, 'b.wav'), track('Untitled', null, 'a.wav')]);
+  handler = () => registered(['Untitled', 'Untitled'], ['a.wav', 'b.wav']);
+
+  await useSetlistStore.getState().registerBundled(BUNDLED_ID);
+
+  assert.deepEqual(
+    entriesOf(BUNDLED_ID).map((e) => [e.file, e.entryId]),
+    [
+      ['b.wav', 'entry-1'],
+      ['a.wav', 'entry-0'],
+    ],
+    'each row must get the id of ITS file, not of the row in that position',
+  );
+}
+
+async function fillingIdsIsNotAnEdit(): Promise<void> {
+  reset();
+  seed(BUNDLED_ID, [track('A', null, 'a.wav'), track('B', null, 'b.wav')]);
+  const before = useSetlistStore.getState().setlists[BUNDLED_ID].updatedAt;
+  handler = () => registered(['A', 'B'], ['a.wav', 'b.wav']);
+
+  await useSetlistStore.getState().registerBundled(BUNDLED_ID);
+
+  assert.equal(
+    useSetlistStore.getState().setlists[BUNDLED_ID].updatedAt,
+    before,
+    'the DJ set list is sorted by updatedAt; opening a set must not reorder it',
+  );
   assert.deepEqual(entriesOf(BUNDLED_ID).map((e) => e.entryId), ['entry-0', 'entry-1']);
 }
 
@@ -169,6 +207,8 @@ async function aNetworkErrorIsSaidOutLoudToo(): Promise<void> {
 const CASES: Array<[string, () => Promise<void>]> = [
   ["the user's reorder, removal and own track survive", theUsersEditsSurviveRegistration],
   ['two tracks sharing a label get their own entry', twoTracksSharingALabelGetTheirOwnEntry],
+  ['same-label tracks, reordered, bind to their own file', sameLabelReorderedStillBindsToItsOwnFile],
+  ['filling ids in does not count as an edit', fillingIdsIsNotAnEdit],
   ['a locally-created set is never posted', aLocalSetIsNeverPosted],
   ['an already-registered set is never posted', anAlreadyRegisteredSetIsNeverPosted],
   ['ad-hoc URL rows are not waiting on the backend', adHocRowsAreNotWaitingOnTheBackend],

@@ -1511,6 +1511,11 @@ def _load_perf_set(
                 perf_block[dst_key] = float(v)
         entry: dict[str, Any] = {
             "entryId": entry_id,
+            # The file this row came from. The frontend patches registered ids
+            # into the set the user has (which they may have reordered, and
+            # two tracks may share a title), and a name is the only thing that
+            # identifies a row across that; the label alone cross-binds.
+            "file": fname,
             "label": label,
             "kind": "audio",
         }

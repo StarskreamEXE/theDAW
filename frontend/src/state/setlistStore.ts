@@ -22,6 +22,10 @@ export interface SetlistEntry {
   label: string;
   /** Optional URL hint for non-library entries. */
   url?: string;
+  /** For a bundled set: the file inside the set folder this row came from.
+   *  What `registerBundled` matches on when it patches ids in — a title can
+   *  repeat and the user can reorder the set, a file name does neither. */
+  file?: string;
   /** 'audio' | 'video' | 'image' — what kind of media this slot
    *  expects. */
   kind?: 'audio' | 'video' | 'image';
@@ -213,13 +217,28 @@ export const useSetlistStore = create<SetlistState>()(
           // (DJView "Sets" editing), and none of that is the backend's to
           // overwrite. Matched by label, taken in order so two tracks sharing
           // a title still land on their own entry.
+          const byFile = new Map<string, string[]>();
           const byLabel = new Map<string, string[]>();
           for (const entry of incoming) {
             if (!entry?.entryId) continue;
+            if (entry.file) {
+              const queue = byFile.get(entry.file) ?? [];
+              queue.push(entry.entryId);
+              byFile.set(entry.file, queue);
+            }
             const queue = byLabel.get(entry.label) ?? [];
             queue.push(entry.entryId);
             byLabel.set(entry.label, queue);
           }
+          // An id may sit in both maps; whichever claims it first owns it.
+          const used = new Set<string>();
+          const take = (queue: string[] | undefined): string | undefined => {
+            while (queue && queue.length > 0) {
+              const id = queue.shift();
+              if (id && !used.has(id)) return id;
+            }
+            return undefined;
+          };
           let patched: SetlistEntry[] = cur.entries;
           const filled: string[] = [];
           set((s) => {
@@ -227,15 +246,23 @@ export const useSetlistStore = create<SetlistState>()(
             if (!live) return s;
             patched = live.entries.map((e) => {
               if (!isPendingBundled(e)) return e;
-              const got = byLabel.get(e.label)?.shift();
+              // File first, label only for a set persisted before the
+              // listing carried file names.
+              const got =
+                (e.file ? take(byFile.get(e.file)) : undefined) ?? take(byLabel.get(e.label));
               if (!got) return e;
+              used.add(got);
               filled.push(got);
               return { ...e, entryId: got };
             });
             return {
               setlists: {
                 ...s.setlists,
-                [id]: { ...live, entries: patched, updatedAt: Date.now() },
+                // `updatedAt` is left alone on purpose: the DJ tab's set
+                // list is sorted by it, and filling ids in is not an edit the
+                // user made -- touching it would jump the row they just
+                // clicked to the top of the list under their cursor.
+                [id]: { ...live, entries: patched },
               },
             };
           });
