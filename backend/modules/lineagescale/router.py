@@ -502,13 +502,22 @@ def _rankings_sync(db: Any, which: str, limit: int) -> dict[str, Any]:
         # The cache holds ids, counts and the detail line. The columns on
         # screen are read fresh, every time: a renamed song shows its new
         # title on the next request without a 3.6 s pass, and at most 500
-        # ids is one indexed lookup.
+        # ids is one indexed lookup -- the same bounded ``WHERE id IN (...)``
+        # over ``_ENTRY_COLUMNS`` the other routes use, so ``source`` costs
+        # this route nothing extra: it is already in the row.
         entries = _entry_rows(snap, [r.id for r in ranked])
     rows = [
         {
             "id": r.id,
             "title": (entries.get(r.id) or {}).get("title") or r.id,
             "model": (entries.get(r.id) or {}).get("model") or "",
+            # `source` travels WITH `model`, exactly as it does on a
+            # neighbourhood node and a relatives row: the provider badge is
+            # the two columns together. A Suno song's model is `chirp-*` and
+            # its source is 'suno', so a ranked row without this field was
+            # badged by the fallback -- "Stable Audio", and "theDAW" after
+            # schema 10 -- for every one of the user's Suno songs.
+            "source": (entries.get(r.id) or {}).get("source") or "",
             "count": r.count,
             "detail": r.detail,
         }

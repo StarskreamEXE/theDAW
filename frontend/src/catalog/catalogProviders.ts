@@ -112,7 +112,7 @@ const trimmed = (v: unknown): string => (typeof v === 'string' ? v.trim() : '');
  * The detected slug wins whenever the backend sent one — it read the file's
  * own metadata, which beats any guess made from a model name. With no detected
  * slug the historical derivation answers, unchanged:
- *   model contains 'suno'                → 'suno'
+ *   model contains 'suno' / 'chirp'      → 'suno'
  *   model contains 'magenta' / 'gemini'  → 'gemini-magenta'
  *   model contains 'udio' / 'riffusion'  → that engine
  *   source === 'import'                  → 'import'
@@ -132,7 +132,10 @@ export const inferProvider = (e: ProviderEntryFields): string => {
   // rule 2). It has to be here too: a promoted Suno song's model is `chirp-*`, not
   // "suno", and a lineage node carries `source` and nothing else -- without this
   // arm every Suno song in a lineage fell through to the Stable Audio default.
-  if (`${e.source ?? ''}`.toLowerCase() === 'suno' || hay.includes('suno')) return 'suno';
+  // `chirp` is Suno's model family (`chirp-v3`, `chirp-v4`, `chirp-crow`, ...)
+  // and the only thing an exported Suno song's model column says. Backend twin:
+  // `_PROVIDER_BY_MODEL_SUBSTRING` and the SQL fallback (schema step 11).
+  if (`${e.source ?? ''}`.toLowerCase() === 'suno' || hay.includes('suno') || hay.includes('chirp')) return 'suno';
   if (hay.includes('magenta') || hay.includes('gemini')) return 'gemini-magenta';
   // "udio" must not be found inside "audio": `stable-audio-3` is not Udio. The
   // backend strips the same word before it looks (db.py, the same rule).

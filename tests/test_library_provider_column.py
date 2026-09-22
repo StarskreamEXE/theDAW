@@ -109,6 +109,11 @@ RARE_SLUG = "quiet-shelf"
 PROVIDER_COLUMN_VERSION = 9
 PROVIDER_REINDEX_VERSION = 10
 
+#: The step that rebuilt them AGAIN when the Suno arm learned ``chirp``,
+#: Suno's model family (T14). The same reason as step 10 one step later:
+#: the expression those two indexes are declared on changed its text.
+PROVIDER_CHIRP_VERSION = 11
+
 #: The expression the v9 indexes were built from, spelled out because it no
 #: longer exists anywhere in the module: this is what a library that migrated
 #: BEFORE step 10 has on disk, and rebuilding it is the whole of step 10.
@@ -432,7 +437,7 @@ def test_step_ten_rebuilds_the_expression_indexes_and_rewrites_no_row(
     old.close()
 
     db = LibraryDB(v9_library)
-    assert db.schema_version() == SCHEMA_VERSION == PROVIDER_REINDEX_VERSION
+    assert db.schema_version() == SCHEMA_VERSION >= PROVIDER_REINDEX_VERSION
     assert _row_dump(db._conn, V9_COLUMNS) == before
     assert set(PROVIDER_INDEXES) <= _indexes(db._conn)
 
@@ -489,6 +494,167 @@ def test_a_failed_step_ten_leaves_the_old_indexes_in_place(
     # A clean reopen with the real statement list still finishes the upgrade.
     monkeypatch.undo()
     db = LibraryDB(v9_library)
+    assert db.schema_version() == SCHEMA_VERSION
+    for name in EXPRESSION_INDEXES:
+        assert db_module._PROVIDER_INDEX_EXPR in _index_sql(db._conn, name), name
+    db.close()
+
+
+#: The expression the v10 indexes were built from: the fallback as it stood
+#: after step 10 and before the Suno arm learned ``chirp``. A literal for the
+#: same reason :data:`V9_INDEX_EXPR` is one -- it no longer exists anywhere in
+#: the module, and it is what a library upgraded before step 11 has on disk.
+V10_INDEX_EXPR = """COALESCE(NULLIF(provider, ''), CASE
+        WHEN source = 'suno'
+             OR instr(lower(model), 'suno') > 0 THEN 'suno'
+        WHEN instr(lower(model), 'magenta') > 0
+             OR instr(lower(model), 'gemini') > 0 THEN 'gemini-magenta'
+        WHEN instr(replace(lower(model), 'audio', ''), 'udio') > 0 THEN 'udio'
+        WHEN instr(lower(model), 'riffusion') > 0 THEN 'riffusion'
+        WHEN source = 'import' THEN 'import'
+        WHEN source = 'generate'
+             OR source = 'studio' THEN 'stable-audio'
+        ELSE 'thedaw'
+    END)"""
+
+
+def _seed_v10_rows(db: LibraryDB) -> None:
+    """Three rows the v10 rule and the v11 rule disagree about by exactly one.
+
+    ``v10_chirp`` is the user's real shape: a Suno song whose ``model`` is
+    ``chirp-*`` and whose ``source`` is NOT 'suno' -- an import of the audio.
+    The v10 rule files it under 'import'; the v11 rule files it under 'suno'.
+    """
+    db._conn.executemany(
+        "INSERT INTO entries (id, kind, title, model, source, provider, "
+        "created_at, updated_at, metadata_json) "
+        "VALUES (?, 'audio', ?, ?, ?, ?, 1.0, 1.0, '{}')",
+        [
+            ("v10_chirp", "v10_chirp", "chirp-v4", "import", None),
+            ("v10_generated", "v10_generated", "medium", "generate", None),
+            ("v10_labeled", "v10_labeled", "chirp-crow", "import", "bandcamp"),
+        ],
+    )
+    db._conn.commit()
+
+
+@pytest.fixture
+def v10_library(tmp_path: Path) -> Path:
+    """A library migrated by the v10 build: all four provider indexes are
+    there, and the two expression ones carry the pre-chirp fallback text.
+
+    Built the way ``v9_library`` is and for the same reason: step 10's
+    statements interpolate the module's LIVE expression, so re-running them
+    today would build the new text rather than the historical one. The two
+    expression indexes are therefore rebuilt here from :data:`V10_INDEX_EXPR`,
+    a literal.
+    """
+    current = db_module._MIGRATIONS
+    db_module._MIGRATIONS = [
+        step for step in current if step[0] <= PROVIDER_REINDEX_VERSION
+    ]
+    try:
+        db = LibraryDB(tmp_path / "library.db")
+        assert db.schema_version() == PROVIDER_REINDEX_VERSION
+        _seed_v10_rows(db)
+    finally:
+        db_module._MIGRATIONS = current
+    for name in EXPRESSION_INDEXES:
+        db._conn.execute(f"DROP INDEX {name}")
+    db._conn.execute(
+        f"CREATE INDEX idx_entries_provider_created "
+        f"ON entries(kind, {V10_INDEX_EXPR}, created_at DESC)"
+    )
+    db._conn.execute(
+        f"CREATE INDEX idx_entries_provider_any_kind "
+        f"ON entries({V10_INDEX_EXPR}, created_at DESC)"
+    )
+    db._conn.commit()
+    for name in EXPRESSION_INDEXES:
+        sql = _index_sql(db._conn, name)
+        assert "ELSE 'thedaw'" in sql, name
+        assert "chirp" not in sql, name
+    db.close()
+    return tmp_path / "library.db"
+
+
+def test_step_eleven_rebuilds_the_expression_indexes_and_rewrites_no_row(
+    v10_library: Path,
+):
+    """T14, under the contract step 10 already has.
+
+    The Suno arm learned ``chirp`` -- Suno's model family, and the only thing
+    an exported Suno song's ``model`` column ever says -- which is a change to
+    the TEXT two of these indexes are declared on. SQLite matches an expression
+    index by that text, so an index left from v10 could neither serve the new
+    comparison nor hold the right slug for a ``chirp-*`` row. Step 11 rebuilds
+    all four from the current expression, rewrites no row, and opens no
+    ``metadata_json``.
+    """
+    old = sqlite3.connect(str(v10_library))
+    old.row_factory = sqlite3.Row
+    before = _row_dump(old, V9_COLUMNS)
+    old.close()
+
+    db = LibraryDB(v10_library)
+    assert db.schema_version() == SCHEMA_VERSION == PROVIDER_CHIRP_VERSION
+    assert _row_dump(db._conn, V9_COLUMNS) == before
+    assert set(PROVIDER_INDEXES) <= _indexes(db._conn)
+
+    for name in EXPRESSION_INDEXES:
+        sql = _index_sql(db._conn, name)
+        assert db_module._PROVIDER_INDEX_EXPR in sql, name
+        assert "'chirp'" in sql, name
+
+    # And the rule the rebuilt indexes answer is the new one: the imported
+    # ``chirp-*`` row is Suno now, the generation is untouched, and the row
+    # whose column was already resolved from its own metadata keeps it -- a
+    # ``chirp-crow`` model does not outrank a stored label.
+    assert set(db.list_entry_ids(EntryFilters(provider="suno"), 10)) == {"v10_chirp"}
+    assert set(db.list_entry_ids(EntryFilters(provider="stable-audio"), 10)) == {
+        "v10_generated"
+    }
+    assert set(db.list_entry_ids(EntryFilters(provider="bandcamp"), 10)) == {
+        "v10_labeled"
+    }
+    assert set(db.list_entry_ids(EntryFilters(provider="import"), 10)) == set()
+    assert _column(db, "v10_chirp") is None
+    db.close()
+
+
+def test_a_failed_step_eleven_leaves_the_v10_indexes_in_place(
+    v10_library: Path, monkeypatch
+):
+    """Step 11 drops four indexes before it builds them, so a failure half way
+    through must roll the drops back -- the same guarantee step 10 has, and
+    what keeps an interrupted upgrade from leaving a 200,000-entry library with
+    no provider index at all."""
+    steps = db_module._MIGRATIONS
+    step = next(s for s in steps if s[0] == PROVIDER_CHIRP_VERSION)
+    monkeypatch.setattr(
+        db_module,
+        "_MIGRATIONS",
+        [
+            *(s for s in steps if s[0] < PROVIDER_CHIRP_VERSION),
+            (
+                PROVIDER_CHIRP_VERSION,
+                [step[1][0], "CREATE INDEX no_such_table_idx ON nope(x)"],
+            ),
+        ],
+    )
+    with pytest.raises(Exception):
+        LibraryDB(v10_library)
+
+    survivor = sqlite3.connect(str(v10_library))
+    survivor.row_factory = sqlite3.Row
+    assert set(PROVIDER_INDEXES) <= _indexes(survivor)
+    for name in EXPRESSION_INDEXES:
+        assert "chirp" not in _index_sql(survivor, name), name
+    survivor.close()
+
+    # A clean reopen with the real statement list still finishes the upgrade.
+    monkeypatch.undo()
+    db = LibraryDB(v10_library)
     assert db.schema_version() == SCHEMA_VERSION
     for name in EXPRESSION_INDEXES:
         assert db_module._PROVIDER_INDEX_EXPR in _index_sql(db._conn, name), name

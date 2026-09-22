@@ -43,7 +43,7 @@ from .provider import PROVIDER_SLUG_MAX, detect_provider
 log = logging.getLogger(__name__)
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 #: How long a statement waits for another connection's write lock before it
 #: gives up with "database is locked". Python's sqlite3 default is 5 s;
@@ -556,8 +556,17 @@ DEFAULT_SORT = "created_desc"
 #: ``inferProvider`` in frontend/src/catalog/catalogProviders.ts spells the
 #: same rule (``model.toLowerCase().replace(/audio/g, '').includes('udio')``)
 #: and both sides walk the same parity table.
+#:
+#: ``chirp`` is Suno's model family -- ``chirp-v3``, ``chirp-v4``,
+#: ``chirp-crow``, ``chirp-bluejay``, ``chirp-fenix``, ``chirp-auk`` -- and it
+#: is the only thing an exported Suno song's ``model`` column ever says. The
+#: word "suno" is not in it, so before T14 a Suno row whose ``source`` was
+#: anything but 'suno' (an import of the audio, a lineage row read by model
+#: alone) fell all the way through to the last arm and was badged "Stable
+#: Audio", then "theDAW" once T13 changed that arm.
 _PROVIDER_BY_MODEL_SUBSTRING: tuple[tuple[str, str, str], ...] = (
     ("", "suno", "suno"),
+    ("", "chirp", "suno"),
     ("", "magenta", "gemini-magenta"),
     ("", "gemini", "gemini-magenta"),
     ("audio", "udio", "udio"),
@@ -679,11 +688,12 @@ def resolved_provider_slug(meta: Optional[Mapping[str, Any]]) -> Optional[str]:
 #: COLUMNS alone -- no ``metadata_json``, no join, nothing an index cannot
 #: carry. ``{a}`` is the table alias prefix, so the one text below is both the
 #: expression the queries compare against and the expression the provider
-#: indexes are built on (migration 9, rebuilt by migration 10); they cannot
+#: indexes are built on (migration 9, rebuilt by migrations 10 and 11); they cannot
 #: drift, because there is only one.
 _PROVIDER_FALLBACK_TEMPLATE = """CASE
         WHEN {a}source = 'suno'
-             OR instr(lower({a}model), 'suno') > 0 THEN 'suno'
+             OR instr(lower({a}model), 'suno') > 0
+             OR instr(lower({a}model), 'chirp') > 0 THEN 'suno'
         WHEN instr(lower({a}model), 'magenta') > 0
              OR instr(lower({a}model), 'gemini') > 0 THEN 'gemini-magenta'
         WHEN instr(replace(lower({a}model), 'audio', ''), 'udio') > 0 THEN 'udio'
@@ -721,7 +731,7 @@ PROVIDER_SQL = _PROVIDER_RESOLVED_TEMPLATE.format(a="e.")
 #: and the filter is an index SEEK rather than a table scan. The test
 #: ``test_library_provider_column.py`` asserts the plan, because a drift here
 #: is silent: the query would still be correct, just 60,000 rows slower. THIS
-#: IS WHY CHANGING THE FALLBACK'S TEXT NEEDS A MIGRATION -- see step 10.
+#: IS WHY CHANGING THE FALLBACK'S TEXT NEEDS A MIGRATION -- see steps 10 and 11.
 _PROVIDER_INDEX_EXPR = _PROVIDER_RESOLVED_TEMPLATE.format(a="")
 
 
@@ -819,6 +829,46 @@ _MIGRATIONS.append(
             # keeps the queries and the indexes from drifting, and freezing a
             # second historical copy of it to save one index build on an
             # upgrade path would give that guarantee up.
+            "DROP INDEX IF EXISTS idx_entries_provider",
+            "DROP INDEX IF EXISTS idx_entries_provider_created",
+            "DROP INDEX IF EXISTS idx_entries_provider_any_kind",
+            "DROP INDEX IF EXISTS idx_entries_facet_provider",
+            "CREATE INDEX IF NOT EXISTS idx_entries_provider ON entries(provider)",
+            "CREATE INDEX IF NOT EXISTS idx_entries_provider_created "
+            f"ON entries(kind, {_PROVIDER_INDEX_EXPR}, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_entries_provider_any_kind "
+            f"ON entries({_PROVIDER_INDEX_EXPR}, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_entries_facet_provider "
+            "ON entries(kind, provider, model, source, favorite)",
+        ],
+    )
+)
+
+
+_MIGRATIONS.append(
+    (
+        11,
+        [
+            # T14: the Suno arm learned ``chirp``, Suno's model family, and the
+            # fallback is the text TWO of these indexes are declared on. Same
+            # reasoning as step 10, one step later: SQLite stores an expression
+            # index's text as written and matches a query against that text, so
+            # an index built before this change can neither serve the new
+            # comparison (every provider filter silently becomes a table scan)
+            # nor hold the right slug for a ``chirp-*`` row. Only a rebuild
+            # repairs either, which is why a text change here is a schema
+            # change.
+            #
+            # The same four indexes, dropped and recreated together, for the
+            # reason step 10 did all four: two of them are on columns and would
+            # survive, but doing the set in one step leaves no doubt that no
+            # index in this database was built from the old rule.
+            #
+            # NO ROW IS REWRITTEN and no ``metadata_json`` is opened. A row
+            # whose ``provider`` column is set keeps it -- that answer came from
+            # the row's own metadata and is still right -- and only the
+            # FALLBACK, computed per query and never stored, changes what it
+            # says about a ``chirp-*`` model.
             "DROP INDEX IF EXISTS idx_entries_provider",
             "DROP INDEX IF EXISTS idx_entries_provider_created",
             "DROP INDEX IF EXISTS idx_entries_provider_any_kind",

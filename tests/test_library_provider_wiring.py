@@ -905,9 +905,20 @@ def test_the_provider_facet_counts_every_entry_under_the_slug_it_filters_as(
 #:
 #: ``stable-audio-3-medium`` and ``audiocraft`` are the reason the udio arm
 #: deletes the word "audio" before it looks: "udio" is a substring of "audio",
-#: so a bare substring test filed every Stable Audio model under Udio.
+#: so a bare substring test filed every Stable Audio model under Udio. The
+#: ``chirp-*`` rows are the T14 arm: Suno names no model of its own, and
+#: neither "suno" nor a stored label appears on one of those rows.
 FALLBACK_PARITY_ROWS: tuple[tuple[object, object, str], ...] = (
     ("chirp-v4", "suno", "suno"),
+    # T14: ``chirp`` is Suno's model family and the only thing an exported Suno
+    # song's model column says. The source arm answers the row above; these
+    # three are the rows that USED to fall through it -- an import of the
+    # audio, a row re-sourced by a writer, a row whose source says nothing --
+    # and be badged by the last arm.
+    ("chirp-v4", "generate", "suno"),
+    ("chirp-v4", "import", "suno"),
+    ("chirp-v4", "", "suno"),
+    ("chirp-crow", "", "suno"),
     ("suno-v3", "generate", "suno"),
     ("sunoesque", "import", "suno"),
     ("magenta-rt", "generate", "gemini-magenta"),

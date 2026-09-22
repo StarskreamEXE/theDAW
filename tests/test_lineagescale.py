@@ -936,9 +936,52 @@ def test_the_rankings_route_answers_every_list_and_refuses_the_rest(
         assert body["list"] == name
         assert len(body["rows"]) <= 5
         for row in body["rows"]:
-            assert set(row) == {"id", "title", "model", "count", "detail"}
+            assert set(row) == {
+                "id",
+                "title",
+                "model",
+                # T14: `source` is not decoration here either. The badge is
+                # `(model, source)` together, and a landing list without this
+                # field badged every Suno song -- whose model is `chirp-*` --
+                # by the fallback's last arm.
+                "source",
+                "count",
+                "detail",
+            }
             assert row["title"]
     assert client.get(f"{PREFIX}/rankings", params={"list": "nope"}).status_code == 400
+
+
+def test_a_ranked_row_carries_the_source_column_its_badge_needs(
+    monkeypatch, tmp_path: Path
+):
+    """A Suno song in a ranked list is a Suno song.
+
+    Its own library, built here rather than taken from the session fixture,
+    because it is edited: the row is given the two columns the user's 194,000
+    Suno rows carry (``source='suno'``, a ``chirp-*`` model) and the route must
+    hand BOTH to the client. ``/neighbourhood`` and ``/relatives`` already do;
+    ``/rankings`` sent `model` alone, so the badge saw
+    ``{model: 'chirp-v4', source: undefined}`` and fell through to the
+    fallback.
+    """
+    fixture = build_small_library(tmp_path / "library.db")
+    try:
+        ranked_id = fixture.ids.deep_root
+        fixture.db._conn.execute(  # noqa: SLF001 - the fixture's own connection
+            "UPDATE entries SET model = 'chirp-v4', source = 'suno' WHERE id = ?",
+            (ranked_id,),
+        )
+        fixture.db._conn.commit()  # noqa: SLF001
+        client = _client(monkeypatch, fixture)
+        rows = client.get(f"{PREFIX}/rankings", params={"list": "most_derived"}).json()[
+            "rows"
+        ]
+        row = next(r for r in rows if r["id"] == ranked_id)
+        assert row["model"] == "chirp-v4"
+        assert row["source"] == "suno"
+    finally:
+        fixture.close()
 
 
 def test_the_neighbourhood_route_answers_the_contract(monkeypatch, library):

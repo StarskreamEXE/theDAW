@@ -99,9 +99,14 @@ import {
   assert.equal(inferProvider({ model: '', source: 'suno' }), 'suno');
   assert.equal(entryProviderMeta({ source: 'suno' }).label, 'Suno');
   assert.equal(entryProviderIsAi({ source: 'suno' }), true);
-  // and it must not swallow its neighbours
-  assert.equal(inferProvider({ model: 'chirp-v4', source: 'import' }), 'import');
-  assert.equal(inferProvider({ model: 'chirp-v4', source: 'generate' }), 'stable-audio');
+  // T14: and the model alone is enough, whatever the source says. `chirp` IS
+  // Suno's model family -- `chirp-v3`, `chirp-v4`, `chirp-crow`, `chirp-auk`,
+  // `chirp-bluejay`, `chirp-fenix` -- so an imported Suno file and a row a
+  // writer re-sourced are Suno too. Before T14 these read 'import' and
+  // 'stable-audio', and a LEARN landing list badged them "theDAW".
+  assert.equal(inferProvider({ model: 'chirp-v4', source: 'import' }), 'suno');
+  assert.equal(inferProvider({ model: 'chirp-v4', source: 'generate' }), 'suno');
+  assert.equal(inferProvider({ model: 'chirp-crow' }), 'suno', 'the model alone');
 }
 
 // ── parity with the backend's fallback (backend/modules/library/db.py, ────────
@@ -112,6 +117,12 @@ import {
   const cases: Array<[string | null, string | null, string]> = [
     // model,            source,       expected
     ['chirp-v4',         'suno',       'suno'],
+    // T14: `chirp` is Suno's model family; the source arm answers the row
+    // above, these are the rows that used to fall past it.
+    ['chirp-v4',         'generate',   'suno'],
+    ['chirp-v4',         'import',     'suno'],
+    ['chirp-v4',         '',           'suno'],
+    ['chirp-crow',       '',           'suno'],
     ['suno-v3',          'generate',   'suno'],
     ['sunoesque',        'import',     'suno'],
     ['magenta-rt',       'generate',   'gemini-magenta'],

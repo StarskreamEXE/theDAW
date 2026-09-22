@@ -22,6 +22,7 @@
 import assert from 'node:assert/strict';
 import { renderToStaticMarkup } from 'react-dom/server';
 
+import { ProviderBadge } from '../components/library/ProviderBadge.tsx';
 import { FocusGraph } from './FocusGraph.tsx';
 import { GraphPane } from './LineageScaleView.tsx';
 import { LineageLanding } from './LineageLanding.tsx';
@@ -575,6 +576,30 @@ const ALONE = 'This song stands alone';
   // reads "Stable Audio" (the bug 30f8732 fixed in the catalogue).
   assert.ok(!/Stable\s*Audio/i.test(html), `badged as Stable Audio: ${html}`);
   assert.ok(/suno/i.test(html), 'the row must say Suno');
+}
+
+/* ═══════ a LANDING hit's badge: model AND source, and `chirp` is Suno ═════ */
+
+{
+  // The landing builds exactly this for every hit it lists (LineageLanding.tsx:
+  // `<ProviderBadge entry={{ model: hit.model, source: hit.source }} />`), so
+  // these are the two shapes the wire can hand it.
+  const badge = (hit: { model?: string; source?: string }) =>
+    renderToStaticMarkup(<ProviderBadge entry={{ model: hit.model, source: hit.source }} />);
+
+  // T14 (2): a Suno song's model is `chirp-*` — the word "suno" is nowhere in
+  // it. `/rankings` sent no `source` at all before this ticket, so this is what
+  // the badge actually received for 194,000 Suno songs, and it read "theDAW".
+  const modelOnly = badge({ model: 'chirp-v4', source: undefined });
+  assert.ok(/suno/i.test(modelOnly), `chirp-v4 badged as: ${modelOnly}`);
+  assert.ok(!/theDAW|Stable\s*Audio/i.test(modelOnly), modelOnly);
+
+  // T14 (1): and when the route DOES send the column — which it now does for a
+  // ranked row, as it always has for a neighbourhood node and a relatives row —
+  // the source arm answers on its own, whatever the model says.
+  const withSource = badge({ model: 'chirp-v4', source: 'suno' });
+  assert.ok(/suno/i.test(withSource), withSource);
+  assert.ok(/suno/i.test(badge({ model: '', source: 'suno' })), 'a legacy import');
 }
 
 console.log('LineageScaleView: all assertions passed');
