@@ -16,6 +16,12 @@
  * `?xrcode=` for the XR posture code, keeping `#pair=` free for the actual
  * LAN pairing token.
  *
+ * P-20260921-lan-https (below the T20 sections): the same share panel now
+ * hands out the LAN **https** address when the launcher has a TLS listener up,
+ * because AudioWorklet, the microphone and Web MIDI exist only in a secure
+ * context and a plain-http LAN link ships a broken EDIT tab to every device
+ * that scans the QR.
+ *
  * Shell needs the full app-store tree mounted to exercise this at runtime,
  * so per the house pattern for a component-only fix (see Shell.test.ts /
  * audioEditorPanelWiring.test.ts) this asserts the wiring at SOURCE level.
@@ -71,6 +77,99 @@ assert.doesNotMatch(
   companionUrlBody,
   /\?pair=/,
   'companionUrl must not build the XR posture-code query as ?pair= — that name now belongs to the LAN pairing token fragment',
+);
+
+// ══ P-20260921-lan-https: the shared link is the SECURE one when there is one ══
+//
+// A browser exposes AudioContext.audioWorklet, the microphone, Web MIDI, the
+// clipboard and crypto.subtle only in a secure context. A phone or second PC
+// opening `http://<lan-ip>:5173` is neither https nor localhost, so the EDIT
+// tab died there with "Cannot read properties of undefined (reading
+// 'addModule')". The launcher now runs a TLS listener beside the http one and
+// `GET /api/network/lan` reports its address as `https_url` while it is up;
+// handing out the plain-http address anyway would ship a broken app to every
+// device that scans the QR.
+
+// ── the share URL comes from /api/network/lan ──────────────────────────────
+assert.match(
+  source,
+  /fetch\(\s*['"]\/api\/network\/lan['"]/,
+  'Shell must read the LAN address from GET /api/network/lan — the route that also reports the https listener',
+);
+assert.doesNotMatch(
+  source,
+  /\/api\/vj\/lan-ip/,
+  'the old /api/vj/lan-ip call must be gone: it only ever returns an IP, so a Shell still using it can never ' +
+    'offer the https address and would keep handing phones a link with no audio',
+);
+
+const lanFetchStart = source.indexOf("fetch('/api/network/lan'");
+assert.ok(lanFetchStart >= 0, 'the LAN fetch must be present');
+// Bounded window, as above: proves these belong to THIS fetch's chain.
+const lanChain = source.slice(lanFetchStart, lanFetchStart + 1200);
+assert.match(
+  lanChain,
+  /\.catch\(/,
+  'the LAN fetch must have a .catch — no backend yet, or no LAN, must not throw out of the effect',
+);
+assert.match(lanChain, /https_url/, 'the response`s https_url must actually be read');
+assert.match(
+  lanChain,
+  /startsWith\(\s*['"]https:\/\/['"]\s*\)/,
+  'only an https:// address may be treated as the secure one — swapping one insecure origin for another fixes nothing',
+);
+assert.match(
+  lanChain,
+  /setLanHttpsUrl\(/,
+  'the https address must be kept, so the certificate note and the AudioWorklet notice can name it',
+);
+assert.match(
+  lanChain,
+  /lanReachablePort\(\)/,
+  'with no listener up, the http link must still be built exactly as before (packaged app has no window port)',
+);
+
+// ── the companion link rides the same base, so it is https too ─────────────
+assert.match(
+  companionUrlBody,
+  /const base = \(shareUrl \|\| ''\)/,
+  'the companion URL must be derived from shareUrl, so the secure address reaches the phone companion too',
+);
+
+// ── the note that tells the user what the certificate warning is ───────────
+assert.match(
+  source,
+  /Secure address/,
+  'the share panel must say the link is the secure one',
+);
+assert.match(
+  source,
+  /The first visit shows a certificate warning; choose Proceed\./,
+  'and must warn about the self-signed certificate prompt — an unexplained browser warning reads as a broken ' +
+    'link and the user stops there',
+);
+const noteStart = source.indexOf('Secure address');
+const noteContext = source.slice(Math.max(0, noteStart - 300), noteStart);
+assert.match(
+  noteContext,
+  /shareUrlIsLanHttps/,
+  'the certificate note must be gated on THIS machine`s own listener being the link — a pasted Cloudflare ' +
+    'tunnel URL is https too, and shows no certificate warning at all',
+);
+const gateStart = source.indexOf('const shareUrlIsLanHttps');
+assert.ok(gateStart >= 0, 'shareUrlIsLanHttps must be defined');
+assert.match(
+  source.slice(gateStart, source.indexOf('\n', gateStart)),
+  /shareUrl === lanHttpsUrl/,
+  'the gate must compare the URL actually being shared against the detected listener, so the override wins',
+);
+
+// ── the AudioWorklet notice is told the address ────────────────────────────
+assert.match(
+  source,
+  /<AudioWorkletUnavailableNotice\s+secureUrl=\{lanHttpsUrl \|\| null\}/,
+  'the standing "audio is switched off on this address" notice must name the https address when one exists — ' +
+    'that notice is what the affected device actually sees',
 );
 
 console.log('Shell.pairing: all assertions passed');

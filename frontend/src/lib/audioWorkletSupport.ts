@@ -96,6 +96,35 @@ export interface AudioWorkletProblem {
   detail: string;
 }
 
+/** The generic advice for an insecure page: true wherever it is shown, but it
+ *  asks the reader to go and arrange something. */
+const INSECURE_DETAIL =
+  'Browsers only allow audio processing (AudioWorklet) on a secure page, and this one is plain ' +
+  'http on a network address. Open theDAW at https:// or at http://localhost to get audio back. ' +
+  'From another computer, either forward the port to your own machine (ssh -L) and open it as ' +
+  'localhost, or mark this address as secure in your browser.';
+
+/**
+ * The concrete way out, when the app knows one.
+ *
+ * `GET /api/network/lan` reports `https_url` when this machine is ALREADY
+ * serving the same app over TLS on the LAN (backend/lib/lan_https.py). On a
+ * device that has the problem, that address is the whole answer — no port
+ * forwarding, no browser flag — so it goes first and the generic advice stays
+ * behind it as the fallback for everyone else.
+ *
+ * Only an `https://` URL qualifies: handing someone a second plain-http
+ * address as the cure would send them to a page with exactly this fault.
+ */
+export function secureAddressAdvice(secureUrl: string | null | undefined): string | null {
+  const url = (secureUrl ?? '').trim();
+  if (!url.toLowerCase().startsWith('https://')) return null;
+  return (
+    `This machine is also serving theDAW at ${url} — the same app on a secure address, where audio, ` +
+    'the microphone and MIDI all work. The first visit shows a certificate warning; choose Proceed. '
+  );
+}
+
 const hasWorkletOnPrototype = (ctor: unknown): boolean => {
   const proto = (ctor as { prototype?: object } | undefined)?.prototype;
   return typeof proto === 'object' && proto !== null && 'audioWorklet' in proto;
@@ -107,8 +136,16 @@ const hasWorkletOnPrototype = (ctor: unknown): boolean => {
  * Pure: everything it reads comes from `e`, which defaults to the real globals.
  * The check is on the CONSTRUCTOR prototype, not on a live context, so the
  * shell can answer before (and without) building an audio engine.
+ *
+ * `secureUrl` is the LAN https address from `GET /api/network/lan`, when the
+ * app has learned one. It only changes the 'insecure-context' message: a
+ * browser with no AudioWorklet at all is not fixed by a different address, and
+ * offering one there would be a false lead.
  */
-export function describeAudioWorkletProblem(e: AudioWorkletEnv = env()): AudioWorkletProblem | null {
+export function describeAudioWorkletProblem(
+  e: AudioWorkletEnv = env(),
+  secureUrl?: string | null,
+): AudioWorkletProblem | null {
   if (hasWorkletOnPrototype(e.BaseAudioContext) || hasWorkletOnPrototype(e.AudioContext)) return null;
 
   const reason = reasonFor(e);
@@ -116,11 +153,7 @@ export function describeAudioWorkletProblem(e: AudioWorkletEnv = env()): AudioWo
     ? {
         reason,
         title: 'Audio is switched off on this address',
-        detail:
-          'Browsers only allow audio processing (AudioWorklet) on a secure page, and this one is plain ' +
-          'http on a network address. Open theDAW at https:// or at http://localhost to get audio back. ' +
-          'From another computer, either forward the port to your own machine (ssh -L) and open it as ' +
-          'localhost, or mark this address as secure in your browser.',
+        detail: `${secureAddressAdvice(secureUrl) ?? ''}${INSECURE_DETAIL}`,
       }
     : {
         reason,

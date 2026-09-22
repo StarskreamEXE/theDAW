@@ -22,6 +22,7 @@ import {
   addWorkletModule,
   audioWorkletAvailable,
   describeAudioWorkletProblem,
+  secureAddressAdvice,
   type AudioWorkletEnv,
 } from './audioWorkletSupport.ts';
 
@@ -204,6 +205,67 @@ const insecureCtx = (): BaseAudioContext => ({}) as unknown as BaseAudioContext;
   // No Web Audio whatsoever (an ancient browser) reads as unsupported.
   const none = describeAudioWorkletProblem({ isSecureContext: true });
   assert.equal(none?.reason, 'unsupported');
+}
+
+// ── the LAN https address, when this machine is serving one ────────────────
+//
+// `GET /api/network/lan` reports `https_url` only while a TLS listener is
+// actually up (backend/lib/lan_https.py). On the device that HAS the problem
+// that address is the entire fix — no port forwarding, no browser flag — so
+// the notice must name it rather than leave the reader to arrange something.
+{
+  const INSECURE_ENV: AudioWorkletEnv = {
+    isSecureContext: false,
+    AudioContext: class {},
+    BaseAudioContext: class {},
+  };
+  const generic = describeAudioWorkletProblem(INSECURE_ENV);
+  assert.ok(generic);
+
+  const withAddress = describeAudioWorkletProblem(INSECURE_ENV, 'https://192.168.1.34:5443');
+  assert.ok(withAddress);
+  assert.equal(withAddress.reason, 'insecure-context', 'the diagnosis does not change');
+  assert.match(withAddress.detail, /https:\/\/192\.168\.1\.34:5443/, 'the detail names the address to open');
+  assert.match(
+    withAddress.detail,
+    /certificate warning/i,
+    'and warns about the self-signed certificate, so the warning is expected rather than alarming',
+  );
+  assert.ok(
+    withAddress.detail.endsWith(generic.detail),
+    'the generic advice is kept behind it — the address is an addition, not a replacement',
+  );
+
+  // A browser with no AudioWorklet at all is not fixed by a different
+  // address. Offering one there is a false lead.
+  const unsupported = describeAudioWorkletProblem(
+    { isSecureContext: true, AudioContext: class {}, BaseAudioContext: class {} },
+    'https://192.168.1.34:5443',
+  );
+  assert.equal(unsupported?.reason, 'unsupported');
+  assert.doesNotMatch(unsupported?.detail ?? '', /192\.168\.1\.34/, 'no address offered for a browser fault');
+
+  // Nothing to offer is the status quo, byte for byte.
+  for (const empty of [undefined, null, '', '   ']) {
+    assert.equal(
+      describeAudioWorkletProblem(INSECURE_ENV, empty)?.detail,
+      generic.detail,
+      `secureUrl ${JSON.stringify(empty)} must leave the message exactly as it was`,
+    );
+  }
+
+  // ── secureAddressAdvice, the piece that decides ──────────────────────────
+  assert.equal(secureAddressAdvice('https://192.168.1.34:5443')?.includes('192.168.1.34:5443'), true);
+  assert.equal(secureAddressAdvice(' https://host:5443 ')?.includes('https://host:5443'), true, 'trimmed');
+  assert.equal(secureAddressAdvice('HTTPS://host:5443')?.includes('HTTPS://host:5443'), true, 'scheme case');
+  assert.equal(secureAddressAdvice(null), null);
+  assert.equal(secureAddressAdvice(undefined), null);
+  assert.equal(secureAddressAdvice(''), null);
+  // The whole point is a SECURE context. A second plain-http address would
+  // send the reader to a page with exactly this fault.
+  assert.equal(secureAddressAdvice('http://192.168.1.34:5173'), null, 'http is not a cure for http');
+  assert.equal(secureAddressAdvice('192.168.1.34:5443'), null, 'a bare host:port is not an address to open');
+  assert.equal(secureAddressAdvice('app://./index.html'), null);
 }
 
 // ── SOURCE GUARD: nothing under src calls addModule directly ────────────────

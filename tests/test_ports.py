@@ -59,6 +59,21 @@ def test_the_posix_launcher_clears_exactly_this_table():
     assert found == ports.ALL_PORTS
 
 
+def test_the_lan_https_listener_has_a_port_in_the_table():
+    """The TLS Vite listener that makes theDAW a secure context on the LAN is
+    a port the launchers start and therefore a port they must also clear: a
+    stale one left holding 5443 stops the next launch from serving audio, mic
+    and MIDI to any other device."""
+    assert ports.LAN_HTTPS_PORT == 5443
+    assert ports.LAN_HTTPS_PORT in ports.ALL_PORTS
+
+
+def test_no_two_of_our_ports_are_the_same_number():
+    """Two entries sharing a number means one of the services silently never
+    binds, and the launcher sweeps the other one's process."""
+    assert len(set(ports.ALL_PORTS)) == len(ports.ALL_PORTS)
+
+
 def test_default_ports_are_a_subset_that_includes_the_backend():
     assert set(ports.DEFAULT_PORTS) <= set(ports.ALL_PORTS)
     assert ports.BACKEND_PORT in ports.DEFAULT_PORTS

@@ -42,6 +42,10 @@ backend/modules/vst/vst3_scan_cache.json
 data/vst_presets/
 # LAN pairing token (a secret, generated per install)
 data/pairing_token.txt
+# Self-signed HTTPS certificate + private key for the LAN listener, generated
+# per install by backend/lib/lan_cert.py. The key is a secret; the certificate
+# names this machine's LAN addresses and hostname.
+data/lan-cert/
 # One-time notation migration bookkeeping (regenerated on demand)
 data/notation_migrations.json
 CHANGES-LOGS/

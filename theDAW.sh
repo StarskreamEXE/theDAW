@@ -101,7 +101,7 @@ fi
 say "live VST host: not available on this platform"
 
 # -- Kill any stale listeners on our ports -----------------------------------
-for port in 5173 8600 5187 5188 5472; do
+for port in 5173 5443 8600 5187 5188 5472; do
   if command -v fuser >/dev/null 2>&1; then
     fuser -k "${port}/tcp" >/dev/null 2>&1 || true
   elif command -v lsof >/dev/null 2>&1; then

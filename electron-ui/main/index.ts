@@ -23,6 +23,13 @@ import { pathToFileURL } from 'url'
 // still reads as F# in the log.
 import { plainAscii } from '../../frontend/src/lib/plainText'
 import { AutoDownloadClaims, uniqueDownloadPath } from './downloadNaming'
+import {
+  lanHttpsLogLine,
+  lanListenerCommand,
+  lanListenerEnv,
+  parseLanHttpsPlan,
+  type LanHttpsPlan,
+} from './lanHttps'
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -557,6 +564,9 @@ function spawnBackend(): void {
 
 function killBackend(): Promise<void> {
   return new Promise((resolve) => {
+    // Before the early return below: the LAN listener exists whether or not
+    // this process spawned the backend, and it must not outlive the app.
+    killLanHttps()
     if (!backendProcess || !weSpawnedBackend) {
       resolve()
       return
@@ -619,6 +629,156 @@ function killBackend(): Promise<void> {
       settle()
     }, 6000)
   })
+}
+
+// ---------------------------------------------------------------------------
+// The LAN HTTPS listener (dev only)
+//
+// electron-vite's renderer dev server is plain http on :5173. A second computer
+// opening theDAW at http://<lan-ip>:5173 is not a secure context, so Chromium
+// withholds AudioContext.audioWorklet, the microphone, Web MIDI, the clipboard
+// and crypto.subtle -- the EDIT tab dies on `ctx.audioWorklet` being undefined.
+// So dev mode also serves the SAME app over TLS on the LAN port.
+//
+// Whether it runs at all is one decision, shared with the web launcher and
+// owned by backend/lib/lan_https.py (the setting, the LAN address, the
+// certificate). This side asks that module rather than reimplementing it, and
+// nothing here can hold up the window: the plan is read on its own timeline,
+// the spawn is never awaited, and every failure is one log line.
+//
+// A packaged build serves its UI over app:// and has no dev server to mirror;
+// the packaged LAN path is separate work.
+// ---------------------------------------------------------------------------
+
+let lanHttpsProcess: ChildProcess | null = null
+
+/** The Python that answers the plan: the dev venv's when it exists (the same
+ *  reliable path spawnBackend prefers), otherwise `uv run`. */
+function lanHttpsPlanCommand(): { command: string; args: string[] } {
+  const module = ['-m', 'backend.lib.lan_https', '--json']
+  const devVenvPy = venvPython(path.join(getPythonDir(), '.venv'))
+  if (fs.existsSync(devVenvPy)) return { command: devVenvPy, args: module }
+  return { command: getUvCommand(), args: ['run', 'python', ...module] }
+}
+
+/** The plan, or null when it could not be read. Never rejects. */
+function readLanHttpsPlan(): Promise<LanHttpsPlan | null> {
+  return new Promise((resolve) => {
+    const { command, args } = lanHttpsPlanCommand()
+    let stdout = ''
+    let settled = false
+    const done = (plan: LanHttpsPlan | null): void => {
+      if (settled) return
+      settled = true
+      resolve(plan)
+    }
+    try {
+      const proc = spawn(command, args, {
+        cwd: getPythonDir(),
+        env: buildBaseEnv(),
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      })
+      // A cold `uv run` can be slow; a hung one must still not keep this
+      // pending forever, because killLanHttps has nothing to kill until the
+      // spawn below has happened.
+      const deadline = setTimeout(() => {
+        try {
+          proc.kill()
+        } catch {
+          // already gone
+        }
+        log('LAN (https): the plan took too long — no listener this launch.')
+        done(null)
+      }, 30_000)
+      proc.stdout?.on('data', (data: Buffer) => {
+        stdout += data.toString()
+      })
+      proc.stderr?.on('data', (data: Buffer) => {
+        const text = plainAscii(data.toString()).trimEnd()
+        if (text) log(`[lan:plan] ${text}`)
+      })
+      proc.on('error', (err) => {
+        clearTimeout(deadline)
+        log(`LAN (https): the plan could not be read (${err.message})`)
+        done(null)
+      })
+      proc.on('exit', () => {
+        clearTimeout(deadline)
+        done(parseLanHttpsPlan(stdout))
+      })
+    } catch (err) {
+      log(`LAN (https): the plan could not be read (${String(err)})`)
+      done(null)
+    }
+  })
+}
+
+async function startLanHttps(): Promise<void> {
+  if (app.isPackaged || isQuitting || lanHttpsProcess) return
+
+  const plan = await readLanHttpsPlan()
+  log(lanHttpsLogLine(plan))
+  // The user began quitting while the plan was being read: a listener started
+  // now is one nothing would ever kill.
+  if (!plan || !plan.enabled || isQuitting) return
+
+  const { command, args } = lanListenerCommand(process.platform)
+  const frontendDir = path.join(repoRoot, 'frontend')
+  try {
+    lanHttpsProcess = spawn(command, args, {
+      cwd: frontendDir,
+      // buildBaseEnv() drops the launch token; lanListenerEnv drops it again
+      // and adds only the four names vite.lan.config.ts reads. Vite runs the
+      // frontend's own devDependencies, so none of it may pass as this shell.
+      env: lanListenerEnv(buildBaseEnv(), plan),
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    })
+  } catch (err) {
+    lanHttpsProcess = null
+    log(`LAN (https): the listener could not start (${String(err)})`)
+    return
+  }
+
+  const emit = (data: Buffer): void => {
+    for (const raw of data.toString().split('\n')) {
+      const text = plainAscii(raw.replace(/\r$/, '')).trimEnd()
+      if (text) log(`[lan] ${text}`)
+    }
+  }
+  lanHttpsProcess.stdout?.on('data', emit)
+  lanHttpsProcess.stderr?.on('data', emit)
+  lanHttpsProcess.on('exit', (code, signal) => {
+    lanHttpsProcess = null
+    if (!isQuitting) log(`LAN (https): the listener exited (code=${code}, signal=${signal}).`)
+  })
+  lanHttpsProcess.on('error', (err) => {
+    lanHttpsProcess = null
+    log(`LAN (https): listener process error: ${err.message}`)
+  })
+}
+
+/** Stop the listener. Synchronous and idempotent: quitting must not wait on
+ *  it, and it is called from both will-quit and killBackend. */
+function killLanHttps(): void {
+  const proc = lanHttpsProcess
+  lanHttpsProcess = null
+  if (!proc || proc.exitCode !== null) return
+  const pid = proc.pid
+  log('Stopping the LAN HTTPS listener...')
+  try {
+    if (process.platform === 'win32' && pid) {
+      // Through `cmd /c npx`, so the tree — not just the shell — has to go.
+      execFile('taskkill', ['/F', '/T', '/PID', String(pid)], { env: buildBaseEnv() }, (err) => {
+        if (err) log(`LAN (https): taskkill error: ${err.message}`)
+      })
+    } else {
+      proc.kill()
+    }
+  } catch {
+    // already gone
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1451,6 +1611,11 @@ if (gotSingleInstanceLock) app.whenReady().then(async () => {
     log('Backend already running — skipping spawn.')
     await warnIfBackendLacksLaunchToken()
   }
+
+  // The same app over TLS for other devices on the network. Deliberately not
+  // awaited: reading the plan shells out to Python, and the window must never
+  // wait on it. Dev only; a failure is one log line and the app runs as before.
+  void startLanHttps()
 })
 
 app.on('window-all-closed', () => {
@@ -1480,6 +1645,9 @@ let backendStoppedForQuit = false
 app.on('will-quit', (event) => {
   if (backendStoppedForQuit) return
   backendStoppedForQuit = true
+  // Unconditionally, unlike the backend below: the LAN listener is ours even
+  // when the backend was already running and we never spawned one.
+  killLanHttps()
   if (weSpawnedBackend && backendProcess) {
     event.preventDefault()
     killBackend().finally(() => {

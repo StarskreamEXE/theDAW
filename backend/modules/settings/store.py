@@ -35,6 +35,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         # starts anything): "web" = backend + Vite + browser (current default),
         # "desktop" = the Electron shell. Both share the same backend + DB.
         "launch_mode": "web",
+        "lan_https": True,
     },
     "analysis": {
         # Analysis is cheap (local librosa + aubio), so it's default-ON

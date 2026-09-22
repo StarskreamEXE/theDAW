@@ -168,7 +168,7 @@ ver >nul
 :: returns and the extra second bought nothing.
 :: Each /c: pattern keeps its TRAILING SPACE, so ":5173 " matches only port
 :: 5173 and never an ephemeral port like 51730 that merely starts with it.
-for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr "LISTENING" ^| findstr /c:":5173 " /c:":8600 " /c:":5187 " /c:":5188 " /c:":5472 "') do taskkill /F /PID %%a >nul 2>&1
+for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr "LISTENING" ^| findstr /c:":5173 " /c:":5443 " /c:":8600 " /c:":5187 " /c:":5188 " /c:":5472 "') do taskkill /F /PID %%a >nul 2>&1
 
 :: -- Read the saved launch mode (web | desktop) from data\settings.json -
 :: Set in-app via Settings -> Startup. Defaults to web if unset/missing.

@@ -29,7 +29,9 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 
+from backend import ports
 from backend._update_sync import UPDATE_EXIT_CODE, run_dependency_sync
+from backend.lib import lan_https, launch_token
 
 RESTART_EXIT_CODE = 88
 FRONTEND_URL = "http://localhost:5173"
@@ -41,6 +43,7 @@ COLORS = {
     "backend": "\033[36m",  # cyan
     "frontend": "\033[35m",  # magenta
     "tunnel": "\033[33m",  # yellow
+    "lan": "\033[94m",  # bright blue (the LAN HTTPS listener)
     "stack": "\033[32m",  # green (our own notices)
 }
 RESET = "\033[0m"
@@ -288,6 +291,50 @@ def _run_backend(children: list) -> None:
         return
 
 
+def _start_lan_listener(children: list, frontend_dir: str) -> bool:
+    """Start the second Vite listener — the same app over TLS — beside the
+    plain http one, so another device on the network gets a SECURE CONTEXT
+    and therefore an audio engine, a microphone and Web MIDI.
+
+    Never fatal, at any step. The listener is a convenience; the stack has to
+    come up without it, and the user has to be told in one line why it did
+    not rather than left wondering why the LAN address is still plain http.
+    A port that is already taken is reported through
+    ``backend.ports.describe_occupant`` — the same sentence the backend's own
+    port clash produces — instead of letting Vite die on strictPort.
+
+    The child's environment starts from ``launch_token.child_env()``: vite
+    runs the frontend's own devDependencies, and none of that may be able to
+    send the desktop shell's ``X-TheDAW-Launch-Token``.
+    """
+    try:
+        plan = lan_https.resolve_plan()
+    except Exception as exc:  # pragma: no cover - resolve_plan does not raise
+        _emit("stack", f"LAN (https): off - could not be worked out ({exc})")
+        return False
+
+    if not plan.enabled:
+        _emit("stack", plan.log_line())
+        return False
+
+    occupant = ports.describe_occupant(plan.port)
+    if occupant:
+        _emit("stack", f"LAN (https): port {plan.port} is taken - {occupant}")
+        return False
+
+    try:
+        env = lan_https.listener_env(plan, launch_token.child_env())
+        proc = _spawn(lan_https.LISTENER_COMMAND, cwd=frontend_dir, env=env)
+    except Exception as exc:
+        _emit("stack", f"LAN (https): off - the listener could not start ({exc})")
+        return False
+
+    children.append(proc)
+    threading.Thread(target=_pump, args=("lan", proc), daemon=True).start()
+    _emit("stack", plan.log_line())
+    return True
+
+
 def _port_open(host: str, port: int) -> bool:
     try:
         with socket.create_connection((host, port), timeout=0.25):
@@ -378,6 +425,11 @@ def main() -> int:
     frontend = _spawn("npm run dev", cwd=frontend_dir, env=fe_env)
     children.append(frontend)
     threading.Thread(target=_pump, args=("frontend", frontend), daemon=True).start()
+
+    # The same app over TLS on the LAN port, so another device gets a secure
+    # context. Off, with a reason, when there is no network, no certificate or
+    # the user turned it off; never blocks or fails the stack.
+    _start_lan_listener(children, frontend_dir)
 
     # Tunnel (optional) — only if localtunnel is installed.
     if shutil.which("lt"):

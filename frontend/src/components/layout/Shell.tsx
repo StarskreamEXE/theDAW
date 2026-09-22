@@ -142,7 +142,16 @@ export const Shell: React.FC = () => {
   // from the backend so the QR points phones at a real address instead
   // of localhost. Falls back to window.location.origin when there's no
   // LAN IP (e.g. offline). Mirrors how the VJ tab builds its mobile QR.
+  //
+  // `GET /api/network/lan` answers with `https_url` as well when the launcher
+  // has a TLS listener UP on this machine right now (backend/lib/lan_https.py,
+  // frontend/vite.lan.config.ts). That address is the one to hand out: a
+  // browser exposes AudioWorklet, the microphone, Web MIDI, the clipboard and
+  // crypto.subtle only in a secure context, so a phone or second PC opening
+  // the plain-http address gets an app whose EDIT tab cannot start audio at
+  // all. When no listener is up the link is exactly the http one it was.
   const [lanUrl, setLanUrl] = React.useState('');
+  const [lanHttpsUrl, setLanHttpsUrl] = React.useState('');
   const isBackendReadyForLan = useStatusBarStore((s) => s.isBackendReady);
   React.useEffect(() => {
     // Wait for the backend: on a packaged cold start this fetch used to fire
@@ -150,14 +159,19 @@ export const Shell: React.FC = () => {
     // app://. origin fallback forever.
     if (!isBackendReadyForLan || lanUrl) return;
     let cancelled = false;
-    void fetch('/api/vj/lan-ip')
+    void fetch('/api/network/lan')
       .then((r) => (r.ok ? r.json() : null))
-      .then((j: { lan_ip?: string | null } | null) => {
+      .then((j: { lan_ip?: string | null; https_url?: string | null } | null) => {
         if (cancelled || !j?.lan_ip || typeof window === 'undefined') return;
+        // Only an https address is an upgrade; anything else and we would be
+        // swapping one insecure origin for another.
+        const secure = (j.https_url ?? '').trim();
+        const isSecure = secure.toLowerCase().startsWith('https://');
+        if (isSecure) setLanHttpsUrl(secure);
         // Packaged app has no window port (app://. origin) — phones reach it
         // on the backend port; browser dev keeps its own port (5173 fallback).
         const port = lanReachablePort() || '5173';
-        setLanUrl(`http://${j.lan_ip}:${port}`);
+        setLanUrl(isSecure ? secure : `http://${j.lan_ip}:${port}`);
       })
       .catch(() => {
         /* no backend / no LAN — keep the http fallback */
@@ -173,6 +187,11 @@ export const Shell: React.FC = () => {
   const detectedShareUrl =
     lanUrl || (typeof window === 'undefined' ? '' : backendHttpBase());
   const shareUrl = shareUrlOverride.trim() || detectedShareUrl;
+  // True only when the link being handed out is THIS machine's own TLS
+  // listener — not when the user has pasted some other https URL (a Cloudflare
+  // tunnel, say) into the override, where the certificate note below would be
+  // wrong: a tunnel presents a certificate the browser already trusts.
+  const shareUrlIsLanHttps = Boolean(lanHttpsUrl) && shareUrl === lanHttpsUrl;
 
   // Phone-companion pairing. The host picks the posture (open LAN or a required
   // code) before handing out the QR; the code rides the URL as ?xrcode=<code>
@@ -537,6 +556,11 @@ export const Shell: React.FC = () => {
                 <a href={shareUrl} target="_blank" rel="noreferrer noopener" className="inline-flex items-center gap-1 text-[9px] font-mono text-emerald-300/75 hover:text-emerald-200 transition-colors">
                   <ExternalLink className="w-2.5 h-2.5" /> Open link in new tab
                 </a>
+                {shareUrlIsLanHttps && (
+                  <p className="text-[9px] leading-relaxed text-emerald-300/70">
+                    Secure address &mdash; audio, mic and MIDI work on other devices. The first visit shows a certificate warning; choose Proceed.
+                  </p>
+                )}
               </div>
 
               <div className="flex flex-col gap-1.5">
@@ -665,7 +689,7 @@ export const Shell: React.FC = () => {
       {/* Standing explanation when this page cannot run AudioWorklet at all
           (plain-http LAN address, or a browser without it). Renders null on a
           page that is fine, and once dismissed for this session. */}
-      <AudioWorkletUnavailableNotice />
+      <AudioWorkletUnavailableNotice secureUrl={lanHttpsUrl || null} />
       {/* Startup HOME landing (card grid per workspace). Auto-opened by App on
           returning launches; also reachable from the app menu. */}
       {homeOpen && (

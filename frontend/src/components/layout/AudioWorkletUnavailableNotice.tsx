@@ -49,12 +49,23 @@ const rememberDismissed = (): void => {
 interface AudioWorkletUnavailableNoticeProps {
   /** Globals to read instead of the real ones. Tests only. */
   env?: AudioWorkletEnv;
+  /**
+   * The LAN https address this machine also serves the app on, from
+   * `GET /api/network/lan` (Shell). When present the notice names it, which
+   * turns "arrange a secure context somehow" into one address to open. It
+   * arrives asynchronously, after this component has already mounted and told
+   * the user the generic version, so the text is re-derived when it lands.
+   */
+  secureUrl?: string | null;
 }
 
-export const AudioWorkletUnavailableNotice: React.FC<AudioWorkletUnavailableNoticeProps> = ({ env }) => {
+export const AudioWorkletUnavailableNotice: React.FC<AudioWorkletUnavailableNoticeProps> = ({
+  env,
+  secureUrl,
+}) => {
   // The page's secure-context status cannot change without a navigation, so
-  // this is decided once per mount rather than re-derived on every render.
-  const [problem] = React.useState(() => describeAudioWorkletProblem(env));
+  // the DIAGNOSIS is stable; only the address we can offer as the cure moves.
+  const problem = React.useMemo(() => describeAudioWorkletProblem(env, secureUrl), [env, secureUrl]);
   const [dismissed, setDismissed] = React.useState(readDismissed);
 
   if (!problem || dismissed) return null;

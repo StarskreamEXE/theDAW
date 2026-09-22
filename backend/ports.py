@@ -58,11 +58,22 @@ from typing import Iterable, Optional
 BACKEND_PORT = 8600
 # The Vite dev server.
 FRONTEND_PORT = 5173
+# The second Vite listener, the one with TLS, that makes theDAW reachable from
+# another device on the LAN as a SECURE CONTEXT. Browsers hand out
+# AudioContext.audioWorklet, the microphone, Web MIDI, the clipboard and
+# crypto.subtle only over https:// or localhost, so a phone or a second PC on
+# plain http://<lan-ip>:5173 gets an EDIT tab with no audio engine at all.
+LAN_HTTPS_PORT = 5443
 # The sidecars theDAW.bat and theDAW.sh also clear: VJ, Sway and the tunnel.
 SIDECAR_PORTS = (5187, 5188, 5472)
 
 #: Every port a launcher clears, in the order the shipped launchers list them.
-ALL_PORTS: tuple[int, ...] = (FRONTEND_PORT, BACKEND_PORT, *SIDECAR_PORTS)
+ALL_PORTS: tuple[int, ...] = (
+    FRONTEND_PORT,
+    LAN_HTTPS_PORT,
+    BACKEND_PORT,
+    *SIDECAR_PORTS,
+)
 
 #: What ``--free`` touches by default: the two that actually block a start.
 DEFAULT_PORTS: tuple[int, ...] = (FRONTEND_PORT, BACKEND_PORT)
