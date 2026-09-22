@@ -161,9 +161,6 @@ export const Shell: React.FC = () => {
   const [lanUrl, setLanUrl] = React.useState('');
   const [lanHttpsUrl, setLanHttpsUrl] = React.useState('');
   const isBackendReadyForLan = useStatusBarStore((s) => s.isBackendReady);
-  // The override address wins over anything detected, so there is nothing for
-  // a poll to discover while one is typed in.
-  const lanPollSuspended = shareUrlOverride.trim() !== '';
   React.useEffect(() => {
     // Wait for the backend: on a packaged cold start this fetch used to fire
     // once before :8600 was bound, fail, and leave the share link on the
@@ -178,7 +175,14 @@ export const Shell: React.FC = () => {
     // the life of the window. Instead: show the http address at once, keep
     // asking on a bounded schedule, and adopt the secure address when it
     // arrives (which stops the polling, because `lanHttpsUrl` is the guard).
-    if (!isBackendReadyForLan || lanHttpsUrl || lanPollSuspended) return;
+    //
+    // Nor is it guarded on the share-URL override. The override decides what
+    // the SHARE LINK is (see `shareUrl` below, where it still wins), but
+    // `lanHttpsUrl` is a separate fact about this machine that the rest of the
+    // UI needs: AudioWorkletUnavailableNotice names it as the address to
+    // reopen the app on. Suspending the poll while an override was typed in
+    // left that notice with no concrete https address to offer.
+    if (!isBackendReadyForLan || lanHttpsUrl) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const giveUpAt = Date.now() + LAN_HTTPS_POLL_WINDOW_MS;
@@ -223,7 +227,7 @@ export const Shell: React.FC = () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, [isBackendReadyForLan, lanHttpsUrl, lanPollSuspended]);
+  }, [isBackendReadyForLan, lanHttpsUrl]);
 
   // Never fall back to window.location.origin blindly: in the packaged app
   // that is app://., which is useless on a phone AND opens a second copy of

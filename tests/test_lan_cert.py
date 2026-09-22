@@ -318,6 +318,57 @@ def test_a_good_certificate_is_reused_rather_than_regenerated(data_dir: Path):
 
 
 @needs_openssl
+def test_a_key_that_does_not_belong_to_the_certificate_regenerates(
+    data_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The pair is written in two atomic replaces, one after the other, so a
+    crash (or a kill, or a power cut) between them leaves a key from one pair
+    beside a certificate from another. cert_matches reads only the certificate
+    and _key_is_pem only the key's first bytes, so both went on passing for the
+    life of the installation while vite died on the mismatch at every launch.
+
+    Minted here the way it happens for real: a good pair, then a SECOND pair
+    elsewhere whose key is copied over the first one's."""
+    first = lan_cert.ensure_lan_cert(["192.168.1.34"])
+    assert first is not None
+    good_cert = first.cert.read_bytes()
+    good_key = first.key.read_bytes()
+
+    # A second, unrelated pair, minted into its own data tree.
+    elsewhere = tmp_path / "elsewhere"
+    monkeypatch.setenv("theDAW_DATA_DIR", str(elsewhere))
+    other = lan_cert.ensure_lan_cert(["192.168.1.34"])
+    assert other is not None
+    stranger_key = other.key.read_bytes()
+    monkeypatch.setenv("theDAW_DATA_DIR", str(data_dir))
+    assert stranger_key != good_key, "two RSA keygens must not collide"
+
+    # The half-finished state: this certificate, that key.
+    first.key.write_bytes(stranger_key)
+    assert lan_cert._key_is_pem(first.key), "the stranger key is valid PEM on its own"
+
+    repaired = lan_cert.ensure_lan_cert(["192.168.1.34"])
+    assert repaired is not None
+    assert repaired.cert.read_bytes() != good_cert, "the certificate is remade"
+    assert repaired.key.read_bytes() not in (stranger_key, good_key), (
+        "and so is the key, as a matching pair"
+    )
+    assert lan_cert._pair_matches(
+        lan_cert.find_openssl(), repaired.cert, repaired.key
+    ), "the pair on disk belongs together again"
+
+
+@needs_openssl
+def test_a_matching_pair_reads_as_matching(data_dir: Path):
+    """The other half of the check: a freshly minted pair must not be thrown
+    away on every launch by a comparison that never agrees (a CRLF difference
+    in openssl's own output would do it)."""
+    pair = lan_cert.ensure_lan_cert(["192.168.1.34"])
+    assert pair is not None
+    assert lan_cert._pair_matches(lan_cert.find_openssl(), pair.cert, pair.key) is True
+
+
+@needs_openssl
 def test_a_new_lan_address_regenerates(data_dir: Path):
     first = lan_cert.ensure_lan_cert(["192.168.1.34"])
     assert first is not None

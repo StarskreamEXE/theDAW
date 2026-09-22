@@ -667,7 +667,12 @@ let lanPlanProcess: ChildProcess | null = null
  *  the next launch, or a uv still in the venv. Synchronous and idempotent:
  *  quitting must not wait on either. */
 function killLanChild(proc: ChildProcess | null, what: string): void {
-  if (!proc || proc.exitCode !== null) return
+  // A child killed by a signal has `exitCode === null` and `signalCode` set --
+  // node reports one or the other, never both. Testing only exitCode meant a
+  // listener already taken down by taskkill (or a SIGTERM'd uv on posix) was
+  // "killed" a second time, logging a line and, on Windows, running a taskkill
+  // against a pid the OS is free to have reused.
+  if (!proc || proc.exitCode !== null || proc.signalCode !== null) return
   const pid = proc.pid
   log(`Stopping ${what}...`)
   try {
@@ -754,7 +759,12 @@ function readLanHttpsPlan(): Promise<LanHttpsPlan | null> {
         log(`LAN (https): the plan could not be read (${err.message})`)
         done(null)
       })
-      proc.on('exit', () => {
+      // 'close', not 'exit': 'exit' fires when the process ends, while its
+      // stdio pipes can still have buffered data on the way. Parsing there
+      // could read a truncated final line -- exactly the line the plan is on --
+      // and silently turn a good plan into "no plan". 'close' fires once every
+      // stream is drained and closed, so the plan is whole by then.
+      proc.on('close', () => {
         clearTimeout(deadline)
         release()
         done(parseLanHttpsPlan(stdout))
@@ -790,7 +800,7 @@ async function startLanHttps(): Promise<void> {
     lanHttpsProcess = spawn(command, args, {
       cwd: frontendDir,
       // buildBaseEnv() drops the launch token; lanListenerEnv drops it again
-      // and adds only the four names vite.lan.config.ts reads. Vite runs the
+      // and adds only the three names vite.lan.config.ts reads. Vite runs the
       // frontend's own devDependencies, so none of it may pass as this shell.
       env: lanListenerEnv(buildBaseEnv(), plan),
       stdio: ['ignore', 'pipe', 'pipe'],

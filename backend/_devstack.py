@@ -291,6 +291,38 @@ def _run_backend(children: list) -> None:
         return
 
 
+#: ``children`` is created on the main thread but appended to from the backend
+#: supervisor thread and, now that the LAN listener no longer runs inline, from
+#: the listener thread too -- which can still be waiting on a 120 s openssl when
+#: the user hits Ctrl-C. A plain append races ``main()``'s final kill loop, and
+#: one that lands after it leaves a vite holding the TLS port against the next
+#: launch. So the list is CLOSED before that loop runs and a child registered
+#: too late is killed by the thread that started it instead.
+_children_lock = threading.Lock()
+_children_closed = False
+
+
+def _register_child(children: list, proc: subprocess.Popen) -> bool:
+    """Add ``proc`` to the shutdown list.
+
+    False when the stack is already tearing down, in which case the caller owns
+    the process and must kill it itself.
+    """
+    with _children_lock:
+        if _children_closed:
+            return False
+        children.append(proc)
+        return True
+
+
+def _close_children(children: list) -> list:
+    """Take a snapshot of the shutdown list and refuse every later register."""
+    global _children_closed
+    with _children_lock:
+        _children_closed = True
+        return list(children)
+
+
 def _start_lan_listener(children: list, frontend_dir: str) -> bool:
     """Start the second Vite listener — the same app over TLS — beside the
     plain http one, so another device on the network gets a SECURE CONTEXT
@@ -329,7 +361,12 @@ def _start_lan_listener(children: list, frontend_dir: str) -> bool:
         _emit("stack", f"LAN (https): off - the listener could not start ({exc})")
         return False
 
-    children.append(proc)
+    if not _register_child(children, proc):
+        # The stack started stopping while openssl was running: nothing is left
+        # to kill this on the way out, so it goes now.
+        _kill_tree(proc)
+        _emit("stack", "LAN (https): the stack is stopping - listener dropped")
+        return False
     threading.Thread(target=_pump, args=("lan", proc), daemon=True).start()
     _emit("stack", plan.log_line())
     return True
@@ -429,7 +466,16 @@ def main() -> int:
     # The same app over TLS on the LAN port, so another device gets a secure
     # context. Off, with a reason, when there is no network, no certificate or
     # the user turned it off; never blocks or fails the stack.
-    _start_lan_listener(children, frontend_dir)
+    #
+    # On its own thread, like _warm_sidecars below, because getting to the
+    # decision is slow: resolve_plan() shells out to openssl to mint an RSA key
+    # (a 120 s timeout) and describe_occupant enumerates every listener on the
+    # machine. Inline, all of that sat in front of the backend supervisor and
+    # the browser, so a first launch waited on a certificate and a hung openssl
+    # held the whole app for two minutes.
+    threading.Thread(
+        target=_start_lan_listener, args=(children, frontend_dir), daemon=True
+    ).start()
 
     # Tunnel (optional) — only if localtunnel is installed.
     if shutil.which("lt"):
@@ -453,7 +499,10 @@ def main() -> int:
         _emit("stack", "Ctrl-C — stopping all processes")
     finally:
         _shutdown.set()
-        for proc in children:
+        # Closed first: a child registered after this point (the LAN listener
+        # thread finishing its openssl call during shutdown) is killed by that
+        # thread rather than missed by this loop.
+        for proc in _close_children(children):
             _kill_tree(proc)
     return 0
 

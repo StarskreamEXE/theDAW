@@ -12,7 +12,7 @@ interstitial once.
 
 Everything here goes through the ``openssl`` command line rather than a Python
 library. ``cryptography`` is not a dependency of this project and adding one
-for four subprocess calls would be a poor trade: ``openssl`` ships with Git
+for a handful of subprocess calls would be a poor trade: ``openssl`` ships with Git
 for Windows (which every Windows install of theDAW already has, because the
 launcher uses git) and is standard everywhere else.
 
@@ -311,6 +311,41 @@ def _key_is_pem(key: Path) -> bool:
     return head.startswith(b"-----BEGIN ")
 
 
+def _pem_body(text: str) -> str:
+    """``text`` with blank lines dropped and every line stripped.
+
+    So a PEM written with CRLF compares equal to the same PEM with LF: openssl
+    on Windows is not consistent about which it emits.
+    """
+    return "\n".join(line.strip() for line in text.splitlines() if line.strip())
+
+
+def _pair_matches(openssl: str, cert: Path, key: Path) -> bool:
+    """True when ``key`` is the private key belonging to ``cert``.
+
+    The two files are replaced one after the other, so a crash, a kill or a
+    power cut between the two leaves a key from one pair beside a certificate
+    from another. :func:`cert_matches` reads only the certificate and
+    :func:`_key_is_pem` reads only the key's first bytes, so both went on
+    passing for the life of the installation while vite died on the mismatch at
+    every single launch, and nothing ever regenerated the pair.
+
+    The comparison is between PUBLIC keys -- ``openssl x509 -noout -pubkey``
+    from the certificate against ``openssl pkey -pubout`` from the key -- so no
+    private material is read into this process. Neither PEM is logged either;
+    a public key is not a secret, but nothing here needs to print one.
+    """
+    try:
+        from_cert = _run([openssl, "x509", "-noout", "-pubkey", "-in", str(cert)])
+        from_key = _run([openssl, "pkey", "-pubout", "-in", str(key)])
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if from_cert.returncode != 0 or from_key.returncode != 0:
+        return False
+    from_cert_pem = _pem_body(from_cert.stdout)
+    return bool(from_cert_pem) and from_cert_pem == _pem_body(from_key.stdout)
+
+
 def _cleanup(*items: Path) -> None:
     for item in items:
         try:
@@ -357,7 +392,15 @@ def ensure_lan_cert(
     cert, key = cert_file(), key_file()
     if cert.exists() and key.exists():
         described = _describe_existing(binary, cert)
-        if described and cert_matches(described, sans, now) and _key_is_pem(key):
+        if (
+            described
+            and cert_matches(described, sans, now)
+            and _key_is_pem(key)
+            # ...and the key on disk is actually THIS certificate's key: the
+            # pair is replaced in two steps, and an interrupted launch leaves
+            # two halves that every other check here accepts forever.
+            and _pair_matches(binary, cert, key)
+        ):
             return CertPaths(cert=cert, key=key)
 
     tmp_cert = temp_sibling(cert)

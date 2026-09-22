@@ -116,7 +116,16 @@ export function lanHttpsLogLine(plan: LanHttpsPlan | null): string {
  * On Windows that binary is `vite.cmd`, a batch shim: node refuses to spawn
  * one directly (EINVAL, since the 2024 argument-injection fix), so it goes
  * through `cmd /c` -- the same reason spawnBackend's Windows fallback does.
- * The path is quoted there because it can contain a space.
+ *
+ * Each piece is its OWN argv element and NOTHING is pre-quoted here. The path
+ * can contain a space (`C:\Program Files\...`), and quoting it ourselves broke
+ * every such install: libuv builds cmd's command line from this array and
+ * quotes any element containing a space itself, escaping the quotes already
+ * inside it, so cmd was handed `\"C:\Program Files\...\vite.cmd\" --config ...`
+ * and answered `'\"C:\Program Files\...\vite.cmd\"' is not recognized as an
+ * internal or external command` (measured). Handing the path over unquoted,
+ * libuv wraps it in the one pair of quotes cmd's two-quote rule strips, and the
+ * batch shim runs with `--config vite.lan.config.ts` intact.
  */
 export function lanListenerCommand(
   platform: string,
@@ -127,8 +136,7 @@ export function lanListenerCommand(
     throw new Error('lanListenerCommand is for an enabled plan with a vite binary')
   }
   if (platform === 'win32') {
-    const quoted = vite.includes(' ') ? `"${vite}"` : vite
-    return { command: 'cmd', args: ['/c', [quoted, ...LISTENER_ARGS].join(' ')] }
+    return { command: 'cmd', args: ['/c', vite, ...LISTENER_ARGS] }
   }
   return { command: vite, args: [...LISTENER_ARGS] }
 }

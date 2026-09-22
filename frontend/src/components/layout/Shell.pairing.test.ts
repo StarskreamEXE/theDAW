@@ -182,15 +182,30 @@ assert.match(
   /const LAN_HTTPS_POLL_WINDOW_MS = 60_?000\b/,
   'bounded: after a minute there is no listener coming, and an unbounded poll would run for the life of the app',
 );
-assert.match(
+// The share-URL override must NOT stop the poll. It decides what the share
+// LINK is, and `shareUrl` below still honours it; `lanHttpsUrl` is a separate
+// fact about this machine that AudioWorkletUnavailableNotice needs in order to
+// name a concrete https address to reopen the app on. Suspending the poll
+// meant an override — a tunnel URL, say — cost that notice its address.
+assert.doesNotMatch(
   lanEffect,
+  /lanPollSuspended|shareUrlOverride/,
+  'the LAN effect must keep asking for `lanHttpsUrl` even while a share-URL override is set',
+);
+assert.doesNotMatch(
+  lanDeps,
+  /lanPollSuspended|shareUrlOverride/,
+  'and the override must not be a dependency of it either',
+);
+assert.doesNotMatch(
+  source,
   /lanPollSuspended/,
-  'no polling while the share-URL override is set — that address wins over anything detected',
+  'the suspend flag is gone entirely, not just unread',
 );
 assert.match(
   source,
-  /const lanPollSuspended = shareUrlOverride\.trim\(\) !== ''/,
-  'and that is what "the override is set" means here',
+  /const shareUrl = shareUrlOverride\.trim\(\) \|\| detectedShareUrl/,
+  'the override still wins for the SHARE URL — that is the only thing it decides',
 );
 
 // ── the companion link rides the same base, so it is https too ─────────────

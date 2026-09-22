@@ -45,6 +45,13 @@ log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 9
 
+#: How long a statement waits for another connection's write lock before it
+#: gives up with "database is locked". Python's sqlite3 default is 5 s;
+#: :meth:`LibraryDB._migrate` describes index builds that take "seconds to
+#: minutes", so 5 s turned a slow-but-fine open into an unopenable library.
+#: Bounded on purpose: a true deadlock must still fail rather than hang.
+BUSY_TIMEOUT_MS = 30_000
+
 
 # Each tuple is (schema_version_after_running, statements list).
 # Add new migration tuples as the schema evolves; never edit a shipped one.
@@ -1116,6 +1123,22 @@ class LibraryDB:
         self._writelock = threading.RLock()
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # FIRST, before any statement that can need a lock. sqlite3.connect's
+        # `timeout` default is a 5 s busy timeout, and 5 s is not enough here:
+        # `_migrate` builds indexes that its own docstring measures in "seconds
+        # to minutes" over a large library, and the two statements below plus
+        # the migration's DDL all want the write lock. Whatever else holds it --
+        # a background analysis writer, a reindex, another test's store on the
+        # same file -- SQLITE_BUSY surfaces as `sqlite3.OperationalError:
+        # database is locked` straight out of __init__, which is an unopenable
+        # library rather than a slow one. 30 s is the conventional single-app
+        # SQLite value and is bounded, so a real deadlock still fails loudly.
+        #
+        # It is set before `journal_mode = WAL` deliberately: switching to WAL
+        # needs a momentary EXCLUSIVE lock, so that PRAGMA is the single most
+        # likely statement in this constructor to meet a concurrent reader, and
+        # it used to run with only the implicit connect() timeout behind it.
+        self._conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
         # Foreign keys are off by default; we rely on CASCADE deletes.
         self._conn.execute("PRAGMA foreign_keys = ON")
         # WAL gives us readers concurrent with writers.

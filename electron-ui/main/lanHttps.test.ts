@@ -120,13 +120,23 @@ const ENABLED = {
   // on Windows and, with no node_modules, fetches vite from the registry.
   const win = lanListenerCommand('win32', ENABLED as LanHttpsPlan);
   assert.equal(win.command, 'cmd', 'vite.cmd is a batch shim — node refuses to spawn one directly');
-  assert.deepEqual(win.args, ['/c', `${VITE} --config vite.lan.config.ts`]);
+  assert.deepEqual(win.args, ['/c', VITE, '--config', 'vite.lan.config.ts']);
   assert.ok(!JSON.stringify(win).includes('npx'), 'no npx anywhere in the Windows command');
 
-  // A path with a space in it stays one argument for cmd.
+  // A path with a space in it is handed over UNQUOTED, as its own argv
+  // element. libuv quotes it when it builds cmd's command line; quoting it
+  // here made libuv escape those quotes, and cmd answered `'\"C:\Program
+  // Files\...\vite.cmd\"' is not recognized as an internal or external
+  // command` — measured against a real .cmd under a spaced path. Any `"` in
+  // any argument is that bug coming back.
   const spacedVite = 'C:\\Program Files\\theDAW\\frontend\\node_modules\\.bin\\vite.cmd';
   const spaced = lanListenerCommand('win32', { ...ENABLED, vite: spacedVite } as LanHttpsPlan);
-  assert.deepEqual(spaced.args, ['/c', `"${spacedVite}" --config vite.lan.config.ts`]);
+  assert.deepEqual(spaced.args, ['/c', spacedVite, '--config', 'vite.lan.config.ts']);
+  for (const args of [win.args, spaced.args]) {
+    for (const arg of args) {
+      assert.ok(!arg.includes('"'), `pre-quoted argument: ${arg}`);
+    }
+  }
 
   for (const platform of ['linux', 'darwin']) {
     const posix = lanListenerCommand(platform, ENABLED as LanHttpsPlan);

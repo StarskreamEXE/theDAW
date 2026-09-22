@@ -557,6 +557,27 @@ def test_router_synthesizes_roles_for_an_old_run_without_a_manifest(
     assert "aggregate_of" not in by_name["vocals"]
 
 
+def test_the_library_connection_waits_for_a_lock_instead_of_failing_the_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """This module's router opens the library through get_store(), and on a
+    loaded machine that open raised `sqlite3.OperationalError: database is
+    locked` out of LibraryDB._migrate: nothing set PRAGMA busy_timeout, so the
+    write lock its DDL needs was only ever waited on for sqlite3.connect's
+    implicit 5 s -- less than the index builds _migrate itself measures in
+    "seconds to minutes". An unopenable library, from a lock that would have
+    cleared."""
+    from backend.modules.library.db import BUSY_TIMEOUT_MS
+
+    _client, store = _stems_client(tmp_path, monkeypatch)
+    assert store.db is not None
+    (timeout,) = store.db._conn.execute("PRAGMA busy_timeout").fetchone()  # noqa: SLF001
+    assert timeout == BUSY_TIMEOUT_MS
+    assert BUSY_TIMEOUT_MS > 5_000, (
+        "5 s is sqlite3.connect's default and was not enough"
+    )
+
+
 def test_router_returns_the_manifest_when_one_was_written(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

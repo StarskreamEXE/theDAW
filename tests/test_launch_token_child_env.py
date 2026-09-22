@@ -334,7 +334,7 @@ def _ts_function(source: str, name: str) -> tuple[int, int]:
 
 
 #: The one spawn that cannot pass ``buildBaseEnv()`` straight through: the LAN
-#: HTTPS listener needs four more names (main/lanHttps.ts). It is still built
+#: HTTPS listener needs three more names (main/lanHttps.ts). It is still built
 #: FROM buildBaseEnv(), and lanListenerEnv drops the token a second time --
 #: asserted separately below, and behaviourally in main/lanHttps.test.ts.
 LAN_LISTENER_ENV = "env: lanListenerEnv(buildBaseEnv(), plan)"
@@ -382,7 +382,7 @@ def test_the_desktop_shell_hands_the_token_only_to_the_backend() -> None:
 
 
 def test_the_lan_listeners_environment_drops_the_token_a_second_time() -> None:
-    """main/lanHttps.ts adds four names to buildBaseEnv()'s result, so it is
+    """main/lanHttps.ts adds three names to buildBaseEnv()'s result, so it is
     the one place a future caller could hand the listener a base that still
     carried the token. It removes it itself, under every spelling, exactly as
     buildBaseEnv does -- vite runs the frontend's own devDependencies, and

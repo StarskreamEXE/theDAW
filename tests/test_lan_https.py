@@ -325,6 +325,14 @@ def test_resolve_plan_survives_a_certificate_that_cannot_be_made(
 ) -> None:
     monkeypatch.setattr(lan_https, "read_settings", lambda: {})
     monkeypatch.setattr(lan_https, "detect_lan_ips", lambda: LAN)
+    # The binary is stubbed so THIS test is about the certificate step. CI has
+    # no frontend/node_modules, where the real listener_binary() answers None
+    # and resolve_plan (correctly) refuses with NO_FRONTEND_REASON before it
+    # ever reaches openssl -- and the assertion below then read a reason about
+    # npm install instead of the one it is pinning.
+    monkeypatch.setattr(
+        lan_https, "listener_binary", lambda *a, **k: Path("/fake/.bin/vite")
+    )
     import backend.lib.lan_cert as lan_cert
 
     def refuse(ips: list[str], **kwargs: Any) -> None:
@@ -492,13 +500,55 @@ def test_a_failed_spawn_is_one_line_and_the_stack_still_runs(
     assert any("could not start" in line for line in lines), lines
 
 
-def test_the_web_launcher_starts_the_listener_on_the_way_up() -> None:
-    """main() has to call it, next to the http frontend it mirrors."""
+def test_the_web_launcher_starts_the_listener_on_a_thread_of_its_own() -> None:
+    """main() has to start it, next to the http frontend it mirrors -- and on a
+    daemon thread, never inline. resolve_plan() shells out to openssl to mint an
+    RSA key (a 120 s timeout) and describe_occupant enumerates every listener on
+    the machine; inline, all of that sat in front of the backend supervisor and
+    the browser, so a first launch waited on a certificate and a hung openssl
+    held the whole app for two minutes."""
     source = (REPO_ROOT / "backend" / "_devstack.py").read_text(encoding="utf-8")
     body = source[source.index("def main(") :]
-    assert "_start_lan_listener(children, frontend_dir)" in body
+    assert re.search(
+        r"threading\.Thread\(\s*target=_start_lan_listener,\s*"
+        r"args=\(children, frontend_dir\),\s*daemon=True,?\s*\)\.start\(\)",
+        body,
+    ), body
+    assert "_start_lan_listener(children" not in body, "nothing calls it inline"
     # After the http dev server, so the two lines read in the order they happen.
-    assert body.index('_spawn("npm run dev"') < body.index("_start_lan_listener(")
+    assert body.index('_spawn("npm run dev"') < body.index("_start_lan_listener")
+
+
+def test_a_listener_that_arrives_during_shutdown_is_killed_by_its_own_thread(
+    devstack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Off the main thread, the listener can be registered after main()'s final
+    kill loop has already run -- leaving a vite holding the TLS port against the
+    next launch. So the registry is CLOSED before that loop, and a child that
+    arrives too late is refused, which makes the thread that started it kill the
+    process itself."""
+    module, _spawns, lines = devstack
+    # The plan is stubbed, like every other devstack test here: the real
+    # resolve_plan() needs frontend/node_modules (absent on CI) and shells out
+    # to openssl to mint a certificate into the real data directory.
+    plan = lan_https.plan_lan_https({}, {}, LAN, CERT, vite=VITE)
+    monkeypatch.setattr(module.lan_https, "resolve_plan", lambda: plan)
+    monkeypatch.setattr(module, "_children_closed", False)
+    children: list = []
+    assert module._register_child(children, "early") is True
+
+    assert module._close_children(children) == ["early"], (
+        "the kill loop still gets everything registered in time"
+    )
+    assert module._register_child(children, "late") is False
+    assert children == ["early"], "a late child is never silently added"
+
+    killed: list = []
+    monkeypatch.setattr(module, "_kill_tree", killed.append)
+    assert module._start_lan_listener(children, "C:/theDAW/frontend") is False
+    assert len(killed) == 1, "the refused listener is killed, not leaked"
+    assert children == ["early"]
+    assert any("stopping" in line for line in lines), lines
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +614,26 @@ def test_the_desktop_shell_reads_the_shared_plan_rather_than_deciding_again(
     reader = electron_main[slice(*_ts_function(electron_main, "readLanHttpsPlan"))]
     assert "env: buildBaseEnv()" in reader, "the plan child gets no launch token"
     assert "parseLanHttpsPlan(stdout)" in reader
+
+
+def test_the_plan_is_parsed_once_its_stdout_has_actually_drained(
+    electron_main: str,
+) -> None:
+    """'close', not 'exit'. 'exit' fires when the process ends, while its stdio
+    pipes can still carry buffered data, so the parse could see a truncated
+    final line -- and the plan IS the last line -- turning a good plan into "no
+    plan" and the launch into a silent no-listener. 'close' fires after every
+    stream is drained and closed."""
+    reader = electron_main[slice(*_ts_function(electron_main, "readLanHttpsPlan"))]
+    assert "proc.on('close'" in reader
+    assert "proc.on('exit'" not in reader, "'exit' can fire with stdout unflushed"
+    closed = reader[reader.index("proc.on('close'") :]
+    body = _bracketed(closed, closed.index("{"), "{", "}")
+    assert "done(parseLanHttpsPlan(stdout))" in body
+    # The timeout and the process handle are released there too, not left in a
+    # handler that no longer runs.
+    assert "clearTimeout(deadline)" in body
+    assert "release()" in body
 
 
 def test_the_packaged_app_starts_no_listener(electron_main: str) -> None:
@@ -647,6 +717,18 @@ def test_the_plan_child_is_tracked_so_quitting_takes_it_with_it(
     tree = electron_main[slice(*_ts_function(electron_main, "killLanChild"))]
     assert "'/F', '/T', '/PID'" in tree
     assert "env: buildBaseEnv()" in tree
+
+
+def test_a_child_already_taken_down_by_a_signal_is_not_killed_again(
+    electron_main: str,
+) -> None:
+    """node reports an exit code OR a signal, never both: a listener taskkill
+    has already stopped has exitCode === null and signalCode set. Testing only
+    exitCode logged a second "Stopping..." and, on Windows, ran another taskkill
+    against a pid the OS is free to have reused by then."""
+    tree = electron_main[slice(*_ts_function(electron_main, "killLanChild"))]
+    assert "proc.exitCode !== null" in tree
+    assert "proc.signalCode !== null" in tree
 
 
 def test_a_port_someone_else_holds_is_said_out_loud_rather_than_guessed_at(
