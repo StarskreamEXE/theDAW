@@ -474,8 +474,8 @@ _backup/
 /backend/modules/library/suno_routes.py
 
 # Local scratch and captures that must never ship (kept in place, untracked)
-/2026-09-18/
-/300mb/
+/2026-09-18
+/300mb
 /VST-Foundry-UI/VST-UI-FOUNDRY/exports/
 /docs/design/repair-expansion-report-and-plan.html
 /docs/guides/screenshots.7z
