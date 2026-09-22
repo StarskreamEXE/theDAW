@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from backend.lib import paths
+from backend.lib.atomic import atomic_write
 
 log = logging.getLogger(__name__)
 
@@ -101,11 +102,9 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     """Write ``payload`` atomically — a crash mid-write must never leave a
-    truncated json file for the next read to choke on (same tmp+replace
-    idiom as backend/modules/library/store.py's ``_write_metadata``)."""
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    truncated json file for the next read to choke on, and two writers can
+    never share a temp file (``backend.lib.atomic.atomic_write``)."""
+    atomic_write(path, json.dumps(payload, indent=2))
 
 
 @dataclass

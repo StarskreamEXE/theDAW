@@ -32,6 +32,7 @@ import tempfile
 from collections.abc import Iterable
 from pathlib import Path
 from backend.lib import paths
+from backend.lib.atomic import atomic_write
 
 log = logging.getLogger(__name__)
 
@@ -132,15 +133,13 @@ def _persist() -> None:
     """Best-effort: an unwritable data dir must not fail a save/load request."""
     try:
         _ROOTS_STATE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _ROOTS_STATE.with_suffix(".json.tmp")
-        tmp.write_text(
+        atomic_write(
+            _ROOTS_STATE,
             json.dumps(
                 {"v": _ROOTS_STATE_VERSION, "roots": [str(p) for p in _session_roots]},
                 indent=2,
             ),
-            encoding="utf-8",
         )
-        tmp.replace(_ROOTS_STATE)
     except OSError as e:
         log.warning("project.media_access: failed to persist %s: %s", _ROOTS_STATE, e)
 

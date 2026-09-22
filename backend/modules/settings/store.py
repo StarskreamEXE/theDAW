@@ -20,6 +20,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 from backend.lib import paths
+from backend.lib.atomic import atomic_write
 
 log = logging.getLogger(__name__)
 
@@ -310,9 +311,7 @@ class SettingsStore:
         return merged
 
     def _write(self, payload: dict[str, Any]) -> None:
-        tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        tmp.replace(self.path)
+        atomic_write(self.path, json.dumps(payload, indent=2))
 
     def get_all(self) -> dict[str, Any]:
         with self._lock:
