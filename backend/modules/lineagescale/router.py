@@ -784,3 +784,9 @@ def _startup_warm() -> None:
 # library store is already up when the thread wakes. Nothing to undo at
 # shutdown: the thread is a daemon and holds no handle past its own `with`.
 register_startup_hook("lineagescale-warm", _startup_warm)
+
+# The LEARN explorer (`explore.py`): every number the landing page shows, as a
+# list you can open. Imported HERE, at the bottom, because that module reads
+# this one's snapshot helpers -- by this line they exist -- and it mounts its
+# own sub-router on `router` as it finishes, so either import order works.
+from . import explore as _explore  # noqa: E402,F401

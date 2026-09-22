@@ -401,6 +401,10 @@ _PARAM_VALUES: dict[str, tuple[str, ...]] = {
     "stem_id": (STEM_ID,),
     "job_id": ("scale-no-such-import-job",),
     "asset_id": ("scale-no-such-asset",),
+    # `/api/lineage-scale/explore/kinds/{kind}` — a relation kind, not an id.
+    # `derived_from` is the library's commonest kind (164,779 links in the real
+    # one), so the probe measures the expensive answer rather than an empty one.
+    "kind": ("derived_from",),
 }
 
 
