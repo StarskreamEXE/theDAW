@@ -22,6 +22,14 @@ Three cost rules hold the whole thing up:
   somebody pressed play is the bug this module exists to avoid
   (:class:`_StatsCache`).
 
+That cache is warmed once a few seconds after startup, by a daemon thread
+registered on ``backend/core/startup.py``'s hook registry, so the FIRST LEARN
+open after a restart does not pay for the pass either -- 8.6 s on the real
+library (:func:`warm_stats_cache`). ``/summary`` reports whether it found the
+cache warm. Nothing polls: a library that changes while nobody is looking
+still lets the next request recompute, which is the correct answer arriving
+once rather than a timer burning a pass nobody asked for.
+
 No statement issued from this module names a ``*_json`` column or selects
 ``*``. Real rows carry ~34 KB of ``metadata_json``; reading it per row is
 ~100x slower than the synthetic-row timings in this repository's performance
@@ -35,6 +43,7 @@ import asyncio
 import logging
 import sqlite3
 import threading
+import time
 import zlib
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -43,6 +52,7 @@ from typing import Any, Iterable, Iterator, Optional, Sequence
 
 from fastapi import APIRouter, HTTPException, Query
 
+from backend.core.startup import register_startup_hook
 from backend.modules.library.router import get_store as get_library_store
 
 from .graph import (
@@ -390,14 +400,20 @@ class _StatsCache:
         #: pin "this did not recompute".
         self.passes = 0
 
-    def get(self, snap: _Snapshot, *, limit: int) -> LibraryStats:
+    def get(self, snap: _Snapshot, *, limit: int) -> tuple[LibraryStats, bool]:
+        """The numbers, and whether they were already sitting here.
+
+        The second element is False for exactly the one call that ran the
+        pass and True for every call served from the slot, which is what
+        ``/summary`` reports as ``warm``.
+        """
         # Read outside the lock: the signature is the cheap part, and two
         # callers arriving together should both get as far as the lock.
         signature = _link_signature(snap)
         with self._lock:
             cached = self._value
             if cached is not None and cached.revision == signature.identity:
-                return cached
+                return cached, True
             stats = compute_library_stats(
                 (
                     (str(r["from_id"]), str(r["to_id"]), str(r["kind"]))
@@ -412,7 +428,7 @@ class _StatsCache:
             )
             self.passes += 1
             self._value = stats
-            return stats
+            return stats, False
 
     def clear(self) -> None:
         with self._lock:
@@ -433,7 +449,8 @@ _RANKING_CACHE_LIMIT = 500
 
 def _summary_sync(db: Any) -> dict[str, Any]:
     with _Snapshot(db) as snap:
-        return dict(_stats_cache.get(snap, limit=_RANKING_CACHE_LIMIT).summary)
+        stats, warm = _stats_cache.get(snap, limit=_RANKING_CACHE_LIMIT)
+    return {**stats.summary, "warm": warm}
 
 
 @router.get("/summary")
@@ -444,13 +461,20 @@ async def get_summary() -> dict[str, Any]:
     drawing work here": below 2,000 linked songs, yes. ``revision`` is the
     identity of the link signature (see :class:`_LinkSignature`) -- compare
     it for equality, never for order.
+
+    ``warm`` is a superset of the original contract: True when these numbers
+    came straight out of the cache, False when THIS request ran the pass and
+    therefore waited for it. It is never a promise that an answer is coming
+    later -- the route always answers with real numbers -- so a UI uses it to
+    say "that one took a moment" or to skip a spinner it does not need, not
+    to poll.
     """
     return await asyncio.to_thread(_summary_sync, _db())
 
 
 def _rankings_sync(db: Any, which: str, limit: int) -> dict[str, Any]:
     with _Snapshot(db) as snap:
-        stats = _stats_cache.get(snap, limit=_RANKING_CACHE_LIMIT)
+        stats, _warm = _stats_cache.get(snap, limit=_RANKING_CACHE_LIMIT)
         ranked = stats.rankings[which][:limit]
         # The cache holds ids, counts and the detail line. The columns on
         # screen are read fresh, every time: a renamed song shows its new
@@ -618,3 +642,102 @@ async def get_relatives(
         max(0, int(offset)),
         clamp_relatives_limit(limit),
     )
+
+
+# ------------------------------------------------------------ startup warm
+
+
+#: How long the warm waits before it opens anything. The pass is 3.6 s of
+#: disk and CPU on the real library and startup has its own I/O to get
+#: through (the library store, the notation backfill, the torch warm); five
+#: seconds of quiet is enough that this is not competing with any of it, and
+#: still far inside the time it takes a user to reach the LEARN tab.
+WARM_DELAY_SEC = 5.0
+
+#: The thread :func:`start_warm_thread` last spawned. Diagnostics, and the
+#: handle a test joins instead of sleeping.
+_warm_thread: Optional[threading.Thread] = None
+
+
+def warm_stats_cache() -> bool:
+    """Run the library-wide pass once, off any request.
+
+    Exactly the compute ``/summary`` and ``/rankings`` run -- the same
+    :class:`_Snapshot`, the same :data:`_stats_cache`, the same limit -- so a
+    request arriving afterwards finds the slot already filled and the first
+    LEARN open after a restart is 60 ms instead of 8.6 s.
+
+    Returns True when the pass ran (or the cache was already warm), False
+    when there was nothing to warm. Never raises: a warm that fails costs
+    the next request the pass it would have paid anyway, which is not worth
+    a traceback out of a daemon thread, so the failure is logged once and
+    swallowed.
+
+    Two things it will not do:
+
+    * run without a library database -- a store with ``db is None`` is a
+      launch where the library never came up, and warming a cache for it
+      would be inventing an answer;
+    * take ``LibraryDB._writelock``. The request path may fall back to the
+      shared connection under that lock (an in-memory database, a SQLite
+      build that refuses read-only WAL) because a request has to be
+      answered; a background warm does not, and holding that lock for a
+      3.6 s pass nobody asked for would stall every write in the app.
+    """
+    try:
+        store = get_library_store()
+        db = getattr(store, "db", None)
+        if db is None:
+            log.info("lineagescale: warm skipped, no library database")
+            return False
+        with _Snapshot(db) as snap:
+            if not snap.isolated:
+                log.info(
+                    "lineagescale: warm skipped, no read-only connection "
+                    "(the write lock is not a background warm's to hold)"
+                )
+                return False
+            _stats_cache.get(snap, limit=_RANKING_CACHE_LIMIT)
+    except Exception:  # noqa: BLE001 - see docstring: logged once, swallowed
+        log.warning(
+            "lineagescale: warming the stats cache failed; the first "
+            "/summary or /rankings will pay for the pass",
+            exc_info=True,
+        )
+        return False
+    return True
+
+
+def start_warm_thread(delay: Optional[float] = None) -> threading.Thread:
+    """Hand the warm to a daemon thread and return immediately.
+
+    A daemon thread rather than the idle-gated background queue
+    (``backend/core/background_workers.py``): that queue has ONE consumer,
+    and a job that begins by sleeping through its delay would hold it shut
+    against the notation backfill and every analysis/stems/MIDI job behind
+    it. This warm wants a few seconds of nothing, not a worker slot, which
+    is the same reason ``server._warm_heavy`` and the underfit spawn are
+    threads.
+    """
+    global _warm_thread
+    wait = WARM_DELAY_SEC if delay is None else float(delay)
+
+    def _run() -> None:
+        if wait > 0:
+            time.sleep(wait)
+        warm_stats_cache()
+
+    thread = threading.Thread(target=_run, name="lineagescale-warm", daemon=True)
+    _warm_thread = thread
+    thread.start()
+    return thread
+
+
+def _startup_warm() -> None:
+    start_warm_thread()
+
+
+# Runs from the app lifespan (core/startup.py), last of everything, so the
+# library store is already up when the thread wakes. Nothing to undo at
+# shutdown: the thread is a daemon and holds no handle past its own `with`.
+register_startup_hook("lineagescale-warm", _startup_warm)

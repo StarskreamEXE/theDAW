@@ -12,6 +12,7 @@ possible.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 import time
@@ -598,6 +599,9 @@ def test_the_summary_route_answers_the_contract(monkeypatch, library):
         "largest_tree",
         "full_view_ok",
         "revision",
+        # A superset of the original contract: whether these numbers came
+        # out of the cache or this request ran the pass for them.
+        "warm",
     }
     assert body["entries"] == library.expected["entries"]
     # ``revision`` is the identity of the link signature, not the library
@@ -836,7 +840,13 @@ def test_the_summary_is_computed_once_and_then_served_from_the_cache(
     started = time.perf_counter()
     warm = client.get(f"{PREFIX}/summary")
     warm_ms = (time.perf_counter() - started) * 1000
-    assert warm.json() == cold.json()
+    # Every number is the same; the one thing that changes is the honest
+    # report of which request paid for them.
+    assert cold.json()["warm"] is False
+    assert warm.json()["warm"] is True
+    assert {k: v for k, v in warm.json().items() if k != "warm"} == {
+        k: v for k, v in cold.json().items() if k != "warm"
+    }
     assert warm_ms < 20, f"cached summary took {warm_ms:.0f} ms"
 
 
@@ -1002,7 +1012,11 @@ def test_two_first_calls_at_once_compute_once(library):
     assert not errors, errors
     assert lineage_router._stats_cache.passes == passes + 1
     assert len(answers) == 4
-    assert all(answer == answers[0] for answer in answers)
+    # One pass, so exactly one of the four says it ran it; the numbers the
+    # other three waited for are the same numbers.
+    assert [a["warm"] for a in answers].count(False) == 1
+    stripped = [{k: v for k, v in a.items() if k != "warm"} for a in answers]
+    assert all(answer == stripped[0] for answer in stripped)
 
 
 def test_the_link_signature_is_cheap(library):
@@ -1023,3 +1037,153 @@ def test_the_link_signature_is_cheap(library):
             lineage_router._link_signature(snap)
         each_ms = (time.perf_counter() - started) * 1000 / 5
     assert each_ms < 5, f"the signature cost {each_ms:.2f} ms"
+
+
+# ------------------------------------------------ warming it at startup
+
+
+def _registered_startup_warm() -> Any:
+    """The hook the router registered when it was imported, by name.
+
+    Looked up rather than called through ``run_startup_hooks()``: that runs
+    EVERY module's hook, and one of them spawns the underfit sidecar. This
+    still drives the real registration, which is the part that decides
+    whether the warm happens at all.
+    """
+    from backend.core import startup as core_startup
+
+    hooks = dict(core_startup._hooks)  # noqa: SLF001 - the registry's own list
+    assert "lineagescale-warm" in hooks, "the router registered no startup warm"
+    return hooks["lineagescale-warm"]
+
+
+def _run_startup_warm(monkeypatch: pytest.MonkeyPatch, timeout: float = 60.0) -> None:
+    """Fire the registered hook with its delay taken out, and wait for it."""
+    monkeypatch.setattr(lineage_router, "WARM_DELAY_SEC", 0.0)
+    _registered_startup_warm()()
+    thread = lineage_router._warm_thread
+    assert thread is not None, "the hook started no thread"
+    thread.join(timeout)
+    assert not thread.is_alive(), "the warm thread never finished"
+
+
+def test_the_startup_warm_fills_the_cache_before_the_first_request(
+    monkeypatch, small_library
+):
+    """The whole point: the first LEARN open after a restart is 60 ms, not
+    the 8.6 s the pass costs on the real library."""
+    client = _client(monkeypatch, small_library)
+    before = lineage_router._stats_cache.passes
+
+    _run_startup_warm(monkeypatch)
+
+    assert lineage_router._stats_cache.passes == before + 1, "the warm ran no pass"
+    body = client.get(f"{PREFIX}/summary").json()
+    assert body["warm"] is True
+    assert body["entries"] == 4
+    assert lineage_router._stats_cache.passes == before + 1, (
+        "the request recomputed what the warm had already computed"
+    )
+
+
+def test_the_startup_warm_does_nothing_without_a_library_database(monkeypatch, caplog):
+    """A launch where the library never came up. Warming a cache for it
+    would be inventing an answer, and failing would take the app down from
+    a daemon thread."""
+    monkeypatch.setattr(lineage_router, "get_library_store", lambda: StubStore(None))
+    caplog.set_level(logging.DEBUG, logger="backend.modules.lineagescale.router")
+    before = lineage_router._stats_cache.passes
+
+    _run_startup_warm(monkeypatch)
+
+    assert lineage_router._stats_cache.passes == before
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+        "a library that is simply absent is not a failure"
+    )
+
+
+def test_a_warm_that_fails_logs_once_and_leaves_the_routes_working(
+    monkeypatch, caplog, tmp_path
+):
+    fixture = build_small_library(tmp_path / "library.db")
+    try:
+        client = _client(monkeypatch, fixture)
+        failing = {"on": True}
+        real_open = lineage_router._open_readonly
+
+        def flaky(db: Any) -> Any:
+            if failing["on"]:
+                raise sqlite3.OperationalError("disk I/O error")
+            return real_open(db)
+
+        monkeypatch.setattr(lineage_router, "_open_readonly", flaky)
+        caplog.set_level(logging.WARNING, logger="backend.modules.lineagescale.router")
+
+        _run_startup_warm(monkeypatch)
+
+        complaints = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(complaints) == 1, complaints
+
+        failing["on"] = False
+        body = client.get(f"{PREFIX}/summary").json()
+        assert body["entries"] == 4
+        # Nothing was warmed, so this request is the one that pays.
+        assert body["warm"] is False
+    finally:
+        fixture.close()
+
+
+def test_a_warm_that_cannot_open_its_own_connection_declines(monkeypatch, tmp_path):
+    """The request path falls back to ``LibraryDB``'s connection under its
+    write lock, because a request has to be answered. A warm nobody asked
+    for does not get that licence: a 3.6 s pass under that lock stalls every
+    write in the app."""
+    fixture = build_small_library(tmp_path / "library.db")
+    try:
+        monkeypatch.setattr(
+            lineage_router, "get_library_store", lambda: StubStore(fixture.db)
+        )
+        monkeypatch.setattr(lineage_router, "_open_readonly", lambda db: None)
+        before = lineage_router._stats_cache.passes
+
+        assert lineage_router.warm_stats_cache() is False
+        assert lineage_router._stats_cache.passes == before
+    finally:
+        fixture.close()
+
+
+def test_the_startup_warm_does_not_hold_the_app_write_lock(monkeypatch, library):
+    """Same technique as the request-path lock test above: the lock is held
+    for real, by another thread, so a regression is a failed assertion
+    rather than a hung run."""
+    monkeypatch.setattr(
+        lineage_router, "get_library_store", lambda: StubStore(library.db)
+    )
+    lock = library.db._writelock  # noqa: SLF001 - the fixture's own lock
+    holding = threading.Event()
+    release = threading.Event()
+    result: dict[str, Any] = {}
+
+    def hold_the_lock() -> None:
+        with lock:
+            holding.set()
+            release.wait(60)
+
+    holder = threading.Thread(target=hold_the_lock, daemon=True)
+    holder.start()
+    assert holding.wait(10), "could not take the library write lock"
+
+    def run_the_warm() -> None:
+        result["warmed"] = lineage_router.warm_stats_cache()
+
+    worker = threading.Thread(target=run_the_warm, daemon=True)
+    worker.start()
+    worker.join(timeout=20)
+    blocked = worker.is_alive()
+
+    release.set()
+    holder.join(10)
+    worker.join(30)
+
+    assert not blocked, "the warm waited for the library write lock"
+    assert result["warmed"] is True
