@@ -80,6 +80,7 @@ const RankedList: React.FC<{
                 <span className="block truncate text-[11px] text-zinc-100">{row.title}</span>
                 <span className="block truncate text-[9px] font-mono text-zinc-500">{row.detail}</span>
               </span>
+              <ProviderBadge entry={{ model: row.model, source: row.source }} className="shrink-0" />
               <span className="shrink-0 text-[11px] tabular-nums text-purple-200">{formatCount(row.count)}</span>
             </button>
           </li>

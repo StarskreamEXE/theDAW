@@ -234,13 +234,17 @@ def _suno_stock_fingerprint(
 # Suno therefore has three spellings in this table: the harvester shape's
 # `generator=suno` / `album=Suno AI` / `txxx_suno_id` frames, and the stock
 # download's `fingerprint`, which infers the provider from the shape of the
-# five keys such a file carries.
+# five keys such a file carries. `chirp` is a fourth VALUE, not a fourth
+# shape: it is Suno's model family, the string a tool frame carries when it
+# names the model instead of the service, and `db.infer_provider` reads it as
+# Suno already -- detection and derivation answer with one voice or a file is
+# filed twice.
 PROVIDER_RULES: tuple[ProviderRule, ...] = (
     ProviderRule(
         provider="suno",
         label="Suno",
         is_ai=True,
-        generator_values=("suno",),
+        generator_values=("suno", "chirp"),
         albums=("suno ai",),
         domains=("suno.com", "suno.ai"),
         id_keys=("txxx_suno_id",),

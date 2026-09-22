@@ -324,6 +324,20 @@ def test_a_thedaw_encoder_signature_is_thedaw_not_stable_audio():
     assert _detect_generator({"encoder": "suno v4"}) == "suno"
 
 
+def test_a_chirp_generator_signature_is_suno():
+    """``chirp`` is Suno's model family, and a frame that names the model
+    instead of the service is the only thing some files say.
+
+    ``db.infer_provider`` and its SQL twin read a ``chirp-*`` model as Suno
+    (schema step 11); a file whose generator frame says the same word has to
+    resolve to the same service here, or one file is Suno by its columns and
+    something else by its tags.
+    """
+    assert _detect_generator({"encoder": "chirp-v4"}) == "suno"
+    assert _detect_generator({"generator": "chirp-crow"}) == "suno"
+    assert _detect_generator({"encoder": "Chirp v3.5"}) == "suno"
+
+
 def test_a_stable_audio_signature_is_not_read_as_udio():
     """ "udio" is a substring of "audio", so a bare substring test files every
     encoder string containing "audio" under the Udio generator.

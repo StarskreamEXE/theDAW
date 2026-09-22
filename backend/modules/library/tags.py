@@ -123,6 +123,12 @@ KNOWN_AI_TAGS: dict[str, str] = {
 # tag.
 GENERATOR_SIGNATURES: dict[str, str] = {
     "suno": "suno",
+    # Suno's model family. A file whose generator/encoder frame says
+    # "chirp-v4" and nothing else names no service by name, and the
+    # ``(model, source)`` derivation in ``db.py`` already reads that string as
+    # Suno -- the detection side has to agree, or one file is Suno by its
+    # columns and something else by its tags.
+    "chirp": "suno",
     "udio": "udio",
     "riffusion": "riffusion",
     "musicgen": "musicgen",

@@ -97,6 +97,11 @@ export interface RankingRow {
   id: string;
   title: string;
   model: string;
+  /** The entry's `source` column. Travels WITH `model`, exactly as it does on
+   *  a neighbourhood node and a relatives row: the provider badge is the two
+   *  together, and a Suno song's model is `chirp-*` while its source says
+   *  'suno'. */
+  source: string;
   count: number;
   /** Server-written one-liner for the row ("8 covers, 3 edits", a date, …). */
   detail: string;

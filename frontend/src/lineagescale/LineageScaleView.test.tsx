@@ -62,8 +62,10 @@ const summary: LineageSummary = {
   revision: 12,
 };
 
-const ranked = (id: string, title: string, count: number): RankingRow =>
-  ({ id, title, model: 'stable-audio', count, detail: `${count} descendants` });
+const ranked = (
+  id: string, title: string, count: number, extra: Partial<RankingRow> = {},
+): RankingRow =>
+  ({ id, title, model: 'stable-audio', source: 'generate', count, detail: `${count} descendants`, ...extra });
 
 {
   const html = renderToStaticMarkup(
@@ -116,6 +118,29 @@ const ranked = (id: string, title: string, count: number): RankingRow =>
 
   // No picture of the library is offered, and the reason is on the page.
   assert.ok(html.includes('no single picture'), 'the landing says why there is no whole-library drawing');
+}
+
+/* ══════ a ranked row is badged, and a Suno one says Suno ═════════════════ */
+
+{
+  // The four landing lists are lists of SONGS, and every other list of songs in
+  // the app says which service made each one. A ranked row now carries
+  // `(model, source)` — the pair the badge reads — so it can say so too.
+  const html = renderToStaticMarkup(
+    <LineageLanding
+      summary={summary}
+      rankings={{
+        most_derived: [
+          ranked('s', 'Promoted From Suno', 3, { model: 'chirp-v4', source: 'suno' }),
+          ranked('n', 'Native Generation', 2),
+        ],
+      }}
+      loading={false} error={null} onRetry={() => {}} onFocus={() => {}} onSearch={async () => []}
+    />,
+  );
+  assert.ok(html.includes('data-provider="suno"'), `a chirp-v4/suno row badged as: ${html}`);
+  assert.ok(html.includes('data-provider="stable-audio"'), 'and a native generation still reads Stable Audio');
+  assert.ok(!html.includes('data-provider="thedaw"'), 'nothing here falls to the last arm');
 }
 
 // Loading and error states.
@@ -581,15 +606,16 @@ const ALONE = 'This song stands alone';
 /* ═══════ a LANDING hit's badge: model AND source, and `chirp` is Suno ═════ */
 
 {
-  // The landing builds exactly this for every hit it lists (LineageLanding.tsx:
-  // `<ProviderBadge entry={{ model: hit.model, source: hit.source }} />`), so
-  // these are the two shapes the wire can hand it.
+  // The shape the landing's SEARCH-HIT list builds for every hit it shows
+  // (LineageLanding.tsx: `<ProviderBadge entry={{ model: hit.model, source:
+  // hit.source }} />`, over rows from the library's own `/entries`), and now
+  // the shape `RankedList` builds too. These are the two the wire can hand it.
   const badge = (hit: { model?: string; source?: string }) =>
     renderToStaticMarkup(<ProviderBadge entry={{ model: hit.model, source: hit.source }} />);
 
   // T14 (2): a Suno song's model is `chirp-*` — the word "suno" is nowhere in
-  // it. `/rankings` sent no `source` at all before this ticket, so this is what
-  // the badge actually received for 194,000 Suno songs, and it read "theDAW".
+  // it. A hit whose `source` is missing or says something else is therefore all
+  // the badge has to go on for 194,000 songs, and it read "theDAW".
   const modelOnly = badge({ model: 'chirp-v4', source: undefined });
   assert.ok(/suno/i.test(modelOnly), `chirp-v4 badged as: ${modelOnly}`);
   assert.ok(!/theDAW|Stable\s*Audio/i.test(modelOnly), modelOnly);

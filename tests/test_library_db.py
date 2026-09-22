@@ -58,8 +58,9 @@ def _make_entry_payload(entry_id: str, **overrides) -> dict:
 #: The step that ADDS ``entries.provider`` and builds the provider indexes --
 #: the ``ADD COLUMN`` these tests reproduce a half-finished run of. Named by its
 #: own version rather than as ``SCHEMA_VERSION - 1``: step 10 rebuilt those
-#: indexes when the provider fallback's last arm changed, so the current
-#: version is no longer the one that adds a column.
+#: indexes when the provider fallback's last arm changed and step 11 rebuilt
+#: them again when its Suno arm learned ``chirp``, so the current version is no
+#: longer the one that adds a column.
 PROVIDER_COLUMN_VERSION = 9
 
 

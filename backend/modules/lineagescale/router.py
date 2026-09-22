@@ -513,10 +513,10 @@ def _rankings_sync(db: Any, which: str, limit: int) -> dict[str, Any]:
             "model": (entries.get(r.id) or {}).get("model") or "",
             # `source` travels WITH `model`, exactly as it does on a
             # neighbourhood node and a relatives row: the provider badge is
-            # the two columns together. A Suno song's model is `chirp-*` and
-            # its source is 'suno', so a ranked row without this field was
-            # badged by the fallback -- "Stable Audio", and "theDAW" after
-            # schema 10 -- for every one of the user's Suno songs.
+            # the two columns together, and a Suno song's model is `chirp-*`
+            # while its source says 'suno'. Sent so a client that badges a
+            # ranked row has the column it needs -- `RankedList` in
+            # `frontend/src/lineagescale/LineageLanding.tsx` now does.
             "source": (entries.get(r.id) or {}).get("source") or "",
             "count": r.count,
             "detail": r.detail,

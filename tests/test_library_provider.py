@@ -42,6 +42,23 @@ def test_suno_detected_from_generator_alone():
     assert info.provider_id is None
 
 
+def test_suno_detected_from_a_chirp_model_frame():
+    """The generator frame names the MODEL, not the service.
+
+    ``chirp-v4``, ``chirp-crow``, ``chirp-bluejay`` are Suno's model family and
+    the only thing an exported Suno song's model string ever says.
+    ``db.infer_provider`` reads it as Suno (schema step 11), so this side must
+    too: a rule that disagrees with the derivation files one file twice.
+    """
+    info = detect_provider({"generator": "chirp-v4"})
+    assert info is not None
+    assert info.provider == "suno"
+    assert info.label == "Suno"
+    assert info.is_ai is True
+    assert info.confidence == "explicit"
+    assert detect_provider({"encoder": "chirp-crow"}).provider == "suno"
+
+
 def test_suno_detected_from_id_frame_alone():
     info = detect_provider({"txxx_suno_id": SAMPLE_ID})
     assert info is not None
