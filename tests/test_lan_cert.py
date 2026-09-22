@@ -369,6 +369,30 @@ def test_a_corrupt_certificate_on_disk_is_replaced(data_dir: Path):
 
 
 @needs_openssl
+@pytest.mark.parametrize("broken_key", ["", "   \n", "not a key", "\x00\x01\x02"])
+def test_a_corrupt_key_beside_a_good_certificate_is_replaced(
+    data_dir: Path, broken_key: str
+):
+    """The reuse path validated the certificate with ``openssl x509`` and never
+    looked at the key, so an empty or truncated key file -- a crashed write, a
+    half-synced folder -- was handed to the listener at every launch and vite
+    died on it every time. The pair is regenerated instead."""
+    first = lan_cert.ensure_lan_cert(["192.168.1.34"])
+    assert first is not None
+    good_cert = first.cert.read_bytes()
+    lan_cert.key_file().write_text(broken_key)
+
+    again = lan_cert.ensure_lan_cert(["192.168.1.34"])
+    assert again is not None
+    key = again.key.read_bytes()
+    assert key.startswith(b"-----BEGIN "), "the key was reused as it was"
+    assert b"PRIVATE KEY" in key
+    # And the certificate now matches that key, so it had to be reissued too.
+    assert again.cert.read_bytes() != good_cert
+    assert again.cert.read_bytes().startswith(b"-----BEGIN CERTIFICATE-----")
+
+
+@needs_openssl
 def test_the_data_dir_is_created_when_it_does_not_exist(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

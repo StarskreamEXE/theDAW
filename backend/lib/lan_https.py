@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Optional, Protocol
 
 from backend import ports
+from backend.lib import paths
 
 log = logging.getLogger(__name__)
 
@@ -42,11 +43,13 @@ __all__ = [
     "ENV_KEY",
     "ENV_PORT",
     "LISTENER_ARGS",
-    "LISTENER_COMMAND",
+    "NO_FRONTEND_REASON",
     "LanHttpsPlan",
     "blocking_reason",
     "detect_lan_ips",
     "lan_address",
+    "listener_binary",
+    "listener_command",
     "listener_env",
     "listener_port",
     "plan_lan_https",
@@ -68,10 +71,16 @@ ENV_ENABLED = "theDAW_LAN_HTTPS"
 SETTING_SECTION = "app"
 SETTING_KEY = "lan_https"
 
-#: How the listener is started, from ``frontend/``. ``npx`` because vite is a
-#: frontend devDependency, not a global.
-LISTENER_ARGS: tuple[str, ...] = ("vite", "--config", "vite.lan.config.ts")
-LISTENER_COMMAND = " ".join(("npx", *LISTENER_ARGS))
+#: What the listener is started WITH, after the binary, from ``frontend/``.
+LISTENER_ARGS: tuple[str, ...] = ("--config", "vite.lan.config.ts")
+
+#: Why there is no listener when the frontend has never been installed. Said
+#: once, by whichever launcher is running, instead of spawning something that
+#: cannot work.
+NO_FRONTEND_REASON = (
+    "frontend dependencies not installed - the LAN https listener is skipped "
+    '(run "npm install" in frontend/)'
+)
 
 _FALSE = frozenset({"0", "false", "no", "off"})
 _TRUE = frozenset({"1", "true", "yes", "on"})
@@ -97,6 +106,10 @@ class LanHttpsPlan:
     port: int
     url: Optional[str] = None
     cert_paths: Optional[CertPathsLike] = None
+    #: The vite executable to run, resolved once by :func:`listener_binary`.
+    #: Carried in the plan so the desktop shell runs the very file this module
+    #: checked for, rather than searching for it again in TypeScript.
+    vite: Optional[str] = None
     reason: Optional[str] = None
 
     def log_line(self) -> str:
@@ -113,6 +126,7 @@ class LanHttpsPlan:
             "url": self.url,
             "cert": str(self.cert_paths.cert) if self.cert_paths else None,
             "key": str(self.cert_paths.key) if self.cert_paths else None,
+            "vite": self.vite,
             "reason": self.reason,
         }
 
@@ -176,7 +190,11 @@ def blocking_reason(
         section = settings.get(SETTING_SECTION)
         stored = section.get(SETTING_KEY) if isinstance(section, Mapping) else None
         if _flag(stored) is False:
-            return f"turned off in Settings ({SETTING_SECTION}.{SETTING_KEY})"
+            return (
+                f"turned off in data/settings.json "
+                f"({SETTING_SECTION}.{SETTING_KEY}) - set {ENV_ENABLED}=1 "
+                f"for one launch"
+            )
 
     if lan_address(lan_ips) is None:
         return (
@@ -191,6 +209,7 @@ def plan_lan_https(
     env: Mapping[str, str],
     lan_ips: Sequence[str],
     cert: Optional[CertPathsLike],
+    vite: Optional[str] = None,
 ) -> LanHttpsPlan:
     """Whether to start the LAN HTTPS listener, where, and why not.
 
@@ -222,6 +241,7 @@ def plan_lan_https(
         port=port,
         url=f"https://{lan_address(lan_ips)}:{port}",
         cert_paths=cert,
+        vite=vite,
     )
 
 
@@ -231,16 +251,46 @@ def listener_env(plan: LanHttpsPlan, base: Mapping[str, str]) -> dict[str, str]:
     ``base`` is the caller's already-sanitised environment --
     :func:`backend.lib.launch_token.child_env` in the backend's launcher -- so
     the desktop shell's launch token never reaches a vite process. Only the
-    four names the listener actually reads are added.
+    three names the listener actually reads are added.
+
+    ``ENABLE_HMR`` is deliberately NOT one of them: it is passed through from
+    ``base`` like everything else. Setting it starts a watcher over the whole
+    repository; the web launcher sets it for its own http dev server, and the
+    desktop shell does not want a second one.
     """
     if not plan.enabled or plan.cert_paths is None:
         raise ValueError("listener_env is for an enabled plan with a certificate")
     env = dict(base)
-    env["ENABLE_HMR"] = "true"
     env[ENV_CERT] = str(plan.cert_paths.cert)
     env[ENV_KEY] = str(plan.cert_paths.key)
     env[ENV_PORT] = str(plan.port)
     return env
+
+
+def listener_binary(repo_root: Optional[Path] = None) -> Optional[Path]:
+    """The frontend's OWN vite executable, or None when it is not installed.
+
+    Not ``npx``: on Windows ``cmd`` searches the current directory before PATH,
+    and a non-interactive ``npx`` with no ``node_modules`` present downloads a
+    copy of vite from the registry in the middle of a launch. The path is
+    resolved here, once, and carried in the plan, so both launchers run the
+    same file and neither has to look for it.
+    """
+    root = paths.PROJECT_ROOT if repo_root is None else Path(repo_root)
+    name = "vite.cmd" if os.name == "nt" else "vite"
+    candidate = root / "frontend" / "node_modules" / ".bin" / name
+    return candidate if candidate.is_file() else None
+
+
+def listener_command(plan: LanHttpsPlan) -> list[str]:
+    """argv for the listener, to be run from ``frontend/``.
+
+    A list rather than a shell string: the path can contain a space, and there
+    is nothing here for a shell to do.
+    """
+    if not plan.enabled or not plan.vite:
+        raise ValueError("listener_command is for an enabled plan with a vite binary")
+    return [plan.vite, *LISTENER_ARGS]
 
 
 def detect_lan_ips() -> list[str]:
@@ -296,6 +346,16 @@ def resolve_plan(env: Optional[Mapping[str, str]] = None) -> LanHttpsPlan:
             enabled=False, port=listener_port(environment), reason=blocked
         )
 
+    # Before openssl, for the same reason: a clone that has never run
+    # ``npm install`` has no listener to start, so nothing is minted for it.
+    vite = listener_binary()
+    if vite is None:
+        return LanHttpsPlan(
+            enabled=False,
+            port=listener_port(environment),
+            reason=NO_FRONTEND_REASON,
+        )
+
     cert: Optional[CertPathsLike] = None
     try:
         from backend.lib.lan_cert import ensure_lan_cert
@@ -309,7 +369,7 @@ def resolve_plan(env: Optional[Mapping[str, str]] = None) -> LanHttpsPlan:
             exc,
         )
         cert = None
-    return plan_lan_https(settings, environment, lan_ips, cert)
+    return plan_lan_https(settings, environment, lan_ips, cert, str(vite))
 
 
 def _main(argv: Optional[list[str]] = None) -> int:

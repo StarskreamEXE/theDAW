@@ -413,8 +413,17 @@ def test_the_lan_https_listener_starts_without_the_token(
     cert = lan_cert.CertPaths(
         cert=tmp_path / "lan-cert.pem", key=tmp_path / "lan-key.pem"
     )
-    plan = lan_https.plan_lan_https({}, {}, ["192.168.1.34"], cert)
+    plan = lan_https.plan_lan_https(
+        {},
+        {},
+        ["192.168.1.34"],
+        cert,
+        vite="C:/theDAW/frontend/node_modules/.bin/vite.cmd",
+    )
     monkeypatch.setattr(_devstack.lan_https, "resolve_plan", lambda: plan)
+    # Pass-through, so a launch that happens to have it set is not what makes
+    # the assertion below pass.
+    monkeypatch.delenv("ENABLE_HMR", raising=False)
     # The real describe_occupant binds the port to find out who holds it.
     monkeypatch.setattr(_devstack.ports, "describe_occupant", lambda port: None)
     monkeypatch.setattr(_devstack, "_emit", lambda tag, line: None)
@@ -424,9 +433,11 @@ def test_the_lan_https_listener_starts_without_the_token(
     [env] = spawns.of("Popen")
     _assert_clean([env])
     assert env is not None
-    assert env["ENABLE_HMR"] == "true"
     assert env[lan_https.ENV_CERT] == str(cert.cert)
     assert env[lan_https.ENV_KEY] == str(cert.key)
+    # ENABLE_HMR is passed through from the base rather than forced on here,
+    # so the listener starts no watcher the launcher did not ask for.
+    assert "ENABLE_HMR" not in env
 
 
 # ---------------------------------------------------------------------------

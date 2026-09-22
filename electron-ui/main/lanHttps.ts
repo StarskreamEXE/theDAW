@@ -28,9 +28,15 @@ export interface LanHttpsPlan {
   cert: string | null
   /** PEM key path. Present exactly when enabled. */
   key: string | null
+  /** The vite executable to run. Present exactly when enabled. */
+  vite: string | null
   /** Why it is off. Present only when it is. */
   reason: string | null
 }
+
+/** What the listener is started WITH, after the binary, from `frontend/`.
+ *  Mirrors `LISTENER_ARGS` in backend/lib/lan_https.py. */
+const LISTENER_ARGS = ['--config', 'vite.lan.config.ts']
 
 /** The environment names `frontend/vite.lan.config.ts` reads. Renaming one of
  *  these breaks the listener silently, so they are stated once. */
@@ -52,9 +58,9 @@ function nonEmpty(value: unknown): string | null {
  * still put a line of its own on stdout ahead of ours.
  *
  * Null means "no plan": no listener, and the caller says so. An `enabled` plan
- * missing its url, certificate or key is a broken contract, not a usable plan,
- * so it is null too -- starting vite without a certificate would only produce
- * a crash loop no one asked for.
+ * missing its url, certificate, key or vite binary is a broken contract, not a
+ * usable plan, so it is null too -- starting vite without a certificate (or
+ * starting nothing at all) would only produce a crash loop no one asked for.
  */
 export function parseLanHttpsPlan(stdout: string): LanHttpsPlan | null {
   const lines = String(stdout ?? '')
@@ -80,9 +86,10 @@ export function parseLanHttpsPlan(stdout: string): LanHttpsPlan | null {
       url: nonEmpty(obj.url),
       cert: nonEmpty(obj.cert),
       key: nonEmpty(obj.key),
+      vite: nonEmpty(obj.vite),
       reason: nonEmpty(obj.reason),
     }
-    if (plan.enabled && (!plan.url || !plan.cert || !plan.key)) return null
+    if (plan.enabled && (!plan.url || !plan.cert || !plan.key || !plan.vite)) return null
     return plan
   }
   return null
@@ -100,17 +107,39 @@ export function lanHttpsLogLine(plan: LanHttpsPlan | null): string {
 /**
  * How to start the listener on this platform, from `frontend/`.
  *
- * `npx` is a .cmd shim on Windows, which CreateProcess cannot exec directly --
- * the same reason spawnBackend's Windows fallback goes through `cmd /c`.
+ * The binary is the frontend's own `node_modules/.bin/vite`, resolved by
+ * backend/lib/lan_https.py and carried in the plan. It is NOT `npx`: on
+ * Windows cmd searches the current directory before PATH, and a
+ * non-interactive npx with no node_modules present downloads a copy of vite
+ * from the registry in the middle of a launch.
+ *
+ * On Windows that binary is `vite.cmd`, a batch shim: node refuses to spawn
+ * one directly (EINVAL, since the 2024 argument-injection fix), so it goes
+ * through `cmd /c` -- the same reason spawnBackend's Windows fallback does.
+ * The path is quoted there because it can contain a space.
  */
-export function lanListenerCommand(platform: string): { command: string; args: string[] } {
-  const args = ['vite', '--config', 'vite.lan.config.ts']
-  if (platform === 'win32') return { command: 'cmd', args: ['/c', ['npx', ...args].join(' ')] }
-  return { command: 'npx', args }
+export function lanListenerCommand(
+  platform: string,
+  plan: LanHttpsPlan,
+): { command: string; args: string[] } {
+  const vite = plan.vite
+  if (!plan.enabled || !vite) {
+    throw new Error('lanListenerCommand is for an enabled plan with a vite binary')
+  }
+  if (platform === 'win32') {
+    const quoted = vite.includes(' ') ? `"${vite}"` : vite
+    return { command: 'cmd', args: ['/c', [quoted, ...LISTENER_ARGS].join(' ')] }
+  }
+  return { command: vite, args: [...LISTENER_ARGS] }
 }
 
 /**
- * The listener's environment: `base` plus the four names it reads.
+ * The listener's environment: `base` plus the three names it reads.
+ *
+ * `ENABLE_HMR` is not one of them -- it is passed through from `base` like
+ * everything else, exactly as `listener_env` does on the Python side. Setting
+ * it starts a watcher over the whole repository, and the desktop shell has no
+ * use for one.
  *
  * The launch token is dropped under every spelling (Windows environment names
  * ignore case) even though `buildBaseEnv` has already dropped it: vite here
@@ -130,7 +159,6 @@ export function lanListenerEnv(
   for (const key of Object.keys(env)) {
     if (key.toUpperCase() === LAUNCH_TOKEN_ENV) delete env[key]
   }
-  env.ENABLE_HMR = 'true'
   env[LAN_HTTPS_CERT_ENV] = plan.cert
   env[LAN_HTTPS_KEY_ENV] = plan.key
   env[LAN_HTTPS_PORT_ENV] = String(plan.port)

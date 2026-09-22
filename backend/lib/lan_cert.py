@@ -291,6 +291,26 @@ def _ensure_key_placeholder(path: Path) -> None:
     os.close(fd)
 
 
+def _key_is_pem(key: Path) -> bool:
+    """True when ``key`` is non-empty and starts with a PEM header.
+
+    The reuse path validates the certificate with ``openssl x509`` and nothing
+    ever looked at the key beside it, so an empty or truncated key -- a crashed
+    write, a half-synced folder, a file someone cleared -- was handed to the
+    listener at every launch and vite died on it every time. Regenerating the
+    pair costs one openssl call and needs nobody in the loop.
+
+    Only the first bytes are read, and they are never logged: no key material
+    leaves this function.
+    """
+    try:
+        with key.open("rb") as handle:
+            head = handle.read(64)
+    except OSError:
+        return False
+    return head.startswith(b"-----BEGIN ")
+
+
 def _cleanup(*items: Path) -> None:
     for item in items:
         try:
@@ -307,9 +327,10 @@ def ensure_lan_cert(
 ) -> CertPaths | None:
     """The certificate covering ``lan_ips``, generating one if need be.
 
-    Returns the existing pair untouched when it already covers every address
-    and has more than a month left; otherwise generates a fresh self-signed
-    certificate into ``data/lan-cert/``.
+    Returns the existing pair untouched when it already covers every address,
+    has more than a month left, and still has a readable PEM key beside it;
+    otherwise generates a fresh self-signed certificate into
+    ``data/lan-cert/``.
 
     Returns None -- never raises -- when openssl is missing or fails, after
     logging exactly one warning that names the fix. A LAN listener is a
@@ -336,7 +357,7 @@ def ensure_lan_cert(
     cert, key = cert_file(), key_file()
     if cert.exists() and key.exists():
         described = _describe_existing(binary, cert)
-        if described and cert_matches(described, sans, now):
+        if described and cert_matches(described, sans, now) and _key_is_pem(key):
             return CertPaths(cert=cert, key=key)
 
     tmp_cert = temp_sibling(cert)

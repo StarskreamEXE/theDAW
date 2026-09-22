@@ -45,6 +45,10 @@ CERT = CertPaths(
     key=Path("C:/theDAW/data/lan-cert/lan-key.pem"),
 )
 LAN = ["192.168.1.34"]
+#: The listener binary a resolved plan carries (backend/lib/lan_https.py
+#: resolves it once, for both launchers). Not this machine's, so no test
+#: depends on whether ``npm install`` has been run here.
+VITE = "C:/theDAW/frontend/node_modules/.bin/vite.cmd"
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +85,11 @@ def test_the_setting_turns_it_off_and_says_so(stored: Any) -> None:
     assert plan.reason is not None
     assert "app.lan_https" in plan.reason
     assert plan.log_line().startswith("LAN (https): off - ")
+    # It names the levers that exist. It used to say "in Settings", and there
+    # is no Settings control for this -- the file and the environment variable
+    # are the only two ways to change it, so the line has to name them.
+    assert "settings.json" in plan.reason
+    assert f"{lan_https.ENV_ENABLED}=1" in plan.reason
 
 
 @pytest.mark.parametrize("stored", [True, "true", "1", "on", "yes", "anything else"])
@@ -162,12 +171,10 @@ def test_the_child_environment_carries_only_what_the_listener_reads() -> None:
 
     assert env["PATH"] == "/usr/bin"
     assert env["THEDAW_ALREADY_HERE"] == "kept"
-    assert env["ENABLE_HMR"] == "true"
     assert env[lan_https.ENV_CERT] == str(CERT.cert)
     assert env[lan_https.ENV_KEY] == str(CERT.key)
     assert env[lan_https.ENV_PORT] == "6443"
     assert set(env) - set(base) == {
-        "ENABLE_HMR",
         lan_https.ENV_CERT,
         lan_https.ENV_KEY,
         lan_https.ENV_PORT,
@@ -176,25 +183,92 @@ def test_the_child_environment_carries_only_what_the_listener_reads() -> None:
     assert set(base) == {"PATH", "THEDAW_ALREADY_HERE"}
 
 
+def test_live_reload_comes_from_the_base_environment_not_from_here() -> None:
+    """``ENABLE_HMR`` used to be forced on for this child, which starts a
+    watcher over the whole repository. The web launcher sets it for its own
+    http dev server; the desktop shell does not want a second watcher, and
+    neither launcher should have that decision made for it here."""
+    plan = lan_https.plan_lan_https({}, {}, LAN, CERT)
+    assert "ENABLE_HMR" not in lan_https.listener_env(plan, {})
+    passed_through = lan_https.listener_env(plan, {"ENABLE_HMR": "true"})
+    assert passed_through["ENABLE_HMR"] == "true"
+
+
 def test_the_child_environment_refuses_a_plan_with_nothing_to_serve() -> None:
     off = lan_https.plan_lan_https({}, {}, LAN, None)
     with pytest.raises(ValueError):
         lan_https.listener_env(off, {})
 
 
-def test_the_listener_command_runs_the_lan_config_from_the_frontend() -> None:
-    assert lan_https.LISTENER_COMMAND == "npx vite --config vite.lan.config.ts"
+def test_the_listener_command_runs_the_frontends_own_vite_binary() -> None:
+    """Not ``npx``: on Windows cmd searches the current directory before PATH,
+    and a non-interactive npx with no node_modules present fetches a copy of
+    vite from the registry in the middle of a launch."""
     assert (REPO_ROOT / "frontend" / "vite.lan.config.ts").is_file()
+    plan = lan_https.plan_lan_https({}, {}, LAN, CERT, vite=VITE)
+    assert lan_https.listener_command(plan) == [
+        VITE,
+        "--config",
+        "vite.lan.config.ts",
+    ]
+    assert "npx" not in " ".join(lan_https.listener_command(plan))
+    assert not hasattr(lan_https, "LISTENER_COMMAND"), (
+        "the npx command string must be gone, not left beside the new one for "
+        "a caller to pick up"
+    )
+
+
+def test_the_listener_command_refuses_a_plan_with_no_binary() -> None:
+    with pytest.raises(ValueError):
+        lan_https.listener_command(lan_https.plan_lan_https({}, {}, LAN, CERT))
+    with pytest.raises(ValueError):
+        lan_https.listener_command(lan_https.plan_lan_https({}, {}, [], None))
+
+
+def test_the_binary_is_the_one_the_frontend_installed_for_itself() -> None:
+    """Resolved here, once, for both launchers: the desktop shell reads the
+    path out of the plan rather than searching for it again in TypeScript."""
+    found = lan_https.listener_binary()
+    if found is not None:
+        assert found.is_file()
+        assert found.parent == REPO_ROOT / "frontend" / "node_modules" / ".bin"
+        assert found.name in {"vite", "vite.cmd"}
+
+
+def test_no_frontend_dependencies_is_one_line_rather_than_a_crash_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A clone that has never run ``npm install`` has no vite to start. Vite is
+    not spawned at all then, and the reason says which lever fixes it."""
+    monkeypatch.setattr(lan_https.paths, "PROJECT_ROOT", tmp_path)
+    assert lan_https.listener_binary() is None
+
+    monkeypatch.setattr(lan_https, "read_settings", lambda: {})
+    monkeypatch.setattr(lan_https, "detect_lan_ips", lambda: LAN)
+    import backend.lib.lan_cert as lan_cert
+
+    monkeypatch.setattr(
+        lan_cert,
+        "ensure_lan_cert",
+        lambda ips, **kw: pytest.fail("shelled out to openssl with no vite"),
+    )
+    plan = lan_https.resolve_plan({})
+    assert plan.enabled is False
+    assert plan.vite is None
+    assert plan.reason is not None
+    assert "frontend dependencies not installed" in plan.reason
+    assert "npm install" in plan.reason
 
 
 def test_the_plan_is_json_the_desktop_shell_can_read() -> None:
-    payload = lan_https.plan_lan_https({}, {}, LAN, CERT).as_json()
+    payload = lan_https.plan_lan_https({}, {}, LAN, CERT, vite=VITE).as_json()
     assert payload == {
         "enabled": True,
         "port": ports.LAN_HTTPS_PORT,
         "url": f"https://192.168.1.34:{ports.LAN_HTTPS_PORT}",
         "cert": str(CERT.cert),
         "key": str(CERT.key),
+        "vite": VITE,
         "reason": None,
     }
     off = lan_https.plan_lan_https({}, {}, [], None).as_json()
@@ -321,20 +395,20 @@ def test_the_web_launcher_starts_the_listener_beside_the_http_one(
     devstack: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     module, spawns, lines = devstack
-    plan = lan_https.plan_lan_https({}, {}, LAN, CERT)
+    plan = lan_https.plan_lan_https({}, {}, LAN, CERT, vite=VITE)
     monkeypatch.setattr(module.lan_https, "resolve_plan", lambda: plan)
 
     children: list[Any] = []
     assert module._start_lan_listener(children, "C:/theDAW/frontend") is True
 
     [(cmd, cwd, env)] = spawns
-    assert cmd == "npx vite --config vite.lan.config.ts"
+    # argv, not a shell string, and the frontend's own binary rather than npx.
+    assert cmd == [VITE, "--config", "vite.lan.config.ts"]
     assert cwd == "C:/theDAW/frontend"
     assert len(children) == 1
     assert any(plan.url in line for line in lines), lines
 
     assert env is not None
-    assert env["ENABLE_HMR"] == "true"
     assert env[lan_https.ENV_CERT] == str(CERT.cert)
     assert env[lan_https.ENV_KEY] == str(CERT.key)
     assert env[lan_https.ENV_PORT] == str(ports.LAN_HTTPS_PORT)
@@ -350,7 +424,7 @@ def test_the_listener_child_never_holds_the_desktop_launch_token(
     monkeypatch.setattr(
         module.lan_https,
         "resolve_plan",
-        lambda: lan_https.plan_lan_https({}, {}, LAN, CERT),
+        lambda: lan_https.plan_lan_https({}, {}, LAN, CERT, vite=VITE),
     )
 
     module._start_lan_listener([], "C:/theDAW/frontend")
@@ -383,7 +457,7 @@ def test_an_occupied_port_is_reported_rather_than_crashing_the_stack(
     monkeypatch.setattr(
         module.lan_https,
         "resolve_plan",
-        lambda: lan_https.plan_lan_https({}, {}, LAN, CERT),
+        lambda: lan_https.plan_lan_https({}, {}, LAN, CERT, vite=VITE),
     )
     monkeypatch.setattr(
         module.ports,
@@ -405,7 +479,7 @@ def test_a_failed_spawn_is_one_line_and_the_stack_still_runs(
     monkeypatch.setattr(
         module.lan_https,
         "resolve_plan",
-        lambda: lan_https.plan_lan_https({}, {}, LAN, CERT),
+        lambda: lan_https.plan_lan_https({}, {}, LAN, CERT, vite=VITE),
     )
 
     def refuse(*_a: Any, **_k: Any) -> None:
@@ -472,7 +546,7 @@ def test_the_desktop_shell_starts_the_listener_from_the_frontend(
     electron_main: str,
 ) -> None:
     body = electron_main[slice(*_ts_function(electron_main, "startLanHttps"))]
-    assert "lanListenerCommand(process.platform)" in body
+    assert "lanListenerCommand(process.platform, plan)" in body
     assert "spawn(command, args" in body
     assert "env: lanListenerEnv(buildBaseEnv(), plan)" in body
     assert "cwd: frontendDir" in body
@@ -518,11 +592,13 @@ def test_the_listener_dies_with_the_app(electron_main: str) -> None:
 
 
 def test_the_listener_is_killed_as_a_tree_on_windows(electron_main: str) -> None:
-    """It is started through ``cmd /c npx``, so killing the shell alone leaves
-    a vite process holding the port against the next launch."""
+    """It is started through ``cmd /c``, so killing the shell alone leaves a
+    vite process holding the port against the next launch."""
     body = electron_main[slice(*_ts_function(electron_main, "killLanHttps"))]
-    assert "'/F', '/T', '/PID'" in body
-    assert "env: buildBaseEnv()" in body
+    assert "killLanChild(listener" in body
+    tree = electron_main[slice(*_ts_function(electron_main, "killLanChild"))]
+    assert "'/F', '/T', '/PID'" in tree
+    assert "env: buildBaseEnv()" in tree
 
 
 def test_the_electron_helper_runs_under_plain_node(electron_main: str) -> None:
@@ -537,13 +613,56 @@ def test_the_electron_helper_runs_under_plain_node(electron_main: str) -> None:
     assert "THEDAW_LAUNCH_TOKEN" in helper, "the helper strips the token itself"
 
 
-def test_the_electron_helper_has_its_own_test_run_the_documented_way() -> None:
-    """Every ``*.test.ts`` under electron-ui/main is run by hand with tsx (the
-    frontend's runner only discovers frontend/src), so the command has to be
-    in the file, as downloadNaming.test.ts does it."""
-    test_file = REPO_ROOT / "electron-ui" / "main" / "lanHttps.test.ts"
-    head = test_file.read_text(encoding="utf-8")[:200]
-    assert "npx tsx electron-ui/main/lanHttps.test.ts" in head
+def test_the_electron_helper_has_its_own_test_and_ci_runs_it() -> None:
+    """``frontend/package.json``'s ``test:electron`` is the ONLY thing that runs
+    a ``*.test.ts`` under electron-ui/main (``npm test`` discovers frontend/src
+    only). A suite missing from that script is a suite nothing runs -- which is
+    what this one was: it existed, it passed, and no gate would have noticed it
+    breaking."""
+    import json
+
+    assert (REPO_ROOT / "electron-ui" / "main" / "lanHttps.test.ts").is_file()
+    scripts = json.loads(
+        (REPO_ROOT / "frontend" / "package.json").read_text(encoding="utf-8")
+    )["scripts"]
+    assert "lanHttps.test.ts" in scripts["test:electron"]
+
+
+def test_the_plan_child_is_tracked_so_quitting_takes_it_with_it(
+    electron_main: str,
+) -> None:
+    """A cold ``uv run`` can take tens of seconds. Quitting in that window used
+    to leave the plan child (and, through the shell it runs under, its tree)
+    behind, and its own timeout killed only the process the shell held."""
+    assert "let lanPlanProcess: ChildProcess | null = null" in electron_main
+    reader = electron_main[slice(*_ts_function(electron_main, "readLanHttpsPlan"))]
+    assert "lanPlanProcess = proc" in reader
+    assert "killLanChild(proc" in reader, (
+        "the timeout kills the tree, not just the shell"
+    )
+
+    kill = electron_main[slice(*_ts_function(electron_main, "killLanHttps"))]
+    assert "lanPlanProcess" in kill, "the plan child dies with the app too"
+    # One Windows path for both children, the one killLanHttps always used.
+    tree = electron_main[slice(*_ts_function(electron_main, "killLanChild"))]
+    assert "'/F', '/T', '/PID'" in tree
+    assert "env: buildBaseEnv()" in tree
+
+
+def test_a_port_someone_else_holds_is_said_out_loud_rather_than_guessed_at(
+    electron_main: str,
+) -> None:
+    """vite's strictPort exits 1 and the log said only "the listener exited
+    (code=1)". A 300 ms connect first turns that into the actual reason, and
+    there is no retry loop fighting whatever owns the port."""
+    body = electron_main[slice(*_ts_function(electron_main, "startLanHttps"))]
+    assert "await portIsHeld(plan.port)" in body
+    assert "already in use" in body
+    probe = electron_main[slice(*_ts_function(electron_main, "portIsHeld"))]
+    assert "'127.0.0.1'" in probe
+    assert "setTimeout(300" in probe
+    # Node's own net, not Electron's `net` (which this file already imports).
+    assert re.search(r"import \{ connect as netConnect \} from 'net'", electron_main)
 
 
 # ---------------------------------------------------------------------------

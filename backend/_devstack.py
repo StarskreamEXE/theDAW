@@ -324,7 +324,7 @@ def _start_lan_listener(children: list, frontend_dir: str) -> bool:
 
     try:
         env = lan_https.listener_env(plan, launch_token.child_env())
-        proc = _spawn(lan_https.LISTENER_COMMAND, cwd=frontend_dir, env=env)
+        proc = _spawn(lan_https.listener_command(plan), cwd=frontend_dir, env=env)
     except Exception as exc:
         _emit("stack", f"LAN (https): off - the listener could not start ({exc})")
         return False

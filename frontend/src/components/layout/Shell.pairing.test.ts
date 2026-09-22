@@ -129,6 +129,70 @@ assert.match(
   'with no listener up, the http link must still be built exactly as before (packaged app has no window port)',
 );
 
+// ── the answer is a liveness fact, so it is re-asked, not latched ──────────
+//
+// `https_url` is present only while something answers on the TLS port RIGHT
+// NOW. On the desktop that listener boots AFTER the backend is ready: the plan
+// is read (a cold `uv run`), a certificate is minted, then vite starts. The
+// first answer therefore says "no listener" on the very machine that hands out
+// the link, and an effect that stopped there latched the http address forever —
+// the whole feature silently did not happen. So: show the http address at once,
+// keep asking on a bounded schedule, adopt the secure address when it arrives.
+const lanEffectStart = source.lastIndexOf('React.useEffect', lanFetchStart);
+assert.ok(lanEffectStart >= 0, 'the LAN fetch must live in an effect');
+const lanDepsAt = source.indexOf('}, [', lanFetchStart);
+assert.ok(lanDepsAt > lanEffectStart, 'the LAN effect must have a dependency array');
+const lanEffect = source.slice(lanEffectStart, source.indexOf('\n', lanDepsAt));
+const lanDeps = /\}, \[([^\]]*)\]/.exec(lanEffect)?.[1] ?? '';
+// The comments in there explain what `lanUrl` used to do, so the assertion
+// below is about the CODE.
+const lanEffectCode = lanEffect.replace(/\/\/[^\n]*/g, '');
+
+assert.doesNotMatch(
+  lanEffectCode,
+  /\blanUrl\b/,
+  'the LAN effect must not read `lanUrl` at all — guarding on it (or depending on it) is what latched ' +
+    'the first, http-only answer and stopped the effect before any listener could come up',
+);
+assert.doesNotMatch(lanDeps, /\blanUrl\b/, 'and `lanUrl` must not be a dependency either');
+assert.match(
+  lanDeps,
+  /\blanHttpsUrl\b/,
+  'the effect stops on the SECURE address instead: once that arrives there is nothing left to ask',
+);
+assert.match(
+  lanEffect,
+  /setTimeout\(/,
+  'while https_url is null the question must be re-asked, so there has to be a timer',
+);
+assert.match(
+  lanEffect,
+  /clearTimeout\(/,
+  'and the timer must be cleared on unmount — a share panel closed mid-poll must not keep fetching',
+);
+assert.match(lanEffect, /LAN_HTTPS_POLL_INTERVAL_MS/, 'the re-poll interval is named, not inline');
+assert.match(lanEffect, /LAN_HTTPS_POLL_WINDOW_MS/, 'and the window it gives up after');
+assert.match(
+  source,
+  /const LAN_HTTPS_POLL_INTERVAL_MS = 3_?000\b/,
+  'every 3 s: fast enough to catch the listener coming up, slow enough to be invisible',
+);
+assert.match(
+  source,
+  /const LAN_HTTPS_POLL_WINDOW_MS = 60_?000\b/,
+  'bounded: after a minute there is no listener coming, and an unbounded poll would run for the life of the app',
+);
+assert.match(
+  lanEffect,
+  /lanPollSuspended/,
+  'no polling while the share-URL override is set — that address wins over anything detected',
+);
+assert.match(
+  source,
+  /const lanPollSuspended = shareUrlOverride\.trim\(\) !== ''/,
+  'and that is what "the override is set" means here',
+);
+
 // ── the companion link rides the same base, so it is https too ─────────────
 assert.match(
   companionUrlBody,

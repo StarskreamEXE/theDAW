@@ -10,6 +10,9 @@ import {
   shell,
 } from 'electron'
 import { ChildProcess, spawn, execFile } from 'child_process'
+// Node's own net, under a name of its own: `net` in this file is ELECTRON's
+// net module (the app:// protocol handler fetches through it).
+import { connect as netConnect } from 'net'
 import { autoUpdater } from 'electron-updater'
 import * as crypto from 'crypto'
 import * as fs from 'fs'
@@ -652,6 +655,53 @@ function killBackend(): Promise<void> {
 
 let lanHttpsProcess: ChildProcess | null = null
 
+/** The short-lived `--json` child that answers the plan. Tracked for the same
+ *  reason the listener is: a cold `uv run` can take tens of seconds, and a
+ *  quit inside that window must not leave it -- or the shell it runs under --
+ *  behind holding the venv lock. */
+let lanPlanProcess: ChildProcess | null = null
+
+/** Stop one of the two LAN children, and on Windows the whole tree under it.
+ *  Both run through a shell (`cmd /c`, `uv run`), so killing the process this
+ *  side holds leaves the real work behind: a vite still on the port against
+ *  the next launch, or a uv still in the venv. Synchronous and idempotent:
+ *  quitting must not wait on either. */
+function killLanChild(proc: ChildProcess | null, what: string): void {
+  if (!proc || proc.exitCode !== null) return
+  const pid = proc.pid
+  log(`Stopping ${what}...`)
+  try {
+    if (process.platform === 'win32' && pid) {
+      execFile('taskkill', ['/F', '/T', '/PID', String(pid)], { env: buildBaseEnv() }, (err) => {
+        if (err) log(`LAN (https): taskkill error: ${err.message}`)
+      })
+    } else {
+      proc.kill()
+    }
+  } catch {
+    // already gone
+  }
+}
+
+/** Is something already answering on 127.0.0.1:port? A 300 ms connect, on the
+ *  way to a spawn nothing waits for. Without this, vite's strictPort exit was
+ *  all the log had to say about a port someone else holds: "the listener
+ *  exited (code=1)". */
+function portIsHeld(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = netConnect({ host: '127.0.0.1', port })
+    const settle = (held: boolean): void => {
+      socket.destroy()
+      resolve(held)
+    }
+    socket.setTimeout(300, () => settle(false))
+    socket.once('connect', () => settle(true))
+    // `on`, not `once`: a socket destroyed by settle() can still raise, and an
+    // unhandled 'error' on a socket takes the main process down.
+    socket.on('error', () => settle(false))
+  })
+}
+
 /** The Python that answers the plan: the dev venv's when it exists (the same
  *  reliable path spawnBackend prefers), otherwise `uv run`. */
 function lanHttpsPlanCommand(): { command: string; args: string[] } {
@@ -679,15 +729,15 @@ function readLanHttpsPlan(): Promise<LanHttpsPlan | null> {
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
       })
+      lanPlanProcess = proc
+      const release = (): void => {
+        if (lanPlanProcess === proc) lanPlanProcess = null
+      }
       // A cold `uv run` can be slow; a hung one must still not keep this
-      // pending forever, because killLanHttps has nothing to kill until the
-      // spawn below has happened.
+      // pending forever.
       const deadline = setTimeout(() => {
-        try {
-          proc.kill()
-        } catch {
-          // already gone
-        }
+        killLanChild(proc, 'the LAN HTTPS plan (it took too long)')
+        release()
         log('LAN (https): the plan took too long — no listener this launch.')
         done(null)
       }, 30_000)
@@ -700,11 +750,13 @@ function readLanHttpsPlan(): Promise<LanHttpsPlan | null> {
       })
       proc.on('error', (err) => {
         clearTimeout(deadline)
+        release()
         log(`LAN (https): the plan could not be read (${err.message})`)
         done(null)
       })
       proc.on('exit', () => {
         clearTimeout(deadline)
+        release()
         done(parseLanHttpsPlan(stdout))
       })
     } catch (err) {
@@ -723,7 +775,16 @@ async function startLanHttps(): Promise<void> {
   // now is one nothing would ever kill.
   if (!plan || !plan.enabled || isQuitting) return
 
-  const { command, args } = lanListenerCommand(process.platform)
+  // Somebody else is on the port -- another copy of theDAW, or a listener run
+  // by hand. Say so once and leave it alone: vite would exit 1 on strictPort
+  // and a retry loop would only fight whatever owns it.
+  if (await portIsHeld(plan.port)) {
+    log(`LAN (https): port ${plan.port} is already in use — no listener this launch.`)
+    return
+  }
+  if (isQuitting) return
+
+  const { command, args } = lanListenerCommand(process.platform, plan)
   const frontendDir = path.join(repoRoot, 'frontend')
   try {
     lanHttpsProcess = spawn(command, args, {
@@ -759,26 +820,16 @@ async function startLanHttps(): Promise<void> {
   })
 }
 
-/** Stop the listener. Synchronous and idempotent: quitting must not wait on
- *  it, and it is called from both will-quit and killBackend. */
+/** Stop the listener, and the plan child if one is still being read.
+ *  Synchronous and idempotent: quitting must not wait on it, and it is called
+ *  from both will-quit and killBackend. */
 function killLanHttps(): void {
-  const proc = lanHttpsProcess
+  const plan = lanPlanProcess
+  lanPlanProcess = null
+  killLanChild(plan, 'the LAN HTTPS plan')
+  const listener = lanHttpsProcess
   lanHttpsProcess = null
-  if (!proc || proc.exitCode !== null) return
-  const pid = proc.pid
-  log('Stopping the LAN HTTPS listener...')
-  try {
-    if (process.platform === 'win32' && pid) {
-      // Through `cmd /c npx`, so the tree — not just the shell — has to go.
-      execFile('taskkill', ['/F', '/T', '/PID', String(pid)], { env: buildBaseEnv() }, (err) => {
-        if (err) log(`LAN (https): taskkill error: ${err.message}`)
-      })
-    } else {
-      proc.kill()
-    }
-  } catch {
-    // already gone
-  }
+  killLanChild(listener, 'the LAN HTTPS listener')
 }
 
 // ---------------------------------------------------------------------------

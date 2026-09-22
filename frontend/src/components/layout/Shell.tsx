@@ -52,6 +52,14 @@ import { keyBelongsToFocusedControl } from '../../lib/keyTargets';
 const RIGHT_RAIL_MIN = 280;
 const RIGHT_RAIL_MAX = 640;
 
+// How often, and for how long, the share panel re-asks `/api/network/lan`
+// whether the LAN TLS listener has come up (see the effect that uses these).
+// Fast enough to catch it appearing a few seconds into a launch, slow enough
+// that nobody notices the requests; bounded, because after a minute the answer
+// is not going to change.
+const LAN_HTTPS_POLL_INTERVAL_MS = 3_000;
+const LAN_HTTPS_POLL_WINDOW_MS = 60_000;
+
 export const Shell: React.FC = () => {
   const navigateTo = useAppUiStore((state) => state.navigateTo);
   const centerTab = useAppUiStore((state) => state.centerTab);
@@ -153,33 +161,69 @@ export const Shell: React.FC = () => {
   const [lanUrl, setLanUrl] = React.useState('');
   const [lanHttpsUrl, setLanHttpsUrl] = React.useState('');
   const isBackendReadyForLan = useStatusBarStore((s) => s.isBackendReady);
+  // The override address wins over anything detected, so there is nothing for
+  // a poll to discover while one is typed in.
+  const lanPollSuspended = shareUrlOverride.trim() !== '';
   React.useEffect(() => {
     // Wait for the backend: on a packaged cold start this fetch used to fire
     // once before :8600 was bound, fail, and leave the share link on the
     // app://. origin fallback forever.
-    if (!isBackendReadyForLan || lanUrl) return;
+    //
+    // Deliberately NOT guarded on `lanUrl`. `https_url` is a LIVENESS fact —
+    // the route reports it only while something answers on the TLS port right
+    // now — and on the desktop the listener comes up AFTER the backend is
+    // ready: the plan is read (a cold `uv run`), a certificate is minted, then
+    // vite starts. So the FIRST answer says "no listener" on the very machine
+    // that hands out the link, and stopping there latched the http address for
+    // the life of the window. Instead: show the http address at once, keep
+    // asking on a bounded schedule, and adopt the secure address when it
+    // arrives (which stops the polling, because `lanHttpsUrl` is the guard).
+    if (!isBackendReadyForLan || lanHttpsUrl || lanPollSuspended) return;
     let cancelled = false;
-    void fetch('/api/network/lan')
-      .then((r) => (r.ok ? r.json() : null))
-      .then((j: { lan_ip?: string | null; https_url?: string | null } | null) => {
-        if (cancelled || !j?.lan_ip || typeof window === 'undefined') return;
-        // Only an https address is an upgrade; anything else and we would be
-        // swapping one insecure origin for another.
-        const secure = (j.https_url ?? '').trim();
-        const isSecure = secure.toLowerCase().startsWith('https://');
-        if (isSecure) setLanHttpsUrl(secure);
-        // Packaged app has no window port (app://. origin) — phones reach it
-        // on the backend port; browser dev keeps its own port (5173 fallback).
-        const port = lanReachablePort() || '5173';
-        setLanUrl(isSecure ? secure : `http://${j.lan_ip}:${port}`);
-      })
-      .catch(() => {
-        /* no backend / no LAN — keep the http fallback */
-      });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const giveUpAt = Date.now() + LAN_HTTPS_POLL_WINDOW_MS;
+    const askAgainLater = (): void => {
+      // Bounded: after the window there is no listener coming, and an endless
+      // poll would run for as long as the app is open.
+      if (cancelled || Date.now() >= giveUpAt) return;
+      timer = setTimeout(ask, LAN_HTTPS_POLL_INTERVAL_MS);
+    };
+    function ask(): void {
+      void fetch('/api/network/lan')
+        .then((r) => (r.ok ? r.json() : null))
+        .then((j: { lan_ip?: string | null; https_url?: string | null } | null) => {
+          if (cancelled || typeof window === 'undefined') return;
+          if (!j?.lan_ip) {
+            askAgainLater();
+            return;
+          }
+          // Only an https address is an upgrade; anything else and we would be
+          // swapping one insecure origin for another.
+          const secure = (j.https_url ?? '').trim();
+          if (secure.toLowerCase().startsWith('https://')) {
+            setLanHttpsUrl(secure);
+            setLanUrl(secure);
+            return;
+          }
+          // Packaged app has no window port (app://. origin) — phones reach it
+          // on the backend port; browser dev keeps its own port (5173
+          // fallback). Shown straight away, so the panel is never blank while
+          // the secure address is still being waited for.
+          const port = lanReachablePort() || '5173';
+          setLanUrl(`http://${j.lan_ip}:${port}`);
+          askAgainLater();
+        })
+        .catch(() => {
+          /* no backend / no LAN — keep the http fallback and try again */
+          askAgainLater();
+        });
+    }
+    ask();
     return () => {
       cancelled = true;
+      if (timer) clearTimeout(timer);
     };
-  }, [isBackendReadyForLan, lanUrl]);
+  }, [isBackendReadyForLan, lanHttpsUrl, lanPollSuspended]);
 
   // Never fall back to window.location.origin blindly: in the packaged app
   // that is app://., which is useless on a phone AND opens a second copy of
