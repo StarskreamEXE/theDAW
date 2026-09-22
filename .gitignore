@@ -481,6 +481,3 @@ _backup/
 /docs/guides/screenshots.7z
 /docs/guides/screenshots/
 /docs/guides/t37a-roll-initial.png
-
-# Retired code kept on disk, never shipped
-/backend/deprecated/
