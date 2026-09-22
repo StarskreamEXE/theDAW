@@ -77,6 +77,11 @@ export interface LineageSummary {
   /** True only for a library small enough to draw whole (with_lineage <= 2000). */
   full_view_ok: boolean;
   revision: number;
+  /**
+   * True when this answer came from the cache; false means this request ran
+   * the pass. Absent on older backends that did not report it.
+   */
+  warm?: boolean;
 }
 
 export type RankingList = 'most_derived' | 'deepest' | 'mashup_sources' | 'recent';

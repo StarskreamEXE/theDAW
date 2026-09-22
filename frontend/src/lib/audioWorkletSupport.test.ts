@@ -304,6 +304,46 @@ const insecureCtx = (): BaseAudioContext => ({}) as unknown as BaseAudioContext;
   assert.ok(DIRECT_CALL.test('void ctx.audioWorklet?.addModule(URL);'));
   assert.ok(!DIRECT_CALL.test('addWorkletModule(ctx, URL)'));
   assert.ok(sourceFiles(srcRoot).length > 50, 'the scan reached the tree, not an empty directory');
+
+  // DIRECT_CALL only sees the property spelled out on the same line. Two ways
+  // of writing the same crash slip past it:
+  //
+  //     const w = ctx.audioWorklet; w.addModule('/x.js');   // aliased
+  //     ctx['audioWorklet'].addModule('/x.js');             // bracket access
+  //
+  // so the guard also runs a pattern that does not care HOW the object was
+  // reached: any `addModule(` at all. `addModule` is not a name anything else
+  // in this tree owns — a grep over src found no non-worklet definition or
+  // call of it outside the exempt file — so the weak pattern needs no
+  // exceptions today. If a legitimate one ever appears, add its
+  // `path:line`-free source path here with a comment saying why.
+  const ANY_CALL = /\baddModule\s*\(/;
+  const ANY_CALL_ALLOWED: readonly string[] = [];
+
+  const looseOffenders = sourceFiles(srcRoot)
+    .filter((file) => !ANY_CALL_ALLOWED.includes(relative(srcRoot, file).replace(/\\/g, '/')))
+    .map((file) => ({ file, lines: readFileSync(file, 'utf8').split(/\r?\n/) }))
+    .flatMap(({ file, lines }) =>
+      lines
+        .map((line, i) => ({ line, i }))
+        .filter(({ line }) => ANY_CALL.test(line))
+        .map(({ i }) => `${relative(srcRoot, file).replace(/\\/g, '/')}:${i + 1}`),
+    );
+
+  assert.deepEqual(
+    looseOffenders,
+    [],
+    'no file under src may call addModule under any spelling — alias it, index it ' +
+      "with a string, it still crashes with \"reading 'addModule'\" off a secure context. " +
+      'Use addWorkletModule (lib/audioWorkletSupport.ts).',
+  );
+
+  // The weaker scan has to catch what the stricter one misses.
+  assert.ok(ANY_CALL.test("const w = ctx.audioWorklet; void w.addModule('/x.js');"), 'aliased');
+  assert.ok(ANY_CALL.test("ctx['audioWorklet'].addModule('/x.js');"), 'bracket access');
+  assert.ok(ANY_CALL.test('await worklet.addModule(URL);'), 'member on any receiver');
+  assert.ok(!ANY_CALL.test('addWorkletModule(ctx, URL)'), 'the sanctioned helper is not a hit');
+  assert.ok(!ANY_CALL.test("// crashed with reading 'addModule')"), 'prose about the crash is not a call');
 }
 
 console.log('audioWorkletSupport: ok');

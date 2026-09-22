@@ -84,12 +84,26 @@ const params = (url: string): Record<string, string> => {
     entries: 194833, with_lineage: 173877, standalone: 20652,
     links_raw: 475174, links_distinct: 400000, by_kind: { derived_from: 164779 },
     largest_connected: 81501, largest_tree: 8618, full_view_ok: false, revision: 7,
+    // The backend reports whether this answer was served from the cache (true)
+    // or paid for by this request (false). It must survive the round trip.
+    warm: true,
   };
   const r = await withFetch(json(body), () => fetchLineageSummary());
   assert.equal(r.error, null);
   assert.equal(r.url, '/api/lineage-scale/summary');
   assert.equal(r.value?.largest_tree, 8618);
   assert.equal(r.value?.full_view_ok, false);
+  assert.equal(r.value?.warm, true, 'warm comes through as sent');
+
+  // A cold answer is `false`, not missing — the two mean different things and
+  // a reader has to be able to tell them apart.
+  const cold = await withFetch(json({ ...body, warm: false }), () => fetchLineageSummary());
+  assert.equal(cold.value?.warm, false);
+  const older = await withFetch(
+    json(Object.fromEntries(Object.entries(body).filter(([k]) => k !== 'warm'))),
+    () => fetchLineageSummary(),
+  );
+  assert.equal(older.value?.warm, undefined, 'a backend that omits it leaves the field absent');
 }
 
 // ── rankings ────────────────────────────────────────────────────────────────
