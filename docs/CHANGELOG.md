@@ -8,6 +8,20 @@ Newest first.
 
 ## 2026-09-22
 
+### Listing performance sets no longer writes to the library (verified by tests: tests/test_library_setlists.py, tests/test_library_api_at_scale.py)
+
+- `GET /api/library/setlists` registered every unregistered track of every performance set as a library entry and
+  rewrote a sidecar on each read (25 commits per listing on a three-set folder). Listing is read-only; a set is
+  registered once when it is opened, through `POST /api/library/setlists/{id}/register` (cross-site refused, 404 on
+  an unknown id, no id echoed).
+- Registering fills entry ids into the user's own list, matched by file name, so reorders, removals and hand-added
+  tracks survive; it is not counted as an edit. Two overlapping opens register each file once: the store reuses the
+  entry an identical resolved path already has, and the route holds a per-folder lock.
+- A set's id hashes its files rather than its registrations, so it survives registration; bundled sets already in a
+  browser re-import once under the new id.
+- The API scale guard now points `theDAW_DATA_DIR` into its fixture, so its probes never read the developer's own
+  data tree; a test pins that.
+
 ### Media roots: the library serves files it never owned (verified by tests: tests/test_library_media_roots.py)
 
 - An entry whose audio was never written under `data/generations/` is served
