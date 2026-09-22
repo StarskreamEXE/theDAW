@@ -359,6 +359,98 @@ def test_stored_label_wins_over_the_embedded_tags(client_with_root, tmp_path):
     assert body["provider_is_ai"] is False
 
 
+def _provider_column(store: LibraryStore, entry_id: str):
+    assert store.db is not None
+    row = store.db.get_entry(entry_id)
+    assert row is not None
+    return row["provider"]
+
+
+def test_a_thedaw_frame_never_refiles_a_native_generation(
+    client_with_root, tmp_path, write_spy
+):
+    """The fallback's last arm is not a detection that outranks anything.
+
+    ``thedaw`` means "made in theDAW, origin unspecified" -- it is what an
+    entry NOTHING identifies is filed under, and it is not an AI provider. A
+    theDAW encoder frame is on every file this app writes, including its own
+    Stable Audio generations, so letting that frame win would refile a native
+    generation as non-AI in the filter, the facet and the badge -- and the
+    read path would then PERSIST that into ``entries.provider``, permanently.
+
+    An entry whose ``source`` is 'generate' derives ``stable-audio``, which is
+    a better answer than the fallback, so the detection is dropped.
+    """
+    _seed_entry(tmp_path, "entry_native", {"source": "generate", "model": "medium"})
+    store = library_router_module.get_store()
+    assert store.db is not None
+    store.db.upsert_analysis(
+        "entry_native", {"embedded_tags": {"encoder": "theDAW 1.0"}}
+    )
+    before = _provider_column(store, "entry_native")
+
+    single = client_with_root.get("/api/library/entries/entry_native").json()
+    assert single["provider"] == "stable-audio"
+    assert single["provider_is_ai"] is True
+
+    listed = client_with_root.get("/api/library/entries?limit=10").json()["entries"]
+    assert [e["provider"] for e in listed] == ["stable-audio"]
+
+    # Nothing was written through: the column still says what it said, and the
+    # metadata on disk was never rewritten with a provider.
+    assert write_spy == []
+    assert _provider_column(store, "entry_native") == before
+    assert "provider" not in _read_meta(store.root, "entry_native")
+
+
+def test_a_thedaw_frame_does_not_outrank_an_import_either(
+    client_with_root, tmp_path, write_spy
+):
+    """Same rule, the other derivation that beats the fallback.
+
+    'import' is a real answer about where the row came from, so a theDAW frame
+    inside the file does not replace it. Only an entry whose derivation IS the
+    fallback has nothing to lose, and for that entry the detection agrees with
+    what it is already shown as -- so this rule never produces a write.
+    """
+    _seed_entry(tmp_path, "entry_imported", {"source": "import", "model": "imported"})
+    store = library_router_module.get_store()
+    assert store.db is not None
+    store.db.upsert_analysis(
+        "entry_imported", {"embedded_tags": {"encoder": "theDAW 1.0"}}
+    )
+    before = _provider_column(store, "entry_imported")
+
+    body = client_with_root.get("/api/library/entries/entry_imported").json()
+    assert body["provider"] == "import"
+    assert body["provider_is_ai"] is False
+    assert write_spy == []
+    assert _provider_column(store, "entry_imported") == before
+
+
+def test_a_real_provider_frame_still_outranks_a_derivation(
+    client_with_root, tmp_path, write_spy
+):
+    """The guard above is narrow: it silences the FALLBACK slug only.
+
+    A Suno frame on a row the columns call 'generate' still wins, and is still
+    persisted -- which is the behaviour the write-through exists for.
+    """
+    _seed_entry(tmp_path, "entry_suno_gen", {"source": "generate", "model": "medium"})
+    store = library_router_module.get_store()
+    assert store.db is not None
+    store.db.upsert_analysis(
+        "entry_suno_gen",
+        {"embedded_tags": {"generator": "suno", "txxx_suno_id": SUNO_ID}},
+    )
+
+    body = client_with_root.get("/api/library/entries/entry_suno_gen").json()
+    assert body["provider"] == "suno"
+    assert body["provider_id"] == SUNO_ID
+    assert [call for call in write_spy if "entry_suno_gen" in call]
+    assert _provider_column(store, "entry_suno_gen") == "suno"
+
+
 # ---- List filter -----------------------------------------------------------
 
 
@@ -1715,6 +1807,57 @@ def test_a_media_entry_whose_metadata_omits_source_is_still_an_import(
     assert record.provider_is_ai is False
     assert _ids(store, provider="import") == {"no_source_media"}
     assert _ids(store, provider="thedaw") == set()
+
+
+def test_the_source_default_never_reaches_the_step_that_fills_the_column(
+    tmp_path: Path, monkeypatch
+):
+    """The default is the FALLBACK's, not the detection's.
+
+    Step 1 of the wire derivation and the ``provider`` column are the same
+    function over the same dict -- ``resolved_provider_slug`` computes the
+    column from the metadata exactly as stored. Handing step 1 a dict with a
+    ``source`` the file does not carry would give the wire a rule SQL cannot
+    have: today ``provider.detect_provider`` already reads ``meta["source"]``
+    (the legacy ``source='suno'`` marker), so this is not hypothetical. The
+    defaults go to step 2, whose twin reads the very columns they came from.
+    """
+    from backend.modules.library import store as library_store_module
+    from backend.modules.library.db import resolved_provider_slug
+
+    root = tmp_path / "lib"
+    root.mkdir(parents=True, exist_ok=True)
+    _seed_entry_without(root, "no_source_probe", {"model": "medium"}, "source")
+
+    seen: list[dict] = []
+    real = library_store_module.detect_provider
+
+    def spy(embedded, meta=None):
+        seen.append(dict(meta or {}))
+        return real(embedded, meta)
+
+    monkeypatch.setattr(library_store_module, "detect_provider", spy)
+    store = LibraryStore(root)
+    record = store.get_entry("no_source_probe")
+    assert record is not None
+    assert record.source == "generate"
+    assert record.provider == "stable-audio"
+
+    # Step 1 saw the dict on disk, unchanged -- no injected 'source'.
+    on_disk = _read_meta(root, "no_source_probe")
+    assert "source" not in on_disk
+    assert seen and all("source" not in meta for meta in seen)
+    assert seen[0] == on_disk
+
+    # And the two halves still agree: the metadata names no provider, so the
+    # column is NULL and the fallback answers for the row -- which is the same
+    # answer the wire just gave it.
+    assert resolved_provider_slug(on_disk) is None
+    assert store.db is not None
+    row = store.db.get_entry("no_source_probe")
+    assert row is not None
+    assert row["provider"] is None
+    assert _ids(store, provider="stable-audio") == {"no_source_probe"}
 
 
 def test_the_sql_else_arm_answers_thedaw_for_a_blank_source(tmp_path: Path):

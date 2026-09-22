@@ -677,17 +677,23 @@ def _provider_wire(
     ``source`` and ``model`` are the ``entries`` columns, used when
     ``metadata.json`` carries none of its own -- the column is the truth for a
     row rebuilt from the DB.
+
+    They reach step 2 ONLY. Step 1 is handed the metadata dict exactly as
+    stored, because :func:`~.db.resolved_provider_slug` computes the
+    ``provider`` COLUMN from that same raw dict: a default injected here and
+    not there is a rule that answers on the wire and not in SQL, which is the
+    split this function's whole shape exists to prevent. The defaults belong
+    to the fallback, whose SQL twin reads the columns they came from.
     """
     row_source = str(meta.get("source") or source or "")
-    if source and not meta.get("source"):
-        meta = {**meta, "source": source}
+    row_model = str(meta.get("model") or model or "")
     info = bounded_provider_info(detect_provider({}, meta))
     if info is not None:
         return bounded_provider_wire_fields(info)
     # No ``suno_id`` argument: an entry carrying one never reaches here,
     # because `detect_provider` above answers "suno" for it. The fallback is
     # the columns alone, in both languages.
-    return derived_provider_wire(str(meta.get("model") or model or ""), row_source)
+    return derived_provider_wire(row_model, row_source)
 
 
 def _detected_provider_meta(info: ProviderInfo) -> dict[str, Any]:

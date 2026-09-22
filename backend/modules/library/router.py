@@ -55,7 +55,14 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from .bundle import build_bundle_bytes
-from .db import DEFAULT_SORT, FACET_FIELDS, SORTS, EntryFilters, infer_provider
+from .db import (
+    DEFAULT_PROVIDER,
+    DEFAULT_SORT,
+    FACET_FIELDS,
+    SORTS,
+    EntryFilters,
+    infer_provider,
+)
 from .provider import ProviderInfo, detect_provider
 from .store import (
     AUDIO_EXTS,
@@ -276,10 +283,21 @@ def _derive_provider(
     that entry, and no further request writes anything.
     """
     current = entry.get("provider")
-    if current and current != infer_provider(entry.get("model"), entry.get("source")):
+    derived = infer_provider(entry.get("model"), entry.get("source"))
+    if current and current != derived:
         return None
     info = bounded_provider_info(detect_provider(embedded, None))
     if info is None:
+        return None
+    # The fallback's LAST arm is not a detection. ``thedaw`` means "made in
+    # theDAW, origin unspecified" and is not an AI provider, while a theDAW
+    # encoder/generator frame is on every file this app writes -- including its
+    # own Stable Audio generations, whose columns derive ``stable-audio``.
+    # Letting the frame win would refile a native generation as non-AI in the
+    # filter, the facet and the badge, and the write-through below would make
+    # that permanent. So it only applies where the derivation is the fallback
+    # too, which is where it changes nothing and no write follows.
+    if info.provider == DEFAULT_PROVIDER and derived != DEFAULT_PROVIDER:
         return None
     fields = bounded_provider_wire_fields(info)
     changed = any(entry.get(key) != value for key, value in fields.items())
