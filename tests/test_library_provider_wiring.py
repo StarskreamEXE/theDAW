@@ -602,6 +602,72 @@ def test_import_with_a_minted_tool_frame_beats_the_import_label(tmp_path: Path):
     assert _read_meta(store.root, record.id)["provider"] == UNKNOWN_TOOL_SLUG
 
 
+@pytest.mark.parametrize("falsy", [None, ""], ids=["none", "empty"])
+def test_import_labels_from_the_columns_the_row_will_actually_hold(
+    tmp_path: Path, falsy
+):
+    """The labeler and the row must read the same ``(model, source)``.
+
+    A caller may hand ``import_blob`` a falsy ``source``; every record
+    constructor normalises that to its own default ('generate' for an audio
+    entry), and the read path derives from the normalised row. Deriving from
+    the raw dict here instead made the two disagree: the labeler saw no source
+    at all, derived the non-AI fallback, let a theDAW frame win and PERSISTED
+    ``provider=thedaw`` -- for a row whose every other reader says
+    stable-audio.
+    """
+    store = LibraryStore(tmp_path / "lib")
+    record = _import_with_encoder(
+        store, tmp_path, "theDAW 1.0", source=falsy, model="medium"
+    )
+
+    assert record.source == "generate"
+    assert record.provider == "stable-audio"
+    assert record.provider_is_ai is True
+    assert record.tags == []
+    assert "provider" not in _read_meta(store.root, record.id)
+
+
+def test_an_outranked_detection_still_ingests_the_curated_song_fields(tmp_path: Path):
+    """Losing the RANK is not losing the song.
+
+    The curated fields describe the music -- prompt, style, lyrics, the model
+    version the file names -- and none of them claims a provider. They are
+    worth ingesting whoever wins, so only the four provider wire fields and the
+    provider tag are skipped when the detection is outranked.
+    """
+    store = LibraryStore(tmp_path / "lib")
+    record = store.import_blob(
+        audio_bytes=_tagged_mp3(
+            tmp_path / "curated.mp3",
+            encoder=UNKNOWN_TOOL,
+            txxx={
+                "style": "dream pop",
+                "model_version": "v2.1",
+                "lyrics": "a line",
+                "prompt": "a prompt",
+            },
+        ),
+        filename="curated.mp3",
+        mime_type="audio/mpeg",
+        metadata={"source": "generate"},
+    )
+
+    # The provider answer is the row's own, and nothing was tagged.
+    assert record.provider == "stable-audio"
+    assert record.provider_is_ai is True
+    assert record.tags == []
+    meta = _read_meta(store.root, record.id)
+    assert "provider" not in meta
+    assert "provider_label" not in meta
+
+    # The song fields are ingested all the same.
+    assert meta["style"] == "dream pop"
+    assert meta["model_version"] == "v2.1"
+    assert record.lyrics == "a line"
+    assert record.prompt == "a prompt"
+
+
 def test_import_of_a_generation_still_takes_a_real_service_frame(tmp_path: Path):
     """Unchanged: a named service outranks the derivation either way."""
     store = LibraryStore(tmp_path / "lib")
@@ -2014,6 +2080,7 @@ def test_the_source_default_never_reaches_the_step_that_fills_the_column(
     on_disk = _read_meta(root, "no_source_probe")
     assert "source" not in on_disk
     assert seen and all("source" not in meta for meta in seen)
+    assert seen[0] == on_disk
 
     # And the two halves still agree: the metadata names no provider, so the
     # column is NULL and the fallback answers for the row -- which is the same

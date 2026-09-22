@@ -606,6 +606,25 @@ def _is_unset(value: Any) -> bool:
     return value is None or value == ""
 
 
+def _audio_row_columns(meta: Mapping[str, Any]) -> tuple[str, str]:
+    """The ``(model, source)`` an AUDIO entry's ROW holds, from its metadata.
+
+    ONE spelling of the two falsy defaults, because the provider rule is only
+    consistent while everything reads the same pair. ``metadata.json`` may
+    carry no ``source`` (a native generation writes none), a null one or an
+    empty string, and :func:`_record_from_metadata` turns all three into
+    'generate' -- as does the DB-row path, and the router derives from the
+    loaded row. A labeler that read the RAW dict instead would derive the
+    fallback for the same entry, let a theDAW frame outrank it and store a
+    provider the rest of the system contradicts.
+
+    ``model`` keeps the pre-refactor ``model_name`` spelling, for the same
+    reason the record does: entries written before that rename still resolve.
+    """
+    model = meta.get("model") or meta.get("model_name") or ""
+    return str(model), str(meta.get("source") or "generate")
+
+
 def _apply_provider_labels(
     record_meta: dict[str, Any],
     embedded: Mapping[str, Any],
@@ -627,11 +646,19 @@ def _apply_provider_labels(
 
     A detection the ``(model, source)`` derivation outranks
     (:func:`~.provider.detection_outranks`, the same rule the read path's
-    ``router._derive_provider`` applies) writes NOTHING -- not the wire fields,
-    not the curated fields, not the provider tag. The entry keeps the label its
-    columns imply, which is the label the list filter, the facet and the badge
-    already show it under. ``record_meta`` is what the caller is about to
-    write, so its ``model`` / ``source`` are the columns the row will have.
+    ``router._derive_provider`` applies) writes no PROVIDER -- not the four
+    wire fields, not the provider tag. The entry keeps the label its columns
+    imply, which is the label the list filter, the facet and the badge already
+    show it under.
+
+    The curated fields are written either way. They describe the SONG -- the
+    prompt, the style, the lyrics, the model version the file names -- and
+    none of them claims a provider, so which label won the rank is no reason
+    to throw the file's own account of its music away.
+
+    The derivation reads :func:`_audio_row_columns`, not ``record_meta``
+    directly: both call sites build an audio entry, and the row it becomes
+    normalises a missing, null or empty ``source`` to 'generate'.
     """
     # Bounded up front, so the slug stored, the slug tagged and the slug on
     # the wire are one string -- and a detection whose slug bounds away to
@@ -639,12 +666,12 @@ def _apply_provider_labels(
     info = bounded_provider_info(detect_provider(embedded, record_meta))
     if info is None:
         return
-    derived = derived_provider_wire(record_meta.get("model"), record_meta.get("source"))
-    if not detection_outranks(
+    derived = derived_provider_wire(*_audio_row_columns(record_meta))
+    outranks = detection_outranks(
         info, str(derived["provider"]), bool(derived["provider_is_ai"])
-    ):
-        return
-    record_meta.update(bounded_provider_wire_fields(info))
+    )
+    if outranks:
+        record_meta.update(bounded_provider_wire_fields(info))
 
     curated = curated_fields(embedded, info)
     for name in _CURATED_ENTRY_FIELDS:
@@ -662,6 +689,10 @@ def _apply_provider_labels(
     # The provider is a tag too, so the existing tag filter and the search
     # index find these tracks without a new mechanism. Compared case-folded:
     # a user who already tagged the track "Suno" does not get a second one.
+    # Skipped with the wire fields: a tag for a label the entry is not shown
+    # under would make the tag filter and the provider filter disagree.
+    if not outranks:
+        return
     tags = list(record_meta.get("tags") or [])
     if info.provider not in {str(tag).strip().lower() for tag in tags}:
         record_meta["tags"] = [*tags, info.provider]
@@ -824,9 +855,10 @@ def _record_from_metadata(
                 timestamp = ""
 
     # Older metadata used `model_name` and `cfg_scale`; the new convention is
-    # `model` and `cfg`. Read both so the library list works for entries
-    # written before this refactor.
-    model = meta.get("model") or meta.get("model_name") or ""
+    # `model` and `cfg`. `model` reads both (in `_audio_row_columns`, which the
+    # import labeler shares) so the library list works for entries written
+    # before this refactor.
+    model, row_source = _audio_row_columns(meta)
     cfg_val = meta.get("cfg")
     if cfg_val is None:
         cfg_val = meta.get("cfg_scale", 0.0)
@@ -852,22 +884,19 @@ def _record_from_metadata(
         else None,
         tags=list(meta.get("tags") or []),
         notes=str(meta.get("notes") or ""),
-        source=str(meta.get("source") or "generate"),
+        source=row_source,
         chimera_sources=list(meta.get("chimera_sources") or []),
         lyrics=str(meta.get("lyrics") or ""),
         spectrogram_paths=dict(meta.get("spectrogram_paths") or {}),
         cover_url=_cover_url_if_present(entry_dir, api_prefix, entry_id),
-        # The SAME defaults the record's own fields use above. `metadata.json`
-        # for a native generation carries no `source` key at all (see
-        # `backend/server.py`), and the DB row for it holds 'generate', so
-        # deriving from "" here would label the entry `thedaw` on the wire
-        # while `PROVIDER_SQL`, the list path and the `provider=` filter all
-        # said stable-audio for the same entry.
-        **_provider_wire(
-            meta,
-            source=str(meta.get("source") or "generate"),
-            model=str(model),
-        ),
+        # The SAME pair the record's own `model` / `source` above were built
+        # from -- one call to `_audio_row_columns`, which the import labeler
+        # shares. `metadata.json` for a native generation carries no `source`
+        # key at all (see `backend/server.py`), and the DB row for it holds
+        # 'generate', so deriving from "" here would label the entry `thedaw`
+        # on the wire while `PROVIDER_SQL`, the list path and the `provider=`
+        # filter all said stable-audio for the same entry.
+        **_provider_wire(meta, source=row_source, model=model),
     )
 
 
