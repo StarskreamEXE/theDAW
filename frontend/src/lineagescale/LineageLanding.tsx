@@ -1,4 +1,5 @@
 import React, { useCallback, useState } from 'react';
+import { entryProviderMeta } from '../catalog/catalogProviders';
 import { ProviderBadge } from '../components/library/ProviderBadge';
 import { relationWords } from '../lib/lineageInsights';
 import type { LineageSummary, RankingList, RankingRow } from './lineageScaleClient';
@@ -72,7 +73,7 @@ const RankedList: React.FC<{
             <button
               type="button"
               onClick={() => onFocus(row.id, row.title)}
-              aria-label={`${row.title}, ${formatCount(row.count)}, ${row.detail}. Focus this song.`}
+              aria-label={`${row.title}, ${entryProviderMeta({ model: row.model, source: row.source }).label}, ${formatCount(row.count)}, ${row.detail}. Focus this song.`}
               className="flex w-full items-center gap-2 border-b border-white/5 px-3 py-1.5 text-left hover:bg-white/5"
             >
               <span className="w-5 shrink-0 text-right text-[9px] font-mono tabular-nums text-zinc-600">{i + 1}</span>
@@ -160,7 +161,7 @@ export const LineageLanding: React.FC<LineageLandingProps> = ({
                   <button
                     type="button"
                     onClick={() => onFocus(hit.id, hit.title)}
-                    aria-label={`${hit.title}. Focus this song.`}
+                    aria-label={`${hit.title}, ${entryProviderMeta({ model: hit.model, source: hit.source }).label}. Focus this song.`}
                     className="flex w-full items-center gap-2 border-b border-white/5 px-3 py-1.5 text-left hover:bg-white/5"
                   >
                     <span className="min-w-0 grow truncate text-[11px] text-zinc-100">{hit.title}</span>
