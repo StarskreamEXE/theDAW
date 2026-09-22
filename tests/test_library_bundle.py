@@ -457,3 +457,159 @@ def test_lineage_relation_rows_keeps_both_directions_when_it_is_cut(tmp_path: Pa
     incoming = [r for r in rows if r["to_id"] == hub]
     assert outgoing, "the derivatives survive the cut"
     assert incoming, "and so do the sources"
+
+
+def _repeats_fixture(tmp_path: Path) -> tuple[LibraryStore, list[str], int]:
+    """A frontier whose second direction re-reads what the first already took.
+
+    Two edges have BOTH ends in the frontier, so the second direction reads
+    them again and keeps nothing. Three more are visible only to the second
+    direction, and spend its budget down before the page of repeats is read —
+    which is how that page can be made full, or not, by the budget alone."""
+    store = LibraryStore(tmp_path)
+    assert store.db is not None
+    ids = [f"wide-{i:04d}" for i in range(500)]
+    repeats = [(ids[0], ids[449]), (ids[1], ids[450])]
+    fresh = [(f"ext-{i}", ids[i]) for i in range(3)]
+    store.db.add_relations_bulk((f, t, "derived_from") for f, t in [*repeats, *fresh])
+    return store, ids, len(repeats) + len(fresh)
+
+
+def test_lineage_relation_rows_a_full_page_of_repeats_is_still_a_cut(tmp_path: Path):
+    """A page that came back FULL was stopped, repeats or not.
+
+    The budget is spent only on distinct edges — but "was this read stopped
+    short" is a question about the read, and a full page has rows behind it
+    that were never looked at. That those in hand happened to be repeats says
+    nothing about the ones that were not read. Reporting a cut that turns out
+    to have lost nothing costs one honest sentence on screen; reporting a
+    family whole when rows were never read is the answer that misleads, so
+    the raw page is what decides it."""
+    store, ids, distinct = _repeats_fixture(tmp_path)
+
+    from backend.modules.library import router
+
+    # A budget that leaves room for exactly one more row when the repeats are
+    # read: the page comes back full.
+    rows, cut = router._lineage_relation_rows(store.db, ids, 8)  # noqa: SLF001
+    keys = {(r["from_id"], r["to_id"], r["kind"]) for r in rows}
+    assert len(keys) == distinct == len(rows), "every distinct edge is still returned"
+    assert cut is True, "and the read that stopped is reported as one"
+
+
+def test_lineage_relation_rows_a_short_page_of_repeats_is_not_a_cut(tmp_path: Path):
+    """The same repeats, read with room to spare, are no cut at all.
+
+    The safe answer above is not a blanket "repeats mean cut": a page that
+    came back shorter than its limit is the end of what there was to read,
+    and the answer says so."""
+    store, ids, distinct = _repeats_fixture(tmp_path)
+
+    from backend.modules.library import router
+
+    # Two more of budget, so the page of repeats comes back short of its limit.
+    rows, cut = router._lineage_relation_rows(store.db, ids, 10)  # noqa: SLF001
+    keys = {(r["from_id"], r["to_id"], r["kind"]) for r in rows}
+    assert len(keys) == distinct == len(rows)
+    assert cut is False, "nothing was left unread, so nothing is claimed to be"
+
+
+def test_lineage_endpoint_says_unknown_is_more(tmp_path: Path):
+    """A probe that filled its page says "more", even seeing nothing new.
+
+    The probe reads the frontier's relations to answer "is there family past
+    this?". When its page fills, the rows past it were never looked at, so a
+    page carrying only already-seen songs settles nothing — and between
+    claiming a family is whole and admitting it might not be, the answer that
+    cannot mislead is the second."""
+    store = LibraryStore(tmp_path)
+    assert store.db is not None
+    root = store.import_blob(
+        b"RIFF\x00\x00\x00\x00WAVE", "r.wav", "audio/wav", metadata={"title": "R"}
+    )
+    store.db.add_relation(root.id, "near-a", "derived_from")
+    store.db.add_relation(root.id, "near-b", "derived_from")
+    # Far more relations between those two than one probe can read, and not
+    # one of them reaches a song the walk has not already got.
+    store.db.add_relations_bulk(
+        ("near-a", "near-b", f"kind-{i:05d}") for i in range(4100)
+    )
+
+    from backend.modules.library import router
+
+    router._store = store  # noqa: SLF001
+    try:
+        result = router.get_lineage(root.id, depth=1)
+    finally:
+        router._store = None  # noqa: SLF001
+
+    assert {n["id"] for n in result["nodes"]} == {root.id, "near-a", "near-b"}
+    assert result["truncated"] is True, (
+        "the probe could not read to the end, so 'whole' is not something to claim"
+    )
+
+
+def test_lineage_relation_read_uses_the_index_and_never_sorts(tmp_path: Path):
+    """The read the walk actually issues, as SQLite plans it.
+
+    ``relations.id`` is the rowid, and the ``IN`` is served by
+    ``idx_relations_from`` / ``idx_relations_to``. Asking for ``ORDER BY id``
+    on top of that makes SQLite visit every matching index entry and sort
+    them before the ``LIMIT`` can bite, which on a hub is the whole degree —
+    exactly the cost the per-hop bound exists to avoid. This pins the plan of
+    the shipped statement, and shows what the dropped clause would have
+    cost."""
+    store = LibraryStore(tmp_path)
+    assert store.db is not None
+    store.db.add_relations_bulk(
+        ("hub", f"child-{i:05d}", "derived_from") for i in range(3000)
+    )
+    store.db.add_relations_bulk(
+        (f"src-{i:05d}", "hub", "derived_from") for i in range(3000)
+    )
+
+    from backend.modules.library import router
+
+    marks = ", ".join("?" * 3)
+    params = ["hub", "a", "b", 4000]
+    cur = store.db._conn.cursor()  # noqa: SLF001
+    try:
+        for column in ("from_id", "to_id"):
+            shipped = (
+                f"SELECT {router._LINEAGE_EDGE_SELECT} FROM relations "  # noqa: SLF001
+                f"WHERE {column} IN ({marks}) LIMIT ?"
+            )
+            plan = [
+                row["detail"]
+                for row in cur.execute(
+                    "EXPLAIN QUERY PLAN " + shipped, params
+                ).fetchall()
+            ]
+            print(f"[{column}] shipped: {plan}")
+            assert any("INDEX" in line for line in plan), (
+                f"the read must be served by an index, not a scan: {plan}"
+            )
+            assert not any(line.startswith("SCAN relations") for line in plan), (
+                f"and never by a table scan: {plan}"
+            )
+            assert not any("TEMP B-TREE" in line for line in plan), (
+                f"and must not sort before the LIMIT: {plan}"
+            )
+
+            sorted_form = (
+                f"SELECT {router._LINEAGE_EDGE_SELECT} FROM relations "  # noqa: SLF001
+                f"WHERE {column} IN ({marks}) ORDER BY id LIMIT ?"
+            )
+            sorted_plan = [
+                row["detail"]
+                for row in cur.execute(
+                    "EXPLAIN QUERY PLAN " + sorted_form, params
+                ).fetchall()
+            ]
+            print(f"[{column}] with ORDER BY id: {sorted_plan}")
+            assert any("TEMP B-TREE" in line for line in sorted_plan), (
+                f"ORDER BY id is what adds the sort — if this ever stops being "
+                f"true the clause can come back: {sorted_plan}"
+            )
+    finally:
+        cur.close()

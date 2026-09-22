@@ -1675,10 +1675,16 @@ def _lineage_relation_rows(
       parents and no children — a picture of the read order, not of the song.
     * **A row is counted once.** An id is listed once per chunk, so an edge
       between ids in different chunks is read twice, and an edge between two
-      frontier ids is read once per direction. Spending budget on a row the
-      answer already holds buys nothing.
-    * **``ORDER BY id``**, so which rows a cut keeps is the insertion order
-      and not whatever the query planner felt like."""
+      frontier ids is read once per direction. Budget spent on a row the
+      answer already holds buys nothing. The CUT, though, is judged on the
+      raw page: a page that came back full has rows behind it that were
+      never read, whether or not the ones in hand were repeats.
+    * **No ``ORDER BY``.** ``relations.id`` is the rowid while the ``IN`` is
+      served by ``idx_relations_from`` / ``idx_relations_to``, so ordering by
+      it makes SQLite visit every matching index entry and sort before the
+      ``LIMIT`` can bite — Σ(degree) rows under the write lock, which is the
+      cost this whole helper exists to avoid. The returned rows are sorted in
+      Python instead, where the count is already bounded by ``limit``."""
     out: list[dict[str, Any]] = []
     unique = list(dict.fromkeys(ids))
     if not unique or limit <= 0:
@@ -1689,7 +1695,7 @@ def _lineage_relation_rows(
     # so the same chunk size is safe if the two sides are ever read together.
     chunk_size = max(1, (_MAX_SQL_PARAMS - 1) // 2)
     first_half = max(1, limit // 2)
-    budgets = ((("from_id"), first_half), ("to_id", max(1, limit - first_half)))
+    budgets = (("from_id", first_half), ("to_id", max(1, limit - first_half)))
     with db._writelock:  # noqa: SLF001 — the DB exposes no bounded projection
         cur = db._conn.cursor()  # noqa: SLF001
         try:
@@ -1705,22 +1711,38 @@ def _lineage_relation_rows(
                     # the answer rather than guessed from a full page.
                     rows = cur.execute(
                         f"SELECT {_LINEAGE_EDGE_SELECT} FROM relations "
-                        f"WHERE {column} IN ({marks}) ORDER BY id LIMIT ?",
+                        f"WHERE {column} IN ({marks}) LIMIT ?",
                         [*chunk, remaining + 1],
                     ).fetchall()
-                    if len(rows) > remaining:
-                        hit_limit = True
-                        rows = rows[:remaining]
+                    fresh: list[tuple[tuple[str, str, str], dict[str, Any]]] = []
+                    page_keys: set[tuple[str, str, str]] = set()
                     for row in rows:
                         edge = {k: row[k] for k in _LINEAGE_EDGE_COLUMNS}
                         key = (edge["from_id"], edge["to_id"], edge["kind"])
-                        if key in seen_keys:
+                        if key in seen_keys or key in page_keys:
                             continue
+                        page_keys.add(key)
+                        fresh.append((key, edge))
+                    # The page was read one row past the budget. If it came
+                    # back full, the rows BEHIND it were never looked at —
+                    # and that is true however many of the ones in hand were
+                    # repeats. Saying "there is more" when there is not costs
+                    # the user one honest sentence; saying a family is whole
+                    # when rows were never read is the lie.
+                    if len(rows) > remaining:
+                        hit_limit = True
+                    # The budget itself is still spent only on new rows.
+                    if len(fresh) > remaining:
+                        fresh = fresh[:remaining]
+                    for key, edge in fresh:
                         seen_keys.add(key)
                         out.append(edge)
                         taken += 1
         finally:
             cur.close()
+    # Bounded by `limit`, so this sort is cheap — and it is the determinism
+    # the dropped ORDER BY would have cost a whole index scan to get.
+    out.sort(key=lambda e: (e["from_id"], e["to_id"], e["kind"]))
     return out, hit_limit
 
 
@@ -1809,13 +1831,21 @@ def get_lineage(entry_id: str, depth: int = 3) -> dict[str, Any]:
     # and calling that cut tells the user part of their family is hidden when
     # all of it is on screen. So it is asked, once, within the same bound a
     # real hop uses.
+    #
+    # The probe answers "yes" outright when it finds a song the walk never
+    # reached. Its other "yes" is an admission rather than a finding: a probe
+    # whose own read filled up never looked at the rows past it, so a page
+    # carrying only already-seen songs settles nothing. Between claiming a
+    # family is whole and admitting it might not be, the answer that cannot
+    # mislead is the second, so an unread remainder counts as "there is more".
     if not truncated and frontier:
         beyond, probe_cut = _lineage_relation_rows(
             store.db, frontier, LINEAGE_MAX_EDGES_PER_HOP
         )
-        truncated = probe_cut or any(
+        found_unseen = any(
             e["from_id"] not in seen_ids or e["to_id"] not in seen_ids for e in beyond
         )
+        truncated = found_unseen or probe_cut
 
     # Materialize node payloads for everything we touched.
     rows_by_id = _lineage_entry_rows(store.db, list(seen_ids))
