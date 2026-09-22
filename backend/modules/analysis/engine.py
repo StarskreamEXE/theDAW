@@ -218,7 +218,7 @@ def _metadata_guard(
     global _logged_unguarded_write
     if not _logged_unguarded_write:
         _logged_unguarded_write = True
-        log.debug(
+        log.warning(
             "analysis.engine: no library store owns %s — writing it atomically "
             "but unlocked (no store in this process)",
             metadata_path,

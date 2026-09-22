@@ -2625,6 +2625,10 @@ def _maybe_enqueue_analysis(
             audio_path,
             metadata_path=metadata_path,
             settings=settings,
+            # The store whose metadata lock must serialise this write. Passed
+            # explicitly: this is the main background writer, and the engine's
+            # router-singleton fallback is for scripts, not for this path.
+            store=store,
         )
 
     try:
