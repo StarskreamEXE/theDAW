@@ -353,3 +353,107 @@ def test_lineage_endpoint_says_so_when_the_depth_ran_out(tmp_path: Path):
     assert shallow["truncated"] is True, "and the chain goes on past them"
     assert len(whole["nodes"]) == 6
     assert whole["truncated"] is False, "walked to its end, nothing left out"
+
+
+def test_lineage_endpoint_asks_before_it_claims_the_family_was_cut(tmp_path: Path):
+    """ "There is more" is a question about the graph, not about the walk.
+
+    A family whose last generation lands exactly on the final hop leaves the
+    walk holding a frontier and NOTHING beyond it; reading that frontier as
+    "cut" tells the user part of their family is hidden when all of it is on
+    screen."""
+    store = LibraryStore(tmp_path)
+    assert store.db is not None
+    root = store.import_blob(
+        b"RIFF\x00\x00\x00\x00WAVE", "a.wav", "audio/wav", metadata={"title": "A"}
+    )
+    lonely = store.import_blob(
+        b"RIFF\x00\x00\x00\x00WAVE", "b.wav", "audio/wav", metadata={"title": "B"}
+    )
+    previous = root.id
+    for i in range(3):
+        nxt = f"gen-{i}"
+        store.db.add_relation(previous, nxt, "derived_from")
+        previous = nxt
+
+    from backend.modules.library import router
+
+    router._store = store  # noqa: SLF001
+    try:
+        exact = router.get_lineage(root.id, depth=3)
+        short = router.get_lineage(root.id, depth=2)
+        none_asked = router.get_lineage(root.id, depth=0)
+        alone = router.get_lineage(lonely.id, depth=0)
+    finally:
+        router._store = None  # noqa: SLF001
+
+    assert len(exact["nodes"]) == 4
+    assert exact["truncated"] is False, (
+        "the last generation lands on the last hop — the family is whole"
+    )
+    assert short["truncated"] is True, "one hop shorter, and it is not"
+    assert none_asked["truncated"] is True, "no hops at all leaves the family out"
+    assert alone["truncated"] is False, "but a song with no relations has none to leave"
+
+
+def test_lineage_relation_rows_chunks_and_never_pays_twice(tmp_path: Path):
+    """A frontier wider than one statement, and edges that span two chunks.
+
+    Each id is listed once per chunk, so a relation between ids in different
+    chunks comes back from both reads — and once the two directions are read
+    separately, an edge between two frontier ids comes back from both of
+    those too. Counting a repeat against the hop's budget would spend it on
+    rows the answer already holds."""
+    store = LibraryStore(tmp_path)
+    assert store.db is not None
+    ids = [f"wide-{i:04d}" for i in range(500)]
+    # Every edge joins the first half to the second, so no chunking of this
+    # frontier can put both ends of an edge in the same read.
+    pairs = [(ids[i], ids[i + 250]) for i in range(250)]
+    store.db.add_relations_bulk((f, t, "derived_from") for f, t in pairs)
+
+    from backend.modules.library import router
+
+    # Room for every edge in BOTH direction budgets, so nothing here is about
+    # the budget running out — only about what repeats cost.
+    rows, cut = router._lineage_relation_rows(  # noqa: SLF001
+        store.db, ids, 2 * len(pairs) + 2
+    )
+    keys = [(r["from_id"], r["to_id"], r["kind"]) for r in rows]
+    assert len(keys) == len(set(keys)), (
+        f"a row is returned once, however often it is read: {len(keys)} rows, "
+        f"{len(set(keys))} distinct"
+    )
+    assert len(rows) == len(pairs), (
+        f"and every distinct edge is there: expected {len(pairs)}, got {len(rows)}"
+    )
+    assert cut is False, "with nothing left out"
+
+
+def test_lineage_relation_rows_keeps_both_directions_when_it_is_cut(tmp_path: Path):
+    """A hub cut by the budget keeps its sources AND its derivatives.
+
+    Spending the hop's whole budget on whichever direction is read first
+    hands back a hub with 4,000 parents and no children — a picture of the
+    read order, not of the song."""
+    store = LibraryStore(tmp_path)
+    assert store.db is not None
+    hub = "welded-hub"
+    store.db.add_relations_bulk(
+        (hub, f"out-{i:05d}", "derived_from") for i in range(3000)
+    )
+    store.db.add_relations_bulk(
+        (f"in-{i:05d}", hub, "derived_from") for i in range(3000)
+    )
+
+    from backend.modules.library import router
+
+    rows, cut = router._lineage_relation_rows(  # noqa: SLF001
+        store.db, [hub], router.LINEAGE_MAX_EDGES_PER_HOP
+    )
+    assert cut is True, "6,000 relations do not fit in the hop's budget"
+    assert len(rows) <= router.LINEAGE_MAX_EDGES_PER_HOP
+    outgoing = [r for r in rows if r["from_id"] == hub]
+    incoming = [r for r in rows if r["to_id"] == hub]
+    assert outgoing, "the derivatives survive the cut"
+    assert incoming, "and so do the sources"

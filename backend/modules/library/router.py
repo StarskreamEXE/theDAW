@@ -1662,38 +1662,63 @@ _LINEAGE_EDGE_SELECT = ", ".join(_LINEAGE_EDGE_COLUMNS)
 def _lineage_relation_rows(
     db: LibraryDB, ids: list[str], limit: int
 ) -> tuple[list[dict[str, Any]], bool]:
-    """Up to ``limit`` relation rows touching ``ids``, in EITHER direction.
+    """Up to ``limit`` DISTINCT relation rows touching ``ids``, either way.
 
-    Returns the rows and whether the limit is what stopped the read — which is
-    the walk's signal that this hop was cut. One statement per chunk of ids,
-    with the ids listed on both sides of the ``OR``, so the parameter budget is
-    halved."""
+    Returns the rows and whether a read was stopped by its bound — which is
+    the walk's signal that this hop was cut.
+
+    Three things this shape is careful about:
+
+    * **Both directions get half the budget each**, in their own statement.
+      Read together, whichever direction the rows happen to be stored in
+      first spends the whole budget, and a cut hub comes back with 4,000
+      parents and no children — a picture of the read order, not of the song.
+    * **A row is counted once.** An id is listed once per chunk, so an edge
+      between ids in different chunks is read twice, and an edge between two
+      frontier ids is read once per direction. Spending budget on a row the
+      answer already holds buys nothing.
+    * **``ORDER BY id``**, so which rows a cut keeps is the insertion order
+      and not whatever the query planner felt like."""
     out: list[dict[str, Any]] = []
     unique = list(dict.fromkeys(ids))
     if not unique or limit <= 0:
         return out, False
     hit_limit = False
-    chunk_size = max(1, _MAX_SQL_PARAMS // 2)
+    seen_keys: set[tuple[str, str, str]] = set()
+    # ids + the LIMIT parameter must fit the statement's budget; halved again
+    # so the same chunk size is safe if the two sides are ever read together.
+    chunk_size = max(1, (_MAX_SQL_PARAMS - 1) // 2)
+    first_half = max(1, limit // 2)
+    budgets = ((("from_id"), first_half), ("to_id", max(1, limit - first_half)))
     with db._writelock:  # noqa: SLF001 — the DB exposes no bounded projection
         cur = db._conn.cursor()  # noqa: SLF001
         try:
-            for chunk in _chunks(unique, chunk_size):
-                remaining = limit - len(out)
-                if remaining <= 0:
-                    hit_limit = True
-                    break
-                marks = ", ".join("?" * len(chunk))
-                # One row past the budget, so "there was more" is read off the
-                # answer rather than guessed from a full page.
-                rows = cur.execute(
-                    f"SELECT {_LINEAGE_EDGE_SELECT} FROM relations "
-                    f"WHERE from_id IN ({marks}) OR to_id IN ({marks}) LIMIT ?",
-                    [*chunk, *chunk, remaining + 1],
-                ).fetchall()
-                if len(rows) > remaining:
-                    hit_limit = True
-                    rows = rows[:remaining]
-                out.extend({k: row[k] for k in _LINEAGE_EDGE_COLUMNS} for row in rows)
+            for column, budget in budgets:
+                taken = 0
+                for chunk in _chunks(unique, chunk_size):
+                    remaining = budget - taken
+                    if remaining <= 0:
+                        hit_limit = True
+                        break
+                    marks = ", ".join("?" * len(chunk))
+                    # One row past the budget, so "there was more" is read off
+                    # the answer rather than guessed from a full page.
+                    rows = cur.execute(
+                        f"SELECT {_LINEAGE_EDGE_SELECT} FROM relations "
+                        f"WHERE {column} IN ({marks}) ORDER BY id LIMIT ?",
+                        [*chunk, remaining + 1],
+                    ).fetchall()
+                    if len(rows) > remaining:
+                        hit_limit = True
+                        rows = rows[:remaining]
+                    for row in rows:
+                        edge = {k: row[k] for k in _LINEAGE_EDGE_COLUMNS}
+                        key = (edge["from_id"], edge["to_id"], edge["kind"])
+                        if key in seen_keys:
+                            continue
+                        seen_keys.add(key)
+                        out.append(edge)
+                        taken += 1
         finally:
             cur.close()
     return out, hit_limit
@@ -1778,8 +1803,19 @@ def get_lineage(entry_id: str, depth: int = 3) -> dict[str, Any]:
             break
     # Relatives the DEPTH never reached are left out just as surely as ones a
     # cap refused, and `truncated` is this answer's only word for "there is
-    # more of this family than you are looking at".
-    truncated = truncated or bool(frontier)
+    # more of this family than you are looking at". But a frontier is not
+    # itself evidence of one: a family whose last generation lands exactly on
+    # the final hop leaves the walk holding a frontier with nothing beyond it,
+    # and calling that cut tells the user part of their family is hidden when
+    # all of it is on screen. So it is asked, once, within the same bound a
+    # real hop uses.
+    if not truncated and frontier:
+        beyond, probe_cut = _lineage_relation_rows(
+            store.db, frontier, LINEAGE_MAX_EDGES_PER_HOP
+        )
+        truncated = probe_cut or any(
+            e["from_id"] not in seen_ids or e["to_id"] not in seen_ids for e in beyond
+        )
 
     # Materialize node payloads for everything we touched.
     rows_by_id = _lineage_entry_rows(store.db, list(seen_ids))
