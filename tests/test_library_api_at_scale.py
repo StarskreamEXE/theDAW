@@ -204,7 +204,15 @@ def _names_a_json_column_outside_the_projection(statement: str) -> bool:
     # carries no column name, so `json_extract(metadata_json, ?) AS j0` in a
     # projection is invisible here and the same call in a WHERE is not.
     remainder = _SELECT_LIST_RE.sub(" select from ", statement)
-    return bool(_JSON_COLUMN_RE.search(remainder))
+    if _JSON_COLUMN_RE.search(remainder):
+        return True
+    # A predicate can hold a SELECT of its own, and blanking every select list
+    # blanks that one too -- ``WHERE ? IN (SELECT json_extract(metadata_json,
+    # '$.lyrics') FROM entries)`` reads every row's blob and leaves a clean
+    # remainder behind. So everything from the first WHERE onward is checked
+    # RAW: nothing after it is a projection of the rows being chosen.
+    _, where, predicate = statement.partition(" where ")
+    return bool(where) and bool(_JSON_COLUMN_RE.search(predicate))
 
 
 #: A ``LIMIT`` of any kind, and the paged list's ``LIMIT ? OFFSET ?`` shape.
@@ -515,7 +523,17 @@ def client(scale_library: ScaleLibrary) -> Iterator[TestClient]:
     with pytest.MonkeyPatch.context() as patch:
         patch.setenv("theDAW_GENERATIONS_DIR", str(scale_library.root))
         patch.setattr(library_router_module, "_store", None)
-        known_paths.set_store_path_for_tests(scale_library.root / "known_paths.json")
+        # Through the patch context, not the setter: the setter leaves the
+        # redirect standing if anything below raises -- TestClient, the
+        # warm-up GET, the revision read -- and the fixture then deletes the
+        # directory it points at, so every later test in the session reads a
+        # known-paths file that is not there. MonkeyPatch undoes it on every
+        # path out, including the raising one.
+        patch.setattr(
+            known_paths,
+            "_STORE_PATH",
+            scale_library.root / "known_paths.json",
+        )
         with TestClient(_build_app()) as test_client:
             test_client.get(f"{LIBRARY_PREFIX}/summary")
             _REVISION_AT_START.append(
@@ -524,7 +542,6 @@ def client(scale_library: ScaleLibrary) -> Iterator[TestClient]:
             try:
                 yield test_client
             finally:
-                known_paths.set_store_path_for_tests(None)
                 store = library_router_module._store
                 database = getattr(store, "db", None)
                 if database is not None:
@@ -752,6 +769,12 @@ def test_the_blob_rule_flags_a_blob_read_and_spares_the_exceptions() -> None:
         "SELECT e.* FROM entries e WHERE (e.title LIKE ? OR COALESCE(CASE WHEN "
         "json_valid(e.metadata_json) THEN json_extract(e.metadata_json, "
         "'$.lyrics') END, '') LIKE ?) ORDER BY e.created_at DESC LIMIT ? OFFSET ?",
+        # a blob read hidden in a predicate's SUBQUERY: blanking every
+        # select list blanks this one too, so the remainder looks clean and
+        # the page shape would buy the exception
+        "SELECT e.* FROM entries e WHERE ? IN (SELECT json_extract("
+        "metadata_json, '$.lyrics') FROM entries) ORDER BY e.created_at DESC "
+        "LIMIT ? OFFSET ?",
         # the same fallback in the paged list's own projection shape: the ids
         # are named, but the predicate is still a whole-table blob read
         "SELECT id, json_extract(metadata_json, ?) AS j0 FROM entries WHERE "
