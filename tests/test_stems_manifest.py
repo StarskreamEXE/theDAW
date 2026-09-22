@@ -618,11 +618,14 @@ def test_a_library_open_waits_out_a_write_lock_another_connection_holds(
             waited = time.monotonic() - started
             release.set()
             timer.cancel()
+        # Closed before the timing assert: a failed assert must not leave the
+        # handles open, or Windows cannot remove tmp_path and the timing
+        # failure is buried under a teardown error.
+        db.close()
         assert waited > 5.0, (
             f"the open returned in {waited:.1f}s -- it never met the lock, so "
             "this test proves nothing about waiting for one"
         )
-        db.close()
     finally:
         release.set()
         thread.join(20)
