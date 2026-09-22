@@ -128,6 +128,7 @@ GENERATOR_SIGNATURES: dict[str, str] = {
     "musicgen": "musicgen",
     "stable_audio": "stable-audio",
     "stable-audio": "stable-audio",
+    "stable audio": "stable-audio",
     # Made IN theDAW, origin unspecified -- NOT the Stable Audio generator.
     # Matches the `thedaw` rule in `provider.py` and the fallback's last arm
     # in `db.py`. The explicit "stable_audio" / "stable-audio" spellings above
@@ -141,6 +142,25 @@ GENERATOR_SIGNATURES: dict[str, str] = {
     "reaper": "reaper",
     "pro tools": "pro-tools",
 }
+
+#: ``needle -> word deleted from the text before the needle is looked for``.
+#:
+#: This exists for exactly one needle. "udio" is a substring of "audio", so a
+#: bare test files every encoder or model string containing "audio" --
+#: ``stable-audio``, ``Stable Audio 3``, ``audiocraft`` -- under the Udio
+#: generator, which is also what the ``stable_audio`` entries above were meant
+#: to answer and never could: they are declared later, and the loop returns on
+#: the first hit.
+#:
+#: The rule is the one ``_PROVIDER_BY_MODEL_SUBSTRING`` in ``db.py`` already
+#: spells for the ``model`` column, and ``inferProvider`` in
+#: ``frontend/src/catalog/catalogProviders.ts`` for the catalogue
+#: (``model.toLowerCase().replace(/audio/g, '').includes('udio')``): delete the
+#: word "audio" from the text first. ``udio-1``, ``Udio v1.5`` and even
+#: ``audio-udio-blend`` still match; ``stable-audio-3-medium`` does not. One
+#: rule, three places, so a file cannot be badged Udio here and Stable Audio in
+#: the catalogue.
+GENERATOR_NEEDLE_STRIP_WORDS: dict[str, str] = {"udio": "audio"}
 
 # ID3v2 URL link frames (``W***``), under a flat name that says what the
 # URL points at. Every name keeps the word "url" in it, because the
@@ -339,6 +359,17 @@ def _coerce_json(value: str) -> Any:
         return s
 
 
+def _mentions(needle: str, text: str) -> bool:
+    """Does ``text`` name ``needle``, under :data:`GENERATOR_NEEDLE_STRIP_WORDS`?
+
+    The one caller-visible difference from ``needle in text`` is that a needle
+    with a strip word is not found inside that word -- "udio" does not match
+    the "audio" in "stable-audio".
+    """
+    strip = GENERATOR_NEEDLE_STRIP_WORDS.get(needle)
+    return needle in (text.replace(strip, "") if strip else text)
+
+
 def _detect_generator(tags: dict[str, Any]) -> str | None:
     """Best-guess which tool authored this file based on which tag keys
     + values appear. Returns a canonical lowercase name or None."""
@@ -346,13 +377,13 @@ def _detect_generator(tags: dict[str, Any]) -> str | None:
         f"{k} {v}" for k, v in tags.items() if isinstance(v, (str, int, float))
     ).lower()
     for needle, canonical in GENERATOR_SIGNATURES.items():
-        if needle in haystack:
+        if _mentions(needle, haystack):
             return canonical
     # Heuristics: if Suno-specific fields are present (e.g. control_sliders)
     # we call it Suno even if no explicit tool tag appears.
     if any(k.startswith("control_sliders") for k in tags):
         return "suno"
-    if any("udio" in k for k in tags):
+    if any(_mentions("udio", k.lower()) for k in tags):
         return "udio"
     return None
 

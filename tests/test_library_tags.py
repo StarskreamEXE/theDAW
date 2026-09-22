@@ -316,11 +316,40 @@ def test_a_thedaw_encoder_signature_is_thedaw_not_stable_audio():
     means made in theDAW, origin unspecified (``thedaw``), not the Stable
     Audio generator.
 
-    The explicit ``stable-audio`` spelling is covered by
-    ``test_library_provider.py`` on ``detect_provider``, not here: every
-    spelling of it contains "udio", whose signature is declared earlier in
-    ``GENERATOR_SIGNATURES``, so this table answers "udio" for it. That is a
-    pre-existing shadowing this test does not assert either way.
+    The explicit ``stable-audio`` spellings are asserted by
+    ``test_a_stable_audio_signature_is_not_read_as_udio`` below, which pins the
+    "udio"-inside-"audio" rule that used to shadow them.
     """
     assert _detect_generator({"encoder": "theDAW 1.0"}) == "thedaw"
     assert _detect_generator({"encoder": "suno v4"}) == "suno"
+
+
+def test_a_stable_audio_signature_is_not_read_as_udio():
+    """ "udio" is a substring of "audio", so a bare substring test files every
+    encoder string containing "audio" under the Udio generator.
+
+    The rule here is the one ``_PROVIDER_BY_MODEL_SUBSTRING`` in ``db.py``
+    already spells for the ``model`` column (and ``inferProvider`` in
+    ``frontend/src/catalog/catalogProviders.ts`` for the catalogue): delete the
+    word "audio" from the text before looking for "udio". That keeps every real
+    Udio spelling matching -- including a blend whose name carries both words --
+    while a Stable Audio encoder frame lands on its own signature instead.
+    """
+    # Not Udio: the word "audio" is what matched, not the service.
+    assert _detect_generator({"encoder": "stable-audio"}) == "stable-audio"
+    assert _detect_generator({"encoder": "Stable Audio 3"}) == "stable-audio"
+    assert _detect_generator({"encoder": "stable_audio 3 medium"}) == "stable-audio"
+    assert _detect_generator({"encoder": "theDAW 1.0"}) == "thedaw"
+    # No signature at all rather than a wrong one: "stableaudio" is a spelling
+    # nothing in the table declares, and it must not fall through to Udio.
+    assert _detect_generator({"encoder": "stableaudio"}) != "udio"
+    # A tag KEY naming the model reached the same shadowing through the
+    # key-only heuristic, which uses the same rule now.
+    assert _detect_generator({"stable_audio_version": "3"}) != "udio"
+
+    # Still Udio: every observed spelling, and a name carrying both words.
+    assert _detect_generator({"encoder": "udio"}) == "udio"
+    assert _detect_generator({"encoder": "Udio v1.5"}) == "udio"
+    assert _detect_generator({"comment": "made with udio"}) == "udio"
+    assert _detect_generator({"encoder": "audio-udio-blend"}) == "udio"
+    assert _detect_generator({"udio_song_id": "abc"}) == "udio"
