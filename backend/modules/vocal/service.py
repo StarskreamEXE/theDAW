@@ -128,7 +128,8 @@ def set_review(asset_id: str, reviewed: bool, notes_text: str) -> dict:
 
     A failure also carries a ``code`` so the route can pick a status without
     reading the sentence: ``missing_artifact`` is the client's wrong asset id
-    (404), ``write_failed`` is this machine's problem (500, worth a retry)."""
+    (404), ``write_failed`` is this machine's problem (500) -- a failed disk
+    write may pass on retry; an audio path that cannot be resolved will not."""
     art = _artifact_obj(asset_id)
     if art is None:
         return {

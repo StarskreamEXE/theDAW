@@ -90,6 +90,7 @@ def test_vocal_review_gate_is_written_atomically(tmp_path: Path, monkeypatch) ->
     monkeypatch.setattr(atomic, "atomic_replace", _boom)
     res2 = service.set_review("a1", False, "changed my mind")
     assert res2["ok"] is False
+    assert res2["code"] == "write_failed", "the route maps this code to 500"
     assert "could not save the review" in res2["error"]
     doc2 = json.loads((tmp_path / "vocal_metadata.json").read_text(encoding="utf-8"))
     assert doc2["review"] == {"reviewed": True, "notes": "good take"}
