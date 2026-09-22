@@ -403,7 +403,26 @@ def _rare_index() -> int:
 
 
 def build_scale_library(root: Path) -> ScaleLibrary:
-    """Build the whole fixture under ``root`` and return it, measured."""
+    """Build the whole fixture under ``root`` and return it, measured.
+
+    Anything that raises after :class:`LibraryDB` is open closes and deletes
+    the database on the way out. It is the better part of 400 MB and a live
+    sqlite handle by the time the rows are in, and a build that died halfway
+    used to leave both behind for the rest of the session.
+    """
+    opened: list[LibraryDB] = []
+    try:
+        return _build_scale_library(root, opened)
+    except BaseException:
+        for db in opened:
+            db.close()
+        remove_database(root / "library.db")
+        raise
+
+
+def _build_scale_library(root: Path, opened: list[LibraryDB]) -> ScaleLibrary:
+    """The build itself. ``opened`` collects the handle so the wrapper above
+    can close it if any of this raises."""
     started = time.perf_counter()
     root.mkdir(parents=True, exist_ok=True)
     db_path = root / "library.db"
@@ -411,6 +430,7 @@ def build_scale_library(root: Path) -> ScaleLibrary:
     # an index it finds empty is backfilled on open -- which would move the
     # cost of 20,000 padded rows into the first request instead of the build.
     db = LibraryDB(db_path)
+    opened.append(db)
     pad = metadata_pad()
 
     written = db.upsert_entries_bulk(_payloads(pad), batch=2_000)
