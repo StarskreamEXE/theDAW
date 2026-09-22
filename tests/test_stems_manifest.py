@@ -16,6 +16,9 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import sqlite3
+import threading
+import time
 import wave
 from datetime import datetime
 from pathlib import Path
@@ -576,6 +579,54 @@ def test_the_library_connection_waits_for_a_lock_instead_of_failing_the_open(
     assert BUSY_TIMEOUT_MS > 5_000, (
         "5 s is sqlite3.connect's default and was not enough"
     )
+
+
+def test_a_library_open_waits_out_a_write_lock_another_connection_holds(
+    tmp_path: Path,
+) -> None:
+    """The test above pins the configuration; this one pins the behaviour it
+    buys. A second connection holds the write lock for longer than
+    sqlite3.connect's implicit 5 s, and opening the library during that hold
+    has to WAIT rather than raise `database is locked` out of _migrate's DDL.
+    Runs for about 6 s by construction: the hold has to outlast the default."""
+    path = tmp_path / "locked.db"
+    holder = sqlite3.connect(str(path), check_same_thread=False)
+    # The holder puts the file in the same journal mode LibraryDB uses, so the
+    # library's own `journal_mode = WAL` is a no-op and the lock the open meets
+    # is the one the schema DDL needs.
+    holder.execute("PRAGMA journal_mode = WAL")
+    locked = threading.Event()
+    release = threading.Event()
+
+    def hold() -> None:
+        holder.execute("BEGIN IMMEDIATE")
+        holder.execute("CREATE TABLE IF NOT EXISTS hold (x INTEGER)")
+        locked.set()
+        release.wait(20)
+        holder.rollback()
+
+    thread = threading.Thread(target=hold, daemon=True)
+    thread.start()
+    try:
+        assert locked.wait(5), "the second connection never took the write lock"
+        timer = threading.Timer(6.0, release.set)
+        timer.start()
+        started = time.monotonic()
+        try:
+            db = LibraryDB(path, enable_fts=False)
+        finally:
+            waited = time.monotonic() - started
+            release.set()
+            timer.cancel()
+        assert waited > 5.0, (
+            f"the open returned in {waited:.1f}s -- it never met the lock, so "
+            "this test proves nothing about waiting for one"
+        )
+        db.close()
+    finally:
+        release.set()
+        thread.join(20)
+        holder.close()
 
 
 def test_router_returns_the_manifest_when_one_was_written(

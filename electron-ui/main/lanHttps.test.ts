@@ -136,6 +136,13 @@ const ENABLED = {
     for (const arg of args) {
       assert.ok(!arg.includes('"'), `pre-quoted argument: ${arg}`);
     }
+    // cmd /c strips the outer pair of quotes off the whole command line, so
+    // leaving the quoting to libuv only survives while exactly ONE element
+    // needs quoting; a second spaced argument would need /s and a rethink.
+    assert.ok(
+      args.filter((arg) => arg.includes(' ')).length <= 1,
+      `more than one argument needs quoting: ${JSON.stringify(args)}`,
+    );
   }
 
   for (const platform of ['linux', 'darwin']) {

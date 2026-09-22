@@ -264,7 +264,14 @@ def _run_backend(children: list) -> None:
     while not _shutdown.is_set():
         _emit("stack", "launching backend: " + " ".join(cmd))
         proc = _spawn(cmd, cwd=os.getcwd(), env=env)
-        children.append(proc)
+        if not _register_child(children, proc):
+            # This loop can pass the _shutdown check above and spawn a backend
+            # after main()'s kill loop has taken its snapshot: nothing else
+            # would ever kill it, and it would hold :8600 against the next
+            # launch. Same gate as the LAN listener.
+            _kill_tree(proc)
+            _emit("stack", "the stack is stopping - backend dropped")
+            return
         _pump("backend", proc)  # blocks until the backend process exits
         rc = proc.wait()
         if rc == RESTART_EXIT_CODE and not _shutdown.is_set():

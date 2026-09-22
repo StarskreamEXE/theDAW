@@ -29,6 +29,7 @@ from __future__ import annotations
 import io
 import re
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -372,6 +373,9 @@ class _FakeProc:
     def poll(self) -> int | None:
         return None
 
+    def wait(self) -> int:
+        return 0
+
 
 @pytest.fixture
 def devstack(monkeypatch: pytest.MonkeyPatch):
@@ -548,6 +552,31 @@ def test_a_listener_that_arrives_during_shutdown_is_killed_by_its_own_thread(
     assert module._start_lan_listener(children, "C:/theDAW/frontend") is False
     assert len(killed) == 1, "the refused listener is killed, not leaked"
     assert children == ["early"]
+    assert any("stopping" in line for line in lines), lines
+
+
+def test_a_backend_that_arrives_during_shutdown_is_killed_by_its_own_thread(
+    devstack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The backend supervisor is off the main thread as well, and its respawn
+    loop can pass its own ``_shutdown`` check, spawn ``backend.run``, and
+    register after main()'s kill loop has taken its snapshot -- a backend that
+    nothing will ever kill, holding :8600 against the next launch. So it goes
+    through the same closed-registry gate as the LAN listener, and kills its
+    own child when the gate refuses it."""
+    module, spawns, lines = devstack
+    monkeypatch.setattr(module, "_children_closed", True)
+    monkeypatch.setattr(module, "_shutdown", threading.Event())
+    monkeypatch.setattr(module, "_pump", lambda tag, proc: None)
+    killed: list = []
+    monkeypatch.setattr(module, "_kill_tree", killed.append)
+
+    children: list = []
+    module._run_backend(children)
+
+    assert len(spawns) == 1, "the supervisor spawned one backend and stopped"
+    assert children == [], "a backend registered too late is never in the list"
+    assert len(killed) == 1, "the refused backend is killed, not leaked"
     assert any("stopping" in line for line in lines), lines
 
 
