@@ -1,9 +1,17 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { AlertCircle, ExternalLink, Loader2, RefreshCw } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { AlertCircle, ExternalLink, Library, Loader2, RefreshCw } from 'lucide-react';
 import { backendHttpBase } from '../lib/backendBase';
 import { panelModelDefaults, panelModelOptions } from '../lib/cloudModels';
 import { useGenerateParamsStore } from '../state/generateParamsStore';
 import { probeLyriaCheckedOut } from '../state/generateStore';
+import { useLibraryStore } from '../state/libraryStore';
+
+// INT-002: how often the panel asks the backend to pull anything new out of
+// the sidecar's own library. Generations take tens of seconds, so 30 s means a
+// finished track shows up in the catalog without the user pressing anything.
+const AUTO_SYNC_MS = 30000;
+// How long the inline "3 imported" / "Nothing new" result stays up.
+const SYNC_NOTE_MS = 4000;
 
 // The Lyria 3 Pro app (StarskreamEXE/lyria-3-pro) is embedded WHOLE and
 // unmodified: it ships its own Express server, its own SPA, its own settings
@@ -39,6 +47,84 @@ export const LyriaPanel: React.FC = () => {
     void probeLyriaCheckedOut().then((ok) => { if (!cancelled) setLyriaCheckedOut(ok); });
     return () => { cancelled = true; };
   }, []);
+
+  // INT-002 — pulling the sidecar's generations into theDAW's library.
+  const [syncing, setSyncing] = useState(false);
+  const [syncNote, setSyncNote] = useState('');
+  const syncNoteTimerRef = useRef<number | null>(null);
+  // Guards the automatic 30 s tick against the button (and against itself on a
+  // slow import): the backend serializes syncs anyway, but a second request
+  // would sit there holding a connection for nothing.
+  const syncBusyRef = useRef(false);
+
+  const showSyncNote = useCallback((text: string) => {
+    setSyncNote(text);
+    if (syncNoteTimerRef.current !== null) window.clearTimeout(syncNoteTimerRef.current);
+    syncNoteTimerRef.current = window.setTimeout(() => setSyncNote(''), SYNC_NOTE_MS);
+  }, []);
+
+  /**
+   * Ask the backend to register every new sidecar generation as a library
+   * entry. `announce` is the button: an automatic tick reports nothing and
+   * never shows a spinner, so a background sync cannot flicker the top bar.
+   *
+   * `include_mock` is always false here. The sidecar defaults to mock mode
+   * (its generations are synthesized sine waves that cost nothing), and
+   * filling the user's library with those is not what this button is for.
+   */
+  const runSync = useCallback(
+    async (announce: boolean) => {
+      if (syncBusyRef.current) return;
+      syncBusyRef.current = true;
+      if (announce) setSyncing(true);
+      try {
+        const r = await fetch('/api/lyria/import-new', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ include_mock: false }),
+        });
+        if (!r.ok) throw new Error(`backend returned ${r.status}`);
+        const j = (await r.json()) as {
+          imported?: string[];
+          skipped?: number;
+          reason?: string;
+        };
+        const n = j.imported?.length ?? 0;
+        // Exactly what sunoStore does when a clip completes: the backend has
+        // already registered the entries, so the store only has to re-read.
+        if (n > 0) await useLibraryStore.getState().refresh();
+        if (announce) {
+          if (n > 0) showSyncNote(`${n} imported`);
+          else if (j.reason) showSyncNote(j.reason);
+          else showSyncNote('Nothing new');
+        }
+      } catch (e) {
+        // A failed sync is not a failed panel — the iframe keeps working.
+        if (announce) showSyncNote(e instanceof Error ? e.message : 'Sync failed');
+      } finally {
+        syncBusyRef.current = false;
+        if (announce) setSyncing(false);
+      }
+    },
+    [showSyncNote],
+  );
+
+  // One sync the moment the iframe is live, then every 30 s while the panel
+  // stays mounted and ready. The interval is cleared on unmount and whenever
+  // the panel leaves 'ready', so a backgrounded tab stops polling.
+  useEffect(() => {
+    if (status !== 'ready') return;
+    void runSync(false);
+    const t = window.setInterval(() => void runSync(false), AUTO_SYNC_MS);
+    return () => window.clearInterval(t);
+  }, [status, runSync]);
+
+  useEffect(
+    () => () => {
+      if (syncNoteTimerRef.current !== null) window.clearTimeout(syncNoteTimerRef.current);
+    },
+    [],
+  );
 
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const poppedWindowRef = useRef<Window | null>(null);
@@ -165,6 +251,32 @@ export const LyriaPanel: React.FC = () => {
           </span>
         )}
         <div className="flex-1" />
+        {/* INT-002: Lyria's own library is inside the sidecar. This is the
+            hand-off that makes a generation a theDAW entry — catalog, lineage,
+            EDIT, stems, export — the way a finished Suno clip already is. */}
+        <button
+          type="button"
+          onClick={() => void runSync(true)}
+          disabled={syncing}
+          aria-label="Sync Lyria generations to the theDAW library"
+          title="Import every new Lyria generation into theDAW's library (catalog, lineage, EDIT, stems, export). Runs automatically every 30 seconds too. Mock generations are never imported."
+          className="px-2 py-0.5 rounded border border-zinc-700 hover:bg-white/5 text-zinc-300 text-[9px] font-mono uppercase tracking-widest flex items-center gap-1 shrink-0 disabled:opacity-40"
+        >
+          {syncing ? (
+            <Loader2 className="w-3 h-3 animate-spin" />
+          ) : (
+            <Library className="w-3 h-3" />
+          )}{' '}
+          Sync to library
+        </button>
+        {syncNote && (
+          <span
+            aria-live="polite"
+            className="text-[9px] font-mono uppercase tracking-widest text-zinc-500 shrink-0 max-w-40 truncate"
+          >
+            {syncNote}
+          </span>
+        )}
         <div className="relative shrink-0">
           <label htmlFor="lyria-model" className="sr-only">
             Active model

@@ -10,7 +10,8 @@
  * Magenta's chips are the REAL model list (what the vendored sidecar can load):
  * the active one is starred, an installed one offers "Use", a missing one
  * offers a download that lands in the Download dock. Lyria's card carries the
- * clone + npm install and the GEMINI_API_KEY field.
+ * clone + npm install and its two ordered key lists (Gemini and OpenRouter)
+ * plus the provider the sidecar should start on.
  */
 import React, { useEffect, useState } from 'react';
 import { CheckCircle2, Download, Eye, EyeOff, Loader2, Trash2 } from 'lucide-react';
@@ -25,8 +26,8 @@ import {
   setMagentaModel,
   stopMagentaEngine,
 } from '../../../lib/magentaEngineClient';
-import type { ModelOption, ProviderStatus } from './providerTypes';
-import { BTN_AMBER, BTN_GHOST, BTN_PURPLE, BTN_ROSE, BTN_SKY, CARD, FIELD_LABEL, INPUT, postFix, sleep } from './shared';
+import type { LyriaProvider, ModelOption, ProviderStatus } from './providerTypes';
+import { BTN_AMBER, BTN_GHOST, BTN_PURPLE, BTN_ROSE, BTN_SKY, CARD, FIELD_LABEL, INPUT, SELECT, postFix, sleep } from './shared';
 import { SecretFieldLabel } from '../../ui/SecretFieldLabel';
 
 export const MODEL_STATE_LABELS: Record<string, string> = {
@@ -147,7 +148,7 @@ export const ModelProviderCard: React.FC<{ provider: ProviderStatus; onFixed: ()
         )}
       </div>
       {isSuno && <SunoKeyInput />}
-      {isLyria && <LyriaKeyInput onSaved={onFixed} />}
+      {isLyria && <LyriaKeyLists onSaved={onFixed} />}
     </article>
   );
 };
@@ -533,108 +534,210 @@ const SunoKeyInput: React.FC = () => {
   );
 };
 
-interface LyriaKeyInfo {
-  configured: boolean;
+/** Counts and sources for one provider. The backend never sends key values. */
+interface LyriaProviderKeys {
+  count: number;
   source: string;
-  prefix: string | null;
+  configured: boolean;
+  /** Keys from the OS environment — removed where they were set, not here. */
+  env: number;
+  /** Keys saved through this panel: the ones a position can be removed by. */
+  stored: number;
+  /** Keys borrowed from the assistant's key pool. */
+  pool: number;
+}
+
+interface LyriaKeySummary {
+  providers: Record<LyriaProvider, LyriaProviderKeys>;
+  provider_preference: LyriaProvider | null;
   mock?: boolean;
 }
 
-/** GEMINI_API_KEY handed to the Lyria sidecar (env > stored here > assistant pool). */
-const LyriaKeyInput: React.FC<{ onSaved: () => void }> = ({ onSaved }) => {
-  const [info, setInfo] = useState<LyriaKeyInfo | null>(null);
+const LYRIA_PROVIDER_LABEL: Record<LyriaProvider, string> = {
+  gemini: 'Gemini',
+  openrouter: 'OpenRouter',
+};
+
+const LYRIA_PROVIDER_HINT: Record<LyriaProvider, string> = {
+  gemini: 'GEMINI_API_KEY (aistudio.google.com)',
+  openrouter: 'OPENROUTER_API_KEY (openrouter.ai/keys)',
+};
+
+const lyriaKeyCounts = (p: LyriaProviderKeys | undefined): string => {
+  if (!p || p.count === 0) return 'no keys';
+  const parts = [
+    p.env ? `${p.env} from the environment` : null,
+    p.stored ? `${p.stored} saved here` : null,
+    p.pool ? `${p.pool} from the key pool` : null,
+  ].filter(Boolean);
+  return `${p.count} key${p.count === 1 ? '' : 's'} · ${parts.join(' · ')}`;
+};
+
+/** One provider's ordered key list: count + source, add, remove by position. */
+const LyriaProviderKeyList: React.FC<{
+  provider: LyriaProvider;
+  keys: LyriaProviderKeys | undefined;
+  busy: boolean;
+  onAdd: (provider: LyriaProvider, key: string) => Promise<void>;
+  onRemove: (provider: LyriaProvider, index: number) => Promise<void>;
+}> = ({ provider, keys, busy, onAdd, onRemove }) => {
   const [val, setVal] = useState('');
   const [show, setShow] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [saved, setSaved] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const refresh = React.useCallback(async () => {
-    try {
-      const r = await fetch('/api/lyria/key');
-      if (r.ok) setInfo((await r.json()) as LyriaKeyInfo);
-    } catch {
-      setInfo(null);
-    }
-  }, []);
-  useEffect(() => { void refresh(); }, [refresh]);
-
-  const save = async () => {
-    if (!val.trim()) return;
-    setBusy(true);
-    setSaved(false);
-    setError(null);
-    try {
-      const r = await fetch('/api/lyria/key', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ key: val.trim() }),
-      });
-      if (!r.ok) {
-        const detail = await r.json().then((j) => j?.detail).catch(() => null);
-        throw new Error(typeof detail === 'string' ? detail : `HTTP ${r.status}`);
-      }
-      setVal('');
-      setSaved(true);
-      await refresh();
-      onSaved();
-      window.setTimeout(() => setSaved(false), 2000);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Could not save the key.');
-    } finally {
-      setBusy(false);
-    }
-  };
-  const clear = async () => {
-    setBusy(true);
-    try {
-      await fetch('/api/lyria/key', { method: 'DELETE' });
-      await refresh();
-      onSaved();
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const placeholder = info?.configured
-    ? `Gemini key: ${info.source}${info.prefix ? ` ${info.prefix}` : ''} — paste to replace`
-    : `GEMINI_API_KEY (aistudio.google.com)${info?.mock ? ' — optional in mock mode' : ''}`;
+  const id = `settings-lyria-${provider}-key`;
+  const label = LYRIA_PROVIDER_LABEL[provider];
+  const title = `Keys theDAW hands the Lyria sidecar for ${label}, in the order it tries them: the environment's first, then the ones saved here, then the assistant's key pool. A running Lyria restarts to pick them up.`;
   return (
-    <form className="flex flex-wrap items-center gap-1" onSubmit={(e) => { e.preventDefault(); void save(); }}>
-      <SecretFieldLabel
-        htmlFor="settings-lyria-gemini-key"
-        className={`shrink-0 ${FIELD_LABEL}`}
-        title="The GEMINI_API_KEY theDAW hands the Lyria sidecar. An environment variable wins; otherwise the key saved here, then the assistant's Gemini key."
-      >
-        Gemini key
+    <form
+      className="flex flex-wrap items-center gap-1"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (!val.trim()) return;
+        void onAdd(provider, val.trim()).then(() => setVal(''));
+      }}
+    >
+      <SecretFieldLabel htmlFor={id} className={`shrink-0 ${FIELD_LABEL}`} title={title}>
+        {label}
       </SecretFieldLabel>
       <div className="relative flex-1 min-w-0">
         <input
-          id="settings-lyria-gemini-key"
-          name="settings-lyria-gemini-key"
+          id={id}
+          name={id}
           type={show ? 'text' : 'password'}
           autoComplete="off"
           spellCheck={false}
           value={val}
           onChange={(e) => setVal(e.target.value)}
-          placeholder={placeholder}
-          title="The GEMINI_API_KEY theDAW hands the Lyria sidecar. An environment variable wins; otherwise the key saved here, then the assistant's Gemini key. A running Lyria restarts to pick it up."
+          placeholder={`Add a ${label} key — ${LYRIA_PROVIDER_HINT[provider]}`}
+          title={title}
           className={`${INPUT} w-full pr-6`}
         />
-        <button type="button" onClick={() => setShow((v) => !v)} aria-label={show ? 'Hide key' : 'Show key'} aria-pressed={show}
-          className="absolute right-1 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-300">
+        <button
+          type="button"
+          onClick={() => setShow((v) => !v)}
+          aria-label={show ? `Hide the ${label} key being typed` : `Show the ${label} key being typed`}
+          aria-pressed={show}
+          className="absolute right-1 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-300"
+        >
           {show ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
         </button>
       </div>
-      <button type="submit" disabled={busy || !val.trim()} title="Save the Gemini key for Lyria (no restart of theDAW needed)" className={BTN_PURPLE}>
-        {busy ? <Loader2 className="w-3 h-3 animate-spin" /> : saved ? <CheckCircle2 className="w-3 h-3" /> : 'Save'}
+      <button type="submit" disabled={busy || !val.trim()} title={`Add this ${label} key to the end of the list`} className={BTN_PURPLE}>
+        {busy ? <Loader2 className="w-3 h-3 animate-spin" /> : 'Add'}
       </button>
-      {info?.source === 'file' && (
-        <button type="button" onClick={() => void clear()} disabled={busy} aria-label="Forget the stored Gemini key" title="Forget the stored Gemini key" className={BTN_GHOST}>
+      <span className="basis-full truncate text-[11px] font-mono text-zinc-400" title={`${label}: ${lyriaKeyCounts(keys)}`}>
+        {lyriaKeyCounts(keys)}
+        {keys?.configured ? ` · first from ${keys.source}` : ''}
+      </span>
+      {Array.from({ length: keys?.stored ?? 0 }, (_, i) => (
+        <button
+          key={i}
+          type="button"
+          onClick={() => void onRemove(provider, i)}
+          disabled={busy}
+          aria-label={`Forget saved ${label} key ${i + 1}`}
+          title={`Forget saved ${label} key ${i + 1} (position ${i + 1} of the keys saved here)`}
+          className={`${BTN_GHOST} font-mono`}
+        >
           <Trash2 className="w-3 h-3" />
+          {`#${i + 1}`}
         </button>
-      )}
-      {error && <p role="alert" className="basis-full truncate text-[11px] text-rose-300" title={error}>{error}</p>}
+      ))}
     </form>
+  );
+};
+
+/**
+ * The keys theDAW hands the Lyria sidecar: an ordered list per provider, plus
+ * which provider the child should default to.
+ *
+ * Two lists rather than one Gemini box because the child fails over between
+ * keys and between providers, and Google's free tier grants zero Lyria
+ * requests a day — a Gemini key alone often cannot generate at all, while an
+ * OpenRouter key can. Counts and sources only: the backend never sends a key
+ * value back, so none can be rendered.
+ */
+const LyriaKeyLists: React.FC<{ onSaved: () => void }> = ({ onSaved }) => {
+  const [summary, setSummary] = useState<LyriaKeySummary | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = React.useCallback(async () => {
+    try {
+      const r = await fetch('/api/lyria/keys');
+      if (r.ok) setSummary((await r.json()) as LyriaKeySummary);
+    } catch {
+      setSummary(null);
+    }
+  }, []);
+  useEffect(() => { void refresh(); }, [refresh]);
+
+  const send = async (url: string, method: string, body: unknown) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await fetch(url, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        const detail = await r.json().then((j) => j?.detail).catch(() => null);
+        throw new Error(typeof detail === 'string' ? detail : `HTTP ${r.status}`);
+      }
+      setSummary((await r.json()) as LyriaKeySummary);
+      onSaved();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'That did not work.');
+      throw e;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const add = async (provider: LyriaProvider, key: string) => {
+    await send('/api/lyria/keys', 'POST', { provider, key });
+  };
+  const remove = async (provider: LyriaProvider, index: number) => {
+    await send('/api/lyria/keys', 'DELETE', { provider, index }).catch(() => undefined);
+  };
+  const choose = async (value: string) => {
+    await send('/api/lyria/keys/provider', 'POST', { provider: value }).catch(() => undefined);
+  };
+
+  return (
+    <div className="flex flex-col gap-1">
+      {(['gemini', 'openrouter'] as LyriaProvider[]).map((provider) => (
+        <LyriaProviderKeyList
+          key={provider}
+          provider={provider}
+          keys={summary?.providers?.[provider]}
+          busy={busy}
+          onAdd={add}
+          onRemove={remove}
+        />
+      ))}
+      <div className="flex flex-wrap items-center gap-1">
+        <label htmlFor="settings-lyria-provider" className={`shrink-0 ${FIELD_LABEL}`}>
+          Provider
+        </label>
+        <select
+          id="settings-lyria-provider"
+          name="settings-lyria-provider"
+          value={summary?.provider_preference ?? ''}
+          disabled={busy}
+          onChange={(e) => void choose(e.target.value)}
+          title="Which provider the Lyria sidecar starts on. Let Lyria decide picks the only provider with keys, and otherwise leaves the app's own default alone."
+          className={SELECT}
+        >
+          <option value="">Let Lyria decide</option>
+          <option value="gemini">Gemini</option>
+          <option value="openrouter">OpenRouter</option>
+        </select>
+      </div>
+      <p className="text-[11px] leading-snug text-zinc-400">
+        Keys are tried in order and a rejected key is skipped for the next.
+      </p>
+      {error && <p role="alert" className="truncate text-[11px] text-rose-300" title={error}>{error}</p>}
+    </div>
   );
 };

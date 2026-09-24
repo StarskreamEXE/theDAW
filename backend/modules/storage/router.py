@@ -678,8 +678,9 @@ def _lyria_provider_status() -> dict:
     """Lyria runs as an embedded sidecar with its own key handling, so
     "configured" here means the checkout is present and startable, not that a
     key exists: the app's own Settings modal accepts a key at runtime, and the
-    sidecar also passes GEMINI_API_KEY through when theDAW already holds one.
-    Mock mode needs no key at all, which is the default.
+    sidecar also passes every Gemini and OpenRouter key theDAW already holds
+    through to the child, which tries them in order. Mock mode needs no key at
+    all, which is the default.
     """
     try:
         from backend.modules.lyria.sidecar import is_mock, probe
@@ -719,15 +720,27 @@ def _lyria_provider_status() -> dict:
                     if mock
                     else "Live mode: each generation costs $0.08 (Pro) / $0.04 (Clip)."
                 )
+                # Either provider can generate on its own, and OpenRouter is
+                # the one that reliably can (Google's free tier grants zero
+                # Lyria requests per day), so both are reported and the
+                # warning only fires when BOTH are absent.
                 if status.get("gemini_key"):
-                    summary += f" Gemini key: {status.get('gemini_key_source')}."
-                elif mock:
-                    summary += " Add a Gemini key before switching to live mode."
-                else:
-                    summary += (
-                        " GEMINI_API_KEY is not set: live mode cannot generate "
-                        "without it."
-                    )
+                    summary += f" Gemini keys: {status.get('gemini_keys') or 1}"
+                    summary += f" ({status.get('gemini_key_source')})."
+                if status.get("openrouter_key"):
+                    summary += f" OpenRouter keys: {status.get('openrouter_keys') or 1}"
+                    summary += f" ({status.get('openrouter_key_source')})."
+                if not status.get("gemini_key") and not status.get("openrouter_key"):
+                    if mock:
+                        summary += (
+                            " Add a Gemini or OpenRouter key before switching to "
+                            "live mode."
+                        )
+                    else:
+                        summary += (
+                            " GEMINI_API_KEY is not set: live mode cannot generate "
+                            "without a Gemini or OpenRouter key."
+                        )
         elif installing:
             summary = f"Installing: {install.get('message')}"
         elif install.get("status") == "error":
@@ -748,6 +761,13 @@ def _lyria_provider_status() -> dict:
                 "install": install,
                 "gemini_key": bool(status.get("gemini_key")),
                 "gemini_key_source": status.get("gemini_key_source"),
+                "openrouter_key": bool(status.get("openrouter_key")),
+                "openrouter_key_source": status.get("openrouter_key_source"),
+                # Counts only -- the card shows how many keys the child gets
+                # and where the first one comes from, never a value.
+                "gemini_keys": int(status.get("gemini_keys") or 0),
+                "openrouter_keys": int(status.get("openrouter_keys") or 0),
+                "provider_preference": status.get("provider_preference"),
                 # theDAW's own LYRIA_MOCK preference only describes a process
                 # WE spawned -- an external process's cost mode is unknown
                 # (item 5 / item 7), so don't report it as mock/live either.

@@ -68,6 +68,12 @@ export const KNOWN_PROVIDERS: Record<string, ProviderMeta> = {
   magenta: { id: 'magenta', label: 'Magenta', color: 'sky' },
   udio: { id: 'udio', label: 'Udio', color: 'pink' },
   riffusion: { id: 'riffusion', label: 'Riffusion', color: 'teal' },
+  // INT-002: theDAW's embedded Lyria 3 Pro sidecar, whose generations are
+  // registered as first-class entries by `backend/modules/lyria/importer.py`.
+  // The backend sends `provider`/`providerLabel`/`providerIsAi` for every one
+  // of them (`library.provider`'s own `lyria` rule), so this row only supplies
+  // the palette and the name a partial, entry-shaped object would miss.
+  lyria: { id: 'lyria', label: 'Lyria 3 Pro', color: 'emerald' },
   import: { id: 'import', label: 'Imported', color: 'zinc' },
   unknown: { id: 'unknown', label: 'Unknown', color: 'zinc' },
 };
@@ -113,6 +119,7 @@ const trimmed = (v: unknown): string => (typeof v === 'string' ? v.trim() : '');
  * own metadata, which beats any guess made from a model name. With no detected
  * slug the historical derivation answers, unchanged:
  *   model contains 'suno' / 'chirp'      → 'suno'
+ *   model contains 'lyria'               → 'lyria'
  *   model contains 'magenta' / 'gemini'  → 'gemini-magenta'
  *   model contains 'udio' / 'riffusion'  → that engine
  *   source === 'import'                  → 'import'
@@ -136,6 +143,10 @@ export const inferProvider = (e: ProviderEntryFields): string => {
   // and the only thing an exported Suno song's model column says. Backend twin:
   // `_PROVIDER_BY_MODEL_SUBSTRING` and the SQL fallback (schema step 11).
   if (`${e.source ?? ''}`.toLowerCase() === 'suno' || hay.includes('suno') || hay.includes('chirp')) return 'suno';
+  // Lyria is checked before the Gemini arm: its model ids are Google's
+  // (`google/lyria-3-pro-preview`) but the songs are not Magenta output.
+  // Backend twin: `_legacy_lyria` in provider.py and the db.py substring row.
+  if (hay.includes('lyria')) return 'lyria';
   if (hay.includes('magenta') || hay.includes('gemini')) return 'gemini-magenta';
   // "udio" must not be found inside "audio": `stable-audio-3` is not Udio. The
   // backend strips the same word before it looks (db.py, the same rule).
@@ -168,7 +179,7 @@ export const entryProviderMeta = (e: ProviderEntryFields): ProviderMeta => {
  * derivation produces except `import`, `thedaw` and `unknown`.
  */
 const AI_PROVIDER_IDS = new Set([
-  'stable-audio', 'suno', 'gemini-magenta', 'magenta', 'udio', 'riffusion',
+  'stable-audio', 'suno', 'lyria', 'gemini-magenta', 'magenta', 'udio', 'riffusion',
 ]);
 
 /**
@@ -188,5 +199,5 @@ export const entryProviderIsAi = (e: ProviderEntryFields): boolean => {
 /** A reasonable default provider list to seed filter dropdowns before
  *  entries exist / to guarantee the common platforms are always offered. */
 export const DEFAULT_PROVIDER_ORDER = [
-  'stable-audio', 'thedaw', 'suno', 'gemini-magenta', 'udio', 'riffusion', 'import',
+  'stable-audio', 'thedaw', 'suno', 'lyria', 'gemini-magenta', 'udio', 'riffusion', 'import',
 ];

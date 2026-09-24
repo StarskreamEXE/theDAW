@@ -284,6 +284,20 @@ PROVIDER_RULES: tuple[ProviderRule, ...] = (
         is_ai=True,
         generator_values=("musicgen", "audiocraft"),
     ),
+    # INT-002. theDAW's embedded Lyria 3 Pro sidecar writes no tags of its own
+    # -- the audio it hands `library.importer` is whatever Gemini/OpenRouter
+    # returned -- so this row is reached through `_legacy_lyria` (the metadata
+    # markers the importer stamps), exactly the way a pre-labeling Suno entry
+    # is. `generator_values` is the generic generator-frame spelling and
+    # nothing invented: a file that names "lyria" as its tool came from here.
+    # Label and AI-ness mirror `db.DERIVED_PROVIDERS` and `KNOWN_PROVIDERS` in
+    # `frontend/src/catalog/catalogProviders.ts`.
+    ProviderRule(
+        provider="lyria",
+        label="Lyria 3 Pro",
+        is_ai=True,
+        generator_values=("lyria", "lyria 3 pro"),
+    ),
     # theDAW's own exports. Only the explicit Stable Audio spellings name the
     # generator; a frame that says "theDAW" says the file was made IN theDAW
     # and nothing about its origin -- a DJ performance set and a VJ clip carry
@@ -748,6 +762,9 @@ def _provider_id_from(
         value, _ = _first(embedded, rule.id_keys)
         if value:
             return value
+    if meta is not None and rule is not None and rule.provider == "lyria":
+        # INT-002: the sidecar's own generation id, off the importer's tag.
+        return _legacy_tag_id(meta, "lyriaid:")
     if meta is not None and (rule is None or rule.provider == "suno"):
         legacy = _text(meta.get("suno_id"))
         if not _is_blank(legacy):
@@ -769,9 +786,16 @@ def _meta_tags(meta: Mapping[str, Any]) -> list[str]:
     return [p.strip().lower() for p in parts if str(p).strip()]
 
 
-def _legacy_tag_id(meta: Mapping[str, Any]) -> Optional[str]:
+def _legacy_tag_id(meta: Mapping[str, Any], prefix: str = "sunoid:") -> Optional[str]:
+    """The provider's own track id out of a ``<prefix><id>`` tag.
+
+    ``prefix`` defaults to Suno's for every pre-existing caller; INT-002 passes
+    ``lyriaid:``, which the Lyria importer stamps for the same two reasons Suno
+    stamps its own -- the badge's ``provider_id`` and resolving a parent when a
+    derived track is registered later.
+    """
     for tag in _meta_tags(meta):
-        if tag.startswith("sunoid:"):
+        if tag.startswith(prefix):
             value = tag.split(":", 1)[1].strip()
             if not _is_blank(value):
                 return value
@@ -795,6 +819,33 @@ def _legacy_suno(meta: Mapping[str, Any]) -> Optional[str]:
             return "meta.tags=suno"
         if tag.startswith("sunoid:"):
             return "meta.tags=sunoid"
+    return None
+
+
+def _legacy_lyria(meta: Mapping[str, Any]) -> Optional[str]:
+    """The evidence that this entry came from the embedded Lyria sidecar.
+
+    INT-002's twin of :func:`_legacy_suno`, and for the same reason: the audio
+    the sidecar returns carries no frame naming Lyria, so the only thing that
+    identifies it is what ``lyria.importer`` wrote into the entry's metadata --
+    a ``model`` of "lyria", plus the ``lyria`` / ``lyriaid:<id>`` tags. Reading
+    them here is what lets the badge, the provider filter and the facet agree
+    without opening a single audio file.
+
+    ``model`` is matched by SUBSTRING, exactly as ``db.infer_provider``'s
+    ``lyria`` arm reads the same column, and deliberately so: the SQL fallback
+    has no ``lyria`` arm (adding one is a schema step -- see the note on
+    ``db._PROVIDER_BY_MODEL_SUBSTRING``), so this detection is what fills the
+    ``provider`` column for such a row at write time and keeps the filter, the
+    facet and the badge from ever having to ask the fallback about one.
+    """
+    if "lyria" in _text(meta.get("model")).lower():
+        return "meta.model=lyria"
+    for tag in _meta_tags(meta):
+        if tag == "lyria":
+            return "meta.tags=lyria"
+        if tag.startswith("lyriaid:"):
+            return "meta.tags=lyriaid"
     return None
 
 
@@ -886,6 +937,21 @@ def detect_provider(
                 provider_id=_provider_id_from(embedded, meta, rule),
                 confidence="explicit",
                 evidence=legacy,
+            )
+        # INT-002: the same step for the embedded Lyria sidecar. After Suno,
+        # which cannot collide with it -- no entry carries both sets of
+        # markers -- and before the unknown-tool arm, so a Lyria track that
+        # also names some encoder is still filed under Lyria.
+        lyria = _legacy_lyria(meta)
+        if lyria:
+            rule = _RULES_BY_SLUG["lyria"]
+            return ProviderInfo(
+                provider=rule.provider,
+                label=rule.label,
+                is_ai=rule.is_ai,
+                provider_id=_provider_id_from(embedded, meta, rule),
+                confidence="explicit",
+                evidence=lyria,
             )
 
     # 4. A tool we have never heard of is still where this file came from —

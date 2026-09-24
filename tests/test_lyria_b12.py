@@ -42,6 +42,17 @@ Re-audit follow-up (round 2):
   * Item 8 -- concurrency tests use a Barrier for determinism and assert
     real lock contention, not just call counts.
 
+Multi-key failover (both providers):
+  * `_child_env` hands the child EVERY key it knows for both providers, as one
+    ordered comma-separated list each (env, then stored, then the key pool,
+    de-duplicated), and never logs a value.
+  * The legacy single-Gemini key file migrates on read and is backed up before
+    the per-provider shape is written over it.
+  * The AI_PROVIDER decision table: only-gemini, only-openrouter, both,
+    neither, and a preference the user set.
+  * The /keys routes' shapes and validation, and that no response body carries
+    key material.
+
 No real npm/node process is spawned -- `_ensure_deps` and `subprocess.Popen`
 are monkeypatched. A throwaway `http.server` (or raw TCP listener, for the
 non-HTTP-banner case) stands in for "something listening on the port" to
@@ -57,6 +68,7 @@ import socket
 import threading
 import time
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Iterator
 
 import pytest
@@ -1303,3 +1315,371 @@ def test_concurrent_ensure_running_installs_once_and_spawns_once(monkeypatch, tm
         "no real _run_lock contention was observed"
     )
     assert results == ["http://127.0.0.1:0"] * n
+
+
+# ---------------------------------------------------------------------------
+# Multi-key failover (both providers) -- the child takes an ORDERED list per
+# provider and skips a rejected key (its server/keys.ts), so theDAW hands it
+# every key it has instead of one. Google's free tier grants zero Lyria
+# requests per day, which is why the OpenRouter list matters at all.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def lyria_keys(tmp_path, monkeypatch):
+    """Isolate the key file, the provider environment variables and the
+    assistant's key pool, so these tests never read or write the real ones."""
+    from backend.key_pool import key_pool
+
+    path = tmp_path / "lyria_gemini_key.json"
+    monkeypatch.setattr(sidecar, "_KEY_FILE", path)
+    monkeypatch.setattr(
+        sidecar, "_KEY_FILE_BACKUP", tmp_path / "lyria_gemini_key.json.bak"
+    )
+    for var in ("GEMINI_API_KEY", "OPENROUTER_API_KEY", "AI_PROVIDER"):
+        monkeypatch.delenv(var, raising=False)
+    pools: dict[str, list[str]] = {}
+    monkeypatch.setattr(
+        key_pool, "get_raw_keys", lambda provider: list(pools.get(provider, []))
+    )
+    return SimpleNamespace(path=path, backup=sidecar._KEY_FILE_BACKUP, pools=pools)
+
+
+def _cfg(tmp_path) -> sidecar.LyriaConfig:
+    return sidecar.LyriaConfig(
+        project_path=tmp_path, port=5188, npm_path="npm", mock=True
+    )
+
+
+def test_child_env_passes_every_key_for_both_providers_in_order(
+    lyria_keys, tmp_path, monkeypatch
+):
+    """env value(s) first, then what theDAW stored, then the key pool -- as
+    one comma-separated list per provider, de-duplicated."""
+    monkeypatch.setenv("GEMINI_API_KEY", "env-g1, env-g2")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "env-o1")
+    sidecar.add_key("gemini", "file-g1")
+    sidecar.add_key("openrouter", "file-o1")
+    # "env-g1" is in the pool too: it must appear ONCE, in its env position.
+    lyria_keys.pools["gemini"] = ["pool-g1", "env-g1"]
+    lyria_keys.pools["openrouter"] = ["pool-o1"]
+    # "openrouter-free" is a distinct pool in backend/key_pool.py; its keys
+    # are OpenRouter keys too and must be folded in.
+    lyria_keys.pools["openrouter-free"] = ["pool-of1", "pool-o1"]
+
+    env = sidecar._child_env(_cfg(tmp_path))
+
+    assert env["GEMINI_API_KEY"] == "env-g1,env-g2,file-g1,pool-g1"
+    assert env["OPENROUTER_API_KEY"] == "env-o1,file-o1,pool-o1,pool-of1"
+
+
+def test_child_env_drops_blanks_and_unsets_a_provider_with_no_keys(
+    lyria_keys, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GEMINI_API_KEY", "  ,  ")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "env-o1,,env-o2\nenv-o3")
+
+    env = sidecar._child_env(_cfg(tmp_path))
+
+    # A whitespace-only inherited value must not reach the child as a "key".
+    assert "GEMINI_API_KEY" not in env
+    assert env["OPENROUTER_API_KEY"] == "env-o1,env-o2,env-o3"
+
+
+def test_child_env_never_logs_key_values(lyria_keys, tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("GEMINI_API_KEY", "secret-gemini-value")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "secret-openrouter-value")
+    with caplog.at_level("DEBUG"):
+        sidecar._child_env(_cfg(tmp_path))
+    assert "secret-gemini-value" not in caplog.text
+    assert "secret-openrouter-value" not in caplog.text
+
+
+def test_legacy_single_gemini_key_file_migrates_on_read(lyria_keys):
+    """The old single-key file keeps working: its key becomes the FIRST
+    Gemini entry, so the key the user already saved is still tried first."""
+    lyria_keys.path.write_text(json.dumps({"key": "legacy-g1"}), encoding="utf-8")
+
+    assert sidecar.stored_keys("gemini") == ["legacy-g1"]
+    assert sidecar.stored_keys("openrouter") == []
+    assert sidecar.gemini_key() == ("legacy-g1", "file")
+
+
+def test_migration_backs_the_legacy_file_up_before_rewriting_it(lyria_keys):
+    lyria_keys.path.write_text(json.dumps({"key": "legacy-g1"}), encoding="utf-8")
+
+    sidecar.add_key("gemini", "added-g2")
+
+    written = json.loads(lyria_keys.path.read_text(encoding="utf-8"))
+    assert written["providers"]["gemini"] == ["legacy-g1", "added-g2"]
+    assert written["providers"]["openrouter"] == []
+    assert written["version"] == sidecar._KEY_FILE_VERSION
+    # The user's original file is not simply gone.
+    assert json.loads(lyria_keys.backup.read_text(encoding="utf-8")) == {
+        "key": "legacy-g1"
+    }
+
+
+def test_add_remove_and_preference_round_trip(lyria_keys):
+    sidecar.add_key("gemini", "g1")
+    sidecar.add_key("gemini", "g2")
+    sidecar.add_key("gemini", "g1")  # already present -- no duplicate
+    sidecar.add_key("openrouter", "o1")
+    assert sidecar.stored_keys("gemini") == ["g1", "g2"]
+
+    assert sidecar.remove_key("gemini", 0) is True
+    assert sidecar.stored_keys("gemini") == ["g2"]
+    assert sidecar.remove_key("gemini", 5) is False
+    # Forgetting a Gemini key leaves the OpenRouter list alone.
+    assert sidecar.stored_keys("openrouter") == ["o1"]
+
+    assert sidecar.set_provider_preference("OpenRouter") == "openrouter"
+    assert sidecar.provider_preference() == "openrouter"
+    assert sidecar.set_provider_preference("") is None
+    assert sidecar.provider_preference() is None
+    with pytest.raises(ValueError):
+        sidecar.set_provider_preference("anthropic")
+    with pytest.raises(ValueError):
+        sidecar.add_key("anthropic", "nope")
+
+
+def test_compat_set_and_clear_gemini_key(lyria_keys):
+    """POST /key appends rather than replacing (a second key is a fallback,
+    not a correction), and DELETE /key forgets only the Gemini list."""
+    sidecar.set_gemini_key("g1")
+    sidecar.set_gemini_key("g2")
+    sidecar.add_key("openrouter", "o1")
+    assert sidecar.stored_keys("gemini") == ["g1", "g2"]
+
+    assert sidecar.clear_gemini_key() is True
+    assert sidecar.stored_keys("gemini") == []
+    assert sidecar.stored_keys("openrouter") == ["o1"]
+    assert sidecar.clear_gemini_key() is False
+
+
+@pytest.mark.parametrize(
+    "gemini,openrouter,stored_pref,env_pref,expected",
+    [
+        (["g1"], [], None, None, "gemini"),
+        ([], ["o1"], None, None, "openrouter"),
+        # Both reachable: leave the child's own default alone.
+        (["g1"], ["o1"], None, None, None),
+        ([], [], None, None, None),
+        # A preference the user set in theDAW wins over the key-count rule...
+        ([], ["o1"], "gemini", None, "gemini"),
+        (["g1"], ["o1"], "openrouter", None, "openrouter"),
+        # ...and over an ambient AI_PROVIDER, which itself beats the rule.
+        ([], ["o1"], "gemini", "openrouter", "gemini"),
+        (["g1"], [], None, "openrouter", "openrouter"),
+    ],
+)
+def test_child_env_ai_provider_decision_table(
+    lyria_keys,
+    tmp_path,
+    monkeypatch,
+    gemini,
+    openrouter,
+    stored_pref,
+    env_pref,
+    expected,
+):
+    if gemini:
+        monkeypatch.setenv("GEMINI_API_KEY", ",".join(gemini))
+    if openrouter:
+        monkeypatch.setenv("OPENROUTER_API_KEY", ",".join(openrouter))
+    if env_pref:
+        monkeypatch.setenv("AI_PROVIDER", env_pref)
+    if stored_pref:
+        sidecar.set_provider_preference(stored_pref)
+
+    env = sidecar._child_env(_cfg(tmp_path))
+
+    assert env.get("AI_PROVIDER") == expected
+
+
+def test_probe_key_issue_only_fires_when_both_providers_are_empty(
+    lyria_keys, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("theDAW_LYRIA_PROJECT", str(tmp_path))
+    monkeypatch.setenv("theDAW_LYRIA_MOCK", "0")  # live mode
+    monkeypatch.setattr(
+        sidecar, "_port_is_listening", lambda port, host="127.0.0.1": False
+    )
+
+    out = sidecar.probe()
+    assert "key" in out["missing"]
+    assert any("Gemini or OpenRouter key" in issue for issue in out["issues"])
+
+    # An OpenRouter key alone is enough to generate -- no key issue.
+    monkeypatch.setenv("OPENROUTER_API_KEY", "o1")
+    out = sidecar.probe()
+    assert "key" not in out["missing"]
+    assert not any("OpenRouter key is set" in issue for issue in out["issues"])
+    assert out["openrouter_key"] is True
+    assert out["openrouter_key_source"] == "env"
+    assert out["gemini_keys"] == 0
+    assert out["openrouter_keys"] == 1
+    assert out["provider_preference"] is None
+
+
+def test_key_summary_reports_counts_and_sources_only(lyria_keys, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "env-g1,env-g2")
+    sidecar.add_key("gemini", "file-g1")
+    sidecar.add_key("openrouter", "file-o1")
+    lyria_keys.pools["openrouter"] = ["pool-o1"]
+    sidecar.set_provider_preference("openrouter")
+
+    summary = sidecar.key_summary()
+
+    assert summary["providers"]["gemini"] == {
+        "count": 3,
+        "source": "env",
+        "configured": True,
+        "env": 2,
+        "stored": 1,
+        "pool": 0,
+    }
+    assert summary["providers"]["openrouter"]["count"] == 2
+    assert summary["providers"]["openrouter"]["source"] == "file"
+    assert summary["provider_preference"] == "openrouter"
+    assert "env-g1" not in json.dumps(summary)
+
+
+# ---------------------------------------------------------------------------
+# The /keys routes: shapes, validation, sidecar restart, and no key material
+# ---------------------------------------------------------------------------
+
+
+def _recording_to_thread_factory(calls: list[object]):
+    async def _recording_to_thread(fn, *args, **kwargs):
+        calls.append(fn)
+        return fn(*args, **kwargs)
+
+    return _recording_to_thread
+
+
+@pytest.fixture
+def keys_router(lyria_keys, monkeypatch):
+    """The Lyria router with its blocking calls recorded and sidecar.stop()
+    faked, so no real process teardown is attempted."""
+    from backend.modules.lyria import router as lyria_router
+
+    calls: list[object] = []
+    monkeypatch.setattr(
+        lyria_router.asyncio, "to_thread", _recording_to_thread_factory(calls)
+    )
+    monkeypatch.setattr(sidecar, "stop", lambda: True)
+    return SimpleNamespace(module=lyria_router, calls=calls, keys=lyria_keys)
+
+
+def test_keys_get_route_returns_counts_and_offloads_to_thread(keys_router, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "env-g1")
+    result = asyncio.run(keys_router.module.keys_status())
+
+    assert sidecar.key_summary in keys_router.calls
+    assert result["providers"]["gemini"]["count"] == 1
+    assert result["providers"]["gemini"]["source"] == "env"
+    assert result["providers"]["openrouter"]["count"] == 0
+    assert result["provider_preference"] is None
+    assert "env-g1" not in json.dumps(result)
+
+
+def test_keys_post_route_appends_stops_the_sidecar_and_hides_the_value(keys_router):
+    result = asyncio.run(
+        keys_router.module.add_provider_key(
+            provider="openrouter", key="sk-or-v1-secret-value"
+        )
+    )
+
+    assert sidecar.stored_keys("openrouter") == ["sk-or-v1-secret-value"]
+    assert sidecar.stop in keys_router.calls
+    assert result["ok"] is True
+    assert result["restarted"] is True
+    assert result["providers"]["openrouter"] == {
+        "count": 1,
+        "source": "file",
+        "configured": True,
+        "env": 0,
+        "stored": 1,
+        "pool": 0,
+    }
+    assert "secret" not in json.dumps(result)
+
+
+def test_keys_post_route_rejects_a_bad_provider_and_a_short_key(keys_router):
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as bad_provider:
+        asyncio.run(
+            keys_router.module.add_provider_key(
+                provider="anthropic", key="sk-123456789"
+            )
+        )
+    assert bad_provider.value.status_code == 400
+
+    with pytest.raises(HTTPException) as short:
+        asyncio.run(keys_router.module.add_provider_key(provider="gemini", key="tiny"))
+    assert short.value.status_code == 400
+    assert sidecar.stored_keys("gemini") == []
+
+
+def test_keys_delete_route_removes_by_position(keys_router):
+    from fastapi import HTTPException
+
+    sidecar.add_key("gemini", "g1-value")
+    sidecar.add_key("gemini", "g2-value")
+
+    result = asyncio.run(
+        keys_router.module.remove_provider_key(provider="gemini", index=0)
+    )
+    assert sidecar.stored_keys("gemini") == ["g2-value"]
+    assert result["providers"]["gemini"]["stored"] == 1
+    assert sidecar.stop in keys_router.calls
+    assert "g2-value" not in json.dumps(result)
+
+    with pytest.raises(HTTPException) as gone:
+        asyncio.run(keys_router.module.remove_provider_key(provider="gemini", index=9))
+    assert gone.value.status_code == 404
+    with pytest.raises(HTTPException) as bad_provider:
+        asyncio.run(keys_router.module.remove_provider_key(provider="nope", index=0))
+    assert bad_provider.value.status_code == 400
+
+
+def test_keys_provider_route_sets_and_clears_the_preference(keys_router):
+    from fastapi import HTTPException
+
+    result = asyncio.run(keys_router.module.set_key_provider(provider="openrouter"))
+    assert result["provider_preference"] == "openrouter"
+    assert sidecar.stop in keys_router.calls
+
+    cleared = asyncio.run(keys_router.module.set_key_provider(provider=""))
+    assert cleared["provider_preference"] is None
+
+    with pytest.raises(HTTPException) as bad:
+        asyncio.run(keys_router.module.set_key_provider(provider="anthropic"))
+    assert bad.value.status_code == 400
+
+
+def test_legacy_key_routes_still_work_and_append(keys_router):
+    """GET/POST/DELETE /key keep their shape; POST now appends so an older
+    client adding a second key gains a fallback instead of losing the first."""
+    first = asyncio.run(keys_router.module.set_key(key="gemini-key-one"))
+    second = asyncio.run(keys_router.module.set_key(key="gemini-key-two"))
+
+    assert first["configured"] is True
+    assert second["source"] == "file"
+    assert second["restarted"] is True
+    assert sidecar.stored_keys("gemini") == ["gemini-key-one", "gemini-key-two"]
+    # The legacy body carries a 6-character hint, never the key itself.
+    assert "gemini-key-one" not in json.dumps(first)
+    assert "gemini-key-two" not in json.dumps(second)
+
+    status = asyncio.run(keys_router.module.key_status())
+    assert status["configured"] is True
+    assert status["source"] == "file"
+    assert "gemini-key-one" not in json.dumps(status)
+
+    cleared = asyncio.run(keys_router.module.clear_key())
+    assert cleared["removed"] is True
+    assert cleared["configured"] is False
+    assert sidecar.stored_keys("gemini") == []

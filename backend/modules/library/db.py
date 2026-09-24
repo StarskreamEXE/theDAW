@@ -571,6 +571,21 @@ _PROVIDER_BY_MODEL_SUBSTRING: tuple[tuple[str, str, str], ...] = (
     ("", "gemini", "gemini-magenta"),
     ("audio", "udio", "udio"),
     ("", "riffusion", "riffusion"),
+    # INT-002. theDAW's embedded Lyria 3 Pro sidecar; `lyria.importer` writes a
+    # bare "lyria" model column. Appended, never inserted: "lyria" is not a
+    # substring of any needle above and none of them is a substring of it, so
+    # this arm can only ever answer for a row the others already fell through.
+    #
+    # NOT mirrored into `_PROVIDER_FALLBACK_TEMPLATE` below, which is the ONE
+    # divergence from the twin rule this table otherwise keeps. Mirroring it is
+    # a change to the text two expression indexes are declared on and therefore
+    # a schema step (see 10 and 11), and it is not needed for correctness here:
+    # `provider._legacy_lyria` reads the same substring off the model column at
+    # WRITE time, so every row this arm could answer for already has its
+    # `provider` column resolved to 'lyria' and never reaches the fallback.
+    # This arm exists for the callers that have no row at all -- a lineage
+    # node, which carries a model and a source and nothing else.
+    ("", "lyria", "lyria"),
 )
 
 #: theDAW's own Stable Audio generations (``source`` of 'generate') and the
@@ -594,6 +609,7 @@ DERIVED_PROVIDERS: dict[str, tuple[str, bool]] = {
     "gemini-magenta": ("Magenta", True),
     "udio": ("Udio", True),
     "riffusion": ("Riffusion", True),
+    "lyria": ("Lyria 3 Pro", True),
     "import": ("Imported", False),
     STABLE_AUDIO_PROVIDER: ("Stable Audio", True),
     DEFAULT_PROVIDER: ("theDAW", False),

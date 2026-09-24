@@ -49,6 +49,7 @@ import http.client
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -121,10 +122,43 @@ LYRIA_REPO = "StarskreamEXE/lyria-3-pro"
 LYRIA_REPO_URL = f"https://github.com/{LYRIA_REPO}.git"
 GIT_CLONE_TIMEOUT_SEC = 900.0
 
-# The GEMINI_API_KEY theDAW hands the child (see _child_env). Env wins, then
-# this file (POST /api/lyria/key), then the assistant's Gemini key pool so a
-# key pasted for the assistant serves Lyria too.
-_GEMINI_KEY_FILE = paths.data_path("lyria_gemini_key.json")
+# The provider keys theDAW hands the child (see _child_env). Per provider the
+# order is: the OS environment's value(s), then what was stored here (POST
+# /api/lyria/key[s]), then the assistant's key pool, so a key pasted for the
+# assistant serves Lyria too. EVERY key is passed, not just the first: the
+# embedded app takes an ordered comma-separated list per provider and fails
+# over from a rejected key (invalid, out of credit, or a quota wall) to the
+# next one -- see its server/keys.ts. That matters because Google's free tier
+# grants zero Lyria requests per day, so a lone Gemini key is often a dead end
+# that the next key, or an OpenRouter key, recovers from.
+#
+# The file name still says "gemini" although its CONTENTS are now per-provider
+# (see _read_store): .gitignore ignores exactly ``data/lyria_gemini_key.json``,
+# and a renamed file of API keys would sit outside that entry until .gitignore
+# is changed too. Not a trade worth making -- the shape is versioned instead.
+_KEY_FILE = paths.data_path("lyria_gemini_key.json")
+_KEY_FILE_VERSION = 2
+# Copy of the pre-migration (single-Gemini) file, kept once, the first time the
+# new shape is written over the old one. ``*.bak`` is already gitignored.
+_KEY_FILE_BACKUP = _KEY_FILE.with_name(_KEY_FILE.name + ".bak")
+
+# The providers theDAW can hand keys to. Both are the embedded app's own
+# (server.ts reads GEMINI_API_KEY and OPENROUTER_API_KEY).
+LYRIA_PROVIDERS: tuple[str, ...] = ("gemini", "openrouter")
+_PROVIDER_ENV_VAR = {
+    "gemini": "GEMINI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+}
+# key_pool pools that hold keys for each provider. "openrouter-free" is its own
+# pool in backend/key_pool.py (PROVIDER_ENV_MAP) with its own entries, so it is
+# folded in rather than assumed to be the same list as "openrouter".
+_PROVIDER_POOLS = {
+    "gemini": ("gemini",),
+    "openrouter": ("openrouter", "openrouter-free"),
+}
+# Serializes the read-modify-write of the key file so two concurrent route
+# handlers (add + remove, say) cannot lose one another's edit.
+_key_file_lock = Lock()
 
 
 @contextmanager
@@ -232,6 +266,11 @@ def _child_env(cfg: LyriaConfig) -> dict[str, str]:
     :33-36 OPENROUTER_API_KEY, :102 PORT), and its in-app Settings modal still
     overrides the keys per-request via x-*-api-key headers, so a user who
     prefers the in-app flow is unaffected.
+
+    Both provider variables are handed the FULL ordered list theDAW knows
+    about, comma-separated, because the child walks that list and skips a
+    rejected key (server/keys.ts). Passing one key throws away the failover
+    the child was built for. No key value is ever logged.
     """
     env = child_env()
     env["PORT"] = str(cfg.port)
@@ -241,19 +280,56 @@ def _child_env(cfg: LyriaConfig) -> dict[str, str]:
         # Explicit opt-in to real spending: clear any inherited mock flag so a
         # stale value in the parent's environment can't silently re-enable it.
         env.pop("LYRIA_MOCK", None)
-    # Pass through keys theDAW already holds so the user needn't re-enter them.
-    # Absent keys are simply not set; Lyria then reports them as unconfigured
-    # via its own /api/settings/status and its Settings modal still works.
-    for key in ("GEMINI_API_KEY", "OPENROUTER_API_KEY", "AI_PROVIDER"):
-        val = os.getenv(key)
-        if val:
-            env[key] = val
-    # The stored / pooled Gemini key, when the environment has none.
-    if not env.get("GEMINI_API_KEY"):
-        gemini, _source = gemini_key()
-        if gemini:
-            env["GEMINI_API_KEY"] = gemini
+    # Pass through every key theDAW already holds so the user needn't re-enter
+    # them. A provider with no keys has its variable REMOVED rather than left
+    # at whatever the parent inherited (a blank or whitespace-only value would
+    # otherwise reach the child); Lyria then reports it as unconfigured via its
+    # own /api/settings/status, and its Settings modal still works.
+    resolved: dict[str, list[str]] = {}
+    for provider in LYRIA_PROVIDERS:
+        keys, _source = resolved_keys(provider)
+        resolved[provider] = keys
+        var = _PROVIDER_ENV_VAR[provider]
+        if keys:
+            env[var] = ",".join(keys)
+        else:
+            env.pop(var, None)
+    ai_provider = _child_ai_provider(resolved)
+    if ai_provider:
+        env["AI_PROVIDER"] = ai_provider
+    log.info(
+        "lyria.sidecar: child keys -- gemini=%d openrouter=%d provider=%s",
+        len(resolved["gemini"]),
+        len(resolved["openrouter"]),
+        ai_provider or "child default",
+    )
     return env
+
+
+def _child_ai_provider(resolved: dict[str, list[str]]) -> Optional[str]:
+    """The AI_PROVIDER value to hand the child, or None to leave the child's
+    own default alone.
+
+    A preference the user set in theDAW's Settings wins -- it is the one thing
+    here that was chosen for THIS child, and a selector that an ambient shell
+    variable could silently override would be a lie. An ``AI_PROVIDER`` in the
+    OS environment is honoured next, since setting it is also a deliberate
+    act. With no preference at all the choice follows the keys: point the
+    child at the only provider it can actually reach, and when it can reach
+    both (or neither) leave its own default in place.
+    """
+    stored = provider_preference()
+    if stored:
+        return stored
+    env_pref = (os.getenv("AI_PROVIDER") or "").strip()
+    if env_pref:
+        return env_pref
+    gemini, openrouter = resolved["gemini"], resolved["openrouter"]
+    if openrouter and not gemini:
+        return "openrouter"
+    if gemini and not openrouter:
+        return "gemini"
+    return None
 
 
 # ── prerequisites, keys, project presence ────────────────────────────────────
@@ -277,43 +353,291 @@ def project_present(cfg: Optional[LyriaConfig] = None) -> bool:
     return (cfg.project_path / "package.json").is_file()
 
 
-def gemini_key() -> tuple[Optional[str], str]:
-    """The GEMINI_API_KEY the child will get, and where it comes from:
-    ``env`` | ``file`` | ``pool`` | ``none``."""
-    env = (os.getenv("GEMINI_API_KEY") or "").strip()
-    if env:
-        return env, "env"
+def normalize_provider(provider: str) -> str:
+    """``provider`` lowercased and validated. Raises ValueError otherwise, so
+    a bad value becomes a 400 at the route rather than a silent no-op."""
+    value = (provider or "").strip().lower()
+    if value not in LYRIA_PROVIDERS:
+        raise ValueError(
+            f"Unknown provider {provider!r}: expected one of "
+            f"{', '.join(LYRIA_PROVIDERS)}."
+        )
+    return value
+
+
+def _split_keys(raw: object) -> list[str]:
+    """Ordered, de-duplicated, blank-free keys from a raw value that may hold
+    a list -- a comma/newline-separated string, or an actual list. Mirrors the
+    embedded app's own parseKeyList so both ends agree on what "a list of
+    keys" means."""
+    parts: list[str] = []
+    if isinstance(raw, (list, tuple)):
+        for item in raw:
+            if isinstance(item, str):
+                parts.extend(re.split(r"[,\n\r]+", item))
+    elif isinstance(raw, str):
+        parts.extend(re.split(r"[,\n\r]+", raw))
+    out: list[str] = []
+    for part in parts:
+        key = part.strip()
+        if key and key not in out:
+            out.append(key)
+    return out
+
+
+def _read_store() -> dict:
+    """The stored per-provider key lists and provider preference.
+
+    Migrates the legacy single-Gemini shape (``{"key": "..."}``) transparently
+    on read: that key becomes the FIRST Gemini entry, so the key a user
+    already saved keeps being the one tried first. Never raises -- an
+    unreadable or corrupt file reads as "nothing stored", exactly as the
+    single-key version did.
+    """
+    store: dict = {
+        "providers": {provider: [] for provider in LYRIA_PROVIDERS},
+        "provider_preference": None,
+    }
     try:
-        stored = (
-            json.loads(_GEMINI_KEY_FILE.read_text(encoding="utf-8")).get("key") or ""
-        ).strip()
-        if stored:
-            return stored, "file"
+        raw = json.loads(_KEY_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        pass
+        return store
+    if not isinstance(raw, dict):
+        return store
+    providers = raw.get("providers")
+    if isinstance(providers, dict):
+        for provider in LYRIA_PROVIDERS:
+            store["providers"][provider] = _split_keys(providers.get(provider))
+    legacy = _split_keys(raw.get("key"))
+    if legacy:
+        gemini = list(store["providers"]["gemini"])
+        for key in reversed(legacy):
+            if key in gemini:
+                gemini.remove(key)
+            gemini.insert(0, key)
+        store["providers"]["gemini"] = gemini
+    preference = raw.get("provider_preference")
+    if isinstance(preference, str) and preference.strip().lower() in LYRIA_PROVIDERS:
+        store["provider_preference"] = preference.strip().lower()
+    return store
+
+
+def _is_legacy_file() -> bool:
+    """True when the file on disk is still the pre-migration single-key shape,
+    i.e. rewriting it would destroy the only copy of that shape."""
+    try:
+        raw = json.loads(_KEY_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(raw, dict) and "key" in raw and "providers" not in raw
+
+
+def _write_store(store: dict) -> None:
+    """Persist the per-provider shape, backing the legacy file up once first.
+
+    The backup exists because this is user data theDAW did not create: a
+    migration that turns out to be wrong must not be the end of the key the
+    user saved months ago.
+    """
+    _KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if _is_legacy_file() and not _KEY_FILE_BACKUP.exists():
+        try:
+            _KEY_FILE_BACKUP.write_bytes(_KEY_FILE.read_bytes())
+            log.info(
+                "lyria.sidecar: migrated %s to per-provider keys (backup: %s)",
+                _KEY_FILE.name,
+                _KEY_FILE_BACKUP.name,
+            )
+        except OSError as e:
+            log.warning("lyria.sidecar: could not back up %s: %s", _KEY_FILE.name, e)
+    payload = {
+        "version": _KEY_FILE_VERSION,
+        "providers": {
+            provider: list(store["providers"].get(provider, []))
+            for provider in LYRIA_PROVIDERS
+        },
+        "provider_preference": store.get("provider_preference"),
+    }
+    _KEY_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def stored_keys(provider: str) -> list[str]:
+    """The keys saved through theDAW's own Lyria settings, in order."""
+    return list(_read_store()["providers"][normalize_provider(provider)])
+
+
+def env_keys(provider: str) -> list[str]:
+    """The OS environment's keys for a provider, in order. The variable may
+    itself hold a comma/newline-separated list."""
+    return _split_keys(os.getenv(_PROVIDER_ENV_VAR[normalize_provider(provider)]))
+
+
+def pooled_keys(provider: str) -> list[str]:
+    """Every key the assistant's key pool holds for a provider, in order,
+    across each pool that feeds it."""
+    provider = normalize_provider(provider)
+    out: list[str] = []
     try:
         from backend.key_pool import key_pool
 
-        pooled = [k for k in key_pool.get_raw_keys("gemini") if k and k.strip()]
-        if pooled:
-            return pooled[0].strip(), "pool"
+        for pool in _PROVIDER_POOLS[provider]:
+            for key in key_pool.get_raw_keys(pool):
+                value = (key or "").strip()
+                if value and value not in out:
+                    out.append(value)
     except Exception:  # noqa: BLE001 - the pool is optional here
-        pass
-    return None, "none"
+        return out
+    return out
+
+
+def resolved_keys(provider: str) -> tuple[list[str], str]:
+    """Every key the child will be handed for a provider, in the order it will
+    try them, plus where the FIRST one comes from: ``env`` | ``file`` |
+    ``pool`` | ``none`` (the source labels the UI has always shown)."""
+    provider = normalize_provider(provider)
+    env = env_keys(provider)
+    stored = stored_keys(provider)
+    pooled = pooled_keys(provider)
+    ordered: list[str] = []
+    for key in (*env, *stored, *pooled):
+        if key not in ordered:
+            ordered.append(key)
+    if env:
+        source = "env"
+    elif stored:
+        source = "file"
+    elif pooled:
+        source = "pool"
+    else:
+        source = "none"
+    return ordered, source
+
+
+def provider_key(provider: str) -> tuple[Optional[str], str]:
+    """The first key the child will try for a provider, and its source."""
+    keys, source = resolved_keys(provider)
+    return (keys[0] if keys else None), source
+
+
+def gemini_key() -> tuple[Optional[str], str]:
+    """The first GEMINI_API_KEY the child will get, and where it comes from:
+    ``env`` | ``file`` | ``pool`` | ``none``. Kept as-is (name and shape)
+    because probe(), the storage provider-status block and GET /api/lyria/key
+    are all built on it."""
+    return provider_key("gemini")
+
+
+def openrouter_key() -> tuple[Optional[str], str]:
+    """gemini_key()'s OpenRouter counterpart. OpenRouter matters because
+    Google's free tier grants zero Lyria requests per day, so it is often the
+    only provider that can actually generate."""
+    return provider_key("openrouter")
+
+
+def provider_preference() -> Optional[str]:
+    """The provider the user picked for the child, or None for "let Lyria
+    decide"."""
+    return _read_store()["provider_preference"]
+
+
+def set_provider_preference(provider: Optional[str]) -> Optional[str]:
+    """Store the provider preference. An empty/None value clears it, which
+    hands the choice back to the key-count rule and then to the child's own
+    default. Returns the stored value."""
+    value = (
+        None
+        if provider is None or not str(provider).strip()
+        else (normalize_provider(str(provider)))
+    )
+    with _key_file_lock:
+        store = _read_store()
+        store["provider_preference"] = value
+        _write_store(store)
+    log.info("lyria.sidecar: provider preference set to %s", value or "auto")
+    return value
+
+
+def add_key(provider: str, key: str) -> int:
+    """Append a key to a provider's stored list (no-op when already present).
+    Returns the new stored count. The value itself is never logged."""
+    provider = normalize_provider(provider)
+    value = (key or "").strip()
+    if not value:
+        raise ValueError("An empty value is not a key.")
+    with _key_file_lock:
+        store = _read_store()
+        keys = store["providers"][provider]
+        if value not in keys:
+            keys.append(value)
+        _write_store(store)
+        count = len(keys)
+    log.info("lyria.sidecar: %s key stored (%d saved here)", provider, count)
+    return count
+
+
+def remove_key(provider: str, index: int) -> bool:
+    """Forget the stored key at ``index`` (position in the stored list only --
+    environment and pooled keys are not ours to remove). False when the index
+    is out of range."""
+    provider = normalize_provider(provider)
+    with _key_file_lock:
+        store = _read_store()
+        keys = store["providers"][provider]
+        if not isinstance(index, int) or index < 0 or index >= len(keys):
+            return False
+        keys.pop(index)
+        _write_store(store)
+        count = len(keys)
+    log.info("lyria.sidecar: %s key #%d forgotten (%d left)", provider, index, count)
+    return True
+
+
+def key_summary() -> dict:
+    """Counts and sources only -- never a key value, not even a prefix.
+
+    ``count`` is what the child is handed (de-duplicated across sources), so
+    it can be smaller than ``env + stored + pool`` when the same key reaches
+    us twice. ``stored`` is the length of the removable list, which is what
+    DELETE /api/lyria/keys indexes into.
+    """
+    providers: dict[str, dict] = {}
+    for provider in LYRIA_PROVIDERS:
+        keys, source = resolved_keys(provider)
+        providers[provider] = {
+            "count": len(keys),
+            "source": source,
+            "configured": bool(keys),
+            "env": len(env_keys(provider)),
+            "stored": len(stored_keys(provider)),
+            "pool": len(pooled_keys(provider)),
+        }
+    return {
+        "providers": providers,
+        "provider_preference": provider_preference(),
+        "mock": is_mock(),
+    }
 
 
 def set_gemini_key(key: str) -> None:
-    _GEMINI_KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _GEMINI_KEY_FILE.write_text(json.dumps({"key": key.strip()}), encoding="utf-8")
-    log.info("lyria.sidecar: GEMINI_API_KEY stored (%s)", _GEMINI_KEY_FILE.name)
+    """Compatibility wrapper for POST /api/lyria/key: appends to the Gemini
+    list rather than replacing it, so an older client adding a second key
+    gains a fallback instead of throwing the first one away."""
+    add_key("gemini", key)
 
 
 def clear_gemini_key() -> bool:
-    try:
-        _GEMINI_KEY_FILE.unlink()
-        return True
-    except FileNotFoundError:
-        return False
+    """Compatibility wrapper for DELETE /api/lyria/key: forgets every Gemini
+    key stored here (the OpenRouter list and the preference are untouched).
+    True when something was actually removed."""
+    with _key_file_lock:
+        store = _read_store()
+        had = bool(store["providers"]["gemini"])
+        if had:
+            store["providers"]["gemini"] = []
+            _write_store(store)
+    if had:
+        log.info("lyria.sidecar: stored Gemini keys forgotten")
+    return had
 
 
 def _port_is_listening(port: int, host: str = "127.0.0.1") -> bool:
@@ -466,6 +790,12 @@ def probe() -> dict:
     offer the matching fix; ``issues`` keeps the human sentences. A missing key
     is only an *issue* in live mode: mock mode (the default) spends nothing and
     needs no key, and Lyria's own Settings modal also accepts one at runtime.
+
+    "Missing key" means BOTH providers are empty. Either one on its own can
+    generate -- and an OpenRouter key is the one that reliably can, since
+    Google's free tier grants zero Lyria requests per day -- so reporting a
+    Gemini-shaped problem to someone who deliberately runs on OpenRouter would
+    be a false alarm.
     """
     cfg = resolve_config()
     pkg = cfg.project_path
@@ -473,7 +803,12 @@ def probe() -> dict:
     git = _git_path()
     npm = _npm_path()
     node = _node_path()
-    key, key_source = gemini_key()
+    # One resolve per provider (each reads the key file and the pool), with the
+    # first key and its source taken from the same list the child would get.
+    gemini_list, key_source = resolved_keys("gemini")
+    openrouter_list, or_key_source = resolved_keys("openrouter")
+    key = gemini_list[0] if gemini_list else None
+    or_key = openrouter_list[0] if openrouter_list else None
     deps_installed = (pkg / "node_modules").is_dir()
     install = install_status()
     installing = install.get("status") in ("cloning", "installing")
@@ -506,11 +841,12 @@ def probe() -> dict:
     if not npm or not node:
         missing.append("node")
         issues.append("Node.js (node + npm) is not installed.")
-    if not key:
+    if not key and not or_key:
         missing.append("key")
         if not cfg.mock:
             issues.append(
-                "GEMINI_API_KEY is not set: live mode cannot generate without it."
+                "No Gemini or OpenRouter key is set: live mode cannot generate "
+                "without one."
             )
     # A TCP listener on the port isn't enough -- confirm it actually answers
     # as our Lyria sidecar before reporting "listening" (INT-001). A listener
@@ -542,6 +878,12 @@ def probe() -> dict:
         "node": bool(node),
         "gemini_key": bool(key),
         "gemini_key_source": key_source,
+        "openrouter_key": bool(or_key),
+        "openrouter_key_source": or_key_source,
+        # Counts, never values: how many keys the child would be handed.
+        "gemini_keys": len(gemini_list),
+        "openrouter_keys": len(openrouter_list),
+        "provider_preference": provider_preference(),
         "listening": listening,
         "process_alive": _proc is not None and _proc.poll() is None,
         "url": _resolved_url or f"http://127.0.0.1:{cfg.port}",

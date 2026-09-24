@@ -242,3 +242,16 @@ import {
 }
 
 console.log('catalogProviders: one id, one label, one AI flag');
+
+// ── Lyria: badged from the model alone, even under a Google model id ─────────
+{
+  assert.equal(inferProvider({ model: 'lyria', source: 'generate' }), 'lyria');
+  assert.equal(
+    inferProvider({ model: 'google/lyria-3-pro-preview', source: 'generate' }),
+    'lyria',
+    'a Google-prefixed Lyria id is Lyria, not Magenta',
+  );
+  assert.equal(inferProvider({ model: 'gemini-magenta-rt', source: 'generate' }), 'gemini-magenta');
+  assert.equal(entryProviderIsAi({ model: 'lyria', source: 'generate' }), true);
+  assert.ok(DEFAULT_PROVIDER_ORDER.includes('lyria'), 'lyria is offered in the default filter list');
+}

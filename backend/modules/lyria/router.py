@@ -18,8 +18,28 @@ git command:
                            background; output goes to the sidecar log
     GET  /install/status   poll the install
     GET  /key              is a GEMINI_API_KEY known, and from where
-    POST /key {key}        store the key theDAW hands the sidecar
-    DELETE /key            forget the stored key
+    POST /key {key}        append a Gemini key theDAW hands the sidecar
+    DELETE /key            forget the stored Gemini keys
+    GET  /keys             per-provider COUNTS and sources (never values)
+    POST /keys {provider,key}     append a key for that provider
+    DELETE /keys {provider,index} forget the stored key at that position
+    POST /keys/provider {provider}  gemini | openrouter | "" for auto
+
+The /key trio is the original single-Gemini surface, kept working: POST now
+appends rather than replaces, because the embedded app tries the keys in order
+and skips a rejected one, so a second key is a fallback and not a correction.
+
+Every route that changes keys stops a running sidecar, so the next open hands
+the child the new environment -- the child reads its keys from the environment
+at spawn, not per request.
+
+No response body here ever carries key material.
+
+INT-002 adds two routes at the bottom of this file that DO reach into the
+sidecar -- over its loopback origin only, and for its own generation listing:
+
+    POST /import-new       register new sidecar generations as library entries
+    GET  /imports          seen-map counts (which generations are already in)
 """
 
 from __future__ import annotations
@@ -31,7 +51,7 @@ import threading
 
 from fastapi import APIRouter, Body, HTTPException
 
-from . import sidecar
+from . import importer, sidecar
 
 log = logging.getLogger(__name__)
 
@@ -172,8 +192,8 @@ async def key_status() -> dict:
 
 @router.post("/key")
 async def set_key(key: str = Body(..., embed=True)) -> dict:
-    """Store the key. A running sidecar is stopped so the next open hands it
-    the new key (the child reads GEMINI_API_KEY from its environment)."""
+    """Append a Gemini key. A running sidecar is stopped so the next open hands
+    it the new environment (the child reads GEMINI_API_KEY at spawn)."""
     value = (key or "").strip()
     if len(value) < 8:
         raise HTTPException(
@@ -197,3 +217,103 @@ async def clear_key() -> dict:
     removed = sidecar.clear_gemini_key()
     key, source = sidecar.gemini_key()
     return {"ok": True, "removed": removed, "configured": bool(key), "source": source}
+
+
+# ── per-provider ordered key lists ───────────────────────────────────────────
+#
+# The embedded app takes an ordered list per provider and skips a rejected key
+# (its server/keys.ts), so theDAW stores lists, not single keys. These routes
+# report COUNTS and SOURCES only: a list UI has no use for the values, and a
+# response body is the easiest place to leak one.
+
+
+def _bad_provider(e: ValueError) -> HTTPException:
+    return HTTPException(status_code=400, detail=str(e))
+
+
+async def _stopped_summary() -> dict:
+    """Stop a running sidecar (so the next open gets the new environment) and
+    return the fresh key summary. Same contract as POST /key."""
+    # stop() can taskkill+wait(5)+kill+wait(5) -- up to ~10s -- off the loop.
+    restarted = await asyncio.to_thread(sidecar.stop)
+    summary = await asyncio.to_thread(sidecar.key_summary)
+    return {"ok": True, "restarted": restarted, **summary}
+
+
+@router.get("/keys")
+async def keys_status() -> dict:
+    """Per-provider counts and sources. Never key values."""
+    return await asyncio.to_thread(sidecar.key_summary)
+
+
+@router.post("/keys")
+async def add_provider_key(
+    provider: str = Body(..., embed=True), key: str = Body(..., embed=True)
+) -> dict:
+    """Append a key to one provider's ordered list."""
+    value = (key or "").strip()
+    if len(value) < 8:
+        raise HTTPException(
+            status_code=400, detail="That does not look like an API key."
+        )
+    try:
+        await asyncio.to_thread(sidecar.add_key, provider, value)
+    except ValueError as e:
+        raise _bad_provider(e) from e
+    return await _stopped_summary()
+
+
+@router.delete("/keys")
+async def remove_provider_key(
+    provider: str = Body(..., embed=True), index: int = Body(..., embed=True)
+) -> dict:
+    """Forget the stored key at ``index``. Positions index the STORED list
+    only -- keys that come from the environment or the assistant's pool are
+    not theDAW's to remove, and are removed where they were set."""
+    try:
+        removed = await asyncio.to_thread(sidecar.remove_key, provider, index)
+    except ValueError as e:
+        raise _bad_provider(e) from e
+    if not removed:
+        raise HTTPException(
+            status_code=404, detail=f"No stored key at position {index}."
+        )
+    return await _stopped_summary()
+
+
+@router.post("/keys/provider")
+async def set_key_provider(provider: str | None = Body(None, embed=True)) -> dict:
+    """Set the provider the child should default to. An empty value clears the
+    preference, which hands the choice back to the keys (and then to the
+    child's own default when both providers are available)."""
+    try:
+        await asyncio.to_thread(sidecar.set_provider_preference, provider)
+    except ValueError as e:
+        raise _bad_provider(e) from e
+    return await _stopped_summary()
+
+
+# ── INT-002: the sidecar's generations, as first-class library entries ───────
+#
+# The embedded app keeps its own library; these two routes are what makes a
+# track generated in the panel a theDAW entry (catalog, lineage, EDIT, stems,
+# export). The work itself lives in importer.py -- see its module docstring for
+# the loopback-only download rule and the seen map.
+
+
+@router.post("/import-new")
+async def import_new(include_mock: bool = Body(False, embed=True)) -> dict:
+    """Import every sidecar generation the library does not have yet.
+
+    Body is optional; ``{"include_mock": true}`` opts in to the locally
+    synthesized mock audio the sidecar produces in its default cost-safe mode.
+    Never raises for a stopped sidecar -- that answers with a ``reason``.
+    """
+    return await importer.sync_generations(include_mock=bool(include_mock))
+
+
+@router.get("/imports")
+async def imports() -> dict:
+    """Counts and ids from the seen map. Never audio, never a prompt."""
+    # Reads a file off disk -- off the loop, consistent with the rest here.
+    return await asyncio.to_thread(importer.imports_summary)
