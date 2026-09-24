@@ -520,7 +520,7 @@ def test_the_web_launcher_starts_the_listener_on_a_thread_of_its_own() -> None:
     ), body
     assert "_start_lan_listener(children" not in body, "nothing calls it inline"
     # After the http dev server, so the two lines read in the order they happen.
-    assert body.index('_spawn("npm run dev"') < body.index("_start_lan_listener")
+    assert body.index("_spawn(_frontend_command(") < body.index("_start_lan_listener")
 
 
 def test_a_listener_that_arrives_during_shutdown_is_killed_by_its_own_thread(

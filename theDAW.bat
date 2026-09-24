@@ -159,16 +159,15 @@ endlocal
 :: failure to the steps below.
 ver >nul
 
-:: -- Kill any stale processes on our ports ------------------------------
-:: ONE netstat pass, not one per port. netstat enumerates the whole TCP table
-:: every time it runs, so five sequential calls cost five full enumerations
-:: (~0.45s here) before the launch can even begin. findstr takes the port list
-:: in a single regex instead. The fixed `timeout /t 1` that followed is gone
-:: too: taskkill /F is synchronous, so the ports are already free when it
-:: returns and the extra second bought nothing.
-:: Each /c: pattern keeps its TRAILING SPACE, so ":5173 " matches only port
-:: 5173 and never an ephemeral port like 51730 that merely starts with it.
-for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr "LISTENING" ^| findstr /c:":5173 " /c:":5443 " /c:":8600 " /c:":5187 " /c:":5188 " /c:":5472 "') do taskkill /F /PID %%a >nul 2>&1
+:: -- Stop theDAW's OWN stale listeners -- and nothing else -------------
+:: backend.ports --free stops a listener ONLY when its command line or working
+:: directory is inside THIS checkout: the PID is revalidated just before the
+:: signal, and a backend is asked to shut down cleanly first. Any other
+:: program on these ports -- another project's Vite, another Electron app's
+:: server -- is LEFT ALONE and named in the log. This used to be a blind
+:: netstat ^| taskkill that killed whatever held the port.
+:: Without the venv nothing of ours can be running from this checkout.
+if exist ".venv\Scripts\python.exe" ".venv\Scripts\python.exe" -m backend.ports --free --all-ports
 
 :: -- Read the saved launch mode (web | desktop) from data\settings.json -
 :: Set in-app via Settings -> Startup. Defaults to web if unset/missing.

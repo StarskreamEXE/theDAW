@@ -100,15 +100,15 @@ fi
 # never builds, downloads, or exits, so Linux/macOS launches continue normally.
 say "live VST host: not available on this platform"
 
-# -- Kill any stale listeners on our ports -----------------------------------
-for port in 5173 5443 8600 5187 5188 5472; do
-  if command -v fuser >/dev/null 2>&1; then
-    fuser -k "${port}/tcp" >/dev/null 2>&1 || true
-  elif command -v lsof >/dev/null 2>&1; then
-    pids="$(lsof -ti tcp:"$port" -sTCP:LISTEN 2>/dev/null || true)"
-    [ -n "$pids" ] && kill -9 $pids >/dev/null 2>&1 || true
-  fi
-done
+# -- Stop theDAW's OWN stale listeners -- and nothing else ---------------------
+# backend.ports --free stops a listener ONLY when its command line or working
+# directory is inside THIS checkout (PID revalidated, a backend asked to shut
+# down cleanly first). Any other program on these ports is LEFT ALONE and named
+# in the log; this used to be fuser -k / kill -9 on whatever held the port.
+# Without the venv nothing of ours can be running from this checkout.
+if [ -x ".venv/bin/python" ]; then
+  .venv/bin/python -m backend.ports --free --all-ports || true
+fi
 
 # -- Launch mode ---------------------------------------------------------------
 # theDAW.bat honours Settings -> Startup (web | desktop). There is no Linux

@@ -43,20 +43,55 @@ def unused_port() -> int:
 # --------------------------------------------------------------------------
 
 
-def test_the_windows_launcher_clears_exactly_this_table():
-    """Read theDAW.bat rather than restating the numbers. A test that compares
-    one hard-coded tuple against another cannot notice the launcher drifting."""
-    bat = (REPO_ROOT / "theDAW.bat").read_text(encoding="utf-8", errors="replace")
-    found = tuple(int(p) for p in re.findall(r'/c:":(\d+) "', bat))
-    assert found == ports.ALL_PORTS
+#: Every shipped launcher that clears theDAW's ports before starting it.
+_LAUNCHERS = ("theDAW.bat", "theDAW-desktop.bat", "theDAW.sh")
+
+#: What a launcher must never run again. Each one kills WHATEVER holds a port:
+#: another project's Vite on 5173, another Electron app's server. The launchers
+#: go through ``backend.ports --free`` instead, which stops only processes
+#: running from this checkout.
+_BLIND_KILLS = (
+    re.compile(r"do\s+taskkill\b[^\n]*%%a", re.IGNORECASE),  # netstat | taskkill
+    re.compile(r"\bfuser\s+-k\b"),
+    re.compile(r"\bkill\s+-9\s+\$pids\b"),
+    re.compile(r"taskkill\b[^\n]*/IM\s", re.IGNORECASE),  # kill by image name
+    re.compile(r"Stop-Process\b[^\n]*-Name\b", re.IGNORECASE),
+)
 
 
-def test_the_posix_launcher_clears_exactly_this_table():
-    sh = (REPO_ROOT / "theDAW.sh").read_text(encoding="utf-8", errors="replace")
-    match = re.search(r"for port in ([\d ]+); do", sh)
-    assert match, "theDAW.sh no longer has the port loop this test reads"
-    found = tuple(int(p) for p in match.group(1).split())
-    assert found == ports.ALL_PORTS
+def _launcher(name: str) -> str:
+    return (REPO_ROOT / name).read_text(encoding="utf-8", errors="replace")
+
+
+def _code_lines(text: str) -> str:
+    """The launcher without its comment lines, so the comments that DESCRIBE
+    the old pipeline cannot trip the check that it is gone."""
+    kept = [
+        line
+        for line in text.splitlines()
+        if not line.lstrip().startswith(("::", "rem ", "REM ", "#"))
+    ]
+    return "\n".join(kept)
+
+
+@pytest.mark.parametrize("name", _LAUNCHERS)
+def test_every_launcher_frees_ports_through_the_ownership_check(name: str):
+    """The table in backend.ports is the single source of truth, and the
+    launchers now use it directly: ``--all-ports`` is ALL_PORTS by construction,
+    so there is no second list in a launcher to drift from it."""
+    code = _code_lines(_launcher(name))
+    assert "-m backend.ports --free --all-ports" in code, (
+        f"{name} no longer clears its ports through backend.ports --free"
+    )
+
+
+@pytest.mark.parametrize("name", _LAUNCHERS)
+def test_no_launcher_kills_a_process_it_did_not_identify_as_ours(name: str):
+    code = _code_lines(_launcher(name))
+    hits = [rx.pattern for rx in _BLIND_KILLS if rx.search(code)]
+    assert not hits, (
+        f"{name} kills processes without checking they are theDAW's: {hits}"
+    )
 
 
 def test_the_lan_https_listener_has_a_port_in_the_table():

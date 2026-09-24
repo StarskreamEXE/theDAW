@@ -70,16 +70,17 @@ if not exist "VST-Foundry-UI\VST-UI-FOUNDRY\node_modules" (
     popd
 )
 
-:: -- Kill any stale processes on our ports ------------------------------
-:: Critical for desktop mode: the Electron shell reuses an already-running
-:: backend on :8600 instead of spawning a fresh one. Killing it forces a fresh,
-:: SUPERVISED backend that loads every module (and makes the in-app Restart
-:: button work again).
-for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":8600 " ^| findstr "LISTENING"') do taskkill /F /PID %%a >nul 2>&1
-for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":5173 " ^| findstr "LISTENING"') do taskkill /F /PID %%a >nul 2>&1
-for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":5187 " ^| findstr "LISTENING"') do taskkill /F /PID %%a >nul 2>&1
-for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":5472 " ^| findstr "LISTENING"') do taskkill /F /PID %%a >nul 2>&1
-timeout /t 1 /nobreak >nul
+:: -- Stop theDAW's OWN stale listeners -- and nothing else -------------
+:: backend.ports --free stops a listener ONLY when its command line or working
+:: directory is inside THIS checkout: the PID is revalidated just before the
+:: signal, and a backend is asked to shut down cleanly first. Any other
+:: program on these ports -- another project's Vite, another Electron app's
+:: server -- is LEFT ALONE and named in the log. This used to be a blind
+:: netstat ^| taskkill that killed whatever held the port.
+:: Desktop mode needs this: the Electron shell reuses a running backend on
+:: :8600, so a stale one of OURS is stopped to get a fresh, supervised one.
+:: Without the venv nothing of ours can be running from this checkout.
+if exist ".venv\Scripts\python.exe" ".venv\Scripts\python.exe" -m backend.ports --free --all-ports
 
 echo.
 echo Launch mode: DESKTOP ^(Electron^)  -  dedicated launcher

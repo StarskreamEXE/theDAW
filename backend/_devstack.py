@@ -34,7 +34,12 @@ from backend._update_sync import UPDATE_EXIT_CODE, run_dependency_sync
 from backend.lib import lan_https, launch_token
 
 RESTART_EXIT_CODE = 88
-FRONTEND_URL = "http://localhost:5173"
+FRONTEND_URL = f"http://localhost:{ports.FRONTEND_PORT}"
+#: The port the web UI actually binds this launch. ports.FRONTEND_PORT unless
+#: another program already holds it; see _choose_frontend_port.
+_frontend_port = ports.FRONTEND_PORT
+#: How far past ports.FRONTEND_PORT to look for a free one.
+_FRONTEND_PORT_SEARCH = 26
 IS_WINDOWS = os.name == "nt"
 
 # One ANSI color per stream so the merged feed stays readable. Blanked at
@@ -387,6 +392,47 @@ def _port_open(host: str, port: int) -> bool:
         return False
 
 
+def _choose_frontend_port() -> int:
+    """The port the web UI binds: ports.FRONTEND_PORT, unless another program has it.
+
+    The launchers stop only theDAW's own stale listeners (backend.ports --free),
+    so anything still on the port by now belongs to another program -- on this
+    kind of machine, often another project's Vite on 5173. That program is left
+    running and theDAW takes the next free port instead, skipping the ports
+    theDAW itself reserves. If the whole range is taken, the preferred port is
+    returned and Vite's own strictPort error says so.
+    """
+    preferred = ports.FRONTEND_PORT
+    if ports.is_port_free(preferred):
+        return preferred
+    for candidate in range(preferred + 1, preferred + 1 + _FRONTEND_PORT_SEARCH):
+        if candidate in ports.ALL_PORTS:
+            continue
+        if ports.is_port_free(candidate):
+            return candidate
+    return preferred
+
+
+def _use_frontend_port(port: int) -> None:
+    """Point everything that names the web UI's address at ``port``."""
+    global _frontend_port, FRONTEND_URL
+    _frontend_port = port
+    FRONTEND_URL = f"http://localhost:{port}"
+
+
+def _frontend_command(port: int) -> str:
+    """How to start the web UI's Vite on ``port``.
+
+    The preferred port keeps ``npm run dev`` exactly as before. Any other port
+    runs the frontend's own Vite with an explicit ``--port``: the dev script
+    already passes ``--port=5173``, and a second ``--port`` appended through
+    ``npm run dev --`` reaches Vite as a list rather than a number.
+    """
+    if port == ports.FRONTEND_PORT:
+        return "npm run dev"
+    return f"npx --no-install vite --port={port} --host=0.0.0.0"
+
+
 def _wait_then_open_browser() -> None:
     """Send the browser to the holding page right away, then report readiness.
 
@@ -398,7 +444,7 @@ def _wait_then_open_browser() -> None:
     _open_browser()
     deadline = time.time() + 60.0
     while not _shutdown.is_set() and time.time() < deadline:
-        if _port_open("127.0.0.1", 5173):
+        if _port_open("127.0.0.1", _frontend_port):
             _emit("stack", f"frontend ready at {FRONTEND_URL}")
             return
         time.sleep(0.05)
@@ -466,7 +512,16 @@ def main() -> int:
     # Frontend (Vite). ENABLE_HMR mirrors the previous launcher behavior.
     fe_env = os.environ.copy()
     fe_env["ENABLE_HMR"] = "true"
-    frontend = _spawn("npm run dev", cwd=frontend_dir, env=fe_env)
+    port = _choose_frontend_port()
+    if port != ports.FRONTEND_PORT:
+        who = ports.describe_occupant(ports.FRONTEND_PORT) or "another program"
+        _emit(
+            "stack",
+            f"port {ports.FRONTEND_PORT} is in use and left running ({who}); "
+            f"the web UI takes :{port} instead",
+        )
+    _use_frontend_port(port)
+    frontend = _spawn(_frontend_command(port), cwd=frontend_dir, env=fe_env)
     children.append(frontend)
     threading.Thread(target=_pump, args=("frontend", frontend), daemon=True).start()
 
@@ -486,7 +541,9 @@ def main() -> int:
 
     # Tunnel (optional) — only if localtunnel is installed.
     if shutil.which("lt"):
-        tunnel = _spawn("lt --port 5173 --subdomain thedaw --print-requests")
+        tunnel = _spawn(
+            f"lt --port {_frontend_port} --subdomain thedaw --print-requests"
+        )
         children.append(tunnel)
         threading.Thread(target=_pump, args=("tunnel", tunnel), daemon=True).start()
     else:
