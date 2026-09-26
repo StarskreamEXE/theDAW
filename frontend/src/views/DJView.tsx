@@ -101,6 +101,16 @@ const AUTOMIX_RESCUE_XFADE = 1; // s — dead-air rescue: the outgoing deck is a
 /** Pitch (%) past which a beatmatch needs key-lock. ~3 % is half a semitone;
  *  beyond that a "harmonic" Camelot pair audibly is not one any more. */
 const KEYLOCK_PITCH_PCT = 3;
+/** Which decks have a key-lock the SYNC paths engaged, and may therefore also
+ *  release. A lock the user set from the deck's own Key-Lock toggle is not
+ *  automix's to switch off the moment a beatmatch happens to need ≤3 % — so
+ *  only a deck flagged here is ever released automatically.
+ *
+ *  Module scope, not a `useRef`, because `useDeck` (which owns the user's
+ *  toggle handler) sits outside the DJView component — and because it mirrors
+ *  the lifetime of the thing it describes: djEngine's decks are module-level
+ *  too and outlive a DJView unmount, so the flag must not reset under them. */
+const autoKeylockRef: { current: Record<djEngine.DeckId, boolean> } = { current: { A: false, B: false } };
 /** How long the automix seed waits for the first track's analysis before
  *  starting it anyway (ms) — dead air is worse than an unmatched first bar. */
 const AUTOMIX_SEED_WAIT_MS = 3000;
@@ -852,7 +862,14 @@ function useDeck(deckId: djEngine.DeckId, entryId: string | null, hasTrack: bool
     loopActive, activeLoopBeats, slip, decoding, keylock,
     setHotcue, dropHotcue, toggleBeatLoop, rollDown, rollUp, beatJump,
     exitLoop: () => djEngine.exitLoop(deckId),
-    setKeylock: (on: boolean) => void djEngine.setDeckKeylock(deckId, on),
+    setKeylock: (on: boolean) => {
+      // The user just took ownership of this deck's key-lock, either way: a
+      // lock they engaged is theirs to keep, and one they released is not
+      // automix's to put back. Either way the sync paths stop managing it
+      // until they engage it again themselves.
+      autoKeylockRef.current[deckId] = false;
+      void djEngine.setDeckKeylock(deckId, on);
+    },
     setSlip: (on: boolean) => djEngine.setSlip(deckId, on),
   };
 }
@@ -1306,11 +1323,19 @@ export const DJView: React.FC = () => {
     djEngine.setDeckPitch(follower, pct);
     // Key-lock above a few percent: a 6 % pull is ~1 semitone of pitch shift,
     // which turns a "harmonic" Camelot match into a clash the listener hears.
-    // Written as a boolean, not an `if`: the old form only ever turned it ON,
-    // so a deck key-locked for one track stayed locked through every later
-    // match — including the 0 % ones an unreachable tempo now produces —
-    // carrying the previous track's formant processing with it.
-    void djEngine.setDeckKeylock(follower, Math.abs(pct) > KEYLOCK_PITCH_PCT);
+    // Released as well as engaged: the old form only ever turned it ON, so a
+    // deck key-locked for one track stayed locked through every later match —
+    // including the 0 % ones an unreachable tempo now produces — carrying the
+    // previous track's formant processing with it. But ONLY a lock this path
+    // engaged itself; a plain boolean write switched off the user's own.
+    const want = Math.abs(pct) > KEYLOCK_PITCH_PCT;
+    if (want) {
+      void djEngine.setDeckKeylock(follower, true);
+      autoKeylockRef.current[follower] = true;
+    } else if (autoKeylockRef.current[follower]) {
+      void djEngine.setDeckKeylock(follower, false);
+      autoKeylockRef.current[follower] = false;
+    }
     // Phase off the CONSTANT beatgrid, not the jittery raw beats — and read
     // both decks AFTER setDeckPitch, which re-anchors the follower's position
     // clock (the old code measured against a position captured before it).
@@ -1799,10 +1824,23 @@ export const DJView: React.FC = () => {
           setSyncLock(nxt);
           // Key-lock the follower when the match needed a real pull (fix 5).
           const followerPitch = djEngine.getStatus(nxt).pitchPct;
-          // Boolean, not an `if` — same reason as syncDeck above: an automix
-          // run that key-locked one follower left every later deck locked too,
-          // because nothing in either path ever turned it back off.
-          void djEngine.setDeckKeylock(nxt, Math.abs(followerPitch) > KEYLOCK_PITCH_PCT);
+          // Engage AND release — same reason as syncDeck above: an automix run
+          // that key-locked one follower left every later deck locked too,
+          // because nothing in either path ever turned it back off. Guarded by
+          // the same ownership flag, so a lock the user set by hand survives.
+          // This runs AFTER the seek→play→sync steps above because the pull it
+          // decides from is the one syncDeck just applied, and `sync` must stay
+          // the last step (dispatched before `play`, syncDeck's phase-align
+          // branch sees a not-yet-playing deck and never aligns). The window is
+          // the same few ms the pitch change itself already occupies.
+          const want = Math.abs(followerPitch) > KEYLOCK_PITCH_PCT;
+          if (want) {
+            void djEngine.setDeckKeylock(nxt, true);
+            autoKeylockRef.current[nxt] = true;
+          } else if (autoKeylockRef.current[nxt]) {
+            void djEngine.setDeckKeylock(nxt, false);
+            autoKeylockRef.current[nxt] = false;
+          }
           mix.fading = true; mix.fadeStart = now; mix.fadeFrom = djEngine.getCrossfade(); mix.fadeTo = nxt === 'B' ? 1 : -1;
           // Dead air: the outgoing deck is already silent, so a 10 s fade is
           // 10 s of a half-open fader. Get the incoming track up fast instead.

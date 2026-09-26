@@ -314,12 +314,12 @@ const {
   // fix 4/5 — honest messaging, and key-lock on a real pull.
   assert.ok(/NOT beatmatched/.test(sync), 'syncDeck says so when the pitch range cannot deliver the match');
   assert.ok(/mixing unmatched/.test(interval), 'the automix flash says so too');
-  // Both sites now write the boolean rather than only ever passing `true` —
-  // see the DJ-5 review block below, which pins the release half. The original
-  // intent is unchanged: key-lock is driven by the size of the pitch pull.
-  assert.ok(/setDeckKeylock\(nxt, Math\.abs\(followerPitch\) > KEYLOCK_PITCH_PCT\)/.test(interval),
-    'key-lock engages for the automix follower on a real pull');
-  assert.ok(/setDeckKeylock\(follower, Math\.abs\(pct\) > KEYLOCK_PITCH_PCT\)/.test(sync), 'and for a manual SYNC');
+  // Both sites engage key-lock on a real pull AND release it when the pull is
+  // gone — but only a lock they engaged themselves. The release half and the
+  // ownership flag are pinned in the DJ-5 review block below; the original
+  // intent here is unchanged: key-lock follows the size of the pitch pull.
+  assert.ok(/setDeckKeylock\(nxt, true\)/.test(interval), 'key-lock engages for the automix follower on a real pull');
+  assert.ok(/setDeckKeylock\(follower, true\)/.test(sync), 'and for a manual SYNC');
   assert.ok(/KEYLOCK_PITCH_PCT/.test(interval) && /KEYLOCK_PITCH_PCT/.test(sync), 'both off the same threshold');
 
   // fix 9 — phase comes off the constant beatgrid, never the raw beats.
@@ -508,12 +508,27 @@ const {
   // 2 — key-lock was engaged on a real pull and NEVER released, so a deck
   // that later matched at 0 % kept the formant processing from a previous
   // track. Both sync paths must write the boolean, not just the `true` case.
-  assert.ok(/setDeckKeylock\(follower, Math\.abs\(pct\) > KEYLOCK_PITCH_PCT\)/.test(sync),
-    'syncDeck sets key-lock to whether the pull warrants it, so 0 % releases it');
-  assert.ok(/setDeckKeylock\(nxt, Math\.abs\(followerPitch\) > KEYLOCK_PITCH_PCT\)/.test(interval),
-    'the automix post-play key-lock does the same for the incoming deck');
-  assert.ok(!/setDeckKeylock\((follower|nxt), true\)/.test(code(sync) + code(interval)),
-    'THE BUG: key-lock was only ever turned ON — nothing in either path ever turned it off');
+  assert.ok(/setDeckKeylock\(follower, false\)/.test(sync),
+    'syncDeck releases key-lock once the pull no longer warrants it');
+  assert.ok(/setDeckKeylock\(nxt, false\)/.test(interval),
+    'the automix post-play key-lock releases it too');
+  assert.ok(/const want = Math\.abs\(pct\) > KEYLOCK_PITCH_PCT/.test(sync)
+    && /const want = Math\.abs\(followerPitch\) > KEYLOCK_PITCH_PCT/.test(interval),
+    'THE BUG: key-lock was only ever turned ON — both sites now decide from the pull itself');
+
+  // 4 — …but a key-lock the USER engaged by hand is not automix's to release.
+  // Writing the bare boolean (the note-2 form) switched off a lock set from
+  // the deck's own Key-Lock toggle the moment a sync computed a ≤3 % pull.
+  // `autoKeylockRef` records which locks the sync paths own; everything else
+  // is left exactly as the user set it.
+  assert.ok(/autoKeylockRef\.current\[follower\]/.test(sync),
+    'syncDeck only releases a key-lock it engaged itself');
+  assert.ok(/autoKeylockRef\.current\[nxt\]/.test(interval),
+    'and the automix site only releases its own too');
+  const keylockToggle = src.slice(src.indexOf('setKeylock: (on: boolean)'), src.indexOf('setSlip: (on: boolean)'));
+  assert.ok(keylockToggle.length > 0 && keylockToggle.length < 600, 'found the deck Key-Lock toggle handler');
+  assert.ok(/autoKeylockRef\.current\[deckId\] = false/.test(keylockToggle),
+    'the user\'s own Key-Lock toggle hands the deck back — automix may no longer release that lock');
 
   // 3 — the swap asserted the incoming deck had started instead of reading
   // it. A play that never took (a buffer evicted, an engine refusal) would
