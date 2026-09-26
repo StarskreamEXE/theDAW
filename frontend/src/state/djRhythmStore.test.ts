@@ -14,7 +14,7 @@
 import assert from 'node:assert/strict';
 import { mock } from 'node:test';
 
-const { useDjRhythmStore } = await import('./djRhythmStore');
+const { useDjRhythmStore, invalidateRhythm, RHYTHM_MISS_TTL_MS } = await import('./djRhythmStore.ts');
 
 let passed = 0;
 const test = async (name: string, fn: () => Promise<void> | void) => {
@@ -106,11 +106,71 @@ await test('concurrent calls for one id share a single request', async () => {
   assert.deepEqual(c?.downbeats, [1]);
 });
 
+/** One bar exactly as `backend/modules/rhythm/engine.py` writes it: the bars
+ *  list is `list[dict]`, and the bar's start time is `start_sec`. A stub of
+ *  bare numbers here let a store that threw the whole list away look correct
+ *  — in production `bars` was always null. */
+const bar = (index: number, start: number, end: number) => ({
+  index,
+  segment: 0,
+  start_sec: start,
+  end_sec: end,
+  beats: 4,
+  time_signature: '4/4',
+  syncopation: { lhl: 0.1, wnbd: 0.2, offbeat_ratio: 0.3, onsets: 4, low_onsets: 2 },
+});
+
 await test('an explicit bars list is kept alongside downbeats', async () => {
-  stubFetch({ status: 'ready', downbeats: [1, 3], bars: [1, 3, 5] });
+  stubFetch({ status: 'ready', downbeats: [1, 3], bars: [bar(0, 1, 3), bar(1, 3, 5), bar(2, 5, 7)] });
   const got = await useDjRhythmStore.getState().ensureRhythm('e7');
   assert.deepEqual(got?.bars, [1, 3, 5]);
   assert.deepEqual(got?.downbeats, [1, 3]);
+});
+
+await test('a bar object with no usable start_sec is discarded, not read as 0', async () => {
+  stubFetch({
+    status: 'ready',
+    bars: [bar(0, 2, 4), { index: 1, segment: 0 }, { ...bar(2, 6, 8), start_sec: 'later' }, bar(3, 10, 12)],
+  });
+  const got = await useDjRhythmStore.getState().ensureRhythm('e14');
+  assert.deepEqual(got?.bars, [2, 10]);
+});
+
+await test('a MISS is re-checked after its window, not cached for the session', async () => {
+  stubFetch({ status: 'pending' });
+  await useDjRhythmStore.getState().ensureRhythm('e11');
+  assert.equal(calls.length, 1);
+  await useDjRhythmStore.getState().ensureRhythm('e11');
+  assert.equal(calls.length, 1, 'a fresh miss is not re-fetched');
+  // Age the miss past the window. The backend cache is on disk and anything
+  // else in the app (TrackInfo, the Rhythm block) can fill it mid-session —
+  // a deck loaded twenty minutes later must not still believe the miss.
+  const stale = { ...useDjRhythmStore.getState().byEntry.e11, checkedAt: Date.now() - RHYTHM_MISS_TTL_MS - 1 };
+  useDjRhythmStore.setState((s) => ({ byEntry: { ...s.byEntry, e11: stale } }), false);
+  stubFetch({ status: 'ready', downbeats: [1, 3] });
+  const got = await useDjRhythmStore.getState().ensureRhythm('e11');
+  assert.deepEqual(got?.downbeats, [1, 3], 'the stale miss was re-fetched');
+  assert.equal(calls.length, 1);
+});
+
+await test('invalidateRhythm sends the next call back to the network', async () => {
+  stubFetch({ status: 'ready', downbeats: [2] });
+  await useDjRhythmStore.getState().ensureRhythm('e12');
+  assert.equal(calls.length, 1);
+  invalidateRhythm('e12');
+  assert.equal(useDjRhythmStore.getState().rhythmFor('e12'), null, 'the entry was forgotten');
+  await useDjRhythmStore.getState().ensureRhythm('e12');
+  assert.equal(calls.length, 2);
+});
+
+await test('invalidateRhythm on an unknown id changes nothing', async () => {
+  stubFetch({ status: 'ready', downbeats: [2] });
+  await useDjRhythmStore.getState().ensureRhythm('e13');
+  const before = useDjRhythmStore.getState().byEntry;
+  invalidateRhythm('nope');
+  invalidateRhythm('');
+  assert.deepEqual(useDjRhythmStore.getState().byEntry, before);
+  assert.equal(calls.length, 1);
 });
 
 await test('a ready payload with no downbeats reads as no data, not as []', async () => {

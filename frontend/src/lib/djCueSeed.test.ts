@@ -64,9 +64,37 @@ test('every cue lands inside the track', () => {
   const out = seedCues({ beats: beatsFrom(0, 80), bpm: BPM, duration: 40 });
   assert.ok(out);
   for (const t of out) {
+    if (t == null) continue;
     assert.ok(t >= 0, `${t} >= 0`);
     assert.ok(t < 40, `${t} < duration`);
   }
+});
+
+test('a phrase past the end is dropped, not clamped onto the last cue', () => {
+  // 40s at 120bpm: the 16-bar phrase (32s) fits; the 32- and 48-bar ones do
+  // not. Clamping them to `duration - beatLen` put cue 3 AND cue 4 on 39.5 —
+  // two pads seeking the same spot and two markers stacked on the waveform.
+  // A phrase the track does not reach has no cue.
+  const out = seedCues({ beats: beatsFrom(0, 80), bpm: BPM, duration: 40 });
+  assert.ok(out);
+  assert.equal(out[0], 0);
+  assert.equal(out[1], PHRASE);
+  assert.equal(out[2], null, `the 32-bar phrase is past the end: ${JSON.stringify(out)}`);
+  assert.equal(out[3], null, `the 48-bar phrase is past the end: ${JSON.stringify(out)}`);
+  const placed = out.filter((t): t is number => t != null);
+  assert.equal(new Set(placed).size, placed.length, `duplicate cues: ${JSON.stringify(out)}`);
+});
+
+test('a bar start the grid places past the end is dropped too', () => {
+  // The rhythm cache can carry a bar line at (or past) the very end of the
+  // file; it is not a legal seek target either.
+  // 49 bar starts, the last one 0.1s from the end of a 40s file — that is
+  // the one cue 4 reads (index 48 = the 48-bar phrase).
+  const bars = Array.from({ length: 49 }, (_, i) => (i === 48 ? 39.9 : i * 0.1));
+  const out = seedCues({ beats: beatsFrom(0, 80), bpm: BPM, duration: 40, bars });
+  assert.ok(out);
+  assert.equal(out[2], bars[32]);
+  assert.equal(out[3], null, JSON.stringify(out));
 });
 
 test('an unknown duration still seeds (nothing to clamp against)', () => {

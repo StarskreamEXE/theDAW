@@ -177,7 +177,11 @@ export type StartAutoDjIntent = 'start' | 'stop' | 'create-set' | 'pick-set' | '
 
 export interface StartAutoDjState {
   label: 'START AUTO DJ' | 'STOP AUTO DJ';
-  /** Can this press actually start (or stop) the mix? */
+  /** Does this press DO something? False only when the click cannot change
+   *  anything — that, and only that, is what `aria-disabled` may claim.
+   *  "No sets at all" is `true`: the press creates the set it is asking for,
+   *  and announcing a real mutation as unavailable is a lie to a screen
+   *  reader. `reason` still carries what is missing. */
   enabled: boolean;
   intent: StartAutoDjIntent;
   /** Exactly what is missing, for `title`. Null when nothing is. */
@@ -186,6 +190,40 @@ export interface StartAutoDjState {
 
 /** Automix needs two tracks to have anything to mix between. */
 export const AUTO_DJ_MIN_TRACKS = 2;
+
+/** The rows the automix sequencer can actually put on a deck: a registered
+ *  library id and nothing else. The one predicate behind both the effect's
+ *  `list.length < AUTO_DJ_MIN_TRACKS` bail-out and the counting below, so the
+ *  two can never drift. */
+export function djAutomixEntries(
+  entries: readonly SetlistEntry[] | null | undefined,
+): Array<SetlistEntry & { entryId: string }> {
+  return (entries ?? []).filter((e): e is SetlistEntry & { entryId: string } => !!e.entryId);
+}
+
+/** A bundled row with no id yet that `registerBundled` WILL fill in. An
+ *  ad-hoc/VJ row (it has a `url`) or a non-audio slot has no library entry
+ *  waiting for it and never will, so neither counts. */
+const isRegisterableBundledRow = (e: SetlistEntry): boolean =>
+  e.entryId === null && !e.url && e.kind === 'audio';
+
+/** How many tracks of a set the START button may offer to play: the rows
+ *  automix can sequence right now, plus — for a bundled set — the rows that
+ *  registering it turns into exactly those. A fresh bundled set lists every
+ *  track as `entryId: null` (GET /setlists is read-only; the entries are
+ *  created on register), so counting only registered ids would make a full
+ *  set look empty until somebody clicked it.
+ *
+ *  The gap this leaves is real and is the caller's job: while the rows are
+ *  still unregistered this count is ABOVE what `djAutomixEntries` finds, so
+ *  anything that starts the mix must register first. See `onStartAutoDj`. */
+export function djPlayableCount(
+  set: { bundled: boolean; entries: readonly SetlistEntry[] } | null | undefined,
+): number {
+  if (!set) return 0;
+  const pending = set.bundled ? set.entries.filter(isRegisterableBundledRow).length : 0;
+  return djAutomixEntries(set.entries).length + pending;
+}
 
 export function startAutoDjState(args: {
   /** How many setlists exist at all. */
@@ -204,7 +242,11 @@ export function startAutoDjState(args: {
   const blocked = (intent: StartAutoDjIntent, reason: string): StartAutoDjState => ({
     label: 'START AUTO DJ', enabled: false, intent, reason,
   });
-  if (args.setCount === 0) return blocked('create-set', 'Create a set first');
+  if (args.setCount === 0) {
+    // The press makes the set it is asking for, so it is an action, not a
+    // dead control: see `enabled` above.
+    return { label: 'START AUTO DJ', enabled: true, intent: 'create-set', reason: 'Create a set first' };
+  }
   if (!args.hasActiveSet) return blocked('pick-set', 'Pick a set below');
   if (args.playableCount < AUTO_DJ_MIN_TRACKS) {
     return blocked('add-tracks', `Add at least ${AUTO_DJ_MIN_TRACKS} tracks to this set`);
@@ -220,6 +262,17 @@ const START_AUTO_DJ_TITLE: Record<StartAutoDjIntent, string> = {
   'add-tracks': `Add at least ${AUTO_DJ_MIN_TRACKS} tracks to this set`,
 };
 
+/** The accessible name per intent. A blocked press carries its reason here
+ *  as well as in `title`: a screen reader announces the name and generally
+ *  drops the tooltip, so "Pick a set below" would otherwise never be heard. */
+const START_AUTO_DJ_ARIA: Record<StartAutoDjIntent, string> = {
+  start: 'Start Auto DJ',
+  stop: 'Stop Auto DJ',
+  'create-set': 'Create a set',
+  'pick-set': 'Start Auto DJ — pick a set below first',
+  'add-tracks': `Start Auto DJ — add at least ${AUTO_DJ_MIN_TRACKS} tracks to this set first`,
+};
+
 /** The one obvious way in. Lives in the DJ tab header, above the decks. */
 export const StartAutoDjButton: React.FC<{
   state: StartAutoDjState;
@@ -232,7 +285,7 @@ export const StartAutoDjButton: React.FC<{
       data-tour="dj-start"
       onClick={() => onActivate(state.intent)}
       aria-disabled={!state.enabled}
-      aria-label={running ? 'Stop Auto DJ' : 'Start Auto DJ'}
+      aria-label={START_AUTO_DJ_ARIA[state.intent]}
       title={START_AUTO_DJ_TITLE[state.intent]}
       className={`shrink-0 flex items-center gap-1.5 px-3 py-1 rounded-md border text-[11px] font-black uppercase tracking-[0.14em] transition-colors ${
         running
@@ -251,12 +304,14 @@ export const StartAutoDjButton: React.FC<{
 /** Shown over the decks while nothing is loaded and nothing is mixing. Three
  *  lines, no controls — it is a caption, not a wizard, and it disappears the
  *  moment a deck has a track. Rendered outside the ControlSurface so Design
- *  Mode never persists it as a widget. */
+ *  Mode never persists it as a widget.
+ *
+ *  NOT `aria-hidden`: these are the only start instructions in the tab, and
+ *  hiding them from the accessibility tree left a screen-reader user on an
+ *  empty DJ view with nothing to read. `pointer-events-none` is what stops
+ *  it swallowing clicks meant for the decks, and that is the whole job. */
 export const DjStartHint: React.FC = () => (
-  <div
-    className="pointer-events-none absolute inset-x-0 top-1/2 z-20 -translate-y-1/2 flex justify-center px-4"
-    aria-hidden="true"
-  >
+  <div className="pointer-events-none absolute inset-x-0 top-1/2 z-20 -translate-y-1/2 flex justify-center px-4">
     <div className="max-w-md rounded-lg border border-white/10 bg-black/70 px-4 py-3 text-[11px] font-mono leading-relaxed text-zinc-400 backdrop-blur-sm">
       <div data-dj-hint-line className="text-zinc-200 font-bold">1 · Pick a set in the list on the left</div>
       <div data-dj-hint-line>2 · Press START AUTO DJ above the decks</div>
@@ -313,7 +368,16 @@ export const DjSetRow: React.FC<{
           : !playable ? `Add at least ${AUTO_DJ_MIN_TRACKS} tracks to Auto-DJ this set`
             : `Auto-DJ "${name}" — load, beatmatch & crossfade the whole set hands-free`
       }
-      aria-label={`Play set ${name} with Auto-DJ`}
+      aria-label={
+        // The reason goes in the NAME, not only in `title`: a screen reader
+        // reads the accessible name and drops the tooltip, so a user who
+        // cannot see the dimmed ▶ was told nothing at all.
+        busy
+          ? `Play set ${name} with Auto-DJ — registering its tracks, please wait`
+          : !playable
+            ? `Play set ${name} with Auto-DJ — add at least ${AUTO_DJ_MIN_TRACKS} tracks first`
+            : `Play set ${name} with Auto-DJ`
+      }
       className={`shrink-0 p-0.5 rounded text-emerald-400 ${playable && !busy ? 'hover:text-emerald-200 hover:bg-emerald-500/15' : 'opacity-25'}`}
     >
       <Play className="w-3 h-3" />
@@ -1010,6 +1074,12 @@ export const DJView: React.FC = () => {
   const createSetlist = useSetlistStore((s) => s.create);
   const setActiveSetlist = useSetlistStore((s) => s.setActive);
   const importBundledSetlists = useSetlistStore((s) => s.importBundled);
+  // The header START button registers a bundled set before it starts it —
+  // see `onStartAutoDj`. The ref is that call's in-flight guard, the same job
+  // `registeringId` does for the Sets rows: two fast presses used to be two
+  // POSTs to /register.
+  const registerBundled = useSetlistStore((s) => s.registerBundled);
+  const startRegisterRef = useRef(false);
   const activeSet = activeId ? setlists[activeId] : null;
   useEffect(() => { void importBundledSetlists(); }, [importBundledSetlists]);
 
@@ -1410,10 +1480,13 @@ export const DJView: React.FC = () => {
   // over the existing engine (no new deps). Drives the real deck loaders + sync.
   useEffect(() => {
     if (!automixOn) { automixRef.current = null; useDjAutomix.getState().setNowPlaying(null); return; }
-    const seqEntries = (): SetlistEntry[] => {
+    const seqEntries = (): Array<SetlistEntry & { entryId: string }> => {
       const sl = useSetlistStore.getState();
       const set = sl.activeId ? sl.setlists[sl.activeId] : null;
-      return (set?.entries ?? []).filter((e): e is SetlistEntry & { entryId: string } => !!e.entryId);
+      // The same predicate the START button counts with, so what the header
+      // calls playable and what this effect can sequence can never disagree
+      // about a row. See `djPlayableCount`.
+      return djAutomixEntries(set?.entries);
     };
     const seq = (): string[] => seqEntries().map((e) => e.entryId as string);
     // Prepared-performance data for a track in the active set (undefined for
@@ -1421,7 +1494,7 @@ export const DJView: React.FC = () => {
     const perfOf = (entryId: string | null) =>
       entryId ? seqEntries().find((e) => e.entryId === entryId)?.perf : undefined;
     const list = seq();
-    if (list.length < 2) { setFlash('Automix needs an active set with ≥2 tracks'); setAutomixOn(false); return; }
+    if (list.length < AUTO_DJ_MIN_TRACKS) { setFlash(`Automix needs an active set with ≥${AUTO_DJ_MIN_TRACKS} tracks`); setAutomixOn(false); return; }
     const other = (d: djEngine.DeckId): djEngine.DeckId => (d === 'A' ? 'B' : 'A');
     const loadOnto = (d: djEngine.DeckId, entryId: string) => (d === 'A' ? setDeckATrack : setDeckBTrack)(entryId);
     const nextEntryIdAfter = (entryId: string | null): string | null => {
@@ -1513,25 +1586,50 @@ export const DJView: React.FC = () => {
 
   /* ── DJ-3: the header START AUTO DJ button ── */
   // Same count the Sets rows use: registered entries plus the bundled rows
-  // that opening the set will register.
-  const autoDjPlayable = activeSet
-    ? activeSet.entries.filter((e) => e.entryId).length
-      + (isBundledSetId(activeSet.id)
-        ? activeSet.entries.filter((e) => e.entryId === null && !e.url && e.kind === 'audio').length
-        : 0)
-    : 0;
+  // that opening the set will register. See `djPlayableCount`.
+  const autoDjPlayable = djPlayableCount(
+    activeSet ? { bundled: isBundledSetId(activeSet.id), entries: activeSet.entries } : null,
+  );
   const startAutoDj = startAutoDjState({
     setCount: Object.keys(setlists).length,
     hasActiveSet: !!activeSet,
     playableCount: autoDjPlayable,
     automixOn,
   });
-  const onStartAutoDj = (intent: StartAutoDjIntent) => {
+  const onStartAutoDj = async (intent: StartAutoDjIntent) => {
     switch (intent) {
       // Both go through the djAutomix bridge rather than `setAutomixOn`, so
       // the button inherits exactly what Send-to-DJ gets: eject both decks,
       // reset the crossfader to full Deck A, reseed from track 1.
-      case 'start': useDjAutomix.getState().requestStart(); break;
+      case 'start': {
+        // `autoDjPlayable` counts bundled rows that have no library entry
+        // yet, so the button offers to start a set the automix effect would
+        // find EMPTY (it sequences `entryId`s only) — it would bail on
+        // `< AUTO_DJ_MIN_TRACKS`, un-toggle itself and flash for 2.2s.
+        // Register first, exactly as the Sets row's ▶ does (see `openSet`):
+        // same order, same in-flight guard, same ProcessingLog warning.
+        if (activeSet && isBundledSetId(activeSet.id)
+            && activeSet.entries.some(isRegisterableBundledRow)) {
+          if (startRegisterRef.current) return;   // a register is already in flight
+          startRegisterRef.current = true;
+          try {
+            const registered = await registerBundled(activeSet.id);
+            if (registered === null) return;      // registerBundled already logged why
+            const playable = djAutomixEntries(registered).length;
+            if (playable < AUTO_DJ_MIN_TRACKS) {
+              logWarn(
+                'dj',
+                `"${activeSet.name}" has ${playable} playable track${playable === 1 ? '' : 's'} — Auto-DJ needs ${AUTO_DJ_MIN_TRACKS}.`,
+              );
+              return;
+            }
+          } finally {
+            startRegisterRef.current = false;
+          }
+        }
+        useDjAutomix.getState().requestStart();
+        break;
+      }
       case 'stop': useDjAutomix.getState().requestStop(); break;
       case 'create-set': {
         // The button said "Create a set first" — so make it, and put the
@@ -2937,7 +3035,7 @@ const SourceTree: React.FC<{ source: Source; setSource: (s: Source) => void; lib
     try {
       const registered = await registerBundled(id);
       if (registered === null) return; // registerBundled already logged why
-      const playable = registered.filter((e) => e.entryId).length;
+      const playable = djAutomixEntries(registered).length;
       if (!autoDj) return;
       if (playable < AUTO_DJ_MIN_TRACKS) {
         logWarn(
@@ -3078,10 +3176,8 @@ const SourceTree: React.FC<{ source: Source; setSource: (s: Source) => void; lib
           // without being clicked first. Only tracks that CAN be registered
           // count: an ad-hoc/VJ row (a `url`, or a non-audio slot) has no
           // entry waiting for it and never will.
-          const pending = isBundledSetId(s.id)
-            ? s.entries.filter((e) => e.entryId === null && !e.url && e.kind === 'audio').length
-            : 0;
-          const playable = s.entries.filter((e) => e.entryId).length + pending >= AUTO_DJ_MIN_TRACKS;
+          const playable =
+            djPlayableCount({ bundled: isBundledSetId(s.id), entries: s.entries }) >= AUTO_DJ_MIN_TRACKS;
           return (
             <DjSetRow
               key={s.id}

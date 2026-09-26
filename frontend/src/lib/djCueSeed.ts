@@ -30,8 +30,12 @@ export const CUE_PHRASE_BARS = 16;
  *  used for the tail of a short downbeat list. */
 export const CUE_BEATS_PER_BAR = 4;
 
-/** Hot cues seeded per track — matches `HOTCUE_SLOTS` in djCuesStore. */
-export type SeededCues = [number, number, number, number];
+/** Hot cues seeded per track — matches `HOTCUE_SLOTS` in djCuesStore.
+ *  A slot is `null` when the track is too short to reach that phrase: the
+ *  alternative is clamping it to the end, which puts two (or three) pads on
+ *  the same spot. `djCuesStore.seedCues` reads `null` as "leave that pad
+ *  empty". */
+export type SeededCues = [number | null, number | null, number | null, number | null];
 
 export interface SeedCuesArgs {
   /** Every beat position in seconds, from `djAnalysisStore` (`a.beats`). */
@@ -73,15 +77,19 @@ export function seedCues(args: SeedCuesArgs): SeededCues | null {
   // Keep the last cue a legal seek target: one beat short of the end, never
   // negative. `duration <= 0` means "unknown" — nothing to clamp against.
   const limit = duration > 0 ? Math.max(0, duration - beatLen) : Number.POSITIVE_INFINITY;
-  const clamp = (t: number): number => Math.max(0, Math.min(t, limit));
 
   const phraseSec = CUE_PHRASE_BARS * CUE_BEATS_PER_BAR * beatLen;
-  const at = (phrase: number): number => {
+  const at = (phrase: number): number | null => {
     // Real bar starts when the grid reaches that far; a short cached grid
     // (the rhythm engine stops at the last bar it was confident about) falls
     // back to measuring the phrase off the anchor.
     const fromGrid = grid?.[phrase * CUE_PHRASE_BARS];
-    return clamp(fromGrid ?? anchor + phrase * phraseSec);
+    const t = fromGrid ?? anchor + phrase * phraseSec;
+    // Past the end of the file there is no cue. Clamping to `limit` instead
+    // collapsed every phrase the track does not reach onto one time, so a
+    // 40-second track got two pads (and two waveform markers) on 39.5.
+    if (!Number.isFinite(t) || t > limit) return null;
+    return Math.max(0, t);
   };
 
   return [at(0), at(1), at(2), at(3)];

@@ -29,8 +29,14 @@ export interface DjRhythm {
   ready: boolean;
   /** Bar starts in seconds, or null when there are none to be had. */
   downbeats: number[] | null;
-  /** An explicit bar list, when the payload carries one separately. */
+  /** Bar start times in seconds, taken from the payload's `bars`. The engine
+   *  writes that as a list of objects (`{index, segment, start_sec, end_sec,
+   *  beats, time_signature, syncopation}` — see
+   *  `backend/modules/rhythm/engine.py`), so only `start_sec` is kept here. */
   bars: number[] | null;
+  /** When this entry was last asked about. Only set on a MISS, which is the
+   *  only result that is allowed to go stale. */
+  checkedAt?: number;
 }
 
 interface DjRhythmState {
@@ -45,14 +51,32 @@ interface DjRhythmState {
 /** In-flight requests, so three decks asking at once make one request. */
 const inflight = new Map<string, Promise<DjRhythm | null>>();
 
-/** Keep only finite, non-negative times; `null` when nothing survives. */
+/** Keep only finite, non-negative times; `null` when nothing survives.
+ *  Two shapes arrive here: `downbeats` is a flat list of seconds, while
+ *  `bars` is a list of bar OBJECTS carrying `start_sec` (see `DjRhythm.bars`
+ *  and `backend/modules/rhythm/engine.py`). Reading only numbers threw every
+ *  real bar away, so `bars` was null in production however good the cache. */
 function times(value: unknown): number[] | null {
   if (!Array.isArray(value)) return null;
-  const out = value.filter((t): t is number => typeof t === 'number' && Number.isFinite(t) && t >= 0);
+  const out: number[] = [];
+  for (const item of value) {
+    const t =
+      typeof item === 'number'
+        ? item
+        : (item as { start_sec?: unknown } | null)?.start_sec;
+    if (typeof t === 'number' && Number.isFinite(t) && t >= 0) out.push(t);
+  }
   return out.length > 0 ? out : null;
 }
 
-const MISS: DjRhythm = { ready: false, downbeats: null, bars: null };
+/** How long a miss (pending cache, 404, 500, offline) is believed before the
+ *  next deck load asks again. The backend cache lives on disk and anything
+ *  else in the app — TrackInfo, the Rhythm block, `lib/rhythmSeed` — can fill
+ *  it while the DJ tab is open, so remembering a miss for the whole session
+ *  meant a track analyzed two minutes ago still drew its grid off `i % 4`. */
+export const RHYTHM_MISS_TTL_MS = 30_000;
+
+const miss = (): DjRhythm => ({ ready: false, downbeats: null, bars: null, checkedAt: Date.now() });
 
 export const useDjRhythmStore = create<DjRhythmState>()((set, get) => ({
   byEntry: {},
@@ -60,7 +84,10 @@ export const useDjRhythmStore = create<DjRhythmState>()((set, get) => ({
   ensureRhythm: async (entryId) => {
     if (!entryId) return null;
     const known = get().byEntry[entryId];
-    if (known) return known.ready ? known : null;
+    // A ready result is final. A miss is only believed for its window: see
+    // RHYTHM_MISS_TTL_MS.
+    if (known?.ready) return known;
+    if (known && Date.now() - (known.checkedAt ?? 0) < RHYTHM_MISS_TTL_MS) return null;
     const pending = inflight.get(entryId);
     if (pending) return pending;
 
@@ -71,13 +98,13 @@ export const useDjRhythmStore = create<DjRhythmState>()((set, get) => ({
           // Remember the failure: a 404 (no such entry) or a 500 will not
           // start working on the next deck load, and retrying on every load
           // would be a request per track per reload.
-          set((s) => ({ byEntry: { ...s.byEntry, [entryId]: MISS } }));
+          set((s) => ({ byEntry: { ...s.byEntry, [entryId]: miss() } }));
           return null;
         }
         const body = (await res.json()) as { status?: string; downbeats?: unknown; bars?: unknown };
         // A cache miss stops here on purpose — see the header. No `/run`.
         if (body?.status !== 'ready') {
-          set((s) => ({ byEntry: { ...s.byEntry, [entryId]: MISS } }));
+          set((s) => ({ byEntry: { ...s.byEntry, [entryId]: miss() } }));
           return null;
         }
         const data: DjRhythm = {
@@ -90,7 +117,7 @@ export const useDjRhythmStore = create<DjRhythmState>()((set, get) => ({
       } catch {
         // Backend still warming, or offline. Same as a miss: the DJ path
         // has a working fallback and must never surface this.
-        set((s) => ({ byEntry: { ...s.byEntry, [entryId]: MISS } }));
+        set((s) => ({ byEntry: { ...s.byEntry, [entryId]: miss() } }));
         return null;
       } finally {
         inflight.delete(entryId);
@@ -100,3 +127,18 @@ export const useDjRhythmStore = create<DjRhythmState>()((set, get) => ({
     return run;
   },
 }));
+
+/** Forget what is known about one entry, so the next `ensureRhythm` asks the
+ *  backend again. For the caller that has just made the cache change — a
+ *  finished `/run` elsewhere in the app, or a re-analysis — and does not want
+ *  to wait out `RHYTHM_MISS_TTL_MS`. A no-op for an id nothing is known
+ *  about, so it is always safe to call. */
+export function invalidateRhythm(entryId: string): void {
+  if (!entryId) return;
+  useDjRhythmStore.setState((s) => {
+    if (!(entryId in s.byEntry)) return s;
+    const next = { ...s.byEntry };
+    delete next[entryId];
+    return { byEntry: next };
+  }, false);
+}

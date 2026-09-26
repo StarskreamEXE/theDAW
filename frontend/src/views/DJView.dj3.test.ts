@@ -47,12 +47,14 @@ g.localStorage = dom.window.localStorage;
 
 const React = (await import('react')).default;
 const { renderToStaticMarkup } = await import('react-dom/server');
-const { useDjCuesStore, HOTCUE_SLOTS } = await import('../state/djCuesStore');
+const { useDjCuesStore, HOTCUE_SLOTS } = await import('../state/djCuesStore.ts');
 
 delete g.window;
 
-const { startAutoDjState, StartAutoDjButton, DjStartHint, DjSetRow, beatMarkPositions } =
-  await import('./DJView');
+const {
+  startAutoDjState, StartAutoDjButton, DjStartHint, DjSetRow, beatMarkPositions,
+  djPlayableCount, djAutomixEntries, AUTO_DJ_MIN_TRACKS,
+} = await import('./DJView.tsx');
 
 let passed = 0;
 const test = (name: string, fn: () => void) => {
@@ -86,7 +88,10 @@ test('while running it offers to stop, and stays enabled', () => {
 
 test('no sets at all → "Create a set first", and the click creates one', () => {
   const s = startAutoDjState({ setCount: 0, hasActiveSet: false, playableCount: 0, automixOn: false });
-  assert.equal(s.enabled, false);
+  // The press makes the set the user is being told to make: a real mutation,
+  // so `enabled` (which is what puts `aria-disabled` on the button) stays
+  // true. `reason` still says what is missing.
+  assert.equal(s.enabled, true);
   assert.equal(s.reason, 'Create a set first');
   assert.equal(s.intent, 'create-set');
 });
@@ -120,6 +125,58 @@ test('a running automix can still be stopped from an emptied set', () => {
   assert.equal(s.enabled, true);
 });
 
+console.log('DJ-3 · what counts as playable');
+
+/** A bundled set as `GET /setlists` returns it: every row still `entryId:
+ *  null`, because the library entries are only created when the set is
+ *  registered. */
+const bundledRow = (label: string) => ({ entryId: null, label, kind: 'audio' as const, file: `${label}.mp3` });
+
+test('a bundled set nobody has opened counts as playable — its rows are registerable', () => {
+  const entries = [bundledRow('a'), bundledRow('b'), bundledRow('c')];
+  assert.equal(djPlayableCount({ bundled: true, entries }), 3);
+  // A locally-made set has no folder behind it: an id-less row there is
+  // never going to get one.
+  assert.equal(djPlayableCount({ bundled: false, entries }), 0);
+  assert.equal(djPlayableCount(null), 0);
+});
+
+test('rows nothing can register never count', () => {
+  const entries = [
+    bundledRow('a'),
+    { entryId: null, label: 'vj clip', url: 'http://x/y.mp4', kind: 'audio' as const },
+    { entryId: null, label: 'a still', kind: 'image' as const },
+    { entryId: 'real-1', label: 'already registered', kind: 'audio' as const },
+  ];
+  assert.equal(djPlayableCount({ bundled: true, entries }), 2);
+});
+
+test('the header count and the automix sequencer only agree AFTER a register', () => {
+  // This gap is the whole bug behind "START does nothing": the header count
+  // counts rows a register WILL fill in, while the automix effect can only
+  // sequence rows that already have an id. Press START on a fresh bundled
+  // set and the effect finds zero, calls `setAutomixOn(false)` and flashes
+  // for 2.2 seconds. The handler must close the gap by registering first.
+  const fresh = [bundledRow('a'), bundledRow('b'), bundledRow('c')];
+  assert.ok(djPlayableCount({ bundled: true, entries: fresh }) >= AUTO_DJ_MIN_TRACKS);
+  assert.ok(
+    djAutomixEntries(fresh).length < AUTO_DJ_MIN_TRACKS,
+    'automix has nothing to sequence until the set is registered',
+  );
+  assert.equal(
+    startAutoDjState({
+      setCount: 1, hasActiveSet: true,
+      playableCount: djPlayableCount({ bundled: true, entries: fresh }),
+      automixOn: false,
+    }).intent,
+    'start',
+  );
+  // After `registerBundled` the two counts are the same number.
+  const registered = fresh.map((e, i) => ({ ...e, entryId: `lib-${i}` }));
+  assert.equal(djPlayableCount({ bundled: true, entries: registered }), 3);
+  assert.equal(djAutomixEntries(registered).length, 3);
+});
+
 console.log('DJ-3 · start button markup');
 
 test('it is a real button with a label, not a styled div', () => {
@@ -147,9 +204,20 @@ test('running state renames the button and its label', () => {
   assert.match(html, /STOP AUTO DJ/);
 });
 
+test('the create-set press is not announced as disabled', () => {
+  // `aria-disabled` on a control whose click performs a real mutation is a
+  // lie to assistive tech: screen readers announce "dimmed"/"unavailable"
+  // and this button goes on to create a setlist, activate it and move the
+  // browser onto it.
+  const s = startAutoDjState({ setCount: 0, hasActiveSet: false, playableCount: 0, automixOn: false });
+  const html = render(React.createElement(StartAutoDjButton, { state: s, onActivate: () => {} }));
+  assert.doesNotMatch(html, /aria-disabled="true"/);
+  assert.match(html, /aria-label="Create a set"/);
+  assert.match(html, /title="[^"]*Create a set first/);
+});
+
 test('every blocked state carries aria-disabled AND the reason in title', () => {
   const blocked = [
-    { setCount: 0, hasActiveSet: false, playableCount: 0, automixOn: false, reason: 'Create a set first' },
     { setCount: 2, hasActiveSet: false, playableCount: 0, automixOn: false, reason: 'Pick a set below' },
     { setCount: 2, hasActiveSet: true, playableCount: 1, automixOn: false, reason: null },
   ];
@@ -180,6 +248,17 @@ test('the hint is inert decoration — no controls to tab through', () => {
   const html = render(React.createElement(DjStartHint, {}));
   assert.doesNotMatch(html, /<button/);
   assert.doesNotMatch(html, /<input/);
+});
+
+test('the hint reaches assistive tech — it is the only start instructions', () => {
+  // It was `aria-hidden="true"`, which removes it from the accessibility
+  // tree entirely: a screen-reader user landed on an empty DJ tab with no
+  // way of learning what to press. It is still inert to the POINTER —
+  // `pointer-events-none` is what keeps it from eating clicks on the decks,
+  // and that is all that was ever needed.
+  const html = render(React.createElement(DjStartHint, {}));
+  assert.doesNotMatch(html, /aria-hidden/);
+  assert.match(html, /pointer-events-none/);
 });
 
 console.log('DJ-3 · set rows');
@@ -217,7 +296,18 @@ test('an unplayable row explains itself instead of doing nothing', () => {
   const html = render(React.createElement(DjSetRow, { ...rowProps, playable: false }));
   assert.match(html, /aria-disabled="true"/);
   assert.match(html, /title="[^"]*2 tracks/);
-  assert.match(html, /aria-label="Play set Warehouse 2am with Auto-DJ"/);
+  // The reason has to be in the accessible NAME, not only in `title`: a
+  // screen reader announces the aria-label and drops the tooltip, so "Add at
+  // least 2 tracks" never reached the one user who cannot see the greyed-out
+  // ▶ at all.
+  assert.match(html, /aria-label="Play set Warehouse 2am with Auto-DJ[^"]*2 tracks[^"]*"/);
+});
+
+test('a playable row keeps a plain label; a busy one says why it is refusing', () => {
+  const ok = render(React.createElement(DjSetRow, rowProps));
+  assert.match(ok, /aria-label="Play set Warehouse 2am with Auto-DJ"/);
+  const busy = render(React.createElement(DjSetRow, { ...rowProps, busy: true }));
+  assert.match(busy, /aria-label="Play set Warehouse 2am with Auto-DJ[^"]*registering[^"]*"/i);
 });
 
 test('both row controls are real buttons', () => {
@@ -399,6 +489,24 @@ test('both deck-load effects re-run when a single-entry lookup lands', () => {
     assert.match(m[1], /libLookupVersion/, `deck ${deck} deps: ${m[1]}`);
     assert.match(m[1], new RegExp(`deck${deck}Track`), `deck ${deck} deps: ${m[1]}`);
   }
+});
+
+test("the header START registers a bundled set before it asks automix to start", () => {
+  // `autoDjPlayable` counts bundled rows that have no entry id yet, so the
+  // button offers to start a set the automix effect cannot sequence. The
+  // 'start' branch therefore has to do what the Sets row's ▶ does: register
+  // first, THEN requestStart — same order, same busy guard, same logWarn on
+  // "not enough tracks" (never a silent 2.2-second flash).
+  const from = djViewSrc.indexOf("case 'start':");
+  assert.ok(from > 0, "no 'start' branch in onStartAutoDj");
+  const branch = djViewSrc.slice(from, djViewSrc.indexOf("case 'stop':", from));
+  const reg = branch.indexOf('registerBundled(');
+  const req = branch.indexOf('requestStart(');
+  assert.ok(reg > 0, `the 'start' branch never registers:\n${branch}`);
+  assert.ok(req > 0, `the 'start' branch never starts:\n${branch}`);
+  assert.ok(reg < req, `registerBundled must run BEFORE requestStart:\n${branch}`);
+  assert.match(branch, /await registerBundled\(/, branch);
+  assert.match(branch, /logWarn\(\s*'dj'/, `no logWarn('dj', …) on the failure path:\n${branch}`);
 });
 
 test('registerBundled queues analysis for the ids it filled in', () => {
