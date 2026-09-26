@@ -52,6 +52,8 @@ import { fetchLibraryMatchCount, plainLibraryQuery } from '../lib/backendLocalPr
 import type { LibrarySortBy } from '../lib/libraryRows';
 import { useDjAnalysisStore } from '../state/djAnalysisStore';
 import { useDjCuesStore, HOTCUE_SLOTS } from '../state/djCuesStore';
+import { useDjRhythmStore } from '../state/djRhythmStore';
+import { seedCues as computeSeedCues } from '../lib/djCueSeed';
 import { toCamelot, keyLabel } from '../lib/camelot';
 import { buildBeatgrid } from '../lib/beatgrid';
 import { rgb, rgba, type RGB } from '../lib/trackColor';
@@ -68,7 +70,7 @@ import { registerDjMasterHandler, reportDjMasterState } from '../state/djMasterB
 import { importUrlToLibrary } from '../lib/onlineImport';
 import { importAudioFile } from '../lib/importAudioFiles';
 import { DESKTOP_DROP_ORIGIN, dropHasLibraryOrFiles, entriesFromDrop } from '../lib/libraryDrop';
-import { logInfo } from '../state/logStore';
+import { logInfo, logWarn } from '../state/logStore';
 import { listStems, prepareStems } from '../lib/djStems';
 import * as djEngine from '../state/djEngine';
 
@@ -155,6 +157,224 @@ export function automixTransitionSteps(nxt: djEngine.DeckId, cueIn: number): Aut
 }
 const PITCH_RANGES = [10, 15] as const;
 type PitchRange = typeof PITCH_RANGES[number];
+
+/* ══════════════════ DJ-3: starting a set, and saying why not ═════════════════
+ *
+ * "its not intuitive to start". Until now the only one-click way in was a
+ * 12-pixel ▶ inside the Source Tree's "Sets" group, and the `Automix` chip —
+ * the thing that looks like the start button — silently un-toggled itself
+ * whenever the active set had fewer than two registered ids, leaving a 10-pixel
+ * line in the footer for 2.2 seconds. `startAutoDjState` is the whole decision
+ * in one pure function so the header button can SAY what is missing instead.
+ *
+ * `enabled` is about the automix path, not about the DOM: the button is always
+ * a live `<button>` (a `disabled` one loses its tooltip and its place in tab
+ * order, so the reason would never reach the user) and carries `aria-disabled`
+ * plus the reason in `title` when it cannot start. The "no sets at all" case
+ * still acts on click — it makes the set the user is being told to make.
+ */
+export type StartAutoDjIntent = 'start' | 'stop' | 'create-set' | 'pick-set' | 'add-tracks';
+
+export interface StartAutoDjState {
+  label: 'START AUTO DJ' | 'STOP AUTO DJ';
+  /** Can this press actually start (or stop) the mix? */
+  enabled: boolean;
+  intent: StartAutoDjIntent;
+  /** Exactly what is missing, for `title`. Null when nothing is. */
+  reason: string | null;
+}
+
+/** Automix needs two tracks to have anything to mix between. */
+export const AUTO_DJ_MIN_TRACKS = 2;
+
+export function startAutoDjState(args: {
+  /** How many setlists exist at all. */
+  setCount: number;
+  /** Is one of them active (the automix sequencer reads only the active one)? */
+  hasActiveSet: boolean;
+  /** Tracks in the active set that can be played — registered, or a bundled
+   *  row still waiting for its id (opening the set creates it). */
+  playableCount: number;
+  automixOn: boolean;
+}): StartAutoDjState {
+  // A running mix is always stoppable, whatever happened to the set behind it.
+  if (args.automixOn) {
+    return { label: 'STOP AUTO DJ', enabled: true, intent: 'stop', reason: null };
+  }
+  const blocked = (intent: StartAutoDjIntent, reason: string): StartAutoDjState => ({
+    label: 'START AUTO DJ', enabled: false, intent, reason,
+  });
+  if (args.setCount === 0) return blocked('create-set', 'Create a set first');
+  if (!args.hasActiveSet) return blocked('pick-set', 'Pick a set below');
+  if (args.playableCount < AUTO_DJ_MIN_TRACKS) {
+    return blocked('add-tracks', `Add at least ${AUTO_DJ_MIN_TRACKS} tracks to this set`);
+  }
+  return { label: 'START AUTO DJ', enabled: true, intent: 'start', reason: null };
+}
+
+const START_AUTO_DJ_TITLE: Record<StartAutoDjIntent, string> = {
+  start: 'Start Auto DJ — load, beatmatch and crossfade the active set hands-free',
+  stop: 'Stop Auto DJ — the decks keep playing, the sequencer stops',
+  'create-set': 'Create a set first — click to make one',
+  'pick-set': 'Pick a set below',
+  'add-tracks': `Add at least ${AUTO_DJ_MIN_TRACKS} tracks to this set`,
+};
+
+/** The one obvious way in. Lives in the DJ tab header, above the decks. */
+export const StartAutoDjButton: React.FC<{
+  state: StartAutoDjState;
+  onActivate: (intent: StartAutoDjIntent) => void;
+}> = ({ state, onActivate }) => {
+  const running = state.intent === 'stop';
+  return (
+    <button
+      type="button"
+      data-tour="dj-start"
+      onClick={() => onActivate(state.intent)}
+      aria-disabled={!state.enabled}
+      aria-label={running ? 'Stop Auto DJ' : 'Start Auto DJ'}
+      title={START_AUTO_DJ_TITLE[state.intent]}
+      className={`shrink-0 flex items-center gap-1.5 px-3 py-1 rounded-md border text-[11px] font-black uppercase tracking-[0.14em] transition-colors ${
+        running
+          ? 'border-rose-400/60 bg-rose-500/20 text-rose-100 hover:bg-rose-500/30'
+          : state.enabled
+            ? 'border-emerald-400/70 bg-emerald-500/20 text-emerald-100 shadow-[0_0_18px_rgba(16,185,129,0.3)] hover:bg-emerald-500/30'
+            : 'border-white/15 bg-white/5 text-zinc-500 hover:text-zinc-300'
+      }`}
+    >
+      {running ? <Square className="w-3.5 h-3.5 fill-current" /> : <Play className="w-3.5 h-3.5 fill-current" />}
+      <span>{state.label}</span>
+    </button>
+  );
+};
+
+/** Shown over the decks while nothing is loaded and nothing is mixing. Three
+ *  lines, no controls — it is a caption, not a wizard, and it disappears the
+ *  moment a deck has a track. Rendered outside the ControlSurface so Design
+ *  Mode never persists it as a widget. */
+export const DjStartHint: React.FC = () => (
+  <div
+    className="pointer-events-none absolute inset-x-0 top-1/2 z-20 -translate-y-1/2 flex justify-center px-4"
+    aria-hidden="true"
+  >
+    <div className="max-w-md rounded-lg border border-white/10 bg-black/70 px-4 py-3 text-[11px] font-mono leading-relaxed text-zinc-400 backdrop-blur-sm">
+      <div data-dj-hint-line className="text-zinc-200 font-bold">1 · Pick a set in the list on the left</div>
+      <div data-dj-hint-line>2 · Press START AUTO DJ above the decks</div>
+      <div data-dj-hint-line>3 · Or drag a track straight onto a deck</div>
+    </div>
+  </div>
+);
+
+/** One row of the Source Tree's "Sets" group. Extracted so its state — which
+ *  set is ACTIVE, and whether a register is in flight — is testable, and
+ *  because the old row highlighted `source.id` while automix played
+ *  `activeId`: after a Send-to-DJ those are different sets, so the tree
+ *  pointed at one list while the decks played another. */
+export const DjSetRow: React.FC<{
+  name: string;
+  count: number;
+  /** Driven by `setlistStore.activeId` — the set automix actually reads. */
+  isActive: boolean;
+  playable: boolean;
+  /** A `/register` POST is in flight for this row. */
+  busy: boolean;
+  onOpen: () => void;
+  onPlay: () => void;
+}> = ({ name, count, isActive, playable, busy, onOpen, onPlay }) => (
+  <div
+    aria-busy={busy}
+    className={`w-full flex items-center gap-1.5 pl-4 pr-1.5 py-0.5 text-[10px] font-mono rounded transition-colors ${isActive ? 'bg-purple-500/15 text-purple-200' : 'text-zinc-400 hover:bg-white/5 hover:text-zinc-200'}`}
+  >
+    <span className={`w-1 h-1 rounded-full shrink-0 ${isActive ? 'bg-purple-300' : 'bg-zinc-700'}`} />
+    <button
+      type="button"
+      onClick={() => { if (!busy) onOpen(); }}
+      aria-disabled={busy}
+      aria-current={isActive ? true : undefined}
+      title={busy ? `Opening "${name}" — registering its tracks…` : `Open set "${name}"`}
+      className="flex-1 min-w-0 truncate text-left bg-transparent"
+    >
+      {name}
+    </button>
+    {isActive && (
+      <span className="shrink-0 rounded-sm bg-purple-400/20 px-1 text-[7px] font-black tracking-widest text-purple-200">
+        ACTIVE
+      </span>
+    )}
+    {busy
+      ? <Loader2 className="w-2.5 h-2.5 shrink-0 animate-spin text-purple-300" aria-hidden="true" />
+      : <span className="text-[8px] text-zinc-600 shrink-0" title={`${count} tracks`}>{count}</span>}
+    <button
+      type="button"
+      onClick={() => { if (playable && !busy) onPlay(); }}
+      aria-disabled={!playable || busy}
+      title={
+        busy ? 'Registering this set’s tracks…'
+          : !playable ? `Add at least ${AUTO_DJ_MIN_TRACKS} tracks to Auto-DJ this set`
+            : `Auto-DJ "${name}" — load, beatmatch & crossfade the whole set hands-free`
+      }
+      aria-label={`Play set ${name} with Auto-DJ`}
+      className={`shrink-0 p-0.5 rounded text-emerald-400 ${playable && !busy ? 'hover:text-emerald-200 hover:bg-emerald-500/15' : 'opacity-25'}`}
+    >
+      <Play className="w-3 h-3" />
+    </button>
+  </div>
+);
+
+/* ══════════════════ DJ-3: the deck beatgrid ═════════════════════════════════
+ *
+ * Two bugs in one `useMemo`: every fourth beat was drawn as a bar line
+ * (`i % 4 === 0` — wrong from beat one on anything with a pickup, or not in
+ * 4/4), and off-beat ticks were dropped entirely above a hard 400 beats, so a
+ * six-minute track lost its grid no matter how wide the lane or how far the
+ * user had zoomed in. Downbeats now come from the rhythm module when its cache
+ * has them, and the cutoff is a pixels-per-tick budget against the real lane.
+ */
+/** Below this many pixels apart, beat ticks read as a smear — drop to bars. */
+const MIN_BEAT_TICK_PX = 3;
+/** Used when the lane has not been measured yet (first paint). */
+const ASSUMED_LANE_PX = 600;
+/** Half a beat at 200bpm — tight enough not to catch the neighbouring beat. */
+const DOWNBEAT_EPS = 0.08;
+
+export function beatMarkPositions(args: {
+  beats: number[] | null;
+  downbeats: number[] | null;
+  dur: number;
+  viewStart: number;
+  viewEnd: number;
+  visibleFrac: number;
+  widthPx: number;
+}): Array<{ left: number; down: boolean }> | null {
+  const { beats, downbeats, dur, viewStart, viewEnd, visibleFrac } = args;
+  if (!beats || beats.length === 0 || dur <= 0 || visibleFrac <= 0) return null;
+  const width = args.widthPx > 0 ? args.widthPx : ASSUMED_LANE_PX;
+  // How many of these beats are on screen right now, and how much room each
+  // would get. Zooming in raises the budget; a narrow lane lowers it.
+  const onScreen = Math.max(1, beats.length * visibleFrac);
+  const dense = width / onScreen >= MIN_BEAT_TICK_PX;
+
+  const useReal = !!downbeats && downbeats.length > 0;
+  let di = 0;
+  const out: Array<{ left: number; down: boolean }> = [];
+  for (let i = 0; i < beats.length; i++) {
+    const t = beats[i];
+    let down: boolean;
+    if (useReal) {
+      // Both lists are in time order, so the downbeat cursor only moves
+      // forward — no per-beat scan of the whole downbeat list.
+      while (di < downbeats.length - 1 && downbeats[di] < t - DOWNBEAT_EPS) di++;
+      down = Math.abs(downbeats[di] - t) <= DOWNBEAT_EPS;
+    } else {
+      down = i % 4 === 0;
+    }
+    if (!dense && !down) continue;
+    const pos = t / dur;
+    if (pos < viewStart || pos > viewEnd) continue;
+    out.push({ left: ((pos - viewStart) / visibleFrac) * 100, down });
+  }
+  return out;
+}
 
 /* DJ MIDI-learn (D6): the bindable actions, grouped for the map panel. CC →
  * continuous (xfader/vol/eq/filter/pitch); note → trigger (play/cue/sync/hotcue). */
@@ -465,6 +685,39 @@ function useDeck(deckId: djEngine.DeckId, entryId: string | null, hasTrack: bool
     autoCuedRef.current = entryId;
   }, [entryId, firstBeat, deckId, decoding]);
 
+  // ── DJ-3: hot cues, without anybody pressing anything ──
+  // This effect used to seek to the first beat and stop there, writing no
+  // cue — so the pads stayed empty and the waveform had no markers on it
+  // ("i dont see cue points"). Now the analysis that lands here also places
+  // the four cues a DJ would: see lib/djCueSeed for the rule.
+  //
+  // `djCuesStore.seedCues` owns every "may I write here" decision (empty
+  // slots only; never on a track the user has touched), so this side can
+  // stay a plain "whenever the inputs improve, offer a seed".
+  const seedCuesInto = useDjCuesStore((s) => s.seedCues);
+  const ensureRhythm = useDjRhythmStore((s) => s.ensureRhythm);
+  const rhythm = useDjRhythmStore((s) => (entryId ? s.byEntry[entryId] : undefined));
+  const durationSec = a?.duration_sec ?? 0;
+
+  // Cheap GET only. A cache miss is left alone — `/run` is a full re-analysis
+  // and has no business firing because a deck loaded. See djRhythmStore.
+  useEffect(() => { if (entryId) void ensureRhythm(entryId); }, [entryId, ensureRhythm]);
+
+  useEffect(() => {
+    if (!entryId) return;
+    const times = computeSeedCues({
+      beats: gridBeats,
+      bpm,
+      duration: durationSec,
+      downbeats: rhythm?.downbeats ?? null,
+      bars: rhythm?.bars ?? null,
+    });
+    // `null` = no bpm / no beats yet. Re-runs when the rhythm cache lands and
+    // moves the phrase cues onto real bar lines — but only while every cue on
+    // the track is still one this store placed.
+    if (times) seedCuesInto(entryId, times);
+  }, [entryId, bpm, gridBeats, durationSec, rhythm, seedCuesInto]);
+
   // Trim follows loudness-matched auto-gain when enabled, else the manual GAIN knob.
   const autoTrim = a?.rms_db != null ? Math.max(-15, Math.min(15, AUTO_GAIN_TARGET_DB - a.rms_db)) : 0;
   const trimDb = autoGain ? autoTrim : manualGain;
@@ -509,6 +762,9 @@ function useDeck(deckId: djEngine.DeckId, entryId: string | null, hasTrack: bool
 
   return {
     a, analyzing, cam, bpm, beats, beatLen, gridBeats, firstBeat, cues, trimDb, stemNames, stemLevels,
+    // Real bar starts when the rhythm module already had them cached; the
+    // deck beatgrid falls back to its every-4th-beat guess when it is null.
+    downbeats: rhythm?.bars ?? rhythm?.downbeats ?? null,
     loopActive, activeLoopBeats, slip, decoding, keylock,
     setHotcue, dropHotcue, toggleBeatLoop, rollDown, rollUp, beatJump,
     exitLoop: () => djEngine.exitLoop(deckId),
@@ -751,6 +1007,8 @@ export const DJView: React.FC = () => {
   const setlists = useSetlistStore((s) => s.setlists);
   const activeId = useSetlistStore((s) => s.activeId);
   const appendToSet = useSetlistStore((s) => s.append);
+  const createSetlist = useSetlistStore((s) => s.create);
+  const setActiveSetlist = useSetlistStore((s) => s.setActive);
   const importBundledSetlists = useSetlistStore((s) => s.importBundled);
   const activeSet = activeId ? setlists[activeId] : null;
   useEffect(() => { void importBundledSetlists(); }, [importBundledSetlists]);
@@ -869,16 +1127,24 @@ export const DJView: React.FC = () => {
     });
   }, [pitchRange]);
 
+  // `libLookupVersion` is load-bearing, not decoration (DJ-3): `trackById`
+  // goes through `libraryStore.getById`, which returns undefined for a track
+  // on no loaded page and kicks off an async single-entry fetch. With
+  // `[deckATrack]` alone nothing re-ran when that fetch landed, so the deck
+  // was loaded with `null` and stayed silently empty — which is every
+  // Send-to-DJ id and every bundled-set id, and is why automix then stalled
+  // on `incomingHasBuffer` forever. Re-running on the lookup bump is cheap:
+  // `loadDeck` no-ops when the url has not changed.
   useEffect(() => {
     const t = trackById(deckATrack);
     void djEngine.loadDeck('A', t ? (t.audioUrl ?? null) : null, t?.title ?? null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [deckATrack]);
+  }, [deckATrack, libLookupVersion]);
   useEffect(() => {
     const t = trackById(deckBTrack);
     void djEngine.loadDeck('B', t ? (t.audioUrl ?? null) : null, t?.title ?? null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [deckBTrack]);
+  }, [deckBTrack, libLookupVersion]);
 
   useEffect(() => {
     if (!flash) return;
@@ -1245,6 +1511,44 @@ export const DJView: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [automixOn, automixRestart]);
 
+  /* ── DJ-3: the header START AUTO DJ button ── */
+  // Same count the Sets rows use: registered entries plus the bundled rows
+  // that opening the set will register.
+  const autoDjPlayable = activeSet
+    ? activeSet.entries.filter((e) => e.entryId).length
+      + (isBundledSetId(activeSet.id)
+        ? activeSet.entries.filter((e) => e.entryId === null && !e.url && e.kind === 'audio').length
+        : 0)
+    : 0;
+  const startAutoDj = startAutoDjState({
+    setCount: Object.keys(setlists).length,
+    hasActiveSet: !!activeSet,
+    playableCount: autoDjPlayable,
+    automixOn,
+  });
+  const onStartAutoDj = (intent: StartAutoDjIntent) => {
+    switch (intent) {
+      // Both go through the djAutomix bridge rather than `setAutomixOn`, so
+      // the button inherits exactly what Send-to-DJ gets: eject both decks,
+      // reset the crossfader to full Deck A, reseed from track 1.
+      case 'start': useDjAutomix.getState().requestStart(); break;
+      case 'stop': useDjAutomix.getState().requestStop(); break;
+      case 'create-set': {
+        // The button said "Create a set first" — so make it, and put the
+        // browser on it, rather than leaving the user to find the + .
+        const id = createSetlist(`Set ${new Date().toLocaleDateString()}`);
+        setActiveSetlist(id);
+        setSource({ kind: 'set', id });
+        setFlash('New set created — drag tracks in, then press START AUTO DJ');
+        break;
+      }
+      // Nothing to do but say why again, loudly — never a silent no-op.
+      default: setFlash(startAutoDj.reason ?? 'Auto-DJ is not ready'); break;
+    }
+  };
+  // The "how do I start" block: only while there is nothing to look at.
+  const showStartHint = !deckATrack && !deckBTrack && !automixOn;
+
   // Build the surface widget registry every render so each control's closure
   // carries live state/wiring; relocating a widget only changes where it draws.
   const registry = buildDjRegistry({
@@ -1275,6 +1579,21 @@ export const DJView: React.FC = () => {
 
   return (
     <div className="relative h-full w-full overflow-hidden bg-[#07050a] text-white flex flex-col">
+      {/* DJ-3 — "its not intuitive to start". One obvious control, above the
+          decks, that either starts the set or says in words what is missing.
+          Deliberately OUTSIDE the ControlSurface: the way in must not be
+          something a user can drag away (or lose) in Design Mode. */}
+      <div className="shrink-0 flex items-center gap-2 px-2 py-1 border-b border-white/5 bg-black/30">
+        <StartAutoDjButton state={startAutoDj} onActivate={onStartAutoDj} />
+        <span className="min-w-0 truncate text-[9px] font-mono text-zinc-500">
+          {automixOn
+            ? `Auto-DJ running · ${activeSet?.name ?? 'set'}`
+            : activeSet
+              ? `${activeSet.name} · ${autoDjPlayable} playable`
+              : startAutoDj.reason ?? ''}
+        </span>
+      </div>
+      {showStartHint && <DjStartHint />}
       {/* The console is laid out on fr fractions of its area, so on a short
           work area every cell shrinks below its content and clips. Below the
           design minimum the surface scrolls instead: the wrapper is
@@ -1363,7 +1682,7 @@ const WaveLane: React.FC<WaveLaneProps> = ({ deckId, accent, hasTrack, audioUrl,
           <Disc className="w-2.5 h-2.5" /> Deck {deckId} · {mode === 'overview' ? 'overview' : 'scroll'}
         </span>
       )}
-      {audioUrl ? <DeckWaveform deckId={deckId} audioUrl={audioUrl} beats={ctl.gridBeats} cues={ctl.cues ?? null} accent={accent} height={height} mode={mode} />
+      {audioUrl ? <DeckWaveform deckId={deckId} audioUrl={audioUrl} beats={ctl.gridBeats} downbeats={ctl.downbeats} cues={ctl.cues ?? null} accent={accent} height={height} mode={mode} />
         : <div className="h-full grid place-items-center text-[10px] font-mono text-zinc-700">{hasTrack ? '…' : 'drop a song here →'}</div>}
     </div>
   );
@@ -2598,8 +2917,40 @@ const SourceTree: React.FC<{ source: Source; setSource: (s: Source) => void; lib
   const setlists = useSetlistStore((s) => s.setlists);
   const createSetlist = useSetlistStore((s) => s.create);
   const setActive = useSetlistStore((s) => s.setActive);
+  const activeSetId = useSetlistStore((s) => s.activeId);
   const registerBundled = useSetlistStore((s) => s.registerBundled);
   const sets = Object.values(setlists).sort((a, b) => b.updatedAt - a.updatedAt);
+  // Which set has a `/register` POST in flight. Doubles as the double-click
+  // guard: the old row fired `registerBundled` un-awaited with no busy state,
+  // so two fast clicks POSTed twice.
+  const [registeringId, setRegisteringId] = useState<string | null>(null);
+
+  /** Activate + register a set. Reports through the ProcessingLog instead of
+   *  the 2.2-second footer flash, which is where the user already reads
+   *  failures — and never returns silently on "not enough tracks", which used
+   *  to be an outright no-op. */
+  const openSet = async (id: string, name: string, autoDj: boolean): Promise<void> => {
+    if (registeringId) return;
+    setActive(id);
+    setSource({ kind: 'set', id });
+    setRegisteringId(id);
+    try {
+      const registered = await registerBundled(id);
+      if (registered === null) return; // registerBundled already logged why
+      const playable = registered.filter((e) => e.entryId).length;
+      if (!autoDj) return;
+      if (playable < AUTO_DJ_MIN_TRACKS) {
+        logWarn(
+          'dj',
+          `"${name}" has ${playable} playable track${playable === 1 ? '' : 's'} — Auto-DJ needs ${AUTO_DJ_MIN_TRACKS}.`,
+        );
+        return;
+      }
+      useDjAutomix.getState().requestStart();
+    } finally {
+      setRegisteringId((cur) => (cur === id ? null : cur));
+    }
+  };
 
   /**
    * The numbers beside Favorites / Generated / Imports.
@@ -2712,63 +3063,36 @@ const SourceTree: React.FC<{ source: Source; setSource: (s: Source) => void; lib
 
         <Group label="Sets" right={<button onClick={() => { const id = createSetlist(`Set ${new Date().toLocaleDateString()}`); setActive(id); setSource({ kind: 'set', id }); }} className="ml-auto p-0.5 text-purple-300 hover:text-purple-100" title="New set"><Plus className="w-3 h-3" /></button>} />
         {sets.length === 0 ? (
-          <div className="pl-4 pr-1.5 py-0.5 text-[9px] font-mono text-zinc-700">No sets — click +</div>
+          <div className="pl-4 pr-1.5 py-0.5 text-[9px] font-mono text-zinc-700 leading-tight">
+            No sets yet — click + above, then drag tracks in and press START AUTO DJ.
+          </div>
         ) : sets.map((s) => {
-          const isActive = source.kind === 'set' && source.id === s.id;
-          // Auto-DJ needs ≥2 real entries. Not `disabled` — browsers suppress
-          // the tooltip on a disabled control and drop it from tab order, so
-          // the "Add at least 2 tracks" hint would never reach the user.
-          // A bundled set nobody has opened lists with `entryId: null` on every
-          // track -- GET /setlists is read-only, and the entries are created
-          // when the set is opened -- so those count here too, or a fresh set
-          // could never be Auto-DJ'd without being clicked first. Only tracks
-          // that CAN be registered count: an ad-hoc/VJ row (a `url`, or a
-          // non-audio slot) has no entry waiting for it and never will.
+          // Highlighted by `activeId`, NOT by the browser's `source` (DJ-3):
+          // a Send-to-DJ makes a set active without touching the source, so
+          // the tree used to point at one list while automix played another.
+          const isActive = activeSetId === s.id;
+          // Auto-DJ needs >=2 real entries. A bundled set nobody has opened
+          // lists with `entryId: null` on every track -- GET /setlists is
+          // read-only, and the entries are created when the set is opened --
+          // so those count here too, or a fresh set could never be Auto-DJ'd
+          // without being clicked first. Only tracks that CAN be registered
+          // count: an ad-hoc/VJ row (a `url`, or a non-audio slot) has no
+          // entry waiting for it and never will.
           const pending = isBundledSetId(s.id)
             ? s.entries.filter((e) => e.entryId === null && !e.url && e.kind === 'audio').length
             : 0;
-          const playable = s.entries.filter((e) => e.entryId).length + pending >= 2;
-          // Row is a div (not the Item <button>) so the green ▶ Auto-DJ action
-          // can sit as a sibling button — nesting a button inside a button is
-          // invalid DOM. Clicking the name opens/activates the set; the ▶
-          // activates it AND starts Automix in one go (requestStart → the
-          // DJView watcher flips Automix on).
+          const playable = s.entries.filter((e) => e.entryId).length + pending >= AUTO_DJ_MIN_TRACKS;
           return (
-            <div
+            <DjSetRow
               key={s.id}
-              className={`w-full flex items-center gap-1.5 pl-4 pr-1.5 py-0.5 text-[10px] font-mono rounded transition-colors ${isActive ? 'bg-purple-500/15 text-purple-200' : 'text-zinc-400 hover:bg-white/5 hover:text-zinc-200'}`}
-            >
-              <span className={`w-1 h-1 rounded-full shrink-0 ${isActive ? 'bg-purple-300' : 'bg-zinc-700'}`} />
-              <button
-                type="button"
-                onClick={() => { setActive(s.id); setSource({ kind: 'set', id: s.id }); void registerBundled(s.id); }}
-                title={`Open set "${s.name}"`}
-                className="flex-1 min-w-0 truncate text-left bg-transparent"
-              >
-                {s.name}
-              </button>
-              <span className="text-[8px] text-zinc-600 shrink-0" title={`${s.entries.length} tracks`}>{s.entries.length}</span>
-              <button
-                type="button"
-                onClick={async () => {
-                  if (!playable) return;
-                  setActive(s.id);
-                  setSource({ kind: 'set', id: s.id });
-                  // Opening is what registers a bundled set's files; Automix
-                  // needs the entry ids, so start only once they are back.
-                  const registered = await registerBundled(s.id);
-                  if ((registered ?? s.entries).filter((e) => e.entryId).length >= 2) {
-                    useDjAutomix.getState().requestStart();
-                  }
-                }}
-                aria-disabled={!playable}
-                title={!playable ? 'Add at least 2 tracks to Auto-DJ this set' : `Auto-DJ "${s.name}" — load, beatmatch & crossfade the whole set hands-free`}
-                aria-label={`Play set ${s.name} with Auto-DJ`}
-                className={`shrink-0 p-0.5 rounded text-emerald-400 disabled:opacity-25 disabled:hover:bg-transparent ${playable ? 'hover:text-emerald-200 hover:bg-emerald-500/15' : 'opacity-25'}`}
-              >
-                <Play className="w-3 h-3" />
-              </button>
-            </div>
+              name={s.name}
+              count={s.entries.length}
+              isActive={isActive}
+              playable={playable}
+              busy={registeringId === s.id}
+              onOpen={() => { void openSet(s.id, s.name, false); }}
+              onPlay={() => { void openSet(s.id, s.name, true); }}
+            />
           );
         })}
       </div>
@@ -2993,11 +3317,13 @@ const DeckWaveform: React.FC<{
   deckId: djEngine.DeckId;
   audioUrl: string;
   beats: number[] | null;
+  /** Real bar starts from the rhythm module; null falls back to every 4th beat. */
+  downbeats?: number[] | null;
   cues: (number | null)[] | null;
   accent: 'purple' | 'cyan';
   height?: number;
   mode?: 'overview' | 'detail';
-}> = ({ deckId, audioUrl, beats, cues, accent, height = 48, mode = 'overview' }) => {
+}> = ({ deckId, audioUrl, beats, downbeats = null, cues, accent, height = 48, mode = 'overview' }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const playheadRef = useRef<HTMLDivElement>(null);
   const [dur, setDur] = useState(0);
@@ -3045,19 +3371,25 @@ const DeckWaveform: React.FC<{
     setViewStart(mode === 'detail' ? -(1 / nextZoom) / 2 : 0);
   }, [audioUrl, mode]);
 
-  const beatMarks = useMemo(() => {
-    if (!beats || beats.length === 0 || dur <= 0) return null;
-    const dense = beats.length <= 400;
-    const out: Array<{ left: number; down: boolean }> = [];
-    for (let i = 0; i < beats.length; i++) {
-      const pos = beats[i] / dur;
-      if (pos < viewStart || pos > viewEnd) continue;
-      const down = i % 4 === 0;
-      if (!dense && !down) continue;
-      out.push({ left: ((pos - viewStart) / visibleFrac) * 100, down });
-    }
-    return out;
-  }, [beats, dur, viewEnd, viewStart, visibleFrac]);
+  // DJ-3: the lane's real width decides how many ticks fit — the old fixed
+  // 400-beat cutoff dropped every off-beat on a long track no matter how wide
+  // the lane was or how far in the user had zoomed. Measured, not guessed.
+  const [laneWidth, setLaneWidth] = useState(0);
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(([entry]) => {
+      const w = Math.round(entry?.contentRect.width ?? 0);
+      setLaneWidth((p) => (p === w ? p : w));
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const beatMarks = useMemo(
+    () => beatMarkPositions({ beats, downbeats, dur, viewStart, viewEnd, visibleFrac, widthPx: laneWidth }),
+    [beats, downbeats, dur, viewEnd, viewStart, visibleFrac, laneWidth],
+  );
 
   const loopView = useMemo(() => {
     if (!loop || dur <= 0) return null;
