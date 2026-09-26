@@ -51,18 +51,25 @@ function sentinelBins(tag: string): WaveBin[] {
 
 type Post = { message: AnalyzeRequest; transfer: unknown[] };
 
-let replyMode: 'bins' | 'error' = 'bins';
+let replyMode: 'bins' | 'error' | 'throw' = 'bins';
 let replyTag = 'worker-0';
 
 class FakeWorker {
   static instances = 0;
   static posts: Post[] = [];
+  static last: FakeWorker | null = null;
   onmessage: ((event: { data: AnalyzeResponse }) => void) | null = null;
+  onmessageerror: ((event: unknown) => void) | null = null;
   onerror: ((event: unknown) => void) | null = null;
+  terminated = false;
   constructor(_url: URL, _opts?: unknown) {
     FakeWorker.instances += 1;
+    FakeWorker.last = this;
   }
   postMessage(message: AnalyzeRequest, transfer: unknown[] = []): void {
+    // A structured-clone failure (a detached buffer, a value the algorithm
+    // refuses) throws synchronously out of postMessage.
+    if (replyMode === 'throw') throw new DOMException('Failed to execute postMessage', 'DataCloneError');
     FakeWorker.posts.push({ message, transfer });
     const mode = replyMode;
     const tag = replyTag;
@@ -74,7 +81,9 @@ class FakeWorker {
       });
     });
   }
-  terminate(): void {}
+  terminate(): void {
+    this.terminated = true;
+  }
 }
 
 g.Worker = FakeWorker;
@@ -82,7 +91,7 @@ g.Worker = FakeWorker;
 // how it detects "we are ourselves inside a worker"). A bare object is enough.
 g.document = g.document ?? {};
 
-const { analyzeBufferAsync, analyzeChannels, binCountFor, evictAnalysis } = await import(
+const { analyzeBufferAsync, analyzeChannels, binCountFor, evictAnalysis, pendingAnalysisCount } = await import(
   './djSemanticWaveformAnalysis.ts'
 );
 
@@ -218,6 +227,63 @@ function stereoBuffer(counter: { calls: number }, duration = 210): AudioBuffer {
   const after = await analyzeBufferAsync('worker-d.wav', buffer, { normalize: true, width: 1200 });
   assert.equal(after[0].color, 'recovered', 'the next analysis still goes to the worker');
   assert.equal(FakeWorker.instances, 1, 'and no replacement worker was built');
+}
+
+// ── a postMessage that THROWS must not leak its pending id ────────────────
+
+{
+  // `postMessage` throws synchronously when structured clone refuses a value.
+  // The request was registered in the pending table BEFORE the post, so a
+  // throw used to strand that entry there for the life of the page — one
+  // leaked closure pair per failed analysis, never collected.
+  assert.equal(pendingAnalysisCount(), 0, 'nothing is pending before this case');
+
+  evictAnalysis('worker-throw.wav');
+  replyMode = 'throw';
+  const counter = { calls: 0 };
+  const buffer = stereoBuffer(counter);
+  const bins = await analyzeBufferAsync('worker-throw.wav', buffer, { normalize: true, width: 40 });
+
+  assert.ok(bins.length > 1, 'a refused postMessage still yields a real in-process analysis');
+  assert.equal(
+    pendingAnalysisCount(),
+    0,
+    'a postMessage that threw must leave NOTHING in the pending-request table',
+  );
+}
+
+// ── onmessageerror is handled, the worker is terminated, then abandoned ───
+
+// Deliberately LAST: killing the worker latches `workerUnavailable`, and every
+// analysis after this point runs in-process for the life of the process.
+{
+  replyMode = 'bins';
+  replyTag = 'pre-kill';
+  evictAnalysis('worker-e.wav');
+
+  const counter = { calls: 0 };
+  const buffer = stereoBuffer(counter);
+  const worker = FakeWorker.last;
+  assert.ok(worker, 'the worker exists before it is killed');
+  assert.equal(typeof worker.onmessageerror, 'function', 'an undeliverable reply must be handled, not dropped');
+
+  // An undeliverable message (a reply that structured-clone cannot deliver)
+  // fires `onmessageerror`, never `onmessage` — unhandled, the request that
+  // caused it would hang forever and the lane would stay blank.
+  const hung = analyzeBufferAsync('worker-e.wav', buffer, { normalize: true, width: 40 });
+  worker.onmessageerror?.({});
+  const bins = await hung;
+  assert.ok(bins.length > 1, 'an undeliverable reply falls back to the in-process analysis');
+  assert.equal(pendingAnalysisCount(), 0, 'and clears the pending table');
+  assert.equal(worker.terminated, true, 'the dead worker is terminated, not just dereferenced and leaked');
+
+  // It is abandoned, not replaced: the next analysis runs in-process.
+  evictAnalysis('worker-f.wav');
+  const postsBefore = FakeWorker.posts.length;
+  const after = await analyzeBufferAsync('worker-f.wav', buffer, { normalize: true, width: 40 });
+  assert.ok(after.length > 1);
+  assert.equal(FakeWorker.posts.length, postsBefore, 'no further worker traffic after it died');
+  assert.equal(FakeWorker.instances, 1, 'and no replacement worker is built');
 }
 
 console.log('djSemanticWaveformAnalysis.worker.test.ts OK');

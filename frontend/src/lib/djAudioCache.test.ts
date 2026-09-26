@@ -87,7 +87,7 @@ g.window = g.window ?? g;
 (g.window as Record<string, unknown>).AudioContext = ForbiddenAudioContext;
 (g.window as Record<string, unknown>).OfflineAudioContext = FakeOfflineAudioContext;
 
-const { getDecodedAudio, evict, evictAll, setDecodeContext, DJ_AUDIO_CACHE_MAX } = await import('./djAudioCache.ts');
+const { getDecodedAudio, evict, evictAll, isDecoded, setDecodeContext, DJ_AUDIO_CACHE_MAX } = await import('./djAudioCache.ts');
 
 function reset(): void {
   evictAll();
@@ -216,6 +216,38 @@ function reset(): void {
   assert.equal(fetchCount, 2, 'evicting one URL leaves the others cached');
   await getDecodedAudio('a.wav');
   assert.equal(fetchCount, 3, 'the evicted URL refetches');
+}
+
+// ── the key includes the SAMPLE RATE the audio was decoded at ─────────────
+
+{
+  // `decodeAudioData` resamples to the DECODING context's rate, so the first
+  // caller's context used to fix the sample rate for everyone: a waveform
+  // decoded through the 44.1k offline fallback would be handed back to the
+  // engine running at 48k, and vice versa. The rate is part of what the entry
+  // IS, so it is part of the key.
+  reset();
+  const at48 = { sampleRate: 48000, decodeAudioData: async () => fakeDecoded('48k') };
+  const at44 = { sampleRate: 44100, decodeAudioData: async () => fakeDecoded('44k') };
+
+  const a = await getDecodedAudio('rate.wav', at48);
+  const b = await getDecodedAudio('rate.wav', at44);
+  assert.notEqual(a, b, 'the same URL decoded at a different rate is a different cache entry');
+  assert.equal(fetchCount, 2, 'so it is fetched and decoded again at the new rate');
+
+  const again = await getDecodedAudio('rate.wav', at48);
+  assert.equal(again, a, 'and the first rate is still cached alongside it');
+  assert.equal(fetchCount, 2);
+
+  const sameRateOtherCtx = { sampleRate: 48000, decodeAudioData: async () => fakeDecoded('48k-2') };
+  const shared = await getDecodedAudio('rate.wav', sameRateOtherCtx);
+  assert.equal(shared, a, 'two contexts at the SAME rate still share one decode');
+  assert.equal(fetchCount, 2);
+
+  evict('rate.wav');
+  await getDecodedAudio('rate.wav', at48);
+  assert.equal(fetchCount, 3, 'evict(url) drops every rate held for that URL');
+  assert.equal(isDecoded('rate.wav'), true, 'and isDecoded still answers for the bare URL');
 }
 
 // ── a failure is not cached: the next caller retries ───────────────────────

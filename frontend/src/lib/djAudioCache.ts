@@ -25,7 +25,8 @@
  * - **Single-flight.** Callers that arrive while a decode is in flight join it;
  *   they never start a second fetch.
  * - **LRU of {@link DJ_AUDIO_CACHE_MAX} buffers** (decoded audio is large — a
- *   3.5-minute stereo track is ~85 MB of Float32 — so this is deliberately
+ *   3.5-minute stereo track is ~74 MB of Float32: 210 s x 44,100 x 2 ch x 4 B
+ *   — so this is deliberately
  *   small: two decks plus one on either side of a transition).
  * - **Never constructs a real `AudioContext`.** Decoding needs *a* context, not
  *   an output device: this uses the caller's context if given, else the one
@@ -64,6 +65,12 @@
  *  `OfflineAudioContext` — or the engine's context — serve as the decoder. */
 export interface AudioDecodeContext {
   decodeAudioData(data: ArrayBuffer): Promise<AudioBuffer>;
+  /** The rate `decodeAudioData` RESAMPLES to. Part of the cache key: a buffer
+   *  decoded at 44.1k is not interchangeable with the same file decoded at
+   *  48k, so two contexts running at different rates must not share an entry.
+   *  Optional because a caller may pass a bare decoder with no rate to
+   *  advertise; those share one key (rate 0) among themselves. */
+  readonly sampleRate?: number;
 }
 
 /** Decoded buffers held at once. Four = both decks plus the pair either side
@@ -74,10 +81,34 @@ export const DJ_AUDIO_CACHE_MAX = 4;
  *  no engine context is available; see the module doc. */
 const FALLBACK_SAMPLE_RATE = 44100;
 
-/** Insertion-ordered = LRU order: the first key is the least recently used. */
+/** Insertion-ordered = LRU order: the first key is the least recently used.
+ *  Keyed `${url}@${decodeSampleRate}` — see {@link cacheKeyFor}. */
 const decoded = new Map<string, AudioBuffer>();
-/** In-flight decodes, keyed by URL — the single-flight table. */
+/** In-flight decodes, same key — the single-flight table. */
 const inFlight = new Map<string, Promise<AudioBuffer>>();
+
+/**
+ * The cache key: the URL AND the rate the audio will be resampled to.
+ *
+ * `decodeAudioData` resamples to the decoding context's own rate, so the same
+ * file decoded through the 44.1 kHz offline fallback and through a 48 kHz
+ * engine context are two different buffers. Keyed on the URL alone, whichever
+ * caller decoded FIRST silently fixed the rate for everyone that followed -
+ * and since nothing calls {@link setDecodeContext} yet, in practice that was
+ * the waveform's offline fallback deciding the rate the engine got.
+ *
+ * A context that advertises no `sampleRate` keys as rate 0: unknown, but at
+ * least consistently unknown.
+ */
+function cacheKeyFor(url: string, ctx: AudioDecodeContext): string {
+  return `${url}@${typeof ctx.sampleRate === 'number' ? ctx.sampleRate : 0}`;
+}
+
+/** Every cache key currently held for `url`, at any rate. */
+function keysFor(url: string): string[] {
+  const prefix = `${url}@`;
+  return [...decoded.keys(), ...inFlight.keys()].filter((key) => key.startsWith(prefix));
+}
 
 let registeredContext: AudioDecodeContext | null = null;
 let sharedOfflineContext: AudioDecodeContext | null = null;
@@ -110,18 +141,18 @@ function resolveContext(explicit?: AudioDecodeContext | null): AudioDecodeContex
   return sharedOfflineContext;
 }
 
-/** Move `url` to the most-recently-used end of the LRU order. */
-function touch(url: string): AudioBuffer | undefined {
-  const hit = decoded.get(url);
+/** Move `key` to the most-recently-used end of the LRU order. */
+function touch(key: string): AudioBuffer | undefined {
+  const hit = decoded.get(key);
   if (hit === undefined) return undefined;
-  decoded.delete(url);
-  decoded.set(url, hit);
+  decoded.delete(key);
+  decoded.set(key, hit);
   return hit;
 }
 
-function store(url: string, buffer: AudioBuffer): void {
-  decoded.delete(url);
-  decoded.set(url, buffer);
+function store(key: string, buffer: AudioBuffer): void {
+  decoded.delete(key);
+  decoded.set(key, buffer);
   while (decoded.size > DJ_AUDIO_CACHE_MAX) {
     const oldest = decoded.keys().next();
     if (oldest.done) break;
@@ -186,10 +217,15 @@ async function measureAsync<T>(name: string, fn: () => Promise<T>): Promise<T> {
  *                 returns the already-decoded buffer regardless.
  */
 export function getDecodedAudio(url: string, context?: AudioDecodeContext | null): Promise<AudioBuffer> {
-  const hit = touch(url);
+  // Resolved FIRST because the rate it decodes at is part of the key. That is
+  // a lookup, not a construction, on every call but the very first.
+  const ctx = resolveContext(context);
+  const key = cacheKeyFor(url, ctx);
+
+  const hit = touch(key);
   if (hit !== undefined) return Promise.resolve(hit);
 
-  const pending = inFlight.get(url);
+  const pending = inFlight.get(key);
   if (pending) return pending;
 
   const job = measureAsync(`dj:decode:${url}`, async () => {
@@ -198,28 +234,31 @@ export function getDecodedAudio(url: string, context?: AudioDecodeContext | null
     // No `.slice(0)`: nothing reads these bytes after the decode, and the copy
     // was a full extra multi-MB allocation per waveform instance.
     const bytes = await res.arrayBuffer();
-    return resolveContext(context).decodeAudioData(bytes);
+    return ctx.decodeAudioData(bytes);
   })
     .then((buffer) => {
       // A concurrent `evict(url)` while this was in flight means the caller no
       // longer wants it cached; still resolve this promise, just do not store.
-      if (inFlight.get(url) === job) store(url, buffer);
+      if (inFlight.get(key) === job) store(key, buffer);
       return buffer;
     })
     .finally(() => {
       // Failures are not cached — dropping the in-flight entry is what lets
       // the next caller retry.
-      if (inFlight.get(url) === job) inFlight.delete(url);
+      if (inFlight.get(key) === job) inFlight.delete(key);
     });
 
-  inFlight.set(url, job);
+  inFlight.set(key, job);
   return job;
 }
 
-/** Drop one URL's decoded buffer (and disown any in-flight decode for it). */
+/** Drop one URL's decoded buffers — EVERY rate held for it — and disown any
+ *  in-flight decode for it. Callers know URLs, not decode rates. */
 export function evict(url: string): void {
-  decoded.delete(url);
-  inFlight.delete(url);
+  for (const key of keysFor(url)) {
+    decoded.delete(key);
+    inFlight.delete(key);
+  }
 }
 
 /** Drop everything — deck teardown, and test isolation. */
@@ -231,5 +270,7 @@ export function evictAll(): void {
 /** Whether `url` is decoded and resident right now. Read-only; does not
  *  refresh LRU recency. */
 export function isDecoded(url: string): boolean {
-  return decoded.has(url);
+  const prefix = `${url}@`;
+  for (const key of decoded.keys()) if (key.startsWith(prefix)) return true;
+  return false;
 }

@@ -128,6 +128,18 @@ export default defineConfig(({mode}) => {
         '@': path.resolve(__dirname, '.'),
       },
     },
+    // Web workers are emitted as ES MODULES, not the iife Vite defaults to.
+    // `components/audio/djSemanticWaveform.worker.ts` is constructed with
+    // `new Worker(new URL(...), { type: 'module' })`, and a module worker
+    // handed an iife bundle is a mismatch that only shows up in a production
+    // build — in dev Vite serves the worker as a module regardless, so the
+    // waveform analysis works locally and silently falls back to the
+    // synchronous main-thread path (the very burst DJ-2 removed) in the
+    // packaged app. It also lets the worker share the code-split chunks
+    // rather than inlining a second copy of the analysis module.
+    worker: {
+      format: 'es',
+    },
     build: {
       // Modern output → less transpilation across the ~3.5k modules.
       target: 'es2022',

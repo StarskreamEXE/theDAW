@@ -318,8 +318,12 @@ const ANALYSIS_MEMO_MAX = 8;
 /** In-flight Worker analyses, so two instances mounting together share one. */
 const analysisInFlight = new Map<string, Promise<WaveBin[]>>();
 
-function memoKey(url: string, normalize: boolean, bins: number): string {
-  return `${url}|${normalize ? 'n' : 'a'}|${bins}`;
+/** `analysisRate` belongs in the key: `analyzeChannels` feeds `sampleRate /
+ *  stride` to `bandPower`, so the SAME file decoded at 44.1k and at 48k does
+ *  not yield the same bands — and with the decode cache now able to hold both
+ *  (see `djAudioCache`'s `cacheKeyFor`), both can reach this memo. */
+function memoKey(url: string, normalize: boolean, bins: number, analysisRate: number): string {
+  return `${url}|${normalize ? 'n' : 'a'}|${bins}|${analysisRate}`;
 }
 
 function rememberAnalysis(key: string, bins: WaveBin[]): WaveBin[] {
@@ -350,7 +354,7 @@ export function evictAnalysis(url: string): void {
 export function analyzeBufferMemo(url: string, buffer: AudioBuffer, opts?: AnalyzeOptions): WaveBin[] {
   const normalize = opts?.normalize ?? true;
   const bins = binCountFor(buffer.duration, opts?.width);
-  const key = memoKey(url, normalize, bins);
+  const key = memoKey(url, normalize, bins, buffer.sampleRate);
   const hit = analysisMemo.get(key);
   if (hit) {
     analysisMemo.delete(key);
@@ -378,6 +382,26 @@ let workerUnavailable = false;
 let nextRequestId = 1;
 const pendingRequests = new Map<number, { resolve: (bins: WaveBin[]) => void; reject: (err: Error) => void }>();
 
+/** How many analyses are waiting on the Worker right now. Introspection for
+ *  tests only — a request that is registered and never resolved, rejected or
+ *  removed is a leaked closure pair, and nothing else can observe that. */
+export function pendingAnalysisCount(): number {
+  return pendingRequests.size;
+}
+
+/**
+ * Give up on the Worker: TERMINATE it (dereferencing alone leaves the thread
+ * and its copy of the channel data alive), fail everything waiting on it, and
+ * latch `workerUnavailable` so callers use the synchronous path from here on.
+ */
+function killAnalysisWorker(): void {
+  workerUnavailable = true;
+  analysisWorker?.terminate();
+  analysisWorker = null;
+  for (const [, waiting] of pendingRequests) waiting.reject(new Error('waveform analysis worker failed'));
+  pendingRequests.clear();
+}
+
 /**
  * The shared analysis Worker, or `null` where Workers do not exist — inside a
  * Worker itself (no `document`), under node/tsx in the test suite, or if
@@ -401,14 +425,12 @@ function getAnalysisWorker(): Worker | null {
       if ('error' in data) waiting.reject(new Error(data.error));
       else waiting.resolve(data.bins);
     };
-    analysisWorker.onerror = () => {
-      // The Worker died; fail everything waiting on it and never try again —
-      // callers retry on the synchronous path.
-      workerUnavailable = true;
-      analysisWorker = null;
-      for (const [, waiting] of pendingRequests) waiting.reject(new Error('waveform analysis worker failed'));
-      pendingRequests.clear();
-    };
+    // BOTH error channels, not just `onerror`. `onmessageerror` fires when a
+    // reply cannot be DESERIALISED on this side; it never reaches `onmessage`,
+    // so an unhandled one leaves the request that caused it pending forever
+    // and the lane blank. Same treatment: kill the worker, fall everyone back.
+    analysisWorker.onerror = killAnalysisWorker;
+    analysisWorker.onmessageerror = killAnalysisWorker;
     return analysisWorker;
   } catch {
     workerUnavailable = true;
@@ -431,7 +453,7 @@ function getAnalysisWorker(): Worker | null {
 export function analyzeBufferAsync(url: string, buffer: AudioBuffer, opts?: AnalyzeOptions): Promise<WaveBin[]> {
   const normalize = opts?.normalize ?? true;
   const bins = binCountFor(buffer.duration, opts?.width);
-  const key = memoKey(url, normalize, bins);
+  const key = memoKey(url, normalize, bins, buffer.sampleRate);
 
   const hit = analysisMemo.get(key);
   if (hit) {
@@ -455,7 +477,16 @@ export function analyzeBufferAsync(url: string, buffer: AudioBuffer, opts?: Anal
 
   const job = new Promise<WaveBin[]>((resolve, reject) => {
     pendingRequests.set(id, { resolve, reject });
-    worker.postMessage(request, channels.map((ch) => ch.buffer));
+    try {
+      worker.postMessage(request, channels.map((ch) => ch.buffer));
+    } catch (err) {
+      // Structured clone can refuse the payload outright (a detached buffer,
+      // say) and throws SYNCHRONOUSLY. The entry was registered a line ago and
+      // no reply will ever clear it, so it has to come back out here — the
+      // rejection is caught below and the analysis runs in-process.
+      pendingRequests.delete(id);
+      throw err;
+    }
   })
     .then((result) => rememberAnalysis(key, result))
     .catch(() => {
@@ -715,9 +746,10 @@ function paintVignette(ctx: CanvasRenderingContext2D, width: number, pixelHeight
 
 // ── viewport repaint: render once, blit thereafter ─────────────────────────
 
-/** Widest offscreen render we will allocate, in device px. Past this a deep
- *  zoom would need a canvas browsers refuse to back, so those (rare) frames
- *  render directly instead. */
+/** Widest offscreen render we will allocate, in device px. A deep zoom on a
+ *  high-dpr display asks for more than browsers will back (zoom 8 x dpr 2 on a
+ *  600 px lane wants 9,600), so the render is CLAMPED to this and the blit
+ *  resamples — still one `drawImage` per frame instead of a full re-render. */
 const MAX_OFFSCREEN_DEVICE_WIDTH = 8192;
 
 type CachedRender = { canvas: HTMLCanvasElement; fullWidth: number; deviceWidth: number };
@@ -730,7 +762,13 @@ export function evictWaveformRender(prefix: string): void {
   for (const key of [...renderCache.keys()]) if (key.startsWith(`${prefix}|`)) renderCache.delete(key);
 }
 
-function cachedRender(key: string, box: CanvasBox, bins: WaveBin[], fullWidth: number): CachedRender | null {
+function cachedRender(
+  key: string,
+  box: CanvasBox,
+  bins: WaveBin[],
+  fullWidth: number,
+  deviceWidth: number,
+): CachedRender | null {
   const hit = renderCache.get(key);
   if (hit) {
     renderCache.delete(key);
@@ -739,13 +777,16 @@ function cachedRender(key: string, box: CanvasBox, bins: WaveBin[], fullWidth: n
   }
   if (typeof document === 'undefined') return null;
 
-  const deviceWidth = Math.max(1, Math.round(fullWidth * box.scale));
   const canvas = document.createElement('canvas');
   canvas.width = deviceWidth;
   canvas.height = box.deviceHeight;
   const ctx = canvas.getContext('2d');
   if (!ctx) return null;
-  ctx.setTransform(box.scale, 0, 0, box.scale, 0, 0);
+  // Horizontal scale is the (possibly CLAMPED) device width over the whole
+  // track's CSS width, so the render always fits the backing store; vertical
+  // stays the box's own scale. Unclamped this is exactly `box.scale`, which
+  // is what it always was.
+  ctx.setTransform(deviceWidth / fullWidth, 0, 0, box.scale, 0, 0);
   ctx.clearRect(0, 0, fullWidth, box.cssHeight);
   // The WHOLE track, at the current zoom, with no background/guides/spine —
   // those are painted per frame on the real canvas so they stay anchored to
@@ -772,9 +813,23 @@ function cachedRender(key: string, box: CanvasBox, bins: WaveBin[], fullWidth: n
  * `(cacheKey, width, height, scale, span, binCount)`; moving the viewport is
  * then a single `drawImage` at a different source offset.
  *
- * The FULL view (`0..1`) and both degenerate states (decode error, no bins)
- * go straight to `drawWaveform`, byte for byte — there is nothing to cache
- * when the visible extent already IS the whole render.
+ * A viewport that covers the WHOLE track and both degenerate states (decode
+ * error, no bins) go straight to `drawWaveform`, byte for byte — there is
+ * nothing to cache when the visible extent already IS the whole render.
+ *
+ * Two things this deliberately does NOT refuse, because the app's own detail
+ * lane does both on every frame (`DJView`'s `DeckWaveform` at zoom 8):
+ *
+ *  - **an over-scrolled viewport.** `viewMin = -visibleFrac / 2` puts the
+ *    viewport before the start of the track for its first ~6% and past the
+ *    end for its last ~6%. The lookup clamps to the part that has audio
+ *    behind it and blits only that; the rest of the lane keeps the painted
+ *    background, exactly as `drawWaveBody`'s own out-of-range columns look.
+ *  - **a render wider than {@link MAX_OFFSCREEN_DEVICE_WIDTH}.** `box.scale`
+ *    is zoom x dpr, so a 600 px lane at zoom 8 / dpr 2 wants a 9,600 px
+ *    backing store. That is clamped (the blit then resamples) rather than
+ *    abandoned: resampling one `drawImage` is far cheaper than re-running the
+ *    per-column render six times a second.
  *
  * @param cacheKey identifies the ANALYSIS behind `bins` — `${audioUrl}|${normalize}`.
  */
@@ -793,26 +848,36 @@ export function drawWaveformCached(
   const span = viewportEnd - viewportStart;
   const fullWidth = span > 0 ? Math.round(width / span) : 0;
 
+  // The part of the viewport that has audio behind it. The detail lane
+  // over-scrolls half a screen past both ends of the track, so clamping here
+  // — rather than refusing to cache — is what keeps the cache engaged for
+  // the first and last ~6% of every track.
+  const visibleStart = clamp(viewportStart, 0, 1);
+  const visibleEnd = clamp(viewportEnd, 0, 1);
+  const visibleSpan = visibleEnd - visibleStart;
+
   const cacheable =
     !decodeError &&
     bins.length > 0 &&
     span > 0 &&
-    // The full view has nothing to gain, and an over-scrolled viewport
-    // (< 0 or > 1) has out-of-range columns the offscreen render omits.
-    viewportStart > 0 &&
-    viewportEnd < 1 &&
+    visibleSpan > 0 &&
+    // A viewport covering the WHOLE track has nothing to gain: the render it
+    // would cache is the frame itself.
+    !(viewportStart <= 0 && viewportEnd >= 1) &&
     width > 0 &&
     Number.isFinite(fullWidth) &&
-    fullWidth >= width &&
-    Math.round(fullWidth * box.scale) <= MAX_OFFSCREEN_DEVICE_WIDTH;
+    fullWidth >= width;
 
   if (!cacheable) {
     drawWaveform(canvas, box, bins, viewportStart, viewportEnd, transparent, decodeError);
     return;
   }
 
-  const key = `${cacheKey}|${Math.round(width)}|${Math.round(pixelHeight)}|${box.scale}|${span.toFixed(6)}|${bins.length}`;
-  const render = cachedRender(key, box, bins, fullWidth);
+  // Clamped, not abandoned — see the note on MAX_OFFSCREEN_DEVICE_WIDTH above.
+  const deviceWidth = Math.max(1, Math.min(Math.round(fullWidth * box.scale), MAX_OFFSCREEN_DEVICE_WIDTH));
+
+  const key = `${cacheKey}|${Math.round(width)}|${Math.round(pixelHeight)}|${box.scale}|${span.toFixed(6)}|${bins.length}|${deviceWidth}`;
+  const render = cachedRender(key, box, bins, fullWidth, deviceWidth);
   if (!render) {
     drawWaveform(canvas, box, bins, viewportStart, viewportEnd, transparent, decodeError);
     return;
@@ -826,13 +891,19 @@ export function drawWaveformCached(
   if (!transparent) paintBackgroundGradient(ctx, width, pixelHeight);
   paintGuides(ctx, width, pixelHeight / 2);
 
-  // Whole DEVICE pixels, so the blit is a 1:1 copy with no resampling.
-  const sx = Math.round(viewportStart * render.deviceWidth);
-  const sw = Math.min(Math.round(width * box.scale), Math.max(1, render.deviceWidth - sx));
+  // Source: whole device pixels of the in-range slice (a 1:1 copy whenever the
+  // render was not clamped).
+  const sx = clamp(Math.round(visibleStart * render.deviceWidth), 0, Math.max(0, render.deviceWidth - 1));
+  const sw = Math.max(1, Math.min(Math.round(visibleSpan * render.deviceWidth), render.deviceWidth - sx));
+  // Destination: the slice of the LANE that in-range part occupies. Anything
+  // the viewport covers beyond either end of the track is left as the
+  // background painted above.
+  const dx = ((visibleStart - viewportStart) / span) * width;
+  const dw = (visibleSpan / span) * width;
   // The body was composited additively onto transparency; replaying it over
   // the background with the same operator keeps the blend it was drawn with.
   ctx.globalCompositeOperation = 'lighter';
-  ctx.drawImage(render.canvas, sx, 0, sw, box.deviceHeight, 0, 0, width, pixelHeight);
+  ctx.drawImage(render.canvas, sx, 0, sw, box.deviceHeight, dx, 0, dw, pixelHeight);
   ctx.globalCompositeOperation = 'source-over';
 
   paintSpine(ctx, width, pixelHeight / 2);

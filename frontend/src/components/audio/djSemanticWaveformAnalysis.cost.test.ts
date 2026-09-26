@@ -19,11 +19,13 @@
  *  3. **the loop runs in a Worker**, leaving the main thread only the
  *     per-channel `Float32Array` copy that is handed to `postMessage`.
  *
- * The assertions below are deliberately loose — every one leaves at least a
- * 3x gap over what the effect actually measures (see the table this prints),
- * so they pin the SHAPE of the win on any machine, under any CI load, without
- * turning into a timing-flake. The printed table is the real evidence; run it
- * directly to read it:
+ * On the assertions: every one of them is a RATIO between two measurements
+ * taken in this same process, never a wall-clock budget, because
+ * `scripts/run-tests.mjs` runs four suites at a time and an absolute number
+ * would mean nothing. The tightest is the sync-fallback roll-up, which
+ * measures ~0.43 against a 0.75 threshold (—1.7x of headroom); the rest sit
+ * between 4x and 7x, and the bin-count claims are exact. The printed table is
+ * the real evidence; run it directly to read it:
  *
  *   npx tsx src/components/audio/djSemanticWaveformAnalysis.cost.test.ts
  *
@@ -110,9 +112,15 @@ const overview = timed(() => analyzeBuffer(buffer, { width: OVERVIEW_LANE_PX }))
 assert.equal(zoomed.value.length, binCountFor(DURATION_S, ZOOMED_LANE_PX));
 assert.equal(overview.value.length, binCountFor(DURATION_S, OVERVIEW_LANE_PX));
 
+// Deterministic, not timed: this one only ever had ~1.4x of headroom, and
+// `scripts/run-tests.mjs` runs four suites at once, so the two measurements
+// were not competing for the same CPU evenly. What it was reaching for — the
+// wide lane does less work than the flat cap — is a fact about the bin count,
+// so assert THAT and leave the clock out of it.
 assert.ok(
-  zoomed.ms < before.ms * 0.95,
-  `a 1200 px lane must analyse at fewer bins than the flat cap (${zoomed.ms.toFixed(1)}ms vs ${before.ms.toFixed(1)}ms)`,
+  zoomed.value.length < before.value.length,
+  `a 1200 px lane must analyse at fewer bins than the flat cap ` +
+    `(${zoomed.value.length} vs ${before.value.length} bins)`,
 );
 assert.ok(
   overview.ms < before.ms * 0.6,

@@ -26,18 +26,29 @@ const g = globalThis as unknown as Record<string, unknown>;
 g.window = dom.window;
 g.document = dom.window.document;
 g.IS_REACT_ACT_ENVIRONMENT = true;
-// jsdom has no ResizeObserver; DJSemanticWaveform's draw effect only needs
-// the constructor + observe/disconnect surface, never a real callback.
+// jsdom has no ResizeObserver. This one keeps the latest callback so a layout
+// change can be delivered for real (DJ-2R item 5), and a controllable
+// `clientWidth` stands in for the measured lane.
+let latestResize: (() => void) | null = null;
+let laneClientWidth = 0;
 class FakeResizeObserver {
+  constructor(cb: () => void) {
+    latestResize = cb;
+  }
   observe(): void {}
   disconnect(): void {}
 }
+Object.defineProperty(dom.window.Element.prototype, 'clientWidth', {
+  configurable: true,
+  get: () => laneClientWidth,
+});
 (g.window as Record<string, unknown>).ResizeObserver = FakeResizeObserver;
 g.ResizeObserver = FakeResizeObserver;
 
 const { act } = await import('react');
 const { createRoot } = await import('react-dom/client');
 const { DJSemanticWaveform } = await import('./DJSemanticWaveform.tsx');
+const { analyzeBufferMemo } = await import('./djSemanticWaveformAnalysis.ts');
 
 // ── fetch stub: counts calls, returns a tiny fixed payload every time ───────
 let fetchCount = 0;
@@ -58,6 +69,9 @@ g.fetch = async (input: unknown) => {
 // AudioContext — every real one opens the output device, which can glitch the
 // engine's playing context on Windows/WASAPI.
 let decodeCount = 0;
+/** Every fresh analysis reads the channel data once; a memo hit reads none. */
+let analysisCalls = 0;
+let lastDecoded: AudioBuffer | null = null;
 class FakeOfflineAudioContext {
   static constructed = 0;
   constructor(_channels: number, _length: number, _sampleRate: number) {
@@ -65,13 +79,20 @@ class FakeOfflineAudioContext {
   }
   async decodeAudioData(_buf: ArrayBuffer): Promise<AudioBuffer> {
     decodeCount += 1;
-    return {
+    // `duration` drives the BIN COUNT and `length` the analysis loop, so a
+    // 128-sample fixture can still stand in for a 3.5-minute track's sizing -
+    // which is the thing the lane width changes.
+    lastDecoded = {
       numberOfChannels: 1,
       length: 128,
       sampleRate: 44100,
-      duration: 128 / 44100,
-      getChannelData: () => new Float32Array(128),
+      duration: 210,
+      getChannelData: () => {
+        analysisCalls += 1;
+        return new Float32Array(128);
+      },
     } as unknown as AudioBuffer;
+    return lastDecoded;
   }
 }
 class ForbiddenAudioContext {
@@ -150,6 +171,49 @@ await act(async () => {
 await settle();
 assert.equal(fetchCount, 2, 'two instances of an already-decoded URL fetch nothing further');
 assert.equal(decodeCount, 2, 'and decode nothing further');
+
+// DJ-2R item 5: the analysis lane width is STATE fed by the ResizeObserver,
+// not a value sampled once inside the analysis effect. Sampled once, a lane
+// that is hidden or not yet laid out measures 0, analyses at the full
+// 6,400-bin cap, and NEVER re-analyses when it is shown or resized — which is
+// every overview lane on a tab that was not the active one at mount.
+{
+  laneClientWidth = 0;
+  analysisCalls = 0;
+  await act(async () => {
+    root.render(<DJSemanticWaveform audioUrl="track-c.wav" normalize={true} />);
+  });
+  await settle();
+  assert.equal(analysisCalls, 1, 'the first mount analyses once');
+  assert.ok(lastDecoded, 'and holds the decoded buffer');
+
+  // The lane gets a real width and the ResizeObserver reports it.
+  laneClientWidth = 600;
+  await act(async () => {
+    latestResize?.();
+  });
+  await settle();
+  assert.equal(analysisCalls, 2, 'a lane that gains a real width must re-analyse at that width');
+
+  // ...and at EXACTLY the bucketed measured width: asking the memo for that
+  // key must be a hit, which reads no channel data at all.
+  const settled = analysisCalls;
+  analyzeBufferMemo('track-c.wav', lastDecoded, { normalize: true, width: 640 });
+  assert.equal(
+    analysisCalls,
+    settled,
+    'the re-analysis is memoised under the bucketed measured width (600 -> 640)',
+  );
+
+  // A sub-bucket wobble is NOT a new analysis: the width is bucketed to 64 px
+  // so a one-pixel layout jitter cannot thrash the analysis.
+  laneClientWidth = 610;
+  await act(async () => {
+    latestResize?.();
+  });
+  await settle();
+  assert.equal(analysisCalls, settled, 'a sub-bucket resize does not re-analyse');
+}
 
 await act(async () => {
   root.unmount();

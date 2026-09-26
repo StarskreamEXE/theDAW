@@ -62,6 +62,14 @@ export function DJSemanticWaveform({
   const [buffer, setBuffer] = useState<AudioBuffer | null>(null);
   const bufferAudioUrlRef = useRef<string | null>(null);
 
+  // The measured lane width, bucketed, as STATE — refreshed by the draw
+  // effect's ResizeObserver below. It has to be state rather than a value
+  // sampled once inside the analysis effect: a lane that is hidden, or simply
+  // not laid out yet when the audio finishes decoding, measures 0, analyses at
+  // the full 6,400-bin cap, and would never re-analyse when it was shown or
+  // resized. 0 means "not measured", which keeps the historical cap.
+  const [laneWidth, setLaneWidth] = useState(0);
+
   // Fetch + decode — keyed ONLY on `audioUrl`. `normalize` never appears
   // here, which is the whole point of the split.
   //
@@ -108,7 +116,7 @@ export function DJSemanticWaveform({
       return;
     }
     let cancelled = false;
-    const lane = width ?? widthBucket(wrapRef.current?.clientWidth ?? 0);
+    const lane = width ?? laneWidth;
     analyzeBufferAsync(audioUrl, buffer, { normalize, width: lane })
       .then((result) => {
         if (!cancelled) setBins(result);
@@ -119,13 +127,20 @@ export function DJSemanticWaveform({
     return () => {
       cancelled = true;
     };
-  }, [buffer, normalize, audioUrl, width]);
+  }, [buffer, normalize, audioUrl, width, laneWidth]);
 
   useEffect(() => {
     const wrap = wrapRef.current;
     const canvas = canvasRef.current;
     if (!wrap || !canvas) return;
     const render = () => {
+      // Publish the measured lane width for the analysis effect. Bucketed, so
+      // a sub-64px layout wobble cannot thrash the analysis, and compared
+      // before setting, so this never loops.
+      setLaneWidth((prev) => {
+        const next = widthBucket(wrap.clientWidth);
+        return prev === next ? prev : next;
+      });
       // `height` is the wrapper's inline height, already in local css px, so it
       // is passed straight through; only the width needs the zoom correction.
       const box = measureCanvasBox(wrap, { cssHeight: height });
