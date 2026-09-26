@@ -41,12 +41,20 @@ The center mixer sits between the decks.
 ## DJ tab — starting a set
 
 **START AUTO DJ** sits in the DJ header above the decks and is the one-click way
-in. It is always pressable; when it cannot start a mix it says what is missing,
-both in its tooltip and in the name a screen reader announces:
+in. It is never a disabled `<button>`: a disabled control loses its tooltip and
+its place in tab order, so the reason would never reach you. Instead it marks
+itself `aria-disabled` in the two states where the press cannot change anything,
+and the tooltip says what is missing. The accessible name a screen reader
+announces carries the same reason in its own wording, because a screen reader
+reads the name and generally drops the tooltip.
 
-- No sets at all — "Create a set first". Pressing it makes the set it is asking for.
-- Sets exist but none is active — "Pick a set below".
-- The active set has fewer than two playable tracks — "Add at least 2 tracks to this set".
+- No sets at all — tooltip "Create a set first — click to make one", name "Create a set".
+  This press is a real action: it makes the set it is asking for, so it is not
+  marked `aria-disabled`.
+- Sets exist but none is active — tooltip "Pick a set below", name "Start Auto DJ — pick a
+  set below first".
+- The active set has fewer than two playable tracks — tooltip "Add at least 2 tracks to this
+  set", name "Start Auto DJ — add at least 2 tracks to this set first".
 
 Once a mix is running the button reads **STOP AUTO DJ**. Stopping ends the
 sequencer only: whatever is on the decks keeps playing.

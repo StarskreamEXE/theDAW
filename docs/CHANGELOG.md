@@ -11,10 +11,13 @@ Newest first.
 ### DJ: a real way to start a set, and cue points that are already there (commits 9201efb, 7713d42; verified by tests: djCueSeed.test.ts, djRhythmStore.test.ts, DJView.dj3.test.ts)
 
 - **START AUTO DJ** sits in the DJ header above the decks. When it cannot start
-  it says what is missing — "Create a set first" (the press makes one), "Pick a
-  set below", "Add at least 2 tracks to this set" — in the tooltip and in the
-  name a screen reader reads, instead of the Automix chip silently un-toggling
-  itself. While a mix runs it reads STOP AUTO DJ, which stops the sequencer and
+  it says what is missing in its tooltip — "Create a set first — click to make
+  one", "Pick a set below", "Add at least 2 tracks to this set" — and the
+  accessible name a screen reader reads carries the same reason in its own
+  wording, instead of the Automix chip silently un-toggling itself. The button is
+  never disabled in the DOM (that would take its tooltip and its tab stop with
+  it); it is marked `aria-disabled` only where the press cannot change anything,
+  and with no sets at all the press creates the set it is asking for. While a mix runs it reads STOP AUTO DJ, which stops the sequencer and
   leaves the decks playing.
 - A bundled performance set is registered first and then started, by the header
   button and the Sets row's ▶ alike, so a full set no longer looks empty until
@@ -105,9 +108,10 @@ Newest first.
   completes it. A run that fails to measure something falls back to the stored
   values rather than erasing them, so a re-run whose tempo step fails cannot
   wipe a measured BPM.
-- **`bpm_confidence`** (0 to 1) is kept now instead of thrown away: a BPM
-  detected at 0.1 confidence is a number to show greyed out, not to beatmatch
-  on.
+- **`bpm_confidence`** (0 to 1) is kept now instead of thrown away. It is
+  persisted with the analysis and carried on the deck’s analysis row, so a BPM
+  detected at 0.1 confidence can be told apart from a solid one; no view renders
+  it differently yet.
 - At most two analyses run at once in the whole backend process, and callers
   asking for the same entry and profile join the run in flight. The cap sits on
   the analysis itself, so the library's background auto-analysis shares it
@@ -115,8 +119,9 @@ Newest first.
 - The DJ tab's queue puts deck loads first and never drops them, while the
   browsing sweep is a replaceable window of at most 24 rows ranked decks →
   active set → visible rows, so scrolling re-aims it instead of building a
-  backlog. A failing row backs off (60/120/240 s, three attempts) and loading
-  it onto a deck runs it anyway; the whole queue can be paused and resumed.
+  backlog. A failing row is retried after 60 s, then after 120 s, and is given up
+  on at the third failure — loading it onto a deck runs it anyway; the whole queue
+  can be paused and resumed.
 
 ## 2026-09-22
 
