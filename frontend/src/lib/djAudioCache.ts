@@ -104,10 +104,22 @@ function cacheKeyFor(url: string, ctx: AudioDecodeContext): string {
   return `${url}@${typeof ctx.sampleRate === 'number' ? ctx.sampleRate : 0}`;
 }
 
+/**
+ * The URL part of a cache key — everything before the LAST `@`.
+ *
+ * `@` is legal in a URL (`a@b.wav`, credentials, an encoded name), so it is
+ * not a delimiter the URL side is guaranteed to be free of. A prefix test on
+ * `` `${url}@` `` therefore matches other URLs' keys: `evict('a')` used to
+ * take every entry for `a@b.wav` with it. Only the rate suffix is guaranteed
+ * `@`-free, so the split is anchored at the end.
+ */
+function urlOfKey(key: string): string {
+  return key.slice(0, key.lastIndexOf('@'));
+}
+
 /** Every cache key currently held for `url`, at any rate. */
 function keysFor(url: string): string[] {
-  const prefix = `${url}@`;
-  return [...decoded.keys(), ...inFlight.keys()].filter((key) => key.startsWith(prefix));
+  return [...decoded.keys(), ...inFlight.keys()].filter((key) => urlOfKey(key) === url);
 }
 
 let registeredContext: AudioDecodeContext | null = null;
@@ -219,8 +231,19 @@ async function measureAsync<T>(name: string, fn: () => Promise<T>): Promise<T> {
 export function getDecodedAudio(url: string, context?: AudioDecodeContext | null): Promise<AudioBuffer> {
   // Resolved FIRST because the rate it decodes at is part of the key. That is
   // a lookup, not a construction, on every call but the very first.
-  const ctx = resolveContext(context);
-  const key = cacheKeyFor(url, ctx);
+  //
+  // It is also the one step here that can fail, and it runs before any
+  // `async` boundary: callers handle a failed load with `.catch`/`await`, so
+  // a throw out of the call ITSELF would escape them. Hand it back as a
+  // rejection, like every other failure this function reports.
+  let ctx: AudioDecodeContext;
+  let key: string;
+  try {
+    ctx = resolveContext(context);
+    key = cacheKeyFor(url, ctx);
+  } catch (err) {
+    return Promise.reject(err instanceof Error ? err : new Error(String(err)));
+  }
 
   const hit = touch(key);
   if (hit !== undefined) return Promise.resolve(hit);
@@ -270,7 +293,6 @@ export function evictAll(): void {
 /** Whether `url` is decoded and resident right now. Read-only; does not
  *  refresh LRU recency. */
 export function isDecoded(url: string): boolean {
-  const prefix = `${url}@`;
-  for (const key of decoded.keys()) if (key.startsWith(prefix)) return true;
+  for (const key of decoded.keys()) if (urlOfKey(key) === url) return true;
   return false;
 }

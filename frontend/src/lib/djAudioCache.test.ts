@@ -99,6 +99,34 @@ function reset(): void {
   failNext = false;
 }
 
+// ── no context at all: a REJECTED promise, never a synchronous throw ───────
+
+// Runs FIRST, while the shared offline context is still unbuilt — once it has
+// been constructed it is kept for the rest of the run and this case cannot
+// happen again. Callers (`DJSemanticWaveform`, `loadDeck`) handle the failure
+// with `.catch`/`await`, so a throw out of the call itself escapes them.
+{
+  reset();
+  const savedOffline = g.OfflineAudioContext;
+  const savedWebkit = g.webkitOfflineAudioContext;
+  delete g.OfflineAudioContext;
+  delete g.webkitOfflineAudioContext;
+  let threw: unknown = null;
+  let promise: Promise<AudioBuffer> | null = null;
+  try {
+    promise = getDecodedAudio('no-context.wav');
+  } catch (err) {
+    threw = err;
+  }
+  g.OfflineAudioContext = savedOffline;
+  if (savedWebkit !== undefined) g.webkitOfflineAudioContext = savedWebkit;
+
+  assert.equal(threw, null, 'a missing decode context must not throw synchronously out of getDecodedAudio');
+  assert.ok(promise, 'getDecodedAudio must return a promise even with no context available');
+  await assert.rejects(promise, /No audio decoding context available/);
+  assert.equal(fetchCount, 0, 'and nothing is fetched when there is nothing to decode with');
+}
+
 // ── single-flight: two concurrent callers + a later one = 1 fetch, 1 decode ─
 
 {
@@ -248,6 +276,29 @@ function reset(): void {
   await getDecodedAudio('rate.wav', at48);
   assert.equal(fetchCount, 3, 'evict(url) drops every rate held for that URL');
   assert.equal(isDecoded('rate.wav'), true, 'and isDecoded still answers for the bare URL');
+}
+
+// ── a URL containing '@' is its own entry, not another URL's ──────────────
+
+{
+  // The key is `${url}@${rate}`, so '@' is not a delimiter the URL is free of:
+  // a prefix match on `'a' + '@'` also matches every key for 'a@b.wav'. Only
+  // the LAST '@' separates the rate, so that is the one the URL ends at.
+  reset();
+  await getDecodedAudio('a');
+  await getDecodedAudio('a@b.wav');
+  assert.equal(fetchCount, 2);
+  assert.equal(isDecoded('a'), true);
+  assert.equal(isDecoded('a@b.wav'), true);
+
+  evict('a');
+  assert.equal(isDecoded('a@b.wav'), true, "evicting 'a' must not evict the different URL 'a@b.wav'");
+  await getDecodedAudio('a@b.wav');
+  assert.equal(fetchCount, 2, "so 'a@b.wav' is still cached and does not refetch");
+
+  assert.equal(isDecoded('a'), false, "and 'a' itself is gone — 'a@b.wav' is not an entry for 'a'");
+  await getDecodedAudio('a');
+  assert.equal(fetchCount, 3, "the evicted 'a' refetches");
 }
 
 // ── a failure is not cached: the next caller retries ───────────────────────
