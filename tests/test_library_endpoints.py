@@ -88,6 +88,23 @@ def test_stream_audio_endpoint_returns_file_bytes(client_with_root, tmp_path):
     assert "audio" in r.headers.get("content-type", "")
 
 
+def test_stream_audio_is_cached_by_the_browser(client_with_root, tmp_path):
+    """An entry's audio bytes never change under its id, and the DJ decks
+    refetch the same entry constantly -- without this header every deck
+    reload pulled the whole file down the wire again."""
+    _seed_generate_entry(
+        tmp_path, "job_cached", 0, audio_bytes=b"RIFF\x00\x00\x00\x00WAVEdata x"
+    )
+
+    r = client_with_root.get("/api/library/audio/job_cached_00")
+    assert r.status_code == 200
+    cache_control = r.headers.get("cache-control", "")
+    assert "immutable" in cache_control
+    assert "max-age=31536000" in cache_control
+    # A library is one user's: no shared proxy may keep a copy.
+    assert "private" in cache_control
+
+
 def test_patch_entry_updates_favorite_and_tags(client_with_root, tmp_path):
     _seed_generate_entry(tmp_path, "job_patch", 0)
 

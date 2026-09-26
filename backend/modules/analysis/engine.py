@@ -60,6 +60,47 @@ _logged_unguarded_write = False
 # any row re-analyzed for its own reasons, get loudness; nothing mass-requeues.
 ANALYSIS_VERSION = 3
 
+#: Analysis profiles.
+#:
+#: ``"full"`` runs every step and is what a catalogue / enrichment pass wants.
+#:
+#: ``"dj"`` runs ONLY what a DJ deck reads off a track — ffprobe, one shared
+#: librosa decode, tempo + beats (and the detector's confidence), key, RMS —
+#: and skips the two most expensive steps, neither of which the DJ tab shows:
+#:
+#:   * ``librosa.pyin`` pitch statistics: 6.5 s of an 11.4 s step budget on a
+#:     3–4 minute MP3, i.e. more than half the analysis, for a number no deck
+#:     reads.
+#:   * integrated loudness: a SECOND full decode at the file's native rate and
+#:     channel count, on top of the shared 22.05 kHz mono one (1.6 s).
+#:
+#: LUFS is deliberately NOT recomputed from the shared mono decode instead of
+#: being skipped: BS.1770 weights channels, and a mono sum reads up to ~9.5 dB
+#: low on wide stereo (see :func:`~backend.modules.analysis.bars.estimate_loudness_lufs`).
+#: Cheap and exact are mutually exclusive here, so a ``dj`` run leaves the
+#: field alone for a full run to fill rather than writing a wrong number into
+#: a column other code trusts.
+PROFILE_FULL = "full"
+PROFILE_DJ = "dj"
+
+#: Key stamped into the persisted ffprobe blob by a partial run, so a later
+#: enrichment pass can find rows that still need the expensive steps. A full
+#: run rewrites that blob wholesale and the key disappears with it, which is
+#: what makes "the full run overwrites" true; a row with no key at all is a
+#: full row, matching every row written before profiles existed.
+PROFILE_MARKER_KEY = "_analysis_profile"
+
+#: The persisted fields a ``dj`` run does not measure. ``upsert_analysis``
+#: writes the WHOLE row, so a partial payload would null these out on an
+#: entry that already had them — see :func:`_carry_forward_partial`.
+_PARTIAL_PROFILE_FIELDS = (
+    "pitch_mean_hz",
+    "pitch_std_hz",
+    "loudness_lufs",
+    "prompt_guess",
+    "prompt_confidence",
+)
+
 
 def analyze_audio(
     audio_path: Path,
@@ -68,20 +109,38 @@ def analyze_audio(
     include_pitch: bool = True,
     include_genre: bool = False,
     include_prompt: bool = True,
+    profile: str = PROFILE_FULL,
 ) -> dict[str, Any]:
     """Pure analysis call — runs the configured steps, returns a flat
-    dict. Idempotent; doesn't touch any persistence."""
+    dict. Idempotent; doesn't touch any persistence.
+
+    ``profile`` selects WHICH steps run; see :data:`PROFILE_DJ`. It overrides
+    ``include_pitch`` / ``include_prompt`` rather than being overridden by
+    them, so a caller cannot ask for the DJ profile and still pay for pyin."""
     p = Path(audio_path)
     if not p.is_file():
         return {"error": "audio not found"}
 
+    dj = profile == PROFILE_DJ
+    if dj:
+        # Both are pure cost for a deck: pyin dominates the step budget, and
+        # the prompt generator would build a weaker prompt out of the fields
+        # this profile deliberately does not measure and persist it over a
+        # better one. /api/analysis/{id}/prompt regenerates prompts from the
+        # stored row on read, so skipping it here costs no surface anything.
+        include_pitch = False
+        include_prompt = False
+
     out: dict[str, Any] = {
         "version": ANALYSIS_VERSION,
         "analyzed_at": time.time(),
+        "profile": profile,
     }
 
     # ffprobe summary (sample rate, bit depth, codec, duration, ...)
     probe = probe_file(p)
+    if dj:
+        probe[PROFILE_MARKER_KEY] = PROFILE_DJ
     out["ffprobe"] = probe
     summary = probe.get("_summary") or {}
     out["sample_rate"] = summary.get("sample_rate")
@@ -114,16 +173,24 @@ def analyze_audio(
         tempo = detect_tempo_and_beats(p, y_sr=y_sr)
         out["bpm"] = tempo["bpm"]
         out["beats"] = list(tempo["beats"])
+        # The detector has always computed this (aubio averages its per-hop
+        # confidence; the librosa path derives one from beat-interval
+        # spread) and it was thrown away here. A DJ needs it: a 0.1
+        # confidence BPM is a number to show greyed out, not to beatmatch on.
+        conf = tempo.get("confidence")
+        out["bpm_confidence"] = float(conf) if isinstance(conf, (int, float)) else None
     except Exception as e:
         log.info("analysis.engine: tempo failed for %s: %s", p.name, e)
         out["bpm"] = None
         out["beats"] = []
+        out["bpm_confidence"] = None
 
     out["bars_estimated"] = estimate_bars(out.get("beats") or [])
     out["rms_db"] = estimate_rms_db(p, y_sr=y_sr)
     # Native decode inside estimate_loudness_lufs — NOT the shared y_sr mono
-    # decode the steps above use (see estimate_loudness_lufs' docstring).
-    out["loudness_lufs"] = estimate_loudness_lufs(p)
+    # decode the steps above use (see estimate_loudness_lufs' docstring), so
+    # the dj profile skips it outright rather than paying a second decode.
+    out["loudness_lufs"] = None if dj else estimate_loudness_lufs(p)
 
     if include_key:
         out.update(detect_key(p, y_sr=y_sr))
@@ -288,6 +355,7 @@ def persist_analysis(
     """
     db_payload = {
         "bpm": payload.get("bpm"),
+        "bpm_confidence": payload.get("bpm_confidence"),
         "beats": payload.get("beats") or [],
         "key": payload.get("key"),
         "key_confidence": payload.get("confidence")
@@ -346,9 +414,15 @@ def analyze_and_persist(
     metadata_path: Optional[Path] = None,
     settings: Optional[dict[str, Any]] = None,
     store: Optional[library_store.LibraryStore] = None,
+    profile: str = PROFILE_FULL,
 ) -> dict[str, Any]:
     """End-to-end: run analysis, persist to DB + metadata.json, update
     the entry's ``analysis_status`` to 'complete'.
+
+    ``profile`` selects which steps run (see :data:`PROFILE_DJ`). A partial
+    profile still persists, and still marks the entry 'complete' -- what it
+    computed IS complete and correct -- but it never erases what it did not
+    compute; see :func:`_carry_forward_partial`.
 
     ``store`` is passed straight to :func:`persist_analysis`, which needs it
     to take the same metadata lock the store's own writers take.
@@ -366,15 +440,20 @@ def analyze_and_persist(
     # of raising a 500.
     entry_exists = db.get_entry(entry_id) is not None
 
-    # Mark running so the UI can show a chip.
+    # Mark running so the UI can show a chip. No revision bump: 'running' is
+    # a chip that lasts seconds, and every bump of ``library_revision`` makes
+    # each connected client refetch the entry list. Bumping here made that
+    # TWICE per analysis (once for 'running', once for 'complete') -- across a
+    # library-wide sweep, one wasted full list refetch per track.
     if entry_exists:
-        _set_status(db, entry_id, "running")
+        _set_status(db, entry_id, "running", bump_revision=False)
     try:
         payload = analyze_audio(
             audio_path,
             include_key=include_key,
             include_pitch=True,
             include_genre=include_genre,
+            profile=profile,
         )
         if not entry_exists:
             log.info(
@@ -410,6 +489,9 @@ def analyze_and_persist(
             payload["prompt_confidence"] = regenerated["prompt_confidence"]
             payload["semantic_tags"] = regenerated["semantic_tags"]
 
+        if profile != PROFILE_FULL:
+            _carry_forward_partial(db, entry_id, payload)
+
         persist_analysis(
             db,
             entry_id,
@@ -426,11 +508,52 @@ def analyze_and_persist(
         raise
 
 
-def _set_status(db: LibraryDB, entry_id: str, status: str) -> None:
+def _carry_forward_partial(
+    db: LibraryDB, entry_id: str, payload: dict[str, Any]
+) -> None:
+    """Keep what a partial profile did not measure.
+
+    INVARIANT: a partial (``dj``) analysis never erases a field a previous
+    full analysis measured.
+
+    ``upsert_analysis`` writes the WHOLE row, so persisting a dj payload
+    verbatim would null out ``pitch_mean_hz``, ``pitch_std_hz`` and
+    ``loudness_lufs`` -- and blank the prompt -- on an entry that already had
+    them: a 4-second run destroying the result of a 12-second one, with no
+    way back but re-decoding the file. Those fields are read off the existing
+    row and put back into the payload BEFORE it is persisted.
+
+    Only fields the partial run left as ``None`` are restored, so everything
+    it did measure (bpm, beats, key, rms, ffprobe, and the profile marker)
+    still wins -- a dj re-run of an old row is still an update, not a no-op.
+    """
+    try:
+        prior = db.get_analysis(entry_id)
+    except Exception as e:  # pragma: no cover - a broken DB fails at persist
+        log.debug("analysis.engine: no prior row for %s: %s", entry_id, e)
+        return
+    if not prior:
+        return
+    for field in _PARTIAL_PROFILE_FIELDS:
+        if payload.get(field) is None and prior.get(field) is not None:
+            payload[field] = prior[field]
+    if not payload.get("semantic_tags"):
+        # Stored as a JSON string; the payload carries a list.
+        try:
+            tags = json.loads(prior.get("semantic_tags_json") or "[]")
+        except (TypeError, ValueError):
+            tags = []
+        if isinstance(tags, list) and tags:
+            payload["semantic_tags"] = tags
+
+
+def _set_status(
+    db: LibraryDB, entry_id: str, status: str, *, bump_revision: bool = True
+) -> None:
     try:
         # Lightweight UPDATE: we don't go through upsert_entry because
         # we don't want to rewrite every column.
-        with db._txn() as cur:  # noqa: SLF001 — intentional internal use
+        with db._txn(bump_revision=bump_revision) as cur:  # noqa: SLF001
             cur.execute(
                 "UPDATE entries SET analysis_status = ?, updated_at = ? WHERE id = ?",
                 (status, time.time(), entry_id),

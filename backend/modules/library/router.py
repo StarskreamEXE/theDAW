@@ -978,6 +978,13 @@ async def stream_audio(entry_id: str) -> Response:
             path=str(served),
             media_type=media_type,
             filename=served.name,
+            # An entry's audio is immutable: the id addresses those bytes and
+            # no endpoint replaces them (the one write below only fills in a
+            # file that did not exist yet). Without this the browser refetched
+            # the whole file every time a deck reloaded the same track -- the
+            # DJ tab does that constantly. ``private`` because a library is
+            # one user's; no shared proxy may keep a copy.
+            headers={"Cache-Control": "private, max-age=31536000, immutable"},
         )
     # No local file, in the entry or in any media root — the remote copy is
     # the last resort. On the first successful fetch the bytes are persisted

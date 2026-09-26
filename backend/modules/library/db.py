@@ -43,7 +43,7 @@ from .provider import PROVIDER_SLUG_MAX, detect_provider
 log = logging.getLogger(__name__)
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 #: How long a statement waits for another connection's write lock before it
 #: gives up with "database is locked". Python's sqlite3 default is 5 s;
@@ -896,6 +896,27 @@ _MIGRATIONS.append(
             f"ON entries({_PROVIDER_INDEX_EXPR}, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_entries_facet_provider "
             "ON entries(kind, provider, model, source, favorite)",
+        ],
+    )
+)
+
+
+_MIGRATIONS.append(
+    (
+        12,
+        [
+            # DJ-1: the tempo detector has always returned a confidence next to
+            # the BPM and this table had nowhere to keep it, so it was dropped
+            # on the floor at every persist. A deck needs it -- a BPM detected
+            # at 0.1 confidence is a number to grey out, not to beatmatch on --
+            # and it is the one extra field the DJ analysis profile gets for
+            # free, since it falls out of the beat detection it already runs.
+            #
+            # Nullable with no default: every existing row means "never
+            # measured", which is the truth, and re-analysis fills it the
+            # normal way. Idempotent through _add_column_stmt/_has_column like
+            # every other ADD COLUMN step here.
+            "ALTER TABLE analysis ADD COLUMN bpm_confidence REAL",
         ],
     )
 )
@@ -2484,6 +2505,7 @@ class LibraryDB:
         row = {
             "entry_id": entry_id,
             "bpm": payload.get("bpm"),
+            "bpm_confidence": payload.get("bpm_confidence"),
             "beats_json": json.dumps(payload.get("beats") or []),
             "key": payload.get("key"),
             "key_confidence": payload.get("key_confidence"),
@@ -2507,13 +2529,15 @@ class LibraryDB:
             cur.execute(
                 """
                 INSERT INTO analysis (
-                    entry_id, bpm, beats_json, key, key_confidence, scale,
+                    entry_id, bpm, bpm_confidence, beats_json, key,
+                    key_confidence, scale,
                     pitch_mean_hz, pitch_std_hz, loudness_lufs, rms_db,
                     bars_estimated, genre, genre_confidence,
                     prompt_guess, prompt_confidence, semantic_tags_json,
                     embedded_tags_json, ffprobe_json, analyzed_at, version
                 ) VALUES (
-                    :entry_id, :bpm, :beats_json, :key, :key_confidence, :scale,
+                    :entry_id, :bpm, :bpm_confidence, :beats_json, :key,
+                    :key_confidence, :scale,
                     :pitch_mean_hz, :pitch_std_hz, :loudness_lufs, :rms_db,
                     :bars_estimated, :genre, :genre_confidence,
                     :prompt_guess, :prompt_confidence, :semantic_tags_json,
@@ -2521,6 +2545,7 @@ class LibraryDB:
                 )
                 ON CONFLICT(entry_id) DO UPDATE SET
                     bpm = excluded.bpm,
+                    bpm_confidence = excluded.bpm_confidence,
                     beats_json = excluded.beats_json,
                     key = excluded.key,
                     key_confidence = excluded.key_confidence,
