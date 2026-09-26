@@ -500,9 +500,13 @@ const {
   // unconditional seek dragged them back to their first beat. Seeking to
   // `firstBeat` is a start-of-track courtesy (fix 8); a deck the user parked
   // 90 s in must resume from where it sits.
-  assert.ok(/st\.currentTime < firstBeat/.test(seed),
+  // The position is re-read from the engine, not taken from the `st` bound at
+  // the top of the poll: djEngine hands back ONE status object per deck and
+  // rewrites it in place, so `st.currentTime` is whatever the last engine call
+  // left there rather than the position this decision is about.
+  assert.ok(/djEngine\.getStatus\(current\)\.currentTime < firstBeat/.test(seed),
     'the seed only seeks to the first beat when the deck is still before it (THE BUG: a paused deck mid-track got rewound)');
-  assert.ok(/firstBeat > 0\.02 && st\.currentTime < firstBeat/.test(seed),
+  assert.ok(/firstBeat > 0\.02 && djEngine\.getStatus\(current\)\.currentTime < firstBeat/.test(seed),
     'the guard is part of the same seek condition, not a separate branch');
 
   // 2 — key-lock was engaged on a real pull and NEVER released, so a deck
@@ -525,10 +529,46 @@ const {
     'syncDeck only releases a key-lock it engaged itself');
   assert.ok(/autoKeylockRef\.current\[nxt\]/.test(interval),
     'and the automix site only releases its own too');
+  // …and it only CLAIMS one it actually engaged. `setDeckKeylock` early-returns
+  // when the deck is already locked (djEngine.ts: `if (d.keylock === on)
+  // return;`), so a >3 % pull on a deck the USER had locked by hand was a no-op
+  // on the engine but still flipped the flag to true — handing automix a lock
+  // it never engaged, which the next ≤3 % sync then released.
+  assert.ok(/const wasOn = djEngine\.getStatus\(follower\)\.keylock/.test(sync)
+    && /if \(!wasOn\) autoKeylockRef\.current\[follower\] = true/.test(sync),
+    'syncDeck claims ownership only when the engine lock was actually OFF');
+  assert.ok(/const wasOn = djEngine\.getStatus\(nxt\)\.keylock/.test(interval)
+    && /if \(!wasOn\) autoKeylockRef\.current\[nxt\] = true/.test(interval),
+    'and so does the automix site (THE BUG: both claimed unconditionally on a >3 % pull)');
   const keylockToggle = src.slice(src.indexOf('setKeylock: (on: boolean)'), src.indexOf('setSlip: (on: boolean)'));
   assert.ok(keylockToggle.length > 0 && keylockToggle.length < 600, 'found the deck Key-Lock toggle handler');
-  assert.ok(/autoKeylockRef\.current\[deckId\] = false/.test(keylockToggle),
+  assert.ok(/setUserKeylock\(deckId, on\)/.test(keylockToggle),
     'the user\'s own Key-Lock toggle hands the deck back — automix may no longer release that lock');
+
+  // 5 — ONE entry point for a key-lock the user drives. The deck toggle above
+  // cleared the flag, but the MIDI-mappable `dj.keylock.${d}` target called
+  // djEngine.setDeckKeylock directly and did not, so a lock engaged from a
+  // mapped controller was still switched off by the next ≤3 % pull.
+  //
+  // The flag and the function live in bindableTargets.ts rather than here:
+  // DJView already imports DJ_TARGETS from it, and the reverse edge would put
+  // this whole view module inside a file that xrControlDjSource.ts and
+  // swayRouting.ts import LAZILY on purpose ("so it stays in the DJ chunk and
+  // never loads at app boot").
+  const bind = readFileSync(fileURLToPath(new URL('../state/bindableTargets.ts', import.meta.url)), 'utf8');
+  assert.ok(/export const setUserKeylock|export function setUserKeylock/.test(bind),
+    'setUserKeylock is exported once, from where the ownership flag lives');
+  assert.ok(!/from '\.\.\/views\/DJView/.test(bind),
+    'and bindableTargets never imports the view back — that would drag DJView into the lazy DJ chunk');
+  // Anchored on the target-literal syntax, not the bare id: `dj.keylock.` also
+  // appears in setUserKeylock's own docblock further up the file, and slicing
+  // from there to the slip target swept up the whole helper.
+  const keylockTarget = bind.slice(bind.indexOf('{ id: `dj.keylock.'), bind.indexOf('{ id: `dj.slip.'));
+  assert.ok(keylockTarget.length > 0 && keylockTarget.length < 400, 'found the dj.keylock MIDI target');
+  assert.ok(/setUserKeylock\(d, Boolean\(v\)\)/.test(keylockTarget),
+    'the MIDI key-lock target goes through setUserKeylock too');
+  assert.ok(!/setDeckKeylock/.test(keylockTarget),
+    'THE BUG: it called djEngine.setDeckKeylock directly, bypassing the ownership flag entirely');
 
   // 3 — the swap asserted the incoming deck had started instead of reading
   // it. A play that never took (a buffer evicted, an engine refusal) would
@@ -536,7 +576,10 @@ const {
   // dead-air rescue back in charge of exactly the case DJ-5 removed it from.
   assert.ok(/mix\.started = djEngine\.getStatus\(nxt\)\.playing \|\| mix\.started/.test(interval),
     'the swap reads the incoming deck\'s real state and never clears a `started` already earned');
-  assert.ok(!/^\s*mix\.started = true;\s*$/m.test(code(interval)),
+  // Deliberately loose: an anchored, semicolon-exact pattern would let a
+  // reformat (`mix.started  =  true`, a trailing comment, no semicolon) put
+  // the unconditional assignment back without this noticing.
+  assert.ok(!/mix\.started\s*=\s*true\b/.test(code(interval)),
     'THE BUG: `started` was set true unconditionally on every swap');
 }
 

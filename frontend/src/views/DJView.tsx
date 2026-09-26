@@ -39,7 +39,7 @@ import { useFeatureToggleStore } from '../state/featureToggleStore';
 import { IoGlobalSelect } from '../components/audio/IoDeviceSelect';
 import { ControlSurface } from '../components/surface/ControlSurface';
 import { InfiNightCredit } from '../components/ui/Credit';
-import { DJ_TARGETS } from '../state/bindableTargets';
+import { autoKeylockRef, DJ_TARGETS, setUserKeylock } from '../state/bindableTargets';
 import type { WidgetRegistry } from '../components/surface/widgetTypes';
 import type { SurfaceLayout } from '../state/surfaceLayoutStore';
 import { useAppUiStore } from '../state/appUiStore';
@@ -101,16 +101,12 @@ const AUTOMIX_RESCUE_XFADE = 1; // s — dead-air rescue: the outgoing deck is a
 /** Pitch (%) past which a beatmatch needs key-lock. ~3 % is half a semitone;
  *  beyond that a "harmonic" Camelot pair audibly is not one any more. */
 const KEYLOCK_PITCH_PCT = 3;
-/** Which decks have a key-lock the SYNC paths engaged, and may therefore also
- *  release. A lock the user set from the deck's own Key-Lock toggle is not
- *  automix's to switch off the moment a beatmatch happens to need ≤3 % — so
- *  only a deck flagged here is ever released automatically.
- *
- *  Module scope, not a `useRef`, because `useDeck` (which owns the user's
- *  toggle handler) sits outside the DJView component — and because it mirrors
- *  the lifetime of the thing it describes: djEngine's decks are module-level
- *  too and outlive a DJView unmount, so the flag must not reset under them. */
-const autoKeylockRef: { current: Record<djEngine.DeckId, boolean> } = { current: { A: false, B: false } };
+/* `autoKeylockRef` / `setUserKeylock` live in bindableTargets (imported above):
+ * the MIDI `dj.keylock.<deck>` target needs the same flag, and DJView already
+ * depends on that module, so putting them there keeps the single entry point
+ * without a cycle. Module scope rather than a `useRef` also matches the
+ * lifetime of what they describe — djEngine's decks outlive a DJView unmount,
+ * so the flag must not reset under a lock that is still engaged. */
 /** How long the automix seed waits for the first track's analysis before
  *  starting it anyway (ms) — dead air is worse than an unmatched first bar. */
 const AUTOMIX_SEED_WAIT_MS = 3000;
@@ -862,14 +858,9 @@ function useDeck(deckId: djEngine.DeckId, entryId: string | null, hasTrack: bool
     loopActive, activeLoopBeats, slip, decoding, keylock,
     setHotcue, dropHotcue, toggleBeatLoop, rollDown, rollUp, beatJump,
     exitLoop: () => djEngine.exitLoop(deckId),
-    setKeylock: (on: boolean) => {
-      // The user just took ownership of this deck's key-lock, either way: a
-      // lock they engaged is theirs to keep, and one they released is not
-      // automix's to put back. Either way the sync paths stop managing it
-      // until they engage it again themselves.
-      autoKeylockRef.current[deckId] = false;
-      void djEngine.setDeckKeylock(deckId, on);
-    },
+    // Through the shared entry point, not djEngine directly: it is what clears
+    // the ownership flag, and the MIDI key-lock target goes through it too.
+    setKeylock: (on: boolean) => setUserKeylock(deckId, on),
     setSlip: (on: boolean) => djEngine.setSlip(deckId, on),
   };
 }
@@ -1330,8 +1321,13 @@ export const DJView: React.FC = () => {
     // engaged itself; a plain boolean write switched off the user's own.
     const want = Math.abs(pct) > KEYLOCK_PITCH_PCT;
     if (want) {
+      // Claim ownership only if the lock was actually OFF. setDeckKeylock
+      // early-returns when the deck already matches, so a >3 % pull on a deck
+      // the USER had locked by hand did nothing to the engine but still
+      // flipped the flag — and the next ≤3 % sync then released their lock.
+      const wasOn = djEngine.getStatus(follower).keylock;
       void djEngine.setDeckKeylock(follower, true);
-      autoKeylockRef.current[follower] = true;
+      if (!wasOn) autoKeylockRef.current[follower] = true;
     } else if (autoKeylockRef.current[follower]) {
       void djEngine.setDeckKeylock(follower, false);
       autoKeylockRef.current[follower] = false;
@@ -1712,7 +1708,11 @@ export const DJView: React.FC = () => {
         // that the gate also seeds a deck that is loaded-but-PAUSED, that seek
         // would rewind a deck the user parked mid-track back to the top. Only
         // pull FORWARD to the first beat, never back to it.
-        if (analyzed && firstBeat != null && firstBeat > 0.02 && st.currentTime < firstBeat) {
+        // Re-read the position rather than trusting the `st` bound at the top
+        // of this callback: djEngine hands back ONE status object per deck and
+        // rewrites it in place, so `st.currentTime` is whatever the last engine
+        // call left there, not the position this decision is about.
+        if (analyzed && firstBeat != null && firstBeat > 0.02 && djEngine.getStatus(current).currentTime < firstBeat) {
           djEngine.seekDeck(current, firstBeat);
         }
         djEngine.playDeck(current);
@@ -1835,8 +1835,11 @@ export const DJView: React.FC = () => {
           // the same few ms the pitch change itself already occupies.
           const want = Math.abs(followerPitch) > KEYLOCK_PITCH_PCT;
           if (want) {
+            // Same ownership rule as syncDeck: only a lock this path actually
+            // switched on is a lock it may later switch off.
+            const wasOn = djEngine.getStatus(nxt).keylock;
             void djEngine.setDeckKeylock(nxt, true);
-            autoKeylockRef.current[nxt] = true;
+            if (!wasOn) autoKeylockRef.current[nxt] = true;
           } else if (autoKeylockRef.current[nxt]) {
             void djEngine.setDeckKeylock(nxt, false);
             autoKeylockRef.current[nxt] = false;
