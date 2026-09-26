@@ -8,6 +8,7 @@ data/api_key_pools.json
 data/tour_keys.json
 data/tour_filters.json
 data/tour_cache/
+data/playable-cache/
 # Underfit upstream-update check cache (written by backend/modules/underfit/updater.py)
 data/underfit_update.json
 # App update check cache (written by backend/modules/updates/router.py)
