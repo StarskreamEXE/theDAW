@@ -405,6 +405,76 @@ const {
   assert.ok(!/NO_STEMS as string\[\]/.test(engine), 'THE BUG: the readonly empties were cast back to mutable');
 }
 
+/* ───────────────── DJ-5: the live-app hotfix (ticket DJ-5) ─────────────────
+ * Two defects the lead watched happen with START AUTO DJ on a bundled 18-track
+ * set. Both decide what the ENGINE is told, so neither is reachable from the
+ * pure plan tests — this is the wiring.
+ *
+ *  A · Deck A was loaded (title + BPM on screen) but still decoding when the
+ *      500 ms interval first ran. `playing` was false, so the dead-air rescue
+ *      fired, the incoming deck became `current` with an undecoded buffer of
+ *      its own, and the next tick did it again: a new track loaded every 3-5 s,
+ *      nothing ever played, the footer stayed PAUSED. The plan can only tell
+ *      "ran out" from "never started" if the interval hands it that fact.
+ *  B · A bogus 36.6 BPM detection made the match unreachable. The flash was
+ *      already honest ("NOT beatmatched") — but syncDeck and the PLL applied
+ *      the CLAMPED `pct` regardless, parking Deck A at +10 % and Deck B at
+ *      −10 % for no benefit at all.
+ */
+{
+  const src = readFileSync(fileURLToPath(new URL('./DJView.tsx', import.meta.url)), 'utf8');
+  const code = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*/g, '');
+  const automix = src.slice(src.indexOf('// Automix (D7): auto-sequence'));
+  const intervalStart = automix.indexOf('const id = window.setInterval');
+  const interval = automix.slice(intervalStart, automix.indexOf('}, 500);', intervalStart));
+  const seed = automix.slice(automix.indexOf('const curEntry ='), intervalStart);
+  const sync = src.slice(src.indexOf('const syncDeck = ('), src.indexOf('const syncDeckRef'));
+  const pllStart = src.indexOf('if (!syncLock) return;');
+  const pll = src.slice(pllStart, src.indexOf('}, 350);', pllStart));
+  assert.ok(pll.includes('getStatus(follower)'), 'found the sync-lock PLL');
+
+  // A — the run tracks whether the outgoing deck ever actually played.
+  assert.ok(/started: mix\.started/.test(interval),
+    'the plan call passes the run\'s `started` flag (THE BUG: without it every undecoded deck read as dead air)');
+  assert.ok(/djEngine\.playDeck\(current\);[\s\S]{0,240}?started = true/.test(seed),
+    'the seed poll marks the run as started where it actually plays the deck');
+  assert.ok(/mix\.started = true/.test(interval),
+    'and the swap marks the deck it just played as started');
+  // The 15 s give-up path never plays anything, so `started` stays false and
+  // the interval can never transition — nothing else would ever switch automix
+  // off, so it says so once and stops rather than ticking forever doing nothing.
+  assert.ok(/never finished loading[\s\S]{0,400}?setAutomixOn\(false\)/.test(seed),
+    'the load give-up path stops automix instead of leaving it on over a deck that never played');
+  // A deck that is LOADED BUT PAUSED has to be seeded too, not just an empty
+  // one. `started` now gates the dead-air rescue, so the old `if (!curEntry)`
+  // gate left the manual Automix toggle with no seed poll and nothing else
+  // that would ever play the deck it was pointed at: the interval sat on
+  // `outgoing-not-started` forever. Track 1 is only loaded onto a deck that is
+  // actually empty — a deck that already holds a track keeps it.
+  assert.ok(/if \(!curEntry\) loadOnto\(current, list\[0\]\);/.test(seed),
+    'only an EMPTY deck gets track 1 loaded onto it');
+  assert.ok(/if \(!curEntry \|\| !djEngine\.getStatus\(current\)\.playing\)/.test(seed),
+    'the seed poll is armed for a loaded-but-paused deck as well as an empty one');
+  assert.ok(
+    seed.indexOf("applyCrossfade(current === 'A' ? -1 : 1)")
+      > seed.indexOf('if (!curEntry || !djEngine.getStatus(current).playing)'),
+    'and the crossfader normalisation sits inside that widened gate, so a paused deck gets it too',
+  );
+
+  // B — an unreachable tempo match pulls nothing, in BOTH places that pitch.
+  assert.ok(/const pct = match\.appliedPct/.test(sync),
+    'syncDeck puts the tempo match\'s appliedPct on the fader');
+  assert.ok(!/match\.pct/.test(code(sync)),
+    'THE BUG: syncDeck applied the CLAMPED pct even when `matched` was false');
+  assert.ok(/match\.matched &&/.test(sync),
+    'and skips the phase nudge for a tempo pair it cannot hold');
+  assert.ok(/NOT beatmatched/.test(sync), 'the honest flash is unchanged');
+  assert.ok(/base\.appliedPct/.test(pll), 'the sync-lock PLL applies appliedPct too');
+  assert.ok(!/base\.pct/.test(code(pll)),
+    'THE BUG: the PLL walked an unmatchable deck to the pitch rail every 350 ms');
+  assert.ok(/base\.matched &&/.test(pll), 'and adds no bend to a tempo it cannot hold');
+}
+
 /* djEngine.hasPendingBend — the accessor the PLL gates on, exercised directly.
  * A deck that was never built has nothing scheduled, and asking must not
  * build one (that would need an AudioContext). */

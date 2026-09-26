@@ -36,7 +36,7 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) <= eps;
   const beatLen = 60 / 128;
   const out = (over: Partial<AutomixOutgoing> = {}): AutomixOutgoing => ({
     currentTime: 0, duration: 300, bpm: 128, gridAnchor: 0.5, beatLen,
-    playing: true, mixOut: null, downbeats: null, ...over,
+    playing: true, started: true, mixOut: null, downbeats: null, ...over,
   });
   const inc = (over: Partial<AutomixIncoming> = {}): AutomixIncoming => ({
     bpm: 124, hasBuffer: true, cueIn: null, ...over,
@@ -125,6 +125,33 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) <= eps;
   // pauses the outgoing deck itself before the swap.
   assert.equal(plan({ currentTime: 12, playing: false }).immediate, true, 'a stopped deck mid-track is still dead air');
 
+  // ── DJ-5: a deck that NEVER started is not dead air ──────────────────────
+  // THE BUG, seen in the live app on a bundled 18-track set: Deck A was
+  // loaded (title + BPM on screen) but still decoding when the first 500 ms
+  // tick ran. `playing` was false, so the dead-air branch fired, the incoming
+  // deck was started and became `current` — its own buffer was not decoded
+  // either — and the next tick fired the same branch again. A new track was
+  // loaded every 3-5 s, nothing ever played, the footer stayed PAUSED and
+  // both deck clocks sat at 0:00.0. "Stopped" means a deck that ran and then
+  // ran out; a deck that has not played yet is a deck to WAIT for.
+  const pnever = plan({ currentTime: 0, playing: false, started: false });
+  assert.equal(pnever.start, false, 'a deck that never started is not rescued as dead air');
+  assert.equal(pnever.immediate, false, 'and nothing is punched in immediately');
+  assert.equal(pnever.startAt, null, 'there is no position to aim at on a deck that never ran');
+  assert.equal(pnever.matched, false, 'nothing is matched before the set has begun');
+  assert.equal(pnever.reason, 'outgoing-not-started');
+  // Mid-track, still never started: same answer — the position is irrelevant.
+  assert.equal(plan({ currentTime: 12, playing: false, started: false }).start, false,
+    'a non-zero position on a deck that never played changes nothing');
+  // Once the deck HAS played, the dead-air rescue is exactly as before.
+  const pran = plan({ currentTime: 300, playing: false, started: true });
+  assert.equal(pran.start, true, 'a deck that played and stopped is still rescued');
+  assert.equal(pran.immediate, true);
+  assert.equal(pran.reason, 'outgoing-stopped');
+  // Nothing decoded on the incoming deck still wins over both.
+  assert.equal(plan({ currentTime: 0, playing: false, started: false }, { hasBuffer: false }).reason, 'no-incoming',
+    'no incoming buffer is reported ahead of the outgoing deck never starting');
+
   // ── the assistant's "transition NOW" ─────────────────────────────────────
   const pf = plan({ currentTime: 10 }, {}, { forced: true });
   assert.equal(pf.start, true, 'forced: start regardless of position');
@@ -148,7 +175,7 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) <= eps;
   const beatLen = 60 / 128;
   const short = (duration: number, currentTime: number): AutomixOutgoing => ({
     currentTime, duration, bpm: 128, gridAnchor: 0.5, beatLen,
-    playing: true, mixOut: null, downbeats: null,
+    playing: true, started: true, mixOut: null, downbeats: null,
   });
   const p = (duration: number, currentTime: number) => planTransition({
     outgoing: short(duration, currentTime),
@@ -278,6 +305,27 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) <= eps;
   }
   // The returned rate is the one the clamped pitch actually produces.
   assert.ok(near(tempoMatch(140, 95, 10).rate, 0.9), 'rate mirrors the CLAMPED pct, not the wish');
+
+  // ── DJ-5: an unreachable match pulls NOTHING ─────────────────────────────
+  // THE BUG, seen in the live app: a bogus 36.6 BPM detection on the incoming
+  // deck. `matched` was already false and the flash already said "NOT
+  // beatmatched" — but syncDeck applied `.pct`, the CLAMPED value, anyway.
+  // Deck A went to +10 %, Deck B to −10 %, both parked at the rail, both
+  // playing at the wrong speed for no benefit whatsoever. `appliedPct` is the
+  // single number a caller may put on the fader: `pct` still reports what the
+  // clamp produced, `appliedPct` is 0 unless the match is real.
+  const bogus = tempoMatch(120, 36.6, 10);
+  assert.equal(bogus.matched, false, '120 against 36.6 BPM is not reachable inside ±10%');
+  assert.equal(bogus.appliedPct, 0, 'an unreachable match moves the pitch fader by nothing');
+  assert.ok(Math.abs(bogus.pct) > 9.9, `pct still reports the clamp itself, got ${bogus.pct}`);
+  // A reachable match applies exactly the pitch it computed.
+  const reach = tempoMatch(128, 124, 10);
+  assert.equal(reach.appliedPct, reach.pct, 'a real match applies the pitch it asked for');
+  assert.equal(tempoMatch(140, 70, 10).appliedPct, 0, 'a half/double match needs no pitch at all');
+  assert.equal(tempoMatch(140, 95, 10).appliedPct, 0, 'the ±10% clamp case applies nothing either');
+  assert.equal(tempoMatch(140, 95, 30).appliedPct, tempoMatch(140, 95, 30).pct,
+    'a wider range makes the same pair reachable, so the pitch is applied');
+  assert.equal(tempoMatch(null, 124, 10).appliedPct, 0, 'unknown tempo applies nothing');
 }
 
 /* ═══════════════════════════ camelot / next track ═════════════════════════ */

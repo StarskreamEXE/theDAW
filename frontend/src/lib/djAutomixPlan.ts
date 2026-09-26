@@ -55,6 +55,11 @@ export interface AutomixOutgoing {
   /** Seconds per beat from the same grid, null with no grid. */
   beatLen: number | null;
   playing: boolean;
+  /** True once this deck has actually PLAYED during the current automix run.
+   *  `playing: false` means two completely different things — a track that
+   *  ran out (rescue it) and a deck that is still decoding and has never made
+   *  a sound (wait for it) — and the plan cannot tell them apart without this. */
+  started: boolean;
   /** A prepared set's exact blend-out point; replaces the tail rule. */
   mixOut?: number | null;
   /** Detected downbeats, when the rhythm analysis has them. Preferred over
@@ -81,6 +86,10 @@ export type TransitionReason =
   | 'incoming-not-ready'
   /** The outgoing deck stopped; start the incoming one immediately. */
   | 'outgoing-stopped'
+  /** The outgoing deck has never played — it is still loading/decoding, or
+   *  its start was given up on. There is nothing to transition OUT of yet, so
+   *  the blend waits rather than "rescuing" a set that never began. */
+  | 'outgoing-not-started'
   /** Started on a 16-beat phrase boundary. */
   | 'phrase'
   /** Started at the raw mix-out point — no grid to align to. */
@@ -219,11 +228,21 @@ export function planTransition(args: {
   // Dead air (fix 6): the outgoing deck is not running — it ended while the
   // incoming track was still decoding, or something else stopped it. Waiting
   // for a mix-out point on a stopped clock means waiting forever.
+  //
+  // …but ONLY once that deck has actually played (DJ-5). A deck that is still
+  // decoding also reads `playing: false`, and treating that as dead air made
+  // every 500 ms tick "rescue" the set into the next track: nothing ever
+  // played, and a new track was loaded every few seconds forever.
   if (!o.playing) {
-    return {
-      ...base, start: true, immediate: true, startAt: o.currentTime,
-      phraseAligned: false, matched: bothTempos, reason: 'outgoing-stopped',
-    };
+    return o.started
+      ? {
+        ...base, start: true, immediate: true, startAt: o.currentTime,
+        phraseAligned: false, matched: bothTempos, reason: 'outgoing-stopped',
+      }
+      : {
+        ...base, start: false, startAt: null,
+        phraseAligned: false, matched: false, reason: 'outgoing-not-started',
+      };
   }
 
   // Where the blend is meant to begin, phrase-quantised.
@@ -299,6 +318,12 @@ export function eqSwap(progress: number): { outLowDb: number; inLowDb: number } 
 export interface TempoMatch {
   /** Pitch percent to put on the follower, already clamped to ±`maxPct`. */
   pct: number;
+  /** The pitch a caller should actually APPLY: `pct` when the match is real,
+   *  0 when it is not (DJ-5). Clamping an unreachable match and applying it
+   *  anyway parks the fader at its rail — the deck plays at the wrong speed
+   *  and is no closer to the master's tempo than it was at 0 %. One number,
+   *  so syncDeck and the sync-lock PLL cannot disagree about it. */
+  appliedPct: number;
   /** The clamp did NOT have to truncate: the decks really are beatmatched.
    *  False means the UI must not claim a match (fix 4). */
   matched: boolean;
@@ -317,7 +342,7 @@ export interface TempoMatch {
  */
 export function tempoMatch(masterBpm: number | null, followerBpm: number | null, maxPct: number): TempoMatch {
   if (!finite(masterBpm) || masterBpm <= 0 || !finite(followerBpm) || followerBpm <= 0) {
-    return { pct: 0, matched: false, folded: false, rate: 1 };
+    return { pct: 0, appliedPct: 0, matched: false, folded: false, rate: 1 };
   }
   let rate = masterBpm / followerBpm;
   let folded = false;
@@ -326,7 +351,8 @@ export function tempoMatch(masterBpm: number | null, followerBpm: number | null,
   const raw = (rate - 1) * 100;
   const lim = Math.abs(finite(maxPct) ? maxPct : 0);
   const pct = clamp(raw, -lim, lim);
-  return { pct, matched: Math.abs(raw) <= lim + 1e-9, folded, rate: 1 + pct / 100 };
+  const matched = Math.abs(raw) <= lim + 1e-9;
+  return { pct, appliedPct: matched ? pct : 0, matched, folded, rate: 1 + pct / 100 };
 }
 
 /* ─────────────────────────────── next track ─────────────────────────────── */

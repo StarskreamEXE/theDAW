@@ -1069,7 +1069,10 @@ export const DJView: React.FC = () => {
   const [automixOn, setAutomixOn] = useState(false);
   const [automixRestart, setAutomixRestart] = useState(0);
   const [flash, setFlash] = useState<string | null>(null);
-  const automixRef = useRef<{ current: djEngine.DeckId; fading: boolean; fadeStart: number; fadeFrom: number; fadeTo: number; fadeSec: number } | null>(null);
+  // `started`: has the deck in `current` actually PLAYED during this automix
+  // run? A deck that is still decoding reads `playing: false` exactly like a
+  // track that ran out, and planTransition needs to tell the two apart (DJ-5).
+  const automixRef = useRef<{ current: djEngine.DeckId; started: boolean; fading: boolean; fadeStart: number; fadeFrom: number; fadeTo: number; fadeSec: number } | null>(null);
   const [source, setSource] = useState<Source>({ kind: 'library' });
   // Lifted out of the old Mixer so the surface widget closures can drive them.
   const [limiterOn, setLimiterOn] = useState(() => djEngine.getLimiter());
@@ -1291,7 +1294,14 @@ export const DJView: React.FC = () => {
     // (140 → 95 BPM needs −26 %) was pitched to the limit and still announced
     // as a sync. tempoMatch reports the truncation so the flash can be honest.
     const match = tempoMatch(masterEffBpm, followerBpm, pitchRange);
-    const pct = match.pct;
+    // DJ-5: a match the ±range cannot reach must pull NOTHING. The old code
+    // applied the CLAMPED value regardless — a bogus 36.6 BPM detection parked
+    // Deck A at +10 % and Deck B at −10 %, both running at the wrong speed and
+    // no closer to the master's tempo than they were at 0 %, while the flash
+    // below honestly said "NOT beatmatched". `appliedPct` is 0 in that case,
+    // which also leaves `Math.abs(pct) > KEYLOCK_PITCH_PCT` false: no key-lock
+    // either, since there is no pitch pull to compensate for.
+    const pct = match.appliedPct;
     if (follower === 'A') setDeckAPitch(pct); else setDeckBPitch(pct);
     djEngine.setDeckPitch(follower, pct);
     // Key-lock above a few percent: a 6 % pull is ~1 semitone of pitch shift,
@@ -1304,7 +1314,10 @@ export const DJView: React.FC = () => {
     const masterBeats = masterCtl.gridBeats;
     const ms = djEngine.getStatus(master);
     const fs = djEngine.getStatus(follower);
-    if (followerBeats && masterBeats && ms.playing && fs.playing) {
+    // No phase nudge on an unmatchable pair (DJ-5): two decks running at
+    // different tempos drift straight back out of phase, so the bend buys
+    // nothing and the platter pull is audible for no reason.
+    if (match.matched && followerBeats && masterBeats && ms.playing && fs.playing) {
       const interval = 60 / (followerBpm * match.rate);
       let delta = (beatPhase(ms.currentTime, masterBeats) - beatPhase(fs.currentTime, followerBeats)) * interval;
       if (delta > interval / 2) delta -= interval;
@@ -1386,8 +1399,13 @@ export const DJView: React.FC = () => {
       let dPhase = beatPhase(ms.currentTime, mBeats) - beatPhase(fs.currentTime, fBeats);
       if (dPhase > 0.5) dPhase -= 1;
       if (dPhase < -0.5) dPhase += 1;
-      const bend = Math.abs(dPhase) > DEADBAND ? Math.max(-MAX_BEND, Math.min(MAX_BEND, dPhase * KP)) : 0;
-      const pct = clampToPitchRange(base.pct + bend);
+      // DJ-5: a tempo the pitch fader cannot reach cannot be HELD either.
+      // Bending around a clamped pitch just walks the follower to its rail and
+      // parks it there, 350 ms at a time. Apply 0 and add no bend instead.
+      const bend = base.matched && Math.abs(dPhase) > DEADBAND
+        ? Math.max(-MAX_BEND, Math.min(MAX_BEND, dPhase * KP))
+        : 0;
+      const pct = clampToPitchRange(base.appliedPct + bend);
       djEngine.setDeckPitch(follower, pct);
       if (follower === 'A') setDeckAPitch(pct); else setDeckBPitch(pct);
     }, 350);
@@ -1609,8 +1627,15 @@ export const DJView: React.FC = () => {
     const current: djEngine.DeckId = djEngine.getStatus('A').playing ? 'A' : djEngine.getStatus('B').playing ? 'B' : 'A';
     const curEntry = current === 'A' ? deckATrackRef.current : deckBTrackRef.current;
     let seedPoll = 0;
-    if (!curEntry) {
-      loadOnto(current, list[0]);
+    // An EMPTY deck gets track 1; a deck that already holds one keeps it.
+    if (!curEntry) loadOnto(current, list[0]);
+    // …but the seed POLL is what actually starts a deck, and it has to run for
+    // a deck that is loaded-but-paused as well (DJ-5). `started` now gates the
+    // dead-air rescue, so with the old `!curEntry`-only gate the manual Automix
+    // toggle armed nothing: the deck the user had loaded was never played, and
+    // the interval sat on `outgoing-not-started` until they pressed play by
+    // hand. A deck that is ALREADY playing needs neither — it has started.
+    if (!curEntry || !djEngine.getStatus(current).playing) {
       // Crossfade normalisation belongs HERE, with the seed (fix 11): every
       // path into automix seeds a deck — the "Send to DJ" bridge AND the
       // manual toggle — and a fader parked at the far side silences the deck
@@ -1626,7 +1651,12 @@ export const DJView: React.FC = () => {
       const loadDeadline = seedStart + AUTOMIX_LOAD_TIMEOUT_MS;
       seedPoll = window.setInterval(() => {
         const st = djEngine.getStatus(current);
-        if (st.playing) { window.clearInterval(seedPoll); seedPoll = 0; return; } // someone beat us to it
+        // Someone beat us to it — the deck IS playing, which is the whole of
+        // what `started` records, so mark the run started before standing down.
+        if (st.playing) {
+          if (automixRef.current) automixRef.current.started = true;
+          window.clearInterval(seedPoll); seedPoll = 0; return;
+        }
         if (!st.hasBuffer || st.decoding) {
           // No audio yet. There is nothing to start, so this wait has no
           // ANALYSIS deadline — but it does need an end: a dead URL or a
@@ -1635,6 +1665,10 @@ export const DJView: React.FC = () => {
             window.clearInterval(seedPoll);
             seedPoll = 0;
             setFlash(`Automix: Deck ${current} never finished loading`);
+            // `started` stays false, so the interval will never transition out
+            // of a deck that never played (DJ-5) — and nothing else would ever
+            // switch automix off, leaving it ticking over silence forever.
+            setAutomixOn(false);
           }
           return;
         }
@@ -1646,10 +1680,20 @@ export const DJView: React.FC = () => {
         const firstBeat = ctl.firstBeat ?? (ctl.gridBeats?.[0] ?? null);
         if (analyzed && firstBeat != null && firstBeat > 0.02) djEngine.seekDeck(current, firstBeat);
         djEngine.playDeck(current);
+        // The set has begun: from here a `playing: false` reading on this deck
+        // really does mean the track ran out, and the dead-air rescue applies.
+        if (automixRef.current) automixRef.current.started = true;
         if (!analyzed) setFlash('Automix: starting before analysis landed — first mix may be unmatched');
       }, 150);
     }
-    automixRef.current = { current, fading: false, fadeStart: 0, fadeFrom: 0, fadeTo: 0, fadeSec: AUTOMIX_XFADE };
+    // The deck was already running when automix came on (the "Send to DJ"
+    // bridge, or the user hit play first): it has played, so the dead-air
+    // rescue is allowed from the first tick. Otherwise the seed poll above
+    // flips this the moment it actually starts the deck.
+    automixRef.current = {
+      current, started: djEngine.getStatus(current).playing,
+      fading: false, fadeStart: 0, fadeFrom: 0, fadeTo: 0, fadeSec: AUTOMIX_XFADE,
+    };
     useDjAutomix.getState().setNowPlaying(curEntry ?? list[0]);
     loadNextAfter(curEntry ?? list[0], other(current));
     setFlash('Automix on — sequencing the set');
@@ -1704,6 +1748,10 @@ export const DJView: React.FC = () => {
             gridAnchor: outAnchor,
             beatLen: outBeatLen,
             playing: outPlaying,
+            // Has this deck ever played in this run? Without it a deck that
+            // is merely still decoding takes the dead-air rescue on the very
+            // first tick, and the set churns through tracks in silence.
+            started: mix.started,
             mixOut: outPerf?.mixOut,
             // Real bar lines when djRhythmStore has them cached (DJ-3), so a
             // blend starts on an actual phrase and not merely on a 16-beat
@@ -1777,6 +1825,9 @@ export const DJView: React.FC = () => {
           // is now the master (or a freshly loaded track on the freed deck).
           setSyncLock(null);
           mix.current = nxt;
+          // The incoming deck was played by the transition above, so the new
+          // `current` has started by definition — carry that with the swap.
+          mix.started = true;
           mix.fading = false;
           const nowEntry = nxt === 'A' ? deckATrackRef.current : deckBTrackRef.current;
           useDjAutomix.getState().setNowPlaying(nowEntry);
