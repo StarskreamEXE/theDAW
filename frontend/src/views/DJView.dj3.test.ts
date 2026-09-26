@@ -509,6 +509,34 @@ test("the header START registers a bundled set before it asks automix to start",
   assert.match(branch, /logWarn\(\s*'dj'/, `no logWarn('dj', …) on the failure path:\n${branch}`);
 });
 
+test('a start that outlives its set bails, and the dropped press says why', () => {
+  // `registerBundled` is a network round-trip. The user can switch sets
+  // while it is out, and the old code then started the automix on whatever
+  // set was active when the press happened — ejecting the decks and mixing
+  // a set nobody is looking at. The re-read after the await is the guard.
+  const from = djViewSrc.indexOf("case 'start':");
+  assert.ok(from > 0, "no 'start' branch in onStartAutoDj");
+  const branch = djViewSrc.slice(from, djViewSrc.indexOf("case 'stop':", from));
+  const await_ = branch.indexOf('await registerBundled(');
+  const reread = branch.indexOf('useSetlistStore.getState().activeId');
+  const req = branch.indexOf('requestStart(');
+  assert.ok(reread > await_, `the active set is never re-read after the register:
+${branch}`);
+  assert.ok(reread < req, `the re-read must happen BEFORE requestStart:
+${branch}`);
+  // A press that is dropped because a register is already in flight is not
+  // allowed to look like a dead button.
+  const guard = branch.indexOf('startRegisterRef.current)');
+  assert.ok(guard > 0, `no in-flight guard:
+${branch}`);
+  assert.match(
+    branch.slice(guard, guard + 400),
+    /setFlash\(/,
+    `the dropped second press says nothing:
+${branch}`,
+  );
+});
+
 test('registerBundled queues analysis for the ids it filled in', () => {
   const body = setlistSrc.slice(setlistSrc.indexOf('registerBundled: async'));
   assert.match(body, /analyzeEntries\(filled\)/);

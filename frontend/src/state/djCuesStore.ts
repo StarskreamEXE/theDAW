@@ -35,7 +35,9 @@ interface DjCuesState {
   /** Clear all cues for a track. */
   clearAll: (entryId: string) => void;
   /** Place automatic cues (see lib/djCueSeed) into slots nobody owns.
-   *  Ignored entirely once the user has touched the track. */
+   *  Ignored entirely once the user has touched the track. An explicit
+   *  `null` is a statement ("there is no cue here") and clears a slot this
+   *  store placed; `undefined` is silence and leaves the slot alone. */
   seedCues: (entryId: string, times: readonly (number | null | undefined)[]) => void;
 }
 
@@ -93,7 +95,13 @@ export const useDjCuesStore = create<DjCuesState>()(
         for (let i = 0; i < HOTCUE_SLOTS; i++) {
           const incoming = times[i];
           const usable = typeof incoming === 'number' && Number.isFinite(incoming);
-          next[i] = (cur[i] == null || mine) && usable ? Math.max(0, incoming) : cur[i];
+          // An explicit null on a slot this store placed CLEARS it. The first
+          // seed of a deck often runs before the duration is known and puts a
+          // phrase cue past the end of the file; the re-seed with the real
+          // duration answers null for that slot, and keeping the old value
+          // left a pad that seeks into silence.
+          const clearing = incoming === null && mine;
+          next[i] = usable && (cur[i] == null || mine) ? Math.max(0, incoming) : clearing ? null : cur[i];
           if (next[i] !== cur[i]) changed = true;
         }
         if (!changed) return s;

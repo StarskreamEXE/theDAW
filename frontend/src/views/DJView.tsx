@@ -1876,10 +1876,24 @@ export const DJView: React.FC = () => {
         // same order, same in-flight guard, same ProcessingLog warning.
         if (activeSet && isBundledSetId(activeSet.id)
             && activeSet.entries.some(isRegisterableBundledRow)) {
-          if (startRegisterRef.current) return;   // a register is already in flight
+          if (startRegisterRef.current) {
+            // A register is already in flight. Say so — a button that does
+            // nothing at all reads as broken, which is the whole complaint
+            // this ticket started from.
+            setFlash('Registering the set…');
+            return;
+          }
           startRegisterRef.current = true;
           try {
             const registered = await registerBundled(activeSet.id);
+            // The register is a network round-trip and the user can switch
+            // sets while it is out. Starting the mix on the set that was
+            // active when the press happened would eject both decks and
+            // sequence a set nobody is looking at.
+            if (useSetlistStore.getState().activeId !== activeSet.id) {
+              setFlash('The active set changed — press START AUTO DJ again');
+              return;
+            }
             if (registered === null) return;      // registerBundled already logged why
             const playable = djAutomixEntries(registered).length;
             if (playable < AUTO_DJ_MIN_TRACKS) {

@@ -51,6 +51,12 @@ interface DjRhythmState {
 /** In-flight requests, so three decks asking at once make one request. */
 const inflight = new Map<string, Promise<DjRhythm | null>>();
 
+/** Bumped by `invalidateRhythm`. A run carries the generation it started in
+ *  and writes nothing once that number has moved: the answer it is holding
+ *  was computed before the cache changed, so storing it would quietly undo
+ *  the invalidation the caller just asked for. */
+const generation = new Map<string, number>();
+
 /** Keep only finite, non-negative times; `null` when nothing survives.
  *  Two shapes arrive here: `downbeats` is a flat list of seconds, while
  *  `bars` is a list of bar OBJECTS carrying `start_sec` (see `DjRhythm.bars`
@@ -91,6 +97,10 @@ export const useDjRhythmStore = create<DjRhythmState>()((set, get) => ({
     const pending = inflight.get(entryId);
     if (pending) return pending;
 
+    const gen = generation.get(entryId) ?? 0;
+    /** Still the run the store cares about? False once invalidated. */
+    const current = () => (generation.get(entryId) ?? 0) === gen;
+
     const run = (async (): Promise<DjRhythm | null> => {
       try {
         const res = await fetch(`/api/rhythm/${encodeURIComponent(entryId)}`);
@@ -98,13 +108,13 @@ export const useDjRhythmStore = create<DjRhythmState>()((set, get) => ({
           // Remember the failure: a 404 (no such entry) or a 500 will not
           // start working on the next deck load, and retrying on every load
           // would be a request per track per reload.
-          set((s) => ({ byEntry: { ...s.byEntry, [entryId]: miss() } }));
+          if (current()) set((s) => ({ byEntry: { ...s.byEntry, [entryId]: miss() } }));
           return null;
         }
         const body = (await res.json()) as { status?: string; downbeats?: unknown; bars?: unknown };
         // A cache miss stops here on purpose — see the header. No `/run`.
         if (body?.status !== 'ready') {
-          set((s) => ({ byEntry: { ...s.byEntry, [entryId]: miss() } }));
+          if (current()) set((s) => ({ byEntry: { ...s.byEntry, [entryId]: miss() } }));
           return null;
         }
         const data: DjRhythm = {
@@ -112,15 +122,18 @@ export const useDjRhythmStore = create<DjRhythmState>()((set, get) => ({
           downbeats: times(body.downbeats),
           bars: times(body.bars),
         };
+        if (!current()) return null;
         set((s) => ({ byEntry: { ...s.byEntry, [entryId]: data } }));
         return data;
       } catch {
         // Backend still warming, or offline. Same as a miss: the DJ path
         // has a working fallback and must never surface this.
-        set((s) => ({ byEntry: { ...s.byEntry, [entryId]: miss() } }));
+        if (current()) set((s) => ({ byEntry: { ...s.byEntry, [entryId]: miss() } }));
         return null;
       } finally {
-        inflight.delete(entryId);
+        // Only if this run is still the registered one — an invalidation may
+        // already have cleared the slot and a newer fetch taken it.
+        if (current()) inflight.delete(entryId);
       }
     })();
     inflight.set(entryId, run);
@@ -135,6 +148,11 @@ export const useDjRhythmStore = create<DjRhythmState>()((set, get) => ({
  *  about, so it is always safe to call. */
 export function invalidateRhythm(entryId: string): void {
   if (!entryId) return;
+  // Retire any run that is already out on the wire BEFORE forgetting the
+  // entry: its result describes the cache as it was a moment ago, and it
+  // would otherwise land after this call and restore what was forgotten.
+  generation.set(entryId, (generation.get(entryId) ?? 0) + 1);
+  inflight.delete(entryId);
   useDjRhythmStore.setState((s) => {
     if (!(entryId in s.byEntry)) return s;
     const next = { ...s.byEntry };

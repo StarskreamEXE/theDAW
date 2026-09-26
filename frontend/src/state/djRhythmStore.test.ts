@@ -163,6 +163,34 @@ await test('invalidateRhythm sends the next call back to the network', async () 
   assert.equal(calls.length, 2);
 });
 
+await test('a fetch already running when invalidateRhythm lands cannot re-store it', async () => {
+  // `invalidateRhythm` is called by whoever just changed the cache. If the
+  // GET it interrupts is allowed to finish into the store, the caller's
+  // "forget this" is undone a few milliseconds later by data that predates
+  // the change — and the next deck load reads the stale analysis as final.
+  calls.length = 0;
+  let release: (() => void) | null = null;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  globalThis.fetch = mock.fn(async (input: string | URL | Request) => {
+    calls.push(String(input));
+    await gate;
+    return { ok: true, status: 200, json: async () => ({ status: 'ready', downbeats: [9] }) } as Response;
+  }) as unknown as typeof fetch;
+
+  const pending = useDjRhythmStore.getState().ensureRhythm('e15');
+  invalidateRhythm('e15');
+  release?.();
+  assert.equal(await pending, null, 'the late result is discarded, not returned');
+  assert.equal(useDjRhythmStore.getState().rhythmFor('e15'), null, 'nothing was stored');
+
+  // …and the entry is still fetchable: the invalidated run did not leave a
+  // stuck in-flight promise behind.
+  stubFetch({ status: 'ready', downbeats: [4] });
+  const got = await useDjRhythmStore.getState().ensureRhythm('e15');
+  assert.deepEqual(got?.downbeats, [4]);
+  assert.equal(calls.length, 1);
+});
+
 await test('invalidateRhythm on an unknown id changes nothing', async () => {
   stubFetch({ status: 'ready', downbeats: [2] });
   await useDjRhythmStore.getState().ensureRhythm('e13');
