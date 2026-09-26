@@ -22,6 +22,7 @@ import {
   eqSwap,
   fadeStep,
   planTransition,
+  residualNudge,
   tempoMatch,
   type AutomixIncoming,
   type AutomixOutgoing,
@@ -140,6 +141,73 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) <= eps;
   assert.equal(plan({ currentTime: 285 }, { cueIn: 12.5 }).cueIn, 12.5);
   assert.equal(plan({ currentTime: 285 }, { cueIn: 0 }).cueIn, 0);
   assert.equal(plan({ currentTime: 285 }, { cueIn: null }).cueIn, 0, 'no cue-in point → start of the track');
+}
+
+/* ══════════════════ short tracks: the blend cannot start at 0 ═════════════ */
+{
+  const beatLen = 60 / 128;
+  const short = (duration: number, currentTime: number): AutomixOutgoing => ({
+    currentTime, duration, bpm: 128, gridAnchor: 0.5, beatLen,
+    playing: true, mixOut: null, downbeats: null,
+  });
+  const p = (duration: number, currentTime: number) => planTransition({
+    outgoing: short(duration, currentTime),
+    incoming: { bpm: 124, hasBuffer: true, cueIn: null },
+    fadeSec: 10, tailSec: 18, now: 0,
+  });
+
+  // THE BUG: `duration - tailSec` is -6 for a 12 s track, `phraseStart` hands
+  // the negative straight back, and `currentTime >= startAt` is true at t=0 —
+  // the track blended out the instant it started. Never before half of it has
+  // played.
+  assert.equal(p(12, 0).start, false, 'a 12 s track does not blend out at t=0');
+  assert.ok(p(12, 0).startAt! >= 6, `12 s track: blend no earlier than half way, got ${p(12, 0).startAt}`);
+  assert.equal(p(12, 5.9).start, false, 'still playing at 5.9 s');
+  assert.equal(p(12, 6.1).start, true, 'past half way: due');
+  // The phrase grid must not drag it back under the floor either: quantising
+  // 6 s down to the 0.5 s phrase line would reintroduce the same bug.
+  assert.equal(p(12, 0).phraseAligned, false, 'no phrase line above the floor → honest about not being aligned');
+
+  // 30 s at tail 18 → 12 s raw, which is under half; the floor wins at 15 s,
+  // and the phrase line below it (8.0 s) must not be used.
+  assert.ok(near(p(30, 0).startAt!, 15), `30 s track: blend at half way, got ${p(30, 0).startAt}`);
+  assert.equal(p(30, 14.9).start, false);
+  assert.equal(p(30, 15.1).start, true);
+
+  // A normal-length track is untouched by the floor and stays phrase-aligned.
+  assert.ok(near(p(300, 0).startAt!, 278), 'long track unchanged');
+  assert.equal(p(300, 0).phraseAligned, true);
+
+  // A prepared set's explicit mix-out point is the DJ's call: an early one is
+  // honoured (only a negative one is nonsense), and one past the end never
+  // fires.
+  const prepared = (mixOut: number, currentTime: number) => planTransition({
+    outgoing: { ...short(300, currentTime), mixOut },
+    incoming: { bpm: 124, hasBuffer: true, cueIn: null },
+    fadeSec: 10, tailSec: 18, now: 0,
+  });
+  assert.equal(prepared(20, 21).start, true, 'an early prepared mix-out is allowed');
+  assert.equal(prepared(400, 299).start, false, 'a mix-out past the end never fires');
+  assert.ok(prepared(-5, 0).startAt! >= 0, 'a negative prepared mix-out clamps to 0');
+}
+
+/* ════════════════════════════ residualNudge ═══════════════════════════════ */
+{
+  // `nudgePhase` can only bend the platter so far in one window, so it returns
+  // what it actually delivered. Whatever is left has to be re-applied, or the
+  // decks sit permanently out of phase by the shortfall.
+  assert.ok(near(residualNudge(0.2, 0.16, 0.008), 0.04), 'the shortfall is carried over');
+  assert.ok(near(residualNudge(-0.2, -0.16, 0.008), -0.04), 'and keeps its sign when holding back');
+  assert.equal(residualNudge(0.2, 0.2, 0.008), 0, 'fully delivered: nothing left');
+  assert.equal(residualNudge(0.2, 0.195, 0.008), 0, 'inside the deadband: do not chase it');
+  assert.equal(residualNudge(0.2, 0.192, 0.008), 0, 'exactly the deadband is still inside it');
+  assert.ok(near(residualNudge(0.2, 0.19, 0.008), 0.01), 'just outside the deadband: carried');
+  assert.equal(residualNudge(0.2, 0, 0.008), 0.2, 'nothing delivered at all: the whole nudge is still owed');
+  // A nudge that overshot must be pulled back, not ignored.
+  assert.ok(near(residualNudge(0.05, 0.2, 0.008), -0.15), 'an overshoot is corrected in the other direction');
+  // Junk in, zero out — never schedule a NaN bend.
+  assert.equal(residualNudge(Number.NaN, 0.1, 0.008), 0);
+  assert.equal(residualNudge(0.2, Number.NaN, 0.008), 0);
 }
 
 /* ═══════════════════════════════ fadeStep ═════════════════════════════════ */

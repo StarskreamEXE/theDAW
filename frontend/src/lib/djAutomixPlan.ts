@@ -29,6 +29,13 @@ const EQ_KILL_DB = -26;
 export const PHRASE_BEATS = 16;
 /** How close (in beats) a downbeat must sit to a 16-beat multiple to count. */
 const DOWNBEAT_TOLERANCE_BEATS = 0.25;
+/** A blend never begins before this much of the outgoing track has played.
+ *  Without it a track shorter than `tailSec` mixes out from its first frame,
+ *  and phrase quantisation (which only ever moves the start EARLIER) can drag
+ *  a short track's blend back onto a phrase line near zero. */
+export const MIN_PLAY_FRACTION = 0.5;
+/** Phase error (sec) below which a nudge is not worth scheduling. */
+export const PHASE_DEADBAND_SEC = 0.008;
 
 const clamp = (x: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, x));
 const finite = (x: number | null | undefined): x is number => typeof x === 'number' && Number.isFinite(x);
@@ -115,6 +122,8 @@ function phraseStart(
   beatLen: number | null,
   gridAnchor: number | null,
   downbeats: number[] | null | undefined,
+  /** Quantising only ever moves the start EARLIER; never below this. */
+  floor: number,
 ): { startAt: number; aligned: boolean } {
   if (!finite(beatLen) || beatLen <= 0) return { startAt: at, aligned: false };
   const phrase = beatLen * PHRASE_BEATS;
@@ -128,13 +137,13 @@ function phraseStart(
       const off = Math.abs(beatsFromFirst - Math.round(beatsFromFirst / PHRASE_BEATS) * PHRASE_BEATS);
       if (off <= DOWNBEAT_TOLERANCE_BEATS && (best == null || d > best)) best = d;
     }
-    if (best != null) return { startAt: best, aligned: true };
+    if (best != null && best >= floor) return { startAt: best, aligned: true };
   }
 
   if (!finite(gridAnchor)) return { startAt: at, aligned: false };
   const k = Math.floor((at - gridAnchor) / phrase + 1e-9);
   const startAt = gridAnchor + k * phrase;
-  if (!finite(startAt) || startAt < 0) return { startAt: at, aligned: false };
+  if (!finite(startAt) || startAt < 0 || startAt < floor) return { startAt: at, aligned: false };
   return { startAt, aligned: true };
 }
 
@@ -147,8 +156,33 @@ function phraseStart(
  * transition is due.
  */
 export function mixOutPoint(o: { duration: number; mixOut?: number | null }, tailSec: number): number | null {
-  if (finite(o.mixOut)) return o.mixOut;
-  return o.duration > 0 ? o.duration - tailSec : null;
+  // A prepared set's point is the DJ's own call — an early mix-out is a valid
+  // edit, so only a negative one (nonsense) is corrected.
+  if (finite(o.mixOut)) return Math.max(0, o.mixOut);
+  if (!(o.duration > 0)) return null;
+  // `duration - tailSec` is NEGATIVE for anything shorter than the tail (an
+  // 18 s tail on a 12 s track gives −6). The old form handed that straight
+  // back, `currentTime >= startAt` was true at 0, and the track blended out
+  // the instant it started. Floor it at MIN_PLAY_FRACTION of the track.
+  return clamp(Math.max(o.duration * MIN_PLAY_FRACTION, o.duration - tailSec), 0, o.duration);
+}
+
+/**
+ * Carry-over for a phase nudge the engine could only partly deliver.
+ *
+ * `djEngine.nudgePhase` bends the platter inside a bend limit and a bounded
+ * window, so a large correction comes back short — it returns what it actually
+ * delivered. Ignoring that leaves the decks permanently out of phase by the
+ * shortfall. Re-apply the remainder on the next tick, unless it is inside the
+ * deadband (chasing a few ms forever is audible wobble, not a fix).
+ *
+ * @returns the shift still owed (signed), or 0 when nothing is worth doing.
+ */
+export function residualNudge(requested: number, delivered: number, deadbandSec: number): number {
+  if (!finite(requested) || !finite(delivered)) return 0;
+  const remaining = requested - delivered;
+  const band = Math.abs(finite(deadbandSec) ? deadbandSec : 0);
+  return Math.abs(remaining) > band + 1e-9 ? remaining : 0;
 }
 
 /**
@@ -194,8 +228,11 @@ export function planTransition(args: {
 
   // Where the blend is meant to begin, phrase-quantised.
   const rawDue = mixOutPoint(o, tailSec);
+  // The tail rule's floor also binds the quantisation; a prepared mix-out is
+  // deliberate, so only the phrase line's own "never negative" rule applies.
+  const floor = finite(o.mixOut) ? 0 : (o.duration > 0 ? o.duration * MIN_PLAY_FRACTION : 0);
   const q = rawDue != null
-    ? phraseStart(rawDue, o.beatLen, o.gridAnchor, o.downbeats)
+    ? phraseStart(rawDue, o.beatLen, o.gridAnchor, o.downbeats, floor)
     : { startAt: null as number | null, aligned: false };
   const due = forced || (q.startAt != null && o.currentTime >= q.startAt);
   const startAt = forced ? o.currentTime : q.startAt;

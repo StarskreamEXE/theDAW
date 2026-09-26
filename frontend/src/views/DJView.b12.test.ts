@@ -356,4 +356,66 @@ const {
   assert.ok(/preferHarmonic/.test(automix), 'behind a flag');
 }
 
+/* ───────────────── DJ-4R: the review rework (ticket DJ-4R) ───────────────── */
+{
+  const src = readFileSync(fileURLToPath(new URL('./DJView.tsx', import.meta.url)), 'utf8');
+  const code = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*/g, '');
+  const automix = src.slice(src.indexOf('// Automix (D7): auto-sequence'));
+  const intervalStart = automix.indexOf('const id = window.setInterval');
+  const interval = automix.slice(intervalStart, automix.indexOf('}, 500);', intervalStart));
+  const seed = automix.slice(automix.indexOf('const curEntry ='), intervalStart);
+  const pllStart = src.indexOf('if (!syncLock) return;');
+  const pll = src.slice(pllStart, src.indexOf('}, 350);', pllStart));
+  assert.ok(pll.includes('getStatus(follower)'), 'found the sync-lock PLL');
+
+  // 2 — the phrase grid gets the REAL downbeats DJ-3's rhythm store supplies.
+  assert.ok(/downbeats: outCtl\.downbeats/.test(interval),
+    'the plan is handed the outgoing deck\'s downbeats');
+  assert.ok(!/downbeats: null/.test(code(interval)),
+    'THE BUG: the plan was wired to a literal null, so phrase alignment never saw a real bar line');
+
+  // 3 — the PLL must not cancel a phase bend that is still running.
+  assert.ok(/hasPendingBend\(/.test(pll), 'the PLL asks the engine whether a bend is in flight');
+  const bendGuard = pll.indexOf('hasPendingBend(');
+  assert.ok(bendGuard >= 0 && bendGuard < pll.indexOf('setDeckPitch('),
+    'THE BUG: setDeckPitch cancels the bend, so the guard has to come first');
+
+  // 4 — a partly-delivered nudge is finished, not dropped.
+  const sync = src.slice(src.indexOf('const syncDeck = ('), src.indexOf('const syncDeckRef'));
+  assert.ok(/residualNudge\(/.test(sync), 'syncDeck measures what the nudge could not deliver');
+  assert.ok(!/^\s*djEngine\.nudgePhase\(follower, delta\);\s*$/m.test(code(sync)),
+    'THE BUG: the return value of nudgePhase was thrown away');
+  assert.ok(/nudgePhase\(/.test(pll), 'and the PLL applies the remainder on a later tick');
+
+  // 5 — a deck that never decodes must stop polling and say so.
+  assert.ok(/AUTOMIX_LOAD_TIMEOUT_MS/.test(seed), 'the seed poll has a hard give-up deadline');
+  assert.ok(/never finished loading/.test(seed), 'and tells the user why the set did not start');
+  assert.ok(seed.indexOf('AUTOMIX_LOAD_TIMEOUT_MS') < seed.indexOf('if (!st.hasBuffer'),
+    'THE BUG: the no-buffer branch returned before any deadline was ever checked');
+
+  // 6 — no cast onto a store field that does not exist.
+  assert.ok(!/as \{ preferHarmonic/.test(automix),
+    'THE BUG: preferHarmonic was read through a cast on a non-existent store field');
+  assert.ok(/PREFER_HARMONIC/.test(automix), 'a named local constant carries it until the store has one');
+
+  // 7 — the shared frozen empties cannot be mutated through the status type.
+  const engine = readFileSync(fileURLToPath(new URL('../state/djEngine.ts', import.meta.url)), 'utf8');
+  assert.ok(/stems: readonly string\[\]/.test(engine), 'DeckStatus.stems is readonly');
+  assert.ok(/stemLevels: Readonly<Record<string, number>>/.test(engine), 'DeckStatus.stemLevels is readonly');
+  assert.ok(!/NO_STEMS as string\[\]/.test(engine), 'THE BUG: the readonly empties were cast back to mutable');
+}
+
+/* djEngine.hasPendingBend — the accessor the PLL gates on, exercised directly.
+ * A deck that was never built has nothing scheduled, and asking must not
+ * build one (that would need an AudioContext). */
+{
+  const djEngine = await import('../state/djEngine.ts');
+  assert.equal(typeof djEngine.hasPendingBend, 'function', 'the accessor is exported');
+  assert.equal(djEngine.hasPendingBend('A'), false, 'an unbuilt deck has no bend in flight');
+  assert.equal(djEngine.hasPendingBend('B'), false);
+  // Asking did not construct a deck (which would have needed an AudioContext
+  // and thrown under plain tsx).
+  assert.equal(djEngine.getStatus('A').hasBuffer, false, 'and the deck is still unbuilt');
+}
+
 console.log('DJView.b12: ok');

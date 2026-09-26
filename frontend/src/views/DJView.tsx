@@ -56,7 +56,7 @@ import { useDjRhythmStore } from '../state/djRhythmStore';
 import { seedCues as computeSeedCues } from '../lib/djCueSeed';
 import { toCamelot, keyLabel } from '../lib/camelot';
 import { buildBeatgrid } from '../lib/beatgrid';
-import { chooseNextIndex, eqSwap, fadeStep, mixOutPoint, planTransition, tempoMatch } from '../lib/djAutomixPlan';
+import { chooseNextIndex, eqSwap, fadeStep, mixOutPoint, PHASE_DEADBAND_SEC, planTransition, residualNudge, tempoMatch } from '../lib/djAutomixPlan';
 import { rgb, rgba, type RGB } from '../lib/trackColor';
 import { DJSemanticWaveform } from '../components/audio/DJSemanticWaveform';
 import { SlideKnob } from '../components/audio/SlideKnob';
@@ -104,6 +104,11 @@ const KEYLOCK_PITCH_PCT = 3;
 /** How long the automix seed waits for the first track's analysis before
  *  starting it anyway (ms) — dead air is worse than an unmatched first bar. */
 const AUTOMIX_SEED_WAIT_MS = 3000;
+/** How long the automix seed keeps waiting for a deck to DECODE before giving
+ *  up entirely (ms). Separate from the analysis wait above: there is nothing
+ *  to start without audio, so that wait has no deadline of its own — which is
+ *  exactly how a dead URL used to poll every 150 ms for the whole session. */
+const AUTOMIX_LOAD_TIMEOUT_MS = 15000;
 const STOP_CUE_EPS = 0.05; // treat cue hits inside 50ms as "at this cue"
 
 /** Keeps a ref pointed at the LATEST `value` on every render, so a long-lived
@@ -693,9 +698,9 @@ const hasDeckLoadDragData = (event: React.DragEvent): boolean => {
 const importAudioFileToLibrary = (file: File): Promise<LibraryEntry> =>
   importAudioFile(file, DESKTOP_DROP_ORIGIN);
 
-const sameStringArray = (a: string[], b: string[]) =>
+const sameStringArray = (a: readonly string[], b: readonly string[]) =>
   a.length === b.length && a.every((v, i) => v === b[i]);
-const sameNumberRecord = (a: Record<string, number>, b: Record<string, number>) => {
+const sameNumberRecord = (a: Readonly<Record<string, number>>, b: Readonly<Record<string, number>>) => {
   const ak = Object.keys(a);
   const bk = Object.keys(b);
   return ak.length === bk.length && ak.every((k) => Math.abs((a[k] ?? 0) - (b[k] ?? 0)) < 0.0001);
@@ -739,8 +744,10 @@ function useDeck(deckId: djEngine.DeckId, entryId: string | null, hasTrack: bool
   const [slip, setSlipSt] = useState(false);
   const [decoding, setDecoding] = useState(false);
   const [keylock, setKeylockSt] = useState(false);
-  const [stemNames, setStemNames] = useState<string[]>(() => djEngine.getDeckStemNames(deckId));
-  const [stemLevels, setStemLevels] = useState<Record<string, number>>({});
+  // readonly: djEngine hands back a shared frozen empty when a deck has no
+  // stems (see DeckStatus), and these hold whatever it handed back.
+  const [stemNames, setStemNames] = useState<readonly string[]>(() => djEngine.getDeckStemNames(deckId));
+  const [stemLevels, setStemLevels] = useState<Readonly<Record<string, number>>>({});
   useEffect(() => djEngine.subscribe((sa, sb) => {
     const st = deckId === 'A' ? sa : sb;
     setLoopActiveSt((p) => (p === st.loopActive ? p : st.loopActive));
@@ -1290,8 +1297,12 @@ export const DJView: React.FC = () => {
       if (delta > interval / 2) delta -= interval;
       if (delta < -interval / 2) delta += interval;
       // Nudge the platter instead of seeking: seekDeck restarts the source
-      // node, which right after playDeck is an audible stutter/restart.
-      djEngine.nudgePhase(follower, delta);
+      // node, which right after playDeck is an audible stutter/restart. A big
+      // correction comes back short (the bend is bounded), so hand the
+      // remainder to the PLL rather than dropping it.
+      const delivered = djEngine.nudgePhase(follower, delta);
+      const owed = residualNudge(delta, delivered, PHASE_DEADBAND_SEC);
+      pendingNudgeRef.current = owed !== 0 ? { deck: follower, seconds: owed } : null;
     }
     setFlash(match.matched
       ? `BPM Sync: Deck ${follower} follows Deck ${master} at ${masterEffBpm.toFixed(1)} BPM${match.folded ? ' (half/double time)' : ''}`
@@ -1306,6 +1317,10 @@ export const DJView: React.FC = () => {
   // Read the CURRENT function through a ref instead (same pattern as
   // deckATrackRef below) so every tick beatmatches against live deck state.
   const syncDeckRef = useLatestRef(syncDeck);
+  // What a phase nudge could not deliver in one bend window (djEngine bounds
+  // both the bend and its length). The sync-lock PLL finishes it on a later
+  // tick; without this the decks sit permanently out of phase by the shortfall.
+  const pendingNudgeRef = useRef<{ deck: djEngine.DeckId; seconds: number } | null>(null);
   // Same reason, same pattern: the automix interval mounts once but needs LIVE
   // per-deck analysis (tempo + beatgrid), the live pitch range, and the DJ's
   // own low-EQ setting (the bass swap cuts RELATIVE to it, and must put it
@@ -1340,6 +1355,19 @@ export const DJView: React.FC = () => {
       const fs = djEngine.getStatus(follower);
       const ms = djEngine.getStatus(master);
       if (!fs.playing || !ms.playing) return;
+      // A phase bend is still running: the setDeckPitch below would cancel it
+      // (it must — a ramp back to the OLD rate would drag the deck there), so
+      // a tick landing inside the bend window threw most of the nudge away.
+      if (djEngine.hasPendingBend(follower)) return;
+      // Bend finished but came back short: finish the job before touching
+      // pitch again, and keep whatever is still owed after that.
+      const owed = pendingNudgeRef.current;
+      if (owed && owed.deck === follower) {
+        const done = djEngine.nudgePhase(follower, owed.seconds);
+        const left = residualNudge(owed.seconds, done, PHASE_DEADBAND_SEC);
+        pendingNudgeRef.current = left !== 0 ? { deck: follower, seconds: left } : null;
+        return;
+      }
       const mEff = mBpm * (1 + ms.pitchPct / 100);
       const base = tempoMatch(mEff, fBpm, pitchRange);
       let dPhase = beatPhase(ms.currentTime, mBeats) - beatPhase(fs.currentTime, fBeats);
@@ -1350,7 +1378,7 @@ export const DJView: React.FC = () => {
       djEngine.setDeckPitch(follower, pct);
       if (follower === 'A') setDeckAPitch(pct); else setDeckBPitch(pct);
     }, 350);
-    return () => window.clearInterval(id);
+    return () => { window.clearInterval(id); pendingNudgeRef.current = null; };
   }, [syncLock, aData, bData, pitchRange]);
 
   const onPitch = (which: djEngine.DeckId, v: number) => {
@@ -1531,6 +1559,10 @@ export const DJView: React.FC = () => {
       entryId ? seqEntries().find((e) => e.entryId === entryId)?.perf : undefined;
     const list = seq();
     if (list.length < AUTO_DJ_MIN_TRACKS) { setFlash(`Automix needs an active set with ≥${AUTO_DJ_MIN_TRACKS} tracks`); setAutomixOn(false); return; }
+    // Harmonic next-track preference. Lives here as a named constant until
+    // `preferHarmonic` exists on djAutomixStore (outside this ticket's write
+    // set); swap this for the store selector when it lands.
+    const PREFER_HARMONIC = true;
     const other = (d: djEngine.DeckId): djEngine.DeckId => (d === 'A' ? 'B' : 'A');
     const loadOnto = (d: djEngine.DeckId, entryId: string) => (d === 'A' ? setDeckATrack : setDeckBTrack)(entryId);
     /** Camelot code for a set entry, from the shared analysis store. */
@@ -1544,18 +1576,14 @@ export const DJView: React.FC = () => {
       const i = entryId ? l.indexOf(entryId) : -1;
       // Harmonic preference (fix 10): with room to spare, skip a key clash
       // straight ahead for the nearest compatible track. Strict set order
-      // otherwise — and whenever the flag is off. The flag lives in
-      // djAutomixStore (outside this ticket's write set): read defensively so
-      // it turns the behaviour off the moment the field exists, and defaults
-      // ON until then.
-      const preferHarmonic = (useDjAutomix.getState() as { preferHarmonic?: boolean }).preferHarmonic !== false;
+      // otherwise — and whenever the flag is off.
       const idx = chooseNextIndex({
         // A deck holding a track that is not in the set has always meant
         // "track 1 is playing" here — keep that, don't restart the set.
         fromIndex: i >= 0 ? i : 0,
         candidates: l.map((id) => ({ camelot: camelotOf(id) })),
         currentCamelot: camelotOf(entryId),
-        preferHarmonic,
+        preferHarmonic: PREFER_HARMONIC,
       });
       return idx != null ? l[idx] ?? null : null;
     };
@@ -1580,13 +1608,21 @@ export const DJView: React.FC = () => {
       // its first beat, with no grid and no tempo — and the first transition
       // out of it would then be unmatched. Wait for the tempo (up to
       // AUTOMIX_SEED_WAIT_MS), then start on the first beat.
-      const seedDeadline = performance.now() + AUTOMIX_SEED_WAIT_MS;
+      const seedStart = performance.now();
+      const seedDeadline = seedStart + AUTOMIX_SEED_WAIT_MS;
+      const loadDeadline = seedStart + AUTOMIX_LOAD_TIMEOUT_MS;
       seedPoll = window.setInterval(() => {
         const st = djEngine.getStatus(current);
-        if (!st.hasBuffer || st.decoding || st.playing) {
-          // No audio yet: keep waiting regardless of the deadline — there is
-          // nothing to start. (If it is already playing, someone beat us.)
-          if (st.playing) { window.clearInterval(seedPoll); seedPoll = 0; }
+        if (st.playing) { window.clearInterval(seedPoll); seedPoll = 0; return; } // someone beat us to it
+        if (!st.hasBuffer || st.decoding) {
+          // No audio yet. There is nothing to start, so this wait has no
+          // ANALYSIS deadline — but it does need an end: a dead URL or a
+          // failed decode used to poll every 150 ms for the whole session.
+          if (performance.now() >= loadDeadline) {
+            window.clearInterval(seedPoll);
+            seedPoll = 0;
+            setFlash(`Automix: Deck ${current} never finished loading`);
+          }
           return;
         }
         const ctl = current === 'A' ? ctlARef.current : ctlBRef.current;
@@ -1656,9 +1692,10 @@ export const DJView: React.FC = () => {
             beatLen: outBeatLen,
             playing: outPlaying,
             mixOut: outPerf?.mixOut,
-            // Detected downbeats come from the rhythm store later; the grid
-            // anchor is the phrase reference until then.
-            downbeats: null,
+            // Real bar lines when djRhythmStore has them cached (DJ-3), so a
+            // blend starts on an actual phrase and not merely on a 16-beat
+            // multiple of the grid anchor; null falls back to the grid.
+            downbeats: outCtl.downbeats,
           },
           incoming: { bpm: inCtl.bpm, hasBuffer: inHasBuffer, cueIn: inPerf?.cueIn },
           fadeSec: outPerf?.transitionSec != null && outPerf.transitionSec > 0 ? outPerf.transitionSec : AUTOMIX_XFADE,
@@ -2237,7 +2274,7 @@ const STEM_MIXER_KNOB_SLOT_LIST = [
   STEM_MIXER_KNOB_SLOTS.lo,
   STEM_MIXER_KNOB_SLOTS.flt,
 ] as const;
-const findStemForSlot = (names: string[], aliases: readonly string[]) => {
+const findStemForSlot = (names: readonly string[], aliases: readonly string[]) => {
   const norm = (s: string) => s.toLowerCase().replace(/[_-]+/g, ' ').trim();
   const normalized = names.map((name) => ({ name, key: norm(name) }));
   return aliases

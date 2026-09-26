@@ -55,8 +55,11 @@ export interface DeckStatus {
   slip: boolean;
   pitchPct: number;
   keylock: boolean;
-  stems: string[]; // loaded stem names (D4); empty = full-track mode
-  stemLevels: Record<string, number>; // per-stem live gains, 0 = muted, 1 = full
+  // Readonly: the no-stems case hands back one shared frozen empty rather
+  // than allocating per frame (see statusOf), so the type must not let a
+  // caller write into what every other deck/frame is also reading.
+  stems: readonly string[]; // loaded stem names (D4); empty = full-track mode
+  stemLevels: Readonly<Record<string, number>>; // per-stem live gains, 0 = muted, 1 = full
 }
 
 export type DjFx = 'flanger' | 'reverb' | 'wahwah';
@@ -425,7 +428,7 @@ const blankStatus = (): DeckStatus => ({
   loadedUrl: null, label: null, playing: false, decoding: false, hasBuffer: false,
   currentTime: 0, duration: 0, ctxTime: 0, loopActive: false, loopIn: null, loopOut: null,
   slip: false, pitchPct: 0, keylock: false,
-  stems: NO_STEMS as string[], stemLevels: NO_STEM_LEVELS as Record<string, number>,
+  stems: NO_STEMS, stemLevels: NO_STEM_LEVELS,
 });
 
 /** One reusable status object per deck, rewritten in place.
@@ -466,10 +469,10 @@ function statusOf(id: DeckId): DeckStatus {
   out.pitchPct = d.pitchPct;
   out.keylock = d.keylock;
   // Skip both containers entirely in full-track mode (the usual case).
-  out.stems = d.stems ? d.stems.map((s) => s.name) : (NO_STEMS as string[]);
+  out.stems = d.stems ? d.stems.map((s) => s.name) : NO_STEMS;
   out.stemLevels = d.stems
     ? Object.fromEntries(d.stems.map((s) => [s.name, s.level]))
-    : (NO_STEM_LEVELS as Record<string, number>);
+    : NO_STEM_LEVELS;
   return out;
 }
 
@@ -763,6 +766,19 @@ export function nudgePhase(id: DeckId, seconds: number): number {
   }, want * 1000);
   emit();
   return delivered;
+}
+
+/**
+ * True while a phase nudge's rate bend is still scheduled on this deck.
+ *
+ * `setDeckPitch` cancels a bend — it has to, a ramp back to the OLD rate would
+ * drag the deck there a moment after the new pitch is set. That makes the
+ * sync-lock PLL (which writes the pitch every 350 ms) lethal to a nudge: a
+ * tick landing inside the bend window wipes out most of the correction the
+ * nudge was scheduled to deliver. The PLL gates on this instead of guessing.
+ */
+export function hasPendingBend(id: DeckId): boolean {
+  return decks[id]?.transportRamp?.kind === 'bend';
 }
 
 const _stretchPending: Partial<Record<DeckId, boolean>> = {};
