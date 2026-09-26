@@ -273,4 +273,87 @@ const {
   mock.timers.reset();
 }
 
+/* ───────────────── source: the DJ-4 automix rewire (ticket DJ-4) ─────────────────
+ * The automix sequencer is a `setInterval` inside a 3,500-line view that needs
+ * the whole DJ store/engine graph to render, so its DECISIONS were extracted
+ * into `lib/djAutomixPlan.ts` and are tested there, behaviourally, branch by
+ * branch. What cannot be reached that way is the WIRING: that the interval
+ * actually calls the engine with what the plan returned. Each assertion below
+ * fails against the pre-DJ-4 DJView.tsx, which is what makes it worth having.
+ */
+{
+  const src = readFileSync(fileURLToPath(new URL('./DJView.tsx', import.meta.url)), 'utf8');
+  // Comments describe the bugs being fixed BY NAME, so every "this must no
+  // longer appear" assertion runs on comment-stripped source.
+  const code = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*/g, '');
+  const automix = src.slice(src.indexOf('// Automix (D7): auto-sequence'));
+  assert.ok(automix.length > 1000, 'found the automix effect');
+  const intervalStart = automix.indexOf('const id = window.setInterval');
+  const interval = automix.slice(intervalStart, automix.indexOf('}, 500);', intervalStart));
+  assert.ok(interval.length > 500, 'found the 500 ms automix tick');
+  const seed = automix.slice(automix.indexOf('const curEntry ='), automix.indexOf('const id = window.setInterval'));
+
+  // fix 1 — the bass swap runs on every tick of the fade, per deck.
+  assert.ok(/eqSwap\(progress\)/.test(interval), 'the fade computes an EQ swap from its progress');
+  assert.ok(/setDeckEq\((cur|nxt), 'low'/.test(interval), 'and pushes it to the deck EQ (setDeckEq was never called here before)');
+  assert.equal((interval.match(/setDeckEq\(/g) ?? []).length >= 4, true,
+    'both decks during the fade, and both restored when it finishes');
+
+  // fix 2 — phase alignment nudges the platter; it never re-seeks (which
+  // rebuilds the AudioBufferSourceNode and is audible as a restart).
+  const sync = src.slice(src.indexOf('const syncDeck = ('), src.indexOf('const syncDeckRef'));
+  assert.ok(sync.includes('djEngine.nudgePhase('), 'syncDeck nudges phase');
+  assert.ok(!code(sync).includes('djEngine.seekDeck('), 'THE BUG: syncDeck must not seek to phase-align');
+  assert.ok(sync.indexOf('djEngine.setDeckPitch(') < sync.indexOf('const ms = djEngine.getStatus(master)'),
+    'the positions used for the phase error are read AFTER the pitch change re-anchors them');
+
+  // fix 3 — the sync-lock PLL is armed by automix, and released on the swap.
+  assert.ok(/setSyncLock\(nxt\)/.test(interval), 'the transition arms the PLL on the incoming deck');
+  assert.ok(/setSyncLock\(null\)/.test(interval), 'and clears it when the decks swap');
+
+  // fix 4/5 — honest messaging, and key-lock on a real pull.
+  assert.ok(/NOT beatmatched/.test(sync), 'syncDeck says so when the pitch range cannot deliver the match');
+  assert.ok(/mixing unmatched/.test(interval), 'the automix flash says so too');
+  assert.ok(/setDeckKeylock\(nxt, true\)/.test(interval), 'key-lock engages for the automix follower');
+  assert.ok(/setDeckKeylock\(follower, true\)/.test(sync), 'and for a manual SYNC');
+  assert.ok(/KEYLOCK_PITCH_PCT/.test(interval) && /KEYLOCK_PITCH_PCT/.test(sync), 'both off the same threshold');
+
+  // fix 9 — phase comes off the constant beatgrid, never the raw beats.
+  assert.ok(!/\.a\?\.beats/.test(code(sync)), 'THE BUG: raw analysis beats drift; syncDeck uses gridBeats');
+  assert.ok(sync.includes('followerCtl.gridBeats') && sync.includes('masterCtl.gridBeats'));
+
+  // The interval's clock is the audio clock.
+  assert.ok(/const now = cs\.ctxTime/.test(interval), 'the fade is timed off the AudioContext clock');
+  assert.ok(!/performance\.now\(\)/.test(code(interval)), 'THE BUG: performance.now() skews against the audio it is fading');
+
+  // fix 7 — the fade always lands exactly on its destination.
+  assert.ok(/applyCrossfade\(fadeStep\(/.test(interval), 'the fader position comes from fadeStep');
+  assert.ok(/applyCrossfade\(mix\.fadeTo\)/.test(interval), 'and the swap branch writes the destination outright');
+
+  // fix 8/11 — the seed block owns both the fader normalisation and the wait
+  // for analysis before the first track starts.
+  assert.ok(/applyCrossfade\(current === 'A' \? -1 : 1\)/.test(seed),
+    'the crossfader is normalised where the deck is seeded, so the manual toggle gets it too');
+  assert.ok(/AUTOMIX_SEED_WAIT_MS/.test(seed), 'the seed waits for analysis (bounded)');
+  assert.ok(/ctl\.firstBeat/.test(seed), 'and starts the first track on its first beat, not at 0');
+  assert.ok(!/pendingPlayRef/.test(code(seed)), 'THE BUG: pendingPlayRef punched play the instant the buffer decoded');
+  // Both `pendingStart`/`pendingStop` selectors are declared before either
+  // effect, so the bridge slice has to run to the next section, not to the
+  // second selector (which would make the assertion below vacuous).
+  const bridge = src.slice(src.indexOf('const automixPendingStart'), src.indexOf('// Deck-load bridge'));
+  assert.ok(bridge.includes('consumeStart()'), 'found the Send-to-DJ bridge effect');
+  assert.ok(!/applyCrossfade\(-1\)/.test(code(bridge)), 'the bridge no longer normalises the fader on its own');
+
+  // Teardown: switching automix off mid-blend restores the bass it cut and
+  // releases the sync-lock it armed (nothing else ever would).
+  const teardown = automix.slice(automix.indexOf('return () => {', intervalStart));
+  assert.ok(/setDeckEq\('A', 'low'/.test(teardown) && /setDeckEq\('B', 'low'/.test(teardown),
+    'the effect teardown puts both decks\' low EQ back');
+  assert.ok(/setSyncLock\(null\)/.test(teardown), 'and drops the PLL it armed');
+
+  // fix 10 — the next track may be chosen harmonically.
+  assert.ok(/chooseNextIndex\(/.test(automix), 'the next track goes through the harmonic chooser');
+  assert.ok(/preferHarmonic/.test(automix), 'behind a flag');
+}
+
 console.log('DJView.b12: ok');

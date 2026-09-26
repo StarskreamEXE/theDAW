@@ -56,6 +56,7 @@ import { useDjRhythmStore } from '../state/djRhythmStore';
 import { seedCues as computeSeedCues } from '../lib/djCueSeed';
 import { toCamelot, keyLabel } from '../lib/camelot';
 import { buildBeatgrid } from '../lib/beatgrid';
+import { chooseNextIndex, eqSwap, fadeStep, mixOutPoint, planTransition, tempoMatch } from '../lib/djAutomixPlan';
 import { rgb, rgba, type RGB } from '../lib/trackColor';
 import { DJSemanticWaveform } from '../components/audio/DJSemanticWaveform';
 import { SlideKnob } from '../components/audio/SlideKnob';
@@ -96,6 +97,13 @@ const STEM_PAD_SLOTS = 6;
 const AUTO_GAIN_TARGET_DB = -12;
 const AUTOMIX_TAIL = 18;   // s before a track ends to begin the blend
 const AUTOMIX_XFADE = 10;  // s the auto-crossfade takes
+const AUTOMIX_RESCUE_XFADE = 1; // s — dead-air rescue: the outgoing deck is already silent
+/** Pitch (%) past which a beatmatch needs key-lock. ~3 % is half a semitone;
+ *  beyond that a "harmonic" Camelot pair audibly is not one any more. */
+const KEYLOCK_PITCH_PCT = 3;
+/** How long the automix seed waits for the first track's analysis before
+ *  starting it anyway (ms) — dead air is worse than an unmatched first bar. */
+const AUTOMIX_SEED_WAIT_MS = 3000;
 const STOP_CUE_EPS = 0.05; // treat cue hits inside 50ms as "at this cue"
 
 /** Keeps a ref pointed at the LATEST `value` on every render, so a long-lived
@@ -116,8 +124,15 @@ export function useLatestRef<T>(value: T): React.RefObject<T> {
  *  present; otherwise it's due `tailSec` before the outgoing track ends. The
  *  assistant's "transition NOW" request (`pendingTransition`) jumps the blend
  *  early. Either way, the incoming deck must actually have a decoded buffer
- *  and the outgoing deck must be playing, or there is nothing to blend. Pure
- *  so the automix interval's decision is testable without the engine. */
+ *  and the outgoing deck must be playing, or there is nothing to blend.
+ *
+ *  This is the BARE due rule. The automix interval itself now runs on
+ *  `planTransition` (lib/djAutomixPlan), which quantises the same point
+ *  (`mixOutPoint`, shared with this function so the two cannot disagree) down
+ *  to a 16-beat phrase, refuses to mix into a track whose tempo is still
+ *  unknown, and rescues the dead-air case this predicate cannot express — a
+ *  stopped outgoing deck is never "due" here, yet that is exactly when the
+ *  incoming track must start. */
 export function automixTransitionDue(args: {
   playing: boolean;
   currentTime: number;
@@ -128,10 +143,8 @@ export function automixTransitionDue(args: {
   incomingHasBuffer: boolean;
 }): boolean {
   if (!args.playing || !args.incomingHasBuffer) return false;
-  const due = args.mixOut != null
-    ? args.currentTime >= args.mixOut
-    : args.duration > 0 && args.duration - args.currentTime <= args.tailSec;
-  return due || args.pendingTransition;
+  const point = mixOutPoint({ duration: args.duration, mixOut: args.mixOut }, args.tailSec);
+  return (point != null && args.currentTime >= point) || args.pendingTransition;
 }
 
 /** One djEngine call the automix transition into `nxt` must make, in order. */
@@ -1237,11 +1250,13 @@ export const DJView: React.FC = () => {
   };
 
   const syncDeck = (which: djEngine.DeckId): djEngine.DeckId | null => {
-    const aStatus = djEngine.getStatus('A');
-    const bStatus = djEngine.getStatus('B');
-    const oneDeckPlaying = aStatus.playing !== bStatus.playing;
+    // djEngine reuses one status object per deck (see statusOf), so these are
+    // live views, not snapshots — read what must not change into consts.
+    const aPlaying = djEngine.getStatus('A').playing;
+    const bPlaying = djEngine.getStatus('B').playing;
+    const oneDeckPlaying = aPlaying !== bPlaying;
     const follower: djEngine.DeckId = oneDeckPlaying
-      ? (aStatus.playing ? 'B' : 'A')
+      ? (aPlaying ? 'B' : 'A')
       : which;
     const master: djEngine.DeckId = follower === 'A' ? 'B' : 'A';
 
@@ -1252,24 +1267,35 @@ export const DJView: React.FC = () => {
     if (!followerBpm || !masterBpm) return null;
     const masterPitch = master === 'A' ? deckAPitch : deckBPitch;
     const masterEffBpm = masterBpm * (1 + masterPitch / 100);
-    let rate = masterEffBpm / followerBpm;
-    while (rate > Math.SQRT2) rate /= 2;
-    while (rate < Math.SQRT1_2) rate *= 2;
-    const pct = clampToPitchRange((rate - 1) * 100);
+    // The ±range clamp used to happen silently: a pair the fader cannot reach
+    // (140 → 95 BPM needs −26 %) was pitched to the limit and still announced
+    // as a sync. tempoMatch reports the truncation so the flash can be honest.
+    const match = tempoMatch(masterEffBpm, followerBpm, pitchRange);
+    const pct = match.pct;
     if (follower === 'A') setDeckAPitch(pct); else setDeckBPitch(pct);
     djEngine.setDeckPitch(follower, pct);
-    const followerBeats = followerCtl.a?.beats ?? null;
-    const masterBeats = masterCtl.a?.beats ?? null;
-    const masterStatus = master === 'A' ? aStatus : bStatus;
-    const followerStatus = follower === 'A' ? aStatus : bStatus;
-    if (followerBeats && masterBeats && masterStatus.playing && followerStatus.playing) {
-      const interval = 60 / (followerBpm * rate);
-      let delta = (beatPhase(masterStatus.currentTime, masterBeats) - beatPhase(followerStatus.currentTime, followerBeats)) * interval;
+    // Key-lock above a few percent: a 6 % pull is ~1 semitone of pitch shift,
+    // which turns a "harmonic" Camelot match into a clash the listener hears.
+    if (Math.abs(pct) > KEYLOCK_PITCH_PCT) void djEngine.setDeckKeylock(follower, true);
+    // Phase off the CONSTANT beatgrid, not the jittery raw beats — and read
+    // both decks AFTER setDeckPitch, which re-anchors the follower's position
+    // clock (the old code measured against a position captured before it).
+    const followerBeats = followerCtl.gridBeats;
+    const masterBeats = masterCtl.gridBeats;
+    const ms = djEngine.getStatus(master);
+    const fs = djEngine.getStatus(follower);
+    if (followerBeats && masterBeats && ms.playing && fs.playing) {
+      const interval = 60 / (followerBpm * match.rate);
+      let delta = (beatPhase(ms.currentTime, masterBeats) - beatPhase(fs.currentTime, followerBeats)) * interval;
       if (delta > interval / 2) delta -= interval;
       if (delta < -interval / 2) delta += interval;
-      djEngine.seekDeck(follower, followerStatus.currentTime + delta);
+      // Nudge the platter instead of seeking: seekDeck restarts the source
+      // node, which right after playDeck is an audible stutter/restart.
+      djEngine.nudgePhase(follower, delta);
     }
-    setFlash(`BPM Sync: Deck ${follower} follows Deck ${master} at ${masterEffBpm.toFixed(1)} BPM`);
+    setFlash(match.matched
+      ? `BPM Sync: Deck ${follower} follows Deck ${master} at ${masterEffBpm.toFixed(1)} BPM${match.folded ? ' (half/double time)' : ''}`
+      : `Deck ${follower}: ${masterEffBpm.toFixed(1)} BPM needs more than ±${pitchRange}% — NOT beatmatched`);
     return follower;
   };
   // syncDeck closes over ctlA/ctlB/deckAPitch/deckBPitch, so it is redefined
@@ -1280,6 +1306,14 @@ export const DJView: React.FC = () => {
   // Read the CURRENT function through a ref instead (same pattern as
   // deckATrackRef below) so every tick beatmatches against live deck state.
   const syncDeckRef = useLatestRef(syncDeck);
+  // Same reason, same pattern: the automix interval mounts once but needs LIVE
+  // per-deck analysis (tempo + beatgrid), the live pitch range, and the DJ's
+  // own low-EQ setting (the bass swap cuts RELATIVE to it, and must put it
+  // back afterwards rather than snapping the band to 0).
+  const ctlARef = useLatestRef(ctlA);
+  const ctlBRef = useLatestRef(ctlB);
+  const pitchRangeRef = useLatestRef(pitchRange);
+  const eqLowRef = useLatestRef({ A: eqA.low, B: eqB.low });
   const toggleSyncLock = (which: djEngine.DeckId) => {
     const synced = syncDeck(which);
     if (!synced) return;
@@ -1295,8 +1329,10 @@ export const DJView: React.FC = () => {
     const follower = syncLock;
     const fBpm = (follower === 'A' ? aData : bData)?.bpm ?? null;
     const mBpm = (follower === 'A' ? bData : aData)?.bpm ?? null;
-    const fBeats = (follower === 'A' ? aData : bData)?.beats ?? null;
-    const mBeats = (follower === 'A' ? bData : aData)?.beats ?? null;
+    // Constant beatgrid, not raw analysis beats: a dropped/jittery detected
+    // beat throws the phase error and the PLL chases the jitter (fix 9).
+    const fBeats = (follower === 'A' ? ctlA : ctlB).gridBeats;
+    const mBeats = (follower === 'A' ? ctlB : ctlA).gridBeats;
     if (!fBpm || !mBpm || !fBeats || !mBeats) return;
     const KP = 12, MAX_BEND = 4, DEADBAND = 0.02;
     const master: djEngine.DeckId = follower === 'A' ? 'B' : 'A';
@@ -1305,14 +1341,12 @@ export const DJView: React.FC = () => {
       const ms = djEngine.getStatus(master);
       if (!fs.playing || !ms.playing) return;
       const mEff = mBpm * (1 + ms.pitchPct / 100);
-      let rate = mEff / fBpm;
-      while (rate > Math.SQRT2) rate /= 2;
-      while (rate < Math.SQRT1_2) rate *= 2;
+      const base = tempoMatch(mEff, fBpm, pitchRange);
       let dPhase = beatPhase(ms.currentTime, mBeats) - beatPhase(fs.currentTime, fBeats);
       if (dPhase > 0.5) dPhase -= 1;
       if (dPhase < -0.5) dPhase += 1;
       const bend = Math.abs(dPhase) > DEADBAND ? Math.max(-MAX_BEND, Math.min(MAX_BEND, dPhase * KP)) : 0;
-      const pct = clampToPitchRange((rate - 1) * 100 + bend);
+      const pct = clampToPitchRange(base.pct + bend);
       djEngine.setDeckPitch(follower, pct);
       if (follower === 'A') setDeckAPitch(pct); else setDeckBPitch(pct);
     }, 350);
@@ -1456,7 +1490,9 @@ export const DJView: React.FC = () => {
     useDjAutomix.getState().consumeStart();
     useDjAutomix.getState().consumeTransition(); // drop a stale "transition now" so the restart doesn't blend off track 1
     ejectDeck('A'); ejectDeck('B');            // clear decks so the sequencer seeds from track 1
-    applyCrossfade(-1);                        // full Deck A — the seed loads track 1 there; a parked +1 would mute it
+    // The crossfade normalisation moved into the automix seed block below, so
+    // the manual Automix toggle gets it too (it never did — a parked fader
+    // silenced the deck the seed had just loaded).
     setAutomixOn(true);
     setAutomixRestart((n) => n + 1);           // re-run the automix effect for a fresh seed even if already on
   }, [automixPendingStart]);
@@ -1497,11 +1533,31 @@ export const DJView: React.FC = () => {
     if (list.length < AUTO_DJ_MIN_TRACKS) { setFlash(`Automix needs an active set with ≥${AUTO_DJ_MIN_TRACKS} tracks`); setAutomixOn(false); return; }
     const other = (d: djEngine.DeckId): djEngine.DeckId => (d === 'A' ? 'B' : 'A');
     const loadOnto = (d: djEngine.DeckId, entryId: string) => (d === 'A' ? setDeckATrack : setDeckBTrack)(entryId);
+    /** Camelot code for a set entry, from the shared analysis store. */
+    const camelotOf = (entryId: string | null): string | null => {
+      if (!entryId) return null;
+      const data = useDjAnalysisStore.getState().byId[entryId]?.data;
+      return data ? toCamelot(data.key, data.scale)?.code ?? null : null;
+    };
     const nextEntryIdAfter = (entryId: string | null): string | null => {
       const l = seq();
       const i = entryId ? l.indexOf(entryId) : -1;
-      const ni = i >= 0 ? i + 1 : 1;
-      return ni < l.length ? l[ni] : null;
+      // Harmonic preference (fix 10): with room to spare, skip a key clash
+      // straight ahead for the nearest compatible track. Strict set order
+      // otherwise — and whenever the flag is off. The flag lives in
+      // djAutomixStore (outside this ticket's write set): read defensively so
+      // it turns the behaviour off the moment the field exists, and defaults
+      // ON until then.
+      const preferHarmonic = (useDjAutomix.getState() as { preferHarmonic?: boolean }).preferHarmonic !== false;
+      const idx = chooseNextIndex({
+        // A deck holding a track that is not in the set has always meant
+        // "track 1 is playing" here — keep that, don't restart the set.
+        fromIndex: i >= 0 ? i : 0,
+        candidates: l.map((id) => ({ camelot: camelotOf(id) })),
+        currentCamelot: camelotOf(entryId),
+        preferHarmonic,
+      });
+      return idx != null ? l[idx] ?? null : null;
     };
     const loadNextAfter = (entryId: string | null, onto: djEngine.DeckId) => {
       const nextId = nextEntryIdAfter(entryId);
@@ -1511,7 +1567,39 @@ export const DJView: React.FC = () => {
     // Init: current = a playing deck, else Deck A seeded with the first track.
     const current: djEngine.DeckId = djEngine.getStatus('A').playing ? 'A' : djEngine.getStatus('B').playing ? 'B' : 'A';
     const curEntry = current === 'A' ? deckATrackRef.current : deckBTrackRef.current;
-    if (!curEntry) { loadOnto(current, list[0]); pendingPlayRef.current = current; }
+    let seedPoll = 0;
+    if (!curEntry) {
+      loadOnto(current, list[0]);
+      // Crossfade normalisation belongs HERE, with the seed (fix 11): every
+      // path into automix seeds a deck — the "Send to DJ" bridge AND the
+      // manual toggle — and a fader parked at the far side silences the deck
+      // the seed just loaded. Doing it in the bridge effect only fixed one.
+      applyCrossfade(current === 'A' ? -1 : 1);
+      // First track (fix 8): do NOT punch play the instant the buffer decodes.
+      // Analysis lands a moment later, so the track would start at 0 — before
+      // its first beat, with no grid and no tempo — and the first transition
+      // out of it would then be unmatched. Wait for the tempo (up to
+      // AUTOMIX_SEED_WAIT_MS), then start on the first beat.
+      const seedDeadline = performance.now() + AUTOMIX_SEED_WAIT_MS;
+      seedPoll = window.setInterval(() => {
+        const st = djEngine.getStatus(current);
+        if (!st.hasBuffer || st.decoding || st.playing) {
+          // No audio yet: keep waiting regardless of the deadline — there is
+          // nothing to start. (If it is already playing, someone beat us.)
+          if (st.playing) { window.clearInterval(seedPoll); seedPoll = 0; }
+          return;
+        }
+        const ctl = current === 'A' ? ctlARef.current : ctlBRef.current;
+        const analyzed = ctl.bpm != null;
+        if (!analyzed && performance.now() < seedDeadline) return;
+        window.clearInterval(seedPoll);
+        seedPoll = 0;
+        const firstBeat = ctl.firstBeat ?? (ctl.gridBeats?.[0] ?? null);
+        if (analyzed && firstBeat != null && firstBeat > 0.02) djEngine.seekDeck(current, firstBeat);
+        djEngine.playDeck(current);
+        if (!analyzed) setFlash('Automix: starting before analysis landed — first mix may be unmatched');
+      }, 150);
+    }
     automixRef.current = { current, fading: false, fadeStart: 0, fadeFrom: 0, fadeTo: 0, fadeSec: AUTOMIX_XFADE };
     useDjAutomix.getState().setNowPlaying(curEntry ?? list[0]);
     loadNextAfter(curEntry ?? list[0], other(current));
@@ -1522,9 +1610,27 @@ export const DJView: React.FC = () => {
       if (!mix) return;
       const cur = mix.current;
       const nxt = other(cur);
+      // djEngine hands back one reused status object per deck, and every
+      // engine call below rewrites it — read the fields that must not move
+      // under us into consts first.
       const cs = djEngine.getStatus(cur);
       const ns = djEngine.getStatus(nxt);
-      const now = performance.now();
+      const outPos = cs.currentTime;
+      const outDur = cs.duration;
+      const outPlaying = cs.playing;
+      const outPitchPct = cs.pitchPct;
+      const inHasBuffer = ns.hasBuffer;
+      // The AudioContext clock, not performance.now(): a fade timed off the
+      // wall clock drifts against the audio it is fading whenever the tab is
+      // throttled, and the interval's own 500 ms cadence is not reliable.
+      const now = cs.ctxTime;
+      const outCtl = cur === 'A' ? ctlARef.current : ctlBRef.current;
+      const inCtl = nxt === 'A' ? ctlARef.current : ctlBRef.current;
+      // The constant grid's phase + spacing: gridBeats[0] IS the grid anchor
+      // (buildBeatgrid emits from it), and beatLen is its interval.
+      const outGrid = outCtl.gridBeats;
+      const outAnchor = outGrid && outGrid.length > 0 ? outGrid[0] : null;
+      const outBeatLen = outCtl.beatLen ?? (outGrid && outGrid.length > 1 ? outGrid[1] - outGrid[0] : null);
       if (!mix.fading) {
         const outEntry = cur === 'A' ? deckATrackRef.current : deckBTrackRef.current;
         // Reconcile the idle deck every tick: a mid-show reorder (assistant
@@ -1532,23 +1638,36 @@ export const DJView: React.FC = () => {
         // holds the right track.
         loadNextAfter(outEntry, nxt);
         const outPerf = perfOf(outEntry);
+        const incomingEntryId = nextEntryIdAfter(outEntry);
+        const inPerf = incomingEntryId ? perfOf(incomingEntryId) : undefined;
         // Prepared sets carry an exact mix-out point on the OUTGOING track;
-        // classic sets use the fixed distance-from-end rule. Assistant
-        // override: "transition NOW" jumps the blend regardless of the
-        // prepared mix-out point (consumed only once it can actually act).
-        const shouldTransition = automixTransitionDue({
-          playing: cs.playing,
-          currentTime: cs.currentTime,
-          duration: cs.duration,
-          mixOut: outPerf?.mixOut,
+        // classic sets use the fixed distance-from-end rule. Either way the
+        // plan quantises it DOWN to a 16-beat phrase boundary, refuses to mix
+        // into a track whose tempo is still unknown (until the outgoing one is
+        // nearly gone), and starts immediately when the outgoing deck already
+        // ran out — the old predicate answered "not due" forever in that case
+        // and the set played to silence. Assistant override: "transition NOW".
+        const plan = planTransition({
+          outgoing: {
+            currentTime: outPos,
+            duration: outDur,
+            bpm: outCtl.bpm,
+            gridAnchor: outAnchor,
+            beatLen: outBeatLen,
+            playing: outPlaying,
+            mixOut: outPerf?.mixOut,
+            // Detected downbeats come from the rhythm store later; the grid
+            // anchor is the phrase reference until then.
+            downbeats: null,
+          },
+          incoming: { bpm: inCtl.bpm, hasBuffer: inHasBuffer, cueIn: inPerf?.cueIn },
+          fadeSec: outPerf?.transitionSec != null && outPerf.transitionSec > 0 ? outPerf.transitionSec : AUTOMIX_XFADE,
           tailSec: AUTOMIX_TAIL,
-          pendingTransition: useDjAutomix.getState().pendingTransition,
-          incomingHasBuffer: ns.hasBuffer,
+          now,
+          forced: useDjAutomix.getState().pendingTransition,
         });
-        if (shouldTransition) {
+        if (plan.start) {
           useDjAutomix.getState().consumeTransition();
-          const incomingEntryId = nextEntryIdAfter(outEntry);
-          const inPerf = incomingEntryId ? perfOf(incomingEntryId) : undefined;
           // Dispatches automixTransitionSteps' order verbatim — seek, then
           // play, THEN sync — rather than three calls written out by hand,
           // so the tested order and the executed order can never drift
@@ -1558,20 +1677,55 @@ export const DJView: React.FC = () => {
           // dispatched before `play`, the incoming deck always reads
           // not-playing there, so only the tempo (pitch) half of the
           // beatmatch would ever apply and phase never would.
-          for (const step of automixTransitionSteps(nxt, inPerf?.cueIn ?? 0)) {
+          for (const step of automixTransitionSteps(nxt, plan.cueIn)) {
             if (step.type === 'seek') djEngine.seekDeck(step.deck, step.to);
             else if (step.type === 'play') djEngine.playDeck(step.deck);
             else syncDeckRef.current(step.deck);   // via ref: see syncDeckRef
           }
+          // Hold the beatmatch for the whole blend (fix 3): syncDeck matches
+          // tempo + phase ONCE, and two decoded buffers at slightly different
+          // real tempos drift apart audibly over a 10 s fade. The sync-lock
+          // PLL already exists — automix just never armed it, because only the
+          // user's SYNC-LOCK button ever did.
+          setSyncLock(nxt);
+          // Key-lock the follower when the match needed a real pull (fix 5).
+          const followerPitch = djEngine.getStatus(nxt).pitchPct;
+          if (Math.abs(followerPitch) > KEYLOCK_PITCH_PCT) void djEngine.setDeckKeylock(nxt, true);
           mix.fading = true; mix.fadeStart = now; mix.fadeFrom = djEngine.getCrossfade(); mix.fadeTo = nxt === 'B' ? 1 : -1;
-          mix.fadeSec = outPerf?.transitionSec != null && outPerf.transitionSec > 0 ? outPerf.transitionSec : AUTOMIX_XFADE;
-          setFlash(`Automix: blending → Deck ${nxt}`);
+          // Dead air: the outgoing deck is already silent, so a 10 s fade is
+          // 10 s of a half-open fader. Get the incoming track up fast instead.
+          mix.fadeSec = plan.immediate ? AUTOMIX_RESCUE_XFADE : plan.fadeSec;
+          // Say what actually happened. The old flash claimed a blend even
+          // when the tempo was a guess or the pitch fader could not reach it.
+          const tm = tempoMatch((outCtl.bpm ?? 0) * (1 + outPitchPct / 100), inCtl.bpm, pitchRangeRef.current);
+          const honest = !plan.matched
+            ? (inCtl.bpm == null ? 'incoming BPM unknown' : 'outgoing BPM unknown')
+            : !tm.matched ? `BPM out of the ±${pitchRangeRef.current}% range` : null;
+          setFlash(honest
+            ? `Automix: mixing unmatched → Deck ${nxt} (${honest})`
+            : `Automix: blending → Deck ${nxt}${plan.phraseAligned ? ', on the phrase' : ''}`);
         }
       } else {
-        const t = Math.min(1, (now - mix.fadeStart) / (mix.fadeSec * 1000));
-        applyCrossfade(mix.fadeFrom + (mix.fadeTo - mix.fadeFrom) * t);
-        if (t >= 1 || !cs.playing) {
-          if (cs.playing) djEngine.pauseDeck(cur);
+        const progress = mix.fadeSec > 0 ? Math.min(1, Math.max(0, (now - mix.fadeStart) / mix.fadeSec)) : 1;
+        applyCrossfade(fadeStep(mix.fadeStart, now, mix.fadeSec, mix.fadeFrom, mix.fadeTo));
+        // Bass swap (fix 1): two basslines on top of each other for ten
+        // seconds is the sound of an amateur automix. Hand the low end over
+        // across the middle third of the fade, relative to the DJ's own EQ.
+        const swap = eqSwap(progress);
+        djEngine.setDeckEq(cur, 'low', eqLowRef.current[cur] + swap.outLowDb);
+        djEngine.setDeckEq(nxt, 'low', eqLowRef.current[nxt] + swap.inLowDb);
+        if (progress >= 1 || !outPlaying) {
+          // Land the fader EXACTLY on the destination (fix 7). The outgoing
+          // track ending mid-fade used to take this branch straight after a
+          // partial write, leaving the crossfader parked at e.g. 0.3 with the
+          // finished track still half in the mix.
+          applyCrossfade(mix.fadeTo);
+          djEngine.setDeckEq(cur, 'low', eqLowRef.current[cur]);
+          djEngine.setDeckEq(nxt, 'low', eqLowRef.current[nxt]);
+          if (outPlaying) djEngine.pauseDeck(cur);
+          // The old pair is gone; the PLL must not keep bending a deck that
+          // is now the master (or a freshly loaded track on the freed deck).
+          setSyncLock(null);
           mix.current = nxt;
           mix.fading = false;
           const nowEntry = nxt === 'A' ? deckATrackRef.current : deckBTrackRef.current;
@@ -1580,7 +1734,18 @@ export const DJView: React.FC = () => {
         }
       }
     }, 500);
-    return () => window.clearInterval(id);
+    return () => {
+      window.clearInterval(id);
+      if (seedPoll) window.clearInterval(seedPoll);
+      // Switching automix off mid-blend must not leave the half-swapped state
+      // behind: a deck stuck at −26 dB of bass, and a sync-lock the user never
+      // armed still bending its pitch. The swap branch undoes both; so does this.
+      if (automixRef.current?.fading) {
+        djEngine.setDeckEq('A', 'low', eqLowRef.current.A);
+        djEngine.setDeckEq('B', 'low', eqLowRef.current.B);
+        setSyncLock(null);
+      }
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [automixOn, automixRestart]);
 

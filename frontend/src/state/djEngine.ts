@@ -44,6 +44,11 @@ export interface DeckStatus {
   hasBuffer: boolean;
   currentTime: number;
   duration: number;
+  /** The engine AudioContext's clock at the moment this status was built.
+   *  The only monotonic, audio-rate clock a subscriber can see — anything
+   *  timing a musical process (the automix crossfade) must run off this and
+   *  not `performance.now()`, which a throttled/background tab skews. */
+  ctxTime: number;
   loopActive: boolean;
   loopIn: number | null;
   loopOut: number | null;
@@ -129,7 +134,7 @@ interface Deck {
   vinylPos: number; // last read-head position (sec) the worklet reported
   vinylWasPlaying: boolean; // deck playing state captured on grab, to restore
   vinylLoadedUrl: string | null; // which track's samples the worklet holds
-  transportRamp: { kind: 'spinUp' | 'windDown'; start: number; end: number; fromRate: number; toRate: number; targetOffset: number } | null;
+  transportRamp: { kind: 'spinUp' | 'windDown' | 'bend'; start: number; end: number; fromRate: number; toRate: number; targetOffset: number } | null;
   transportRampTimer: number | null;
 }
 
@@ -410,34 +415,62 @@ function startSource(d: Deck, offset: number, spinUp = false): void {
   }
 }
 
+/** Shared empties for the (overwhelmingly common) no-stems case, so a deck in
+ *  full-track mode allocates neither an array nor a map per frame. Never
+ *  mutated — the stems path below allocates fresh containers instead. */
+const NO_STEMS: readonly string[] = Object.freeze([]);
+const NO_STEM_LEVELS: Readonly<Record<string, number>> = Object.freeze({});
+
+const blankStatus = (): DeckStatus => ({
+  loadedUrl: null, label: null, playing: false, decoding: false, hasBuffer: false,
+  currentTime: 0, duration: 0, ctxTime: 0, loopActive: false, loopIn: null, loopOut: null,
+  slip: false, pitchPct: 0, keylock: false,
+  stems: NO_STEMS as string[], stemLevels: NO_STEM_LEVELS as Record<string, number>,
+});
+
+/** One reusable status object per deck, rewritten in place.
+ *
+ *  `statusOf` runs for BOTH decks on every rAF frame while anything is
+ *  playing (`tick`), so the old "build two fresh objects, each with a fresh
+ *  stems array and a fresh stemLevels map" cost ~240 short-lived objects a
+ *  second for a deck pair that usually has no stems at all. Every subscriber
+ *  reads the fields synchronously inside its callback (DJView, JogWheel) and
+ *  the only non-primitives any of them retains are `stems` / `stemLevels` —
+ *  which are still freshly allocated whenever stems actually exist, so a
+ *  retained one can never be mutated underneath its holder. */
+const statusCache: Record<DeckId, DeckStatus> = { A: blankStatus(), B: blankStatus() };
+/** Reset template for a deck that has not been built yet (no allocation). */
+const BLANK_STATUS: Readonly<DeckStatus> = Object.freeze(blankStatus());
+
 function statusOf(id: DeckId): DeckStatus {
+  const out = statusCache[id];
   const d = decks[id];
   if (!d) {
-    return {
-      loadedUrl: null, label: null, playing: false, decoding: false, hasBuffer: false,
-      currentTime: 0, duration: 0, loopActive: false, loopIn: null, loopOut: null,
-      slip: false, pitchPct: 0, keylock: false, stems: [], stemLevels: {},
-    };
+    Object.assign(out, BLANK_STATUS);
+    return out;
   }
-  return {
-    loadedUrl: d.loadedUrl,
-    label: d.label,
-    playing: d.playing,
-    decoding: d.decoding,
-    hasBuffer: !!d.buffer || (d.stemMode && !!d.stems?.length),
-    // During a scratch the worklet drives playback, so the read-head it
-    // reports (vinylPos) is the true position for the platter + waveform.
-    currentTime: d.vinylActive ? clamp(d.vinylPos, 0, deckDuration(d)) : audiblePos(d),
-    duration: deckDuration(d),
-    loopActive: d.loopActive,
-    loopIn: d.loopActive ? d.loopIn : null,
-    loopOut: d.loopActive ? d.loopOut : null,
-    slip: d.slip,
-    pitchPct: d.pitchPct,
-    keylock: d.keylock,
-    stems: d.stems?.map((s) => s.name) ?? [],
-    stemLevels: Object.fromEntries((d.stems ?? []).map((s) => [s.name, s.level])),
-  };
+  out.loadedUrl = d.loadedUrl;
+  out.label = d.label;
+  out.playing = d.playing;
+  out.decoding = d.decoding;
+  out.hasBuffer = !!d.buffer || (d.stemMode && !!d.stems?.length);
+  // During a scratch the worklet drives playback, so the read-head it
+  // reports (vinylPos) is the true position for the platter + waveform.
+  out.currentTime = d.vinylActive ? clamp(d.vinylPos, 0, deckDuration(d)) : audiblePos(d);
+  out.duration = deckDuration(d);
+  out.ctxTime = ctxNow();
+  out.loopActive = d.loopActive;
+  out.loopIn = d.loopActive ? d.loopIn : null;
+  out.loopOut = d.loopActive ? d.loopOut : null;
+  out.slip = d.slip;
+  out.pitchPct = d.pitchPct;
+  out.keylock = d.keylock;
+  // Skip both containers entirely in full-track mode (the usual case).
+  out.stems = d.stems ? d.stems.map((s) => s.name) : (NO_STEMS as string[]);
+  out.stemLevels = d.stems
+    ? Object.fromEntries(d.stems.map((s) => [s.name, s.level]))
+    : (NO_STEM_LEVELS as Record<string, number>);
+  return out;
 }
 
 function emit(): void {
@@ -499,6 +532,13 @@ export async function loadDeck(id: DeckId, url: string | null, label: string | n
   emit();
 
   try {
+    // TODO(dj-audio-cache): route this fetch+decode through
+    // `lib/djAudioCache.getDecodedAudio(url)` once that module lands (another
+    // builder owns it). Automix loads the same track onto the idle deck ahead
+    // of every transition, and a set that loops or revisits a track re-fetches
+    // and re-decodes the whole file each time — the cache is what makes an
+    // incoming deck ready before the outgoing one's tail (see the automix
+    // 'incoming-not-ready' path in DJView/djAutomixPlan).
     const resp = await fetch(url);
     if (!resp.ok) throw new Error(`fetch ${resp.status}`);
     const arr = await resp.arrayBuffer();
@@ -620,7 +660,18 @@ export function setDeckPitch(id: DeckId, pct: number): void {
   const rate = clamp(1 + pct / 100, 0.25, 4);
   if (d.playing) {
     // Re-anchor the position + slip clocks so they stay continuous at the new rate.
+    // `audiblePos` already accounts for an in-flight ramp, so read it FIRST.
     const pos = audiblePos(d);
+    // A phase-nudge bend (see nudgePhase) is a scheduled ramp back to the OLD
+    // rate; leaving it running would drag the deck there a moment after the
+    // new pitch is set. Cancel just that kind — the vinyl spin-up / wind-down
+    // ramps own the transport and must be left alone.
+    if (d.transportRamp?.kind === 'bend') {
+      for (const s of d.srcs) {
+        try { s.playbackRate.cancelScheduledValues(ctxNow()); } catch { /* best effort */ }
+      }
+      clearTransportRamp(d);
+    }
     if (d.loopActive) {
       const vp = virtualPos(d);
       d.virtualBase = vp;
@@ -634,6 +685,84 @@ export function setDeckPitch(id: DeckId, pct: number): void {
   d.pitchPct = pct;
   // Key-lock: cancel the speed-induced pitch change so only tempo moves.
   applyKeylockPitch(d);
+}
+
+/** Hardest a phase nudge is allowed to bend the deck's rate (fraction). ~8 %
+ *  is a hand-on-the-platter nudge: clearly a nudge, never a rewind. */
+const MAX_PHASE_BEND = 0.08;
+/** Shortest / longest a bend window may be (sec). */
+const MIN_BEND_SEC = 0.12;
+const MAX_BEND_SEC = 4;
+
+/**
+ * Shift a deck's playback position by `seconds` WITHOUT restarting its source.
+ *
+ * Phase-aligning two decks used to go through `seekDeck`, which tears down the
+ * `AudioBufferSourceNode` and starts a new one at the new offset — milliseconds
+ * after `playDeck`, so the listener heard the incoming track start, stutter,
+ * and restart. A DJ nudges the platter instead: run the deck a few percent
+ * fast (or slow) for a moment and let it drift into phase. That is what this
+ * does — a single linear `playbackRate` ramp from a bent rate back down to the
+ * deck's own rate, exactly the shape `audiblePos` already integrates for the
+ * vinyl spin-up ramp, so the reported position stays correct throughout.
+ *
+ * Position gained over a linear ramp from `bent` to `rate` across `W` seconds
+ * is `W·(bent − rate)/2`, which is what sizes the window and the bend.
+ *
+ * @param seconds positive = jump forward (deck is behind), negative = hold back.
+ * @returns the shift actually scheduled, in seconds (0 when it could not run).
+ */
+export function nudgePhase(id: DeckId, seconds: number): number {
+  const d = decks[id];
+  if (!d || !Number.isFinite(seconds)) return 0;
+  // Not playing: there is no source to bend, so just move the parked offset.
+  if (!d.playing || d.srcs.length === 0) {
+    if (!d.buffer && !d.stemMode) return 0;
+    const target = clamp(d.startOffset + seconds, 0, deckDuration(d));
+    const moved = target - d.startOffset;
+    d.startOffset = target;
+    emit();
+    return moved;
+  }
+  // The platter is in someone's hand, or the motor is spinning up/down — both
+  // own `playbackRate` and the position clock. Leave them alone.
+  if (d.vinylActive || d.transportRamp) return 0;
+  if (Math.abs(seconds) < 1e-4) return 0;
+
+  const ctx = getEngineCtx();
+  const now = ctx.currentTime;
+  const rate = d.rate;
+  // Window wide enough to deliver the shift inside the bend limit, bounded so
+  // a huge correction becomes a partial one rather than a minute-long drift.
+  const want = Math.min(MAX_BEND_SEC, Math.max(MIN_BEND_SEC, (2 * Math.abs(seconds)) / (rate * MAX_PHASE_BEND)));
+  const bent = clamp(rate + (2 * seconds) / want, rate * (1 - MAX_PHASE_BEND), rate * (1 + MAX_PHASE_BEND));
+  const safeBent = Math.max(MIN_TRANSPORT_RATE, bent);
+  const delivered = (want * (safeBent - rate)) / 2;
+  if (Math.abs(delivered) < 1e-5) return 0;
+
+  // Anchor the position clock BEFORE the ramp starts, then describe the ramp
+  // so `audiblePos` integrates it (same struct the spin-up ramp uses).
+  d.startOffset = audiblePos(d);
+  d.startCtxTime = now;
+  for (const s of d.srcs) {
+    try {
+      s.playbackRate.cancelScheduledValues(now);
+      s.playbackRate.setValueAtTime(safeBent, now);
+      s.playbackRate.linearRampToValueAtTime(rate, now + want);
+    } catch { /* ramp is best-effort; the deck keeps playing at its own rate */ }
+  }
+  d.transportRamp = { kind: 'bend', start: now, end: now + want, fromRate: safeBent, toRate: rate, targetOffset: d.startOffset };
+  d.transportRampTimer = window.setTimeout(() => {
+    const dd = decks[id];
+    if (!dd || dd.transportRamp?.kind !== 'bend') return;
+    dd.startOffset = audiblePos(dd);
+    dd.startCtxTime = getEngineCtx().currentTime;
+    dd.transportRamp = null;
+    dd.transportRampTimer = null;
+    emit();
+  }, want * 1000);
+  emit();
+  return delivered;
 }
 
 const _stretchPending: Partial<Record<DeckId, boolean>> = {};
