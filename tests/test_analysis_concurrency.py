@@ -182,17 +182,19 @@ class _StubDbStore(_StubStore):
         self.db = db
 
 
-@pytest.fixture
-def run_client(tmp_path: Path, monkeypatch):
-    audio = tmp_path / "audio.wav"
-    audio.write_bytes(b"RIFF....WAVEfmt ")
-    monkeypatch.setattr(analysis_router, "get_library_store", lambda: _StubStore(audio))
+def _arm_real_library_tripwire(monkeypatch) -> None:
+    """Make any fall-back to the real library resolver fail loudly.
 
-    # Tripwire: the stub above is the ONLY store these tests may reach. If any
-    # path here falls back to the real resolver, the user's actual library is
-    # one call away from being opened (and analysed) -- so that call fails
-    # loudly instead of succeeding quietly. Patched in both modules because
-    # the router imports the name directly.
+    A stubbed store is the ONLY store these tests may reach. If any path falls
+    back to ``default_library_root()``, the user's actual library is one call
+    away from being opened (and analysed) -- so that call fails loudly instead
+    of succeeding quietly. Patched in both modules because the router imports
+    the name directly.
+
+    Every test that stubs the store arms this; the source pin at the bottom of
+    this file keeps that true for tests added later.
+    """
+
     def _explode(*_args: Any, **_kwargs: Any) -> Any:
         raise AssertionError(
             "default_library_root() was consulted: something is about to open "
@@ -201,6 +203,14 @@ def run_client(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr(library_store, "default_library_root", _explode)
     monkeypatch.setattr(library_router, "default_library_root", _explode, raising=False)
+
+
+@pytest.fixture
+def run_client(tmp_path: Path, monkeypatch):
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"RIFF....WAVEfmt ")
+    monkeypatch.setattr(analysis_router, "get_library_store", lambda: _StubStore(audio))
+    _arm_real_library_tripwire(monkeypatch)
 
     app = FastAPI()
     app.include_router(analysis_router.router, prefix="/api/analysis")
@@ -277,6 +287,7 @@ def test_the_store_path_and_the_endpoint_share_one_run(tmp_path, monkeypatch):
     db = _NoRowsDB()
     store = _StubDbStore(db, audio)
     monkeypatch.setattr(analysis_router, "get_library_store", lambda: store)
+    _arm_real_library_tripwire(monkeypatch)
     app = FastAPI()
     app.include_router(analysis_router.router, prefix="/api/analysis")
     run_client = TestClient(app)
@@ -337,6 +348,7 @@ def test_the_store_path_and_the_endpoint_share_one_run(tmp_path, monkeypatch):
 def test_get_analysis_reports_the_profile_that_wrote_the_row(monkeypatch):
     """Without this the DJ tab's cheap row is indistinguishable from a full
     one, and the panels that show pitch/LUFS render a partial row as complete."""
+    _arm_real_library_tripwire(monkeypatch)
 
     class _RowDB:
         def __init__(self, row):
@@ -378,3 +390,26 @@ def test_get_analysis_reports_the_profile_that_wrote_the_row(monkeypatch):
     pending = TestClient(app).get("/api/analysis/x").json()
     assert pending["status"] == "pending"
     assert "profile" not in pending
+
+
+def test_every_test_that_stubs_the_store_arms_the_real_library_tripwire():
+    """The tripwire is the guard that keeps these tests off the user's real
+    library, so it belongs to every test that stubs the store -- not only to
+    the one fixture that happened to be written first. Tests added later built
+    their own app and stubbed only ``get_library_store``, leaving the real
+    resolver one fallback away from being consulted."""
+    import ast
+
+    source = Path(__file__).read_text(encoding="utf-8")
+    unarmed = [
+        node.name
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef)
+        and not node.name.startswith("test_every_test_that_stubs_the_store")
+        and "get_library_store" in (ast.get_source_segment(source, node) or "")
+        and "_arm_real_library_tripwire("
+        not in (ast.get_source_segment(source, node) or "")
+    ]
+    assert not unarmed, (
+        f"these stub the library store without arming the tripwire: {unarmed}"
+    )

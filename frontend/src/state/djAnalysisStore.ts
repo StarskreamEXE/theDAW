@@ -165,6 +165,18 @@ async function _processQueue(): Promise<void> {
         if (!_eligible(id, Date.now())) continue;
         await _runOne(id);
       } catch (e) {
+        // The throw left the entry mid-run, i.e. status 'running' — which is
+        // never eligible, so every later `ensureAnalyzed(id)` would return
+        // having done nothing and the row would stay empty for the rest of
+        // the session. Record the failure instead: 'error' is retryable, and
+        // a priority request clears the backoff outright.
+        try {
+          _markError(id);
+        } catch {
+          // The write that threw can throw again for the same reason (a
+          // broken subscriber). Losing the consumer here would undo the whole
+          // point of this catch.
+        }
         logError('dj', `Analysis queue step failed for ${id}: ${e instanceof Error ? e.message : String(e)}`);
       } finally {
         _settle(id);

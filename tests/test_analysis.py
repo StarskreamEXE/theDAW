@@ -511,3 +511,40 @@ def test_bpm_confidence_is_clamped_to_the_unit_range(tmp_path: Path):
         assert row["bpm_confidence"] == expected, (
             f"{given!r} -> {row['bpm_confidence']!r}"
         )
+
+
+def test_a_carried_key_confidence_never_outlives_the_key_it_measured():
+    """``key_confidence`` describes a specific key, so it may only be carried
+    forward together with that key.
+
+    The restore used to fire whenever the payload had no confidence, so a dj
+    run that measured a FRESH key but no confidence for it inherited the
+    confidence of the PREVIOUS key -- a number reported against a key it was
+    never computed for."""
+    from backend.modules.analysis.engine import _carry_forward_partial
+
+    class _PriorDB:
+        def __init__(self, row: dict) -> None:
+            self._row = row
+
+        def get_analysis(self, entry_id: str):
+            return dict(self._row)
+
+    prior = {"key": "F#", "scale": "minor", "key_confidence": 0.91}
+
+    # The key WAS carried forward (the partial run measured none), so its
+    # confidence comes with it -- otherwise the row keeps a key with no
+    # confidence at all.
+    carried = {"bpm": 128.0, "key": None, "scale": None, "confidence": None}
+    _carry_forward_partial(_PriorDB(prior), "x", carried)
+    assert carried["key"] == "F#"
+    assert carried["key_confidence"] == 0.91
+
+    # A fresh key: the stored confidence belongs to the old one and must stay
+    # behind, even though this run reported no confidence of its own.
+    fresh = {"bpm": 128.0, "key": "C", "scale": "major", "confidence": None}
+    _carry_forward_partial(_PriorDB(prior), "x", fresh)
+    assert fresh["key"] == "C"
+    assert fresh.get("key_confidence") is None, (
+        "the previous key's confidence was pinned onto a newly measured key"
+    )

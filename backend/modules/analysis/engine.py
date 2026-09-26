@@ -731,9 +731,11 @@ def _carry_forward_partial(
         return
     if not prior:
         return
+    carried: set[str] = set()
     for field in _PARTIAL_PROFILE_FIELDS:
         if payload.get(field) is None and prior.get(field) is not None:
             payload[field] = prior[field]
+            carried.add(field)
     if not payload.get("beats"):
         # The row keeps beats as a JSON string; the payload carries a list.
         beats = _loads_list(prior.get("beats_json"))
@@ -744,9 +746,14 @@ def _carry_forward_partial(
     # key_confidence is spelled ``confidence`` by detect_key and read back out
     # by persist_analysis under that name when it is present, so restoring the
     # stored value means removing the empty one the failed step left behind.
+    #
+    # It rides with the KEY, not on its own: a confidence measures one specific
+    # key, so it may only be restored when that key was itself carried forward.
+    # Restoring it whenever the payload had none pinned the previous key's
+    # confidence onto a freshly measured key that reported no confidence.
     if payload.get("confidence") is None and payload.get("key_confidence") is None:
         payload.pop("confidence", None)
-        if prior.get("key_confidence") is not None:
+        if "key" in carried and prior.get("key_confidence") is not None:
             payload["key_confidence"] = prior["key_confidence"]
     if embedded is not None and not embedded:
         stored = prior.get("embedded_tags_json")

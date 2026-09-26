@@ -24,6 +24,34 @@ const deferred = (): Deferred => {
   return { promise, resolve };
 };
 
+/**
+ * Await `promise`, but for at most `ms`, and report WHICH won. A regression
+ * that strands the queue's awaiters leaves an `await` here pending forever;
+ * without this the file would hang rather than fail, and a hung run is
+ * indistinguishable from a slow one.
+ */
+const raceTimeout = async (
+  promise: Promise<unknown>,
+  ms: number,
+): Promise<'settled' | 'timeout'> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expiry = new Promise<'timeout'>((r) => { timer = setTimeout(() => r('timeout'), ms); });
+  try {
+    return await Promise.race([promise.then((): 'settled' => 'settled'), expiry]);
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+// The timeout guard itself: a promise that never settles has to be REPORTED,
+// not waited on. Without it a regression that strands the queue's awaiters
+// hangs this file instead of failing it, and a hung run looks like a slow one.
+{
+  assert.equal(await raceTimeout(new Promise<void>(() => {}), 20), 'timeout',
+    'the guard must report a promise that never settles');
+  assert.equal(await raceTimeout(Promise.resolve(), 20), 'settled');
+}
+
 /** Rows the stub backend already has analysed (GET answers from here). */
 const ready = new Map<string, Record<string, unknown>>();
 /** Ids whose POST /run must fail. */
@@ -324,7 +352,8 @@ const drain = async (): Promise<void> => {
   });
   try {
     const first = st().ensureAnalyzed('boom');
-    await first; // must not hang
+    assert.equal(await raceTimeout(first, 2_000), 'settled',
+      'a throw inside the queue loop left every awaiter of that id pending forever');
     assert.equal(thrown, 1, 'the test did not reproduce a throw inside the loop');
   } finally {
     unsubscribe();
@@ -333,6 +362,17 @@ const drain = async (): Promise<void> => {
   await st().ensureAnalyzed('after_boom');
   assert.ok(posts.includes('after_boom'), 'one throw killed the queue consumer');
   assert.equal(st().byId['after_boom'].status, 'ready');
+
+  // And the entry the throw interrupted is not stranded. It was left mid-run,
+  // so its status is whatever the interrupted write set — and a status of
+  // 'running' is never eligible, which would make every later request for it
+  // a silent no-op: the deck asks, nothing runs, the promise resolves, the
+  // row stays empty forever.
+  posts.length = 0;
+  await st().ensureAnalyzed('boom', { priority: true });
+  assert.ok(posts.includes('boom'),
+    'the interrupted entry stayed "running" forever: ensureAnalyzed can never run it again');
+  assert.equal(st().byId['boom'].status, 'ready');
 }
 
 // ── DJView hands the sweep its ranking, not the raw row order ──────────────
