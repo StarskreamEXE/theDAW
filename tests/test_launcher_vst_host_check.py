@@ -207,7 +207,7 @@ def test_the_check_sits_where_theDAW_sh_already_puts_it() -> None:
     theDAW.sh committed to for the same advisory line."""
     deps = BAT.index(r"VST-Foundry-UI\VST-UI-FOUNDRY")
     check = BAT.index("check_vst_host.py")
-    ports = BAT.index("netstat -ano")
+    ports = BAT.index("backend.ports --free")
     assert deps < check < ports
 
     sh_deps = SH.index("VST-Foundry-UI/VST-UI-FOUNDRY")
@@ -314,7 +314,7 @@ def test_nothing_in_the_check_can_stop_the_launch() -> None:
     for forbidden in ("exit /b", "pause", ":needtools", ":rerun"):
         assert forbidden not in block, f"theDAW.bat: {forbidden!r} is inside the block"
     assert block.rstrip().endswith("ver >nul")
-    assert BAT.index("ver >nul") < BAT.index("netstat -ano")
+    assert BAT.index("ver >nul") < BAT.index("backend.ports --free")
 
 
 # ---------------------------------------------------------------------------

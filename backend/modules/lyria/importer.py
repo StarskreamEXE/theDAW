@@ -97,7 +97,7 @@ def seen_map_path() -> Path:
 
     ``theDAW_LYRIA_IMPORTS_FILE`` wins so a test or a live smoke-check can
     point it at a temp file; otherwise it follows the writable data root like
-    every other registry (never ``PROJECT_ROOT / "data"`` directly -- see
+    every other registry (never the project root's data folder directly -- see
     ``backend/lib/paths.py``).
     """
     configured = os.getenv(SEEN_MAP_ENV)
