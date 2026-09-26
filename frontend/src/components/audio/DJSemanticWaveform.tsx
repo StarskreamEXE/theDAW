@@ -1,6 +1,20 @@
 import { useEffect, useRef, useState } from 'react';
 import { measureCanvasBox } from '../../lib/canvasScale';
-import { EMPTY_BINS, analyzeBuffer, decodeAudio, drawWaveform, type WaveBin } from './djSemanticWaveformAnalysis';
+import {
+  EMPTY_BINS,
+  analyzeBufferAsync,
+  decodeAudio,
+  drawWaveformCached,
+  type WaveBin,
+} from './djSemanticWaveformAnalysis';
+
+/** Round a measured lane width UP to a 64 px bucket, so a one-pixel layout
+ *  wobble never changes the analysis bin count (and so re-mounting a lane at
+ *  a near-identical width still hits the analysis memo). */
+function widthBucket(px: number): number {
+  if (!Number.isFinite(px) || px <= 0) return 0;
+  return Math.ceil(px / 64) * 64;
+}
 
 export function DJSemanticWaveform({
   audioUrl,
@@ -10,6 +24,7 @@ export function DJSemanticWaveform({
   onDuration,
   transparentBg = false,
   normalize = true,
+  width,
 }: {
   audioUrl: string;
   height?: number;
@@ -25,6 +40,11 @@ export function DJSemanticWaveform({
    *  clamped but never rescaled — REAPER's default, and what the EDIT
    *  timeline wants (see `analyzeBuffer`'s `AnalyzeOptions`). */
   normalize?: boolean;
+  /** Lane width in CSS px, if the caller already knows it. Decides how many
+   *  analysis bins this instance asks for: the overview lanes are 34-44 px
+   *  and used to compute the full 6,400 bins anyway. Omitted, the wrapper is
+   *  measured instead, so no call site has to change. */
+  width?: number;
 }) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -38,30 +58,37 @@ export function DJSemanticWaveform({
   // keyed on it, and a ref's mutations do not retrigger an effect — only a
   // state change does. `bufferAudioUrlRef` guards the one thing a ref IS
   // right for: an in-flight decode for a STALE audioUrl resolving after a
-  // newer one has already started must not write over it, even though the
-  // AbortController below already covers the same race for `fetch` itself.
+  // newer one has already started must not write over it.
   const [buffer, setBuffer] = useState<AudioBuffer | null>(null);
   const bufferAudioUrlRef = useRef<string | null>(null);
 
   // Fetch + decode — keyed ONLY on `audioUrl`. `normalize` never appears
   // here, which is the whole point of the split.
+  //
+  // DJ-2: this goes through the DJ-wide decode cache (`lib/djAudioCache`), so
+  // the deck's two waveform instances and the engine share ONE fetch and ONE
+  // decode per URL. There is deliberately no `AbortController` any more — the
+  // request is shared, so an unmounting instance must not cancel the download
+  // the others are waiting on; a stale result is dropped here instead.
   useEffect(() => {
-    const ctrl = new AbortController();
+    let cancelled = false;
     setBuffer(null);
     setDecodeError(null);
-    decodeAudio(audioUrl, ctrl.signal)
+    decodeAudio(audioUrl)
       .then((decoded) => {
-        if (ctrl.signal.aborted) return;
+        if (cancelled) return;
         bufferAudioUrlRef.current = audioUrl;
         setBuffer(decoded);
         onDuration?.(decoded.duration);
       })
       .catch((err: unknown) => {
-        if (ctrl.signal.aborted) return;
+        if (cancelled) return;
         setBuffer(null);
         setDecodeError(err instanceof Error ? err.message : 'Unable to decode audio waveform');
       });
-    return () => ctrl.abort();
+    return () => {
+      cancelled = true;
+    };
     // onDuration intentionally omitted — a fresh closure each render must not re-decode.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [audioUrl]);
@@ -70,13 +97,29 @@ export function DJSemanticWaveform({
   // analysis result's real cache key; see `buffer`'s own doc above for why
   // `audioUrl` is deliberately NOT repeated here). Runs again whenever either
   // changes, but a `normalize` flip alone never touches the effect above.
+  //
+  // DJ-2: `analyzeBufferAsync` memoises per (url, normalize, binCount) and
+  // runs the loop in a Worker where one exists, so the SECOND instance for a
+  // deck costs nothing and the first one no longer blocks the main thread for
+  // 0.6-2 s. The lane is measured (not a prop) so no call site had to change.
   useEffect(() => {
     if (!buffer || bufferAudioUrlRef.current !== audioUrl) {
       setBins(EMPTY_BINS);
       return;
     }
-    setBins(analyzeBuffer(buffer, { normalize }));
-  }, [buffer, normalize, audioUrl]);
+    let cancelled = false;
+    const lane = width ?? widthBucket(wrapRef.current?.clientWidth ?? 0);
+    analyzeBufferAsync(audioUrl, buffer, { normalize, width: lane })
+      .then((result) => {
+        if (!cancelled) setBins(result);
+      })
+      .catch(() => {
+        if (!cancelled) setBins(EMPTY_BINS);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [buffer, normalize, audioUrl, width]);
 
   useEffect(() => {
     const wrap = wrapRef.current;
@@ -86,13 +129,26 @@ export function DJSemanticWaveform({
       // `height` is the wrapper's inline height, already in local css px, so it
       // is passed straight through; only the width needs the zoom correction.
       const box = measureCanvasBox(wrap, { cssHeight: height });
-      drawWaveform(canvas, box, bins, viewportStart, viewportEnd, transparentBg, decodeError);
+      // DJ-2: a playing deck moves its viewport ~6x/s. `drawWaveformCached`
+      // renders the body once per (track, zoom, size) and blits a different
+      // slice of it as the viewport moves; the full view still goes straight
+      // through to the unchanged `drawWaveform`.
+      drawWaveformCached(
+        canvas,
+        box,
+        bins,
+        viewportStart,
+        viewportEnd,
+        transparentBg,
+        decodeError,
+        `${audioUrl}|${normalize ? 'n' : 'a'}`,
+      );
     };
     render();
     const ro = new ResizeObserver(render);
     ro.observe(wrap);
     return () => ro.disconnect();
-  }, [bins, height, viewportEnd, viewportStart, transparentBg, decodeError]);
+  }, [bins, height, viewportEnd, viewportStart, transparentBg, decodeError, audioUrl, normalize]);
 
   return (
     <div

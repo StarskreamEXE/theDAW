@@ -52,9 +52,17 @@ g.fetch = async (input: unknown) => {
   } as unknown as Response;
 };
 
-// ── AudioContext stub: counts decodeAudioData calls ─────────────────────────
+// ── decoding context stub: counts decodeAudioData calls ────────────────────
+// DJ-2: decoding goes through `lib/djAudioCache`, which decodes with a shared
+// OfflineAudioContext (or the engine's context) and must NEVER build a real
+// AudioContext — every real one opens the output device, which can glitch the
+// engine's playing context on Windows/WASAPI.
 let decodeCount = 0;
-class FakeAudioContext {
+class FakeOfflineAudioContext {
+  static constructed = 0;
+  constructor(_channels: number, _length: number, _sampleRate: number) {
+    FakeOfflineAudioContext.constructed += 1;
+  }
   async decodeAudioData(_buf: ArrayBuffer): Promise<AudioBuffer> {
     decodeCount += 1;
     return {
@@ -65,9 +73,16 @@ class FakeAudioContext {
       getChannelData: () => new Float32Array(128),
     } as unknown as AudioBuffer;
   }
-  async close(): Promise<void> {}
 }
-(g.window as Record<string, unknown>).AudioContext = FakeAudioContext;
+class ForbiddenAudioContext {
+  constructor() {
+    throw new Error('a real AudioContext was constructed for a waveform decode');
+  }
+}
+(g.window as Record<string, unknown>).OfflineAudioContext = FakeOfflineAudioContext;
+(g.window as Record<string, unknown>).AudioContext = ForbiddenAudioContext;
+g.OfflineAudioContext = FakeOfflineAudioContext;
+g.AudioContext = ForbiddenAudioContext;
 
 /** Let the fetch → decode → analyze chain and its state updates settle. */
 async function settle(): Promise<void> {
@@ -115,6 +130,26 @@ await settle();
 assert.equal(fetchCount, 2, 'a new audioUrl does fetch again');
 assert.equal(decodeCount, 2, 'and does decode again');
 assert.deepEqual(lastFetchUrls, ['track-a.wav', 'track-b.wav'], 'exactly the two real URL changes fetched');
+
+// DJ-2: every decode above ran on ONE shared OfflineAudioContext, and not a
+// single real AudioContext was opened (ForbiddenAudioContext would have
+// thrown). The old code built — and closed — one real output-device context
+// per waveform INSTANCE, and the default deck layout mounts two of them.
+assert.equal(FakeOfflineAudioContext.constructed, 1, 'one shared decoding context for every URL');
+
+// DJ-2: a SECOND waveform instance for a URL already loaded must ride the
+// shared cache — no second fetch, no second decode.
+await act(async () => {
+  root.render(
+    <>
+      <DJSemanticWaveform audioUrl="track-a.wav" normalize={true} />
+      <DJSemanticWaveform audioUrl="track-a.wav" normalize={true} />
+    </>,
+  );
+});
+await settle();
+assert.equal(fetchCount, 2, 'two instances of an already-decoded URL fetch nothing further');
+assert.equal(decodeCount, 2, 'and decode nothing further');
 
 await act(async () => {
   root.unmount();
