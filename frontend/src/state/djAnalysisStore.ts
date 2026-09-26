@@ -53,11 +53,20 @@ interface Entry {
  *  is a window, not a backlog. */
 export const DJ_SWEEP_CAP = 24;
 
-/** An entry whose analysis failed is retried exactly ONCE, and only after this
- *  long. Before this, a failing entry that stayed on screen was re-POSTed by
- *  every sweep; after it, a transient failure (backend busy, file briefly
- *  locked) still gets a second chance without becoming a loop. */
+/** How long the browsing sweep waits before retrying an entry whose analysis
+ *  failed. The wait DOUBLES per failure (60 s, 120 s, 240 s), so a row that is
+ *  simply broken — a missing file, an unsupported codec — stops costing
+ *  requests, while a transient failure (backend busy, file briefly locked)
+ *  still heals on its own. Before this, a failing row on screen was re-POSTed
+ *  by every sweep. */
 export const ANALYSIS_ERROR_RETRY_MS = 60_000;
+
+/** After this many failures the sweep gives up on an entry: at that point the
+ *  failure is a property of the file, not of the moment. A user action
+ *  (`ensureAnalyzed` at priority) still runs it — asking for a track IS the
+ *  statement that it is worth another try — so "gave up" is never permanent
+ *  from the user's side. */
+export const MAX_SWEEP_ANALYSIS_ATTEMPTS = 3;
 
 /** Breathing room between queued analyses so the backend's threadpool is not
  *  saturated by this tab alone. The server-side cap is the real bound; this
@@ -77,23 +86,38 @@ const _hot: string[] = [];
 let _sweep: string[] = [];
 const _queued = new Set<string>();
 const _waiters = new Map<string, Array<() => void>>();
-/** id -> when its last run failed, and whether its one retry is spent. */
-const _erroredAt = new Map<string, number>();
-const _retried = new Set<string>();
+/** id -> when its last run failed, and how many failures it has had. */
+const _failures = new Map<string, { at: number; attempts: number }>();
 let _processing = false;
 let _paused = false;
 
-/** Worth queueing or running right now? Pure — it consumes nothing, so an id
- *  that is only *considered* never burns its one retry. */
+/** How long the sweep must wait after failure number `attempts`. */
+function _backoffMs(attempts: number): number {
+  return ANALYSIS_ERROR_RETRY_MS * 2 ** Math.max(0, attempts - 1);
+}
+
+/** Worth queueing or running right now? Pure — it consumes nothing and
+ *  changes nothing, so an id that is only *considered* never spends a retry. */
 function _eligible(id: string, now: number): boolean {
   const cur = useDjAnalysisStore.getState().byId[id];
   if (!cur) return true;
   if (cur.status === 'ready' || cur.status === 'running') return false;
   if (cur.status === 'error') {
-    if (_retried.has(id)) return false;
-    return now - (_erroredAt.get(id) ?? 0) >= ANALYSIS_ERROR_RETRY_MS;
+    const failure = _failures.get(id);
+    if (!failure) return true;
+    if (failure.attempts >= MAX_SWEEP_ANALYSIS_ATTEMPTS) return false;
+    return now - failure.at >= _backoffMs(failure.attempts);
   }
   return true;
+}
+
+/** A user asked for this entry by name. Whatever the sweep concluded about it
+ *  is out of date: clear the failure history so it runs now and gets a fresh
+ *  backoff ladder if it fails again. Without this, an entry the sweep had
+ *  given up on could not be analysed by loading it onto a deck — the request
+ *  returned silently having done nothing. */
+function _forgetFailure(id: string): void {
+  _failures.delete(id);
 }
 
 function _settle(id: string): void {
@@ -132,14 +156,19 @@ async function _processQueue(): Promise<void> {
       const id = _hot.shift() ?? _sweep.shift();
       if (id === undefined) break;
       _queued.delete(id);
-      if (!_eligible(id, Date.now())) {
+      // Whatever happens to this id — skipped, analysed, or an unexpected
+      // throw on the way (a subscriber blowing up inside setState, say) — its
+      // awaiters are released. A throw that escaped this loop used to leave
+      // every `await ensureAnalyzed(...)` in the app pending forever AND kill
+      // the consumer, so the queue behind it never moved again.
+      try {
+        if (!_eligible(id, Date.now())) continue;
+        await _runOne(id);
+      } catch (e) {
+        logError('dj', `Analysis queue step failed for ${id}: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
         _settle(id);
-        continue;
       }
-      // Spend the one retry HERE, where the run actually happens.
-      if (useDjAnalysisStore.getState().byId[id]?.status === 'error') _retried.add(id);
-      await _runOne(id);
-      _settle(id);
       if (_hot.length || _sweep.length) await new Promise((r) => setTimeout(r, QUEUE_GAP_MS));
     }
   } finally {
@@ -148,15 +177,15 @@ async function _processQueue(): Promise<void> {
 }
 
 function _markReady(entryId: string, raw: Record<string, unknown>): void {
-  _erroredAt.delete(entryId);
-  _retried.delete(entryId);
+  _failures.delete(entryId);
   useDjAnalysisStore.setState((s) => ({
     byId: { ...s.byId, [entryId]: { status: 'ready', data: pickFields(raw) } },
   }));
 }
 
 function _markError(entryId: string): void {
-  _erroredAt.set(entryId, Date.now());
+  const prior = _failures.get(entryId);
+  _failures.set(entryId, { at: Date.now(), attempts: (prior?.attempts ?? 0) + 1 });
   useDjAnalysisStore.setState((s) => ({
     byId: { ...s.byId, [entryId]: { status: 'error', data: null } },
   }));
@@ -310,9 +339,11 @@ export const useDjAnalysisStore = create<DjAnalysisState>()((set, get) => ({
 
   ensureAnalyzed: async (entryId, opts) => {
     if (!entryId) return;
+    const priority = opts?.priority !== false;
+    if (priority) _forgetFailure(entryId);
     if (!_eligible(entryId, Date.now())) return;
     const settled = _waitFor(entryId);
-    _enqueue(entryId, opts?.priority !== false);
+    _enqueue(entryId, priority);
     void _processQueue();
     await settled;
   },
@@ -331,10 +362,16 @@ export const useDjAnalysisStore = create<DjAnalysisState>()((set, get) => ({
     // The previous window is gone, not merged: rows that scrolled out of the
     // browser are not worth a decode, and keeping them would let the backlog
     // grow without bound no matter what the cap says.
-    for (const id of _sweep) {
-      if (wanted.includes(id)) continue;
+    //
+    // EXCEPT an id somebody is awaiting. Dropping one of those used to settle
+    // its promise without running anything, so `await ensureAnalyzed(id)`
+    // resolved with the entry still unanalysed and the caller read an empty
+    // row as a finished one. A promise is not a window: those ids move to the
+    // request lane and run.
+    const dropped = _sweep.filter((id) => !wanted.includes(id));
+    for (const id of dropped) {
       _queued.delete(id);
-      _settle(id);
+      if (_waiters.has(id)) _enqueue(id, true);
     }
     _sweep = wanted;
     for (const id of wanted) _queued.add(id);

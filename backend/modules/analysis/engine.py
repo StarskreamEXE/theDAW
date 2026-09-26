@@ -25,9 +25,10 @@ import contextlib
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from backend.modules.library import store as library_store
 from backend.modules.library.db import LibraryDB
@@ -90,13 +91,141 @@ PROFILE_DJ = "dj"
 #: full row, matching every row written before profiles existed.
 PROFILE_MARKER_KEY = "_analysis_profile"
 
-#: The persisted fields a ``dj`` run does not measure. ``upsert_analysis``
-#: writes the WHOLE row, so a partial payload would null these out on an
-#: entry that already had them — see :func:`_carry_forward_partial`.
+
+def profile_of_row(row: Optional[dict[str, Any]]) -> str:
+    """Which profile wrote this stored analysis row.
+
+    The marker lives inside the persisted ffprobe blob (a full run rewrites
+    that blob wholesale, so the marker disappears with it). Every reader of a
+    row goes through here rather than reaching into the blob, and a row with
+    no marker -- which is every row written before profiles existed -- is a
+    full row, not an unknown one.
+    """
+    if not row:
+        return PROFILE_FULL
+    blob: Any = row.get("ffprobe_json")
+    if isinstance(blob, str):
+        try:
+            blob = json.loads(blob)
+        except (TypeError, ValueError):
+            blob = None
+    if not isinstance(blob, dict):
+        blob = row.get("ffprobe")
+    marker = blob.get(PROFILE_MARKER_KEY) if isinstance(blob, dict) else None
+    return marker if marker in (PROFILE_FULL, PROFILE_DJ) else PROFILE_FULL
+
+
+#: How many analyses this PROCESS will run at once.
+#:
+#: This gate lives on :func:`analyze_and_persist` rather than on the HTTP
+#: endpoint because the endpoint is not the only caller: the library store
+#: enqueues background analyses through ``asyncio.to_thread(analyze_and_persist,
+#: ...)``, and while the cap sat in the router that path walked straight past
+#: it -- a background sweep and a deck load could decode the same file at the
+#: same moment. One gate, at the one door every caller uses.
+#:
+#: Two, not one: one decode can be running while another analysis is inside
+#: ffprobe or blocked on a lock, so a pair keeps a core busy without letting
+#: the decodes pile up. Deliberately a constant rather than a setting -- it is
+#: a property of the work (a decode is hundreds of MB and one core), not a
+#: preference.
+MAX_CONCURRENT_ANALYSES = 2
+
+_analysis_slots = threading.BoundedSemaphore(MAX_CONCURRENT_ANALYSES)
+
+
+class _InFlight:
+    """One running analysis, and the place its result is published.
+
+    Followers wait on ``done`` and read ``payload``/``error``; they hold no
+    semaphore slot while waiting, which is what keeps single-flight from
+    deadlocking against the concurrency cap (a waiter can never be the thing
+    the leader is waiting for). ``followers`` is how many callers joined this
+    run instead of starting their own.
+    """
+
+    __slots__ = ("done", "payload", "error", "followers")
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.payload: Optional[dict] = None
+        self.error: Optional[BaseException] = None
+        self.followers = 0
+
+
+_inflight_lock = threading.Lock()
+#: (entry_id, profile) -> the run currently computing it.
+#:
+#: Keyed on the profile as well as the id on purpose: joining a ``dj`` run
+#: would hand a full-profile caller a payload with no pitch and no LUFS, which
+#: is a wrong answer, not a shared one. Two profiles of one entry at the same
+#: instant is rare, both results are correct, and the semaphore still bounds
+#: the total work.
+_inflight: dict[tuple[str, str], _InFlight] = {}
+
+
+def _single_flight(key: tuple[str, str], work: Callable[[], dict]) -> dict:
+    """Run ``work`` under the concurrency cap, once per ``key``.
+
+    A second request for a key already running does not start a second
+    analysis: it waits for the first and returns (a copy of) its result, or
+    re-raises its exception. Before this, a deck load and the browser sweep
+    racing on the same track decoded that track twice.
+    """
+    with _inflight_lock:
+        run = _inflight.get(key)
+        leader = run is None
+        if run is None:
+            run = _InFlight()
+            _inflight[key] = run
+        else:
+            run.followers += 1
+
+    if not leader:
+        log.debug("analysis.engine: joining the run already computing %s", key)
+        run.done.wait()
+        if run.error is not None:
+            raise run.error
+        # A copy per follower: nobody mutates a payload another caller holds.
+        return dict(run.payload or {})
+
+    try:
+        with _analysis_slots:
+            payload = work()
+        run.payload = payload
+        return payload
+    except BaseException as e:
+        run.error = e
+        raise
+    finally:
+        # Drop the entry BEFORE waking anyone: a request arriving after this
+        # point must be able to start a fresh run rather than latch onto a
+        # finished one.
+        with _inflight_lock:
+            _inflight.pop(key, None)
+        run.done.set()
+
+
+#: Every scalar the analysis row keeps, in PAYLOAD key spelling.
+#:
+#: ``upsert_analysis`` writes the WHOLE row, so anything a partial run leaves
+#: empty is written as NULL over whatever a previous run measured. The set is
+#: deliberately "all of them", not "the ones the dj profile skips": a step can
+#: also fail (``analyze_audio`` swallows a tempo failure into bpm=None,
+#: beats=[], bpm_confidence=None), and a run that measured nothing must still
+#: not destroy a row that did. See :func:`_carry_forward_partial`.
 _PARTIAL_PROFILE_FIELDS = (
+    "bpm",
+    "bpm_confidence",
+    "key",
+    "scale",
     "pitch_mean_hz",
     "pitch_std_hz",
     "loudness_lufs",
+    "rms_db",
+    "bars_estimated",
+    "genre",
+    "genre_confidence",
     "prompt_guess",
     "prompt_confidence",
 )
@@ -325,6 +454,13 @@ def _read_entry_metadata(metadata_path: Path) -> Optional[dict[str, Any]]:
     return loaded
 
 
+def _unit_or_none(value: Any) -> Optional[float]:
+    """A confidence as a float in [0, 1], or None when there is not one."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    return min(1.0, max(0.0, float(value)))
+
+
 def persist_analysis(
     db: LibraryDB,
     entry_id: str,
@@ -355,7 +491,12 @@ def persist_analysis(
     """
     db_payload = {
         "bpm": payload.get("bpm"),
-        "bpm_confidence": payload.get("bpm_confidence"),
+        # Clamped HERE, at the one door into the column: the aubio path
+        # averages its per-hop confidences with no bound while the librosa
+        # path clamps, so the two detectors disagreed about what the range
+        # even is. A deck renders this as a bar -- >1 overflows it, <0 draws
+        # backwards -- and every reader would otherwise have to re-clamp.
+        "bpm_confidence": _unit_or_none(payload.get("bpm_confidence")),
         "beats": payload.get("beats") or [],
         "key": payload.get("key"),
         "key_confidence": payload.get("confidence")
@@ -407,6 +548,41 @@ def persist_analysis(
 
 
 def analyze_and_persist(
+    db: LibraryDB,
+    entry_id: str,
+    audio_path: Path,
+    *,
+    metadata_path: Optional[Path] = None,
+    settings: Optional[dict[str, Any]] = None,
+    store: Optional[library_store.LibraryStore] = None,
+    profile: str = PROFILE_FULL,
+) -> dict[str, Any]:
+    """Run one analysis for one entry, under the process-wide gate.
+
+    EVERY caller enters here -- the ``/run`` endpoint, the library store's
+    background queue, scripts -- so this is where the two guarantees live:
+
+      * at most :data:`MAX_CONCURRENT_ANALYSES` analyses run at once, and
+      * two callers asking for the same ``(entry_id, profile)`` at the same
+        time share ONE run instead of decoding the same file twice.
+
+    See :func:`_analyze_and_persist` for what a run actually does.
+    """
+    return _single_flight(
+        (entry_id, profile),
+        lambda: _analyze_and_persist(
+            db,
+            entry_id,
+            audio_path,
+            metadata_path=metadata_path,
+            settings=settings,
+            store=store,
+            profile=profile,
+        ),
+    )
+
+
+def _analyze_and_persist(
     db: LibraryDB,
     entry_id: str,
     audio_path: Path,
@@ -490,7 +666,7 @@ def analyze_and_persist(
             payload["semantic_tags"] = regenerated["semantic_tags"]
 
         if profile != PROFILE_FULL:
-            _carry_forward_partial(db, entry_id, payload)
+            _carry_forward_partial(db, entry_id, payload, embedded)
 
         persist_analysis(
             db,
@@ -508,24 +684,45 @@ def analyze_and_persist(
         raise
 
 
-def _carry_forward_partial(
-    db: LibraryDB, entry_id: str, payload: dict[str, Any]
-) -> None:
-    """Keep what a partial profile did not measure.
+def _loads_list(raw: Any) -> list:
+    """Parse a stored JSON array column; anything else reads as empty."""
+    if not isinstance(raw, str):
+        return []
+    try:
+        out = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return out if isinstance(out, list) else []
 
-    INVARIANT: a partial (``dj``) analysis never erases a field a previous
-    full analysis measured.
+
+def _carry_forward_partial(
+    db: LibraryDB,
+    entry_id: str,
+    payload: dict[str, Any],
+    embedded: Optional[dict[str, Any]] = None,
+) -> None:
+    """Keep everything a partial run did not produce.
+
+    INVARIANT: a partial (``dj``) analysis never erases a persisted field it
+    did not measure -- whether it skipped that step on purpose or the step
+    failed.
 
     ``upsert_analysis`` writes the WHOLE row, so persisting a dj payload
-    verbatim would null out ``pitch_mean_hz``, ``pitch_std_hz`` and
-    ``loudness_lufs`` -- and blank the prompt -- on an entry that already had
-    them: a 4-second run destroying the result of a 12-second one, with no
-    way back but re-decoding the file. Those fields are read off the existing
-    row and put back into the payload BEFORE it is persisted.
+    verbatim nulls out every column the payload left empty: a 3-second run
+    destroying the result of a 12-second one, with no way back but re-decoding
+    the file. The obvious half is the steps the profile skips (pitch, LUFS,
+    the prompt built from them). The other half is failure: ``analyze_audio``
+    swallows a tempo failure into ``bpm=None`` / ``beats=[]`` /
+    ``bpm_confidence=None``, so one unlucky re-run used to wipe a measured BPM
+    and beatgrid. Both are the same bug, so this restores ANY field the
+    payload left empty from the stored row.
 
-    Only fields the partial run left as ``None`` are restored, so everything
-    it did measure (bpm, beats, key, rms, ffprobe, and the profile marker)
-    still wins -- a dj re-run of an old row is still an update, not a no-op.
+    Only empty fields are restored, so everything the partial run DID measure
+    still wins -- a dj re-run of an old row is an update, not a no-op.
+
+    ``ffprobe`` is deliberately NOT carried forward: it is the blob the
+    profile marker lives in, and restoring an older one would relabel this
+    partial row as the full row that wrote it.
     """
     try:
         prior = db.get_analysis(entry_id)
@@ -537,6 +734,28 @@ def _carry_forward_partial(
     for field in _PARTIAL_PROFILE_FIELDS:
         if payload.get(field) is None and prior.get(field) is not None:
             payload[field] = prior[field]
+    if not payload.get("beats"):
+        # The row keeps beats as a JSON string; the payload carries a list.
+        beats = _loads_list(prior.get("beats_json"))
+        if beats:
+            payload["beats"] = beats
+            if payload.get("bars_estimated") is None:
+                payload["bars_estimated"] = prior.get("bars_estimated")
+    # key_confidence is spelled ``confidence`` by detect_key and read back out
+    # by persist_analysis under that name when it is present, so restoring the
+    # stored value means removing the empty one the failed step left behind.
+    if payload.get("confidence") is None and payload.get("key_confidence") is None:
+        payload.pop("confidence", None)
+        if prior.get("key_confidence") is not None:
+            payload["key_confidence"] = prior["key_confidence"]
+    if embedded is not None and not embedded:
+        stored = prior.get("embedded_tags_json")
+        try:
+            tags = json.loads(stored) if isinstance(stored, str) else None
+        except (TypeError, ValueError):
+            tags = None
+        if isinstance(tags, dict) and tags:
+            embedded.update(tags)
     if not payload.get("semantic_tags"):
         # Stored as a JSON string; the payload carries a list.
         try:

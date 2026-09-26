@@ -99,10 +99,16 @@ def test_stream_audio_is_cached_by_the_browser(client_with_root, tmp_path):
     r = client_with_root.get("/api/library/audio/job_cached_00")
     assert r.status_code == 200
     cache_control = r.headers.get("cache-control", "")
-    assert "immutable" in cache_control
     assert "max-age=31536000" in cache_control
     # A library is one user's: no shared proxy may keep a copy.
     assert "private" in cache_control
+    # NOT immutable: `immutable` promises the bytes at this URL can never
+    # change, and _playable_audio's transcode cache is re-done when the source
+    # is replaced, so the promise is one this endpoint cannot keep. Without it
+    # the browser still skips the download -- it revalidates and the
+    # FileResponse's ETag / Last-Modified answer 304 -- which is the saving
+    # that mattered, honestly stated.
+    assert "immutable" not in cache_control
 
 
 def test_patch_entry_updates_favorite_and_tags(client_with_root, tmp_path):

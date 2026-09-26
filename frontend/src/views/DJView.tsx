@@ -1198,11 +1198,24 @@ export const DJView: React.FC = () => {
     });
   }, []);
 
-  // BPM/key analysis is a per-track backend job, so it runs over the rows the
-  // library actually has in hand — a few hundred, not 200,000. Scrolling the
-  // browser brings more into range; the analysis queue de-duplicates ids, so
-  // re-running this as pages land costs nothing.
-  useEffect(() => { if (djTabActive && entries.length) void analyzeAll(entries.map((e) => e.id)); }, [djTabActive, entries, analyzeAll]);
+  // BPM/key analysis is a per-track backend job — a real decode each — so the
+  // store takes a capped WINDOW, not the whole page: everything past the cap
+  // is dropped, and this call's order is what decides which rows survive it.
+  // Rank them the way they are needed: the two loaded decks first (a deck
+  // without a beatgrid is the one thing the user can see), then the active
+  // set's tracks (the next things to be loaded), then the visible rows.
+  // Each run REPLACES the window, so scrolling re-aims it instead of piling
+  // another page onto a backlog; ids already analysed or in flight are
+  // skipped, so re-running this as pages land costs nothing.
+  useEffect(() => {
+    if (!djTabActive || !entries.length) return;
+    void analyzeAll([
+      deckATrack,
+      deckBTrack,
+      ...(activeSet?.entries ?? []).map((e) => e.entryId),
+      ...entries.map((e) => e.id),
+    ].filter((id): id is string => !!id));
+  }, [djTabActive, entries, analyzeAll, deckATrack, deckBTrack, activeSet]);
 
   useEffect(() => {
     setDeckAPitch((prev) => {

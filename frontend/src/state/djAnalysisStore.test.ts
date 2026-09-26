@@ -8,11 +8,13 @@
 // the cheap `dj` profile, a failed entry is retried exactly once and only after
 // a minute, and the parsed row carries the detector's BPM confidence.
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
   useDjAnalysisStore,
   analyzeEntries,
   DJ_SWEEP_CAP,
   ANALYSIS_ERROR_RETRY_MS,
+  MAX_SWEEP_ANALYSIS_ATTEMPTS,
 } from './djAnalysisStore.ts';
 
 type Deferred = { promise: Promise<void>; resolve: () => void };
@@ -79,7 +81,10 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 const st = () => useDjAnalysisStore.getState();
 
 /** Wait for every queued analysis to finish: a sentinel appended to the SWEEP
- *  lane resolves only after everything ahead of it has run. */
+ *  lane resolves only after everything ahead of it has run. Valid only while
+ *  no `analyzeAll` runs concurrently — a new window would promote this
+ *  awaited sentinel into the request lane, ahead of the work being waited
+ *  for. Every call below drains AFTER the last `analyzeAll` of its block. */
 let sentinelSeq = 0;
 const drain = async (): Promise<void> => {
   sentinelSeq += 1;
@@ -215,62 +220,134 @@ const drain = async (): Promise<void> => {
   assert.deepEqual(posts, ['inflight', 'after_pause']);
 }
 
-// ── a failed entry is retried exactly once, and only after the window ───────
+// ── a failed sweep entry backs off, doubling, then the sweep gives up ──────
 {
   posts.length = 0;
   failing.add('flaky');
-  await st().ensureAnalyzed('flaky');
+  await st().analyzeAll(['flaky'], { cap: 1 });
+  await drain();
   assert.equal(st().byId['flaky'].status, 'error');
   assert.deepEqual(posts, ['flaky']);
 
-  // Immediately, and all the way up to the window, it is left alone.
-  await st().ensureAnalyzed('flaky');
+  // Nothing before the first window.
+  nowMs += ANALYSIS_ERROR_RETRY_MS - 1;
   await st().analyzeAll(['flaky'], { cap: 1 });
   await drain();
-  nowMs += ANALYSIS_ERROR_RETRY_MS - 1;
-  await st().ensureAnalyzed('flaky');
   assert.deepEqual(posts, ['flaky'], 'a failing entry must not be re-hammered');
 
-  // Past the window: exactly one retry.
+  // 60 s: attempt two.
   nowMs += 2;
-  await st().ensureAnalyzed('flaky');
-  assert.deepEqual(posts, ['flaky', 'flaky'], 'one retry after the window');
-
-  nowMs += ANALYSIS_ERROR_RETRY_MS * 10;
-  await st().ensureAnalyzed('flaky');
   await st().analyzeAll(['flaky'], { cap: 1 });
   await drain();
-  assert.deepEqual(posts, ['flaky', 'flaky'], 'the retry is spent; no third attempt');
+  assert.equal(posts.length, 2, 'the first retry lands after 60 s');
+
+  // The wait DOUBLES: 60 s more is not enough, 120 s is.
+  nowMs += ANALYSIS_ERROR_RETRY_MS;
+  await st().analyzeAll(['flaky'], { cap: 1 });
+  await drain();
+  assert.equal(posts.length, 2, 'the second wait is 120 s, not another 60 s');
+  nowMs += ANALYSIS_ERROR_RETRY_MS;
+  await st().analyzeAll(['flaky'], { cap: 1 });
+  await drain();
+  assert.equal(posts.length, 3, 'the second retry lands after 120 s');
+
+  // Third and last: 240 s.
+  nowMs += ANALYSIS_ERROR_RETRY_MS * 4;
+  await st().analyzeAll(['flaky'], { cap: 1 });
+  await drain();
+  assert.equal(posts.length, 3, 'attempt four is past the cap');
+  assert.equal(MAX_SWEEP_ANALYSIS_ATTEMPTS, 3);
+
+  // However long it waits, the sweep is done with this row.
+  nowMs += ANALYSIS_ERROR_RETRY_MS * 1000;
+  await st().analyzeAll(['flaky'], { cap: 1 });
+  await drain();
+  assert.equal(posts.length, 3, 'the sweep gives up rather than retrying forever');
+
+  // But a user asking for it by name runs it anyway — and the ladder resets.
+  failing.delete('flaky');
+  await st().ensureAnalyzed('flaky');
+  assert.equal(posts.length, 4, 'a deck load must override the sweep giving up');
+  assert.equal(st().byId['flaky'].status, 'ready');
 }
 
-// A run that succeeds after a failure clears the retry budget, so a LATER
-// failure still gets its own retry.
+// A priority request for an entry still inside its backoff runs immediately.
 {
   posts.length = 0;
-  failing.add('recovers');
-  await st().ensureAnalyzed('recovers');
-  assert.equal(st().byId['recovers'].status, 'error');
-  failing.delete('recovers');
-  nowMs += ANALYSIS_ERROR_RETRY_MS;
-  await st().ensureAnalyzed('recovers');
-  assert.equal(st().byId['recovers'].status, 'ready');
-  assert.deepEqual(posts, ['recovers', 'recovers']);
+  failing.add('cooling');
+  await st().analyzeAll(['cooling'], { cap: 1 });
+  await drain();
+  assert.deepEqual(posts, ['cooling']);
+  // Well inside the 60 s window the sweep would skip it...
+  await st().analyzeAll(['cooling'], { cap: 1 });
+  await drain();
+  assert.deepEqual(posts, ['cooling']);
+  // ...and a user request does not.
+  failing.delete('cooling');
+  await st().ensureAnalyzed('cooling');
+  assert.deepEqual(posts, ['cooling', 'cooling'], 'priority ignores the backoff');
+  assert.equal(st().byId['cooling'].status, 'ready');
+}
 
-  // Fail it again from a clean slate: the budget was reset by the success.
-  ready.delete('recovers');
-  failing.add('recovers');
-  useDjAnalysisStore.setState((s) => {
-    const next = { ...s.byId };
-    delete next['recovers'];
-    return { byId: next };
+// ── an awaited id is never dropped by a window change ──────────────────────
+{
+  posts.length = 0;
+  const hold = deferred();
+  holds.set('busy', hold);
+  void st().analyzeAll(['busy'], { cap: 1 });
+  await new Promise((r) => setTimeout(r, 5));
+  // Queued behind the running one, in the sweep lane, and awaited.
+  let resolved = false;
+  const awaited = st().ensureAnalyzed('awaited_row', { priority: false }).then(() => { resolved = true; });
+  // The browser scrolls: the new window has neither of them.
+  await st().analyzeAll(['elsewhere'], { cap: 1 });
+  hold.resolve();
+  await awaited;
+  assert.ok(resolved);
+  assert.ok(posts.includes('awaited_row'),
+    'an awaited id was dropped by a window change and its promise resolved having done nothing');
+  assert.equal(st().byId['awaited_row'].status, 'ready');
+  await drain();
+}
+
+// ── a throw inside the queue loop releases awaiters and keeps the consumer ──
+{
+  posts.length = 0;
+  let thrown = 0;
+  const unsubscribe = useDjAnalysisStore.subscribe(() => {
+    // A component selector blowing up during setState: the throw propagates
+    // out of the store write and into the queue's loop body.
+    if (thrown === 0 && useDjAnalysisStore.getState().byId['boom']?.status === 'running') {
+      thrown += 1;
+      throw new Error('a subscriber exploded');
+    }
   });
-  await st().ensureAnalyzed('recovers');
-  nowMs += ANALYSIS_ERROR_RETRY_MS;
-  await st().ensureAnalyzed('recovers');
-  // fail, success, fail, retry — the fourth POST only happens because the
-  // success in between cleared the spent retry.
-  assert.deepEqual(posts, ['recovers', 'recovers', 'recovers', 'recovers'],
-    'a success resets the one-retry budget');
+  try {
+    const first = st().ensureAnalyzed('boom');
+    await first; // must not hang
+    assert.equal(thrown, 1, 'the test did not reproduce a throw inside the loop');
+  } finally {
+    unsubscribe();
+  }
+  // The consumer survived: the next entry still runs.
+  await st().ensureAnalyzed('after_boom');
+  assert.ok(posts.includes('after_boom'), 'one throw killed the queue consumer');
+  assert.equal(st().byId['after_boom'].status, 'ready');
+}
+
+// ── DJView hands the sweep its ranking, not the raw row order ──────────────
+// A source pin (b12/dj3 style): the cap only means anything if the caller
+// ranks what it passes, and that ranking lives in DJView's one sweep call.
+{
+  const djView = readFileSync(new URL('../views/DJView.tsx', import.meta.url), 'utf8');
+  const call = djView.slice(djView.indexOf('void analyzeAll('));
+  const body = call.slice(0, call.indexOf(');') + 2);
+  const at = (needle: string): number => body.indexOf(needle);
+  assert.ok(at('deckATrack') >= 0 && at('deckBTrack') >= 0, 'the loaded decks must be swept first');
+  assert.ok(at('activeSet') > at('deckATrack'), 'the active set comes after the decks');
+  assert.ok(at('entries.map') > at('activeSet'), 'the visible rows come last');
+  assert.ok(!/Scrolling the browser brings more into range/.test(djView),
+    'the comment still describes the old unbounded sweep');
 }
 
 Date.now = realNow;

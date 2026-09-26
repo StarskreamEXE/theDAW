@@ -14,9 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
-import threading
 from pathlib import Path
-from typing import Any, Callable, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -27,6 +25,7 @@ from .engine import (
     PROFILE_DJ,
     PROFILE_FULL,
     analyze_and_persist,
+    profile_of_row,
 )
 from .ffprobe import has_ffprobe
 from .prompt import generate_prompt
@@ -35,95 +34,6 @@ log = logging.getLogger(__name__)
 
 
 router = APIRouter()
-
-
-#: How many analyses this process will run at once, for the whole process.
-#:
-#: ``run_analysis`` is a sync ``def``, so FastAPI hands it to the threadpool
-#: (40 workers by default) and N simultaneous requests used to start N librosa
-#: decodes: N full-file float arrays resident at once, N cores of FFT, and --
-#: because every analysis also takes the library DB's single write lock three
-#: times and the entry's metadata lock once -- N threads queueing on those two
-#: mutexes. That is how one DJ tab activation turned a 12-second analysis into
-#: a 20-second one and kept the backend pegged: the extra time was not work,
-#: it was waiting.
-#:
-#: Two, not one: one decode can be running while another analysis is inside
-#: ffprobe or blocked on a lock, so a pair keeps a core busy without letting
-#: the decodes pile up. Deliberately a constant rather than a setting -- it is
-#: a property of the work (a decode is hundreds of MB and one core), not a
-#: preference -- and deliberately process-wide rather than per-client, which
-#: is the only scope that actually bounds anything.
-MAX_CONCURRENT_ANALYSES = 2
-
-_analysis_slots = threading.BoundedSemaphore(MAX_CONCURRENT_ANALYSES)
-
-
-class _InFlight:
-    """One running analysis, and the place its result is published.
-
-    Followers wait on ``done`` and read ``payload``/``error``; they hold no
-    semaphore slot while waiting, which is what keeps single-flight from
-    deadlocking against the concurrency cap (a waiter can never be the thing
-    the leader is waiting for).
-    """
-
-    __slots__ = ("done", "payload", "error")
-
-    def __init__(self) -> None:
-        self.done = threading.Event()
-        self.payload: Optional[dict] = None
-        self.error: Optional[BaseException] = None
-
-
-_inflight_lock = threading.Lock()
-#: (entry_id, profile) -> the run currently computing it.
-#:
-#: Keyed on the profile as well as the id on purpose: joining a ``dj`` run
-#: would hand a full-profile caller a payload with no pitch and no LUFS, which
-#: is a wrong answer, not a shared one. Two profiles of one entry at the same
-#: instant is rare, both results are correct, and the semaphore still bounds
-#: the total work.
-_inflight: dict[tuple[str, str], _InFlight] = {}
-
-
-def _single_flight(key: tuple[str, str], work: Callable[[], dict]) -> dict:
-    """Run ``work`` under the concurrency cap, once per ``key``.
-
-    A second request for a key already running does not start a second
-    analysis: it waits for the first and returns (a copy of) its result, or
-    re-raises its exception. Before this, a deck load and the browser sweep
-    racing on the same track decoded that track twice.
-    """
-    with _inflight_lock:
-        run = _inflight.get(key)
-        leader = run is None
-        if run is None:
-            run = _InFlight()
-            _inflight[key] = run
-
-    if not leader:
-        run.done.wait()
-        if run.error is not None:
-            raise run.error
-        # A copy per follower: nobody mutates a payload another caller holds.
-        return dict(run.payload or {})
-
-    try:
-        with _analysis_slots:
-            payload = work()
-        run.payload = payload
-        return payload
-    except BaseException as e:
-        run.error = e
-        raise
-    finally:
-        # Drop the entry BEFORE waking anyone: a request arriving after this
-        # point must be able to start a fresh run rather than latch onto a
-        # finished one.
-        with _inflight_lock:
-            _inflight.pop(key, None)
-        run.done.set()
 
 
 @router.get("")
@@ -207,7 +117,11 @@ def get_analysis(entry_id: str) -> dict:
     # fallback — heal themselves instead of looking permanently analyzed.
     if int(row.get("version") or 0) < ANALYSIS_VERSION:
         return {"entry_id": entry_id, "status": "pending"}
-    return row
+    # WHICH profile wrote this row. A 'dj' row has no pitch statistics and no
+    # integrated loudness, and without this field every reader -- the Details
+    # panel, the node inspector, the prompt route -- showed a partial row as a
+    # complete one whose expensive fields happened to be empty.
+    return {**row, "profile": profile_of_row(row)}
 
 
 @router.post("/{entry_id}/run")
@@ -248,7 +162,12 @@ def run_analysis(
     except Exception:
         pass
 
-    def _work() -> dict[str, Any]:
+    try:
+        # The concurrency cap and the single-flight live in the engine, on
+        # analyze_and_persist itself: the library store's background queue
+        # calls that function directly and would otherwise bypass a gate kept
+        # here. This endpoint owns the profile validation above and nothing
+        # else about scheduling.
         return analyze_and_persist(
             store.db,
             entry_id,
@@ -260,9 +179,6 @@ def run_analysis(
             store=store,
             profile=profile,
         )
-
-    try:
-        return _single_flight((entry_id, profile), _work)
     finally:
         try:
             from backend.core.idle import get_idle_manager

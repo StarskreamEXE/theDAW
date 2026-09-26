@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from backend.modules.analysis.bars import estimate_bars
 from backend.modules.analysis.engine import (
     ANALYSIS_VERSION,
@@ -258,7 +260,7 @@ def test_dj_profile_skips_pitch_and_lufs_but_keeps_what_a_deck_reads(tmp_path: P
         import numpy as np  # noqa: F401
         import soundfile as sf  # noqa: F401
     except ImportError:
-        return
+        pytest.skip("numpy/soundfile not installed")
 
     from backend.modules.analysis.engine import (
         PROFILE_DJ,
@@ -290,7 +292,7 @@ def test_full_profile_still_measures_pitch_lufs_and_carries_no_marker(tmp_path: 
         import numpy as np  # noqa: F401
         import soundfile as sf  # noqa: F401
     except ImportError:
-        return
+        pytest.skip("numpy/soundfile not installed")
 
     from backend.modules.analysis.engine import (
         PROFILE_MARKER_KEY,
@@ -316,7 +318,7 @@ def test_dj_profile_never_erases_what_a_full_run_measured(tmp_path: Path):
         import numpy as np  # noqa: F401
         import soundfile as sf  # noqa: F401
     except ImportError:
-        return
+        pytest.skip("numpy/soundfile not installed")
 
     from backend.modules.analysis.engine import PROFILE_DJ
     from backend.modules.library.store import LibraryStore
@@ -403,3 +405,109 @@ def test_bpm_confidence_column_is_added_to_a_pre_column_database(tmp_path: Path)
     again = LibraryDB(path)  # must not raise
     assert again._has_column("analysis", "bpm_confidence")  # noqa: SLF001
     again._conn.close()  # noqa: SLF001
+
+
+# ---------------------------------------------------------------------------
+# DJ-1R: review rework — a readable profile marker, a total carry-forward,
+# and a clamped confidence.
+# ---------------------------------------------------------------------------
+
+
+def test_analysis_row_reports_which_profile_wrote_it():
+    """A dj row is NOT a complete row, and every reader of ``entry['analysis']``
+    (DetailsView, NodeInspector, the prompt route) had no way to tell: the
+    marker lived inside the ffprobe blob and nothing ever surfaced it. A marker
+    with no reader is decoration."""
+    from backend.modules.analysis.engine import PROFILE_MARKER_KEY
+    from backend.modules.library.router import _analysis_payload
+
+    dj_row = {"bpm": 128.0, "ffprobe_json": json.dumps({PROFILE_MARKER_KEY: "dj"})}
+    analysis, _ = _analysis_payload(dj_row)
+    assert analysis["profile"] == "dj"
+
+    full_row = {
+        "bpm": 128.0,
+        "ffprobe_json": json.dumps({"_summary": {"codec": "mp3"}}),
+    }
+    analysis, _ = _analysis_payload(full_row)
+    assert analysis["profile"] == "full", "a row with no marker is a full row"
+
+    # A row with no ffprobe blob at all is still a full row, not an unknown:
+    # every row written before profiles existed is a full row.
+    analysis, _ = _analysis_payload({"bpm": 128.0})
+    assert analysis["profile"] == "full"
+
+
+def test_dj_run_never_erases_bpm_when_its_tempo_step_fails(tmp_path: Path, monkeypatch):
+    """INVARIANT (widened): a partial run never erases ANY persisted field it
+    did not measure -- not just the ones it skips on purpose.
+
+    ``analyze_audio`` swallows a tempo failure into bpm=None / beats=[] /
+    bpm_confidence=None, and ``upsert_analysis`` writes the whole row, so one
+    unlucky dj re-run used to wipe the BPM and beatgrid a full run measured."""
+    try:
+        import numpy as np  # noqa: F401
+        import soundfile as sf  # noqa: F401
+    except ImportError:
+        pytest.skip("numpy/soundfile not installed")
+
+    from backend.modules.analysis.engine import PROFILE_DJ
+    from backend.modules.chimera import detect as chimera_detect
+    from backend.modules.library.db import LibraryDB
+
+    audio_path = _seed_tone(tmp_path, "wipe")
+    db = LibraryDB(tmp_path / "library.db")
+    db.upsert_entry({"id": "wipe"})
+    persist_analysis(
+        db,
+        "wipe",
+        {
+            "version": ANALYSIS_VERSION,
+            "bpm": 128.0,
+            "bpm_confidence": 0.9,
+            "beats": [0.5, 1.0, 1.5],
+            "key": "F#",
+            "scale": "minor",
+            "rms_db": -9.5,
+            "bars_estimated": 32,
+        },
+    )
+    before = db.get_analysis("wipe")
+    assert before is not None and before["bpm"] == 128.0
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("aubio exploded")
+
+    monkeypatch.setattr(chimera_detect, "detect_tempo_and_beats", _boom)
+    analyze_and_persist(db, "wipe", audio_path, profile=PROFILE_DJ)
+
+    after = db.get_analysis("wipe")
+    assert after is not None
+    assert after["bpm"] == 128.0, "a failed tempo step erased a measured BPM"
+    assert json.loads(after["beats_json"]) == [0.5, 1.0, 1.5], "the beatgrid was erased"
+    assert after["bpm_confidence"] == 0.9
+    assert after["key"] is not None
+    # And the run still counts: what it DID measure is written.
+    assert after["analyzed_at"] >= before["analyzed_at"]
+
+
+def test_bpm_confidence_is_clamped_to_the_unit_range(tmp_path: Path):
+    """The aubio path averages per-hop confidences with no clamp, unlike the
+    librosa path. A deck renders this as a bar; >1 overflows it and <0 makes it
+    negative, so the persist site is where the range is guaranteed."""
+    from backend.modules.library.db import LibraryDB
+
+    db = LibraryDB(tmp_path / "library.db")
+    db.upsert_entry({"id": "clamp"})
+
+    for given, expected in ((1.7, 1.0), (-0.2, 0.0), (0.42, 0.42), (None, None)):
+        persist_analysis(
+            db,
+            "clamp",
+            {"version": ANALYSIS_VERSION, "bpm": 128.0, "bpm_confidence": given},
+        )
+        row = db.get_analysis("clamp")
+        assert row is not None
+        assert row["bpm_confidence"] == expected, (
+            f"{given!r} -> {row['bpm_confidence']!r}"
+        )

@@ -80,6 +80,7 @@ from .store import (
     get_import_jobs,
 )
 from .tags import MAX_EMBEDDED_COVER_BYTES
+from backend.modules.analysis.engine import profile_of_row
 from backend.core.startup import register_startup_hook
 from backend.lib import known_paths, paths
 from backend.lib.cross_site import (
@@ -257,6 +258,12 @@ def _analysis_payload(row: dict[str, Any]) -> tuple[dict[str, Any], dict[str, An
         for k in _FFPROBE_SUMMARY_KEYS:
             if summary.get(k) is not None:
                 analysis.setdefault(k, summary[k])
+    # WHICH profile wrote this row. A 'dj' row measured no pitch statistics
+    # and no integrated loudness, so a reader that treats "field absent" as
+    # "nothing to show" would present a partial row as a complete one. Always
+    # present, and always 'full' for a row with no marker -- which is every
+    # row written before profiles existed.
+    analysis["profile"] = profile_of_row(row)
     embedded = _loose_json(row.get("embedded_tags_json"))
     if not (isinstance(embedded, dict) and embedded):
         embedded = {}
@@ -978,13 +985,16 @@ async def stream_audio(entry_id: str) -> Response:
             path=str(served),
             media_type=media_type,
             filename=served.name,
-            # An entry's audio is immutable: the id addresses those bytes and
-            # no endpoint replaces them (the one write below only fills in a
-            # file that did not exist yet). Without this the browser refetched
-            # the whole file every time a deck reloaded the same track -- the
-            # DJ tab does that constantly. ``private`` because a library is
-            # one user's; no shared proxy may keep a copy.
-            headers={"Cache-Control": "private, max-age=31536000, immutable"},
+            # An entry's audio is addressed by its id and is not replaced,
+            # and the DJ decks refetch the same entry constantly -- without a
+            # freshness hint the browser pulled the whole file down on every
+            # deck reload. NOT ``immutable``: that promises these exact bytes
+            # can never change, and _playable_audio's transcode cache IS
+            # re-done when the source file is replaced. Plain max-age still
+            # skips the download; when the browser does revalidate, the
+            # FileResponse's ETag / Last-Modified answer 304. ``private``
+            # because a library is one user's: no shared proxy may keep a copy.
+            headers={"Cache-Control": "private, max-age=31536000"},
         )
     # No local file, in the entry or in any media root — the remote copy is
     # the last resort. On the first successful fetch the bytes are persisted
