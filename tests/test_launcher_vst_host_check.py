@@ -212,7 +212,7 @@ def test_the_check_sits_where_theDAW_sh_already_puts_it() -> None:
 
     sh_deps = SH.index("VST-Foundry-UI/VST-UI-FOUNDRY")
     sh_line = SH.index("live VST host: not available on this platform")
-    sh_ports = SH.index("for port in")
+    sh_ports = SH.index("backend.ports --free")
     assert sh_deps < sh_line < sh_ports
 
 
