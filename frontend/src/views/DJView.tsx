@@ -1306,7 +1306,11 @@ export const DJView: React.FC = () => {
     djEngine.setDeckPitch(follower, pct);
     // Key-lock above a few percent: a 6 % pull is ~1 semitone of pitch shift,
     // which turns a "harmonic" Camelot match into a clash the listener hears.
-    if (Math.abs(pct) > KEYLOCK_PITCH_PCT) void djEngine.setDeckKeylock(follower, true);
+    // Written as a boolean, not an `if`: the old form only ever turned it ON,
+    // so a deck key-locked for one track stayed locked through every later
+    // match — including the 0 % ones an unreachable tempo now produces —
+    // carrying the previous track's formant processing with it.
+    void djEngine.setDeckKeylock(follower, Math.abs(pct) > KEYLOCK_PITCH_PCT);
     // Phase off the CONSTANT beatgrid, not the jittery raw beats — and read
     // both decks AFTER setDeckPitch, which re-anchors the follower's position
     // clock (the old code measured against a position captured before it).
@@ -1678,7 +1682,14 @@ export const DJView: React.FC = () => {
         window.clearInterval(seedPoll);
         seedPoll = 0;
         const firstBeat = ctl.firstBeat ?? (ctl.gridBeats?.[0] ?? null);
-        if (analyzed && firstBeat != null && firstBeat > 0.02) djEngine.seekDeck(current, firstBeat);
+        // Seeking to the first beat is a START-of-track courtesy (fix 8): it
+        // stops a fresh track opening on the silence before its downbeat. Now
+        // that the gate also seeds a deck that is loaded-but-PAUSED, that seek
+        // would rewind a deck the user parked mid-track back to the top. Only
+        // pull FORWARD to the first beat, never back to it.
+        if (analyzed && firstBeat != null && firstBeat > 0.02 && st.currentTime < firstBeat) {
+          djEngine.seekDeck(current, firstBeat);
+        }
         djEngine.playDeck(current);
         // The set has begun: from here a `playing: false` reading on this deck
         // really does mean the track ran out, and the dead-air rescue applies.
@@ -1788,7 +1799,10 @@ export const DJView: React.FC = () => {
           setSyncLock(nxt);
           // Key-lock the follower when the match needed a real pull (fix 5).
           const followerPitch = djEngine.getStatus(nxt).pitchPct;
-          if (Math.abs(followerPitch) > KEYLOCK_PITCH_PCT) void djEngine.setDeckKeylock(nxt, true);
+          // Boolean, not an `if` — same reason as syncDeck above: an automix
+          // run that key-locked one follower left every later deck locked too,
+          // because nothing in either path ever turned it back off.
+          void djEngine.setDeckKeylock(nxt, Math.abs(followerPitch) > KEYLOCK_PITCH_PCT);
           mix.fading = true; mix.fadeStart = now; mix.fadeFrom = djEngine.getCrossfade(); mix.fadeTo = nxt === 'B' ? 1 : -1;
           // Dead air: the outgoing deck is already silent, so a 10 s fade is
           // 10 s of a half-open fader. Get the incoming track up fast instead.
@@ -1825,9 +1839,13 @@ export const DJView: React.FC = () => {
           // is now the master (or a freshly loaded track on the freed deck).
           setSyncLock(null);
           mix.current = nxt;
-          // The incoming deck was played by the transition above, so the new
-          // `current` has started by definition — carry that with the swap.
-          mix.started = true;
+          // The transition played the incoming deck, but asserting that it
+          // WORKED puts the dead-air rescue back in charge of exactly the case
+          // DJ-5 took it out of: a play that never took (an evicted buffer, an
+          // engine refusal) would latch `started` true over a deck making no
+          // sound. Read the deck instead — and never clear a `started` the run
+          // has already earned, since a track that ran out still counts.
+          mix.started = djEngine.getStatus(nxt).playing || mix.started;
           mix.fading = false;
           const nowEntry = nxt === 'A' ? deckATrackRef.current : deckBTrackRef.current;
           useDjAutomix.getState().setNowPlaying(nowEntry);

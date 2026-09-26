@@ -314,8 +314,12 @@ const {
   // fix 4/5 — honest messaging, and key-lock on a real pull.
   assert.ok(/NOT beatmatched/.test(sync), 'syncDeck says so when the pitch range cannot deliver the match');
   assert.ok(/mixing unmatched/.test(interval), 'the automix flash says so too');
-  assert.ok(/setDeckKeylock\(nxt, true\)/.test(interval), 'key-lock engages for the automix follower');
-  assert.ok(/setDeckKeylock\(follower, true\)/.test(sync), 'and for a manual SYNC');
+  // Both sites now write the boolean rather than only ever passing `true` —
+  // see the DJ-5 review block below, which pins the release half. The original
+  // intent is unchanged: key-lock is driven by the size of the pitch pull.
+  assert.ok(/setDeckKeylock\(nxt, Math\.abs\(followerPitch\) > KEYLOCK_PITCH_PCT\)/.test(interval),
+    'key-lock engages for the automix follower on a real pull');
+  assert.ok(/setDeckKeylock\(follower, Math\.abs\(pct\) > KEYLOCK_PITCH_PCT\)/.test(sync), 'and for a manual SYNC');
   assert.ok(/KEYLOCK_PITCH_PCT/.test(interval) && /KEYLOCK_PITCH_PCT/.test(sync), 'both off the same threshold');
 
   // fix 9 — phase comes off the constant beatgrid, never the raw beats.
@@ -438,7 +442,10 @@ const {
     'the plan call passes the run\'s `started` flag (THE BUG: without it every undecoded deck read as dead air)');
   assert.ok(/djEngine\.playDeck\(current\);[\s\S]{0,240}?started = true/.test(seed),
     'the seed poll marks the run as started where it actually plays the deck');
-  assert.ok(/mix\.started = true/.test(interval),
+  // The swap maintains `started` for the deck it just moved to; the exact
+  // expression (which reads the deck rather than asserting the play took) is
+  // pinned in the DJ-5 review block below.
+  assert.ok(/mix\.current = nxt;[\s\S]{0,600}?mix\.started =/.test(interval),
     'and the swap marks the deck it just played as started');
   // The 15 s give-up path never plays anything, so `started` stays false and
   // the interval can never transition — nothing else would ever switch automix
@@ -473,6 +480,49 @@ const {
   assert.ok(!/base\.pct/.test(code(pll)),
     'THE BUG: the PLL walked an unmatchable deck to the pitch rail every 350 ms');
   assert.ok(/base\.matched &&/.test(pll), 'and adds no bend to a tempo it cannot hold');
+}
+
+/* ─────────── DJ-5 review follow-ups: three notes on the hotfix ───────────
+ * Each one is a consequence of widening the seed gate / adding `started`,
+ * and each is invisible to the pure plan tests because it is a call the
+ * interval makes on the engine.
+ */
+{
+  const src = readFileSync(fileURLToPath(new URL('./DJView.tsx', import.meta.url)), 'utf8');
+  const code = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*/g, '');
+  const automix = src.slice(src.indexOf('// Automix (D7): auto-sequence'));
+  const intervalStart = automix.indexOf('const id = window.setInterval');
+  const interval = automix.slice(intervalStart, automix.indexOf('}, 500);', intervalStart));
+  const seed = automix.slice(automix.indexOf('const curEntry ='), intervalStart);
+  const sync = src.slice(src.indexOf('const syncDeck = ('), src.indexOf('const syncDeckRef'));
+
+  // 1 — the widened gate now seeds decks that are ALREADY mid-track, and the
+  // unconditional seek dragged them back to their first beat. Seeking to
+  // `firstBeat` is a start-of-track courtesy (fix 8); a deck the user parked
+  // 90 s in must resume from where it sits.
+  assert.ok(/st\.currentTime < firstBeat/.test(seed),
+    'the seed only seeks to the first beat when the deck is still before it (THE BUG: a paused deck mid-track got rewound)');
+  assert.ok(/firstBeat > 0\.02 && st\.currentTime < firstBeat/.test(seed),
+    'the guard is part of the same seek condition, not a separate branch');
+
+  // 2 — key-lock was engaged on a real pull and NEVER released, so a deck
+  // that later matched at 0 % kept the formant processing from a previous
+  // track. Both sync paths must write the boolean, not just the `true` case.
+  assert.ok(/setDeckKeylock\(follower, Math\.abs\(pct\) > KEYLOCK_PITCH_PCT\)/.test(sync),
+    'syncDeck sets key-lock to whether the pull warrants it, so 0 % releases it');
+  assert.ok(/setDeckKeylock\(nxt, Math\.abs\(followerPitch\) > KEYLOCK_PITCH_PCT\)/.test(interval),
+    'the automix post-play key-lock does the same for the incoming deck');
+  assert.ok(!/setDeckKeylock\((follower|nxt), true\)/.test(code(sync) + code(interval)),
+    'THE BUG: key-lock was only ever turned ON — nothing in either path ever turned it off');
+
+  // 3 — the swap asserted the incoming deck had started instead of reading
+  // it. A play that never took (a buffer evicted, an engine refusal) would
+  // have latched `started` true over a deck making no sound, putting the
+  // dead-air rescue back in charge of exactly the case DJ-5 removed it from.
+  assert.ok(/mix\.started = djEngine\.getStatus\(nxt\)\.playing \|\| mix\.started/.test(interval),
+    'the swap reads the incoming deck\'s real state and never clears a `started` already earned');
+  assert.ok(!/^\s*mix\.started = true;\s*$/m.test(code(interval)),
+    'THE BUG: `started` was set true unconditionally on every swap');
 }
 
 /* djEngine.hasPendingBend — the accessor the PLL gates on, exercised directly.
