@@ -548,3 +548,35 @@ def test_a_carried_key_confidence_never_outlives_the_key_it_measured():
     assert fresh.get("key_confidence") is None, (
         "the previous key's confidence was pinned onto a newly measured key"
     )
+
+
+def test_a_re_measured_key_keeps_the_confidence_already_stored_for_it():
+    """The confidence belongs to a key, not to a run.
+
+    Gating the restore on "the key was carried forward" was too narrow: a dj
+    run that RE-MEASURES the same key the row already holds reports no
+    confidence of its own (the dj profile's key step is the cheap one), so the
+    row lost a confidence that still describes exactly the key it names."""
+    from backend.modules.analysis.engine import _carry_forward_partial
+
+    class _PriorDB:
+        def __init__(self, row: dict) -> None:
+            self._row = row
+
+        def get_analysis(self, entry_id: str):
+            return dict(self._row)
+
+    prior = {"key": "F#", "scale": "minor", "key_confidence": 0.91}
+
+    same = {"bpm": 128.0, "key": "F#", "scale": "minor", "confidence": None}
+    _carry_forward_partial(_PriorDB(prior), "x", same)
+    assert same["key"] == "F#"
+    assert same["key_confidence"] == 0.91, (
+        "re-measuring the SAME key dropped the confidence stored for it"
+    )
+
+    different = {"bpm": 128.0, "key": "C", "scale": "major", "confidence": None}
+    _carry_forward_partial(_PriorDB(prior), "x", different)
+    assert different.get("key_confidence") is None, (
+        "a different key inherited the previous key's confidence"
+    )

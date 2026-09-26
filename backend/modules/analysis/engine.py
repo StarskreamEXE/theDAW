@@ -748,12 +748,16 @@ def _carry_forward_partial(
     # stored value means removing the empty one the failed step left behind.
     #
     # It rides with the KEY, not on its own: a confidence measures one specific
-    # key, so it may only be restored when that key was itself carried forward.
-    # Restoring it whenever the payload had none pinned the previous key's
-    # confidence onto a freshly measured key that reported no confidence.
+    # key, so it may only be restored while the row still names that key --
+    # either because the key was carried forward, or because this run measured
+    # the very same key again. Restoring it whenever the payload had none
+    # pinned the previous key's confidence onto a DIFFERENT, freshly measured
+    # key. (Two absent keys are not "the same key": that would attach a
+    # confidence to a row that names no key at all.)
+    same_key = payload.get("key") is not None and payload.get("key") == prior.get("key")
     if payload.get("confidence") is None and payload.get("key_confidence") is None:
         payload.pop("confidence", None)
-        if "key" in carried and prior.get("key_confidence") is not None:
+        if ("key" in carried or same_key) and prior.get("key_confidence") is not None:
             payload["key_confidence"] = prior["key_confidence"]
     if embedded is not None and not embedded:
         stored = prior.get("embedded_tags_json")

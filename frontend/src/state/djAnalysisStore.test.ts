@@ -5,8 +5,8 @@
 // with the deck the user just loaded queued behind all of them. These drive
 // the store against a stub backend: the sweep is a capped, replaceable window,
 // an explicit request jumps ahead of it, the queue can be paused, runs ask for
-// the cheap `dj` profile, a failed entry is retried exactly once and only after
-// a minute, and the parsed row carries the detector's BPM confidence.
+// the cheap `dj` profile, a failed entry is retried twice and no sooner than a
+// minute, and the parsed row carries the detector's BPM confidence.
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
@@ -279,11 +279,13 @@ const drain = async (): Promise<void> => {
   await drain();
   assert.equal(posts.length, 3, 'the second retry lands after 120 s');
 
-  // Third and last: 240 s.
+  // There is no third wait: the attempt cap ends the ladder after the second
+  // retry, so the doubled 240 s step is never served.
   nowMs += ANALYSIS_ERROR_RETRY_MS * 4;
   await st().analyzeAll(['flaky'], { cap: 1 });
   await drain();
-  assert.equal(posts.length, 3, 'attempt four is past the cap');
+  assert.equal(posts.length, 3,
+    'the served ladder is 60 s then 120 s; after the third failure the sweep gives up');
   assert.equal(MAX_SWEEP_ANALYSIS_ATTEMPTS, 3);
 
   // However long it waits, the sweep is done with this row.
@@ -373,6 +375,49 @@ const drain = async (): Promise<void> => {
   assert.ok(posts.includes('boom'),
     'the interrupted entry stayed "running" forever: ensureAnalyzed can never run it again');
   assert.equal(st().byId['boom'].status, 'ready');
+}
+
+// ── a subscriber that is broken FOR GOOD still cannot strand an entry ──────
+// The queue's recovery writes the entry to 'error' through the same setState
+// that just exploded, so a subscriber that throws every time makes the
+// recovery itself the thing that fails.
+{
+  const breakEverythingFor = (id: string) => {
+    let thrown = 0;
+    const stop = useDjAnalysisStore.subscribe(() => {
+      if (useDjAnalysisStore.getState().byId[id]) {
+        thrown += 1;
+        throw new Error('a subscriber that stays broken');
+      }
+    });
+    return { count: () => thrown, stop };
+  };
+
+  const sweepCase = breakEverythingFor('stuck');
+  assert.equal(await raceTimeout(st().ensureAnalyzed('stuck'), 2_000), 'settled');
+  sweepCase.stop();
+  assert.ok(sweepCase.count() >= 2, 'the recovery write never threw: the case is not reproduced');
+  // zustand commits the next state BEFORE it notifies, so the 'error' write
+  // landed even though delivering it exploded.
+  assert.equal(st().byId['stuck'].status, 'error');
+  // The failure belongs to the subscriber, not to the file, so it must not
+  // spend the file's retry ladder: the browsing sweep runs it right away.
+  posts.length = 0;
+  await st().analyzeAll(['stuck'], { cap: 1 });
+  await drain();
+  assert.ok(posts.includes('stuck'),
+    'a broken subscriber put the FILE into backoff: the sweep will not touch it for a minute');
+  assert.equal(st().byId['stuck'].status, 'ready');
+
+  // ...and an explicit request revives it too.
+  const priorityCase = breakEverythingFor('stuck_p');
+  assert.equal(await raceTimeout(st().ensureAnalyzed('stuck_p'), 2_000), 'settled');
+  priorityCase.stop();
+  assert.ok(priorityCase.count() >= 2);
+  posts.length = 0;
+  await st().ensureAnalyzed('stuck_p', { priority: true });
+  assert.ok(posts.includes('stuck_p'), 'a priority request could not revive the entry');
+  assert.equal(st().byId['stuck_p'].status, 'ready');
 }
 
 // ── DJView hands the sweep its ranking, not the raw row order ──────────────

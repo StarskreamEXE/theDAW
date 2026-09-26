@@ -10,6 +10,7 @@ on the same track decoded that track twice.
 
 from __future__ import annotations
 
+import ast
 import json
 import threading
 import time
@@ -392,24 +393,75 @@ def test_get_analysis_reports_the_profile_that_wrote_the_row(monkeypatch):
     assert "profile" not in pending
 
 
+#: Spelled as constants so the scanner's OWN source carries neither marker and
+#: needs no self-exclusion.
+_STORE_STUB_MARKER = "get_library_store"
+_TRIPWIRE_MARKER = "_arm_real_library_tripwire("
+
+#: A scanner that only looked at ``tree.body`` saw neither an ``async def``
+#: test nor one grouped inside a class. Both are one refactor away, and an
+#: unseen test is an unarmed one.
+_SCANNER_SAMPLE = """
+class TestGroup:
+    def test_nested(self, monkeypatch):
+        monkeypatch.setattr(mod, "get_library_store", lambda: stub)
+
+
+async def test_async(monkeypatch):
+    monkeypatch.setattr(mod, "get_library_store", lambda: stub)
+
+
+def test_armed(monkeypatch):
+    monkeypatch.setattr(mod, "get_library_store", lambda: stub)
+    _arm_real_library_tripwire(monkeypatch)
+
+
+def test_with_a_closure(monkeypatch):
+    _arm_real_library_tripwire(monkeypatch)
+
+    def client_for(row):
+        monkeypatch.setattr(mod, "get_library_store", lambda: stub)
+"""
+
+
+def _unarmed_store_stubbing_tests(source: str) -> list[str]:
+    """Names of the tests in ``source`` that stub the store without arming the
+    tripwire.
+
+    Scans every named scope -- module level, inside a class, sync or async.
+    Functions nested INSIDE one of those are deliberately not scanned as
+    scopes of their own: they are part of their enclosing test's source, so a
+    closure that stubs the store is covered by the test that owns it.
+    """
+    tree = ast.parse(source)
+    containers: list[Any] = [
+        tree,
+        *(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)),
+    ]
+    unarmed: list[str] = []
+    for container in containers:
+        for node in container.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            segment = ast.get_source_segment(source, node) or ""
+            if _STORE_STUB_MARKER in segment and _TRIPWIRE_MARKER not in segment:
+                unarmed.append(node.name)
+    return unarmed
+
+
 def test_every_test_that_stubs_the_store_arms_the_real_library_tripwire():
     """The tripwire is the guard that keeps these tests off the user's real
     library, so it belongs to every test that stubs the store -- not only to
     the one fixture that happened to be written first. Tests added later built
-    their own app and stubbed only ``get_library_store``, leaving the real
-    resolver one fallback away from being consulted."""
-    import ast
-
-    source = Path(__file__).read_text(encoding="utf-8")
-    unarmed = [
-        node.name
-        for node in ast.parse(source).body
-        if isinstance(node, ast.FunctionDef)
-        and not node.name.startswith("test_every_test_that_stubs_the_store")
-        and "get_library_store" in (ast.get_source_segment(source, node) or "")
-        and "_arm_real_library_tripwire("
-        not in (ast.get_source_segment(source, node) or "")
+    their own app and stubbed only the store, leaving the real resolver one
+    fallback away from being consulted."""
+    # The scanner itself first: a pin that cannot SEE a test is not a pin.
+    assert sorted(_unarmed_store_stubbing_tests(_SCANNER_SAMPLE)) == [
+        "test_async",
+        "test_nested",
     ]
+
+    unarmed = _unarmed_store_stubbing_tests(Path(__file__).read_text(encoding="utf-8"))
     assert not unarmed, (
         f"these stub the library store without arming the tripwire: {unarmed}"
     )

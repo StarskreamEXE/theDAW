@@ -54,7 +54,9 @@ interface Entry {
 export const DJ_SWEEP_CAP = 24;
 
 /** How long the browsing sweep waits before retrying an entry whose analysis
- *  failed. The wait DOUBLES per failure (60 s, 120 s, 240 s), so a row that is
+ *  failed. The wait DOUBLES per failure, and {@link MAX_SWEEP_ANALYSIS_ATTEMPTS}
+ *  ends the ladder before the third step is ever served: 60 s after the first
+ *  failure, 120 s after the second, given up after the third. So a row that is
  *  simply broken — a missing file, an unsupported codec — stops costing
  *  requests, while a transient failure (backend busy, file briefly locked)
  *  still heals on its own. Before this, a failing row on screen was re-POSTed
@@ -174,8 +176,15 @@ async function _processQueue(): Promise<void> {
           _markError(id);
         } catch {
           // The write that threw can throw again for the same reason (a
-          // broken subscriber). Losing the consumer here would undo the whole
-          // point of this catch.
+          // subscriber that is broken for good). Losing the consumer here
+          // would undo the whole point of this catch — and the entry is NOT
+          // left mid-run by it: zustand commits the next state before it
+          // notifies listeners, so `_markError`'s 'error' write has already
+          // landed; only its delivery exploded. What must not survive is the
+          // failure it recorded on the way in: that failure belongs to the
+          // subscriber, not to the file, so charging it to this id's retry
+          // ladder would keep the sweep off a perfectly good track.
+          _failures.delete(id);
         }
         logError('dj', `Analysis queue step failed for ${id}: ${e instanceof Error ? e.message : String(e)}`);
       } finally {
