@@ -832,6 +832,21 @@ def test_the_https_address_is_offered_only_while_something_is_listening(
     assert dead["https_port"] == ports.LAN_HTTPS_PORT
 
 
+def test_the_http_port_is_the_one_the_web_ui_really_took(
+    network_router: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When another program held 5173, the launcher put the web UI on the next
+    free port and told this process which one (theDAW_FRONTEND_PORT). Sending a
+    second device to 5173 anyway would send it to the OTHER program."""
+    monkeypatch.setattr(network_router, "_probe_once", lambda port: False)
+    monkeypatch.setenv("theDAW_FRONTEND_PORT", "5178")
+    assert network_router.get_lan()["http_port"] == 5178
+
+    monkeypatch.delenv("theDAW_FRONTEND_PORT")
+    monkeypatch.setattr(network_router, "_probe_cache", {})
+    assert network_router.get_lan()["http_port"] == ports.FRONTEND_PORT
+
+
 def test_an_offline_machine_answers_with_nulls_not_an_error(
     network_router: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

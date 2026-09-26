@@ -172,3 +172,20 @@ export function lanListenerEnv(
   env[LAN_HTTPS_PORT_ENV] = String(plan.port)
   return env
 }
+
+/**
+ * The port the electron-vite renderer dev server actually got, read from the
+ * ELECTRON_RENDERER_URL it hands the main process, or null outside dev (a
+ * packaged build loads files and has no dev server). The server steps past
+ * 5173 when another program holds it, so the backend is told this port as
+ * theDAW_FRONTEND_PORT and /api/network/lan reports the one in use.
+ */
+export function rendererDevPort(url: string | undefined): number | null {
+  if (!url) return null
+  try {
+    const port = Number(new URL(url).port)
+    return Number.isInteger(port) && port > 0 && port < 65536 ? port : null
+  } catch {
+    return null
+  }
+}

@@ -31,6 +31,7 @@ import {
   lanListenerCommand,
   lanListenerEnv,
   parseLanHttpsPlan,
+  rendererDevPort,
   type LanHttpsPlan,
 } from './lanHttps'
 
@@ -298,6 +299,12 @@ function buildBaseEnv(): NodeJS.ProcessEnv {
 // the token out.
 function buildBackendEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...buildBaseEnv(), THEDAW_LAUNCH_TOKEN: LAUNCH_TOKEN }
+  // The renderer's dev server steps past 5173 when another program holds it,
+  // so tell the backend the port it actually got; /api/network/lan reports it
+  // (backend.ports.frontend_port). A packaged build has no dev server and the
+  // backend keeps its default.
+  const rendererPort = rendererDevPort(process.env.ELECTRON_RENDERER_URL)
+  if (rendererPort) env.theDAW_FRONTEND_PORT = String(rendererPort)
   // Live VST host: a packaged build may ship the exe under resourcesPath (see
   // electron-builder.yml's win.extraResources, staged by
   // scripts/stage-vst-host.mjs). Point the backend's HostLocator at it unless

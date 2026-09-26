@@ -16,6 +16,7 @@
 import assert from 'node:assert/strict';
 import {
   LAN_HTTPS_CERT_ENV,
+  rendererDevPort,
   LAN_HTTPS_KEY_ENV,
   LAN_HTTPS_PORT_ENV,
   lanHttpsLogLine,
@@ -170,6 +171,17 @@ const ENABLED = {
     lanHttpsLogLine({ enabled: false, port: 5443, url: null, cert: null, key: null, vite: null, reason: null }),
     'LAN (https): off - unavailable',
   );
+}
+
+// rendererDevPort: the port the renderer dev server really got (it steps past
+// 5173 when another program holds it), or null when there is no dev server.
+{
+  assert.equal(rendererDevPort('http://localhost:5175/'), 5175);
+  assert.equal(rendererDevPort('http://127.0.0.1:5173'), 5173);
+  assert.equal(rendererDevPort(undefined), null, 'packaged build: no dev server');
+  assert.equal(rendererDevPort(''), null);
+  assert.equal(rendererDevPort('http://localhost/'), null, 'no explicit port');
+  assert.equal(rendererDevPort('not a url'), null);
 }
 
 console.log('lanHttps: plan parsing + token-free child env + platform command contract passed');

@@ -49,13 +49,17 @@ _LAUNCHERS = ("theDAW.bat", "theDAW-desktop.bat", "theDAW.sh")
 #: What a launcher must never run again. Each one kills WHATEVER holds a port:
 #: another project's Vite on 5173, another Electron app's server. The launchers
 #: go through ``backend.ports --free`` instead, which stops only processes
-#: running from this checkout.
+#: running from this checkout. These match the ACT, not the exact text that was
+#: removed once: a launcher that signals a pid or an image name it looked up
+#: itself has skipped the ownership check however it spells it.
 _BLIND_KILLS = (
-    re.compile(r"do\s+taskkill\b[^\n]*%%a", re.IGNORECASE),  # netstat | taskkill
+    re.compile(r"taskkill[^\n]*/PID", re.IGNORECASE),  # kill by pid (netstat | ...)
+    re.compile(r"taskkill[^\n]*/IM", re.IGNORECASE),  # kill by image name
+    re.compile(r"\bpkill\b"),
+    re.compile(r"\bkillall\b"),
+    re.compile(r"Stop-Process", re.IGNORECASE),
+    re.compile(r"\bkill\s+-9\b"),
     re.compile(r"\bfuser\s+-k\b"),
-    re.compile(r"\bkill\s+-9\s+\$pids\b"),
-    re.compile(r"taskkill\b[^\n]*/IM\s", re.IGNORECASE),  # kill by image name
-    re.compile(r"Stop-Process\b[^\n]*-Name\b", re.IGNORECASE),
 )
 
 
@@ -415,3 +419,26 @@ def test_port_in_use_exit_code_cannot_be_mistaken_for_a_respawn():
     from backend.run import PORT_IN_USE_EXIT_CODE
 
     assert PORT_IN_USE_EXIT_CODE not in (0, RESTART_EXIT_CODE, UPDATE_EXIT_CODE)
+
+
+# ---------------------------------------------------------------------------
+# frontend_port(): the port the web UI REALLY took this launch
+# ---------------------------------------------------------------------------
+
+
+def test_the_frontend_port_defaults_to_the_table(monkeypatch):
+    monkeypatch.delenv("theDAW_FRONTEND_PORT", raising=False)
+    assert ports.frontend_port() == ports.FRONTEND_PORT
+
+
+def test_the_launcher_can_name_the_port_the_web_ui_actually_took(monkeypatch):
+    """_devstack hands the backend the port it chose when another program had
+    5173; everything that advertises the web UI's address must follow it."""
+    monkeypatch.setenv("theDAW_FRONTEND_PORT", "5177")
+    assert ports.frontend_port() == 5177
+
+
+@pytest.mark.parametrize("value", ["", "   ", "nope", "0", "-1", "65536", "5173.5"])
+def test_an_unusable_frontend_port_falls_back_to_the_table(monkeypatch, value: str):
+    monkeypatch.setenv("theDAW_FRONTEND_PORT", value)
+    assert ports.frontend_port() == ports.FRONTEND_PORT

@@ -265,6 +265,11 @@ def _run_backend(children: list) -> None:
     """Backend supervisor loop: respawn on rc=88, else trip shutdown."""
     env = os.environ.copy()
     env["SA3_SUPERVISOR_PRESENT"] = "1"
+    # The port the web UI ACTUALLY took (main() chose it before this thread
+    # starts). The backend advertises the web UI's address to other devices
+    # through GET /api/network/lan; without this it would hand a phone :5173,
+    # which in the case that moved us is another program entirely.
+    env[ports.FRONTEND_PORT_ENV] = str(_frontend_port)
     cmd = [sys.executable, "-m", "backend.run"]
     while not _shutdown.is_set():
         _emit("stack", "launching backend: " + " ".join(cmd))
@@ -401,16 +406,44 @@ def _choose_frontend_port() -> int:
     running and theDAW takes the next free port instead, skipping the ports
     theDAW itself reserves. If the whole range is taken, the preferred port is
     returned and Vite's own strictPort error says so.
+
+    The listening table is walked ONCE, for the whole candidate range: every
+    candidate it already shows as held is rejected without a syscall, so the
+    per-candidate ``is_port_free`` probe (which would walk that table again,
+    per candidate) runs only for candidates that still look free.
     """
     preferred = ports.FRONTEND_PORT
-    if ports.is_port_free(preferred):
+    span = range(preferred, preferred + 1 + _FRONTEND_PORT_SEARCH)
+    held = {holder.port for holder in ports.holders(span)}
+    if preferred not in held and ports.is_port_free(preferred):
         return preferred
     for candidate in range(preferred + 1, preferred + 1 + _FRONTEND_PORT_SEARCH):
-        if candidate in ports.ALL_PORTS:
+        if candidate in ports.ALL_PORTS or candidate in held:
             continue
         if ports.is_port_free(candidate):
             return candidate
     return preferred
+
+
+def _frontend_port_note(port: int) -> str:
+    """The log line for "someone else has 5173, we took another port".
+
+    Names the holder from the listening table directly rather than through
+    ``ports.describe_occupant``, whose sentence ends "Close it and start theDAW
+    again" -- the opposite of what happens here, where the other program is
+    deliberately left running and theDAW moves.
+    """
+    found = ports.holders([ports.FRONTEND_PORT])
+    if found:
+        holder = found[0]
+        safe = holder.name.encode("ascii", "backslashreplace").decode("ascii")
+        who = f"{safe}, pid {holder.pid}"
+    else:
+        who = "another program"
+    return (
+        f"port {ports.FRONTEND_PORT} is in use and left running ({who}); "
+        f"the web UI takes :{port} instead"
+    )
 
 
 def _use_frontend_port(port: int) -> None:
@@ -427,6 +460,15 @@ def _frontend_command(port: int) -> str:
     runs the frontend's own Vite with an explicit ``--port``: the dev script
     already passes ``--port=5173``, and a second ``--port`` appended through
     ``npm run dev --`` reaches Vite as a list rather than a number.
+
+    ``strictPort`` stays on, deliberately. The port was free when
+    ``_choose_frontend_port`` looked, and something else can still take it in
+    the moment between that check and Vite's bind. With strictPort on, that
+    race fails LOUDLY through Vite's own error, which the frontend pump prints
+    in this console; with it off, Vite would silently slide to another port and
+    every address this process then advertises -- the browser it opens, the
+    tunnel, the LAN link -- would point at nothing. No retry loop here: a
+    second guess would be just as racy, and the honest report is the error.
     """
     if port == ports.FRONTEND_PORT:
         return "npm run dev"
@@ -514,12 +556,7 @@ def main() -> int:
     fe_env["ENABLE_HMR"] = "true"
     port = _choose_frontend_port()
     if port != ports.FRONTEND_PORT:
-        who = ports.describe_occupant(ports.FRONTEND_PORT) or "another program"
-        _emit(
-            "stack",
-            f"port {ports.FRONTEND_PORT} is in use and left running ({who}); "
-            f"the web UI takes :{port} instead",
-        )
+        _emit("stack", _frontend_port_note(port))
     _use_frontend_port(port)
     frontend = _spawn(_frontend_command(port), cwd=frontend_dir, env=fe_env)
     children.append(frontend)

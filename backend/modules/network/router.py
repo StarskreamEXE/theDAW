@@ -83,7 +83,7 @@ def get_lan() -> dict:
         https_url = f"https://{lan_ip}:{https_port}"
     return {
         "lan_ip": lan_ip,
-        "http_port": ports.FRONTEND_PORT,
+        "http_port": ports.frontend_port(),
         "https_port": https_port,
         "https_url": https_url,
     }

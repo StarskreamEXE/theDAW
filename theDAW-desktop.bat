@@ -9,12 +9,15 @@ title theDAW (Desktop)
 :: Electron shell directly — no need to change any setting. It does NOT modify
 :: your saved launch_mode; double-click theDAW.bat any time to go back to web.
 ::
-:: It mirrors theDAW.bat's preflight + desktop branch, and it kills any stale
-:: backend on :8600 FIRST so the Electron shell spawns a fresh, supervised
-:: backend (which loads every backend module — e.g. the VST Foundry tab)
-:: instead of reattaching to an old process that started before those modules
-:: existed. (The Electron main process reuses an already-running backend; a
-:: stale one is exactly why a newly-added tab can stay broken across restarts.)
+:: It mirrors theDAW.bat's preflight + desktop branch, and it calls
+:: `python -m backend.ports --free --all-ports` FIRST, which stops only the
+:: listeners running from THIS checkout — a stale theDAW backend on :8600, not
+:: whatever else happens to hold a port. That way the Electron shell spawns a
+:: fresh, supervised backend (which loads every backend module — e.g. the VST
+:: Foundry tab) instead of reattaching to an old process that started before
+:: those modules existed. (The Electron main process reuses an already-running
+:: backend; a stale one is exactly why a newly-added tab can stay broken across
+:: restarts.) Another program's server is left alone and left running.
 :: ===========================================================================
 
 :: Run from the repo root (this script's folder).

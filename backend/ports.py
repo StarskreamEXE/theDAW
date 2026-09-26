@@ -17,11 +17,15 @@ This gives every launcher one portable way to ask and to act:
     python -m backend.ports --free      # stop theDAW's own stale listeners
     python -m backend.ports --free --all-ports
 
-``theDAW.bat`` and ``theDAW.sh`` deliberately KEEP their native pipelines: they
-are a process spawn cheaper than starting Python, and they still work when the
-venv is half-built, a state the .bat is specifically written to survive. The port
-numbers here are the single source of truth, and ``tests/test_ports.py`` parses
-both launchers to prove their lists still match this table.
+All three shipped launchers (``theDAW.bat``, ``theDAW-desktop.bat``,
+``theDAW.sh``) now call ``--free --all-ports`` instead of their old native
+``netstat | taskkill`` / ``fuser -k`` pipelines: those stopped WHATEVER held a
+port, which on a developer's machine is as likely to be another project's Vite
+on 5173 as a stale theDAW. ``--free`` stops only listeners running FROM THIS
+CHECKOUT and leaves everyone else's alone. The port numbers here are the single
+source of truth, and ``tests/test_ports.py`` reads all three launchers to prove
+they still go through this module and never signal a pid or an image name they
+looked up themselves.
 
 Identity, because ``--free`` kills things
 -----------------------------------------
@@ -77,6 +81,33 @@ ALL_PORTS: tuple[int, ...] = (
 
 #: What ``--free`` touches by default: the two that actually block a start.
 DEFAULT_PORTS: tuple[int, ...] = (FRONTEND_PORT, BACKEND_PORT)
+
+#: How the launcher tells this process which port the web UI REALLY took.
+FRONTEND_PORT_ENV = "theDAW_FRONTEND_PORT"
+
+
+def frontend_port() -> int:
+    """The port the web UI is serving on this launch.
+
+    ``FRONTEND_PORT`` is only the preferred one. When another program already
+    holds it, ``backend/_devstack.py`` leaves that program running, puts the web
+    UI on the next free port and exports the choice as ``theDAW_FRONTEND_PORT``
+    for the backend child. Anything that ADVERTISES the web UI's address -- the
+    Mobile Access link and QR code from ``GET /api/network/lan`` above all --
+    has to read it here, because sending a second device to 5173 when the UI
+    moved to 5174 sends it to the other program instead of to theDAW.
+
+    Anything unusable in the environment (empty, not a number, out of the 1-65535
+    range) falls back to the table rather than raising: a bad value must not stop
+    the backend from answering at all.
+    """
+    raw = os.environ.get(FRONTEND_PORT_ENV, "").strip()
+    try:
+        port = int(raw)
+    except ValueError:
+        return FRONTEND_PORT
+    return port if 1 <= port <= 65535 else FRONTEND_PORT
+
 
 # Binaries we are willing to signal. Necessary but never sufficient; see
 # _is_ours, which also requires the process to live in this checkout.
