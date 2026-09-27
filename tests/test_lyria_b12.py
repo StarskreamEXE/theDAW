@@ -3377,6 +3377,38 @@ def test_check_latest_says_an_update_is_waiting_and_asks_github_once(
     assert len(asks) == 1
 
 
+def test_a_failed_check_is_not_asked_again_on_every_open(latest, monkeypatch):
+    """GitHub cannot be reached: the first open asks and fails, and opening
+    the panel again within ten minutes does not start another git ls-remote
+    (each can wait out the fetch timeout). After ten minutes, or when forced,
+    it asks again."""
+    checkout = _existing_install(latest, latest.upstream.a)
+    monkeypatch.setattr(sidecar, "DEFAULT_PROJECT_PATH", checkout)
+    monkeypatch.setattr(
+        sidecar, "LYRIA_REPO_URL", (latest.root / "unreachable").as_uri()
+    )
+    asks: list[list[str]] = []
+    real_git_run = sidecar._git_run
+
+    def _counting(git, args, cwd, timeout=60.0):
+        if "ls-remote" in args:
+            asks.append(args)
+        return real_git_run(git, args, cwd, timeout)
+
+    monkeypatch.setattr(sidecar, "_git_run", _counting)
+
+    unanswered = {"head": latest.upstream.a, "latest": None, "available": False}
+    assert sidecar.check_latest() == unanswered
+    assert sidecar.check_latest() == unanswered
+    assert len(asks) == 1
+
+    sidecar._checkout_state["latest_checked_at"] -= sidecar.CHECKOUT_RETRY_SEC + 1
+    assert sidecar.check_latest() == unanswered
+    assert len(asks) == 2
+    sidecar.check_latest(force=True)
+    assert len(asks) == 3
+
+
 def test_update_route_reports_the_job_and_refuses_without_a_checkout(
     latest, monkeypatch
 ):

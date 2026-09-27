@@ -1718,6 +1718,21 @@ def _set_latest(latest: Optional[str]) -> None:
         _checkout_state.update(latest=latest, latest_checked_at=time.time())
 
 
+def _claim_latest_check(force: bool) -> bool:
+    """True when check_latest should ask GitHub now, and the time of this ask
+    recorded in the same step: forced, or no ask began in the last
+    CHECKOUT_RETRY_SEC. Recorded before the ask, so a failed ask (offline,
+    GitHub unreachable) counts too, and panels opened while one ask is still
+    waiting on the network do not start another."""
+    with _checkout_lock:
+        last = _checkout_state["latest_checked_at"]
+        now = time.time()
+        if not force and last is not None and now - last < CHECKOUT_RETRY_SEC:
+            return False
+        _checkout_state["latest_checked_at"] = now
+        return True
+
+
 def _is_ancestor(git: str, project: Path, older: str, newer: str) -> bool:
     return (
         _git_run(git, ["merge-base", "--is-ancestor", older, newer], project).returncode
@@ -1944,11 +1959,13 @@ def check_latest(*, force: bool = False) -> dict:
     """Ask GitHub for the latest commit of LYRIA_REPO's default branch
     (``git ls-remote``, no download) and compare it with the checkout's HEAD.
 
-    Asked at most once per CHECKOUT_RETRY_SEC unless ``force``, so opening the
-    Lyria panel repeatedly does not hit the network each time. Returns
-    ``{"head", "latest", "available"}``: ``available`` is True when the
-    latest differs from HEAD (the Update press then says whether it is a
-    fast-forward). Never raises; a failed ask leaves ``latest`` as it was."""
+    Asked at most once per CHECKOUT_RETRY_SEC unless ``force``, whether the
+    last ask was answered or not (_claim_latest_check), so opening the Lyria
+    panel repeatedly, or while GitHub cannot be reached, does not start a
+    git ls-remote each time. Returns ``{"head", "latest", "available"}``:
+    ``available`` is True when the latest differs from HEAD (the Update press
+    then says whether it is a fast-forward). Never raises; a failed ask
+    leaves ``latest`` as it was."""
     cfg = resolve_config()
     git = _git_path()
     head: Optional[str] = None
@@ -1958,12 +1975,7 @@ def check_latest(*, force: bool = False) -> dict:
             head = rev.stdout.strip() or None if rev.returncode == 0 else None
         except (OSError, subprocess.TimeoutExpired):
             head = None
-    state = checkout_state()
-    fresh = (
-        state["latest_checked_at"] is not None
-        and time.time() - state["latest_checked_at"] < CHECKOUT_RETRY_SEC
-    )
-    if git and (force or not fresh):
+    if git and _claim_latest_check(force):
         cwd = cfg.project_path if cfg.project_path.is_dir() else _REPO_ROOT
         try:
             remote = _git_run(
