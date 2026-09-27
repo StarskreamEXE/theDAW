@@ -1815,6 +1815,13 @@ class LibraryProgress:
             self._error = message
             self._error_label = label
 
+    def clear_failure(self) -> None:
+        """Forget a failure, for a task that is being started again (a search
+        index build restarted by the Retry button)."""
+        with self._lock:
+            self._error = None
+            self._error_label = ""
+
     def mark_opened(self) -> None:
         """The store answers requests from here on (a task may still run)."""
         with self._lock:
@@ -2036,8 +2043,15 @@ class LibraryDB:
         #: setting the outermost one restores.
         self._checkpoint_depth = 0
         self._checkpoint_previous = 1000
-        self._migrate()
-        self._ensure_search(background=build_search_in_background)
+        try:
+            self._migrate()
+            self._ensure_search(background=build_search_in_background)
+        except BaseException:
+            # An open that failed part way must not keep the file open: the
+            # backend retries a failed open, and every attempt would leave a
+            # connection behind.
+            self.close()
+            raise
 
     def close(self) -> None:
         with self._writelock:
@@ -2310,9 +2324,21 @@ class LibraryDB:
         """``{"complete": True}`` once the index answers for every entry;
         while a background build runs, ``{"complete": False, "indexed",
         "total", "eta_sec"}`` -- a search then covers the ``indexed`` rows.
-        Reads no row and takes no lock."""
+        A build that stopped answers ``{"complete": False, "failed": True,
+        "error"}``: nothing finishes it until :meth:`restart_search_build`
+        or the next open. Reads no row and takes no lock."""
         if self.search_complete:
             return {"complete": True}
+        error = self._search_build_error
+        if error is not None:
+            return {
+                "complete": False,
+                "failed": True,
+                "error": str(error) or type(error).__name__,
+                "indexed": 0,
+                "total": 0,
+                "eta_sec": None,
+            }
         snap = self.progress.snapshot()
         if snap["phase"] == "index":
             return {
@@ -2322,6 +2348,31 @@ class LibraryDB:
                 "eta_sec": snap["eta_sec"],
             }
         return {"complete": False, "indexed": 0, "total": 0, "eta_sec": None}
+
+    def restart_search_build(self) -> bool:
+        """Start a background search index build that stopped again, from its
+        last committed batch (the LIBRARY tab's Retry button). False when
+        there is nothing to restart: no build failed, or the database is
+        closed."""
+        with self._writelock:
+            if self._closed or self._search_build_error is None:
+                return False
+            self._search_build_error = None
+            self._search_built.clear()
+            self.progress.clear_failure()
+        log.info("library.db: restarting the search index build")
+        try:
+            self._ensure_search(background=True)
+        except BaseException as e:
+            self._search_build_error = e
+            self._search_built.set()
+            self.progress.fail(
+                f"the search index build could not be restarted ({e})",
+                label="The search index build stopped",
+            )
+            log.exception("library.db: restarting the search index build failed")
+            return False
+        return True
 
     def _raise_if_search_failed(self) -> None:
         """Raise :class:`SearchIndexFailed` when a background build of the

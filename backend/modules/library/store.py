@@ -1416,11 +1416,19 @@ class LibraryStore:
             # deleted, or rebuilt DB file next to a library that already has
             # 200,000 entries on disk -- and whenever the flag says a read
             # like that was cut short.
-            if (
-                self.db.get_flag(DISK_READ_PENDING_KEY) is not None
-                or self.db.count_entries() == 0
-            ):
-                self.read_disk_into_db()
+            try:
+                if (
+                    self.db.get_flag(DISK_READ_PENDING_KEY) is not None
+                    or self.db.count_entries() == 0
+                ):
+                    self.read_disk_into_db()
+            except BaseException:
+                # Nobody gets this store, so nobody else would close its
+                # database: its connection, and a search index build it
+                # started, would outlive the failed open, one more for every
+                # retry. The flag keeps a cut-short read resumable.
+                self.db.close()
+                raise
 
         #: Entry ids whose missing cover art has already been looked for, so a
         #: track that simply has none costs one tag read per process rather

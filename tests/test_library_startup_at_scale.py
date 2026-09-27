@@ -30,6 +30,7 @@ from backend.modules.library.db import (
     DISK_READ_PENDING_KEY,
     EntryFilters,
     FairRLock,
+    SEARCH_BUILD_THREAD,
     LibraryDB,
     LibraryProgress,
 )
@@ -95,6 +96,12 @@ def _status(client: TestClient) -> dict:
 def _timed_get(client: TestClient, url: str, **kwargs) -> tuple[float, object]:
     began = time.perf_counter()
     response = client.get(url, **kwargs)
+    return time.perf_counter() - began, response
+
+
+def _timed_post(client: TestClient, url: str, **kwargs) -> tuple[float, object]:
+    began = time.perf_counter()
+    response = client.post(url, **kwargs)
     return time.perf_counter() - began, response
 
 
@@ -349,8 +356,20 @@ def test_the_startup_only_starts_the_open(tmp_path: Path, monkeypatch) -> None:
             )
             assert listed.status_code == 503 and took < PROMPT_SEC
             assert listed.json()["library_status"]["phase"] == "opening"
-            for route in ("/api/library/summary", "/api/library/entries/stats"):
-                assert client.get(route).status_code == 503, route
+            for route in (
+                "/api/library/summary",
+                "/api/library/entries/stats",
+                "/api/library/entries/facets?fields=model",
+                "/api/library/entries/ids",
+                "/api/library/entries/resolve?ref=harbor",
+            ):
+                took, refused = _timed_get(client, route)
+                assert refused.status_code == 503 and took < PROMPT_SEC, route
+                assert refused.json()["library_status"]["phase"] == "opening"
+            took, refused = _timed_post(
+                client, "/api/library/entries/bulk-delete", json={"ids": ["x"]}
+            )
+            assert refused.status_code == 503 and took < PROMPT_SEC
             assert _status(client)["phase"] == "opening"
             release.set()
             _wait_for_phase(client, {"ready"}, 60)
@@ -360,15 +379,20 @@ def test_the_startup_only_starts_the_open(tmp_path: Path, monkeypatch) -> None:
         release.set()
 
 
-def test_a_failed_open_is_retried(tmp_path: Path, monkeypatch) -> None:
+def test_a_failed_open_is_retried_after_the_backoff(
+    tmp_path: Path, monkeypatch
+) -> None:
     """An open that raises (the file locked by another process, say) is
-    reported as failed and tried again by the next caller, instead of leaving
-    the library unopenable until a restart."""
+    reported as failed. A caller that needs the store inside
+    OPEN_RETRY_AFTER_SEC gets that failure without another attempt; the first
+    caller after it tries again, so the library never stays unopenable until
+    a restart."""
     root = tmp_path / "gens"
     root.mkdir()
     monkeypatch.setenv("theDAW_GENERATIONS_DIR", str(root))
     monkeypatch.setattr(library_router_module, "_store", None)
     monkeypatch.setattr(library_router_module, "_opening", None)
+    monkeypatch.setattr(library_router_module, "OPEN_RETRY_AFTER_SEC", 60.0)
     real_init = LibraryStore.__init__
     attempts: list[int] = []
 
@@ -379,13 +403,17 @@ def test_a_failed_open_is_retried(tmp_path: Path, monkeypatch) -> None:
         real_init(self, *args, **kwargs)
 
     monkeypatch.setattr(LibraryStore, "__init__", flaky_init)
-    try:
-        library_router_module.get_store()
-    except RuntimeError as e:
-        assert "database is locked" in str(e)
-    else:
-        raise AssertionError("the first open did not fail")
-    assert library_router_module.library_status()["phase"] == "failed"
+    for _ in range(2):
+        try:
+            library_router_module.get_store()
+        except RuntimeError as e:
+            assert "database is locked" in str(e)
+        else:
+            raise AssertionError("the open did not fail")
+        assert library_router_module.library_status()["phase"] == "failed"
+    assert len(attempts) == 1, "inside the backoff, the failure is answered as it is"
+
+    monkeypatch.setattr(library_router_module, "OPEN_RETRY_AFTER_SEC", 0.0)
     store = library_router_module.get_store()
     try:
         assert len(attempts) == 2
@@ -393,6 +421,231 @@ def test_a_failed_open_is_retried(tmp_path: Path, monkeypatch) -> None:
     finally:
         assert store.db is not None
         store.db.close()
+
+
+def _wait_for_failed(client: TestClient, timeout: float = 30) -> dict:
+    deadline = time.monotonic() + timeout
+    while True:
+        status = _status(client)
+        if status["phase"] == "failed":
+            return status
+        assert time.monotonic() < deadline, f"never failed: {status}"
+        time.sleep(0.05)
+
+
+def test_a_failed_open_stays_failed_on_the_progress_poll_until_retry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The LIBRARY tab polls /index-status every second. That poll used to
+    start a new open whenever the store was missing, so after a failure it
+    always saw a fresh attempt at phase "opening": the failure alert never
+    showed, and every poll made another attempt (and, before LibraryStore
+    closed a failed open's database, another connection and build thread).
+    Now the poll reports "failed" and starts nothing; the list answers 503
+    with the failure; the Retry button (POST /retry-open) is what tries
+    again."""
+    attempts: list[int] = []
+    failing = [True]
+    real_init = LibraryStore.__init__
+
+    def broken_init(self, *args, **kwargs):
+        if threading.current_thread().name == library_router_module.LIBRARY_OPEN_THREAD:
+            attempts.append(1)
+            if failing[0]:
+                raise OSError("the library folder cannot be read")
+        real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(LibraryStore, "__init__", broken_init)
+    # raising=False: the backoff is what this test pins, and a build without
+    # it must fail on the behaviour, not on the missing name.
+    monkeypatch.setattr(
+        library_router_module, "OPEN_RETRY_AFTER_SEC", 600.0, raising=False
+    )
+    with (
+        real_app_context(tmp_path, monkeypatch) as app,
+        TestClient(app, client=("127.0.0.1", 51000)) as client,
+    ):
+        status = _wait_for_failed(client)
+        assert "cannot be read" in status["error"]
+        for _ in range(6):
+            time.sleep(0.1)
+            assert _status(client)["phase"] == "failed"
+        assert len(attempts) == 1, attempts
+
+        listed = client.get("/api/library/entries", params={"limit": 5})
+        assert listed.status_code == 503
+        assert listed.json()["library_status"]["phase"] == "failed"
+        assert listed.headers["retry-after"] == "600"
+        assert len(attempts) == 1, "the list answers the failure; it opens nothing"
+
+        retried = client.post("/api/library/retry-open")
+        assert retried.status_code == 200
+        _wait_for_failed(client)
+        assert len(attempts) == 2, "the Retry button tries again"
+
+        failing[0] = False
+        assert client.post("/api/library/retry-open").status_code == 200
+        _wait_for_phase(client, {"ready"}, 60)
+        assert len(attempts) == 3
+        assert (
+            client.get("/api/library/entries", params={"limit": 5}).status_code == 200
+        )
+
+
+def test_a_failed_open_closes_its_database_and_stops_its_build(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A LibraryStore that raised after its LibraryDB was open kept that
+    database open: nothing else holds the store, and the exception kept it
+    alive. When the file needed a search index build, the build thread ran on
+    to the end on its own connection, one more for every retry."""
+    root = tmp_path / "gens"
+    root.mkdir()
+    path = root / "library.db"
+    _seed_mains_library(path, 60_000)
+    closes: list[int] = []
+    real_close = LibraryDB.close
+
+    def counting_close(self):
+        closes.append(1)
+        real_close(self)
+
+    def unreadable(self):
+        raise OSError("the disk went away")
+
+    monkeypatch.setattr(LibraryDB, "close", counting_close)
+    monkeypatch.setattr(LibraryDB, "count_entries", unreadable)
+    try:
+        LibraryStore(root, build_search_in_background=True)
+    except OSError:
+        pass
+    else:
+        raise AssertionError("the open did not fail")
+    assert closes == [1], "the failed open closed its database"
+    deadline = time.monotonic() + 5
+    while any(t.name == SEARCH_BUILD_THREAD for t in threading.enumerate()):
+        assert time.monotonic() < deadline, "the build of a failed open ran on"
+        time.sleep(0.05)
+    path.unlink()  # nothing holds the file any more
+
+
+def test_a_database_whose_open_fails_is_closed(tmp_path: Path, monkeypatch) -> None:
+    """LibraryDB.__init__ opens the connection before the migration and the
+    search setup; either raising left that connection open."""
+    closes: list[int] = []
+    real_close = LibraryDB.close
+
+    def counting_close(self):
+        closes.append(1)
+        real_close(self)
+
+    def broken(self, *, background: bool = False):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(LibraryDB, "close", counting_close)
+    monkeypatch.setattr(LibraryDB, "_ensure_search", broken)
+    path = tmp_path / "library.db"
+    try:
+        LibraryDB(path)
+    except sqlite3.OperationalError:
+        pass
+    else:
+        raise AssertionError("the open did not fail")
+    assert closes == [1]
+    path.unlink()
+
+
+def _search_build_held(monkeypatch) -> tuple[threading.Event, list[int]]:
+    """Hold the background search build before its first row, and make its
+    first run fail when asked to."""
+    release = threading.Event()
+    fail_first: list[int] = []
+    real_rows = LibraryDB._index_search_rows
+
+    def held_rows(self, start, *args, **kwargs):
+        if threading.current_thread().name == SEARCH_BUILD_THREAD:
+            release.wait(timeout=60)
+            if fail_first:
+                fail_first.pop()
+                raise sqlite3.OperationalError("database or disk is full")
+        return real_rows(self, start, *args, **kwargs)
+
+    monkeypatch.setattr(LibraryDB, "_index_search_rows", held_rows)
+    return release, fail_first
+
+
+def test_play_and_reveal_get_the_partial_ids_while_select_all_waits(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Play the list, a shift-click range and revealing a track all read
+    /entries/ids. During the index build a search there answered 409, so play
+    fell back to one track and reveal failed. They send partial=true and get
+    the ids the list shows, with search_index; select-all (no flag) is still
+    refused until the build finishes."""
+    root = tmp_path / "app-generations"
+    root.mkdir()
+    _seed_mains_library(root / "library.db", 500)
+    release, _ = _search_build_held(monkeypatch)
+    try:
+        with (
+            real_app_context(tmp_path, monkeypatch) as app,
+            TestClient(app, client=("127.0.0.1", 51000)) as client,
+        ):
+            _wait_for_phase(client, {"index"}, 60)
+            refused = client.get("/api/library/entries/ids", params={"q": "harbor"})
+            assert refused.status_code == 409
+            assert "still being built" in refused.json()["detail"]
+            partial = client.get(
+                "/api/library/entries/ids", params={"q": "harbor", "partial": "true"}
+            )
+            assert partial.status_code == 200
+            body = partial.json()
+            assert body["search_index"]["complete"] is False
+            assert body["search_index"]["total"] == 500
+            assert body["total"] == len(body["ids"]) < 500
+            release.set()
+            _wait_for_phase(client, {"ready"}, 60)
+            done = client.get("/api/library/entries/ids", params={"q": "harbor"})
+            assert done.status_code == 200
+            assert done.json()["total"] == 500
+            assert done.json()["search_index"] == {"complete": True}
+    finally:
+        release.set()
+
+
+def test_a_stopped_build_says_so_and_the_retry_restarts_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """After a background build stopped, select-all by a search answered 409
+    "still being built (0 of 0 entries) ... when it finishes", but nothing
+    would finish it before a restart. It now answers 503 saying the build
+    stopped, and POST /retry-open restarts the build from its cursor."""
+    root = tmp_path / "app-generations"
+    root.mkdir()
+    _seed_mains_library(root / "library.db", 500)
+    release, fail_first = _search_build_held(monkeypatch)
+    fail_first.append(1)
+    try:
+        with (
+            real_app_context(tmp_path, monkeypatch) as app,
+            TestClient(app, client=("127.0.0.1", 51000)) as client,
+        ):
+            _wait_for_phase(client, {"index"}, 60)
+            release.set()
+            status = _wait_for_failed(client)
+            assert status["label"] == "The search index build stopped"
+            stopped = client.get("/api/library/entries/ids", params={"q": "harbor"})
+            assert stopped.status_code == 503
+            assert "build stopped" in stopped.json()["detail"]
+            assert "disk is full" in stopped.json()["detail"]
+
+            assert client.post("/api/library/retry-open").status_code == 200
+            _wait_for_phase(client, {"ready"}, 60)
+            done = client.get("/api/library/entries/ids", params={"q": "harbor"})
+            assert done.status_code == 200
+            assert done.json()["total"] == 500
+    finally:
+        release.set()
 
 
 def test_the_library_lock_is_handed_over_in_arrival_order() -> None:
