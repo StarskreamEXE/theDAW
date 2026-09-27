@@ -11,10 +11,17 @@ from __future__ import annotations
 import re
 
 import numpy as np
-import soundfile as sf
 from pathlib import Path
 
 from backend.lib.audio_depth import write_like_source
+from backend.lib.audio_io import load_audio_array
+
+
+def _read_frames(path: Path) -> tuple[np.ndarray, int]:
+    """Decode ``path`` to float32 (frames, channels) through audio_io, which
+    falls back to the ffmpeg CLI for anything libsndfile cannot open."""
+    data, sr = load_audio_array(path)
+    return np.ascontiguousarray(data.T), sr
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -24,7 +31,7 @@ def grainlab(input_path: Path, output_path: Path, params: dict) -> None:
     """Slice input into grains, scatter, pitch-shift per grain, overlap-add."""
     import librosa
 
-    data, sr = sf.read(str(input_path), dtype="float32", always_2d=True)
+    data, sr = _read_frames(input_path)
     n_channels = data.shape[1]
     n_samples = data.shape[0]
 
@@ -101,7 +108,7 @@ def grainlab(input_path: Path, output_path: Path, params: dict) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 def voxsynth(input_path: Path, output_path: Path, params: dict) -> None:
     """Spectral vocoder: modulator envelope from input shapes a noise carrier."""
-    data, sr = sf.read(str(input_path), dtype="float32", always_2d=True)
+    data, sr = _read_frames(input_path)
     n_channels = data.shape[1]
     smooth = params["spectralSmooth"]
     mix = params["mix"]
@@ -172,7 +179,7 @@ def spectramorph(input_path: Path, output_path: Path, params: dict) -> None:
     from scipy.signal import stft as scipy_stft, istft as scipy_istft
     from scipy.ndimage import gaussian_filter1d
 
-    data, sr = sf.read(str(input_path), dtype="float32", always_2d=True)
+    data, sr = _read_frames(input_path)
     n_channels = data.shape[1]
     smear_ms = params["smearLength"]
     intensity = params["brushIntensity"]
@@ -226,7 +233,7 @@ def crossfade_morph(input_path: Path, output_path: Path, params: dict) -> None:
     from scipy.signal import stft as scipy_stft, istft as scipy_istft
     from scipy.ndimage import gaussian_filter1d
 
-    data, sr = sf.read(str(input_path), dtype="float32", always_2d=True)
+    data, sr = _read_frames(input_path)
     n_channels = data.shape[1]
     morph = params["morphPosition"]  # 0=original, 1=fully smeared
     mix = params["mix"]
@@ -373,7 +380,7 @@ def _shape_tone(audio: np.ndarray, sr: int, tone: str) -> np.ndarray:
 def tokensynth(input_path: Path, output_path: Path, params: dict) -> None:
     """Transform input into a tonal/synth texture via ring mod + LFOs, in the
     voice the prompt names (see ``tokensynth_voice``)."""
-    data, sr = sf.read(str(input_path), dtype="float32", always_2d=True)
+    data, sr = _read_frames(input_path)
     n_channels = data.shape[1]
     temperature = params["temperature"]  # 0.1-2.0, drives detune/intensity
     voice = tokensynth_voice(str(params.get("prompt", "")))
@@ -517,8 +524,8 @@ def timbreforge_shape(
     its shifted render; the result is written at ``depth_source``'s bit depth
     (the upload), so the float intermediates never turn into a 16-bit file.
     """
-    source, sr = sf.read(str(source_path), dtype="float32", always_2d=True)
-    shifted, shifted_sr = sf.read(str(shifted_path), dtype="float32", always_2d=True)
+    source, sr = _read_frames(source_path)
+    shifted, shifted_sr = _read_frames(shifted_path)
     if shifted_sr != sr:
         raise RuntimeError(
             f"timbreforge: shifted render came back at {shifted_sr} Hz, source is {sr} Hz"

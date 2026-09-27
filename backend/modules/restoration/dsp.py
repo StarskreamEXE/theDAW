@@ -20,9 +20,22 @@ import asyncio
 from pathlib import Path
 
 import numpy as np
-import soundfile as sf
 
 from backend.lib.audio_depth import write_like_source
+from backend.lib.audio_io import load_audio_array
+
+
+def _read_audio(path: Path) -> tuple[np.ndarray, int]:
+    """Decode ``path`` through audio_io (libsndfile, then the ffmpeg CLI):
+    float32, 1-D for mono and (frames, channels) otherwise."""
+    data, sr = _read_channels_first(path)
+    return (data if data.ndim == 1 else np.ascontiguousarray(data.T)), sr
+
+
+def _read_channels_first(path: Path) -> tuple[np.ndarray, int]:
+    """As ``_read_audio``, with multichannel audio as (channels, frames)."""
+    data, sr = load_audio_array(path)
+    return (data[0].copy() if data.shape[0] == 1 else data), sr
 
 
 def _stft_size(sr: int) -> tuple[int, int]:
@@ -118,7 +131,7 @@ def vocal_isolate_sync(input_path: Path, output_path: Path, params: dict) -> Non
     ``vocal.preprocess.isolation``, which asks only for the isolation, gets
     exactly that; the tool page always sends both.
     """
-    data, sr = sf.read(str(input_path), dtype="float32")
+    data, sr = _read_audio(input_path)
     denoise = float(params.get("denoiseAmount", 0.0))
     dereverb = float(params.get("dereverbAmount", 0.0))
 
@@ -176,9 +189,9 @@ def stem_separation(input_path: Path, output_path: Path, params: dict) -> None:
     """
     import librosa
 
-    y, sr = librosa.load(str(input_path), sr=None, mono=False)
+    y, sr = _read_channels_first(input_path)
 
-    # librosa.load returns (samples,) for mono, (channels, samples) for multi
+    # (samples,) for mono, (channels, samples) for multi
     was_stereo = y.ndim == 2
 
     stems_val = int(params.get("stems", 4))
@@ -197,7 +210,7 @@ def stem_separation(input_path: Path, output_path: Path, params: dict) -> None:
     else:
         result = _separate(y)
 
-    # Transpose for soundfile (expects samples, channels)
+    # write_like_source takes (samples, channels)
     if was_stereo:
         result = result.T
     write_like_source(output_path, result, sr, input_path)
@@ -212,7 +225,7 @@ def spectral_repair(input_path: Path, output_path: Path, params: dict) -> None:
     import librosa
     from scipy.ndimage import median_filter
 
-    y, sr = librosa.load(str(input_path), sr=None, mono=False)
+    y, sr = _read_channels_first(input_path)
     was_stereo = y.ndim == 2
 
     attenuation = float(params.get("attenuation", 1.0))
@@ -315,7 +328,7 @@ def breath_removal_sync(input_path: Path, output_path: Path, params: dict) -> No
     """
     import librosa
 
-    y, sr = sf.read(str(input_path), dtype="float32")
+    y, sr = _read_audio(input_path)
     was_stereo = y.ndim == 2
 
     breath_reduction = float(params.get("breathReduction", 0.8))

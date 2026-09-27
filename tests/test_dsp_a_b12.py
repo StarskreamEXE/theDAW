@@ -244,19 +244,26 @@ def test_timbreforge_description_does_not_overclaim_instrument_transfer():
     assert "neural timbre transfer" not in desc
 
 
+def _spec_rows(tool) -> list[tuple]:
+    """Each declared control as main's P(...) call spells it: name, type,
+    range, default, unit, control and label."""
+    return [
+        (p.name, p.type, p.lo, p.hi, p.default, p.unit, p.control, p.label)
+        for p in tool.params
+    ]
+
+
 def test_timbreforge_declares_structure_timbre_and_wander():
-    """main's three knobs, in main's order. Each is read by the handler (see
+    """main's three knobs, in main's order, with main's ranges, defaults and
+    labels. Each is read by the handler (see
     test_every_creative_neural_declared_param_is_read_by_its_handler) and
     changes the render (tests/test_tool_controls_restored.py)."""
     tool = next(t for t in CREATIVE_NEURAL_TOOLS if t.id == "timbreforge")
-    assert [p.name for p in tool.params] == [
-        "structureWeight",
-        "timbreBlend",
-        "latentWander",
+    assert _spec_rows(tool) == [
+        ("structureWeight", "float", 0, 1, 0.5, "", "ParamKnob", "Structure"),
+        ("timbreBlend", "float", 0, 1, 0.5, "", "ParamKnob", "Timbre"),
+        ("latentWander", "float", 0, 1, 0.0, "", "ParamKnob", "Wander"),
     ]
-    labels = {p.name: p.label for p in tool.params}
-    assert labels["structureWeight"] == "Structure"
-    assert labels["latentWander"] == "Wander"
     desc = tool.description.lower()
     assert "structure" in desc and "wander" in desc
 
@@ -305,7 +312,10 @@ def test_ambientforge_declares_prompt_and_says_what_it_steers():
     """The bed is still lavfi noise, not a text model: the description says
     the prompt shapes it and that the input audio is ignored."""
     tool = next(t for t in CREATIVE_NEURAL_TOOLS if t.id == "ambientforge")
-    assert [p.name for p in tool.params] == ["prompt", "duration"]
+    assert _spec_rows(tool) == [
+        ("prompt", "string", None, None, "", "", "TextInput", "Prompt"),
+        ("duration", "float", 5, 300, 30, "s", "ParamKnob", "Duration"),
+    ]
     desc = tool.description.lower()
     assert "prompt" in desc
     assert "noise" in desc and "ignores" in desc
@@ -315,7 +325,10 @@ def test_tokensynth_declares_prompt_and_says_what_it_steers():
     """The prompt picks the ring-mod voice; the description must not claim
     text-to-instrument generation, which the DSP does not do."""
     tool = next(t for t in CREATIVE_NEURAL_TOOLS if t.id == "tokensynth")
-    assert [p.name for p in tool.params] == ["prompt", "temperature"]
+    assert _spec_rows(tool) == [
+        ("prompt", "string", None, None, "", "", "TextInput", "Prompt"),
+        ("temperature", "float", 0.1, 2.0, 1.0, "", "ParamKnob", "Temp"),
+    ]
     desc = tool.description.lower()
     assert "prompt" in desc
     assert "text ->" not in desc

@@ -774,3 +774,47 @@ def test_batch_export_jobs_1_arrival_waits_for_the_running_renders(
     assert state["started"] == ["w0", "w1", "solo", "late"]
     assert state["company"]["solo"] == {"solo"}
 
+
+# ---------------------------------------------------------------------------
+# Every DSP read goes through backend/lib/audio_io.py
+# ---------------------------------------------------------------------------
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize(
+    ("prefix", "tool_id"),
+    [
+        (RESTORATION, "vocal_isolate"),
+        (RESTORATION, "breath_removal"),
+        (RESTORATION, "stem_separation"),
+        (RESTORATION, "spectral_repair"),
+        (CREATIVE, "tokensynth"),
+        (CREATIVE, "grainlab"),
+        (CREATIVE, "voxsynth"),
+    ],
+)
+def test_dsp_tools_open_an_upload_libsndfile_cannot_read(
+    client, tmp_path, prefix, tool_id
+):
+    """/process saves every upload as input.wav whatever it holds, and these
+    tools read it with soundfile or librosa directly, so an AAC file dropped
+    on the page failed the render. They read through audio_io now, which
+    decodes such a file with the ffmpeg CLI."""
+    import subprocess
+
+    t = np.arange(SR) / SR
+    tone = 0.2 * np.sin(2 * np.pi * 440 * t)
+    wav = _write(tmp_path / "tone.wav", np.column_stack([tone, tone]))
+    aac = tmp_path / "tone.m4a"
+    subprocess.run(
+        ["ffmpeg", "-y", "-v", "error", "-i", str(wav), "-c:a", "aac", str(aac)],
+        check=True,
+    )
+    with pytest.raises(sf.LibsndfileError):
+        sf.info(str(aac))
+
+    values = _page_values(client, prefix, tool_id)
+    data, sr, _ = _process(client, prefix, tool_id, values, aac)
+    assert sr == SR and data.shape[1] == 2
+    assert data.shape[0] > SR // 2
+    assert float(np.max(np.abs(data))) > 0.0
