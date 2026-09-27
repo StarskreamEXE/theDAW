@@ -203,12 +203,39 @@ def _normalize_extra_folders(value: Any) -> list[str]:
     return out
 
 
-def _has_legacy_lan_key(payload: Any) -> bool:
-    """True when ``payload`` still holds the schema-10 ``app.lan_https``."""
+_ABSENT = object()
+
+
+def _legacy_lan_value(payload: Any) -> Any:
+    """What ``payload`` holds at the schema-10 ``app.lan_https``, or
+    ``_ABSENT``."""
     if not isinstance(payload, dict):
-        return False
+        return _ABSENT
     app = payload.get(lan_https.LEGACY_SETTING_SECTION)
-    return isinstance(app, dict) and lan_https.LEGACY_SETTING_KEY in app
+    if not isinstance(app, dict):
+        return _ABSENT
+    return app.get(lan_https.LEGACY_SETTING_KEY, _ABSENT)
+
+
+def _mirror_lan_off(settings: dict[str, Any]) -> None:
+    """Write an off at ``lan.https`` to ``app.lan_https`` as well, and drop
+    the old key otherwise.
+
+    The schema-10 build (8039b45) reads the switch only at ``app.lan_https``,
+    so without the copy it turned HTTPS back on after this build had switched
+    it off. main drops the copy when it saves, and keeps ``lan`` whole, so
+    ``lan.https`` stays the switch this build reads. An on is never copied:
+    an off left at the old key would win over it (``stored_off_key``), and
+    the user could not switch the listener back on.
+    """
+    app = settings.get(lan_https.LEGACY_SETTING_SECTION)
+    if not isinstance(app, dict):
+        return
+    lan = {lan_https.SETTING_SECTION: settings.get(lan_https.SETTING_SECTION)}
+    if lan_https.stored_off_key(lan) is not None:
+        app[lan_https.LEGACY_SETTING_KEY] = False
+    else:
+        app.pop(lan_https.LEGACY_SETTING_KEY, None)
 
 
 def default_settings_path() -> Path:
@@ -317,12 +344,13 @@ def _merge_defaults(payload: dict[str, Any]) -> dict[str, Any]:
 
     # An "off" at the schema-10 app.lan_https carries into lan.https on EVERY
     # load, not only below v11: a build that still writes the old key may have
-    # run since this one. The merge above already dropped the old key from
-    # `app`, so the next write leaves one place holding the switch. An off
-    # stored in either place wins, the same rule the launcher applies to the
-    # raw file (lan_https.stored_off_key).
+    # run since this one. An off stored in either place wins, the same rule
+    # the launcher applies to the raw file (lan_https.stored_off_key). The
+    # merge above dropped the old key from `app`; _mirror_lan_off puts it back
+    # as False only while lan.https is off.
     if lan_https.stored_off_key(payload) is not None:
         merged["lan"]["https"] = False
+    _mirror_lan_off(merged)
 
     # Hygiene lives in the store, not only on the PATCH path: a hand-edited,
     # restored, or externally written settings.json gets the same str-only /
@@ -396,10 +424,11 @@ class SettingsStore:
             return deepcopy(DEFAULT_SETTINGS)
         merged = _merge_defaults(raw)
         # Persist the post-migration shape so future loads start clean. A file
-        # still carrying app.lan_https is rewritten too, even at this schema:
-        # the launcher reads the raw file, and the switch belongs in one place.
+        # whose app.lan_https differs from what _mirror_lan_off keeps there is
+        # rewritten too, even at this schema: the launchers read the raw file.
         prev_version = raw.get("schema_version") if isinstance(raw, dict) else None
-        if prev_version != merged.get("schema_version") or _has_legacy_lan_key(raw):
+        legacy_differs = _legacy_lan_value(raw) != _legacy_lan_value(merged)
+        if prev_version != merged.get("schema_version") or legacy_differs:
             try:
                 self._write(merged)
             except OSError as e:
@@ -456,6 +485,7 @@ class SettingsStore:
                             continue
                         v = _normalize_extra_folders(v)
                     target[k] = v
+            _mirror_lan_off(self._cache)
             self._cache["schema_version"] = SCHEMA_VERSION
             self._write(self._cache)
             return deepcopy(self._cache)

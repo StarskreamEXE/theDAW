@@ -8,15 +8,17 @@ lives in a section of its own, ``lan.https``, which main keeps whole.
 
 main's store runs from ``tests/fixtures/main_851f6a0/settings_store.py``, a
 byte-identical copy of ``backend/modules/settings/store.py`` at 851f6a0, and
-the schema-10 build's from ``tests/fixtures/pr207_8039b45/settings_store.py``
-(8039b45), so each sequence below goes through the older builds' real load
-and save code.
+the schema-10 build's store and launcher from ``tests/fixtures/pr207_8039b45/``
+(8039b45), so each sequence below goes through the older builds' real load,
+save and launch code. That build reads the switch only at ``app.lan_https``,
+so this build keeps a plain False there while ``lan.https`` is off.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
 from types import ModuleType
 
@@ -28,6 +30,7 @@ from backend.modules.settings.store import SCHEMA_VERSION, SettingsStore
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 MAIN_STORE = FIXTURES / "main_851f6a0" / "settings_store.py"
 SCHEMA_10_STORE = FIXTURES / "pr207_8039b45" / "settings_store.py"
+SCHEMA_10_LAUNCHER = FIXTURES / "pr207_8039b45" / "lan_https.py"
 LAN = ["192.168.1.34"]
 
 
@@ -35,7 +38,12 @@ def _load(source: Path, name: str) -> ModuleType:
     spec = importlib.util.spec_from_file_location(name, source)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # A dataclass looks its module up in sys.modules while it is built.
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        del sys.modules[name]
     return module
 
 
@@ -47,6 +55,12 @@ def _main_store() -> ModuleType:
 def _schema_10_store() -> ModuleType:
     """8039b45's settings store (schema 10), imported fresh."""
     return _load(SCHEMA_10_STORE, "pr207_8039b45_settings")
+
+
+def _schema_10_launcher_blocks(path: Path) -> bool:
+    """Whether 8039b45's launcher, reading ``path``, leaves the listener off."""
+    launcher = _load(SCHEMA_10_LAUNCHER, "pr207_8039b45_lan_https")
+    return launcher.blocking_reason(_on_disk(path), {}, LAN) is not None
 
 
 def _launcher_blocks(path: Path, monkeypatch: pytest.MonkeyPatch) -> bool:
@@ -82,6 +96,28 @@ def test_an_off_the_schema_10_build_saved_stays_off_through_main(
     assert "lan_https" not in _on_disk(path)["app"], "main's save drops the key"
 
     assert _launcher_blocks(path, monkeypatch)
+
+
+def test_an_off_this_build_saved_stays_off_in_the_schema_10_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The user switches the listener off here, then runs 8039b45, which reads
+    only ``app.lan_https``. Its store keeps the ``lan`` section whole and its
+    launcher leaves the listener off. Back here, switching it on clears the
+    copy, so neither build keeps HTTPS off against the user."""
+    path = tmp_path / "settings.json"
+    SettingsStore(path).patch({"lan": {"https": False}})
+
+    assert _schema_10_launcher_blocks(path)
+    _schema_10_store().SettingsStore(path).patch({"stems": {"auto_on_import": True}})
+    assert _on_disk(path)["lan"] == {"https": False}
+    assert _schema_10_launcher_blocks(path)
+    assert _launcher_blocks(path, monkeypatch)
+
+    SettingsStore(path).patch({"lan": {"https": True}})
+    assert "lan_https" not in _on_disk(path)["app"]
+    assert not _launcher_blocks(path, monkeypatch)
+    assert not _schema_10_launcher_blocks(path)
 
 
 def test_an_off_switch_stays_off_after_main_loads_and_saves(
@@ -129,8 +165,7 @@ def test_an_off_stored_at_app_lan_https_moves_to_lan_and_survives_main(
     migrated = _on_disk(path)
     assert migrated["schema_version"] == SCHEMA_VERSION
     assert migrated["lan"] == {"https": False}
-    assert "lan_https" not in migrated["app"]
-    assert migrated["app"]["launch_mode"] == "desktop"
+    assert migrated["app"] == {"launch_mode": "desktop", "lan_https": False}
 
     main = _main_store()
     main.SettingsStore(path).patch({"notation": {"artist": "SOMEONE"}})
@@ -155,7 +190,7 @@ def test_an_off_written_to_the_old_key_after_this_build_ran_still_wins(
 
     assert _launcher_blocks(path, monkeypatch)
     assert SettingsStore(path).get_value("lan", "https") is False
-    assert "lan_https" not in _on_disk(path)["app"]
+    assert _on_disk(path)["lan"] == {"https": False}
     assert _launcher_blocks(path, monkeypatch)
 
 
@@ -163,7 +198,8 @@ def test_the_old_key_at_the_current_schema_is_moved_on_load(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A hand edit can put the old key back at schema 11. The store rewrites
-    the file on load, so the next write cannot drop the off it carried."""
+    the file on load, so the next write cannot drop the off it carried, and
+    the old key holds the plain False the schema-10 build reads."""
     path = tmp_path / "settings.json"
     SettingsStore(path)
     edited = _on_disk(path)
@@ -172,7 +208,7 @@ def test_the_old_key_at_the_current_schema_is_moved_on_load(
 
     SettingsStore(path)
     assert _on_disk(path)["lan"] == {"https": False}
-    assert "lan_https" not in _on_disk(path)["app"]
+    assert _on_disk(path)["app"]["lan_https"] is False
     assert _launcher_blocks(path, monkeypatch)
 
 
