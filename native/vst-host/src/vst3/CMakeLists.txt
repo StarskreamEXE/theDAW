@@ -77,9 +77,11 @@ target_link_libraries(thedaw_vst3 PUBLIC thedaw_vst3_abi)
 target_compile_features(thedaw_vst3 PUBLIC cxx_std_17)
 target_link_libraries(thedaw_vst3 PUBLIC user32 gdi32 ole32 shell32)
 if(MSVC)
-    # /wd4324: the lock-free ring pads its head and tail indices onto separate cache lines on
-    # purpose; the compiler reporting that the struct grew is the intended outcome, not a defect.
-    target_compile_options(thedaw_vst3 PRIVATE /W4 /EHsc /permissive- /wd4324)
+    target_compile_options(thedaw_vst3 PRIVATE /W4 /EHsc /permissive-)
+    # The CRT's secure template overloads: a strcpy into a fixed-size array, which the vendored
+    # ivstrepresentation.h does, becomes the bounded strcpy_s. Without this the call is the
+    # deprecated unbounded one, and C4996 under /WX stops the build.
+    target_compile_definitions(thedaw_vst3 PRIVATE _CRT_SECURE_CPP_OVERLOAD_STANDARD_NAMES=1)
     # The parent sets THEDAW_WERROR; standalone builds of this directory default to the same
     # strictness so a warning cannot reach the host through the library.
     if(NOT DEFINED THEDAW_WERROR OR THEDAW_WERROR)
