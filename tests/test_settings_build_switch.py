@@ -7,8 +7,10 @@ start of main dropped the key and a user's "off" came back on. The switch now
 lives in a section of its own, ``lan.https``, which main keeps whole.
 
 main's store runs from ``tests/fixtures/main_851f6a0/settings_store.py``, a
-byte-identical copy of ``backend/modules/settings/store.py`` at 851f6a0, so
-each sequence below goes through the older build's real load and save code.
+byte-identical copy of ``backend/modules/settings/store.py`` at 851f6a0, and
+the schema-10 build's from ``tests/fixtures/pr207_8039b45/settings_store.py``
+(8039b45), so each sequence below goes through the older builds' real load
+and save code.
 """
 
 from __future__ import annotations
@@ -23,19 +25,28 @@ import pytest
 from backend.lib import lan_https
 from backend.modules.settings.store import SCHEMA_VERSION, SettingsStore
 
-MAIN_STORE = (
-    Path(__file__).resolve().parent / "fixtures" / "main_851f6a0" / "settings_store.py"
-)
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+MAIN_STORE = FIXTURES / "main_851f6a0" / "settings_store.py"
+SCHEMA_10_STORE = FIXTURES / "pr207_8039b45" / "settings_store.py"
 LAN = ["192.168.1.34"]
 
 
-def _main_store() -> ModuleType:
-    """main 851f6a0's settings store, imported fresh."""
-    spec = importlib.util.spec_from_file_location("main_851f6a0_settings", MAIN_STORE)
+def _load(source: Path, name: str) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(name, source)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _main_store() -> ModuleType:
+    """main 851f6a0's settings store, imported fresh."""
+    return _load(MAIN_STORE, "main_851f6a0_settings")
+
+
+def _schema_10_store() -> ModuleType:
+    """8039b45's settings store (schema 10), imported fresh."""
+    return _load(SCHEMA_10_STORE, "pr207_8039b45_settings")
 
 
 def _launcher_blocks(path: Path, monkeypatch: pytest.MonkeyPatch) -> bool:
@@ -51,6 +62,26 @@ def _launcher_blocks(path: Path, monkeypatch: pytest.MonkeyPatch) -> bool:
 
 def _on_disk(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_an_off_the_schema_10_build_saved_stays_off_through_main(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reported sequence. The schema-10 build saves the user's off at
+    ``app.lan_https``; this build starts; main starts and saves; the launcher
+    runs. The schema-10 build kept the off where main's save drops it, and its
+    launcher read only that key, so HTTPS came back on. Only the launcher's
+    answer is asserted, so an older build fails at that step."""
+    path = tmp_path / "settings.json"
+    _schema_10_store().SettingsStore(path).patch({"app": {"lan_https": False}})
+    assert _on_disk(path)["schema_version"] == 10
+    assert _on_disk(path)["app"]["lan_https"] is False
+
+    SettingsStore(path)
+    _main_store().SettingsStore(path).patch({"stems": {"auto_on_import": True}})
+    assert "lan_https" not in _on_disk(path)["app"], "main's save drops the key"
+
+    assert _launcher_blocks(path, monkeypatch)
 
 
 def test_an_off_switch_stays_off_after_main_loads_and_saves(
