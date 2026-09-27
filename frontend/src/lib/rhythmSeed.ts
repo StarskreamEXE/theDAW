@@ -8,6 +8,7 @@
  * entries that name a denominator become lanes looping at their bar length.
  */
 import { meterFromAnalysis, normalizeMeterMap, stepsPerBar, type MeterSegment, type PolyLane } from './meterMap';
+import { invalidateRhythm } from '../state/djRhythmStore';
 
 export interface RhythmMeterSegment {
   start_bar: number;
@@ -124,5 +125,9 @@ export async function fetchRhythm(entryId: string, { run = false, signal }: { ru
   };
   const got = await read(await fetch(base, { signal }), 'Reading the rhythm analysis');
   if (got.status === 'ready' || !run) return got;
-  return read(await fetch(`${base}/run`, { method: 'POST', signal }), 'Analyzing the rhythm');
+  const ran = await read(await fetch(`${base}/run`, { method: 'POST', signal }), 'Analyzing the rhythm');
+  // The backend cache changed: a DJ deck holding this track re-reads its bar
+  // lines now instead of trusting the miss it remembered.
+  invalidateRhythm(entryId);
+  return ran;
 }
