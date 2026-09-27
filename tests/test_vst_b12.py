@@ -116,6 +116,11 @@ def vst3_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     # probed plugin name and category) with this empty tmp root's.
     cache = tmp_path / "vst3_scan_cache.json"
     monkeypatch.setattr(scanner, "_cache_path", lambda: cache)
+    # The editor routes save each plugin's window rect and size under
+    # data/vst_presets, the same folder as the user's plugin state; left
+    # unpatched, the loopback /editor-rect tests wrote Ozone11_*.rect.json
+    # into the checkout running the suite.
+    monkeypatch.setattr(vst_router, "_PRESET_DIR", tmp_path / "vst_presets")
     return root
 
 
