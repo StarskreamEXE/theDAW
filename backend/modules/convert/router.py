@@ -341,7 +341,7 @@ async def convert_library_entry(entry_id: str, body: ConvertRequest) -> Response
     """Convert a library entry (audio/video/image) to the requested format and
     return the converted bytes as a download."""
     _ensure_ffmpeg()
-    store = get_library_store()
+    store = await asyncio.to_thread(get_library_store)
 
     record = store.get_entry(entry_id)
     if record is None:

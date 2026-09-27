@@ -34,6 +34,7 @@ import re
 import sqlite3
 import threading
 import time
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -454,8 +455,17 @@ SEARCH_TARGET_KEY = "search_index_target"
 LEGACY_FTS_TABLE = "entries_fts"
 LEGACY_FTS_BACKFILL_KEY = "fts_backfill"
 
-#: Rows indexed per commit while the index is (re)built.
+#: The most rows indexed per commit while the index is (re)built. A batch is
+#: usually smaller: its size follows :data:`SEARCH_BATCH_TARGET_SEC`.
 SEARCH_BACKFILL_BATCH = 2000
+
+#: ``schema_meta`` key present while the store reads every ``metadata.json``
+#: into a database that had none of them (a first start, or a lost or deleted
+#: ``library.db`` beside a full library). Written before the read starts and
+#: removed after its last batch, so a read cut short by a close or a crash
+#: runs again on the next start instead of leaving the library half listed:
+#: without it the next start saw a non-empty database and never read the rest.
+DISK_READ_PENDING_KEY = "disk_read_pending"
 
 #: The name of the thread a background build of the index runs on.
 SEARCH_BUILD_THREAD = "library-search-build"
@@ -1732,6 +1742,223 @@ def _search_rows_sql(marks: str) -> str:
     """
 
 
+class SearchIndexFailed(RuntimeError):
+    """A background build of the search index stopped part way. Searches
+    raise it until the next open resumes the build from its cursor."""
+
+
+#: The long jobs opening a library can run, in the order they run and the
+#: order :meth:`LibraryProgress.snapshot` reports them: the schema upgrade,
+#: the read of every ``metadata.json`` into an empty (or half-filled)
+#: database, and the search index build.
+PROGRESS_TASKS: tuple[str, ...] = ("upgrade", "read", "index")
+
+#: What each task is called on the LIBRARY tab's progress bar.
+PROGRESS_LABELS: dict[str, str] = {
+    "upgrade": "Upgrading the library database",
+    "read": "Reading the library from disk",
+    "index": "Building the search index",
+}
+
+
+class LibraryProgress:
+    """How far the long jobs of opening a library have got, readable from any
+    thread without touching the database.
+
+    ``GET /api/library/index-status`` answers from :meth:`snapshot` while the
+    schema upgrade still holds the write lock, so nothing here may take that
+    lock or read the file. Each task counts its own units -- migration
+    statements, top-level library folders, entries -- and an ETA comes from
+    the rate of the units done since the task (re)started, so a build that
+    resumes at row 150,000 does not claim it did those rows in no time.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._tasks: dict[str, dict[str, Any]] = {}
+        self._error: Optional[str] = None
+        self._error_label = ""
+        self._opened = False
+
+    def begin(self, task: str, total: int, done: int = 0) -> None:
+        with self._lock:
+            self._tasks[task] = {
+                "total": max(0, int(total)),
+                "done": max(0, int(done)),
+                "base": max(0, int(done)),
+                "items": 0,
+                "started": time.monotonic(),
+                "finished": False,
+            }
+
+    def advance(self, task: str, units: int = 0, *, items: int = 0) -> None:
+        """Add ``units`` of progress (and ``items`` counted alongside, such as
+        the entries a folder walk found) to a running task."""
+        with self._lock:
+            state = self._tasks.get(task)
+            if state is None or state["finished"]:
+                return
+            state["done"] = min(state["total"], state["done"] + int(units))
+            state["items"] += int(items)
+
+    def finish(self, task: str) -> None:
+        with self._lock:
+            state = self._tasks.get(task)
+            if state is not None:
+                state["done"] = state["total"]
+                state["finished"] = True
+
+    def fail(
+        self, message: str, *, label: str = "The library could not be opened"
+    ) -> None:
+        with self._lock:
+            self._error = message
+            self._error_label = label
+
+    def mark_opened(self) -> None:
+        """The store answers requests from here on (a task may still run)."""
+        with self._lock:
+            self._opened = True
+
+    def snapshot(self) -> dict[str, Any]:
+        """``{phase, label, done, total, items, eta_sec, opened, error}``.
+
+        ``phase`` is the first running task of :data:`PROGRESS_TASKS`,
+        ``"opening"`` before the store has opened with nothing running yet,
+        ``"failed"`` when the open or a task stopped, else ``"ready"``.
+        ``eta_sec`` is None until a task has a rate to go by."""
+        with self._lock:
+            now = time.monotonic()
+            if self._error is not None:
+                return {
+                    "phase": "failed",
+                    "label": self._error_label,
+                    "done": 0,
+                    "total": 0,
+                    "items": 0,
+                    "eta_sec": None,
+                    "opened": self._opened,
+                    "error": self._error,
+                }
+            for task in PROGRESS_TASKS:
+                state = self._tasks.get(task)
+                if state is None or state["finished"]:
+                    continue
+                gained = state["done"] - state["base"]
+                elapsed = now - state["started"]
+                remaining = state["total"] - state["done"]
+                eta: Optional[float] = None
+                if gained > 0 and elapsed > 0:
+                    eta = round(remaining * elapsed / gained, 1)
+                return {
+                    "phase": task,
+                    "label": PROGRESS_LABELS[task],
+                    "done": state["done"],
+                    "total": state["total"],
+                    "items": state["items"],
+                    "eta_sec": eta,
+                    "opened": self._opened,
+                    "error": None,
+                }
+            return {
+                "phase": "ready" if self._opened else "opening",
+                "label": "Ready" if self._opened else "Opening the library",
+                "done": 0,
+                "total": 0,
+                "items": 0,
+                "eta_sec": None,
+                "opened": self._opened,
+                "error": None,
+            }
+
+
+#: How long one batch of a search index build may hold the write lock. Every
+#: library read takes that lock too, so this is the longest one read waits on
+#: the build; a list request makes three or four of them. The batch size
+#: follows the measured rate toward it. At 0.1 s a search during the build
+#: measured 0.26-0.36 s; each commit costs little next to the rows it holds.
+SEARCH_BATCH_TARGET_SEC = 0.05
+
+#: The smallest batch a build shrinks to on a slow disk.
+SEARCH_BATCH_MIN = 50
+
+#: Rows per hold of the write lock when a whole ``entries`` read runs
+#: (:meth:`LibraryDB._entry_rows_in_chunks`).
+WHOLE_TABLE_READ_CHUNK = 1000
+
+
+class FairRLock:
+    """A re-entrant lock that is handed to its waiters in the order they
+    arrived.
+
+    :class:`LibraryDB` serializes every read and write of its one connection
+    on this lock. ``threading.RLock`` is not fair: a thread that releases it
+    and asks again at once usually gets it back, however long another thread
+    has waited. With the search index build (one batch after another) and the
+    notation backfill (several calls per entry over 200,000 entries) both
+    looping on it after a start, a library search measured a 4 s wait for its
+    turn at 200,000 rows. Here a release hands the lock straight to the
+    longest waiter, so a request waits for the critical sections queued ahead
+    of it and no longer.
+
+    Same use as ``RLock``: ``with lock:``, ``acquire(blocking, timeout)``,
+    ``release()``, re-entrant for the owning thread.
+    """
+
+    def __init__(self) -> None:
+        self._mutex = threading.Lock()
+        self._owner: Optional[int] = None
+        self._depth = 0
+        self._queue: deque[tuple[int, threading.Lock]] = deque()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        me = threading.get_ident()
+        with self._mutex:
+            if self._owner == me:
+                self._depth += 1
+                return True
+            if self._owner is None and not self._queue:
+                self._owner = me
+                self._depth = 1
+                return True
+            if not blocking:
+                return False
+            gate = threading.Lock()
+            gate.acquire()
+            ticket = (me, gate)
+            self._queue.append(ticket)
+        # release() makes this thread the owner BEFORE it opens the gate.
+        if gate.acquire(timeout=timeout):
+            return True
+        with self._mutex:
+            if self._owner == me:
+                # Handed over just as the wait ran out: it is ours.
+                return True
+            self._queue.remove(ticket)
+            return False
+
+    def release(self) -> None:
+        with self._mutex:
+            if self._owner != threading.get_ident():
+                raise RuntimeError("cannot release un-acquired lock")
+            self._depth -= 1
+            if self._depth:
+                return
+            if self._queue:
+                owner, gate = self._queue.popleft()
+                self._owner = owner
+                self._depth = 1
+                gate.release()
+            else:
+                self._owner = None
+
+    def __enter__(self) -> bool:
+        return self.acquire()
+
+    def __exit__(self, *exc: object) -> None:
+        self.release()
+
+
 class LibraryDB:
     """Thin DAO over a single SQLite file.
 
@@ -1750,10 +1977,16 @@ class LibraryDB:
         *,
         enable_fts: bool = True,
         build_search_in_background: bool = False,
+        progress: Optional[LibraryProgress] = None,
     ) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._writelock = threading.RLock()
+        #: What the schema upgrade and the search index build report to, read
+        #: by ``GET /api/library/index-status`` (see :class:`LibraryProgress`).
+        self.progress = progress if progress is not None else LibraryProgress()
+        #: Fair, so a request never starves behind a background loop
+        #: (:class:`FairRLock`).
+        self._writelock = FairRLock()
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         # FIRST, before any statement that can need a lock. sqlite3.connect's
@@ -1790,9 +2023,10 @@ class LibraryDB:
         self.fts_enabled = False
         #: Whether the search tables exist (see :meth:`_ensure_search`).
         self.search_ready = False
-        #: Set once the search index answers for every entry. A search waits
-        #: for it (:meth:`_wait_for_search`); only a build running in the
-        #: background leaves it clear past the constructor.
+        #: Set once the search index answers for every entry. Only a build
+        #: running in the background leaves it clear past the constructor; a
+        #: search meanwhile answers from the rows indexed so far and says so
+        #: (:meth:`search_status`).
         self._search_built = threading.Event()
         #: What stopped a background build, raised to every search after it.
         self._search_build_error: Optional[BaseException] = None
@@ -1863,6 +2097,15 @@ class LibraryDB:
         """
         with self._writelock:
             current = self._current_schema_version()
+            pending = [
+                statements
+                for target_version, statements in _MIGRATIONS
+                if target_version > current
+            ]
+            if pending:
+                # One unit per statement: an index build over 200,000 rows is
+                # the slow part, and every CREATE INDEX is one statement.
+                self.progress.begin("upgrade", sum(len(s) for s in pending))
             for target_version, statements in _MIGRATIONS:
                 if target_version <= current:
                     continue
@@ -1877,8 +2120,10 @@ class LibraryDB:
                                 "finishing an interrupted migration",
                                 *column,
                             )
+                            self.progress.advance("upgrade", 1)
                             continue
                         self._conn.execute(stmt)
+                        self.progress.advance("upgrade", 1)
                     self._conn.execute(
                         "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
                         (str(target_version),),
@@ -1899,6 +2144,8 @@ class LibraryDB:
                     )
                     raise
                 current = target_version
+            if pending:
+                self.progress.finish("upgrade")
 
     def _has_column(self, table: str, column: str) -> bool:
         rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
@@ -1928,12 +2175,12 @@ class LibraryDB:
         opens one: a real open either reaches ``SCHEMA_VERSION`` or raises.
 
         With ``background`` the rows of step 3, and step 4 after them, are
-        indexed on a thread of their own, which takes the write lock one batch
-        at a time. The backend opens the library inside its startup, and a
-        200,000-entry build there held every route, ``/api/health``
-        included, for as long as it ran. Writes keep their own rows indexed
-        meanwhile (:meth:`_sync_dirty`), and a search waits for the build
-        (:meth:`_wait_for_search`).
+        indexed on a thread of their own, which takes the write lock one short
+        batch at a time (:data:`SEARCH_BATCH_TARGET_SEC`). The backend opens
+        the library off its startup, and a 200,000-entry build takes minutes.
+        Writes keep their own rows indexed meanwhile (:meth:`_sync_dirty`), and
+        a search answers at once from the rows indexed so far, with
+        :meth:`search_status` saying how far the build has got.
         """
         with self._writelock:
             self.search_ready = (
@@ -1986,9 +2233,12 @@ class LibraryDB:
                 self._reconcile_search()
                 self._search_built.set()
                 return
+            # Counted here, under the lock, so the progress bar has its total
+            # before the first batch runs.
+            self._begin_index_progress(start)
         log.info(
             "library.db: building the search index in the background; "
-            "a library search waits for it"
+            "a search answers from the rows indexed so far until it finishes"
         )
         threading.Thread(
             target=self._finish_search_build,
@@ -1997,42 +2247,132 @@ class LibraryDB:
             daemon=True,
         ).start()
 
+    def _begin_index_progress(self, start: int) -> None:
+        """Start the ``index`` task of :attr:`progress`: every entry, the ones
+        at or below ``start`` (a resumed build's cursor) already done."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n, "
+            "COALESCE(SUM(CASE WHEN rowid <= ? THEN 1 ELSE 0 END), 0) AS done "
+            "FROM entries",
+            (start,),
+        ).fetchone()
+        self.progress.begin("index", int(row["n"]), int(row["done"]))
+
     def _finish_search_build(self, start: int) -> None:
         """The background half of :meth:`_ensure_search`: index the rows,
         then reconcile. Whatever stops it is kept and raised to every search
-        (:meth:`_wait_for_search`); the next open resumes the build from its
-        last committed batch."""
+        after it (:meth:`_raise_if_search_failed`); the next open resumes the
+        build from its last committed batch.
+
+        A finished build moves ``library_revision`` once, after the index
+        answers for every entry: every search answer a client cached while it
+        ran (pages, facets, the stats chips, all keyed by revision) covered
+        part of the library, and the bump is what tells it to ask again.
+        Never per batch, which would make every client refetch hundreds of
+        times over a 200,000-row build."""
+        finished = False
         try:
-            if self._index_search_rows(start):
-                with self._writelock:
-                    if not self._closed:
-                        self._reconcile_search()
+            finished = self._index_search_rows(start)
+            if finished:
+                self._reconcile_search()
         except BaseException as e:
+            finished = False
             self._search_build_error = e
+            self.progress.fail(
+                f"the search index build stopped ({e}); it resumes from where it "
+                "stopped the next time theDAW starts",
+                label="The search index build stopped",
+            )
             log.exception("library.db: the search index build stopped")
         finally:
+            self.progress.finish("index")
             self._search_built.set()
+        if not finished:
+            return
+        try:
+            with self._writelock:
+                if not self._closed:
+                    with self._txn() as cur:
+                        cur.execute("SELECT 1")
+        except sqlite3.Error:
+            log.warning(
+                "library.db: the search index is built, but announcing it to "
+                "the clients failed; they see it on the next library write",
+                exc_info=True,
+            )
 
-    def _wait_for_search(self) -> None:
-        """Return once the search index answers for every entry.
+    @property
+    def search_complete(self) -> bool:
+        """Whether the search index answers for every entry."""
+        return self._search_built.is_set() and self._search_build_error is None
 
-        Never call it holding :attr:`_writelock`: a background build needs
-        that lock for every batch. Raises RuntimeError when the build
-        stopped, so a search never answers from part of the library."""
-        if not self._search_built.is_set():
-            log.info("library.db: a search is waiting for the search index build")
-            self._search_built.wait()
+    def search_status(self) -> dict[str, Any]:
+        """``{"complete": True}`` once the index answers for every entry;
+        while a background build runs, ``{"complete": False, "indexed",
+        "total", "eta_sec"}`` -- a search then covers the ``indexed`` rows.
+        Reads no row and takes no lock."""
+        if self.search_complete:
+            return {"complete": True}
+        snap = self.progress.snapshot()
+        if snap["phase"] == "index":
+            return {
+                "complete": False,
+                "indexed": snap["done"],
+                "total": snap["total"],
+                "eta_sec": snap["eta_sec"],
+            }
+        return {"complete": False, "indexed": 0, "total": 0, "eta_sec": None}
+
+    def _raise_if_search_failed(self) -> None:
+        """Raise :class:`SearchIndexFailed` when a background build of the
+        index stopped: the index then holds part of the library and nothing
+        is filling in the rest until the next open resumes the build. A build
+        still running raises nothing; the search answers from the rows done
+        so far (:meth:`search_status`)."""
         if self._search_build_error is not None:
-            raise RuntimeError(
+            raise SearchIndexFailed(
                 f"the library search index could not be built: "
                 f"{self._search_build_error}"
             ) from self._search_build_error
+
+    def _unindexed_after(self) -> Optional[int]:
+        """The rowid a running build has indexed up to, or None when the index
+        answers for every entry. Rows above it hold no search text yet unless
+        a write indexed them. Call it holding :attr:`_writelock`."""
+        if self.search_complete:
+            return None
+        cursor = self._meta_value(FTS_BACKFILL_ROWID_KEY)
+        return None if cursor is None else int(cursor)
 
     def _meta_value(self, key: str) -> Optional[str]:
         row = self._conn.execute(
             "SELECT value FROM schema_meta WHERE key = ?", (key,)
         ).fetchone()
         return None if row is None else str(row["value"])
+
+    def get_flag(self, key: str) -> Optional[str]:
+        """A ``schema_meta`` value, or None. For the store's bookkeeping
+        (:data:`DISK_READ_PENDING_KEY`), never for library data."""
+        with self._writelock:
+            return self._meta_value(key)
+
+    def set_flag(self, key: str, value: Optional[str]) -> None:
+        """Write (or, with None, remove) a ``schema_meta`` value, committed at
+        once. Bookkeeping, not a library mutation: ``library_revision`` does
+        not move, so no client refetches for it."""
+        with self._writelock:
+            try:
+                if value is None:
+                    self._conn.execute("DELETE FROM schema_meta WHERE key = ?", (key,))
+                else:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+                        (key, str(value)),
+                    )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def _search_state(self) -> str:
         """The :data:`SEARCH_STATE_KEY` value a finished build leaves here."""
@@ -2138,19 +2478,29 @@ class LibraryDB:
         Each batch takes the write lock and commits together with
         :data:`FTS_BACKFILL_ROWID_KEY`, the highest rowid it covered, so a
         build interrupted by a crash, a kill or a full disk resumes after the
-        last committed batch, and a write waits one batch at most. A row a
-        write changes meanwhile is indexed by that write (:meth:`_sync_dirty`)
-        and again when the build reaches it, the same text both times. Commits
-        directly, for the reason :meth:`_start_search_build` gives.
+        last committed batch. A row a write changes meanwhile is indexed by
+        that write (:meth:`_sync_dirty`) and again when the build reaches it,
+        the same text both times. Commits directly, for the reason
+        :meth:`_start_search_build` gives.
+
+        Every library read takes the same lock, so a batch is sized to hold
+        it for about :data:`SEARCH_BATCH_TARGET_SEC`: the size follows the
+        measured rate, between :data:`SEARCH_BATCH_MIN` and ``batch``. At
+        2,000 rows a batch held the lock for 0.3 s on a fast disk and more
+        than a second on a slow one, and every read waited that long. The
+        lock is fair (:class:`FairRLock`), so a read that arrives during a
+        batch runs before the next one.
         """
         expected = self._search_state()
         indexed = 0
         reported = time.monotonic()
         top: Optional[int] = None
+        size = max(1, min(batch, 500))
         while True:
             with self._writelock:
                 if self._closed:
                     return False
+                began = time.perf_counter()
                 cur = self._conn.cursor()
                 try:
                     if top is None:
@@ -2160,7 +2510,7 @@ class LibraryDB:
                     rows = cur.execute(
                         "SELECT rowid FROM entries WHERE rowid > ? "
                         "ORDER BY rowid LIMIT ?",
-                        (last_rowid, batch),
+                        (last_rowid, size),
                     ).fetchall()
                     if rows:
                         rids = [int(r["rowid"]) for r in rows]
@@ -2187,9 +2537,14 @@ class LibraryDB:
                     raise
                 finally:
                     cur.close()
+                held = time.perf_counter() - began
             if not rows:
                 break
             indexed += len(rows)
+            self.progress.advance("index", len(rows))
+            if held > 0:
+                size = int(len(rows) * SEARCH_BATCH_TARGET_SEC / held)
+            size = max(min(SEARCH_BATCH_MIN, batch), min(batch, size))
             if time.monotonic() - reported >= 10.0:
                 reported = time.monotonic()
                 log.info(
@@ -2212,49 +2567,60 @@ class LibraryDB:
           writer the triggers could not see left behind -- an ``INSERT OR
           REPLACE`` into ``entries`` (its implied delete fires no trigger
           unless recursive triggers are on), or a hand edit.
-          Both are anti-joins over integer keys, so on a 200k library they
-          cost milliseconds.
+          The two rowid lists are read and compared as sets: at 200,000
+          rows that is about 0.1 s per list, where ``rowid NOT IN (SELECT rid
+          FROM entries_search_head)`` took 1.1 s -- it walks ``entries`` in
+          an index's order and looks every rowid up in the head table's
+          text-laden pages at random, all of it under the write lock.
 
-        Commits per batch, directly, for the reason ``_start_search_build``
-        gives.
+        Takes the write lock per list and per batch, and commits per batch,
+        directly, for the reason ``_start_search_build`` gives. A write that
+        lands between the two lists only adds a rowid to re-index, and
+        re-indexing a row that needs nothing writes back the same text; a
+        row a write re-indexes in between is indexed again here with the
+        same text.
         """
-        cur = self._conn.cursor()
-        try:
-            todo = {int(r["rid"]) for r in cur.execute(_DIRTY_ROWIDS_SQL)}
-            todo.update(
-                int(r["rowid"])
-                for r in cur.execute(
-                    "SELECT rowid FROM entries "
-                    "WHERE rowid NOT IN (SELECT rid FROM entries_search_head)"
-                )
-            )
-            todo.update(
-                int(r["rid"])
-                for r in cur.execute(
-                    "SELECT rid FROM entries_search_head "
-                    "WHERE rid NOT IN (SELECT rowid FROM entries)"
-                )
-            )
-            if not todo:
+        with self._writelock:
+            if self._closed:
                 return
-            ordered = sorted(todo)
-            for chunk in _chunks(ordered, batch):
-                self._sync_search(cur, chunk)
-                for part in _chunks(list(chunk), _MAX_SQL_PARAMS):
-                    marks = ", ".join("?" * len(part))
-                    cur.execute(
-                        f"DELETE FROM search_dirty WHERE rid IN ({marks})", list(part)
-                    )
-                self._conn.commit()
-            log.info(
-                "library.db: re-indexed %d entries changed outside this build",
-                len(ordered),
-            )
-        except Exception:
-            self._conn.rollback()
-            raise
-        finally:
-            cur.close()
+            todo = {int(r["rid"]) for r in self._conn.execute(_DIRTY_ROWIDS_SQL)}
+            entry_rowids = {
+                int(r["rowid"]) for r in self._conn.execute("SELECT rowid FROM entries")
+            }
+        with self._writelock:
+            if self._closed:
+                return
+            head_rowids = {
+                int(r["rid"])
+                for r in self._conn.execute("SELECT rid FROM entries_search_head")
+            }
+        todo.update(entry_rowids.symmetric_difference(head_rowids))
+        if not todo:
+            return
+        ordered = sorted(todo)
+        for chunk in _chunks(ordered, batch):
+            with self._writelock:
+                if self._closed:
+                    return
+                cur = self._conn.cursor()
+                try:
+                    self._sync_search(cur, chunk)
+                    for part in _chunks(list(chunk), _MAX_SQL_PARAMS):
+                        marks = ", ".join("?" * len(part))
+                        cur.execute(
+                            f"DELETE FROM search_dirty WHERE rid IN ({marks})",
+                            list(part),
+                        )
+                    self._conn.commit()
+                except Exception:
+                    self._conn.rollback()
+                    raise
+                finally:
+                    cur.close()
+        log.info(
+            "library.db: re-indexed %d entries changed outside this build",
+            len(ordered),
+        )
 
     def _sync_search(self, cur: sqlite3.Cursor, rids: Sequence[int]) -> None:
         """Make the index hold exactly the current text of these rowids.
@@ -2594,14 +2960,45 @@ class LibraryDB:
             cur.close()
             return dict(row) if row else None
 
+    def _entry_rows_in_chunks(
+        self, columns: str, *, chunk: int = WHOLE_TABLE_READ_CHUNK
+    ) -> list[dict[str, Any]]:
+        """Every ``entries`` row's ``columns``, read ``chunk`` rows at a time
+        in rowid order, with the write lock taken per chunk.
+
+        A whole-table read under one hold of the lock kept every other
+        library call waiting for it: at 200,000 rows ``SELECT * FROM
+        entries`` (the notation backfill runs it on every start) held the
+        lock for seconds, longer still while another thread kept the GIL
+        busy, and a library search waited behind it. A write that lands
+        between two chunks is seen or not depending on its rowid, which is
+        what a read a moment earlier or later would have seen too."""
+        out: list[dict[str, Any]] = []
+        last = -(2**63)
+        while True:
+            with self._writelock:
+                rows = self._conn.execute(
+                    f"SELECT rowid AS _chunk_rowid, {columns} FROM entries "
+                    "WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                    (last, chunk),
+                ).fetchall()
+            if not rows:
+                return out
+            last = int(rows[-1]["_chunk_rowid"])
+            for row in rows:
+                item = dict(row)
+                del item["_chunk_rowid"]
+                out.append(item)
+            if len(rows) < chunk:
+                return out
+
     def list_entries(self) -> list[dict[str, Any]]:
-        with self._writelock:
-            cur = self._conn.cursor()
-            rows = cur.execute(
-                "SELECT * FROM entries ORDER BY created_at DESC"
-            ).fetchall()
-            cur.close()
-            return [dict(r) for r in rows]
+        """Every entry, newest first. Read in chunks
+        (:meth:`_entry_rows_in_chunks`) and sorted here, so no single hold of
+        the write lock lasts the whole table."""
+        rows = self._entry_rows_in_chunks("*")
+        rows.sort(key=lambda r: r.get("created_at") or 0.0, reverse=True)
+        return rows
 
     def list_entries_filtered(
         self,
@@ -2863,11 +3260,8 @@ class LibraryDB:
                     self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchall()
 
     def all_entry_ids(self) -> list[str]:
-        with self._writelock:
-            cur = self._conn.cursor()
-            rows = cur.execute("SELECT id FROM entries").fetchall()
-            cur.close()
-            return [r["id"] for r in rows]
+        """Every entry id, read in chunks (:meth:`_entry_rows_in_chunks`)."""
+        return [r["id"] for r in self._entry_rows_in_chunks("id")]
 
     def count_entries(self) -> int:
         with self._writelock:
@@ -2908,14 +3302,17 @@ class LibraryDB:
         words on those rows' text; a ``UNION`` would instead sort every
         matching rowid into a temporary b-tree to remove the repeats.
 
-        A search waits here for a background build of the index
-        (:meth:`_wait_for_search`), so every caller reaches this before it
-        takes the write lock.
+        While a background build of the index runs, the select matches the
+        rows indexed so far and never waits for the rest: a search that waited
+        held a request thread for the whole build, 52 to 170 s at 200,000
+        rows. :meth:`search_status` says how much of the library that is. A
+        build that stopped raises :class:`SearchIndexFailed` here
+        (:meth:`_raise_if_search_failed`).
         """
         raw = q.strip()
         if not raw:
             return None
-        self._wait_for_search()
+        self._raise_if_search_failed()
         words = search_words(raw)
         text_sql, params = self._text_match_sql(words)
         number = js_parse_float(raw)
@@ -3184,15 +3581,14 @@ class LibraryDB:
 
         Title candidates come from the search index (every token of the folded
         reference occurs in a folded title that contains it), so only the
-        matching rows' ids and titles are read.
+        matching rows' ids and titles are read. While a background build of
+        the index runs, the rows it has not reached yet are candidates too:
+        their titles are folded and tested here, so a score opened during the
+        build still finds its track.
         """
         text = str(ref or "")
         if not text.strip():
             return None
-        # Before the lock: the title lookup below reads the search index, and
-        # a background build of it needs the lock to finish.
-        self._wait_for_search()
-        audio = frozenset({"audio"})
         with self._writelock:
             cur = self._conn.cursor()
             try:
@@ -3213,11 +3609,19 @@ class LibraryDB:
                 needle = fold_title(text)
                 if not needle:
                     return None
-                where, params = self._filter_sql(EntryFilters(kinds=audio, q=needle))
+                search = self._search_rids_sql(needle)
+                assert search is not None  # a folded needle is never blank
+                match = f"e.rowid IN ({search[0]})"
+                params = list(search[1])
+                floor = self._unindexed_after()
+                if floor is not None:
+                    match = f"({match} OR e.rowid > ?)"
+                    params.append(floor)
                 titled = [
                     (str(r["id"]), fold_title(str(r["title"] or "")))
                     for r in cur.execute(
-                        f"SELECT e.id AS id, e.title AS title FROM entries e {where} "
+                        "SELECT e.id AS id, e.title AS title FROM entries e "
+                        f"WHERE {match} AND e.kind = 'audio' "
                         f"ORDER BY {_SORT_SQL[DEFAULT_SORT]}",
                         params,
                     ).fetchall()
