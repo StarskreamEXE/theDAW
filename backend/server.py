@@ -1211,6 +1211,20 @@ async def _on_startup():
 
 
 async def _on_shutdown() -> None:
+    # The live VST hosts go first. POST /api/admin/shutdown gives this whole
+    # function one time budget (admin_routes.SHUTDOWN_HANDLER_BUDGET_SEC), and
+    # the sidecar stops below can wait many seconds each; the plugin state the
+    # hosts save is the user's work, and a slow sidecar must never cut it off.
+    try:
+        from backend.modules.vst.live_host import kill_all as stop_live_vst_hosts
+
+        # One native plugin host per live chain entry; each is asked to save
+        # its state before it is signalled, so this blocks — off the loop too.
+        await asyncio.to_thread(stop_live_vst_hosts)
+    except Exception:
+        # Never blocks the exit, but a failed stop can drop plugin state and
+        # leave host processes running; this line is the only trace of why.
+        logger.warning("shutdown: stopping the live VST hosts failed", exc_info=True)
     try:
         from backend.core.background_workers import get_background_queue
 
@@ -1235,15 +1249,7 @@ async def _on_shutdown() -> None:
         # Off the loop: sidecar stops block on process waits.
         await asyncio.to_thread(stop_all_sidecars)
     except Exception:
-        pass
-    try:
-        from backend.modules.vst.live_host import kill_all as stop_live_vst_hosts
-
-        # One native plugin host per live chain entry; each is asked to save
-        # its state before it is signalled, so this blocks — off the loop too.
-        await asyncio.to_thread(stop_live_vst_hosts)
-    except Exception:
-        pass
+        logger.warning("shutdown: stopping the sidecars failed", exc_info=True)
 
 
 @app.get("/api/modules")

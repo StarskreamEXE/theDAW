@@ -4,9 +4,9 @@
 // ./backendStop.test.ts, the same arrangement as ./downloadNaming.ts.
 //
 // POST /api/admin/shutdown makes the backend run its shutdown handlers before it
-// exits (backend/admin_routes.py): the background queue, the assistant's claude
-// children, every sidecar, and the live VST hosts, each of which saves its
-// plugin state. Those handlers get SHUTDOWN_HANDLER_BUDGET_SEC (15 s) after a
+// exits (backend/admin_routes.py): the live VST hosts, each of which saves its
+// plugin state, then the background queue, the assistant's claude children and
+// every sidecar. Those handlers get SHUTDOWN_HANDLER_BUDGET_SEC (15 s) after a
 // 0.6 s pause. A force-kill inside that window cuts the plugin saves off, so the
 // shell waits out the whole budget once the backend has accepted the request,
 // and kills at once only when the request is refused or never answered.

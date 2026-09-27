@@ -6,16 +6,21 @@ the assistant's ``claude`` children, the live VST hosts saving their plugin
 state -- never ran. ``backend/ports.py`` said they did, and ``--free`` makes
 this call on every launch.
 
-``os._exit`` and the sidecar teardown are replaced by recorders in every test
-here; each test waits for the recorded exit before it returns, so the exit
-thread never outlives the patch.
+``os._exit``, the sidecar teardown and the live VST host stop are replaced by
+recorders in every test here; each test waits for the recorded exit before it
+returns, so the exit thread never outlives the patch.
 """
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import logging
 import os
+import sys
 import threading
+import time
+import types
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -60,6 +65,9 @@ def exits(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         teardown, "stop_all_sidecars", lambda: events.append("sidecars")
     )
+    import backend.modules.vst.live_host as live_host
+
+    monkeypatch.setattr(live_host, "kill_all", lambda: events.append("vst"))
     return events, exited
 
 
@@ -100,7 +108,8 @@ def test_hung_handlers_cannot_keep_the_process_alive(
     exits, monkeypatch: pytest.MonkeyPatch
 ):
     """The handlers get a budget. Past it the process exits anyway, and the
-    sidecars are still stopped so none is left holding its port."""
+    live VST hosts and the sidecars are still stopped: the hosts save their
+    plugin state, and no sidecar is left holding its port."""
     monkeypatch.setattr(admin_routes, "SHUTDOWN_HANDLER_BUDGET_SEC", 0.3)
     events, exited = exits
 
@@ -110,7 +119,7 @@ def test_hung_handlers_cannot_keep_the_process_alive(
     with TestClient(_app(events, handlers=hang)) as client:
         assert client.post("/api/admin/shutdown").status_code == 200
         assert exited.wait(10), "a hung handler kept the process alive"
-    assert events == ["sidecars", ("exit", 0)]
+    assert events == ["vst", "sidecars", ("exit", 0)]
 
 
 def test_an_app_without_a_lifespan_still_stops_its_sidecars(exits):
@@ -120,7 +129,7 @@ def test_an_app_without_a_lifespan_still_stops_its_sidecars(exits):
     with TestClient(app) as client:
         assert client.post("/api/admin/shutdown").status_code == 200
         assert exited.wait(10)
-    assert events == ["sidecars", ("exit", 0)]
+    assert events == ["vst", "sidecars", ("exit", 0)]
 
 
 @pytest.mark.parametrize("route", ["/api/admin/shutdown", "/api/admin/restart"])
@@ -151,3 +160,62 @@ def test_the_real_lifespan_publishes_its_shutdown_handlers():
     register = body.index("setattr(app_.state, SHUTDOWN_HANDLERS_STATE, _on_shutdown)")
     assert register < body.index("\n    yield\n")
     assert admin_routes.SHUTDOWN_HANDLERS_STATE == "run_shutdown_handlers"
+
+
+def _server_on_shutdown():
+    """backend/server.py's real ``_on_shutdown``, compiled from its source.
+
+    Importing server.py would start every module; the function imports what it
+    stops inside its own body, so it runs here against the recorders."""
+    source = (REPO_ROOT / "backend" / "server.py").read_text(encoding="utf-8")
+    node = next(
+        n
+        for n in ast.parse(source).body
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "_on_shutdown"
+    )
+    namespace = {"asyncio": asyncio, "logger": logging.getLogger("test.server")}
+    exec(compile(ast.get_source_segment(source, node), "server.py", "exec"), namespace)
+    return namespace["_on_shutdown"]
+
+
+def test_slow_sidecars_cannot_cut_off_the_live_vst_hosts_state_save(
+    exits, monkeypatch: pytest.MonkeyPatch
+):
+    """Settings > Shutdown while a sidecar is slow to stop. The server's own
+    handlers run under one budget; when they stopped the sidecars first and
+    the budget ran out there, the live VST hosts were never asked to save their
+    plugin state, and the fallback stopped only the sidecars again."""
+    monkeypatch.setattr(admin_routes, "SHUTDOWN_HANDLER_BUDGET_SEC", 0.3)
+    events, exited = exits
+    import backend.core.teardown as teardown
+
+    def slow_sidecars() -> None:
+        time.sleep(0.8)
+        events.append("sidecars")
+
+    monkeypatch.setattr(teardown, "stop_all_sidecars", slow_sidecars)
+
+    class Queue:
+        async def stop(self) -> None:
+            events.append("queue")
+
+    async def kill_claude_children() -> None:
+        events.append("claude")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "backend.core.background_workers",
+        types.SimpleNamespace(get_background_queue=Queue),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "backend.modules.assistant.claude_session",
+        types.SimpleNamespace(kill_all=kill_claude_children),
+    )
+
+    with TestClient(_app(events, handlers=_server_on_shutdown())) as client:
+        assert client.post("/api/admin/shutdown").status_code == 200
+        assert exited.wait(10), "the process never exited"
+    first_exit = events.index(("exit", 0))
+    assert "vst" in events[:first_exit], f"the VST hosts never stopped: {events}"
+    assert events.index("vst") < events.index("sidecars")

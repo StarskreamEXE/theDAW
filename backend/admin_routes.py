@@ -90,24 +90,40 @@ def _delayed_exit(
     time.sleep(delay_seconds)
     # os._exit below skips atexit handlers (they hang on uvicorn shutdown when
     # called from a request thread) and the lifespan's own shutdown half, so
-    # the handlers that half would run are run here first: the background
-    # queue, the assistant's claude children, every sidecar and the live VST
-    # hosts, which save their plugin state.
+    # the handlers that half would run are run here first: the live VST hosts,
+    # which save their plugin state, the background queue, the assistant's
+    # claude children and every sidecar.
     ran = False
     if loop is not None and handlers is not None:
         ran = _run_shutdown_handlers(loop, handlers)
     if not ran:
-        # No lifespan registered them (or they failed part-way): still stop the
-        # sidecars, which would otherwise be orphaned holding their ports.
-        try:
-            from backend.core.teardown import stop_all_sidecars
-
-            stop_all_sidecars()
-        except Exception:
-            # Teardown must never block the exit; the line is the only trace.
-            log.debug("admin: stopping the sidecars failed", exc_info=True)
+        _stop_children_directly()
     log.info("admin: exiting with code %d", code)
     os._exit(code)
+
+
+def _stop_children_directly() -> None:
+    """Stop the live VST hosts and the sidecars without the app's handlers.
+
+    For when no lifespan registered the handlers, or they ran out of budget.
+    The hosts come first so each can still save its plugin state; a host the
+    handlers already reached is gone from the host manager, so that call
+    returns at once. The sidecars would otherwise be orphaned holding their
+    ports.
+    """
+    try:
+        from backend.modules.vst.live_host import kill_all as stop_live_vst_hosts
+
+        stop_live_vst_hosts()
+    except Exception:
+        # Teardown must never block the exit; the line is the only trace.
+        log.warning("admin: stopping the live VST hosts failed", exc_info=True)
+    try:
+        from backend.core.teardown import stop_all_sidecars
+
+        stop_all_sidecars()
+    except Exception:
+        log.warning("admin: stopping the sidecars failed", exc_info=True)
 
 
 def _schedule_exit(request: Request, code: int) -> None:

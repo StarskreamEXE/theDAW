@@ -51,9 +51,9 @@ Shutdown, cleanest first
 ------------------------
 For the backend port, ``--free`` first asks the running instance to stop through
 ``POST /api/admin/shutdown``, which runs the app's shutdown handlers -- the
-background queue, the assistant's ``claude`` children, every sidecar, and the
-live VST hosts, each of which saves its plugin state -- before the process
-exits. Only if that is refused or times out does it signal the process. This
+live VST hosts, each of which saves its plugin state, then the background
+queue, the assistant's ``claude`` children and every sidecar -- before the
+process exits. Only if that is refused or times out does it signal the process. This
 matters on Windows, where ``psutil.terminate()`` is ``TerminateProcess`` -- not a
 catchable SIGTERM -- so signalling a backend mid-write is exactly as abrupt as
 killing it.
