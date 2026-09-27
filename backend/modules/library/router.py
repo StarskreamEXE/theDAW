@@ -35,6 +35,7 @@ import hashlib
 import json
 import logging
 import mimetypes
+import os
 import re
 import tempfile
 import threading
@@ -50,6 +51,7 @@ from fastapi import (
     Form,
     HTTPException,
     Query,
+    Request,
     UploadFile,
 )
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -184,6 +186,10 @@ def _attach_play_counts(
 # parsed separately below so the frontend never receives raw JSON strings.
 _ANALYSIS_SCALAR_KEYS = (
     "bpm",
+    # The tempo detector's own confidence in ``bpm``, 0..1 (clamped where it
+    # is measured). Without it only GET /api/analysis/{id} carried the number
+    # and every list-driven surface saw a BPM with no confidence behind it.
+    "bpm_confidence",
     "key",
     "key_confidence",
     "scale",
@@ -963,8 +969,49 @@ def _remember_cdn_refusal(entry_id: str, detail: str) -> None:
     log.warning("library: %s", detail)
 
 
+#: Cache policy for a library entry's local audio. ``no-cache`` means "keep a
+#: copy, but ask before using it": every use is a conditional request, and
+#: :func:`stream_audio` answers one whose ETag still matches with an empty 304,
+#: so a deck reload costs a round trip, not a download. A long ``max-age``
+#: skipped the question entirely, which kept the browser playing whatever it
+#: first received -- the unplayable original when the AIFF remux had failed,
+#: and the old bytes after the user re-exported a referenced file to the same
+#: path. ``private`` because a library is one user's: no shared proxy may keep
+#: a copy.
+_AUDIO_CACHE_CONTROL = "private, no-cache"
+
+
+def _audio_etag(served: Path, st: os.stat_result) -> str:
+    """A strong validator for the bytes ``stream_audio`` is about to send.
+
+    Built from the served path as well as its size and mtime: the path
+    changes when a failed remux starts succeeding (the original becomes the
+    cached WAV), and size + mtime change when a file is replaced in place.
+    Starlette's own ETag uses size + mtime only, and ``FileResponse`` never
+    compares it against the request, so on its own it could not answer 304.
+    """
+    basis = f"{served}|{st.st_size}|{st.st_mtime_ns}"
+    return (
+        '"'
+        + hashlib.sha1(basis.encode("utf-8"), usedforsecurity=False).hexdigest()
+        + '"'
+    )
+
+
+def _etag_matches(if_none_match: Optional[str], etag: str) -> bool:
+    """RFC 9110 weak comparison of ``If-None-Match`` against ``etag``."""
+    if not if_none_match:
+        return False
+    if if_none_match.strip() == "*":
+        return True
+    bare = etag.removeprefix("W/")
+    return any(
+        tag.strip().removeprefix("W/") == bare for tag in if_none_match.split(",")
+    )
+
+
 @router.get("/audio/{entry_id}")
-async def stream_audio(entry_id: str) -> Response:
+async def stream_audio(entry_id: str, request: Request) -> Response:
     # CHANGED: support CDN-backed entries — if no local file exists but
     # metadata has a cdn_audio_url, proxy the audio from Suno CDN on demand.
     # Even building the store is filesystem work the first time (it walks the
@@ -981,20 +1028,20 @@ async def stream_audio(entry_id: str) -> Response:
         served, media_type = await asyncio.to_thread(
             _playable_audio, audio_path, cache_parent
         )
+        # One stat, off the loop, shared by the validator and the response
+        # (FileResponse would otherwise stat the file again itself).
+        st = await asyncio.to_thread(os.stat, served)
+        etag = _audio_etag(served, st)
+        headers = {"Cache-Control": _AUDIO_CACHE_CONTROL, "ETag": etag}
+        if _etag_matches(request.headers.get("if-none-match"), etag):
+            # The browser's copy is these exact bytes: tell it to use it.
+            return Response(status_code=304, headers=headers)
         return FileResponse(
             path=str(served),
             media_type=media_type,
             filename=served.name,
-            # An entry's audio is addressed by its id and is not replaced,
-            # and the DJ decks refetch the same entry constantly -- without a
-            # freshness hint the browser pulled the whole file down on every
-            # deck reload. NOT ``immutable``: that promises these exact bytes
-            # can never change, and _playable_audio's transcode cache IS
-            # re-done when the source file is replaced. Plain max-age still
-            # skips the download; when the browser does revalidate, the
-            # FileResponse's ETag / Last-Modified answer 304. ``private``
-            # because a library is one user's: no shared proxy may keep a copy.
-            headers={"Cache-Control": "private, max-age=31536000"},
+            headers=headers,
+            stat_result=st,
         )
     # No local file, in the entry or in any media root — the remote copy is
     # the last resort. On the first successful fetch the bytes are persisted

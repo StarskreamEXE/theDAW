@@ -965,6 +965,7 @@ DEFAULT_DELETE_BATCH = 500
 _ANALYSIS_LIST_COLUMNS = (
     "entry_id",
     "bpm",
+    "bpm_confidence",
     "key",
     "key_confidence",
     "scale",
