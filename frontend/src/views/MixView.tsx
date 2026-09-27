@@ -794,12 +794,12 @@ function buildMixRegistry(p: MixRegArgs): WidgetRegistry {
             <button onClick={p.rescanVst} disabled={p.vstScanning} className="btn-ghost inline-flex items-center gap-1 disabled:opacity-40" title="Rescan the standard VST3 folders">
               {p.vstScanning ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />} Rescan
             </button>
-            <span className="text-[8px] font-mono text-zinc-600">host: pedalboard</span>
+            <span className="text-xs font-semibold text-zinc-500">host: pedalboard</span>
           </div>
           {p.vstPlugins.length === 0 ? (
-            <div className="flex-1 flex flex-col items-center justify-center opacity-30 italic gap-2 py-8">
-              <Plug className="w-7 h-7" />
-              <span className="text-[10px] text-center px-4">{vstBrowserEmptyText(p.vstScanning, p.vstUnavailableReason)}</span>
+            <div className="flex-1 flex flex-col items-center justify-center gap-2 py-8">
+              <Plug className="w-7 h-7 text-zinc-600" />
+              <span className="text-sm font-semibold text-zinc-400 text-center px-4">{vstBrowserEmptyText(p.vstScanning, p.vstUnavailableReason)}</span>
             </div>
           ) : (
             <div className="flex flex-wrap gap-3 content-start justify-center p-1.5">
@@ -815,13 +815,13 @@ function buildMixRegistry(p: MixRegArgs): WidgetRegistry {
                     style={{ width: 132 }}>
                     <div className="flex items-center gap-1.5">
                       <Plug className="w-3 h-3 text-teal-300 shrink-0" />
-                      <span className="text-[10px] font-bold text-zinc-100 truncate flex-1">{name}</span>
+                      <span className="text-xs font-bold text-zinc-100 truncate flex-1">{name}</span>
                       {inChain && <span aria-label="In chain" className="w-1.5 h-1.5 rounded-full bg-teal-400 shrink-0" />}
                     </div>
                     <div className="relative w-full h-16 rounded bg-[#0a0c14] border border-white/5 overflow-hidden">
                       <ModuleThumb preview={vstPreviewKey(pl.category)} seed={`${pl.name}|${pl.manufacturer}`} className="w-full h-full" />
                     </div>
-                    <span className="text-[8px] font-mono text-zinc-500 leading-tight line-clamp-2">{[pl.manufacturer, pl.version].filter(Boolean).join(' · ') || pl.category}</span>
+                    <span className="text-xs font-semibold text-zinc-500 leading-tight line-clamp-2">{[pl.manufacturer, pl.version].filter(Boolean).join(' · ') || pl.category}</span>
                   </button>
                 );
               })}
