@@ -210,11 +210,18 @@ def _port_holders(port: int) -> tuple[bool, bool]:
 
 def _holder_of(port: int) -> Optional[dict]:
     """The first process other than this one listening on ``port`` here, as
-    ``{pid, name, port, thedaw}``; None when nobody else listens on it or the
-    listening table is unreadable."""
+    ``{pid, name, port, thedaw}``; None when nobody else listens on it.
+
+    The listening table can hide the process: psutil gets AccessDenied for the
+    whole table on macOS without root, and on Linux it reports no pid for a
+    socket another user owns, so ``holders()`` comes back without it. A bind
+    probe still sees the port taken, and such a holder is reported as
+    ``{pid: 0, name: ""}``: some program serves the port, which one is unknown.
+    """
     from backend.ports import holders
 
-    for holder in holders([port]):
+    listed = holders([port])
+    for holder in listed:
         if holder.pid == os.getpid():
             continue
         return {
@@ -223,7 +230,10 @@ def _holder_of(port: int) -> Optional[dict]:
             "port": port,
             "thedaw": any(entry in holder.cmdline for entry in _THEDAW_ENTRY_POINTS),
         }
-    return None
+    if listed or _port_number_is_free(port):
+        # Only this process listens on it, or nobody does.
+        return None
+    return {"pid": 0, "name": "", "port": port, "thedaw": False}
 
 
 def _port_number_is_free(port: int) -> bool:
@@ -236,12 +246,19 @@ def _port_number_is_free(port: int) -> bool:
     listening on 8765 on all interfaces: its clients reached our raw TCP
     listener and saw their own server as dead. So the wildcard address is
     probed as well as ours; a bind to an address somebody holds does fail.
+
+    Elsewhere the probe sets SO_REUSEADDR, so a connection left in TIME_WAIT by
+    a program that already exited does not count as a listener. Linux still
+    refuses the bind while any socket listens on the port, and BSD/macOS while
+    one holds the same address.
     """
     for host in ("0.0.0.0", "127.0.0.1"):
         probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             if sys.platform == "win32":
                 probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind((host, port))
         except OSError:
             return False
@@ -339,18 +356,29 @@ def _own_port() -> Optional[int]:
 
 
 def _consent_key(holder: dict) -> tuple[int, str]:
-    return (int(holder["pid"]), str(holder["name"]))
+    """Which program a holder is, for Take over: its pid and name, or its port
+    when the listening table could not name it (pid 0)."""
+    if holder["pid"]:
+        return (int(holder["pid"]), str(holder["name"]))
+    return (0, f"port {holder['port']}")
+
+
+def _holder_label(holder: dict) -> str:
+    if holder["thedaw"]:
+        return f"another theDAW (pid {holder['pid']})"
+    if holder["pid"]:
+        return f"{holder['name']} (pid {holder['pid']})"
+    return "another program"
 
 
 def _note_holder(holder: Optional[dict]) -> None:
     """Record who holds the headset, logging once per change of holder."""
     if holder is not None and holder != _s.headset_holder:
         log.info(
-            "questmidi: %s (pid %d) serves port %d, the port the headset dials "
+            "questmidi: %s serves port %d, the port the headset dials "
             "(listening on port %d here); theDAW leaves the headset with it "
             "until you press Take over (Settings > Inputs & outputs)",
-            "another theDAW" if holder["thedaw"] else holder["name"],
-            holder["pid"],
+            _holder_label(holder),
             _device_port(),
             holder["port"],
         )

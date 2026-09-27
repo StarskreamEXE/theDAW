@@ -18,8 +18,10 @@ import { pairingHeader } from '../lib/pairing';
 import { postStatus } from './statusNoticeStore';
 
 export interface QuestMidiHolder {
+  /** 0 when the backend sees the port taken but cannot name the process
+   *  (the OS keeps the listening table from it). */
   pid: number;
-  /** Process name as the OS reports it. */
+  /** Process name as the OS reports it; 'another program' when unknown. */
   name: string;
   /** The port on this PC the holder listens on. */
   port: number;
@@ -97,7 +99,8 @@ export function questMidiState(status: QuestMidiStatus | null): QuestMidiState {
 }
 
 export function questMidiHolderName(holder: QuestMidiHolder): string {
-  return holder.thedaw ? `another theDAW (pid ${holder.pid})` : `${holder.name} (pid ${holder.pid})`;
+  if (holder.thedaw) return `another theDAW (pid ${holder.pid})`;
+  return holder.pid > 0 ? `${holder.name} (pid ${holder.pid})` : holder.name;
 }
 
 /** What the Settings row says about the holder. */
@@ -117,7 +120,13 @@ export function questMidiHolderNotice(holder: QuestMidiHolder, devicePort: numbe
   );
 }
 
-const holderKey = (h: QuestMidiHolder | null): string => (h ? `${h.pid}:${h.port}:${h.mapped}` : '');
+// One program, one notice: the same identity the backend's Take over consent
+// uses (_consent_key), so a program that goes from listening on the port to
+// mapping the headset is not announced twice.
+const holderKey = (h: QuestMidiHolder | null): string => {
+  if (!h) return '';
+  return h.pid > 0 ? `pid ${h.pid}:${h.name}` : `port ${h.port}`;
+};
 
 const errText = async (res: Response): Promise<string> => {
   if (res.status === 404) return 'The Quest MIDI module is off (Settings, Modules).';

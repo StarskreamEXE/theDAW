@@ -1,12 +1,15 @@
 /**
  * Quest MIDI: another program serves the headset, and only the user moves it.
  *
- * Replays the order the app sees it in: the bridge WebSocket opens and its
- * first frame names the program that holds the headset's port; the LOG gets
- * one notice; Settings → Inputs & outputs shows Held with a labelled Take over
- * button; a reconnect that finds the same program posts nothing new; nothing
- * has asked the backend to take the headset until the user presses Take over;
- * after it, the row shows Ready and offers Re-attach instead.
+ * Replays the order the app sees it in: the bridge WebSocket opens with
+ * theDAW holding the headset; mid-session the backend pushes a status frame
+ * naming a program that started listening on the headset's port, and the LOG
+ * gets one notice; Settings → Inputs & outputs shows Held with a labelled Take
+ * over button; the same program then maps the headset to itself, which is not
+ * news; a reconnect that finds the same program posts nothing new; nothing has
+ * asked the backend to take the headset until the user presses Take over;
+ * after it, the row shows Ready and offers Re-attach instead. Last, a holder
+ * the backend could not name (pid 0) is shown without a pid.
  *
  * Run: npx tsx src/components/layout/settings/QuestMidiRow.test.tsx
  */
@@ -56,7 +59,7 @@ const { STATUS_REPEAT_MS } = await import('../../../state/statusNoticeStore.ts')
 const { QuestMidiRowView } = await import('./QuestMidiRow.tsx');
 
 const HOLDER = { pid: 4242, name: 'node.exe', port: 8765, thedaw: false, mapped: true };
-const heldStatus = {
+const readyStatus = {
   type: 'status',
   started: true,
   port: 8765,
@@ -64,13 +67,24 @@ const heldStatus = {
   host_port: 8766,
   configured_host_port: 8766,
   adb_path: 'C:/platform-tools/adb.exe',
-  adb_reverse_ok: false,
+  adb_reverse_ok: true,
   quest_connected: false,
-  headset_holder: HOLDER,
+  headset_holder: null,
   took_over: false,
 };
+const heldStatus = { ...readyStatus, adb_reverse_ok: false, headset_holder: HOLDER };
+const listeningStatus = { ...heldStatus, headset_holder: { ...HOLDER, mapped: false } };
 
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+// Moves the clock past the notice store's repeat window, which drops an
+// identical line posted within STATUS_REPEAT_MS. Status changes that are
+// seconds apart in the app are that far apart here too.
+const realNow = Date.now;
+let clockOffset = 0;
+const later = () => {
+  clockOffset += STATUS_REPEAT_MS + 1000;
+  Date.now = () => realNow() + clockOffset;
+};
 const questNotices = () =>
   useLogStore.getState().entries.filter((e) => e.source === 'questmidi' && e.msg.startsWith('QUEST MIDI HELD'));
 const renderRow = () => {
@@ -80,29 +94,46 @@ const renderRow = () => {
   );
 };
 
-// 1. The bridge WebSocket opens; its first frame names the holder.
+// 1. The bridge WebSocket opens; theDAW has the headset.
 startQuestMidi();
 const sock = FakeSocket.made[0];
 assert.ok(sock, 'the bridge opened a socket');
 sock.open();
-sock.frame(heldStatus);
+sock.frame(readyStatus);
 await tick();
+let html = renderRow();
+assert.ok(html.includes('Ready'), html);
+assert.equal(questNotices().length, 0);
 
+// 2. Mid-session, with the socket still open, the backend pushes a frame: the
+// Node bridge started listening on the headset's port.
+sock.frame(listeningStatus);
+await tick();
 const held = useQuestMidiStatusStore.getState().status;
-assert.equal(held?.holder?.pid, 4242, 'the status frame reached the store');
+assert.equal(held?.holder?.pid, 4242, 'the pushed status frame reached the store');
 assert.equal(questNotices().length, 1, 'one LOG notice names the holder');
 assert.equal(questNotices()[0].level, 'warn');
 assert.ok(questNotices()[0].msg.includes('node.exe (pid 4242)'), questNotices()[0].msg);
+html = renderRow();
+assert.ok(html.includes('Held'), html);
+assert.ok(html.includes('node.exe (pid 4242) listens on port 8765 here'), html);
 
-// 2. Settings shows Held, says who, and offers a labelled Take over.
-let html = renderRow();
+// 3. Some seconds later the same program maps the headset to itself: the row
+// says so, and it is not announced a second time.
+later();
+sock.frame(heldStatus);
+await tick();
+assert.equal(questNotices().length, 1, 'the same program was announced twice');
+
+// Settings shows Held, says who, and offers a labelled Take over.
+html = renderRow();
 assert.ok(html.includes('Held'), html);
 assert.ok(html.includes('node.exe (pid 4242) has the headset'), html);
 assert.ok(html.includes('aria-label="Take over the Quest headset from node.exe (pid 4242)"'), html);
 assert.ok(html.includes('>Take over<'), html);
 assert.ok(!html.includes('Re-attach'), 'no Re-attach while another program holds the headset');
 
-// 3. A reconnect that finds the same program posts nothing new.
+// 4. A reconnect that finds the same program posts nothing new.
 sock.close();
 stopQuestMidi();
 startQuestMidi();
@@ -112,14 +143,14 @@ again.frame(heldStatus);
 await tick();
 assert.equal(questNotices().length, 1, 'the same holder is not announced twice');
 
-// 4. Nothing asked the backend to take the headset before the user did.
+// 5. Nothing asked the backend to take the headset before the user did.
 assert.deepEqual(
   requests.filter((r) => r.method === 'POST'),
   [],
   'the headset was taken without a user action',
 );
 
-// 5. The user presses Take over.
+// 6. The user presses Take over.
 nextResponse = { ...heldStatus, type: undefined, headset_holder: null, took_over: true, adb_reverse_ok: true };
 await useQuestMidiStatusStore.getState().takeOver();
 assert.deepEqual(requests.filter((r) => r.method === 'POST'), [{ url: '/api/questmidi/takeover', method: 'POST' }]);
@@ -132,15 +163,23 @@ assert.ok(html.includes('Ready'), html);
 assert.ok(!html.includes('Take over the Quest headset'), 'no Take over once theDAW has the headset');
 assert.ok(html.includes('aria-label="Re-attach the Quest headset over USB"'), html);
 
-// 6. The holder coming back later (it mapped the headset to itself again) is
-// news. "Later" is past the notice store's repeat window, which drops an
-// identical line posted within STATUS_REPEAT_MS.
-const realNow = Date.now;
-Date.now = () => realNow() + STATUS_REPEAT_MS + 1000;
+// 7. The holder coming back later (it mapped the headset to itself again) is
+// news.
+later();
 again.frame(heldStatus);
 await tick();
 assert.equal(questNotices().length, 2, 'a holder that returns is announced again');
-Date.now = realNow;
 
+// 8. A holder the backend sees on the port but cannot name (pid 0).
+again.frame({ ...listeningStatus, headset_holder: { pid: 0, name: '', port: 8765, thedaw: false, mapped: false } });
+await tick();
+assert.equal(questNotices().length, 3, 'a different program is news');
+assert.ok(questNotices()[2].msg.includes('QUEST MIDI HELD: another program serves port 8765'), questNotices()[2].msg);
+html = renderRow();
+assert.ok(html.includes('another program listens on port 8765 here'), html);
+assert.ok(!html.includes('pid 0'), html);
+assert.ok(html.includes('aria-label="Take over the Quest headset from another program"'), html);
+
+Date.now = realNow;
 stopQuestMidi();
 console.log('QuestMidiRow: the headset stays with its holder until the user presses Take over');

@@ -355,6 +355,56 @@ def test_a_program_that_takes_the_headset_later_keeps_it(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("mapped", [False, True], ids=["listening", "mapped"])
+def test_a_program_the_listening_table_hides_keeps_the_headset(
+    headset, other_bridge, monkeypatch, mapped
+):
+    """Sequence: the standalone bridge serves the headset's port on a machine
+    where psutil cannot read the listening table (macOS without root; on Linux,
+    a socket another user owns); theDAW starts; the user presses Take over; the
+    cable is pulled and plugged back in. theDAW must leave the headset alone
+    until Take over, and afterwards re-attach without asking."""
+    import backend.ports
+
+    other = other_bridge()
+    device_port = other.port
+    _headset_dials(monkeypatch, device_port)
+    if mapped:
+        headset.reverse[device_port] = device_port
+    monkeypatch.setattr(backend.ports, "holders", lambda ports: [])
+
+    async def scenario() -> None:
+        await bridge.ensure_started()
+        try:
+            assert headset.midi_reversals(device_port) == [], (
+                "theDAW took the headset from a program psutil could not name"
+            )
+            holder = bridge.status()["headset_holder"]
+            assert holder == {
+                "pid": 0,
+                "name": "",
+                "port": device_port,
+                "thedaw": False,
+                "mapped": mapped,
+            }
+            assert await bridge.reattach_adb() is False
+            assert headset.midi_reversals(device_port) == []
+
+            status = await bridge.take_over()
+            assert status["headset_holder"] is None
+            assert headset.reverse[device_port] == status["host_port"]
+
+            headset.unplug_and_replug()
+            await bridge.refresh_headset_holder()
+            assert bridge.status()["headset_holder"] is None
+            assert await bridge.reattach_adb() is True
+            assert headset.reverse[device_port] == status["host_port"]
+        finally:
+            await bridge.stop()
+
+    asyncio.run(scenario())
+
+
 def test_a_second_program_is_asked_about_anew(headset, other_bridge, monkeypatch):
     """Sequence: the user takes the headset from one program; a different
     program then maps it to itself; a re-attach leaves it with that one."""
