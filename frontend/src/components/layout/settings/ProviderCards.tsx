@@ -29,7 +29,22 @@ import {
   stopMagentaEngine,
 } from '../../../lib/magentaEngineClient';
 import type { LyriaProvider, ModelOption, ProviderStatus } from './providerTypes';
-import { BTN_AMBER, BTN_GHOST, BTN_PURPLE, BTN_ROSE, BTN_SKY, CARD, FIELD_LABEL, INPUT, SELECT, postFix, sleep } from './shared';
+import {
+  BTN_AMBER,
+  BTN_GHOST,
+  BTN_GHOST_12,
+  BTN_PURPLE,
+  BTN_PURPLE_12,
+  BTN_ROSE,
+  BTN_SKY,
+  CARD,
+  FIELD_LABEL,
+  FIELD_LABEL_12,
+  INPUT,
+  SELECT,
+  postFix,
+  sleep,
+} from './shared';
 import { SecretFieldLabel } from '../../ui/SecretFieldLabel';
 
 export const MODEL_STATE_LABELS: Record<string, string> = {
@@ -621,7 +636,7 @@ const LyriaProviderKeyList: React.FC<{
         });
       }}
     >
-      <SecretFieldLabel htmlFor={id} className={`shrink-0 ${FIELD_LABEL}`} title={title}>
+      <SecretFieldLabel htmlFor={id} className={`shrink-0 ${FIELD_LABEL_12}`} title={title}>
         {label}
       </SecretFieldLabel>
       <div className="relative flex-1 min-w-0">
@@ -647,7 +662,7 @@ const LyriaProviderKeyList: React.FC<{
           {show ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
         </button>
       </div>
-      <button type="submit" disabled={busy || !val.trim()} title={`Add this ${label} key to the end of the list`} className={BTN_PURPLE}>
+      <button type="submit" disabled={busy || !val.trim()} title={`Add this ${label} key to the end of the list`} className={BTN_PURPLE_12}>
         {busy ? <Loader2 className="w-3 h-3 animate-spin" /> : 'Add'}
       </button>
       <span
@@ -666,7 +681,7 @@ const LyriaProviderKeyList: React.FC<{
           disabled={busy}
           aria-label={`Forget saved ${label} key ${i + 1}`}
           title={`Forget saved ${label} key ${i + 1} (position ${i + 1} of the keys saved here)`}
-          className={BTN_GHOST}
+          className={BTN_GHOST_12}
         >
           <Trash2 className="w-3 h-3" />
           {`#${i + 1}`}
@@ -752,7 +767,7 @@ export const LyriaKeyLists: React.FC<{ onSaved: () => void }> = ({ onSaved }) =>
         />
       ))}
       <div className="flex flex-wrap items-center gap-1">
-        <label htmlFor="settings-lyria-provider" className={`shrink-0 ${FIELD_LABEL}`}>
+        <label htmlFor="settings-lyria-provider" className={`shrink-0 ${FIELD_LABEL_12}`}>
           Provider
         </label>
         <select

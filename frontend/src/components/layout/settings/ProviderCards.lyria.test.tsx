@@ -15,7 +15,8 @@
  *     keeps its old keys until Restart.
  *  4. The pool switch is a real toggle (aria-pressed) that posts the new
  *     value, off by default.
- *  5. The count line is 12px bold sans, not small mono.
+ *  5. The count line, the field labels and the Add / forget buttons are
+ *     12px or larger bold sans, with no small mono.
  *
  * Real component, real React (react-dom/client + act) under jsdom; `fetch`
  * is stubbed and every call recorded.
@@ -110,6 +111,16 @@ async function main(): Promise<void> {
   const countClass = count!.className;
   assert.ok(countClass.includes('text-xs') && countClass.includes('font-bold'), countClass);
   assert.ok(!/text-\[(?:[0-9]|1[01])px\]|font-mono/.test(countClass), countClass);
+  // Every label, button and line of text in the card: 12px or larger, no
+  // mono. The key and provider fields keep the Settings input style (a typed
+  // value at 12px, not a label), so only the text around them is held here.
+  const cardText: HTMLElement[] = Array.from<HTMLElement>(host.querySelectorAll<HTMLElement>('label, button, span, p'));
+  assert.ok(cardText.length > 8, `expected the card's labels and buttons, found ${cardText.length}`);
+  for (const el of cardText) {
+    const cls = el.getAttribute('class') ?? '';
+    assert.ok(!/text-\[(?:[0-9]|1[01])px\]/.test(cls), `text under 12px on <${el.tagName.toLowerCase()}> "${el.textContent}": ${cls}`);
+    assert.ok(!cls.includes('font-mono'), `mono on <${el.tagName.toLowerCase()}> "${el.textContent}": ${cls}`);
+  }
 
   const input = doc.getElementById('settings-lyria-gemini-key') as HTMLInputElement;
   assert.ok(input, 'the Gemini key field renders with its id');
