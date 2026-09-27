@@ -1,10 +1,10 @@
 """theDAW's own TCP ports, and one cross-platform way to inspect or free them.
 
-``theDAW.bat`` and ``theDAW.sh`` both clear these ports before starting, each
-with a shell pipeline of its own (``netstat | findstr | taskkill`` on Windows,
-``fuser`` with an ``lsof`` fallback on POSIX). The Pinokio launcher had neither,
-because its steps are JSON with nowhere to put a three-platform pipeline, which
-is how a Pinokio Start on a machine that already had a backend running died with
+``theDAW.bat`` and ``theDAW.sh`` once cleared these ports each with a shell
+pipeline of its own (``netstat | findstr | taskkill`` on Windows, ``fuser`` with
+an ``lsof`` fallback on POSIX). The Pinokio launcher had neither, because its
+steps are JSON with nowhere to put a three-platform pipeline, which is how a
+Pinokio Start on a machine that already had a backend running died with
 
     ERROR: [Errno 10048] error while attempting to bind on address
     ('0.0.0.0', 8600): only one usage of each socket address ... is permitted
@@ -30,9 +30,17 @@ looked up themselves.
 Identity, because ``--free`` kills things
 -----------------------------------------
 A process is ours only when it is running FROM THIS CHECKOUT: its command line
-or its working directory has to contain this repository's root. Matching on the
-command line alone was not enough -- ``vite`` appears in every Vite dev server on
-the machine, so an unrelated project on port 5173 looked exactly like ours.
+or its working directory has to name this repository's root or a path inside
+it. Matching on the command line alone was not enough -- ``vite`` appears in
+every Vite dev server on the machine, so an unrelated project on port 5173
+looked exactly like ours. The root is matched as a whole folder name, so a
+sibling such as ``theDAW-Pinokio`` or a ``theDAW-<branch>`` worktree beside
+this checkout is somebody else.
+
+theDAW's Node sidecars are matched the same way against their OWN project
+folders: Lyria and VJ normally run from a checkout beside this one
+(``lyria-3-pro``, ``GANTASMO-LIVE-VJ``), and the Lyria and Foundry listeners run
+``tsx server.ts`` or ``node dist/server.cjs``, which name no backend entry point.
 
 The PID is revalidated against the process creation time immediately before any
 signal. A PID identified during the scan can exit and be reused by the OS before
@@ -41,18 +49,31 @@ the signal lands, and Windows recycles PIDs aggressively.
 Shutdown, cleanest first
 ------------------------
 For the backend port, ``--free`` first asks the running instance to stop through
-``POST /api/admin/shutdown``, which runs FastAPI's shutdown handlers and closes
-the library database. Only if that is refused or times out does it signal the
-process. This matters on Windows, where ``psutil.terminate()`` is
-``TerminateProcess`` -- not a catchable SIGTERM -- so signalling a backend
-mid-write is exactly as abrupt as killing it.
+``POST /api/admin/shutdown``, which runs the app's shutdown handlers -- the
+background queue, the assistant's ``claude`` children, every sidecar, and the
+live VST hosts, each of which saves its plugin state -- before the process
+exits. Only if that is refused or times out does it signal the process. This
+matters on Windows, where ``psutil.terminate()`` is ``TerminateProcess`` -- not a
+catchable SIGTERM -- so signalling a backend mid-write is exactly as abrupt as
+killing it.
+
+Listing listeners on macOS
+--------------------------
+``psutil.net_connections()`` walks every process on the machine, and on macOS it
+raises AccessDenied unless it runs as root, which a launcher never does. There
+the listeners come from ``lsof`` run as the user, which lists that user's own
+sockets: every process theDAW starts.
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib
 import os
+import re
+import shutil
 import socket
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,7 +89,8 @@ FRONTEND_PORT = 5173
 # crypto.subtle only over https:// or localhost, so a phone or a second PC on
 # plain http://<lan-ip>:5173 gets an EDIT tab with no audio engine at all.
 LAN_HTTPS_PORT = 5443
-# The sidecars theDAW.bat and theDAW.sh also clear: VJ, Sway and the tunnel.
+# The sidecars every launcher also clears: VJ (5187), Lyria (5188) and the VST
+# Foundry (5472). Each module's DEFAULT_PORT is the authority for its number.
 SIDECAR_PORTS = (5187, 5188, 5472)
 
 #: Every port a launcher clears, in the order the shipped launchers list them.
@@ -123,8 +145,23 @@ _OUR_CMDLINE_HINTS = (
     "npm",
 )
 
-# How long to wait for a clean HTTP shutdown before signalling instead.
-_CLEAN_SHUTDOWN_TIMEOUT = 6.0
+# theDAW's Node sidecars: the module that owns each one, and the entry points
+# its LISTENING process names. Lyria's `npm run dev` is `tsx server.ts`; the
+# Foundry runs `node dist/server.cjs`, or `tsx server.ts` in its dev mode; VJ
+# runs its project's own vite. The folder each one runs from comes from that
+# module's resolve_config(), so theDAW_LYRIA_PROJECT / THEDAW_FOUNDRY_PROJECT /
+# theDAW_VJ_PROJECT move the match exactly where they move the sidecar.
+_SIDECARS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("backend.modules.lyria.sidecar", ("server.ts",)),
+    ("backend.modules.foundry.sidecar", ("server.cjs", "server.ts")),
+    ("backend.modules.vj.sidecar", ("vite",)),
+)
+
+# How long to wait for a clean HTTP shutdown before signalling instead. Longer
+# than the backend's own budget for its shutdown handlers (admin_routes'
+# SHUTDOWN_HANDLER_BUDGET_SEC, plus the delay before they start), so a backend
+# saving its live plugins' state is never signalled halfway through.
+_CLEAN_SHUTDOWN_TIMEOUT = 20.0
 
 
 def repo_root() -> Path:
@@ -132,17 +169,64 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def _same_tree(text: str) -> bool:
-    """Does ``text`` point inside this checkout?
+def _norm(text: str) -> str:
+    """``text`` with ``/`` separators and lower case, for path comparison.
 
-    Compared case-insensitively with both separators normalised, because a
-    Windows command line mixes ``/`` and ``\\`` freely and a drive letter's case
-    is not stable.
+    A Windows command line mixes ``/`` and ``\\`` freely and a drive letter's
+    case is not stable.
+    """
+    return text.replace("\\", "/").lower()
+
+
+def _names_folder(folder: Path | str, text: str) -> bool:
+    """Does ``text`` name ``folder`` itself or a path inside it?
+
+    The folder has to end where a path component ends: at a separator, a
+    quote, whitespace or the end of the text. A plain substring test counted
+    ``.../Dev/theDAW-Pinokio/...`` and every ``theDAW-<branch>`` worktree as
+    inside ``.../Dev/theDAW``, so ``--free`` stopped another checkout's backend.
     """
     if not text:
         return False
-    root = str(repo_root()).replace("\\", "/").lower()
-    return root in text.replace("\\", "/").lower()
+    root = _norm(str(folder)).rstrip("/")
+    if not root:
+        return False
+    return re.search(re.escape(root) + r"(?=[/\"'\s]|$)", _norm(text)) is not None
+
+
+def _same_tree(text: str) -> bool:
+    """Does ``text`` point at this checkout or inside it?"""
+    return _names_folder(repo_root(), text)
+
+
+def _sidecar_folders() -> list[tuple[Path, tuple[str, ...]]]:
+    """``(project folder, entry points)`` for every sidecar module that loads.
+
+    Imported here rather than at the top: this module runs in a launcher before
+    anything else, and the sidecar modules are only needed once a listener has
+    already failed the backend rule. One that cannot be imported or configured
+    is left out, so a broken sidecar module never stops a launch.
+    """
+    found: list[tuple[Path, tuple[str, ...]]] = []
+    for module_name, entries in _SIDECARS:
+        try:
+            module = importlib.import_module(module_name)
+            folder = Path(module.resolve_config().project_path)
+        except Exception:
+            continue
+        found.append((folder, entries))
+    return found
+
+
+def _is_our_sidecar(cmdline: str, cwd: str) -> bool:
+    """Is this listener one of theDAW's sidecars, running from its own folder?"""
+    low_cmd = (cmdline or "").lower()
+    for folder, entries in _sidecar_folders():
+        if not any(entry in low_cmd for entry in entries):
+            continue
+        if _names_folder(folder, low_cmd) or _names_folder(folder, cwd or ""):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -156,6 +240,8 @@ class Holder:
     ours: bool
     #: psutil's process creation time, used to prove the PID was not recycled.
     create_time: Optional[float] = None
+    #: The process's working directory, when the OS let us read it.
+    cwd: str = ""
 
     def describe(self) -> str:
         who = "theDAW" if self.ours else "another program"
@@ -212,21 +298,82 @@ def _is_ours(name: str, cmdline: str, cwd: str = "") -> bool:
     and either the command line or the working directory is inside this
     repository. Without the last one, every Vite dev server on the machine
     matched, and ``--free`` would have killed an unrelated project's.
+
+    A sidecar passes the same three checks against its own entry points and its
+    own project folder (see ``_SIDECARS``).
     """
     low_name = (name or "").lower()
     low_cmd = (cmdline or "").lower()
     if not any(hint in low_name for hint in _OUR_EXE_HINTS):
         return False
-    if not any(hint in low_cmd for hint in _OUR_CMDLINE_HINTS):
-        return False
-    return _same_tree(low_cmd) or _same_tree(cwd or "")
+    if any(hint in low_cmd for hint in _OUR_CMDLINE_HINTS) and (
+        _same_tree(low_cmd) or _same_tree(cwd or "")
+    ):
+        return True
+    return _is_our_sidecar(low_cmd, cwd or "")
+
+
+# Where macOS and most Linux distributions keep lsof, for a launcher whose PATH
+# leaves out the sbin directories.
+_LSOF_FALLBACKS = ("/usr/sbin/lsof", "/usr/bin/lsof")
+
+
+def _lsof_listeners(wanted: set[int]) -> list[tuple[int, int]]:
+    """``(port, pid)`` for every TCP listener ``lsof`` shows on ``wanted``.
+
+    The macOS path: see the module docstring. ``-F pn`` prints one ``p<pid>``
+    line per process followed by its files, each with an ``n<address>`` line
+    such as ``n*:8600``, ``n127.0.0.1:5173`` or ``n[::1]:5173``. lsof exits 1
+    when some process could not be read, and what it did print is still right,
+    so the exit code is not a verdict.
+    """
+    lsof = shutil.which("lsof") or next(
+        (p for p in _LSOF_FALLBACKS if os.path.exists(p)), None
+    )
+    if lsof is None:
+        return []
+    # Here, not at the top: backend.lib's package import costs a launcher
+    # about a quarter of a second, and only this macOS fallback needs it.
+    from backend.lib.launch_token import child_env
+
+    try:
+        done = subprocess.run(
+            [lsof, "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            # The launch token stays with the backend (backend.lib.launch_token).
+            env=child_env(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found: list[tuple[int, int]] = []
+    pid: Optional[int] = None
+    for line in (done.stdout or "").splitlines():
+        if line.startswith("p"):
+            try:
+                pid = int(line[1:])
+            except ValueError:
+                pid = None
+        elif line.startswith("n") and pid is not None:
+            try:
+                port = int(line[1:].rsplit(":", 1)[-1])
+            except ValueError:
+                continue
+            if port in wanted and (port, pid) not in found:
+                found.append((port, pid))
+    return found
 
 
 def holders(ports: Iterable[int]) -> list[Holder]:
-    """Who is listening on each of ``ports``. Empty when psutil cannot look.
+    """Who is listening on each of ``ports``. Empty when nothing can look.
 
     Never raises: enumerating connections needs privileges we may not have, and
-    a launcher must still start, or report honestly, without them.
+    a launcher must still start, or report honestly, without them. When psutil
+    is refused (macOS without root), ``lsof`` answers instead.
     """
     try:
         import psutil
@@ -234,26 +381,30 @@ def holders(ports: Iterable[int]) -> list[Holder]:
         return []
 
     wanted = set(ports)
-    found: list[Holder] = []
-    seen: set[tuple[int, int]] = set()
+    listening: list[tuple[int, int]] = []
     try:
         conns = psutil.net_connections(kind="inet")
-    except (psutil.AccessDenied, PermissionError, OSError):
+    except (psutil.AccessDenied, PermissionError):
+        listening = _lsof_listeners(wanted)
+    except OSError:
         return []
+    else:
+        for conn in conns:
+            if conn.status != psutil.CONN_LISTEN or not conn.laddr:
+                continue
+            if conn.laddr.port in wanted and conn.pid is not None:
+                listening.append((conn.laddr.port, conn.pid))
 
-    for conn in conns:
-        if conn.status != psutil.CONN_LISTEN or not conn.laddr:
-            continue
-        port = conn.laddr.port
-        if port not in wanted or conn.pid is None:
-            continue
-        key = (port, conn.pid)
+    found: list[Holder] = []
+    seen: set[tuple[int, int]] = set()
+    for port, pid in listening:
+        key = (port, pid)
         if key in seen:
             continue
         seen.add(key)
         name, cmdline, cwd, created = "", "", "", None
         try:
-            proc = psutil.Process(conn.pid)
+            proc = psutil.Process(pid)
             name = proc.name()
             cmdline = " ".join(proc.cmdline())
             created = proc.create_time()
@@ -266,11 +417,12 @@ def holders(ports: Iterable[int]) -> list[Holder]:
         found.append(
             Holder(
                 port=port,
-                pid=conn.pid,
+                pid=pid,
                 name=name or "?",
                 cmdline=cmdline,
                 ours=_is_ours(name, cmdline, cwd),
                 create_time=created,
+                cwd=cwd,
             )
         )
     return found
@@ -302,10 +454,10 @@ def _still_the_same_process(holder: Holder) -> Optional["object"]:
 def _ask_backend_to_stop(port: int) -> bool:
     """Ask a theDAW backend on ``port`` to shut down cleanly. True if it did.
 
-    ``POST /api/admin/shutdown`` runs FastAPI's shutdown handlers and closes the
-    library database, which signalling the process does not: on Windows
-    ``psutil.terminate()`` is ``TerminateProcess``, so it is every bit as abrupt
-    as ``kill()`` and can cut a write in half.
+    ``POST /api/admin/shutdown`` runs the app's shutdown handlers before the
+    process exits (see the module docstring), which signalling the process does
+    not: on Windows ``psutil.terminate()`` is ``TerminateProcess``, so it is
+    every bit as abrupt as ``kill()`` and can cut a write in half.
     """
     import json
     import time

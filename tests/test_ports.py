@@ -10,15 +10,71 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import socket
-from contextlib import closing
+import subprocess
+import sys
+from contextlib import closing, contextmanager
 from pathlib import Path
+from typing import Iterator
 
+import psutil
 import pytest
 
 from backend import ports
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+#: The interpreter itself, not a venv's redirector: on Windows a venv's
+#: python.exe starts the base interpreter as a CHILD, and the child would be the
+#: listener these tests look for.
+_PYTHON = getattr(sys, "_base_executable", None) or sys.executable
+
+#: What every stand-in listener runs: bind an ephemeral loopback port, print
+#: it, and wait to be stopped.
+_LISTENER = (
+    "import socket, time\n"
+    "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+    "s.bind(('127.0.0.1', 0))\n"
+    "s.listen(1)\n"
+    "print(s.getsockname()[1], flush=True)\n"
+    "time.sleep(120)\n"
+)
+
+
+@contextmanager
+def _listening_child(
+    cwd: Path, args: list[str]
+) -> Iterator[tuple[subprocess.Popen, int]]:
+    """A real process started in ``cwd`` as ``python <args>``, listening on the
+    port it yields. Killed, with anything it started, on the way out."""
+    proc = subprocess.Popen(
+        [_PYTHON, *args], cwd=str(cwd), stdout=subprocess.PIPE, text=True
+    )
+    try:
+        assert proc.stdout is not None
+        port = int(proc.stdout.readline())
+        yield proc, port
+    finally:
+        try:
+            parent = psutil.Process(proc.pid)
+            for child in parent.children(recursive=True):
+                child.kill()
+            parent.kill()
+        except psutil.NoSuchProcess:
+            pass
+        proc.wait(timeout=10)
+        if proc.stdout is not None:
+            proc.stdout.close()
+
+
+def _fake_checkout(root: Path) -> Path:
+    """A folder where ``python -m backend.run`` starts a listener, the way a
+    real theDAW checkout's backend does."""
+    (root / "backend").mkdir(parents=True)
+    (root / "backend" / "__init__.py").write_text("", encoding="utf-8")
+    (root / "backend" / "run.py").write_text(_LISTENER, encoding="utf-8")
+    return root
 
 
 @pytest.fixture
@@ -199,6 +255,19 @@ _HERE = str(REPO_ROOT)
         # NOT ours: right command line and checkout, wrong kind of binary.
         ("nginx.exe", f"nginx -c {_HERE} backend.run", _HERE, False),
         ("", "", "", False),
+        # NOT ours: a sibling folder whose name merely STARTS with this one's,
+        # the Pinokio launcher's clone and every theDAW-<branch> worktree.
+        (
+            "python.exe",
+            f"{_HERE}-Pinokio/.venv/Scripts/python.exe -m backend.run",
+            "",
+            False,
+        ),
+        ("node.exe", "node vite", _HERE + "-footer-bar/frontend", False),
+        ("python.exe", "python -m backend._supervisor", _HERE + "-midi-dock", False),
+        # Ours: the checkout folder itself, and a quoted path inside it.
+        ("python.exe", "python -m backend.run", _HERE, True),
+        ("python.exe", f'"{_HERE}/.venv/Scripts/python.exe" -m backend.run', "", True),
     ],
 )
 def test_is_ours_requires_binary_entry_point_and_this_checkout(
@@ -214,6 +283,195 @@ def test_same_tree_ignores_separator_and_case():
     assert ports._same_tree(root.replace("/", "\\").lower()) is True
     assert ports._same_tree("") is False
     assert ports._same_tree("C:/somewhere/else") is False
+    assert ports._same_tree(root + "-Pinokio") is False
+    assert ports._same_tree(root + "-Pinokio/frontend") is False
+
+
+def test_free_leaves_a_sibling_checkouts_backend_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The sequence on the machine this was reported on: theDAW-Pinokio (or a
+    theDAW-<branch> worktree) sits beside the checkout and its backend is
+    running; this checkout's launcher then runs ``--free``. The sibling's
+    folder starts with this checkout's name, and ``root in text`` counted it as
+    this checkout, so the launch stopped the other install's backend."""
+    here = _fake_checkout(tmp_path / "theDAW")
+    sibling = _fake_checkout(tmp_path / "theDAW-Pinokio")
+    monkeypatch.setattr(ports, "repo_root", lambda: here)
+
+    with _listening_child(sibling, ["-m", "backend.run"]) as (proc, port):
+        stopped, refused = ports.free_ports([port])
+        assert stopped == []
+        assert [h.pid for h in refused] == [proc.pid]
+        assert proc.poll() is None, "the sibling checkout's backend was stopped"
+
+
+def test_free_still_stops_a_stale_backend_from_this_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The twin of the sibling case: the same listener, run from THIS folder,
+    is the stale backend ``--free`` exists to stop."""
+    here = _fake_checkout(tmp_path / "theDAW")
+    monkeypatch.setattr(ports, "repo_root", lambda: here)
+
+    with _listening_child(here, ["-m", "backend.run"]) as (proc, port):
+        stopped, refused = ports.free_ports([port])
+        assert [h.pid for h in stopped] == [proc.pid]
+        assert refused == []
+        proc.wait(timeout=10)
+
+
+# --------------------------------------------------------------------------
+# theDAW's Node sidecars, each run from its own project folder
+# --------------------------------------------------------------------------
+
+
+def _sidecar_project(folder: Path, entry: str) -> Path:
+    """A sidecar project folder whose ``entry`` file starts a listener.
+
+    Python runs a file whatever its extension, so ``python server.ts`` stands
+    in for Lyria's ``tsx server.ts`` with the same command line shape and the
+    same working directory."""
+    target = folder / entry
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(_LISTENER, encoding="utf-8")
+    return folder
+
+
+@pytest.mark.parametrize(
+    ("env", "folder_name", "entry"),
+    [
+        # Lyria: `npm run dev` is `tsx server.ts`, in a clone beside the repo.
+        ("theDAW_LYRIA_PROJECT", "lyria-3-pro", "server.ts"),
+        # Foundry: the production server, `node dist/server.cjs`.
+        ("THEDAW_FOUNDRY_PROJECT", "VST-UI-FOUNDRY", "dist/server.cjs"),
+        # VJ: its own vite, in a clone beside the repo.
+        ("theDAW_VJ_PROJECT", "GANTASMO-LIVE-VJ", "node_modules/vite/bin/vite.js"),
+    ],
+)
+def test_free_stops_a_stale_sidecar_left_running_from_its_project_folder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    env: str,
+    folder_name: str,
+    entry: str,
+):
+    """A sidecar left behind by a crashed session holds its port against the
+    next launch, and the next backend then adopts a process that still has the
+    old session's keys. Its command line names no backend entry point and its
+    folder is not this checkout, so ``--free`` left it running."""
+    here = _fake_checkout(tmp_path / "theDAW")
+    monkeypatch.setattr(ports, "repo_root", lambda: here)
+    project = _sidecar_project(tmp_path / folder_name, entry)
+    monkeypatch.setenv(env, str(project))
+
+    with _listening_child(project, [entry]) as (proc, port):
+        stopped, refused = ports.free_ports([port])
+        assert [h.pid for h in stopped] == [proc.pid], f"refused: {refused}"
+        proc.wait(timeout=10)
+
+
+def test_free_leaves_the_same_entry_point_alone_outside_the_sidecar_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """``server.ts`` alone proves nothing: another project's dev server runs
+    one too. Only the sidecar's own project folder makes it theDAW's."""
+    here = _fake_checkout(tmp_path / "theDAW")
+    monkeypatch.setattr(ports, "repo_root", lambda: here)
+    monkeypatch.setenv("theDAW_LYRIA_PROJECT", str(tmp_path / "lyria-3-pro"))
+    stranger = _sidecar_project(tmp_path / "someone-elses-app", "server.ts")
+
+    with _listening_child(stranger, ["server.ts"]) as (proc, port):
+        stopped, _refused = ports.free_ports([port])
+        assert stopped == []
+        assert proc.poll() is None
+
+
+# --------------------------------------------------------------------------
+# macOS: psutil needs root to list connections, lsof does not
+# --------------------------------------------------------------------------
+
+
+def _as_macos_without_root(
+    monkeypatch: pytest.MonkeyPatch, lsof_output: str
+) -> list[dict]:
+    """psutil refuses exactly as it does on macOS for a non-root user, and a
+    stand-in lsof answers with ``lsof_output``. Returns the keyword arguments
+    of every lsof call, as they are made."""
+    calls: list[dict] = []
+
+    def refused(kind: str = "inet"):
+        raise psutil.AccessDenied(pid=None, msg="net_connections needs root on macOS")
+
+    monkeypatch.setattr(psutil, "net_connections", refused)
+    fake_lsof = "/usr/sbin/lsof"
+    real_which = shutil.which
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda cmd, *a, **k: fake_lsof if cmd == "lsof" else real_which(cmd, *a, **k),
+    )
+    real_run = subprocess.run
+
+    def run(argv, *args, **kwargs):
+        if argv and argv[0] == fake_lsof:
+            calls.append(kwargs)
+            return subprocess.CompletedProcess(argv, 0, lsof_output, "")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return calls
+
+
+def test_free_stops_a_stale_backend_on_macos_without_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """On macOS psutil.net_connections() raises AccessDenied unless run as
+    root, holders() answered with nothing, and ``--free`` stopped nothing: a
+    stale backend then made the new one fail to bind. lsof, run as the user,
+    lists the user's own listeners."""
+    here = _fake_checkout(tmp_path / "theDAW")
+    monkeypatch.setattr(ports, "repo_root", lambda: here)
+
+    with _listening_child(here, ["-m", "backend.run"]) as (proc, port):
+        _as_macos_without_root(
+            monkeypatch,
+            # -F pn output: a process line, then its files. The first file is
+            # a listener on another port, which must be ignored.
+            f"p{proc.pid}\nf3\nn*:1\nf4\nn127.0.0.1:{port}\n",
+        )
+        stopped, refused = ports.free_ports([port])
+        assert [h.pid for h in stopped] == [proc.pid]
+        assert refused == []
+        proc.wait(timeout=10)
+
+
+def test_lsof_listeners_reads_every_address_form(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("THEDAW_LAUNCH_TOKEN", "secret-of-the-desktop-shell")
+    calls = _as_macos_without_root(
+        monkeypatch,
+        "p101\nf5\nn*:8600\np202\nf7\nn[::1]:5173\nf8\nn127.0.0.1:5443\np303\nf9\nn*:9999\n",
+    )
+    assert ports._lsof_listeners({8600, 5173, 5443}) == [
+        (8600, 101),
+        (5173, 202),
+        (5443, 202),
+    ]
+    # lsof is a child like any other: the desktop shell's launch token stays
+    # with the backend (backend.lib.launch_token.child_env).
+    assert len(calls) == 1
+    assert "THEDAW_LAUNCH_TOKEN" not in calls[0]["env"]
+
+
+def test_lsof_missing_means_nothing_to_report(monkeypatch: pytest.MonkeyPatch):
+    real_which = shutil.which
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda cmd, *a, **k: None if cmd == "lsof" else real_which(cmd, *a, **k),
+    )
+    monkeypatch.setattr(ports, "_LSOF_FALLBACKS", ())
+    assert ports._lsof_listeners({8600}) == []
 
 
 def test_still_the_same_process_rejects_a_recycled_pid():
@@ -293,6 +551,17 @@ def test_free_ports_reports_a_process_that_did_exit(monkeypatch):
 
     stopped, _refused = ports.free_ports([4243])
     assert [h.pid for h in stopped] == [999002]
+
+
+def test_the_clean_shutdown_wait_outlasts_the_backends_handler_budget():
+    """--free signals the backend once this wait runs out. The backend gives its
+    shutdown handlers (live plugins saving state among them) a budget after a
+    short delay; signalling inside that window cuts the save in half."""
+    from backend import admin_routes
+
+    assert ports._CLEAN_SHUTDOWN_TIMEOUT > (
+        admin_routes._EXIT_DELAY_SEC + admin_routes.SHUTDOWN_HANDLER_BUDGET_SEC
+    )
 
 
 def test_free_ports_asks_the_backend_to_shut_down_cleanly_first(monkeypatch):
