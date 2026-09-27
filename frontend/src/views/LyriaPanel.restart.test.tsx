@@ -13,12 +13,12 @@
  * Then theDAW's own child on an old checkout. On open the panel asks GET
  * /api/lyria/update?check=true, which says GitHub has a newer commit, and
  * shows it beside "Update Lyria". The first press finds local changes: the
- * backend leaves the checkout alone and the panel shows why, once, with no
- * restart button (the child is ours and has the current keys). The user
- * discards the edit and presses Update again: the backend fast-forwards the
- * checkout and restarts Lyria, the panel says what moved, the checkout note
- * and the "new commit" label go, and the frame reloads against the
- * restarted child. A refused Update shows the backend's reason as an alert,
+ * backend leaves the checkout alone and the panel shows why, once, and
+ * offers "Restart with current keys", which runs the checkout as it is now.
+ * The user discards the edit and presses Update again: the backend
+ * fast-forwards the checkout and restarts Lyria, the panel says what moved,
+ * the checkout note, the restart button and the "new commit" label go, and
+ * the frame reloads against the restarted child. A refused Update shows the backend's reason as an alert,
  * and one whose restart failed says so and re-reads Lyria.
  *
  * Buttons are found by their visible text, the name they have for a screen
@@ -223,7 +223,13 @@ async function main(): Promise<void> {
   assert.equal(calls.filter((c) => c.url === '/api/lyria/update' && c.method === 'POST').length, 1);
   assert.ok(host.textContent?.includes('then press Update again'), host.textContent ?? '');
   assert.equal(host.textContent?.split('has local changes').length, 2, 'the reason is shown once');
-  assert.equal(restart(), null, 'no restart button for our own child');
+  // The checkout note is up, so Restart is offered for our own child too:
+  // it runs the checkout as it is now, edits included, with the current keys.
+  assert.ok(restart(), 'a checkout left alone offers the restart for our own child');
+  assert.ok(
+    restart()!.title.startsWith('Stop Lyria and start it again from the checkout as it is now'),
+    restart()!.title,
+  );
   assert.ok(host.textContent?.includes('New commit ef8b16f'), 'the newer commit is still waiting');
   const frameBeforeUpdate = host.querySelector('iframe');
 
@@ -242,6 +248,7 @@ async function main(): Promise<void> {
   assert.ok(host.textContent?.includes(moved), host.textContent ?? '');
   assert.ok(!host.textContent?.includes('local changes'), 'the note goes once the checkout moved');
   assert.ok(!host.textContent?.includes('New commit'), 'nothing newer is waiting');
+  assert.equal(restart(), null, 'no restart button once the note is gone and the child is ours');
   assert.ok(
     calls.filter((c) => c.url === '/api/lyria/url').length > urlCallsBefore,
     'the panel re-reads the restarted Lyria',

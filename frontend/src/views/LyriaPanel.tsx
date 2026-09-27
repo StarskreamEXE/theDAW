@@ -427,14 +427,21 @@ export const LyriaPanel: React.FC = () => {
         )}
         {/* An adopted Lyria (left over from an earlier session, or launched
             by hand) has the keys and cost mode it started with. This is the
-            one control that hands it the current ones. The visible text
-            names the button. */}
-        {status === 'ready' && external && (
+            one control that hands it the current ones. It also shows while
+            the checkout note is up: the checkout was left where it is (local
+            changes, its own branch, a folder the user manages), and a
+            restart runs it as it is now, edits included, with the current
+            keys. The visible text names the button. */}
+        {status === 'ready' && (external || checkoutNote) && (
           <button
             type="button"
             onClick={() => void restartLyria()}
             disabled={restarting}
-            title="This Lyria was not started by this session of theDAW (a leftover from an earlier run, or one launched by hand), so it still has the keys and cost mode it started with. Restart it to hand it the current keys and cost mode."
+            title={
+              external
+                ? 'This Lyria was not started by this session of theDAW (a leftover from an earlier run, or one launched by hand), so it still has the keys and cost mode it started with. Restart it to hand it the current keys and cost mode.'
+                : 'Stop Lyria and start it again from the checkout as it is now, local changes included, with the current keys and cost mode.'
+            }
             className="px-2 py-0.5 rounded border border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/20 text-amber-200 text-xs font-bold uppercase tracking-wide flex items-center gap-1 shrink-0 disabled:opacity-40"
           >
             {restarting ? <Loader2 className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />} Restart with
