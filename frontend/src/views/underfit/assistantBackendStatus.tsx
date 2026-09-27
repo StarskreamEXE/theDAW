@@ -8,6 +8,11 @@
  * orb says so with a dot and one word, the reason theDAW's backend gives, and
  * a Start key that calls POST /api/underfit/assistant/start.
  *
+ * The orb counts the backend as running when its own /api/health answers or
+ * when theDAW's status route says it answers. theDAW checks from the server
+ * side, so a health response the browser refuses (a server built before its
+ * /api/health sent CORS headers) never strands the orb on Offline.
+ *
  * theDAW's API base comes from the `thedaw_api` query parameter the Underfit
  * tab puts on the dashboard's URL (UnderfitView), else
  * window.__THEDAW_API_BASE__, else http://localhost:8600, the fixed backend
@@ -21,6 +26,8 @@ export type AssistantBackendState = 'checking' | 'running' | 'starting' | 'offli
 export interface AssistantSidecarStatus {
   running: boolean;
   starting: boolean;
+  /** True while the first start runs npm install (absent from older backends). */
+  installing?: boolean;
   installed: boolean;
   issues: string[];
   error: string | null;
@@ -45,7 +52,7 @@ export function assistantStatusDetail(
   if (state === 'running') return 'The assistant backend is running.';
   if (state === 'checking') return 'Looking for the assistant backend.';
   if (state === 'starting') {
-    return sidecar && !sidecar.installed
+    return sidecar && (sidecar.installing ?? !sidecar.installed)
       ? 'Installing the assistant’s packages, then starting it. The first start takes a minute.'
       : 'Starting the assistant backend.';
   }
@@ -104,6 +111,14 @@ export function useAssistantBackendStatus(
   onOnlineRef.current = onOnline;
 
   const check = useCallback(async () => {
+    const markRunning = () => {
+      setState('running');
+      setStartError(null);
+      if (!wasRunning.current) {
+        wasRunning.current = true;
+        onOnlineRef.current();
+      }
+    };
     let running = false;
     try {
       const res = await fetcher(`${assistantBase}/api/health`, { cache: 'no-store' });
@@ -112,22 +127,22 @@ export function useAssistantBackendStatus(
       running = false;
     }
     if (running) {
-      setState('running');
-      setStartError(null);
-      if (!wasRunning.current) {
-        wasRunning.current = true;
-        onOnlineRef.current();
-      }
+      markRunning();
       return;
     }
-    wasRunning.current = false;
     try {
       const res = await fetcher(`${apiBase}/api/underfit/assistant/status`, { cache: 'no-store' });
       const body = res.ok ? await readJson<AssistantSidecarStatus>(res) : null;
       setThedawReachable(res.ok);
       setSidecar(body);
+      if (body?.running) {
+        markRunning();
+        return;
+      }
+      wasRunning.current = false;
       if (!startingRef.current) setState(body?.starting ? 'starting' : 'offline');
     } catch {
+      wasRunning.current = false;
       setThedawReachable(false);
       setSidecar(null);
       if (!startingRef.current) setState('offline');

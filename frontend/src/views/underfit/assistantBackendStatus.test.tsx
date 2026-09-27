@@ -11,7 +11,11 @@
  * down (theDAW reports the npm install failure from auto-start), the user
  * presses Start, theDAW answers once the server is up, the next health check
  * sees it, and the status strip disappears and the catalog reloads. Then theDAW
- * itself is unreachable, and the strip says Start cannot work from here.
+ * itself is unreachable, and the strip says Start cannot work from here. Then
+ * a first launch, where theDAW is still running npm install: the strip says
+ * Starting and Installing, never Offline. Last, the server runs but the
+ * browser refuses its /api/health response (a build without CORS on that
+ * route): theDAW's status says it runs, so the strip goes and the catalog loads.
  *
  * Run: npx tsx src/views/underfit/assistantBackendStatus.test.tsx
  */
@@ -59,6 +63,8 @@ const ASSISTANT = 'http://localhost:5473';
 const THEDAW = 'http://localhost:8600';
 let assistantUp = false;
 let thedawUp = true;
+let installingNow = false;
+let healthBlocked = false;
 let startCalls = 0;
 const calls: string[] = [];
 const json = (body: unknown, status = 200) =>
@@ -67,14 +73,15 @@ const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = String(input);
   calls.push(`${init?.method ?? 'GET'} ${url}`);
   if (url === `${ASSISTANT}/api/health`) {
-    if (!assistantUp) throw new TypeError('Failed to fetch');
+    if (!assistantUp || healthBlocked) throw new TypeError('Failed to fetch');
     return json({ app: 'underfit-assistant', status: 'ok' });
   }
   if (!thedawUp) throw new TypeError('Failed to fetch');
   if (url === `${THEDAW}/api/underfit/assistant/status`) {
     return json({
       running: assistantUp,
-      starting: false,
+      starting: installingNow,
+      installing: installingNow,
       installed: false,
       issues: [],
       error: assistantUp ? null : 'npm install in underfit/assistant-backend exited 1.',
@@ -143,5 +150,30 @@ await act(async () => root2.render(<Harness />));
 await settle();
 assert.ok(host.textContent?.includes('theDAW did not answer'), `explains the dead end: ${host.textContent}`);
 await act(async () => root2.unmount());
+
+// 4. First launch: theDAW's auto-start is running npm install.
+thedawUp = true;
+installingNow = true;
+const root3 = createRoot(host);
+await act(async () => root3.render(<Harness />));
+await settle();
+assert.ok(host.textContent?.includes(STATE_WORD.starting), `Starting during the install: ${host.textContent}`);
+assert.ok(!host.textContent?.includes(STATE_WORD.offline), 'never Offline while installing');
+assert.ok(host.textContent?.includes('Installing the assistant’s packages'), `says it is installing: ${host.textContent}`);
+const busyStart = host.querySelector('button[aria-label="Start the UNDERFIT assistant backend"]') as HTMLButtonElement | null;
+assert.ok(busyStart?.disabled, 'Start waits while the install runs');
+await act(async () => root3.unmount());
+
+// 5. The server runs, but the browser refuses its health response.
+installingNow = false;
+assistantUp = true;
+healthBlocked = true;
+const onlineBefore = onlineCount;
+const root4 = createRoot(host);
+await act(async () => root4.render(<Harness />));
+await settle();
+assert.equal(host.querySelector('[role="status"]'), null, 'theDAW saying it runs is enough');
+assert.equal(onlineCount, onlineBefore + 1, 'the catalog loads');
+await act(async () => root4.unmount());
 
 console.log('assistantBackendStatus: ok');

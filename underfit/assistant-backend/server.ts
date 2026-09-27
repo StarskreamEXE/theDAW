@@ -3881,10 +3881,13 @@ async function streamClaude(opts: {
 }
 
 // ===========================================================================
-// CORS for assistant routes (cors package not bundled; set headers manually)
+// CORS for every /api/* route (cors package not bundled; set headers manually)
 // ===========================================================================
-
-app.use("/api/assistant", (req, res, next) => {
+// Registered before the first /api route. /api/health sat above the old
+// /api-wide block, so its response carried no Access-Control-Allow-Origin and
+// the orb on the dashboard (:8791) could never read it; /api/shutdown sat
+// there too, so any page could stop this server with a form post.
+app.use("/api", (req, res, next) => {
   if (!applyCors(req, res)) {
     res.status(403).json({ error: "Cross-origin request blocked" });
     return;
@@ -4327,18 +4330,6 @@ app.post("/api/assistant/transcribe", express.raw({ type: "audio/*", limit: "25m
       res.json({ ok: true, text: stdout.trim() });
     },
   );
-});
-
-// ===========================================================================
-// CORS for all /api/* routes (data/SD/texture endpoints)
-// ===========================================================================
-app.use("/api", (req, res, next) => {
-  if (!applyCors(req, res)) {
-    res.status(403).json({ error: "Cross-origin request blocked" });
-    return;
-  }
-  if (req.method === "OPTIONS") { res.sendStatus(204); return; }
-  next();
 });
 
 // ===========================================================================
