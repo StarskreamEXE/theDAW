@@ -10,7 +10,8 @@ import {
 } from 'lucide-react';
 import { CoverArt } from '../catalog/CoverArt';
 import { importUrlToLibrary } from '../lib/onlineImport';
-import { importFolder } from '../lib/mediaLibrary';
+import { importFolderToLibrary } from '../lib/folderImport';
+import { formatDuration, formatSize } from '../lib/libraryFormat';
 import { startQueue } from '../state/playlistQueue';
 import { DESKTOP_DROP_ORIGIN, LIBRARY_IDS_MIME, MIDI_ID_MIME, STEM_ID_MIME, dropHasLibraryOrFiles, entriesFromDrop } from '../lib/libraryDrop';
 import { midiRowPart, type LibraryMidiRow } from '../lib/libraryIndex';
@@ -25,6 +26,7 @@ import { ProviderBadge } from '../components/library/ProviderBadge';
 import { MicRecorder } from '../components/audio/MicRecorder';
 import { Section } from '../components/ui/Section';
 import { useLibraryStore, LibraryIdCapError, type LibraryEntry } from '../state/libraryStore';
+import { LibraryStatsStrip } from '../components/library/LibraryStatsStrip';
 import {
   describeBulkConflict,
   LibraryBulkConflictError,
@@ -64,26 +66,12 @@ import {
 } from '../lib/sendToTargets';
 
 
-const formatDuration = (sec: number): string => {
-  if (!Number.isFinite(sec) || sec <= 0) return '--:--';
-  const total = Math.round(sec);
-  const m = Math.floor(total / 60);
-  const s = total % 60;
-  return `${m}:${s.toString().padStart(2, '0')}`;
-};
-
 const formatDate = (iso: string): string => {
   try {
     return new Date(iso).toLocaleDateString();
   } catch {
     return iso;
   }
-};
-
-const formatSize = (bytes: number): string => {
-  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
-  return `${bytes} B`;
 };
 
 // Every save in this view goes through saveFile: Save As opens in the folder
@@ -1526,40 +1514,8 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
     setPlayingId(entry.id);
   };
 
-  const handleImportFolder = async () => {
-    try {
-      const res = await importFolder();
-      if (res.cancelled) return;
-      await useLibraryStore.getState().refresh();
-      logInfo(
-        'library',
-        `Added ${res.entries.length} track${res.entries.length === 1 ? '' : 's'} from ${res.folder}`,
-      );
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      logError('library', `Folder import failed: ${msg}`);
-      useStatusBarStore.getState().setText(`FOLDER IMPORT FAILED: ${msg}`);
-    }
-  };
+  const handleImportFolder = importFolderToLibrary;
 
-  // Compact analytics strip at the very top of the panel — the user
-  // wanted the prior "LIBRARY ANALYSIS" section's stats hoisted up
-  // here as small chip-style features instead of taking up real
-  // estate at the bottom of the panel.
-  // Sums are over the rows in hand, not the whole library: at 200,000 entries
-  // the browser never holds them all, and the backend does not total them.
-  // The entry COUNT is the server's `total`, which is the real one.
-  const loadedStats = useMemo(() => {
-    let bytes = 0;
-    let seconds = 0;
-    let favorites = 0;
-    for (const e of entries) {
-      bytes += e.fileSizeBytes;
-      seconds += e.duration;
-      if (e.favorite) favorites += 1;
-    }
-    return { bytes, seconds, favorites };
-  }, [entries]);
   /** "200,134 tracks", with the query echoed when one is active. */
   const totalLabel = `${total.toLocaleString()} ${total === 1 ? 'track' : 'tracks'}`;
 
@@ -1708,33 +1664,7 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
 
       {/* Top stats strip — compact "features" version of the old
           LIBRARY ANALYSIS section. */}
-      <div className="shrink-0 flex items-center gap-1 flex-wrap text-[8px] font-mono uppercase tracking-widest text-zinc-500 pb-1 border-b border-white/5">
-        <span
-          className="px-1.5 py-0.5 rounded bg-white/5 border border-white/10"
-          title={searchQuery.trim() ? `Matching “${searchQuery.trim()}”` : 'Every entry in the library'}
-        >
-          <span className="text-zinc-300">{total.toLocaleString()}</span> entries
-        </span>
-        <span
-          className="px-1.5 py-0.5 rounded bg-yellow-500/10 border border-yellow-500/20"
-          title="Favorites among the rows loaded so far"
-        >
-          <Star className="w-2 h-2 fill-current inline-block text-yellow-400 -mt-0.5" />{' '}
-          <span className="text-yellow-200">{loadedStats.favorites}</span>
-        </span>
-        <span
-          className="px-1.5 py-0.5 rounded bg-white/5 border border-white/10"
-          title={`Size of the ${loadedStats.bytes > 0 ? entries.length : 0} rows loaded so far`}
-        >
-          <span className="text-zinc-300">{formatSize(loadedStats.bytes)}</span>
-        </span>
-        <span
-          className="px-1.5 py-0.5 rounded bg-white/5 border border-white/10"
-          title="Total length of the rows loaded so far"
-        >
-          <span className="text-zinc-300">{formatDuration(loadedStats.seconds)}</span>
-        </span>
-      </div>
+      <LibraryStatsStrip total={total} searchQuery={searchQuery} loadedRows={entries.length} />
 
       {/* Stems running banner. Shows live phase + progress + an Abort
           button so the user can bail without right-click-finding the

@@ -51,7 +51,8 @@ import {
   type LibraryFacetField,
   type LibraryFacets,
 } from '../lib/libraryFacets';
-import { hasProvider, providerSearchText } from '../lib/providerLabel';
+import { hasProvider } from '../lib/providerLabel';
+import { entryMatchesSearch } from '../lib/librarySearchMatch';
 import {
   firstIndexOfPage,
   missingPages,
@@ -263,59 +264,7 @@ const applyClientQuery = (rows: readonly LibraryEntry[], state: LibraryState): L
   // the source filter above is.
   if (state.providerFilter) filtered = filtered.filter((e) => hasProvider(e, state.providerFilter));
   const query = state.searchQuery.trim();
-  if (query) {
-    const q = query.toLowerCase();
-    // Numeric search: queries like "120 bpm", "key c", "5min", "30s" or
-    // a plain number try to match BPM / duration / key / etc. via
-    // analysis_json so users can find tracks by their musical features.
-    const num = parseFloat(q);
-    const queryIsNumeric = !Number.isNaN(num);
-    filtered = filtered.filter((e) => {
-      const haystack: string[] = [
-        e.title,
-        e.prompt,
-        e.negativePrompt,
-        e.model,
-        e.notes,
-        e.source,
-        // The provider reads like a source to a searching user, so "suno"
-        // finds Suno tracks here exactly as "import" finds imports. Same
-        // helper the Catalogue's own haystack uses, so a query that hits a row
-        // there hits it here.
-        providerSearchText(e),
-        e.mimeType,
-        e.rating ?? '',
-        ...e.tags,
-        ...(e.chimeraSources ?? []),
-      ];
-      // Pull analysis bits stashed by the backend (best-effort; field
-      // names mirror the SQLite `analysis` columns we already persist).
-      const analysis = e.analysis;
-      if (analysis && typeof analysis === 'object') {
-        for (const v of Object.values(analysis)) {
-          if (v == null) continue;
-          haystack.push(String(v));
-        }
-      }
-      // Embedded ID3/iTunes/etc tags surfaced by the import pipeline.
-      const embedded = e.embeddedTags;
-      if (embedded && typeof embedded === 'object') {
-        for (const v of Object.values(embedded)) {
-          if (v == null) continue;
-          haystack.push(String(v));
-        }
-      }
-      const hayLower = haystack.join(' ​ ').toLowerCase();
-      if (hayLower.includes(q)) return true;
-
-      // Convenience numeric matches.
-      if (queryIsNumeric) {
-        if (Math.round(e.duration) === Math.round(num)) return true;
-        if (Math.round(e.duration / 60) === Math.round(num)) return true;
-      }
-      return false;
-    });
-  }
+  if (query) filtered = filtered.filter((e) => entryMatchesSearch(e, query));
   // The one comparator, shared with the DETAILS tab's library pane so the
   // two lists can never disagree about what "newest" means.
   return sortEntriesBy(filtered, state.sortBy);
