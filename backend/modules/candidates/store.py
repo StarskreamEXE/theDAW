@@ -33,6 +33,7 @@ import logging
 import os
 import re
 import shutil
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -62,6 +63,28 @@ def default_candidates_root() -> Path:
     """Where candidate sets live: a sibling of the library root, NEVER inside
     it — an unaccepted candidate must not appear in a library scan/reindex."""
     return paths.library_root().parent / "candidates"
+
+
+_stamp_lock = threading.Lock()
+_last_stamp = 0.0
+
+
+def _created_at() -> float:
+    """``time.time()``, strictly increasing within this process.
+
+    list_sets orders sets newest first and each set's candidates oldest first
+    by ``created_at``. Windows' clock moves in 15.6 ms steps, so two made in
+    quick succession got the same value and fell back to folder order, whose
+    names are random ids. A stamp that would repeat or go back moves a
+    microsecond past the last one instead.
+    """
+    global _last_stamp
+    with _stamp_lock:
+        now = time.time()
+        if now <= _last_stamp:
+            now = _last_stamp + 1e-6
+        _last_stamp = now
+        return now
 
 
 def new_token() -> str:
@@ -201,7 +224,7 @@ class CandidateStore:
             "provider": provider,
             "params": dict(params),
             "label": label,
-            "created_at": time.time(),
+            "created_at": _created_at(),
         }
         _write_json(set_dir / _SET_FILENAME, header)
         return set_id
@@ -242,7 +265,7 @@ class CandidateStore:
             "params": dict(params),
             "seed": seed,
             "file_size_bytes": len(audio_bytes),
-            "created_at": time.time(),
+            "created_at": _created_at(),
             "library_entry_id": None,
         }
         _write_json(set_dir / f"{candidate_id}.json", meta)

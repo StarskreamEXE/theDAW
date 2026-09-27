@@ -236,6 +236,38 @@ def test_mark_accepted_sets_status_and_library_entry_id(store: CandidateStore) -
     assert on_disk["library_entry_id"] == "lib-entry-1"
 
 
+def test_sets_and_candidates_made_in_one_clock_tick_keep_their_order(
+    store: CandidateStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows' time.time() moves in 15.6 ms steps, so sets and candidates
+    made in quick succession got the same created_at. list_sets then fell
+    back to folder order (random ids), and "newest first" was a coin toss:
+    test_list_sets_filters_by_source_id failed on a full-suite run here."""
+    from backend.modules.candidates import store as store_module
+
+    monkeypatch.setattr(store_module.time, "time", lambda: 1_790_000_000.0)
+    made = [
+        store.create_set(source={"id": "t"}, provider="suno", params={}, label=str(i))
+        for i in range(6)
+    ]
+    assert [s["id"] for s in store.list_sets()] == made[::-1]
+
+    added = [
+        store.add_candidate(
+            made[0],
+            audio_bytes=_wav_bytes(),
+            filename=f"take{i}.wav",
+            mime_type="audio/wav",
+            provider_job_id=None,
+            params={},
+            seed=None,
+        )
+        for i in range(6)
+    ]
+    listed = next(s for s in store.list_sets() if s["id"] == made[0])
+    assert [c["id"] for c in listed["candidates"]] == added
+
+
 def test_list_sets_filters_by_source_id(store: CandidateStore) -> None:
     set_a = store.create_set(
         source={"id": "track-a"}, provider="suno", params={}, label="a"
