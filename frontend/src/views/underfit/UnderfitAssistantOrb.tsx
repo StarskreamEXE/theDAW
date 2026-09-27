@@ -477,6 +477,10 @@ export default function UnderfitAssistantOrb() {
   // ---------------------------------------------------------------------------
 
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
+  // The latest catalog, for the model fetch's fallback to the provider's
+  // default model when its reply lands (a dependency would refetch models).
+  const providersRef = useRef<ProviderInfo[]>([]);
+  providersRef.current = providers;
   // Bumped each time the assistant backend comes online, so the provider and
   // model catalogs load again after a Start (or after it finishes booting).
   const [catalogKey, setCatalogKey] = useState(0);
@@ -533,16 +537,18 @@ export default function UnderfitAssistantOrb() {
         const normalized = normalizeProviders(rawList);
         setProviders(normalized);
         // If the persisted provider no longer exists, fall back sensibly.
-        if (normalized.length && !normalized.find((p) => p.id === selectedProvider)) {
-          const fallback = normalized.find((p) => p.id === DEFAULT_PROVIDER) || normalized[0];
-          setSelectedProvider(fallback.id);
+        if (normalized.length) {
+          setSelectedProvider((current) =>
+            normalized.some((p) => p.id === current)
+              ? current
+              : (normalized.find((p) => p.id === DEFAULT_PROVIDER) || normalized[0]).id,
+          );
         }
       })
       .catch((e) => console.warn("Failed to load providers", e));
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [catalogKey]);
 
   // Fetch models whenever the provider (or its API key) changes.
@@ -561,20 +567,22 @@ export default function UnderfitAssistantOrb() {
         const rawList = Array.isArray(data) ? data : data?.models || [];
         const normalized = normalizeModels(rawList);
         setModels(normalized);
-        if (normalized.length && !normalized.find((m) => m.id === selectedModel)) {
-          const provInfo = providers.find((p) => p.id === selectedProvider);
-          const preferred =
-            (provInfo?.defaultModel &&
-              normalized.find((m) => m.id === provInfo.defaultModel)?.id) ||
-            normalized[0].id;
-          setSelectedModel(preferred);
+        if (normalized.length) {
+          setSelectedModel((current) => {
+            if (normalized.some((m) => m.id === current)) return current;
+            const provInfo = providersRef.current.find((p) => p.id === selectedProvider);
+            return (
+              (provInfo?.defaultModel &&
+                normalized.find((m) => m.id === provInfo.defaultModel)?.id) ||
+              normalized[0].id
+            );
+          });
         }
       })
       .catch((e) => console.warn("Failed to load models for", selectedProvider, e));
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedProvider, providerApiKeys, catalogKey]);
 
   // Styling / Scale Modifiers
@@ -613,6 +621,10 @@ export default function UnderfitAssistantOrb() {
 
   // Sessions History
   const [sessions, setSessions] = useState<ChatSession[]>([]);
+  // The rendered session list, for the save effect below: a `sessions`
+  // dependency would re-run it on its own write and loop.
+  const sessionsRef = useRef<ChatSession[]>([]);
+  sessionsRef.current = sessions;
   const [currentSessionId, setCurrentSessionId] = useState<string>("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   // Live mirror of `messages` so async continuations (notably the mid-turn
@@ -663,27 +675,9 @@ export default function UnderfitAssistantOrb() {
     setClaudeSessionId(sess.claudeSessionId ?? null);
   };
 
-  // Load Saved Chat Sessions on Mount. Every new app session starts a FRESH
-  // chat — prior chats are kept as history (welcome-only empties are pruned so
-  // reloads don't pile up blank entries).
-  useEffect(() => {
-    let history: ChatSession[] = [];
-    try {
-      const savedSessions = localStorage.getItem(LS_SESSIONS);
-      if (savedSessions) {
-        history = (JSON.parse(savedSessions) as ChatSession[]).filter(
-          (s) => (s.messages?.length ?? 0) > 1,
-        );
-      }
-    } catch (e) {
-      console.error("Failed to load assistant sessions", e);
-    }
-    startNewChat(false, history);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Sync session changes to localStorage
-  const saveSessionsToStorage = (updatedSessions: ChatSession[]) => {
+  // Sync session changes to localStorage. Uses only setSessions and
+  // localStorage, so one instance serves every render.
+  const saveSessionsToStorage = useCallback((updatedSessions: ChatSession[]) => {
     setSessions(updatedSessions);
     try {
       // Strip heavy base64 images to prevent exceeding the browser's 5MB localStorage quota
@@ -713,7 +707,7 @@ export default function UnderfitAssistantOrb() {
         console.error("Critical: Failed to save fallback sessions to localStorage", innerErr);
       }
     }
-  };
+  }, []);
 
   // Tell the backend to release the persistent Claude process tied to an
   // abandoned conversation. Fire-and-forget + idempotent: never blocks the UI
@@ -765,6 +759,27 @@ export default function UnderfitAssistantOrb() {
     }
   };
 
+  // Load Saved Chat Sessions on Mount. Every new app session starts a FRESH
+  // chat — prior chats are kept as history (welcome-only empties are pruned so
+  // reloads don't pile up blank entries). Runs once: it calls the current
+  // startNewChat through a ref, since startNewChat is rebuilt every render.
+  const startNewChatRef = useRef(startNewChat);
+  startNewChatRef.current = startNewChat;
+  useEffect(() => {
+    let history: ChatSession[] = [];
+    try {
+      const savedSessions = localStorage.getItem(LS_SESSIONS);
+      if (savedSessions) {
+        history = (JSON.parse(savedSessions) as ChatSession[]).filter(
+          (s) => (s.messages?.length ?? 0) > 1,
+        );
+      }
+    } catch (e) {
+      console.error("Failed to load assistant sessions", e);
+    }
+    startNewChatRef.current(false, history);
+  }, []);
+
   // Load an existing session
   const loadSession = (sessionId: string) => {
     const sess = sessions.find((s) => s.id === sessionId);
@@ -795,6 +810,7 @@ export default function UnderfitAssistantOrb() {
   // Save current thread messages + active AI configuration
   useEffect(() => {
     if (!currentSessionId) return;
+    const sessions = sessionsRef.current;
     const sessionToUpdate = sessions.find((s) => s.id === currentSessionId);
     if (sessionToUpdate) {
       const updatedMessages = [...messages];
@@ -820,8 +836,15 @@ export default function UnderfitAssistantOrb() {
       });
       saveSessionsToStorage(updated);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [messages, selectedProvider, selectedModel, effort, claudeSessionId]);
+  }, [
+    messages,
+    selectedProvider,
+    selectedModel,
+    effort,
+    claudeSessionId,
+    currentSessionId,
+    saveSessionsToStorage,
+  ]);
 
   // Keep chat scrolled to bottom
   useEffect(() => {
