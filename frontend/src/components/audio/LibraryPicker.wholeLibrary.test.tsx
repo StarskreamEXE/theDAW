@@ -78,7 +78,8 @@ async function main(): Promise<void> {
   const { useLibraryStore } = await import('../../state/libraryStore.ts');
   const { LibraryPicker } = await import('./LibraryPicker.tsx');
   const { MobileLibrary } = await import('../../mobile/tabs/MobileLibrary.tsx');
-  const { useLibraryStats } = await import('../../state/useLibraryStats.ts');
+  const { LibraryStatsStrip } = await import('../library/LibraryStatsStrip.tsx');
+  const { formatDuration, formatSize } = await import('../../lib/libraryFormat.ts');
 
   const dom = new JSDOM('<!doctype html><html><body><div id="root"></div></body></html>', {
     url: 'http://localhost/',
@@ -164,6 +165,34 @@ async function main(): Promise<void> {
     await act(async () => root.unmount());
   }
 
+  // ── Reopening after a library write asks for the first page once ──────────
+  {
+    const { useLibraryCounts } = await import('../../state/libraryCountsStore.ts');
+    const host = doc.createElement('div');
+    doc.body.appendChild(host);
+    const root = createRoot(host);
+    const render = (open: boolean) =>
+      act(async () => {
+        root.render(
+          React.createElement(LibraryPicker, { open, tabs: ['audio'], onClose: () => undefined, onPick: () => undefined }),
+        );
+      });
+    await render(true);
+    await settle(50);
+    await render(false);
+    await settle(10);
+    // A track is generated while the picker is closed.
+    await act(async () => {
+      useLibraryCounts.setState({ revision: useLibraryCounts.getState().revision + 1 });
+    });
+    calls.length = 0;
+    await render(true);
+    await settle(100);
+    const lists = calls.filter((c) => new URL(c, 'http://local').pathname === '/api/library/entries');
+    assert.equal(lists.length, 1, `one first-page request on reopen, got ${lists.length}`);
+    await act(async () => root.unmount());
+  }
+
   // ── The phone's library tab finds it too ───────────────────────────────────
   {
     const host = doc.createElement('div');
@@ -183,19 +212,31 @@ async function main(): Promise<void> {
 
   // ── The chips total the whole query, not the loaded page ──────────────────
   {
+    // The strip LibraryView renders, fed the way LibraryView feeds it.
     const host = doc.createElement('div');
     doc.body.appendChild(host);
     const root = createRoot(host);
-    const Probe = () => {
-      const s = useLibraryStats();
-      return React.createElement('span', { id: 'stats' }, `${s.favorites}|${s.sizeBytes}|${s.durationSec}|${s.whole}`);
-    };
+    const held = useLibraryStore.getState();
     await act(async () => {
-      root.render(React.createElement(Probe));
+      root.render(
+        React.createElement(LibraryStatsStrip, {
+          total: held.total,
+          searchQuery: held.searchQuery,
+          loadedRows: held.entries.length,
+        }),
+      );
     });
     await settle(400);
-    // 200 loaded rows would say 20 | 200000 | 12000.
-    assert.equal(host.querySelector('#stats')?.textContent, '100|1000000|60000|true');
+    const chip = (name: string) => host.querySelector(`[data-stat="${name}"]`)?.textContent;
+    // The 200 loaded rows would say 20 favourites, 195 KB and 200:00.
+    assert.equal(chip('count'), '1,000');
+    assert.equal(chip('favorites'), '100');
+    assert.equal(chip('size'), formatSize(TOTAL * 1000));
+    assert.equal(chip('size'), '977 KB');
+    assert.equal(chip('duration'), formatDuration(TOTAL * 60));
+    assert.equal(chip('duration'), '1000:00');
+    const favTitle = host.querySelector('[data-stat="favorites"]')?.parentElement?.getAttribute('title');
+    assert.equal(favTitle, 'Favorites among every entry in this view');
     await act(async () => root.unmount());
   }
 

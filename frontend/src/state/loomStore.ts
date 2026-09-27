@@ -141,9 +141,8 @@ interface LoomState {
   toggleKeepLane: (lane: string) => void;
   /** Return to an earlier generation. */
   revert: (index: number) => void;
-  /** Load a sample score: text + apply + its songs into the crate. Returns the
-   *  song references that could not be found in the library. */
-  /** Load a template; resolves to the song references the library lacks. */
+  /** Load a sample score: text + apply + its songs into the crate. Resolves
+   *  to the song references the library lacks. */
   loadTemplate: (id: string) => Promise<string[]>;
   resolvedFor: (tile: ShardTile) => ShardRow | null;
 }

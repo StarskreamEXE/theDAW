@@ -494,6 +494,21 @@ export interface LibraryListResult {
   entries: LibraryEntry[] | null;
 }
 
+/**
+ * Raised by `fetchLibraryList` when the backend refuses the query's sort (400
+ * naming the sort): a backend from before that sort existed. The backend has
+ * no auto-reload, so a frontend that already knows a new sort can be talking
+ * to one that does not; the caller picks a sort the backend has.
+ */
+export class LibrarySortUnsupportedError extends Error {
+  readonly sort: LibraryServerSort;
+  constructor(sort: LibraryServerSort, detail: string) {
+    super(`library.page: ${detail}`);
+    this.name = 'LibrarySortUnsupportedError';
+    this.sort = sort;
+  }
+}
+
 /** Raised by `fetchLibraryIds` when the filters match more ids than the cap. */
 export class LibraryIdCapError extends Error {
   readonly cap: number;
@@ -565,7 +580,13 @@ export async function fetchLibraryList(
   params.set('limit', String(limit));
   params.set('offset', String(offset));
   const r = await fetch(`${base}/entries?${params.toString()}`, { signal });
-  if (!r.ok) throw new Error(`library.page: ${await errorText(r)}`);
+  if (!r.ok) {
+    const detail = await errorText(r);
+    if (r.status === 400 && detail.startsWith('sort must be one of')) {
+      throw new LibrarySortUnsupportedError(query.sort, detail);
+    }
+    throw new Error(`library.page: ${detail}`);
+  }
   const body: unknown = await r.json();
   const page = asPage(body);
   if (page) return { paged: true, page, entries: null };

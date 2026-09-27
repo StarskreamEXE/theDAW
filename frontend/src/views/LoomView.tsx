@@ -35,10 +35,12 @@ import { CollapsibleRail } from '../components/ui/CollapsibleRail';
 type Pane = 'cell' | 'code' | 'crate';
 
 const label = 'text-xs font-mono font-semibold uppercase tracking-wider et-ink-2';
-/** Bold sans labels for the crate's library controls. */
-const labelSans = 'text-xs font-bold uppercase tracking-wider et-ink-2';
 const input = 'compact-input rounded border border-white/25 bg-black/30 px-2 py-1 text-[13px] font-mono et-ink focus:outline-none focus:border-amber-300';
 const btn = 'rounded-md border border-white/25 px-2.5 py-1 text-xs font-mono font-semibold uppercase tracking-wider et-ink hover:bg-white/10 transition-colors disabled:opacity-40 disabled:pointer-events-none';
+/** Bold sans label, field and button for the crate's library controls. */
+const labelSans = 'text-xs font-bold uppercase tracking-wider et-ink-2';
+const inputSans = 'compact-input rounded border border-white/25 bg-black/30 px-2 py-1 text-[13px] font-sans font-semibold et-ink focus:outline-none focus:border-amber-300';
+const btnSans = 'rounded-md border border-white/25 px-2.5 py-1 text-xs font-sans font-bold uppercase tracking-wider et-ink hover:bg-white/10 transition-colors disabled:opacity-40 disabled:pointer-events-none';
 const chip = 'rounded-md border px-2 py-1 text-xs font-mono font-semibold et-ink transition-colors';
 
 /**
@@ -710,7 +712,7 @@ const CratePane: React.FC = () => {
           value={find}
           onChange={(e) => setFind(e.target.value)}
           placeholder="title, artist, bpm, key…"
-          className={`${input} w-full`}
+          className={`${inputSans} w-full`}
         />
         <label htmlFor="loom-crate-add" className={labelSans}>add a song to the crate</label>
         <select
@@ -718,7 +720,7 @@ const CratePane: React.FC = () => {
           name="loom-crate-add"
           value=""
           onChange={(e) => { if (e.target.value) addToCrate(e.target.value); }}
-          className={`${input} form-select w-full`}
+          className={`${inputSans} form-select w-full`}
           style={{ colorScheme: 'dark' }}
         >
           <option value="">
@@ -728,9 +730,11 @@ const CratePane: React.FC = () => {
           </option>
           {addable.map((e) => <option key={e.id} value={e.id}>{e.title}</option>)}
         </select>
-        {songs.error && <p className="text-xs et-ink-2">Could not search the library: {songs.error}</p>}
+        {songs.error && (
+          <p className="text-xs font-sans font-semibold et-ink-2">Could not search the library: {songs.error}</p>
+        )}
         {songs.hasMore && (
-          <button type="button" onClick={songs.loadMore} disabled={songs.loading} className={`${btn} self-start`}>
+          <button type="button" onClick={songs.loadMore} disabled={songs.loading} className={`${btnSans} self-start`}>
             {songs.loading ? 'loading…' : `more songs (${(songs.total - songs.rows.length).toLocaleString()} left)`}
           </button>
         )}

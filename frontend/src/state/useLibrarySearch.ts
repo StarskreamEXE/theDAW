@@ -68,12 +68,18 @@ export function useLibrarySearch(
     }
   }, [session, q, sort, kind, favorite, source, provider]);
 
-  // A newer library revision: the first page again.
-  const seenRevision = useRef(revision);
+  // A newer library revision: the first page again. A session sees the
+  // revision it was started at as current -- its first page was just asked
+  // for -- so reopening after a write sends one request, not two.
+  const seen = useRef<{ session: LibrarySearchSession | null; revision: number }>({
+    session: null,
+    revision,
+  });
   useEffect(() => {
-    if (!session || revision === seenRevision.current) return;
-    seenRevision.current = revision;
-    void session.refresh();
+    if (!session) return;
+    const last = seen.current;
+    seen.current = { session, revision };
+    if (last.session === session && last.revision !== revision) void session.refresh();
   }, [session, revision]);
 
   const snapshot = useSyncExternalStore(

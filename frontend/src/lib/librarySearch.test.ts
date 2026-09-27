@@ -20,6 +20,8 @@ import { LibrarySearchSession, filterLibraryLocally } from './librarySearch.ts';
 import { entryMatchesSearch } from './librarySearchMatch.ts';
 import { localCandidates, resolveEntryRef, resolveEntryRefIn } from '../state/shardIndexStore.ts';
 import { describeFolderImport, importFolder } from './mediaLibrary.ts';
+import { importFolderToLibrary } from './folderImport.ts';
+import { useLogStore } from '../state/logStore.ts';
 import type { LibraryEntry } from '../state/libraryEntry.ts';
 
 const TOTAL = 1000;
@@ -208,11 +210,62 @@ const st = () => useLibraryStore.getState();
   assert.equal(res.entries.length, 200, 'the backend echoes at most 200');
   assert.equal(res.created_total, 250);
   assert.equal(describeFolderImport(res), 'Added 250 tracks from D:/music/big');
+  // The LIBRARY tab's action logs that number, after refreshing the list.
+  handler = async (url) =>
+    url === '/api/library/import-folder'
+      ? jsonResponse({ cancelled: false, folder: 'D:/music/big', name: 'big', entries: echoed, created_total: 250 })
+      : pagedBackend(url);
+  useLogStore.getState().clear();
+  calls.length = 0;
+  await importFolderToLibrary();
+  const logged = useLogStore.getState().entries.map((e) => `${e.level}:${e.msg}`);
+  assert.deepEqual(logged, ['info:Added 250 tracks from D:/music/big']);
+  assert.ok(calls.some(isList), 'the list was refreshed');
   // An older backend with no created_total still reports what it echoed.
   assert.equal(
     describeFolderImport({ cancelled: false, folder: 'D:/x', entries: echoed.slice(0, 1) }),
     'Added 1 track from D:/x',
   );
+}
+
+// ── 7. A backend from before favorites_first still answers the picker ───────
+{
+  // The backend has no auto-reload: a frontend that knows the new sort can be
+  // talking to a backend at 8039b45, which answers 400 for it.
+  handler = async (url) => {
+    const u = new URL(url, 'http://local');
+    if (isList(url) && u.searchParams.get('sort') === 'favorites_first') {
+      return jsonResponse({ detail: "sort must be one of ['created_desc', 'title_asc'], got 'favorites_first'" }, 400);
+    }
+    return pagedBackend(url);
+  };
+  calls.length = 0;
+  const session = new LibrarySearchSession({ kind: 'audio', sort: 'favorites_first' }, { debounceMs: 0, pageSize: 25 });
+  await session.start();
+  const snap = session.getSnapshot();
+  assert.equal(snap.error, null, 'the refused sort is not shown as an error');
+  assert.equal(snap.rows.length, 25);
+  const sorts = calls.filter(isList).map((c) => new URL(c, 'http://local').searchParams.get('sort'));
+  assert.deepEqual(sorts, ['favorites_first', 'title_asc'], 'asked once, then the fallback');
+  const favs = snap.rows.filter((r) => r.favorite).length;
+  assert.ok(favs > 0);
+  assert.ok(snap.rows.slice(0, favs).every((r) => r.favorite), 'the favourites held come first');
+  // Later pages go straight to the fallback and keep the favourites first.
+  calls.length = 0;
+  await session.loadMore();
+  const next = session.getSnapshot();
+  assert.equal(next.rows.length, 50);
+  assert.deepEqual(
+    calls.filter(isList).map((c) => new URL(c, 'http://local').searchParams.get('sort')),
+    ['title_asc'],
+  );
+  const nextFavs = next.rows.filter((r) => r.favorite).length;
+  assert.ok(next.rows.slice(0, nextFavs).every((r) => r.favorite));
+  // Any other refusal is still an error.
+  handler = async (url) => (isList(url) ? jsonResponse({ detail: 'boom' }, 500) : pagedBackend(url));
+  await session.refresh();
+  assert.match(session.getSnapshot().error ?? '', /boom/);
+  session.dispose();
 }
 
 console.log('librarySearch: ok');

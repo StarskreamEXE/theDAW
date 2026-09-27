@@ -21,6 +21,7 @@ import type { LibraryEntry } from '../state/libraryEntry';
 import {
   DEFAULT_LIBRARY_QUERY,
   fetchLibraryList,
+  LibrarySortUnsupportedError,
   type LibraryListResult,
   type LibraryQuery,
   type LibraryServerSort,
@@ -67,6 +68,16 @@ const CLIENT_SORT: Record<LibraryServerSort, (a: LibraryEntry, b: LibraryEntry) 
   duration_desc: (a, b) => b.duration - a.duration,
   duration_asc: (a, b) => a.duration - b.duration,
   favorites_first: (a, b) => Number(b.favorite) - Number(a.favorite) || byTitle(a, b),
+};
+
+/**
+ * What to ask a backend that refuses a sort newer than it is
+ * (`LibrarySortUnsupportedError`): an order it has, which the rows are then
+ * re-sorted from here. `favorites_first` came with the whole-library EDIT
+ * picker; its title order is what a backend without it can give.
+ */
+const SORT_FALLBACK: Partial<Record<LibraryServerSort, LibraryServerSort>> = {
+  favorites_first: 'title_asc',
 };
 
 const matchesKind = (entry: LibraryEntry, kind: string): boolean => {
@@ -121,6 +132,8 @@ export class LibrarySearchSession {
   private waiting: (() => void)[] = [];
   /** The whole library, when the backend does not page. */
   private unpagedRows: LibraryEntry[] | null = null;
+  /** The backend refused a sort; ask its `SORT_FALLBACK` from now on. */
+  private sortRefused = false;
   private disposed = false;
 
   constructor(query: Partial<LibraryQuery> = {}, options: LibrarySearchOptions = {}) {
@@ -207,12 +220,17 @@ export class LibrarySearchSession {
     this.controller = ctrl;
     this.emit({ ...this.snapshot, loading: true, error: null });
     try {
-      const result = await this.fetchList(this.query, rows.length, this.pageSize, ctrl.signal);
+      const result = await this.fetchRows(rows.length, ctrl.signal);
       if (seq !== this.seq) return;
       if (result.paged && result.page) {
         const seen = new Set(rows.map((r) => r.id));
         const more = result.page.entries.filter((r) => !seen.has(r.id));
-        this.emit({ rows: [...rows, ...more], total: result.page.total, loading: false, error: null });
+        this.emit({
+          rows: this.inQueryOrder([...rows, ...more]),
+          total: result.page.total,
+          loading: false,
+          error: null,
+        });
       } else {
         this.adoptUnpaged(result.entries ?? [], rows.length + this.pageSize);
       }
@@ -243,10 +261,15 @@ export class LibrarySearchSession {
     this.controller = ctrl;
     this.emit({ ...this.snapshot, loading: true, error: null });
     try {
-      const result = await this.fetchList(this.query, 0, this.pageSize, ctrl.signal);
+      const result = await this.fetchRows(0, ctrl.signal);
       if (seq !== this.seq) return;
       if (result.paged && result.page) {
-        this.emit({ rows: result.page.entries, total: result.page.total, loading: false, error: null });
+        this.emit({
+          rows: this.inQueryOrder(result.page.entries),
+          total: result.page.total,
+          loading: false,
+          error: null,
+        });
       } else {
         this.adoptUnpaged(result.entries ?? [], this.pageSize);
       }
@@ -254,6 +277,35 @@ export class LibrarySearchSession {
       if (seq !== this.seq || ctrl.signal.aborted) return;
       this.emit({ rows: [], total: 0, loading: false, error: e instanceof Error ? e.message : String(e) });
     }
+  }
+
+  /**
+   * One page of the current query from `offset`. A backend that refuses the
+   * sort is asked again with the `SORT_FALLBACK`, and so is every later
+   * request of this session.
+   */
+  private async fetchRows(offset: number, signal: AbortSignal): Promise<LibraryListResult> {
+    const fallback = SORT_FALLBACK[this.query.sort];
+    if (this.sortRefused && fallback) {
+      return this.fetchList({ ...this.query, sort: fallback }, offset, this.pageSize, signal);
+    }
+    try {
+      return await this.fetchList(this.query, offset, this.pageSize, signal);
+    } catch (e) {
+      if (!(e instanceof LibrarySortUnsupportedError) || !fallback) throw e;
+      this.sortRefused = true;
+      return this.fetchList({ ...this.query, sort: fallback }, offset, this.pageSize, signal);
+    }
+  }
+
+  /**
+   * Rows as the query orders them. The backend's order already is, unless it
+   * was asked a fallback sort; then the rows held are sorted here, so the
+   * favourites among them come first.
+   */
+  private inQueryOrder(rows: LibraryEntry[]): LibraryEntry[] {
+    if (!this.sortRefused || !SORT_FALLBACK[this.query.sort]) return rows;
+    return [...rows].sort(CLIENT_SORT[this.query.sort]);
   }
 
   private adoptUnpaged(all: LibraryEntry[], show: number): void {
