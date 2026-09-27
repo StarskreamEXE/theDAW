@@ -16,10 +16,12 @@ import http.server
 import json
 import shutil
 import socket
+import sys
 import threading
 import time
 from pathlib import Path
 
+import psutil
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -91,6 +93,8 @@ def underfit_tree(tmp_path, monkeypatch):
     monkeypatch.setenv("theDAW_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setattr(assistant_sidecar, "_proc", None)
     monkeypatch.setattr(assistant_sidecar, "_last_error", None)
+    monkeypatch.setattr(assistant_sidecar, "_phase", None)
+    monkeypatch.setattr(assistant_sidecar, "_install_proc", None)
     yield {"root": root, "backend": backend, "port": port, "dash_port": dash_port}
     assistant_sidecar.stop()
 
@@ -170,6 +174,121 @@ def test_missing_packages_without_npm_says_so_and_spawns_nothing(
     with pytest.raises(RuntimeError, match="npm was not found"):
         assistant_sidecar.ensure_running()
     assert assistant_sidecar._proc is None
+
+
+# Stands in for npm: the sidecar runs ``[npm, "install"]`` in the
+# assistant-backend folder, and with npm pointed at this interpreter that runs
+# the file named ``install`` there. It records its pid, waits for the test to
+# release it (or for a kill), then lays down tsx's CLI the way npm would.
+FAKE_NPM_INSTALL = r"""
+import os, pathlib, sys, time
+here = pathlib.Path.cwd()
+(here / "npm-pid").write_text(str(os.getpid()))
+deadline = time.monotonic() + float(os.environ.get("FAKE_NPM_SECONDS", "30"))
+while not (here / "npm-release").exists():
+    if time.monotonic() > deadline:
+        sys.exit(3)
+    time.sleep(0.05)
+dist = here / "node_modules" / "tsx" / "dist"
+dist.mkdir(parents=True, exist_ok=True)
+(dist / "fake.cjs").write_text(os.environ["FAKE_SERVER_SOURCE"])
+(dist / "cli.mjs").write_text(
+    'import { createRequire } from "module";\n'
+    "createRequire(import.meta.url)('./fake.cjs');\n"
+)
+"""
+
+
+@pytest.fixture
+def first_run(underfit_tree, monkeypatch):
+    """The first launch: node_modules is missing and npm install takes a while."""
+    backend = underfit_tree["backend"]
+    shutil.rmtree(backend / "node_modules")
+    (backend / "install").write_text(FAKE_NPM_INSTALL, encoding="utf-8")
+    monkeypatch.setattr(assistant_sidecar, "_resolve_npm", lambda: sys.executable)
+    monkeypatch.setenv("FAKE_SERVER_SOURCE", FAKE_SERVER)
+    return underfit_tree
+
+
+def _auto_start() -> tuple[threading.Thread, list]:
+    """Start the assistant the way router.startup_underfit does: on a thread."""
+    outcome: list = []
+
+    def run() -> None:
+        try:
+            outcome.append(assistant_sidecar.ensure_running())
+        except RuntimeError as e:
+            outcome.append(e)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, outcome
+
+
+def _wait_for(predicate, timeout: float = 20.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.05)
+    raise AssertionError("timed out")
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not on PATH")
+def test_status_says_installing_during_the_first_run_npm_install(first_run):
+    backend = first_run["backend"]
+    thread, outcome = _auto_start()
+    _wait_for(lambda: (backend / "npm-pid").exists() or bool(outcome))
+    assert not outcome, outcome
+
+    # The orb polls /status while npm runs: it must read as a start, never as
+    # "not running, press Start", and must answer while the start is busy.
+    began = time.monotonic()
+    status = assistant_sidecar.probe()
+    assert time.monotonic() - began < 5, "status waits on the running install"
+    assert status["running"] is False
+    assert status["starting"] is True
+    assert status["installing"] is True
+    assert status["error"] is None
+
+    # A Start pressed during the install joins it and spawns nothing more.
+    joined, joined_outcome = _auto_start()
+
+    (backend / "npm-release").write_text("1")
+    thread.join(60)
+    joined.join(60)
+    assert outcome == [f"http://localhost:{first_run['port']}"]
+    assert joined_outcome == outcome
+    status = assistant_sidecar.probe()
+    assert status["running"] is True
+    assert status["starting"] is False
+    assert status["installing"] is False
+
+
+def test_stop_during_the_first_run_install_kills_npm_and_does_not_wait(first_run):
+    backend = first_run["backend"]
+    thread, outcome = _auto_start()
+    _wait_for(lambda: (backend / "npm-pid").exists())
+    npm_pid = int((backend / "npm-pid").read_text())
+    assert psutil.pid_exists(npm_pid)
+
+    # Shutdown or Restart while npm install runs (core/teardown.py).
+    began = time.monotonic()
+    assert assistant_sidecar.stop() is True
+    assert time.monotonic() - began < 15, "stop waited on the start"
+
+    _wait_for(lambda: not psutil.pid_exists(npm_pid), timeout=10)
+    thread.join(20)
+    assert not thread.is_alive()
+    assert len(outcome) == 1 and isinstance(outcome[0], RuntimeError)
+    assert str(outcome[0]) == assistant_sidecar.STOPPED_MESSAGE
+    # The cancelled start spawned no server and left no error for the orb.
+    assert assistant_sidecar._proc is None
+    status = assistant_sidecar.probe()
+    assert status["starting"] is False
+    assert status["installing"] is False
+    assert status["error"] is None
+    assert not (backend / "node_modules").exists()
 
 
 def _join(prefix: str, timeout: float = 5.0) -> None:
