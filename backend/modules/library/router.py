@@ -1083,11 +1083,14 @@ async def stream_audio(entry_id: str, request: Request) -> Response:
                     resp = await client.get(cdn_url)
                     resp.raise_for_status()
                 audio_bytes = resp.content
-                # Cache to disk so future requests skip CDN.
+                # Cache to disk so future requests skip CDN. Written aside and
+                # renamed, off the event loop: the next play serves whatever
+                # sits at this name, so a write cut short (a full disk, a
+                # kill) must leave no file there at all, never half a track.
                 local_name = (meta or {}).get("audio_filename") or f"{entry_id}.mp3"
                 local_path = entry_dir / local_name
                 try:
-                    local_path.write_bytes(audio_bytes)
+                    await asyncio.to_thread(atomic_write, local_path, audio_bytes)
                     log.info("library: cached CDN audio to %s", local_path)
                 except OSError as write_err:
                     log.warning("library: failed to cache CDN audio: %s", write_err)
