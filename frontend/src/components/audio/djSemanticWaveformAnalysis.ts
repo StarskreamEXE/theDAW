@@ -36,6 +36,24 @@ export type WaveBin = {
 };
 
 export const EMPTY_BINS: WaveBin[] = [];
+
+/** How a waveform's body is coloured. 'semantic' (default): the frequency
+ *  + beat classification below. 'plain': one flat colour, amplitude only.
+ *  'clipping': plain, plus samples at/near full scale flagged in red.
+ *  Owned here (the drawing module); `state/waveformStyleStore.ts` is the one
+ *  global preference that picks it. */
+export type WaveformDrawMode = 'semantic' | 'plain' | 'clipping';
+
+/** A bin's peak at/above this (0..1) is drawn as clipped in 'clipping' mode.
+ *  Not 1.0: the analysis window can average a true full-scale sample down
+ *  slightly, and a normalised track's loudest region legitimately sits here
+ *  without clipping — see the doc comment on 'clipping' mode's own caveat. */
+const CLIP_PEAK_THRESHOLD = 0.985;
+/** The flat body colour for 'plain' and non-clipped bins in 'clipping' mode. */
+const PLAIN_BODY = [188, 196, 214] as const;
+/** Clipped-bin colour in 'clipping' mode. */
+const CLIP_BODY = [255, 61, 79] as const;
+
 const SILENCE = 'rgba(72, 83, 100, 0.45)';
 const BEAT = '#ff3f4f';
 const VOCAL = '#72ee78';
@@ -577,6 +595,7 @@ export function drawWaveform(
   viewportEnd: number,
   transparent = false,
   decodeError: string | null = null,
+  mode: WaveformDrawMode = 'semantic',
 ): void {
   // The canvas stretches with `absolute inset-0 h-full w-full`, so only the
   // backing store is set here; an inline width in viewport px would apply the
@@ -624,7 +643,7 @@ export function drawWaveform(
 
   const center = pixelHeight / 2;
   paintGuides(ctx, width, center);
-  drawWaveBody(ctx, width, pixelHeight, bins, viewportStart, viewportEnd);
+  drawWaveBody(ctx, width, pixelHeight, bins, viewportStart, viewportEnd, mode);
   paintSpine(ctx, width, center);
   paintVignette(ctx, width, pixelHeight);
 }
@@ -646,6 +665,12 @@ function paintGuides(ctx: CanvasRenderingContext2D, width: number, center: numbe
  * offscreen canvas covering the whole track and then blit slices as the
  * viewport moves. `drawWaveform` calls it in the same place with the same
  * arguments, so its output is unchanged.
+ *
+ * `mode` defaults to 'semantic' and that branch is byte-for-byte what this
+ * function always did — every existing caller that doesn't pass it keeps
+ * its exact output (the pre-DJ-2 golden in DJSemanticWaveform.b12.test.ts
+ * pins this). 'plain'/'clipping' are a deliberately cheaper second path:
+ * one flat body colour, no frequency-glow layers, no beat rail.
  */
 function drawWaveBody(
   ctx: CanvasRenderingContext2D,
@@ -654,9 +679,14 @@ function drawWaveBody(
   bins: WaveBin[],
   viewportStart: number,
   viewportEnd: number,
+  mode: WaveformDrawMode = 'semantic',
 ): void {
   const center = pixelHeight / 2;
   const maxBar = Math.max(3, pixelHeight * 0.47);
+  if (mode !== 'semantic') {
+    drawWaveBodyFlat(ctx, width, pixelHeight, bins, viewportStart, viewportEnd, mode, center, maxBar);
+    return;
+  }
 
   const spanNorm = Math.max(0.001, viewportEnd - viewportStart);
 
@@ -725,6 +755,60 @@ function drawWaveBody(
   ctx.globalCompositeOperation = 'source-over';
 }
 
+/** 'plain'/'clipping' body: the same per-column amplitude bar as the
+ *  semantic path, one flat colour, no frequency-glow layers or beat rail.
+ *  'clipping' recolours a bin red when its peak is at/above
+ *  {@link CLIP_PEAK_THRESHOLD} — everything else about the shape is
+ *  identical between the two modes, so switching modes never moves a single
+ *  pixel of the outline, only its colour. */
+function drawWaveBodyFlat(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  pixelHeight: number,
+  bins: WaveBin[],
+  viewportStart: number,
+  viewportEnd: number,
+  mode: 'plain' | 'clipping',
+  center: number,
+  maxBar: number,
+): void {
+  const spanNorm = Math.max(0.001, viewportEnd - viewportStart);
+  const [pr, pg, pb] = PLAIN_BODY;
+  const [cr, cg, cb] = CLIP_BODY;
+
+  for (let x = 0; x < width; x += 1) {
+    const startNorm = viewportStart + (x / width) * spanNorm;
+    const endNorm = viewportStart + ((x + 1) / width) * spanNorm;
+    if (endNorm <= 0 || startNorm >= 1) {
+      ctx.fillStyle = 'rgba(72, 83, 100, 0.13)';
+      fillSymmetricBar(ctx, x, center, 1, 1, 1);
+      continue;
+    }
+    const start = Math.floor(clamp(startNorm, 0, 0.999) * bins.length);
+    const end = Math.max(start + 1, Math.ceil(clamp(endNorm, 0.001, 1) * bins.length));
+    const bin = sliceStats(bins, start, end);
+    const amp = Math.pow(clamp(bin.peak, 0, 1), 0.58);
+
+    if (amp < 0.012) {
+      ctx.fillStyle = 'rgba(72, 83, 100, 0.24)';
+      fillSymmetricBar(ctx, x, center, 1, 1, 1);
+      continue;
+    }
+
+    const minHalf = Math.max(1, Math.abs(bin.min) * maxBar);
+    const maxHalf = Math.max(1, Math.abs(bin.max) * maxBar);
+    const fallbackHalf = Math.max(1.25, amp * maxBar);
+    const upper = Math.max(maxHalf, fallbackHalf * 0.72);
+    const lower = Math.max(minHalf, fallbackHalf * 0.72);
+    const alpha = clamp(0.3 + amp * 0.4 + bin.rms * 0.22, 0.32, 0.92);
+
+    const clipped = mode === 'clipping' && bin.peak >= CLIP_PEAK_THRESHOLD;
+    const [r, g, b] = clipped ? [cr, cg, cb] : [pr, pg, pb];
+    ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${clipped ? Math.max(alpha, 0.7) : alpha})`;
+    fillSymmetricBar(ctx, x, center, upper, lower, 1);
+  }
+}
+
 function paintSpine(ctx: CanvasRenderingContext2D, width: number, center: number): void {
   const spine = ctx.createLinearGradient(0, 0, width, 0);
   spine.addColorStop(0, 'rgba(255,255,255,0.04)');
@@ -768,6 +852,7 @@ function cachedRender(
   bins: WaveBin[],
   fullWidth: number,
   deviceWidth: number,
+  mode: WaveformDrawMode,
 ): CachedRender | null {
   const hit = renderCache.get(key);
   if (hit) {
@@ -791,7 +876,7 @@ function cachedRender(
   // The WHOLE track, at the current zoom, with no background/guides/spine —
   // those are painted per frame on the real canvas so they stay anchored to
   // the visible lane rather than scrolling with the audio.
-  drawWaveBody(ctx, fullWidth, box.cssHeight, bins, 0, 1);
+  drawWaveBody(ctx, fullWidth, box.cssHeight, bins, 0, 1, mode);
 
   const entry: CachedRender = { canvas, fullWidth, deviceWidth };
   renderCache.set(key, entry);
@@ -842,6 +927,7 @@ export function drawWaveformCached(
   transparent: boolean,
   decodeError: string | null,
   cacheKey: string,
+  mode: WaveformDrawMode = 'semantic',
 ): void {
   const width = box.cssWidth;
   const pixelHeight = box.cssHeight;
@@ -877,17 +963,19 @@ export function drawWaveformCached(
     fullWidth >= width;
 
   if (!cacheable) {
-    drawWaveform(canvas, box, bins, viewportStart, viewportEnd, transparent, decodeError);
+    drawWaveform(canvas, box, bins, viewportStart, viewportEnd, transparent, decodeError, mode);
     return;
   }
 
   // Clamped, not abandoned — see the note on MAX_OFFSCREEN_DEVICE_WIDTH above.
   const deviceWidth = Math.max(1, Math.min(Math.round(fullWidth * box.scale), MAX_OFFSCREEN_DEVICE_WIDTH));
 
-  const key = `${cacheKey}|${Math.round(width)}|${Math.round(pixelHeight)}|${box.scale}|${span.toFixed(6)}|${bins.length}|${deviceWidth}`;
-  const render = cachedRender(key, box, bins, fullWidth, deviceWidth);
+  // `mode` in the key: a cached render is a rasterised body, and a body
+  // rendered in one mode is the wrong pixels for another.
+  const key = `${cacheKey}|${Math.round(width)}|${Math.round(pixelHeight)}|${box.scale}|${span.toFixed(6)}|${bins.length}|${deviceWidth}|${mode}`;
+  const render = cachedRender(key, box, bins, fullWidth, deviceWidth, mode);
   if (!render) {
-    drawWaveform(canvas, box, bins, viewportStart, viewportEnd, transparent, decodeError);
+    drawWaveform(canvas, box, bins, viewportStart, viewportEnd, transparent, decodeError, mode);
     return;
   }
 

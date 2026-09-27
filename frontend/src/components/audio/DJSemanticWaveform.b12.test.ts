@@ -704,4 +704,96 @@ const HUGE: CanvasBox = { cssWidth: 20000, cssHeight: 64, deviceWidth: 20000, de
   assert.equal(offscreens.length, 0);
 }
 
+// ── waveform display modes: semantic (default) / plain / clipping ──────────
+
+/** `createLinearGradient` hands back a fresh object each call, so compare a
+ *  projection where a gradient style is just "gradient" (matches the
+ *  `normalize` helper used above, module-scoped here for reuse). */
+function normalizeCalls(calls: ReturnType<typeof makeFakeCanvas>['calls']) {
+  return calls.map((c) => ({ ...c, style: typeof c.style === 'object' && c.style !== null ? 'gradient' : String(c.style) }));
+}
+
+function modeBins(): WaveBin[] {
+  return [
+    // Loud, near full-scale: the case 'clipping' mode must flag.
+    { peak: 0.99, rms: 0.7, min: -0.98, max: 0.99, low: 0.6, mid: 0.2, bright: 0.1, transient: 0.1, color: '#ff3f4f' },
+    // Ordinary level: must NOT be flagged, in either non-semantic mode.
+    { peak: 0.5, rms: 0.3, min: -0.45, max: 0.5, low: 0.1, mid: 0.6, bright: 0.2, transient: 0.05, color: '#72ee78' },
+  ];
+}
+const MODE_BOX: CanvasBox = { cssWidth: 2, cssHeight: 16, deviceWidth: 2, deviceHeight: 16, scale: 1, zoom: 1, dpr: 1 };
+
+{
+  // Default (omitted) and explicit 'semantic' must be the exact same call —
+  // every existing caller that never passes a mode keeps its exact output.
+  const omitted = makeFakeCanvas();
+  drawWaveform(omitted.canvas, MODE_BOX, modeBins(), 0, 1, false, null);
+  const explicit = makeFakeCanvas();
+  drawWaveform(explicit.canvas, MODE_BOX, modeBins(), 0, 1, false, null, 'semantic');
+  assert.deepEqual(normalizeCalls(explicit.calls), normalizeCalls(omitted.calls), "mode: 'semantic' must be byte-identical to omitting mode");
+  assert.deepEqual(explicit.gradients, omitted.gradients);
+}
+
+{
+  // 'plain': one flat colour for every bin, not the per-bin semantic colour,
+  // and none of the frequency-glow layers (far fewer fillRect calls).
+  const semantic = makeFakeCanvas();
+  drawWaveform(semantic.canvas, MODE_BOX, modeBins(), 0, 1, false, null, 'semantic');
+  const plain = makeFakeCanvas();
+  drawWaveform(plain.canvas, MODE_BOX, modeBins(), 0, 1, false, null, 'plain');
+
+  assert.ok(plain.calls.length < semantic.calls.length, 'plain skips the frequency-glow layers');
+  const plainFills = plain.calls.filter((c) => c.kind === 'fillRect' && typeof c.style === 'string' && (c.style as string).startsWith('rgba(188, 196, 214'));
+  assert.equal(plainFills.length, 2, 'both bins use the one flat plain colour');
+  assert.ok(
+    !plain.calls.some((c) => typeof c.style === 'string' && ((c.style as string).includes('255, 89, 64') || (c.style as string).includes('30, 144, 255'))),
+    'plain never paints the beat-rail or low-glow colours',
+  );
+}
+
+{
+  // 'clipping': the loud bin (peak 0.99) is flagged red; the ordinary bin
+  // (peak 0.5) stays the plain neutral colour, same as 'plain' mode.
+  const clipping = makeFakeCanvas();
+  drawWaveform(clipping.canvas, MODE_BOX, modeBins(), 0, 1, false, null, 'clipping');
+  const bodyFills = clipping.calls.filter(
+    (c) => c.kind === 'fillRect' && typeof c.style === 'string'
+      && ((c.style as string).startsWith('rgba(255, 61, 79') || (c.style as string).startsWith('rgba(188, 196, 214')),
+  );
+  assert.equal(bodyFills.length, 2, 'one body fill per column at this box width');
+  assert.ok((bodyFills[0].style as string).startsWith('rgba(255, 61, 79'), `column 0 (peak 0.99) must be flagged red, got ${bodyFills[0].style}`);
+  assert.ok((bodyFills[1].style as string).startsWith('rgba(188, 196, 214'), `column 1 (peak 0.5) must stay plain, got ${bodyFills[1].style}`);
+
+  // A bin just under the threshold is not flagged.
+  const belowThreshold = makeFakeCanvas();
+  drawWaveform(belowThreshold.canvas, MODE_BOX, [
+    { peak: 0.98, rms: 0.6, min: -0.9, max: 0.98, low: 0.5, mid: 0.2, bright: 0.1, transient: 0.1, color: '#ff3f4f' },
+    modeBins()[1],
+  ], 0, 1, false, null, 'clipping');
+  const belowFill = belowThreshold.calls.find(
+    (c) => c.kind === 'fillRect' && typeof c.style === 'string'
+      && ((c.style as string).startsWith('rgba(255, 61, 79') || (c.style as string).startsWith('rgba(188, 196, 214')),
+  );
+  assert.ok(belowFill && (belowFill.style as string).startsWith('rgba(188, 196, 214'), 'peak just under the threshold is not flagged');
+}
+
+{
+  // drawWaveformCached: a cached render is keyed on mode too, so switching
+  // modes on an otherwise-unchanged zoomed view invalidates the cache
+  // instead of blitting the wrong colours.
+  offscreens.length = 0;
+  const semanticCached = makeFakeCanvas();
+  drawWaveformCached(semanticCached.canvas, LANE, REAL_BINS, 0.4, 0.525, false, null, 'mode-key', 'semantic');
+  assert.equal(offscreens.length, 1);
+
+  const plainCached = makeFakeCanvas();
+  drawWaveformCached(plainCached.canvas, LANE, REAL_BINS, 0.4, 0.525, false, null, 'mode-key', 'plain');
+  assert.equal(offscreens.length, 2, 'a mode switch at the same cacheKey/viewport builds a NEW offscreen render, not a stale blit');
+
+  // Same mode, same everything again: reuses the render already built.
+  const plainCached2 = makeFakeCanvas();
+  drawWaveformCached(plainCached2.canvas, LANE, REAL_BINS, 0.4, 0.525, false, null, 'mode-key', 'plain');
+  assert.equal(offscreens.length, 2, 'the same mode still reuses its own cached render');
+}
+
 console.log('DJSemanticWaveform.b12.test.ts OK');

@@ -6,6 +6,7 @@ import {
   decodeAudio,
   drawWaveformCached,
   type WaveBin,
+  type WaveformDrawMode,
 } from './djSemanticWaveformAnalysis';
 
 /** Round a measured lane width UP to a 64 px bucket, so a one-pixel layout
@@ -24,6 +25,7 @@ export function DJSemanticWaveform({
   onDuration,
   transparentBg = false,
   normalize = true,
+  mode = 'semantic',
   width,
 }: {
   audioUrl: string;
@@ -40,6 +42,10 @@ export function DJSemanticWaveform({
    *  clamped but never rescaled — REAPER's default, and what the EDIT
    *  timeline wants (see `analyzeBuffer`'s `AnalyzeOptions`). */
   normalize?: boolean;
+  /** How the body is coloured; see `WaveformDrawMode`. This component stays
+   *  a plain-props leaf (no store read) — `SemanticWave` owns picking it
+   *  from the global preference. */
+  mode?: WaveformDrawMode;
   /** Lane width in CSS px, if the caller already knows it. Decides how many
    *  analysis bins this instance asks for: the overview lanes are 34-44 px
    *  and used to compute the full 6,400 bins anyway. Omitted, the wrapper is
@@ -157,13 +163,14 @@ export function DJSemanticWaveform({
         transparentBg,
         decodeError,
         `${audioUrl}|${normalize ? 'n' : 'a'}`,
+        mode,
       );
     };
     render();
     const ro = new ResizeObserver(render);
     ro.observe(wrap);
     return () => ro.disconnect();
-  }, [bins, height, viewportEnd, viewportStart, transparentBg, decodeError, audioUrl, normalize]);
+  }, [bins, height, viewportEnd, viewportStart, transparentBg, decodeError, audioUrl, normalize, mode]);
 
   return (
     <div

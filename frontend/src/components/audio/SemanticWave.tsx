@@ -10,6 +10,16 @@
  */
 import React, { useRef } from 'react';
 import { DJSemanticWaveform } from './DJSemanticWaveform';
+import { useWaveformStyleStore, WAVEFORM_DRAW_MODES, type WaveformDrawMode } from '../../state/waveformStyleStore';
+
+/** What the corner toggle's tooltip says, and the one place the color
+ *  legend is written down — answer to "wtf are all the colors??". */
+const MODE_LABEL: Record<WaveformDrawMode, string> = {
+  semantic: 'Colors: red = beat, green = vocal, blue = bass, orange = bright/noisy, purple = everything else, gray = silence. Click to change.',
+  plain: 'Plain: amplitude only, no color coding. Click to change.',
+  clipping: 'Clipping: amplitude, with samples near full scale flagged in red. Click to change.',
+};
+const MODE_GLYPH: Record<WaveformDrawMode, string> = { semantic: '●', plain: '○', clipping: '!' };
 
 const clamp01 = (n: number) => (n < 0 ? 0 : n > 1 ? 1 : n);
 
@@ -41,6 +51,12 @@ export interface SemanticWaveProps {
    *  sample — see `DJSemanticWaveform`'s prop of the same name. `false`:
    *  absolute amplitude, never rescaled (REAPER's default). */
   normalize?: boolean;
+  /** Show the small corner button that cycles the global waveform color
+   *  mode (semantic / plain / clipping) and explains it on hover. Default
+   *  true; set false on compact/decorative instances (a footer scrub strip,
+   *  a mix-row thumbnail) where a 14px control would just be clutter — the
+   *  mode itself, set from any OTHER instance, still applies everywhere. */
+  showModeToggle?: boolean;
 }
 
 export const SemanticWave: React.FC<SemanticWaveProps> = ({
@@ -56,8 +72,11 @@ export const SemanticWave: React.FC<SemanticWaveProps> = ({
   className,
   ariaLabel,
   normalize = true,
+  showModeToggle = true,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
+  const mode = useWaveformStyleStore((s) => s.mode);
+  const cycleMode = useWaveformStyleStore((s) => s.cycleMode);
   const span = Math.max(1e-6, viewportEnd - viewportStart);
 
   // Map a full-track fraction to a horizontal percentage within the viewport.
@@ -122,7 +141,21 @@ export const SemanticWave: React.FC<SemanticWaveProps> = ({
         onDuration={onDuration}
         transparentBg={transparentBg}
         normalize={normalize}
+        mode={mode}
       />
+
+      {showModeToggle && (
+        <button
+          type="button"
+          aria-label={`Waveform color mode: ${mode}. ${MODE_LABEL[mode]}`}
+          title={MODE_LABEL[mode]}
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => { e.stopPropagation(); cycleMode(); }}
+          className="absolute bottom-0.5 right-0.5 z-40 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-black/40 text-[8px] leading-none text-white/50 opacity-50 transition-opacity hover:opacity-100 focus-visible:opacity-100"
+        >
+          {MODE_GLYPH[mode]}
+        </button>
+      )}
 
       {/* scrub layer */}
       {onSeek && (
