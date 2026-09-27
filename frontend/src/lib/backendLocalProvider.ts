@@ -416,7 +416,9 @@ export type LibraryServerSort =
   | 'title_desc'
   | 'plays_desc'
   | 'duration_desc'
-  | 'duration_asc';
+  | 'duration_asc'
+  /** Starred rows first, then the rest, each by name (the EDIT picker's order). */
+  | 'favorites_first';
 
 /** The filter/sort state a paged request is made of. */
 export interface LibraryQuery {
@@ -676,6 +678,77 @@ export async function fetchLibraryMatchCount(
   const result = await fetchLibraryList(query, 0, 1, signal, base);
   if (!result.paged || !result.page) return null;
   return result.page.total;
+}
+
+/* ════════════════════════════ stats ════════════════════════════════════════
+ *
+ * `GET /api/library/entries/stats?<the page filters>` answers
+ * `{count, favorites, size_bytes, duration_sec, revision}` over EVERY row the
+ * filters match, so the chips above the list describe the whole query rather
+ * than the pages this client happens to hold.
+ */
+
+/** Totals over a whole query. */
+export interface LibraryStats {
+  count: number;
+  favorites: number;
+  sizeBytes: number;
+  durationSec: number;
+  /** The `library_revision` the totals were read at; 0 when unknown. */
+  revision: number;
+}
+
+const finiteOr0 = (v: unknown): number =>
+  typeof v === 'number' && Number.isFinite(v) ? v : 0;
+
+/**
+ * The totals of everything `query` matches. Null against a backend with no
+ * stats route: an older one answers the path with its `/entries/{id}` route,
+ * which is a 404, and the caller then sums the rows it holds.
+ */
+export async function fetchLibraryStats(
+  query: LibraryQuery,
+  signal?: AbortSignal,
+  base: string = DEFAULT_BASE,
+): Promise<LibraryStats | null> {
+  const params = queryParams(query);
+  params.delete('sort');
+  const r = await fetch(`${base}/entries/stats?${params.toString()}`, { signal });
+  if (r.status === 404 || r.status === 405) return null;
+  if (!r.ok) throw new Error(`library.stats: ${await errorText(r)}`);
+  const body = (await r.json()) as Record<string, unknown>;
+  return {
+    count: finiteOr0(body.count),
+    favorites: finiteOr0(body.favorites),
+    sizeBytes: finiteOr0(body.size_bytes),
+    durationSec: finiteOr0(body.duration_sec),
+    revision: finiteOr0(body.revision),
+  };
+}
+
+/* ═════════════════════════ entry references ═══════════════════════════════
+ *
+ * `GET /api/library/entries/resolve?ref=` names the audio entry a LOOM score or
+ * template means by an id, an id prefix or a title fragment, over the whole
+ * library. `{id: null}` when nothing matches.
+ */
+
+/**
+ * The entry id `ref` names, null when the library has none, or undefined
+ * against a backend with no resolve route (a 404 from its `/entries/{id}`),
+ * which tells the caller to look through the rows it holds instead.
+ */
+export async function resolveLibraryEntryRef(
+  ref: string,
+  signal?: AbortSignal,
+  base: string = DEFAULT_BASE,
+): Promise<string | null | undefined> {
+  const params = new URLSearchParams({ ref });
+  const r = await fetch(`${base}/entries/resolve?${params.toString()}`, { signal });
+  if (r.status === 404 || r.status === 405) return undefined;
+  if (!r.ok) throw new Error(`library.resolve: ${await errorText(r)}`);
+  const body = (await r.json()) as { id?: unknown };
+  return typeof body.id === 'string' ? body.id : null;
 }
 
 /* ═════════════════════════ bulk delete ═════════════════════════════════════
