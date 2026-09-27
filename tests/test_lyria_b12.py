@@ -108,6 +108,15 @@ def _reset_sidecar_module_state():
     sidecar._stopping.clear()
 
 
+@pytest.fixture(autouse=True)
+def _sidecar_log_in_tmp(tmp_path, monkeypatch):
+    """SIDECAR_LOG_PATH is fixed at import to the checkout's
+    data/logs/lyria-sidecar.log, and the install/spawn paths these tests drive
+    open it, so a run created that file in whichever checkout ran the suite
+    (the user's app tree included). Every test here logs to its own tmp file."""
+    monkeypatch.setattr(sidecar, "SIDECAR_LOG_PATH", tmp_path / "lyria-sidecar.log")
+
+
 # ---------------------------------------------------------------------------
 # Throwaway HTTP servers used to fake "something is listening on the port"
 # ---------------------------------------------------------------------------
