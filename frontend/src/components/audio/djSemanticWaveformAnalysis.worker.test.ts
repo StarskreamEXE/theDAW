@@ -56,7 +56,7 @@ type AnalyzeResponse = { id: number; bins: WaveBin[] } | { id: number; error: st
  *  on the other side of the `postMessage`. */
 function sentinelBins(tag: string): WaveBin[] {
   return [
-    { peak: 1, rms: 1, min: -1, max: 1, low: 1, mid: 1, bright: 1, transient: 1, color: tag },
+    { peak: 1, rms: 1, min: -1, max: 1, low: 1, mid: 1, bright: 1, transient: 1, color: tag, clipped: 0 },
   ];
 }
 

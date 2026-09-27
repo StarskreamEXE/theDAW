@@ -34,26 +34,40 @@ export type WaveBin = {
   bright: number;
   transient: number;
   color: string;
+  /** Samples in this bin, summed over channels, at or above
+   *  {@link CLIP_SAMPLE_LEVEL} in magnitude. Counted over EVERY sample of each
+   *  channel's raw data, never the strided mono mix and never rescaled by
+   *  `normalize`, so it says whether the file itself reaches full scale. */
+  clipped: number;
 };
 
 export const EMPTY_BINS: WaveBin[] = [];
 
 /** How a waveform's body is coloured. 'semantic' (default): the frequency
  *  + beat classification below. 'plain': one flat colour, amplitude only.
- *  'clipping': plain, plus samples at/near full scale flagged in red.
+ *  'clipping': plain, plus every column holding a sample at full scale in
+ *  any channel ({@link WaveBin.clipped}) flagged in red.
  *  Owned here (the drawing module); `state/waveformStyleStore.ts` is the one
  *  global preference that picks it. */
 export type WaveformDrawMode = 'semantic' | 'plain' | 'clipping';
 
-/** A bin's peak at/above this (0..1) is drawn as clipped in 'clipping' mode.
- *  Not 1.0: the analysis window can average a true full-scale sample down
- *  slightly, and a normalised track's loudest region legitimately sits here
- *  without clipping — see the doc comment on 'clipping' mode's own caveat. */
-const CLIP_PEAK_THRESHOLD = 0.985;
+/** A raw sample at or above this magnitude (about -0.01 dBFS) counts as
+ *  clipped. The test used to be a bin's drawn peak at or above 0.985, which
+ *  read the mono mix after `normalize` had rescaled it: the loudest bin of
+ *  every normalised waveform is 1.0, so a track peaking at -12 dBFS showed
+ *  red, while a file clipping in one channel averaged down to about half and
+ *  never did. Exported for tests. */
+export const CLIP_SAMPLE_LEVEL = 0.999;
 /** The flat body colour for 'plain' and non-clipped bins in 'clipping' mode. */
 const PLAIN_BODY = [188, 196, 214] as const;
 /** Clipped-bin colour in 'clipping' mode. */
 const CLIP_BODY = [255, 61, 79] as const;
+
+/** The Goertzel frequencies (Hz) behind each band's energy. The legend names
+ *  the bands from these, so what it says is what is measured. */
+const LOW_BAND_HZ = [58, 88, 128, 180];
+const MID_BAND_HZ = [420, 760, 1180, 1700];
+const BRIGHT_BAND_HZ = [2600, 3600, 5200];
 
 const SILENCE = 'rgba(72, 83, 100, 0.45)';
 const BEAT = '#ff3f4f';
@@ -138,6 +152,38 @@ function semanticRgb(color: string): [number, number, number] {
       return [72, 83, 100];
   }
 }
+
+function hz(value: number): string {
+  return value >= 1000 ? `${Number((value / 1000).toFixed(1))} kHz` : `${value} Hz`;
+}
+function bandRange(freqs: number[]): string {
+  return `${hz(freqs[0])}–${hz(freqs[freqs.length - 1])}`;
+}
+
+/** One legend row: the colour a waveform draws and what it means. */
+export type WaveformLegendItem = { rgb: readonly [number, number, number]; label: string };
+
+/**
+ * What each colour means, per mode — the one place the legend is written, next
+ * to the code that picks the colours. Red is a beat in 'semantic' and a
+ * clipped sample in 'clipping', so each mode's rows say which one it is, and
+ * the green, blue and orange rows name the band they measure.
+ */
+export const WAVEFORM_LEGEND: Record<WaveformDrawMode, readonly WaveformLegendItem[]> = {
+  semantic: [
+    { rgb: semanticRgb(BEAT), label: 'Red: beat (sharp hit)' },
+    { rgb: semanticRgb(VOCAL), label: `Green: mids ${bandRange(MID_BAND_HZ)}` },
+    { rgb: semanticRgb(BASS), label: `Blue: bass ${bandRange(LOW_BAND_HZ)}` },
+    { rgb: semanticRgb(BRIGHT), label: `Orange: highs ${bandRange(BRIGHT_BAND_HZ)} or noise` },
+    { rgb: semanticRgb(BODY), label: 'Purple: no band leads' },
+    { rgb: semanticRgb(SILENCE), label: 'Gray: silence' },
+  ],
+  plain: [{ rgb: PLAIN_BODY, label: 'Level only, no colour coding' }],
+  clipping: [
+    { rgb: PLAIN_BODY, label: 'Level' },
+    { rgb: CLIP_BODY, label: 'Red: clipped (a channel at full scale)' },
+  ],
+};
 
 function semanticRgba(color: string, alpha: number): string {
   const [r, g, b] = semanticRgb(color);
@@ -273,12 +319,25 @@ export function analyzeChannels(
       prev = sample;
     }
 
+    // Clipping is read from every raw sample of every channel: the strided
+    // mono read above can step over a short run at full scale, and averaging
+    // the channels halves a clip that is in one channel only.
+    let clipped = 0;
+    for (let ch = 0; ch < channels.length; ch += 1) {
+      const data = channels[ch];
+      const stop = Math.min(end, data.length);
+      for (let n = start; n < stop; n += 1) {
+        const v = data[n];
+        if (v >= CLIP_SAMPLE_LEVEL || v <= -CLIP_SAMPLE_LEVEL) clipped += 1;
+      }
+    }
+
     const rms = Math.sqrt(sumSq / analysisCount);
     const zcr = crossings / Math.max(1, analysisCount - 1);
     const analysisRate = sampleRate / stride;
-    const low = bandPower(samples, analysisRate, [58, 88, 128, 180]);
-    const mid = bandPower(samples, analysisRate, [420, 760, 1180, 1700]);
-    const bright = bandPower(samples, analysisRate, [2600, 3600, 5200]);
+    const low = bandPower(samples, analysisRate, LOW_BAND_HZ);
+    const mid = bandPower(samples, analysisRate, MID_BAND_HZ);
+    const bright = bandPower(samples, analysisRate, BRIGHT_BAND_HZ);
     const crest = peak / Math.max(0.0001, rms);
     const transient = clamp((crest - 1.45) / 3.2, 0, 1);
 
@@ -292,6 +351,7 @@ export function analyzeChannels(
       bright,
       transient,
       color: pickColor(peak, rms, low, mid, bright, zcr, transient),
+      clipped,
     });
     if (peak > globalPeak) globalPeak = peak;
     if (low > globalLow) globalLow = low;
@@ -839,6 +899,7 @@ type SliceStats = {
   bright: number;
   transient: number;
   color: string;
+  clipped: number;
 };
 
 function sliceStats(bins: WaveBin[], start: number, end: number): SliceStats {
@@ -852,6 +913,7 @@ function sliceStats(bins: WaveBin[], start: number, end: number): SliceStats {
   let mid = 0;
   let bright = 0;
   let transient = 0;
+  let clipped = 0;
   let count = 0;
 
   for (let i = start; i < end; i += 1) {
@@ -868,6 +930,7 @@ function sliceStats(bins: WaveBin[], start: number, end: number): SliceStats {
     mid += bin.mid;
     bright += bin.bright;
     if (bin.transient > transient) transient = bin.transient;
+    clipped += bin.clipped;
   }
 
   return {
@@ -880,6 +943,7 @@ function sliceStats(bins: WaveBin[], start: number, end: number): SliceStats {
     bright: bright / Math.max(1, count),
     transient,
     color: strongest.color,
+    clipped,
   };
 }
 
@@ -1069,8 +1133,8 @@ function drawWaveBody(
 
 /** 'plain'/'clipping' body: the same per-column amplitude bar as the
  *  semantic path, one flat colour, no frequency-glow layers or beat rail.
- *  'clipping' recolours a bin red when its peak is at/above
- *  {@link CLIP_PEAK_THRESHOLD} — everything else about the shape is
+ *  'clipping' recolours a column red when any bin under it holds a clipped
+ *  sample ({@link WaveBin.clipped}) — everything else about the shape is
  *  identical between the two modes, so switching modes never moves a single
  *  pixel of the outline, only its colour. */
 function drawWaveBodyFlat(
@@ -1114,7 +1178,7 @@ function drawWaveBodyFlat(
     const lower = Math.max(minHalf, fallbackHalf * 0.72);
     const alpha = clamp(0.3 + amp * 0.4 + bin.rms * 0.22, 0.32, 0.92);
 
-    const clipped = mode === 'clipping' && bin.peak >= CLIP_PEAK_THRESHOLD;
+    const clipped = mode === 'clipping' && bin.clipped > 0;
     const [r, g, b] = clipped ? [cr, cg, cb] : [pr, pg, pb];
     ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${clipped ? Math.max(alpha, 0.7) : alpha})`;
     fillSymmetricBar(ctx, x, center, upper, lower, 1);

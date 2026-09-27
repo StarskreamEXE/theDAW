@@ -452,6 +452,7 @@ function goldenBins(): WaveBin[] {
       bright: ((i + 2) % 5) / 4,
       transient: (i % 6) / 5,
       color: colors[i % colors.length],
+      clipped: 0,
     });
   }
   return out;
@@ -877,10 +878,10 @@ function normalizeCalls(calls: ReturnType<typeof makeFakeCanvas>['calls']) {
 
 function modeBins(): WaveBin[] {
   return [
-    // Loud, near full-scale: the case 'clipping' mode must flag.
-    { peak: 0.99, rms: 0.7, min: -0.98, max: 0.99, low: 0.6, mid: 0.2, bright: 0.1, transient: 0.1, color: '#ff3f4f' },
+    // Holds clipped samples: the case 'clipping' mode must flag.
+    { peak: 0.99, rms: 0.7, min: -0.98, max: 0.99, low: 0.6, mid: 0.2, bright: 0.1, transient: 0.1, color: '#ff3f4f', clipped: 3 },
     // Ordinary level: must NOT be flagged, in either non-semantic mode.
-    { peak: 0.5, rms: 0.3, min: -0.45, max: 0.5, low: 0.1, mid: 0.6, bright: 0.2, transient: 0.05, color: '#72ee78' },
+    { peak: 0.5, rms: 0.3, min: -0.45, max: 0.5, low: 0.1, mid: 0.6, bright: 0.2, transient: 0.05, color: '#72ee78', clipped: 0 },
   ];
 }
 const MODE_BOX: CanvasBox = { cssWidth: 2, cssHeight: 16, deviceWidth: 2, deviceHeight: 16, scale: 1, zoom: 1, dpr: 1 };
@@ -914,8 +915,8 @@ const MODE_BOX: CanvasBox = { cssWidth: 2, cssHeight: 16, deviceWidth: 2, device
 }
 
 {
-  // 'clipping': the loud bin (peak 0.99) is flagged red; the ordinary bin
-  // (peak 0.5) stays the plain neutral colour, same as 'plain' mode.
+  // 'clipping': the bin holding clipped samples is flagged red; the ordinary
+  // bin stays the plain neutral colour, same as 'plain' mode.
   const clipping = makeFakeCanvas();
   drawWaveform(clipping.canvas, MODE_BOX, modeBins(), 0, 1, false, null, 'clipping');
   const bodyFills = clipping.calls.filter(
@@ -923,20 +924,21 @@ const MODE_BOX: CanvasBox = { cssWidth: 2, cssHeight: 16, deviceWidth: 2, device
       && ((c.style as string).startsWith('rgba(255, 61, 79') || (c.style as string).startsWith('rgba(188, 196, 214')),
   );
   assert.equal(bodyFills.length, 2, 'one body fill per column at this box width');
-  assert.ok((bodyFills[0].style as string).startsWith('rgba(255, 61, 79'), `column 0 (peak 0.99) must be flagged red, got ${bodyFills[0].style}`);
-  assert.ok((bodyFills[1].style as string).startsWith('rgba(188, 196, 214'), `column 1 (peak 0.5) must stay plain, got ${bodyFills[1].style}`);
+  assert.ok((bodyFills[0].style as string).startsWith('rgba(255, 61, 79'), `column 0 (clipped samples) must be flagged red, got ${bodyFills[0].style}`);
+  assert.ok((bodyFills[1].style as string).startsWith('rgba(188, 196, 214'), `column 1 (none clipped) must stay plain, got ${bodyFills[1].style}`);
 
-  // A bin just under the threshold is not flagged.
-  const belowThreshold = makeFakeCanvas();
-  drawWaveform(belowThreshold.canvas, MODE_BOX, [
-    { peak: 0.98, rms: 0.6, min: -0.9, max: 0.98, low: 0.5, mid: 0.2, bright: 0.1, transient: 0.1, color: '#ff3f4f' },
+  // The drawn peak says nothing about clipping: a normalised waveform's
+  // loudest bin is 1.0 whatever the file's level. Only the clip count flags.
+  const loudestOfNormalised = makeFakeCanvas();
+  drawWaveform(loudestOfNormalised.canvas, MODE_BOX, [
+    { peak: 1, rms: 0.6, min: -1, max: 1, low: 0.5, mid: 0.2, bright: 0.1, transient: 0.1, color: '#ff3f4f', clipped: 0 },
     modeBins()[1],
   ], 0, 1, false, null, 'clipping');
-  const belowFill = belowThreshold.calls.find(
+  const loudestFill = loudestOfNormalised.calls.find(
     (c) => c.kind === 'fillRect' && typeof c.style === 'string'
       && ((c.style as string).startsWith('rgba(255, 61, 79') || (c.style as string).startsWith('rgba(188, 196, 214')),
   );
-  assert.ok(belowFill && (belowFill.style as string).startsWith('rgba(188, 196, 214'), 'peak just under the threshold is not flagged');
+  assert.ok(loudestFill && (loudestFill.style as string).startsWith('rgba(188, 196, 214'), 'a peak of 1.0 with no clipped sample is not flagged');
 }
 
 {
