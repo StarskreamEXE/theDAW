@@ -1691,6 +1691,33 @@ def test_keys_saved_here_survive_main_saving_and_clearing_its_key(
     assert sidecar.stored_keys("openrouter") == ["this-o1", "this-o2"]
 
 
+def test_gemini_keys_main_deleted_stay_deleted_when_main_saves_a_new_one(
+    lyria_keys, monkeypatch
+):
+    """The user saves two Gemini keys here, deletes the Gemini key in main
+    (main unlinks the file), opens this build, then saves a fresh key in main.
+    The two deleted keys came back behind the fresh one: the copy beside the
+    key file still held them, and main's fresh file read as "main saved over
+    this build's keys"."""
+    sidecar.add_key("gemini", "revoked-1")
+    sidecar.add_key("gemini", "revoked-2")
+    sidecar.add_key("openrouter", "this-o1")
+
+    main = _main_build(lyria_keys.path, monkeypatch)
+    assert main.clear_gemini_key() is True
+    assert sidecar.stored_keys("gemini") == []
+
+    main.set_gemini_key("fresh")
+    assert sidecar.stored_keys("gemini") == ["fresh"]
+    assert sidecar.stored_keys("openrouter") == ["this-o1"]
+    assert sidecar.gemini_key() == ("fresh", "file")
+
+    # This build writes again; main still reads the key it saved.
+    sidecar.add_key("openrouter", "this-o2")
+    assert main.gemini_key() == ("fresh", "file")
+    assert sidecar.stored_keys("gemini") == ["fresh"]
+
+
 class _TornWriter:
     """A file whose write() lands half its data and then fails, the way a
     crash or a full disk leaves a file mid-write."""

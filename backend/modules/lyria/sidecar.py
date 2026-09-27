@@ -62,7 +62,7 @@ import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Lock
+from threading import Lock, RLock
 from typing import IO, Callable, Iterator, Optional
 from backend.lib import paths
 from backend.lib.atomic import atomic_write
@@ -195,8 +195,10 @@ _PROVIDER_POOLS = {
     "openrouter": ("openrouter", "openrouter-free"),
 }
 # Serializes the read-modify-write of the key file so two concurrent route
-# handlers (add + remove, say) cannot lose one another's edit.
-_key_file_lock = Lock()
+# handlers (add + remove, say) cannot lose one another's edit. Reentrant:
+# _read_store takes it to write main's delete into the copy, and the writers
+# call _read_store while they hold it.
+_key_file_lock = RLock()
 
 
 @contextmanager
@@ -488,12 +490,12 @@ def _read_store() -> dict:
         # everything this build kept; main's own key, when there is one, goes
         # first, as the single-key migration below does. A deleted file
         # forgets every Gemini key, exactly as this build's own DELETE
-        # /api/lyria/key does, and leaves everything else.
+        # /api/lyria/key does, and leaves everything else; the forget is
+        # written into the copy so main's next save cannot bring them back.
         base = copy
         if not exists:
-            base = {**copy, "providers": {**(copy.get("providers") or {})}}
-            base["providers"]["gemini"] = []
-            base.pop("key", None)
+            base = _forget_gemini(copy)
+            _forget_copy_gemini()
         elif isinstance(raw, dict):
             base = {**copy, "key": raw.get("key")}
         else:
@@ -519,6 +521,47 @@ def _read_store() -> dict:
     # Only a literal true shares the pool: a hand-edited "yes" or 1 fails safe.
     store["share_pool"] = raw.get("share_pool") is True
     return store
+
+
+def _forget_gemini(payload: dict) -> dict:
+    """``payload`` with its Gemini list emptied and its ``key`` dropped."""
+    out = {**payload, "providers": {**(payload.get("providers") or {})}}
+    out["providers"]["gemini"] = []
+    out.pop("key", None)
+    return out
+
+
+def _forget_copy_gemini() -> None:
+    """Write main's delete of the key file into the copy.
+
+    The copy keeps every Gemini key this build saved. Left as it is, main's
+    next save (``{"key": ...}`` over a fresh file) reads as main saving over
+    this build's keys, and every key the user deleted in main comes back
+    behind the new one. Nothing is written when the copy holds no Gemini key.
+    Never raises: a copy that cannot be written only costs the forget.
+    """
+    with _key_file_lock:
+        if _KEY_FILE.exists():
+            return
+        _exists, copy = _read_key_json(_key_copy_file())
+        if not isinstance(copy, dict):
+            return
+        providers = copy.get("providers")
+        gemini = providers.get("gemini") if isinstance(providers, dict) else None
+        if not _split_keys(gemini) and not _split_keys(copy.get("key")):
+            return
+        try:
+            atomic_write(
+                _key_copy_file(),
+                json.dumps(_forget_gemini(copy), indent=2),
+                mode=0o600,
+            )
+        except OSError as e:
+            log.warning(
+                "lyria.sidecar: could not forget deleted Gemini keys in %s: %s",
+                _KEY_COPY_NAME,
+                e,
+            )
 
 
 def _key_copy_file() -> Path:
