@@ -12,7 +12,7 @@
     THEDAW_VST_BUILD_DIR environment variable; -BuildDir wins over both.
 
     The CMake generator is chosen here, never left to CMake's default: a CMake
-    whose default is Ninja (WinLibs, MSYS2, a pip-installed cmake) would
+    whose default is Ninja (the WinLibs build of CMake is one) would
     otherwise pick up whatever compiler is first on PATH and reject the
     platform argument outright. The newest Visual Studio that has the C++
     toolset, found through vswhere, gets its own generator with -A x64. -Generator

@@ -3,7 +3,7 @@
 Two setup bugs, reported 2026-09-22, both reproduced here with the real tools:
 
 * The script passed ``-A x64`` and no ``-G``. A CMake whose default generator
-  is Ninja (WinLibs, MSYS2, pip's cmake) rejects a platform argument, the
+  is Ninja (the WinLibs build of CMake is one) rejects a platform argument, the
   configure failed, and the failed configure left a Ninja cache in the build
   tree that CMake then refused to reconfigure with any other generator.
 * The host compiles with ``/Zc:preprocessor`` and ``/WX``. winbase.h in Windows
