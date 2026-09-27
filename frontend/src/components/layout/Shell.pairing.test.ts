@@ -251,4 +251,29 @@ assert.match(
     'that notice is what the affected device actually sees',
 );
 
+// ── revoking the links handed out so far ───────────────────────────────────
+//
+// The token now rides the Share URL as well as the companion link, so a link
+// that went somewhere it should not must be revocable from the same panel.
+// POST /api/pairing/token/regenerate existed with no UI calling it.
+const revokeStart = source.indexOf('const revokePairing = async');
+assert.ok(revokeStart >= 0, 'the share panel must offer a way to replace the pairing token');
+const revokeBody = source.slice(revokeStart, source.indexOf('\n  };', revokeStart));
+assert.match(
+  revokeBody,
+  /fetch\('\/api\/pairing\/token\/regenerate', \{ method: 'POST' \}\)/,
+  'it must call the regenerate route',
+);
+assert.match(
+  revokeBody,
+  /setLanPairingToken\(j\.token\)/,
+  'and adopt the new token, so the QR codes and both links switch to it at once',
+);
+assert.match(
+  revokeBody,
+  /if \(!revokeArmed\) \{\s*setRevokeArmed\(true\);\s*return;/,
+  'the first click only arms it: replacing the token un-pairs every paired device',
+);
+assert.match(source, /'Confirm: old links stop working'/, 'the armed button says what the second click does');
+
 console.log('Shell.pairing: all assertions passed');
