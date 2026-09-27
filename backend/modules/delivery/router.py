@@ -56,7 +56,8 @@ assert set(CODEC_ARGS) == {"wav", "flac", "mp3", "aac", "m4a", "opus", "ogg"}
 # codecs take their highest bitrate or quality (MP3 320k CBR, AAC 320k, Opus
 # 510k, Vorbis q10), WAV is 32-bit float so a float master keeps its overs,
 # and FLAC takes its tightest compression (identical audio, smaller file).
-# Quality "high" is CODEC_ARGS.
+# libopus accepts at most 256 kbps per channel, so a mono file gets 256k
+# (see _opus_max_bitrate). Quality "high" is CODEC_ARGS.
 CODEC_ARGS_MAX: dict[str, list[str]] = {
     "wav": ["-c:a", "pcm_f32le"],
     "flac": ["-c:a", "flac", "-compression_level", "12"],
@@ -69,12 +70,37 @@ CODEC_ARGS_MAX: dict[str, list[str]] = {
 assert set(CODEC_ARGS_MAX) == set(CODEC_ARGS)
 
 
+OPUS_MAX_BPS = 510_000
+OPUS_MAX_BPS_PER_CHANNEL = 256_000
+
+
+async def _opus_max_bitrate(inp: Path) -> int:
+    """The highest bitrate libopus accepts for this input: 510 kbps, capped at
+    256 kbps per channel. libopus rejects anything above the per-channel cap
+    ("Invalid argument"), so 510k failed every mono upload. When the channel
+    count cannot be probed, 256k, which every channel count accepts."""
+    from backend.modules.analysis.ffprobe import probe_file
+
+    try:
+        info = await asyncio.to_thread(probe_file, inp)
+        channels = int((info.get("_summary") or {}).get("channels") or 0)
+    except Exception:
+        log.warning("codec_matrix: could not probe %s for its channel count", inp)
+        channels = 0
+    if channels < 1:
+        return OPUS_MAX_BPS_PER_CHANNEL
+    return min(OPUS_MAX_BPS, OPUS_MAX_BPS_PER_CHANNEL * channels)
+
+
 async def _codec_matrix(inp: Path, out: Path, params: dict) -> None:
     """Encode at the Quality the page asks for; the dropdown was declared and
     never read, so "max" encoded exactly like "high"."""
     ext = out.suffix.lstrip(".").lower()
-    table = CODEC_ARGS_MAX if params.get("quality", "high") == "max" else CODEC_ARGS
-    await ffmpeg.render(inp, out, [], extra_out_args=table.get(ext, []))
+    quality_max = params.get("quality", "high") == "max"
+    args = list((CODEC_ARGS_MAX if quality_max else CODEC_ARGS).get(ext, []))
+    if quality_max and ext == "opus":
+        args[args.index("-b:a") + 1] = str(await _opus_max_bitrate(inp))
+    await ffmpeg.render(inp, out, [], extra_out_args=args)
 
 
 def _hq_src(params: dict) -> list[str]:
@@ -453,7 +479,9 @@ async def _metadata(inp: Path, out: Path, params: dict) -> None:
 # server-wide, the one being asked for included. /process (module_base.py)
 # returns exactly one file per request, so a batch is a run of requests (one
 # per stem, format or platform) and Jobs is how many of them encode side by
-# side. The knob's own range (1-8) is the server-wide ceiling: no request can
+# side. Every running render's Jobs value holds for as long as it runs: a
+# render that asked for Jobs=1 runs alone, even when later requests ask for
+# more. The knob's own range (1-8) is the server-wide ceiling: no request can
 # raise concurrency past 8, whatever it sends.
 BATCH_JOBS_MAX = 8
 BATCH_JOBS_DEFAULT = 4
@@ -462,19 +490,25 @@ BATCH_JOBS_DEFAULT = 4
 class _ExportJobGate:
     """First-come admission for Batch Export renders on one event loop.
 
-    A request waits until it is the oldest one waiting and fewer than its own
-    Jobs value are running; a waiter that is cancelled (client gone) leaves
-    the queue, so it never blocks the requests behind it.
+    A request waits until it is the oldest one waiting and fewer renders are
+    running than both its own Jobs value and the lowest Jobs value among the
+    renders already running, so no running render ever has more company than
+    it asked for. A waiter that is cancelled (client gone) leaves the queue,
+    so it never blocks the requests behind it.
     """
 
     def __init__(self) -> None:
-        self._running = 0
+        # the Jobs value of each render running now, one entry per render
+        self._limits: list[int] = []
         self._queue: deque[object] = deque()
         self._cond = asyncio.Condition()
 
     @property
     def running(self) -> int:
-        return self._running
+        return len(self._limits)
+
+    def _admits(self, jobs: int) -> bool:
+        return len(self._limits) < min([jobs, *self._limits])
 
     @contextlib.asynccontextmanager
     async def slot(self, jobs: int):
@@ -483,21 +517,21 @@ class _ExportJobGate:
             self._queue.append(ticket)
             try:
                 await self._cond.wait_for(
-                    lambda: self._queue[0] is ticket and self._running < jobs
+                    lambda: self._queue[0] is ticket and self._admits(jobs)
                 )
             except BaseException:
                 self._queue.remove(ticket)
                 self._cond.notify_all()
                 raise
             self._queue.popleft()
-            self._running += 1
+            self._limits.append(jobs)
             # the next waiter may fit too
             self._cond.notify_all()
         try:
             yield
         finally:
             async with self._cond:
-                self._running -= 1
+                self._limits.remove(jobs)
                 self._cond.notify_all()
 
 
@@ -659,7 +693,7 @@ TOOLS: list[ToolSpec] = [
         engine="ffmpeg encoders",
         handler=_batch_export,
         description=(
-            "Encode to the requested output format. Jobs sets how many Batch "
+            "Encode to the requested output format. Jobs caps how many Batch "
             "Export renders run at once, this one included; the rest wait "
             "their turn."
         ),
@@ -673,7 +707,7 @@ TOOLS: list[ToolSpec] = [
                 "",
                 "ParamKnob",
                 "Jobs",
-                help="How many Batch Export renders may run at the same time, this one included.",
+                help="The most Batch Export renders that may run while this one runs, this one included.",
             )
         ],
     ),

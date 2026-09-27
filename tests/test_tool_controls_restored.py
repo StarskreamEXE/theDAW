@@ -666,3 +666,111 @@ def test_batch_export_cancelled_waiter_does_not_block_the_queue(monkeypatch, tmp
 
     asyncio.run(scenario())
     assert started == ["a.wav", "c.wav"]
+
+
+def _held_renders(monkeypatch) -> dict:
+    """Swap ffmpeg.render for a fake that holds each render until its
+    ``release[name]`` event is set, and records which renders overlapped."""
+    state = {"running": set(), "company": {}, "release": {}, "started": []}
+
+    async def _render(inp, out, filter_args, extra_out_args=None, timeout=600.0):
+        name = out.stem
+        state["started"].append(name)
+        state["running"].add(name)
+        for other in state["running"]:
+            state["company"].setdefault(other, set()).update(state["running"])
+        event = state["release"].get(name)
+        if event is not None:
+            await event.wait()
+        else:
+            await asyncio.sleep(0.02)
+        state["running"].discard(name)
+        out.write_bytes(b"fake-render")
+        return out
+
+    monkeypatch.setattr(delivery_router.ffmpeg, "render", _render)
+    return state
+
+
+def test_batch_export_jobs_1_render_runs_alone_when_jobs_8_requests_follow(
+    monkeypatch, tmp_path
+):
+    """One page asks for a render at Jobs=1; while it runs, another page
+    sends five renders at Jobs=8. The gate checked only each arrival's own
+    value, so all five joined the Jobs=1 render (six at once). Now the five
+    wait for it to finish, then run side by side."""
+    state = _held_renders(monkeypatch)
+    src = _write(tmp_path / "in.wav", np.zeros(SR // 10))
+
+    async def scenario():
+        state["release"]["solo"] = asyncio.Event()
+        solo = asyncio.create_task(
+            delivery_router._batch_export(
+                src, tmp_path / "solo.wav", {"parallelJobs": 1}
+            )
+        )
+        await asyncio.sleep(0.01)
+        wide = [
+            asyncio.create_task(
+                delivery_router._batch_export(
+                    src, tmp_path / f"wide{i}.wav", {"parallelJobs": 8}
+                )
+            )
+            for i in range(5)
+        ]
+        await asyncio.sleep(0.05)
+        assert state["started"] == ["solo"]
+        assert delivery_router._batch_gate().running == 1
+        state["release"]["solo"].set()
+        await asyncio.wait_for(asyncio.gather(solo, *wide), timeout=2.0)
+        assert delivery_router._batch_gate().running == 0
+
+    asyncio.run(scenario())
+    assert state["company"]["solo"] == {"solo"}
+    assert state["company"]["wide0"] == {f"wide{i}" for i in range(5)}
+
+
+def test_batch_export_jobs_1_arrival_waits_for_the_running_renders(
+    monkeypatch, tmp_path
+):
+    """Two Jobs=8 renders are running when a Jobs=1 render arrives, with
+    another Jobs=8 render behind it. The Jobs=1 render waits until both
+    finish and then runs alone; the one behind it keeps its place in line."""
+    state = _held_renders(monkeypatch)
+    src = _write(tmp_path / "in.wav", np.zeros(SR // 10))
+    wide = {"parallelJobs": 8}
+
+    async def scenario():
+        for name in ("w0", "w1", "solo"):
+            state["release"][name] = asyncio.Event()
+        first = [
+            asyncio.create_task(
+                delivery_router._batch_export(src, tmp_path / f"{n}.wav", wide)
+            )
+            for n in ("w0", "w1")
+        ]
+        await asyncio.sleep(0.01)
+        solo = asyncio.create_task(
+            delivery_router._batch_export(
+                src, tmp_path / "solo.wav", {"parallelJobs": 1}
+            )
+        )
+        await asyncio.sleep(0.01)
+        late = asyncio.create_task(
+            delivery_router._batch_export(src, tmp_path / "late.wav", wide)
+        )
+        await asyncio.sleep(0.05)
+        assert state["started"] == ["w0", "w1"]
+        state["release"]["w0"].set()
+        await asyncio.sleep(0.05)
+        assert state["started"] == ["w0", "w1"]
+        state["release"]["w1"].set()
+        await asyncio.sleep(0.05)
+        assert state["started"] == ["w0", "w1", "solo"]
+        state["release"]["solo"].set()
+        await asyncio.wait_for(asyncio.gather(*first, solo, late), timeout=2.0)
+
+    asyncio.run(scenario())
+    assert state["started"] == ["w0", "w1", "solo", "late"]
+    assert state["company"]["solo"] == {"solo"}
+

@@ -408,14 +408,15 @@ def test_metadata_wav_tagging_keeps_valid_riff_container(tmp_path: Path, monkeyp
 
 
 # ---------------------------------------------------------------------------
-# FX-006b — Batch Export: single-file encode; Jobs sets the concurrency
+# FX-006b — Batch Export: single-file encode; Jobs caps the concurrency
 # ---------------------------------------------------------------------------
 #
 # /process returns exactly one file, so Batch Export renders only the
 # requested output_format (no per-call multi-format encode). Its Jobs knob
-# (parallelJobs, main's 1-8, default 4) sets how many Batch Export renders
-# run at once, server-wide, with one admission gate per event loop; 8 is the
-# ceiling no request can raise.
+# (parallelJobs, main's 1-8, default 4) caps how many Batch Export renders
+# run at once, server-wide, with one admission gate per event loop; every
+# running render's cap holds while it runs, and 8 is the ceiling no request
+# can raise.
 
 
 def test_batch_export_produces_only_the_requested_file(tmp_path: Path, monkeypatch):
@@ -830,6 +831,44 @@ def test_codec_matrix_quality_max_encodes_at_the_top_setting(tmp_path: Path):
     assert top.bitrate == 320000
     assert top.bitrate_mode != BitrateMode.VBR
     assert MP3(str(tmp_path / "high.mp3")).info.bitrate_mode == BitrateMode.VBR
+
+
+def test_codec_matrix_quality_max_encodes_a_mono_upload_to_opus(
+    tmp_path: Path, monkeypatch
+):
+    """Quality "max" asked libopus for 510 kbps on every file, and libopus
+    takes at most 256 kbps per channel, so a mono upload to Opus failed the
+    render ("Invalid argument") while the same upload at "high" encoded. The
+    page's sequence: a mono upload at "high", then at "max", then a stereo
+    upload at "max"; every render comes back, each at the top bitrate its
+    channel count allows."""
+    _needs_ffmpeg()
+    from mutagen.oggopus import OggOpus
+
+    asked: list[str] = []
+    real_render = delivery_router.ffmpeg.render
+
+    async def _spy(inp, out, filter_args, extra_out_args=None, timeout=600.0):
+        args = list(extra_out_args or [])
+        asked.append(args[args.index("-b:a") + 1])
+        return await real_render(inp, out, filter_args, extra_out_args, timeout)
+
+    monkeypatch.setattr(delivery_router.ffmpeg, "render", _spy)
+    mono = tmp_path / "mono.wav"
+    sf.write(str(mono), _tone(seconds=1.0), SR, subtype="PCM_16")
+    stereo = tmp_path / "stereo.wav"
+    sf.write(str(stereo), np.stack([_tone(seconds=1.0)] * 2, axis=1), SR)
+    with _metadata_client() as client:
+        renders = [
+            _codec_matrix_post(client, mono, "high", "opus"),
+            _codec_matrix_post(client, mono, "max", "opus"),
+            _codec_matrix_post(client, stereo, "max", "opus"),
+        ]
+
+    assert asked == ["192k", "256000", "510000"]
+    for i, (data, channels) in enumerate(zip(renders, (1, 1, 2))):
+        (tmp_path / f"r{i}.opus").write_bytes(data)
+        assert OggOpus(str(tmp_path / f"r{i}.opus")).info.channels == channels
 
 
 def test_metadata_wav_to_wav_still_copies(tmp_path: Path, monkeypatch):
