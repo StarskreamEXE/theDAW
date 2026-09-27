@@ -16,9 +16,11 @@
  * Nothing in the app imports this file.
  */
 
-/** An AudioParam that takes every scheduling call and keeps the last value. */
+/** An AudioParam that takes every scheduling call, keeps the last value and
+ *  records every value it was sent in `history`. */
 function fakeParam(): Record<string, unknown> {
-  const p: Record<string, unknown> = { value: 0 };
+  const history: number[] = [];
+  const p: Record<string, unknown> = { value: 0, history };
   for (const name of [
     'setValueAtTime',
     'linearRampToValueAtTime',
@@ -27,7 +29,10 @@ function fakeParam(): Record<string, unknown> {
     'cancelScheduledValues',
   ]) {
     p[name] = (v: unknown) => {
-      if (typeof v === 'number') p.value = v;
+      if (typeof v === 'number') {
+        p.value = v;
+        history.push(v);
+      }
       return p;
     };
   }
@@ -73,6 +78,15 @@ export interface FakeAudioBuffer {
   getChannelData: (ch: number) => Float32Array;
 }
 
+/** The fake key-lock insert (`signalsmith-stretch`'s node): records what the
+ *  engine asks of it. */
+export interface FakeStretch {
+  /** Every `schedule({...})` call, in order. */
+  schedules: Array<Record<string, unknown>>;
+  /** Every remote call by name, in order. */
+  calls: string[];
+}
+
 export interface DjEngineRig {
   /** Every URL fetched, in order. */
   fetches: string[];
@@ -92,6 +106,19 @@ export interface DjEngineRig {
   page: string[];
   /** Wait for every pending promise job and timer tick. */
   settle: () => Promise<void>;
+  /** The delay-line `delayTime` of every Delay node the engine built, in
+   *  creation order (a deck builds one; the first deck built is first). */
+  delays: Array<{ value: number; history: number[] }>;
+  /** The `gain` of every BiquadFilter the engine built, in creation order. A
+   *  deck builds its low, mid and high EQ bands first, then its DJ filter. */
+  biquadGains: Array<{ value: number; history: number[] }>;
+  /** Every AudioBufferSourceNode the engine started, in order. Call the last
+   *  one's `onended` to replay a track reaching its natural end. */
+  sources: Array<{ onended: (() => void) | null }>;
+  /** Key-lock inserts. Set `hold` before a first engage to keep the
+   *  stretcher "loading" until `releaseStretch()`. */
+  stretch: { hold: boolean; latency: number; nodes: FakeStretch[] };
+  releaseStretch: () => Promise<void>;
 }
 
 /** Install the rig on `globalThis`. `sampleRate` is the fake engine's rate. */
@@ -104,6 +131,11 @@ export function installDjEngineRig(sampleRate = 48000): DjEngineRig {
   const held = new Map<string, () => void>();
   const page: string[] = [];
   const audioUrlOf = (entryId: string) => `/api/library/audio/${entryId}.wav`;
+  const delays: Array<{ value: number; history: number[] }> = [];
+  const biquadGains: Array<{ value: number; history: number[] }> = [];
+  const sources: Array<{ onended: (() => void) | null }> = [];
+  const stretch = { hold: false, latency: 0.08, nodes: [] as FakeStretch[] };
+  const readyWaiters: Array<() => void> = [];
 
   class FakeAudioContext {
     sampleRate = sampleRate;
@@ -116,13 +148,25 @@ export function installDjEngineRig(sampleRate = 48000): DjEngineRig {
       return Promise.resolve();
     }
     createGain() { return new FakeNode(); }
-    createBiquadFilter() { return new FakeNode(); }
-    createDelay() { return new FakeNode(); }
+    createBiquadFilter() {
+      const n = new FakeNode();
+      biquadGains.push(n.gain as unknown as { value: number; history: number[] });
+      return n;
+    }
+    createDelay() {
+      const n = new FakeNode();
+      delays.push(n.delayTime as unknown as { value: number; history: number[] });
+      return n;
+    }
     createDynamicsCompressor() { return new FakeNode(); }
     createMediaStreamDestination() { return new FakeNode(); }
     createAnalyser() { return new FakeNode(); }
     createMediaElementSource() { return new FakeNode(); }
-    createBufferSource() { return new FakeNode(); }
+    createBufferSource() {
+      const n = new FakeNode();
+      sources.push(n);
+      return n;
+    }
     createConvolver() { return new FakeNode(); }
     createBuffer(channels: number, length: number, rate: number) {
       return fakeBuffer('', length / rate, channels, rate);
@@ -145,6 +189,32 @@ export function installDjEngineRig(sampleRate = 48000): DjEngineRig {
       url,
       getChannelData: () => new Float32Array(16),
     };
+  }
+
+  // What `signalsmith-stretch` builds: an AudioWorkletNode whose port answers
+  // a 'ready' handshake, then one reply per remote call.
+  class FakeStretchNode extends FakeNode implements FakeStretch {
+    schedules: Array<Record<string, unknown>> = [];
+    calls: string[] = [];
+    port: { onmessage: ((e: { data: unknown[] }) => void) | null; postMessage: (msg: unknown[]) => void };
+    constructor() {
+      super();
+      const port = {
+        onmessage: null as ((e: { data: unknown[] }) => void) | null,
+        postMessage: (msg: unknown[]) => {
+          const [id, key, ...args] = msg as [number, string, ...unknown[]];
+          this.calls.push(key);
+          if (key === 'schedule') this.schedules.push(args[0] as Record<string, unknown>);
+          const reply = key === 'latency' ? stretch.latency : undefined;
+          queueMicrotask(() => port.onmessage?.({ data: [id, reply] }));
+        },
+      };
+      this.port = port;
+      stretch.nodes.push(this);
+      const ready = () => port.onmessage?.({ data: ['ready', { schedule: 1, start: 5, stop: 1, latency: 0 }] });
+      if (stretch.hold) readyWaiters.push(ready);
+      else setTimeout(ready, 0);
+    }
   }
 
   class FakeAudioElement {
@@ -206,6 +276,7 @@ export function installDjEngineRig(sampleRate = 48000): DjEngineRig {
     removeEventListener() {},
   };
   g.Audio = FakeAudioElement;
+  g.AudioWorkletNode = FakeStretchNode;
   // The engine re-arms rAF while a deck plays; a frame that never fires keeps
   // the test in charge of time.
   g.requestAnimationFrame = () => 1;
@@ -232,5 +303,14 @@ export function installDjEngineRig(sampleRate = 48000): DjEngineRig {
     },
     page,
     settle,
+    delays,
+    biquadGains,
+    sources,
+    stretch,
+    releaseStretch: async () => {
+      stretch.hold = false;
+      for (const ready of readyWaiters.splice(0)) ready();
+      await settle();
+    },
   };
 }
