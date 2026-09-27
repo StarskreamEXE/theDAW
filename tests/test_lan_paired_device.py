@@ -259,6 +259,39 @@ def test_process_keeps_a_paired_device_inside_the_project_roots(
     assert kept.is_file()
 
 
+def test_a_paired_device_writing_a_stem_back_over_itself_never_truncates_it(
+    paired: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MIX on a paired device renders a stem in place: output_path is the
+    stem it read. The encode dies partway; the stem must still be whole."""
+    import soundfile
+
+    monkeypatch.setattr(vst_router, "process_chain", lambda ids, audio, sr: audio)
+    stem = _projects_dir() / "stems" / "vox.wav"
+    stem.parent.mkdir(parents=True)
+    stem.write_bytes(_wav_bytes())
+    before = stem.read_bytes()
+
+    def truncate_then_fail(file, *args, **kwargs):
+        with open(file, "wb") as fh:
+            fh.write(b"RIFF")
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(soundfile, "write", truncate_then_fail)
+    resp = paired.post(
+        "/api/vst/process",
+        json={
+            "instance_ids": ["i1"],
+            "audio_path": str(stem),
+            "output_path": str(stem),
+        },
+    )
+    assert resp.status_code == 500, resp.text
+    assert "disk full" in resp.json()["detail"]
+    assert stem.read_bytes() == before
+    assert sorted(p.name for p in stem.parent.iterdir()) == ["vox.wav"]
+
+
 # ---------------------------------------------------------------------------
 # Recent projects on a paired device
 # ---------------------------------------------------------------------------
