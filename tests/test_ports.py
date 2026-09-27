@@ -371,6 +371,55 @@ def test_free_stops_a_stale_sidecar_left_running_from_its_project_folder(
         proc.wait(timeout=10)
 
 
+#: A stand-in backend.run that starts a sidecar the way the real backend does:
+#: as its own child, in the sidecar's project folder. It prints the sidecar's
+#: port and keeps running, as a live backend does.
+_BACKEND_WITH_SIDECAR = (
+    "import subprocess, sys, time\n"
+    "sidecar = subprocess.Popen([sys.executable, 'server.ts'], cwd=sys.argv[1],\n"
+    "                           stdout=subprocess.PIPE, text=True)\n"
+    "print(sidecar.stdout.readline().strip(), flush=True)\n"
+    "time.sleep(120)\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("backend_folder", "expect_stopped"),
+    [
+        # theDAW-Pinokio beside this checkout, running, with Lyria from the
+        # clone both checkouts share.
+        ("theDAW-Pinokio", False),
+        # This checkout's own backend and its Lyria.
+        ("theDAW", True),
+    ],
+)
+def test_free_leaves_a_shared_sidecar_to_the_checkout_whose_backend_runs_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend_folder: str,
+    expect_stopped: bool,
+):
+    """Lyria from Dev/lyria-3-pro is the project folder of every checkout beside
+    it. With theDAW-Pinokio running, this checkout's ``--free --all-ports``
+    left the Pinokio backend alone but stopped the Lyria it was using, since
+    the folder was all the match looked at."""
+    here = _fake_checkout(tmp_path / "theDAW")
+    monkeypatch.setattr(ports, "repo_root", lambda: here)
+    shared = _sidecar_project(tmp_path / "lyria-3-pro", "server.ts")
+    monkeypatch.setenv("theDAW_LYRIA_PROJECT", str(shared))
+    owner = tmp_path / backend_folder
+    if owner != here:
+        _fake_checkout(owner)
+    (owner / "backend" / "run.py").write_text(_BACKEND_WITH_SIDECAR, encoding="utf-8")
+
+    with _listening_child(owner, ["-m", "backend.run", str(shared)]) as (backend, port):
+        sidecar = next(h for h in ports.holders([port]) if h.pid != backend.pid).pid
+        stopped, _refused = ports.free_ports([port])
+        assert [h.pid for h in stopped] == ([sidecar] if expect_stopped else [])
+        assert psutil.pid_exists(sidecar) is not expect_stopped
+        assert backend.poll() is None
+
+
 def test_free_leaves_the_same_entry_point_alone_outside_the_sidecar_folder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -501,7 +550,9 @@ def test_still_the_same_process_rejects_a_recycled_pid():
 
 
 def test_free_ports_never_kills_a_foreign_listener(bound_port: int, monkeypatch):
-    monkeypatch.setattr(ports, "_is_ours", lambda name, cmdline, cwd="": False)
+    monkeypatch.setattr(
+        ports, "_is_ours", lambda name, cmdline, cwd="", pid=None: False
+    )
     stopped, refused = ports.free_ports([bound_port])
     assert stopped == []
     assert ports.is_port_free(bound_port) is False
@@ -509,7 +560,7 @@ def test_free_ports_never_kills_a_foreign_listener(bound_port: int, monkeypatch)
 
 
 def test_free_ports_skips_this_very_process(bound_port: int, monkeypatch):
-    monkeypatch.setattr(ports, "_is_ours", lambda name, cmdline, cwd="": True)
+    monkeypatch.setattr(ports, "_is_ours", lambda name, cmdline, cwd="", pid=None: True)
     stopped, _refused = ports.free_ports([bound_port])
     assert all(h.pid != os.getpid() for h in stopped)
     assert ports.is_port_free(bound_port) is False
@@ -675,7 +726,9 @@ def test_every_user_facing_message_is_ascii(bound_port: int, monkeypatch, capsys
     ports._main(["--check"])
     capsys.readouterr().out.encode("ascii")
 
-    monkeypatch.setattr(ports, "_is_ours", lambda name, cmdline, cwd="": False)
+    monkeypatch.setattr(
+        ports, "_is_ours", lambda name, cmdline, cwd="", pid=None: False
+    )
     ports._main(["--free"])
     capsys.readouterr().out.encode("ascii")
 

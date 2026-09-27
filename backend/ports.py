@@ -39,9 +39,12 @@ sibling such as ``theDAW-Pinokio`` or a ``theDAW-<branch>`` worktree beside
 this checkout is somebody else.
 
 theDAW's Node sidecars are matched the same way against their OWN project
-folders: Lyria and VJ normally run from a checkout beside this one
-(``lyria-3-pro``, ``GANTASMO-LIVE-VJ``), and the Lyria and Foundry listeners run
-``tsx server.ts`` or ``node dist/server.cjs``, which name no backend entry point.
+folders: Lyria and VJ run from a bundled folder inside this checkout or, when
+that is missing, from a clone beside it (``lyria-3-pro``, ``GANTASMO-LIVE-VJ``),
+and the Lyria and Foundry listeners run ``tsx server.ts`` or
+``node dist/server.cjs``, which name no backend entry point. A clone beside the
+checkout is shared by every checkout next to it, so a sidecar whose parent
+chain leads to another checkout's running backend is that checkout's.
 
 The PID is revalidated against the process creation time immediately before any
 signal. A PID identified during the scan can exit and be reused by the OS before
@@ -137,12 +140,17 @@ def frontend_port() -> int:
 # _is_ours, which also requires the process to live in this checkout.
 _OUR_EXE_HINTS = ("python", "pythonw", "node", "uv", "electron", "thedaw")
 
-# Entry points that identify one of OUR processes, once the checkout matches.
-_OUR_CMDLINE_HINTS = (
+# The backend's own entry points: what a process that starts sidecars runs.
+_BACKEND_ENTRY_POINTS = (
     "backend.run",
     "backend._supervisor",
     "backend._devstack",
     "backend.server",
+)
+
+# Entry points that identify one of OUR processes, once the checkout matches.
+_OUR_CMDLINE_HINTS = (
+    *_BACKEND_ENTRY_POINTS,
     "vite",
     "npm",
 )
@@ -220,14 +228,48 @@ def _sidecar_folders() -> list[tuple[Path, tuple[str, ...]]]:
     return found
 
 
-def _is_our_sidecar(cmdline: str, cwd: str) -> bool:
-    """Is this listener one of theDAW's sidecars, running from its own folder?"""
+def _started_by_another_checkout(pid: int) -> bool:
+    """Was process ``pid`` started by a backend running from another checkout?
+
+    Walks the parent chain to the nearest process that runs a backend entry
+    point and asks whether that backend is this checkout's. Lyria and VJ can
+    run from a folder BESIDE the repository (``Dev/lyria-3-pro``), and every
+    checkout beside it -- theDAW-Pinokio, a worktree -- resolves to that same
+    folder, so the folder alone cannot say whose a running sidecar is. A
+    sidecar whose backend is gone (the stale case ``--free`` exists for) or
+    was this checkout's has no such parent, and anything unreadable counts as
+    no such parent too.
+    """
+    try:
+        import psutil
+
+        chain = psutil.Process(pid).parents()
+    except Exception:
+        return False
+    for parent in chain:
+        try:
+            cmd = _norm(" ".join(parent.cmdline()))
+        except (psutil.Error, OSError):
+            continue
+        if not any(hint in cmd for hint in _BACKEND_ENTRY_POINTS):
+            continue
+        try:
+            cwd = parent.cwd()
+        except (psutil.Error, OSError):
+            cwd = ""
+        return not (_same_tree(cmd) or _same_tree(cwd))
+    return False
+
+
+def _is_our_sidecar(cmdline: str, cwd: str, pid: Optional[int] = None) -> bool:
+    """Is this listener one of theDAW's sidecars, running from its own folder
+    and not started by another checkout's backend?"""
     low_cmd = (cmdline or "").lower()
     for folder, entries in _sidecar_folders():
         if not any(entry in low_cmd for entry in entries):
             continue
         if _names_folder(folder, low_cmd) or _names_folder(folder, cwd or ""):
-            return True
+            return pid is None or not _started_by_another_checkout(pid)
     return False
 
 
@@ -306,7 +348,7 @@ def is_port_free(port: int, host: str = "0.0.0.0") -> bool:
         return probe.connect_ex(("127.0.0.1", port)) != 0
 
 
-def _is_ours(name: str, cmdline: str, cwd: str = "") -> bool:
+def _is_ours(name: str, cmdline: str, cwd: str = "", pid: Optional[int] = None) -> bool:
     """Is this process theDAW's, running from THIS checkout?
 
     All three of these have to agree, because ``--free`` kills what it matches:
@@ -316,7 +358,8 @@ def _is_ours(name: str, cmdline: str, cwd: str = "") -> bool:
     matched, and ``--free`` would have killed an unrelated project's.
 
     A sidecar passes the same three checks against its own entry points and its
-    own project folder (see ``_SIDECARS``).
+    own project folder (see ``_SIDECARS``), and with ``pid`` given it must not
+    have been started by another checkout's backend.
     """
     low_name = (name or "").lower()
     low_cmd = (cmdline or "").lower()
@@ -326,7 +369,7 @@ def _is_ours(name: str, cmdline: str, cwd: str = "") -> bool:
         _same_tree(low_cmd) or _same_tree(cwd or "")
     ):
         return True
-    return _is_our_sidecar(low_cmd, cwd or "")
+    return _is_our_sidecar(low_cmd, cwd or "", pid)
 
 
 # Where macOS and most Linux distributions keep lsof, for a launcher whose PATH
@@ -436,7 +479,7 @@ def holders(ports: Iterable[int]) -> list[Holder]:
                 pid=pid,
                 name=name or "?",
                 cmdline=cmdline,
-                ours=_is_ours(name, cmdline, cwd),
+                ours=_is_ours(name, cmdline, cwd, pid),
                 create_time=created,
                 cwd=cwd,
             )
