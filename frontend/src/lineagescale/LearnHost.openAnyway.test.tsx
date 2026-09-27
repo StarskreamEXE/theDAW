@@ -159,6 +159,30 @@ async function main(): Promise<void> {
     assert.deepEqual(mounted(), ['classic'], 'pressing it opens the classic graph');
     assert.equal(dom.window.sessionStorage.getItem('thedaw.learnMode'), 'classic', 'and the pick is remembered');
     await act(async () => root.unmount());
+
+    // A reload with "classic" remembered, and the summary failing again (a
+    // 503 while the library opens): the scale view opens, the Classic tab is
+    // one press away, and the remembered choice alone mounts nothing.
+    const again = createRoot(host);
+    await act(async () =>
+      again.render(
+        <LearnHost
+          visible
+          loadSummary={async () => {
+            throw new Error('HTTP 503');
+          }}
+          scaleView={Scale}
+          classicView={Classic}
+        />,
+      ),
+    );
+    await settle();
+    assert.deepEqual(mounted(), ['scale'], 'a fresh mount on an unknown size opens the scale view');
+    assert.equal(button('Classic graph')!.disabled, false, 'with the Classic tab still offered');
+    await act(async () => button('Classic graph')!.click());
+    await settle();
+    assert.deepEqual(mounted(), ['classic'], 'and a press on this mount opens it');
+    await act(async () => again.unmount());
   }
 
   // ── a small library: nothing changed ────────────────────────────────────

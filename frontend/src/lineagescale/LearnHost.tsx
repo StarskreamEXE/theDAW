@@ -26,7 +26,10 @@ import { formatCount } from './lineageScaleModel';
  * still opening, a dropped request — leaves the library's size unknown. The
  * scale view opens, the failure is said with a Retry, and the Classic tab is
  * enabled with a warning that the size is unknown: not knowing the size is a
- * reason to say so, not to take the view away.
+ * reason to say so, not to take the view away. Only a pick made on this mount
+ * opens the classic view then; a choice remembered from before a reload does
+ * not, because a reload is how a user leaves a drawing that stopped
+ * responding, and a 503 while the library opens must not put them back in it.
  *
  * The props are the ones `DAWCenterPanel` already passes to `LineageView`, so
  * mounting this instead is a one-line change at the import.
@@ -77,8 +80,9 @@ export const classicUnknownSizeReason =
  * the classic one is what starts the whole-library request.
  *
  *  * `failed` — the route answered something other than 404. The size is
- *    unknown: the scale view opens unless the user picked the classic one,
- *    and the Classic tab is enabled with the unknown-size warning.
+ *    unknown: the scale view opens unless the user picked the classic one on
+ *    this mount (`picked`; `remembered` alone does not count), and the
+ *    Classic tab is enabled with the unknown-size warning.
  *  * `summary === null` and not `failed` — a 404: a backend that predates this
  *    module. That is the classic view, exactly what this tab did before, with
  *    nothing alarming said.
@@ -94,9 +98,10 @@ export function decideLearnMode(
   remembered: LearnMode | null,
   failed = false,
   openedAnyway = false,
+  picked: LearnMode | null = null,
 ): LearnDecision {
   if (failed) {
-    return { mode: remembered ?? 'scale', classicAllowed: true, reason: classicUnknownSizeReason, canOpenAnyway: false };
+    return { mode: picked ?? 'scale', classicAllowed: true, reason: classicUnknownSizeReason, canOpenAnyway: false };
   }
   if (!summary) return { mode: 'classic', classicAllowed: true, reason: '', canOpenAnyway: false };
   if (!summary.full_view_ok) {
@@ -296,6 +301,8 @@ export interface LearnHostSurfaceProps extends LearnViewProps {
   onRetry?: () => void;
   /** The session's remembered choice, if any. */
   chosen: LearnMode | null;
+  /** The choice made since this host mounted, if any. */
+  picked?: LearnMode | null;
   onSelect: (mode: LearnMode) => void;
   /** The user pressed "Open anyway" past the limit. */
   openedAnyway?: boolean;
@@ -315,10 +322,10 @@ export interface LearnHostSurfaceProps extends LearnViewProps {
  * whole-library request can happen until the user picks it.
  */
 export const LearnHostSurface: React.FC<LearnHostSurfaceProps> = ({
-  read, summary, failure = null, onRetry, chosen, onSelect, openedAnyway = false, onOpenAnyway,
+  read, summary, failure = null, onRetry, chosen, picked = null, onSelect, openedAnyway = false, onOpenAnyway,
   rootEntryId = null, visible = true, scaleView, classicView,
 }) => {
-  const decision = decideLearnMode(summary, chosen, failure !== null, openedAnyway);
+  const decision = decideLearnMode(summary, chosen, failure !== null, openedAnyway, picked);
   const Scale = scaleView ?? DefaultScaleView;
   const Classic = classicView ?? DefaultClassicView;
 
@@ -389,6 +396,8 @@ export const LearnHost: React.FC<LearnHostProps> = ({
 }) => {
   const [state, setState] = useState<SummaryReadState>(UNREAD_SUMMARY);
   const [chosen, setChosen] = useState<LearnMode | null>(() => rememberedMode());
+  // The pick made on this mount, which is all a failed summary honours.
+  const [picked, setPicked] = useState<LearnMode | null>(null);
   // "Open anyway" past the limit. Held here, not in storage: the tab stays
   // mounted while theDAW runs, so the press lasts across tab switches, and a
   // reload (the way out of a drawing that stopped responding) opens the scale
@@ -415,6 +424,7 @@ export const LearnHost: React.FC<LearnHostProps> = ({
 
   const onSelect = useCallback((mode: LearnMode) => {
     setChosen(mode);
+    setPicked(mode);
     rememberMode(mode);
     // Going back to the scale view puts the Classic tab behind "Open anyway"
     // again; picking Classic keeps a press that is already in effect.
@@ -432,6 +442,7 @@ export const LearnHost: React.FC<LearnHostProps> = ({
       failure={failure}
       onRetry={onRetry}
       chosen={chosen}
+      picked={picked}
       onSelect={onSelect}
       openedAnyway={openedAnyway}
       onOpenAnyway={onOpenAnyway}

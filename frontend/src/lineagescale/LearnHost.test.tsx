@@ -353,9 +353,14 @@ const surface = (props: Partial<React.ComponentProps<typeof LearnHostSurface>>):
     { mode: 'scale', classicAllowed: true, reason: classicUnknownSizeReason, canOpenAnyway: false },
   );
   assert.equal(
-    decideLearnMode(null, 'classic', true).mode,
+    decideLearnMode(null, 'classic', true, false, 'classic').mode,
     'classic',
-    'the user’s pick is honoured when the size is unknown',
+    'the user’s pick on this mount is honoured when the size is unknown',
+  );
+  assert.equal(
+    decideLearnMode(null, 'classic', true).mode,
+    'scale',
+    'a choice remembered from before a reload does not mount the classic graph on an unknown size',
   );
 
   // The 404 branch, through the host: classic mounts, no banner.
