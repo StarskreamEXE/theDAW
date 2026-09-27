@@ -1,11 +1,12 @@
+# The code below is a verbatim copy of backend/modules/settings/store.py at
+# PR #207 head 8039b45 (schema 10).
+# The settings round-trip tests open data/settings.json with this older
+# build's own code; never edit it, re-copy it from git instead.
 """App-wide feature settings persisted to ``data/settings.json``.
 
-This is the source of truth for background workflows (auto-analysis,
-auto-stems, auto-midi, shards, lyrics) and the app-wide choices that go with
-them: device slots, model and media folders, the assistant's Claude setup.
-Heavy workflows (stems, midi) default OFF and run only once the user enables
-them; cheap local ones (analysis, shards, lyric timing) default ON. Each
-default below says why.
+This is the source of truth for opt-in background workflows: auto-analysis,
+auto-stems, auto-midi. Defaults are OFF for every toggle so that nothing
+runs automatically until the user explicitly enables it.
 
 The on-disk schema is versioned (``schema_version``) so we can migrate
 fields forward without losing the user's existing choices. Missing keys
@@ -28,7 +29,7 @@ from backend.lib.atomic import atomic_write
 log = logging.getLogger(__name__)
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 10
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -171,21 +172,6 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         # folder actually exists. See _normalize_extra_folders / patch().
         "extra_folders": [],
     },
-    "assistant": {
-        # "Use my Claude settings and MCP servers" (the assistant panel, Claude
-        # Code provider). True: the in-app Claude session loads the user's own
-        # Claude setup -- ~/.claude/settings.json, ~/.claude/CLAUDE.md, their
-        # skills, commands and agents (the CLI's `user` setting source) and
-        # every MCP server they configured -- next to theDAW's relay, as it did
-        # before the permission modes arrived; the user's own allow rules then
-        # approve what they match, except in Read-only mode and for edits to
-        # the assistant's own code (claude_session.permission_rules). False:
-        # only this project's settings and theDAW's own MCP servers. Read by
-        # backend/assistant_routes.py on every turn; see
-        # claude_session.build_base_args. PATCH is loopback/launch-token only
-        # (settings/router.py), a phone on the LAN cannot flip it.
-        "use_user_claude_config": True,
-    },
 }
 
 
@@ -299,24 +285,6 @@ def _merge_defaults(payload: dict[str, Any]) -> dict[str, Any]:
         # section, already filled from DEFAULT_SETTINGS above; this branch
         # re-persists the bumped schema with the field present.
         merged.setdefault("library", deepcopy(DEFAULT_SETTINGS["library"]))
-    if old_version < 11:
-        # Migration v10 → v11: add the `assistant` section
-        # (use_user_claude_config, default ON: the in-app Claude keeps the
-        # user's own settings and MCP servers it always had). New section,
-        # already filled from DEFAULT_SETTINGS above; this branch re-persists
-        # the bumped schema with the field present.
-        merged.setdefault("assistant", deepcopy(DEFAULT_SETTINGS["assistant"]))
-
-    # A hand-edited non-boolean ("no", 0, null) -- or a section that is not an
-    # object at all -- is not a choice the user made in the app; it falls back
-    # to the default rather than being read as truthy or falsy by whoever looks
-    # at it next.
-    if not isinstance(merged.get("assistant"), dict):
-        merged["assistant"] = deepcopy(DEFAULT_SETTINGS["assistant"])
-    if not isinstance(merged["assistant"].get("use_user_claude_config"), bool):
-        merged["assistant"]["use_user_claude_config"] = DEFAULT_SETTINGS["assistant"][
-            "use_user_claude_config"
-        ]
 
     # Hygiene lives in the store, not only on the PATCH path: a hand-edited,
     # restored, or externally written settings.json gets the same str-only /
@@ -409,11 +377,6 @@ class SettingsStore:
                         if not isinstance(v, list):
                             continue
                         v = _normalize_extra_folders(v)
-                    if (section, k) == ("assistant", "use_user_claude_config"):
-                        # A switch: anything but a real boolean is malformed
-                        # and ignored, so it cannot flip the session setup.
-                        if not isinstance(v, bool):
-                            continue
                     target[k] = v
             self._cache["schema_version"] = SCHEMA_VERSION
             self._write(self._cache)

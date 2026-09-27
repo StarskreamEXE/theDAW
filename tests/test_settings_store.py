@@ -52,11 +52,14 @@ def test_v7_file_gains_io_without_losing_existing_choices():
 
     merged = _merge_defaults(old)
 
-    assert merged["schema_version"] == SCHEMA_VERSION == 10
+    assert merged["schema_version"] == SCHEMA_VERSION == 11
     assert merged["io"] == DEFAULT_SETTINGS["io"]
     # v9 -> v10 added the library section; a file that predates it gets the
     # empty list rather than a missing key the media-root index would trip on.
     assert merged["library"] == {"media_roots": []}
+    # v10 -> v11 added the assistant section, ON: the in-app Claude keeps the
+    # user's own Claude settings and MCP servers it had before.
+    assert merged["assistant"] == {"use_user_claude_config": True}
     assert merged["io"] is not DEFAULT_SETTINGS["io"], "must be a deep copy"
     assert merged["app"]["launch_mode"] == "desktop"
     assert merged["stems"]["device"] == "cpu"

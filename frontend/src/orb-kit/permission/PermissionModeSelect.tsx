@@ -52,7 +52,7 @@ export function PermissionModeSelect({ conversationId, compact = false }: Permis
         className={
           compact
             ? 'sr-only'
-            : 'text-[10px] text-muted uppercase tracking-wider'
+            : 'text-xs font-bold text-muted uppercase tracking-wider'
         }
       >
         Permissions
@@ -62,7 +62,7 @@ export function PermissionModeSelect({ conversationId, compact = false }: Permis
         name="assistantPermissionMode"
         value={mode}
         onChange={handleChange}
-        className={`${compact ? 'max-w-40' : 'w-full'} bg-black/30 border border-white/10 rounded px-2 py-1 text-[11px] text-white cursor-pointer hover:border-white/20 focus:outline-none focus:border-primary/50 transition-colors`}
+        className={`${compact ? 'max-w-40' : 'w-full'} bg-black/30 border border-white/10 rounded px-2 py-1 text-xs text-white cursor-pointer hover:border-white/20 focus:outline-none focus:border-primary/50 transition-colors`}
       >
         {PERMISSION_MODE_OPTIONS.map((option) => (
           <option key={option.value} value={option.value} title={option.description} className="bg-black text-white">
