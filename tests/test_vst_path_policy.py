@@ -250,3 +250,87 @@ def test_a_junction_cycle_in_the_root_does_not_hang_the_check(
     with pytest.raises(path_policy.PluginPathError) as exc:
         path_policy.check_plugin_path(str(invented))
     assert exc.value.status == 403
+
+
+# ---------------------------------------------------------------------------
+# The link walk behind a linked plugin's check. A MIX freeze or bounce posts
+# one /process-file per stage and stem, and each post checks the same linked
+# plugin; each check walked every VST3 root again.
+# ---------------------------------------------------------------------------
+
+
+def _unlink_dir(link: Path) -> None:
+    """Remove a directory link made by ``_link_dir``, never its target."""
+    if os.name == "nt":
+        os.rmdir(link)
+    else:
+        link.unlink()
+
+
+@pytest.fixture
+def walks(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Every root the policy walks, in order."""
+    seen: list[Path] = []
+    real = path_policy._walk_vst3_paths
+
+    def counting(root: Path) -> list[Path]:
+        seen.append(root)
+        return real(root)
+
+    monkeypatch.setattr(path_policy, "_walk_vst3_paths", counting)
+    return seen
+
+
+@pytest.mark.skipif(
+    scanner.platform.system() == "Darwin", reason="a macOS bundle has no inner module"
+)
+def test_a_bounce_through_a_linked_plugin_walks_the_roots_once(
+    scanned_root: Path, tmp_path: Path, walks: list[Path]
+) -> None:
+    _link_dir(scanned_root / "Foo.vst3", _real_bundle(tmp_path / "D-drive"))
+    [listed] = _listed_paths()
+
+    # Four stages of a chain on two stems: eight checks of the listed path.
+    for _hop in range(8):
+        assert path_policy.check_plugin_path(listed) == Path(listed).resolve()
+    assert len(walks) == 1
+
+
+@pytest.mark.skipif(
+    scanner.platform.system() == "Darwin", reason="a macOS bundle has no inner module"
+)
+def test_a_link_pointed_elsewhere_stops_vouching_for_its_old_target(
+    scanned_root: Path, tmp_path: Path, walks: list[Path]
+) -> None:
+    old = _real_bundle(tmp_path / "D-drive")
+    link = scanned_root / "Foo.vst3"
+    _link_dir(link, old)
+    [listed] = _listed_paths()
+    assert path_policy.check_plugin_path(listed) == Path(listed).resolve()
+
+    # The owner points the link at a new copy; the old folder stays on disk.
+    _unlink_dir(link)
+    _link_dir(link, _real_bundle(tmp_path / "E-drive"))
+
+    with pytest.raises(path_policy.PluginPathError) as exc:
+        path_policy.check_plugin_path(listed)
+    assert exc.value.status == 403
+    [now_listed] = _listed_paths()
+    assert path_policy.check_plugin_path(now_listed) == Path(now_listed).resolve()
+
+
+@pytest.mark.skipif(
+    scanner.platform.system() == "Darwin", reason="a macOS bundle has no inner module"
+)
+def test_a_plugin_linked_after_a_check_loads_at_once(
+    scanned_root: Path, tmp_path: Path, walks: list[Path]
+) -> None:
+    _link_dir(scanned_root / "Foo.vst3", _real_bundle(tmp_path / "D-drive"))
+    [first] = _listed_paths()
+    assert path_policy.check_plugin_path(first) == Path(first).resolve()
+
+    _link_dir(scanned_root / "Bar.vst3", _real_bundle(tmp_path / "E-drive", "Bar.vst3"))
+    listed = sorted(_listed_paths())
+    [second] = [p for p in listed if p != first]
+    assert path_policy.check_plugin_path(second) == Path(second).resolve()
+    assert len(walks) == 2

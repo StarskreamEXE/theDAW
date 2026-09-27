@@ -21,12 +21,20 @@ inside a root as written and has no ``..`` segment; or the resolved path is
 inside the target of a link the scan itself walks under a root. A link inside a
 VST3 folder is something the machine's owner put there, so its target is a
 plugin location the same way the folder is.
+
+The link targets come from a walk of every root, and a MIX freeze or bounce
+checks the same linked plugin once per stage and stem, so the walk's result is
+kept for ``LINKED_TARGETS_TTL_SEC`` (see ``_linked_targets``). A kept target is
+trusted only after the one link that produced it is re-resolved and still
+leads there; a path no kept target covers always gets a fresh walk.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -104,15 +112,16 @@ def _lexically_inside(raw: str, roots: list[Path]) -> bool:
     return any(root_contains(root, absolute) for root in roots)
 
 
-def linked_plugin_targets(roots: list[Path]) -> Iterator[Path]:
-    """The resolved target of every plugin the scan reaches through a link.
+def _linked_plugin_sources(roots: list[Path]) -> Iterator[tuple[Path, Path]]:
+    """``(link, target)`` for every plugin the scan reaches through a link.
 
     Walks each root with the scanner's own walker (``scanner._walk_vst3_paths``:
     it descends into a junctioned folder the way the scan does, skips a
-    junction cycle, and stops at each bundle), and yields, for each bundle or
-    standalone ``.vst3`` whose resolved form leaves the root, that resolved
-    form. A real bundle whose loadable module is itself a link yields the
-    module's target. These are the paths the scanner lists for linked plugins
+    junction cycle, and stops at each bundle). For each bundle or standalone
+    ``.vst3`` whose resolved form leaves the root, ``link`` is that walked path
+    and ``target`` its resolved form. A real bundle whose loadable module is
+    itself a link gives the module path and the module's target. The targets
+    are the paths the scanner lists for linked plugins
     (``scan_vst3_directories`` records ``load_path.resolve()``), and so the
     paths an effect chain or a project saved from a scan carries.
     """
@@ -123,7 +132,7 @@ def linked_plugin_targets(roots: list[Path]) -> Iterator[Path]:
             except (OSError, RuntimeError):
                 continue
             if not root_contains(root, target):
-                yield target
+                yield item, target
                 continue
             if not item.is_dir():
                 continue
@@ -135,7 +144,65 @@ def linked_plugin_targets(roots: list[Path]) -> Iterator[Path]:
             except (OSError, RuntimeError):
                 continue
             if not root_contains(root, binary_target):
-                yield binary_target
+                yield binary, binary_target
+
+
+def linked_plugin_targets(roots: list[Path]) -> Iterator[Path]:
+    """The resolved target of every plugin the scan reaches through a link,
+    from a fresh walk (see ``_linked_plugin_sources``)."""
+    for _link, target in _linked_plugin_sources(roots):
+        yield target
+
+
+#: How long one walk's link targets answer later checks. A freeze or bounce of
+#: a long chain checks the same plugin many times inside this window.
+LINKED_TARGETS_TTL_SEC = 30.0
+
+_linked_cache_lock = threading.Lock()
+#: roots key -> (monotonic time of the walk, [(link, target), ...])
+_linked_cache: dict[tuple[str, ...], tuple[float, list[tuple[Path, Path]]]] = {}
+
+
+def _roots_key(roots: list[Path]) -> tuple[str, ...]:
+    return tuple(os.path.normcase(str(root)) for root in roots)
+
+
+def _still_leads_to(link: Path, target: Path) -> bool:
+    """Whether ``link`` resolves to ``target`` right now (the link was not
+    removed or pointed somewhere else since it was walked)."""
+    try:
+        now = link.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    return os.path.normcase(str(now)) == os.path.normcase(str(target))
+
+
+def _covered_by(pairs: list[tuple[Path, Path]], resolved: Path) -> bool:
+    return any(
+        root_contains(target, resolved) and _still_leads_to(link, target)
+        for link, target in pairs
+    )
+
+
+def _linked_targets_cover(roots: list[Path], resolved: Path) -> bool:
+    """Whether ``resolved`` is inside the target of a link the scan walks.
+
+    A walk less than ``LINKED_TARGETS_TTL_SEC`` old answers first; a target it
+    kept counts only while its link still resolves there. When the kept walk
+    covers nothing (a plugin linked since, or a path no link leads to) the
+    roots are walked again and that walk is kept.
+    """
+    key = _roots_key(roots)
+    now = time.monotonic()
+    with _linked_cache_lock:
+        kept = _linked_cache.get(key)
+    if kept is not None and now - kept[0] < LINKED_TARGETS_TTL_SEC:
+        if _covered_by(kept[1], resolved):
+            return True
+    fresh = list(_linked_plugin_sources(roots))
+    with _linked_cache_lock:
+        _linked_cache[key] = (time.monotonic(), fresh)
+    return _covered_by(fresh, resolved)
 
 
 def is_allowed(raw: str, resolved: Path) -> bool:
@@ -146,17 +213,15 @@ def is_allowed(raw: str, resolved: Path) -> bool:
     with no ``..`` segment that sits inside a root as written (a path under a
     linked bundle); or when ``resolved`` is inside the target of a link the
     scan walks under a root (the resolved path the scanner lists for a linked
-    plugin). The walk behind the last test runs only when the first two fail,
-    so a plugin installed the ordinary way never pays for it.
+    plugin). The link test runs only when the first two fail, so a plugin
+    installed the ordinary way never pays for it.
     """
     roots = allowed_roots()
     if any(root_contains(root, resolved) for root in roots):
         return True
     if _lexically_inside(raw, roots):
         return True
-    return any(
-        root_contains(target, resolved) for target in linked_plugin_targets(roots)
-    )
+    return _linked_targets_cover(roots, resolved)
 
 
 def check_plugin_path(raw: str) -> Path:
