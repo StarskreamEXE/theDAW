@@ -72,6 +72,7 @@ import { importUrlToLibrary } from '../lib/onlineImport';
 import { importAudioFile } from '../lib/importAudioFiles';
 import { DESKTOP_DROP_ORIGIN, dropHasLibraryOrFiles, entriesFromDrop } from '../lib/libraryDrop';
 import { logInfo, logWarn } from '../state/logStore';
+import { useWaveformStyleStore } from '../state/waveformStyleStore';
 import { listStems, prepareStems } from '../lib/djStems';
 import * as djEngine from '../state/djEngine';
 
@@ -3872,10 +3873,11 @@ const DeckWaveform: React.FC<{
   const onScrubMove = (e: React.PointerEvent) => { if (scrubbing.current) queueScrub(e.clientX); };
   const onScrubUp = (e: React.PointerEvent) => { scrubbing.current = false; e.currentTarget.releasePointerCapture?.(e.pointerId); };
   useEffect(() => () => { if (scrubRaf.current) cancelAnimationFrame(scrubRaf.current); }, []);
+  const waveformMode = useWaveformStyleStore((s) => s.mode);
 
   return (
     <div ref={containerRef} className="relative h-full" style={{ minHeight: height }} onWheel={onWheelZoom}>
-      <DJSemanticWaveform audioUrl={audioUrl} height={height} viewportStart={viewStart} viewportEnd={viewEnd} />
+      <DJSemanticWaveform audioUrl={audioUrl} height={height} viewportStart={viewStart} viewportEnd={viewEnd} mode={waveformMode} />
       <div className="absolute inset-0 z-10 cursor-ew-resize touch-none" onPointerDown={onScrubDown} onPointerMove={onScrubMove} onPointerUp={onScrubUp} onPointerCancel={onScrubUp} title="Scroll to zoom · Shift-scroll to pan · drag to scrub" />
       {beatMarks && (<div className="absolute inset-0 z-20 pointer-events-none">{beatMarks.map((m, i) => (<div key={i} className="absolute top-0 bottom-0" style={{ left: `${m.left}%`, width: '1px', background: m.down ? 'rgba(255,255,255,0.28)' : 'rgba(255,255,255,0.10)' }} />))}</div>)}
       {loopView && (<div className="absolute top-0 bottom-0 z-20 pointer-events-none" style={{ left: `${loopView.left}%`, width: `${loopView.width}%`, background: 'rgba(245,200,66,0.18)', borderLeft: '1px solid rgba(245,200,66,0.7)', borderRight: '1px solid rgba(245,200,66,0.7)' }} />)}
