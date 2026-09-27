@@ -92,11 +92,17 @@ from backend.modules.lyria import sidecar
 
 
 @pytest.fixture(autouse=True)
-def _reset_sidecar_module_state():
+def _reset_sidecar_module_state(tmp_path, monkeypatch):
     """The sidecar tracks its child process/URL/stop-request in module
     globals, which persist across tests in the same process. Reset them
     around every test so one test's fake spawned process can't leak into the
-    next test's "is anything running" checks."""
+    next test's "is anything running" checks.
+
+    The child's log goes to tmp_path: SIDECAR_LOG_PATH is the checkout's
+    data/logs/lyria-sidecar.log, and the fake spawns below open it, so a run
+    of this module created that file in whatever checkout ran it -- the live
+    app's own data/ when run from the app tree."""
+    monkeypatch.setattr(sidecar, "SIDECAR_LOG_PATH", tmp_path / "lyria-sidecar.log")
     sidecar._proc = None
     sidecar._resolved_url = None
     sidecar._stop_requested = False
