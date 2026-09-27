@@ -134,9 +134,10 @@ export interface AssistantSettings {
   /** "Use my Claude settings and MCP servers". True (the default): the session
    *  loads the user's own ~/.claude settings, CLAUDE.md, skills, agents and MCP
    *  servers next to theDAW's relay, and the user's own allow rules approve
-   *  what they match. False: only this project's settings and theDAW's own MCP
-   *  servers, so the permission mode is the only authority. The backend reads
-   *  it on every turn and respawns the session when it changes. */
+   *  what they match, except in Read-only mode and for edits to the
+   *  assistant's own code. False: only this project's settings and theDAW's
+   *  own MCP servers. The backend reads it on every turn and respawns the
+   *  session when it changes. */
   use_user_claude_config: boolean;
 }
 
@@ -300,6 +301,13 @@ function describePatch(partial: FeatureSettingsPatch): string {
 
 const PATCH_NOTICE_ID = 'settings:patch';
 
+/** The last sentence of a "Setting not saved" notice, by how far the PATCH got. */
+const PATCH_OUTCOME_TEXT = {
+  unsent: 'The backend never received it.',
+  refused: 'The backend refused it.',
+  unreadable: 'The backend answered, but its reply could not be read.',
+} as const;
+
 export const useFeatureToggleStore = create<FeatureToggleState>()(
   persist(
     (set, get) => ({
@@ -329,6 +337,9 @@ export const useFeatureToggleStore = create<FeatureToggleState>()(
         const previous = get().settings;
         const optimistic = mergeSettings(previous, partial);
         set({ settings: optimistic });
+        // How far the request got, so the notice says what really happened:
+        // a LAN device's 403 reached the backend and was refused there.
+        let outcome: 'unsent' | 'refused' | 'unreadable' = 'unsent';
         try {
           const res = await fetch('/api/settings', {
             method: 'PATCH',
@@ -336,6 +347,7 @@ export const useFeatureToggleStore = create<FeatureToggleState>()(
             body: JSON.stringify(partial),
           });
           if (!res.ok) {
+            outcome = 'refused';
             let reason = `HTTP ${res.status}`;
             try {
               const body = (await res.json()) as { detail?: unknown };
@@ -345,6 +357,7 @@ export const useFeatureToggleStore = create<FeatureToggleState>()(
             }
             throw new Error(`PATCH /api/settings → ${reason}`);
           }
+          outcome = 'unreadable';
           const payload = (await res.json()) as FeatureSettings;
           set({ settings: mergeSettings(DEFAULT_FEATURE_SETTINGS, payload), loaded: true, error: null });
           dismissFeatureGate(PATCH_NOTICE_ID);
@@ -360,7 +373,7 @@ export const useFeatureToggleStore = create<FeatureToggleState>()(
             id: PATCH_NOTICE_ID,
             kind: 'error',
             title: 'Setting not saved',
-            message: `${what} was reverted — ${reason}. The backend never received it.`,
+            message: `${what} was reverted — ${reason}. ${PATCH_OUTCOME_TEXT[outcome]}`,
             action: {
               label: 'Retry',
               run: async () => {

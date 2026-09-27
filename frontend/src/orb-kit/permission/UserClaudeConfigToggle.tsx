@@ -6,7 +6,7 @@
  * persists in data/settings.json). On, the default: the Claude Code session
  * loads the user's own ~/.claude settings, CLAUDE.md, skills, agents and MCP
  * servers next to theDAW's relay. Off: only this project's settings and
- * theDAW's own MCP servers load, so the permission mode is the only authority.
+ * theDAW's own MCP servers load.
  * The backend reads the value on every turn and restarts the session when it
  * changed, so a switch applies from the next message.
  *
@@ -23,8 +23,8 @@ export const USER_CLAUDE_CONFIG_ID = 'assistant-use-user-claude-config';
 /** What the current position of the switch means, in one or two sentences. */
 export function userClaudeConfigHint(on: boolean): string {
   return on
-    ? 'Your own Claude settings, CLAUDE.md, skills, agents and MCP servers load next to theDAW’s tools, and your own allow rules approve the commands they match without asking. Applies from your next message.'
-    : 'Only this project’s settings and theDAW’s own tools load, so the permission mode decides every action. Applies from your next message.';
+    ? 'Your own Claude settings, CLAUDE.md, skills, agents and MCP servers load next to theDAW’s tools, and your own allow rules approve the commands they match without asking, except in Read-only mode. Edits to the assistant’s own code always ask. Applies from your next message.'
+    : 'Only this project’s settings and theDAW’s own tools load, so the permission mode decides every action this project’s own allow rules leave open. Applies from your next message.';
 }
 
 /**

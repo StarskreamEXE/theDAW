@@ -7,7 +7,9 @@
  *      which has no `assistant` section at all;
  *   2. the backend answers GET /api/settings from a build that also lacks it;
  *   3. the user unchecks the box (PATCH, confirmed);
- *   4. a phone on the LAN tries to check it again and the backend refuses (403).
+ *   4. a phone on the LAN tries to check it again and the backend refuses (403),
+ *      and the notice says the backend refused it (it did receive it);
+ *   5. the backend is unreachable, and the notice says it never received it.
  * Plus the static markup: a native checkbox with a real <label htmlFor>.
  *
  *   cd frontend && npx tsx src/orb-kit/permission/UserClaudeConfigToggle.test.tsx
@@ -89,6 +91,8 @@ let answer: Answer = { status: 200, body: {} };
 
 // Imported through the SAME specifiers the component uses, so all share one store.
 const { useFeatureToggleStore } = await import('../../state/featureToggleStore');
+const { useFeatureGateStore } = await import('../../notices/featureGateStore');
+const notice = () => useFeatureGateStore.getState().notices.find((n) => n.id === 'settings:patch');
 const {
   UserClaudeConfigToggle,
   USER_CLAUDE_CONFIG_ID,
@@ -144,10 +148,24 @@ answer = { status: 403, body: { detail: "This request must come from theDAW's de
 assert.equal(await setUseUserClaudeConfig(true), false);
 assert.equal(current(), false, 'a refused save rolls back');
 assert.ok(useFeatureToggleStore.getState().error?.includes('desktop shell'));
+assert.ok(notice()?.message.includes('The backend refused it.'), notice()?.message);
+assert.ok(!notice()?.message.includes('never received'), 'the 403 WAS received');
+
+// 5. The backend is down: the request never arrives, and the notice says so.
+const reachable = globalThis.fetch;
+(globalThis as unknown as { fetch: typeof fetch }).fetch = (async () => {
+  throw new TypeError('Failed to fetch');
+}) as typeof fetch;
+assert.equal(await setUseUserClaudeConfig(true), false);
+assert.equal(current(), false);
+assert.ok(notice()?.message.includes('The backend never received it.'), notice()?.message);
+(globalThis as unknown as { fetch: typeof fetch }).fetch = reachable;
 
 // The hint says what each position means, and when it takes effect.
 assert.ok(userClaudeConfigHint(true).includes('MCP servers'));
 assert.ok(userClaudeConfigHint(true).includes('allow rules'));
+assert.ok(userClaudeConfigHint(true).includes('except in Read-only'));
+assert.ok(userClaudeConfigHint(true).includes('own code always ask'));
 assert.ok(userClaudeConfigHint(false).includes('permission mode decides every action'));
 for (const on of [true, false]) {
   assert.ok(userClaudeConfigHint(on).includes('Applies from your next message.'));
