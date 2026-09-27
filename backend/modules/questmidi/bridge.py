@@ -304,6 +304,11 @@ def _adb(*args: str) -> Optional[str]:
             [adb, *args],
             capture_output=True,
             text=True,
+            # Named, as every backend text subprocess names it: left out,
+            # Python decodes with the locale codepage (cp1252 on most Windows
+            # machines) and a byte outside it raises instead of returning.
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             check=True,
             env=child_env(),
