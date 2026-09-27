@@ -101,27 +101,52 @@ export const useAssistantPermissionStore = create<AssistantPermissionState>()(
   ),
 );
 
+/** What POST /api/assistant/permission-mode answered. */
+export interface PermissionModeReply {
+  /** The backend accepted the switch. */
+  ok: boolean;
+  /** A running turn was stopped so the new mode covers its next step: the
+   *  CLI's child keeps the rules it was started with until it is respawned,
+   *  and a switch into Ask or Read-only needs rules it lacks. */
+  interrupted: boolean;
+}
+
 /**
- * Tell a live conversation about a mode change (contract C2). Returns true
- * when the backend accepted it. Never throws and never rejects: the dropdown
- * has already moved by the time this runs, and a backend that is down must
- * not strand the UI. Returns false — without calling the API — when there is
- * no conversation yet, in which case the mode simply rides along with the
- * next chat request.
+ * Tell a live conversation about a mode change (contract C2). Never throws
+ * and never rejects: the dropdown has already moved by the time this runs,
+ * and a backend that is down must not strand the UI. Answers `ok: false` —
+ * without calling the API — when there is no conversation yet, in which case
+ * the mode simply rides along with the next chat request.
  */
-export async function postPermissionMode(
+export async function sendPermissionMode(
   conversationId: string | null | undefined,
   mode: PermissionMode,
-): Promise<boolean> {
-  if (!conversationId) return false;
+): Promise<PermissionModeReply> {
+  if (!conversationId) return { ok: false, interrupted: false };
   try {
     const response = await fetch('/api/assistant/permission-mode', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ conversationId, mode }),
     });
-    return response.ok;
+    if (!response.ok) return { ok: false, interrupted: false };
+    let interrupted = false;
+    try {
+      const body = (await response.json()) as { interrupted?: unknown } | null;
+      interrupted = body?.interrupted === true;
+    } catch {
+      interrupted = false;
+    }
+    return { ok: true, interrupted };
   } catch {
-    return false;
+    return { ok: false, interrupted: false };
   }
+}
+
+/** `sendPermissionMode`, answering only whether the backend accepted it. */
+export async function postPermissionMode(
+  conversationId: string | null | undefined,
+  mode: PermissionMode,
+): Promise<boolean> {
+  return (await sendPermissionMode(conversationId, mode)).ok;
 }

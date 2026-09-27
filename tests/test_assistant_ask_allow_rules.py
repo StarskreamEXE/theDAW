@@ -23,6 +23,7 @@ import json
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -212,3 +213,71 @@ def test_a_lan_caller_cannot_mark_a_rule_and_junk_is_a_400(machine):
     )
     assert junk.status_code == 400
     assert machine["store"].get_value("assistant", "always_allow_rules") == []
+
+
+def _routes_client() -> httpx.AsyncClient:
+    app = FastAPI()
+    app.include_router(ar.router)
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, client=("127.0.0.1", 51000)),
+        base_url="http://test",
+    )
+
+
+async def _wait_busy(conversation_id: str) -> cs.ClaudeSession:
+    for _ in range(400):
+        session = cs.sessions.get(conversation_id)
+        if session is not None and session.busy:
+            return session
+        await asyncio.sleep(0.025)
+    raise AssertionError("the turn never started")
+
+
+def test_switching_to_ask_mid_turn_stops_the_turn_and_the_next_one_asks(
+    machine, monkeypatch
+):
+    """A turn runs in Trusted, whose child has no mirrored ask rules, so the
+    CLI approves every call a loaded allow rule matches. The user switches to
+    Ask because the agent is about to run something. The running turn is
+    interrupted, and the next turn's child carries the ask rules."""
+    monkeypatch.setenv("FAKE_CLI_MODE", "until_interrupt")
+    args = machine["args"]
+
+    async def body():
+        turn = asyncio.create_task(_turn("conv-live", "trusted"))
+        session = await _wait_busy("conv-live")
+        assert _ask_rules(args[0]) == _self_surface()
+
+        async with _routes_client() as http:
+            resp = await http.post(
+                "/api/assistant/permission-mode",
+                json={"conversationId": "conv-live", "mode": "ask"},
+            )
+        assert resp.status_code == 200, resp.text
+        # The running turn is stopped: its child would approve matched calls
+        # unasked. The CLI ends the interrupted turn and the child is kept.
+        await asyncio.wait_for(turn, 10)
+        assert resp.json()["interrupted"] is True
+        assert session.permission_mode == "ask"
+        assert len(args) == 1
+
+        # The next turn respawns the child with the mirrored ask rules.
+        second = asyncio.create_task(_turn("conv-live", "ask"))
+        session = await _wait_busy("conv-live")
+        assert len(args) == 2
+        assert "Bash(npm run test:*)" in _ask_rules(args[1])
+        assert "Bash(uv run pytest:*)" in _ask_rules(args[1])
+
+        # Ask -> Trusted needs no rule the child lacks: the turn keeps going.
+        async with _routes_client() as http:
+            relaxed = await http.post(
+                "/api/assistant/permission-mode",
+                json={"conversationId": "conv-live", "mode": "trusted"},
+            )
+        assert relaxed.status_code == 200, relaxed.text
+        assert relaxed.json()["interrupted"] is False
+        assert session.busy
+        assert cs.interrupt("conv-live")
+        await asyncio.wait_for(second, 10)
+
+    _run(body)

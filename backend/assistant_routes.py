@@ -1625,6 +1625,14 @@ async def claude_permission_mode(payload: PermissionModeRequest):
     "default" ``--permission-mode`` (see ``CLI_PERMISSION_MODES``' comment),
     so the CLI's "own view of the mode" never actually changes what it asks
     for -- it always asks the host for every non-baseline tool regardless.
+
+    decide() only sees what the CLI asks about, and the child's ask rules
+    (``claude_session.permission_rules``, passed with ``--settings``) are
+    fixed at spawn. A switch into Ask or Read-only needs ask rules the running
+    child lacks, so until it is respawned the CLI would still approve every
+    call a loaded allow rule matches. When a turn is running then, it is
+    interrupted (the child is kept, and the next turn respawns it with the new
+    rules), and ``interrupted`` tells the panel to say so.
     """
     mode = (payload.mode or "").strip()
     if mode not in CLAUDE_PERMISSION_MODES:
@@ -1638,7 +1646,20 @@ async def claude_permission_mode(payload: PermissionModeRequest):
         raise HTTPException(404, "unknown conversation")
     conversation_id = session.conversation_id
 
+    missing = claude_session.ask_rules_missing(
+        session, mode, always_allow=_claude_always_allow_rules()
+    )
     session.permission_mode = mode
+    interrupted = False
+    if missing and session.busy:
+        logger.info(
+            "[Claude] mode -> %s mid-turn conv=%s: interrupting, %d ask rule(s) "
+            "missing from the child",
+            mode,
+            conversation_id,
+            len(missing),
+        )
+        interrupted = claude_session.interrupt(conversation_id)
     cli_mode = permissions.cli_permission_mode(mode)
     acknowledged = await claude_session.send_control_request(
         conversation_id, {"subtype": "set_permission_mode", "mode": cli_mode}
@@ -1648,6 +1669,7 @@ async def claude_permission_mode(payload: PermissionModeRequest):
         "mode": mode,
         "cliMode": cli_mode,
         "acknowledged": acknowledged is not None,
+        "interrupted": interrupted,
     }
 
 

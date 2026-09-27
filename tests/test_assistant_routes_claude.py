@@ -626,6 +626,8 @@ def test_permission_mode_route_updates_policy_and_forwards_to_the_cli():
             "mode": "accept_edits",
             "cliMode": "default",
             "acknowledged": True,
+            # No turn is running, so nothing is interrupted.
+            "interrupted": False,
         }
         assert session.permission_mode == "accept_edits"
 

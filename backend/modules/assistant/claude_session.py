@@ -686,6 +686,31 @@ def permission_rules_key(
     )
 
 
+def ask_rules_missing(
+    session: "ClaudeSession",
+    permission_mode: str,
+    *,
+    always_allow: tuple[str, ...] | list[str] = (),
+) -> list[str]:
+    """
+    The ask rules a child in ``permission_mode`` would carry that ``session``'s
+    child was not given. The rules are fixed at spawn, so while this is not
+    empty the running child still lets the CLI approve calls those rules would
+    send to decide(), until the next turn respawns it.
+    """
+    try:
+        given = json.loads(session.permission_rules_key)["permissions"]["ask"]
+    except (ValueError, KeyError, TypeError):
+        given = []
+    have = set(given) if isinstance(given, list) else set()
+    wanted = permission_rules(
+        permission_mode,
+        use_user_config=session.use_user_config,
+        always_allow=always_allow,
+    )["permissions"]["ask"]
+    return [rule for rule in wanted if rule not in have]
+
+
 def _permission_settings_path(relay_id: str, permission_mode: str) -> Path:
     """Per-relay, per-mode file, so a respawn into another mode never rewrites
     the file the outgoing child loaded, and teardown can find every one."""
