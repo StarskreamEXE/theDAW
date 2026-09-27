@@ -168,6 +168,11 @@ class _Gate:
     holding it is still going; that run's later :meth:`release` is then a
     no-op. Waiters re-check at the earliest lease deadline, so a stuck run
     frees its slot on time without any timer thread.
+
+    A run that a priority caller joins while it is still waiting for a slot
+    moves to the priority line (:meth:`promote`). Without that, a deck load
+    that found the background queue's full run of the same track waiting in
+    the ordinary line waited behind every full run queued before it.
     """
 
     def __init__(self, slots: int) -> None:
@@ -194,12 +199,21 @@ class _Gate:
                 return line[0]
         return None
 
-    def acquire(self, *, priority: bool) -> int:
+    def acquire(self, *, priority: bool, run: Optional["_InFlight"] = None) -> int:
+        """Wait for a slot and return its lease ticket.
+
+        ``run`` is the single-flight run this caller leads. Its ticket is
+        recorded on it, and a run already promoted before it got here queues
+        in the priority line, all under the gate's lock so :meth:`promote`
+        can never miss it.
+        """
         with self._cond:
             self._next_ticket += 1
             ticket = self._next_ticket
-            line = self._lines[0 if priority else 1]
-            line.append(ticket)
+            if run is not None:
+                priority = priority or run.promoted
+                run.ticket = ticket
+            self._lines[0 if priority else 1].append(ticket)
             try:
                 while True:
                     now = time.monotonic()
@@ -215,10 +229,15 @@ class _Gate:
                     )
                     self._cond.wait(timeout)
             except BaseException:
-                line.remove(ticket)
+                for line in self._lines:
+                    if ticket in line:
+                        line.remove(ticket)
                 self._cond.notify_all()
                 raise
-            line.popleft()
+            for line in self._lines:
+                if line and line[0] == ticket:
+                    line.popleft()
+                    break
             self._holders[ticket] = time.monotonic() + SLOT_LEASE_S
             # The next head may fit in a slot that is still free.
             self._cond.notify_all()
@@ -227,6 +246,23 @@ class _Gate:
     def release(self, ticket: int) -> None:
         with self._cond:
             if self._holders.pop(ticket, None) is not None:
+                self._cond.notify_all()
+
+    def promote(self, run: "_InFlight") -> None:
+        """Serve ``run`` from the priority line from now on.
+
+        Marks the run first, so a leader that has not reached :meth:`acquire`
+        yet queues in the priority line; a leader already waiting in the
+        ordinary line moves to the back of the priority line. A run that
+        already holds a slot has nothing left to wait for.
+        """
+        with self._cond:
+            run.promoted = True
+            ticket = run.ticket
+            ordinary, first = self._lines[1], self._lines[0]
+            if ticket is not None and ticket in ordinary:
+                ordinary.remove(ticket)
+                first.append(ticket)
                 self._cond.notify_all()
 
 
@@ -241,9 +277,20 @@ class _InFlight:
     against the concurrency cap (a waiter can never be the thing the leader
     is waiting for). ``followers`` is how many callers joined this run
     instead of starting their own; ``profile`` is the profile it computes.
+    ``ticket`` is the leader's gate ticket once it has queued, and
+    ``promoted`` says a priority caller joined it (see :meth:`_Gate.promote`);
+    both are read and written under the gate's lock.
     """
 
-    __slots__ = ("done", "payload", "error", "followers", "profile")
+    __slots__ = (
+        "done",
+        "payload",
+        "error",
+        "followers",
+        "profile",
+        "ticket",
+        "promoted",
+    )
 
     def __init__(self, profile: str) -> None:
         self.done = threading.Event()
@@ -251,6 +298,8 @@ class _InFlight:
         self.error: Optional[BaseException] = None
         self.followers = 0
         self.profile = profile
+        self.ticket: Optional[int] = None
+        self.promoted = False
 
 
 _inflight_lock = threading.Lock()
@@ -306,7 +355,9 @@ def _single_flight(
 
     Waiting is bounded by :data:`FOLLOWER_WAIT_S` (then :class:`AnalysisBusy`);
     the slot a leader holds is bounded by :data:`SLOT_LEASE_S`. ``priority``
-    defaults to True for the dj profile: the gate serves DJ runs first.
+    defaults to True for the dj profile: the gate serves DJ runs first, and a
+    priority caller that joins a run still waiting for its slot moves that run
+    to the priority line.
     """
     entry_id, profile = key
     if priority is None:
@@ -324,6 +375,8 @@ def _single_flight(
                 run.followers += 1
         if joined:
             log.debug("analysis.engine: joining the run already computing %s", key)
+            if priority:
+                _gate.promote(run)
         else:
             log.debug(
                 "analysis.engine: %s waits for the %s run of the same entry",
@@ -345,7 +398,7 @@ def _single_flight(
         # the next run or join whichever one got there first.
 
     try:
-        ticket = _gate.acquire(priority=priority)
+        ticket = _gate.acquire(priority=priority, run=run)
         try:
             payload = work()
         finally:
