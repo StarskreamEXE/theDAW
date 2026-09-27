@@ -117,8 +117,8 @@ import { useEditThemeStore } from '../../state/editThemeStore';
 import { TimelineGridLayer } from './TimelineGridLayer';
 import { TimelinePrefsPanel } from './TimelinePrefsPanel';
 import {
-  ZOOM_FOLLOW_HOLD_MS, ZOOM_STEP_FACTOR, clipChromeLayout, createZoomCoalescer, fitProjectZoom, fitRangeZoom,
-  followHoldActive, localViewportWidth, planZoom, resolveAnchorSec, rulerBarLabels, rulerTimeTicks, shouldRescrollAfterZoom,
+  ZOOM_FOLLOW_HOLD_MS, ZOOM_STEP_FACTOR, barLabelUnderReadout, clipChromeLayout, createZoomCoalescer, fitProjectZoom, fitRangeZoom,
+  followHoldActive, localViewportWidth, planZoom, resolveAnchorSec, rulerBarLabels, rulerReadoutSpanPx, rulerTimeTicks, shouldRescrollAfterZoom,
   spanOfClips, viewportWindowSec, wheelDispatch, type ZoomAnchor, type ZoomCoalescer,
 } from './timelineZoom';
 import {
@@ -5840,6 +5840,10 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const barLabels = gridWindow
     ? rulerBarLabels({ startSec: gridWindow.startSec, endSec: gridWindow.endSec, bpm: projectBpm, zoom })
     : [];
+  /** The time range's readout, and the ruler px its pill can cover. It shares
+   *  the ruler's top row with the bar numbers, so the numbers under it hide. */
+  const rangeReadout = timeSelection ? formatRangeReadout(timeSelection) : null;
+  const rangeReadoutSpan = timeSelection && rangeReadout ? rulerReadoutSpanPx(timeSelection.startSec, zoom, rangeReadout) : null;
   /** Is this clip's action menu the one on screen? (`aria-expanded` for its trigger buttons.) */
   const clipMenuOpenFor = (clipId: string): boolean => clipMenu.position !== null && clipMenu.payload?.clipId === clipId;
   /** Open a clip's menu under one of its header buttons (compact / handle chrome). */
@@ -7303,7 +7307,8 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                 </span>
               </div>
             ))}
-            {/* Bar numbers (F05) at bar lines, once bars are RULER_BAR_LABEL_MIN_PX apart. */}
+            {/* Bar numbers (F05) at bar lines, once bars are RULER_BAR_LABEL_MIN_PX apart.
+                A number the range readout would cover keeps its bar line only. */}
             {barLabels.map((b) => (
               <div
                 key={`bar-${b.bar}`}
@@ -7311,7 +7316,9 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                 className="absolute top-0 h-2.5 border-l border-purple-300/40 pointer-events-none"
                 style={{ left: b.sec * zoom }}
               >
-                <span className="absolute top-0 left-0.5 font-sans text-xs font-bold leading-none tabular-nums text-purple-300">{b.bar}</span>
+                {!(rangeReadoutSpan && barLabelUnderReadout(b, zoom, rangeReadoutSpan)) && (
+                  <span className="absolute top-0 left-0.5 font-sans text-xs font-bold leading-none tabular-nums text-purple-300">{b.bar}</span>
+                )}
               </div>
             ))}
             {/* Loop region (shift-drag the ruler to set; LOOP toggles it) */}
@@ -7322,15 +7329,17 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
               />
             )}
             {/* Time range on the ruler (F03): the stronger band, with its
-                start – end · duration readout. A picture of state: no pointer. */}
+                start – end · duration readout on an opaque pill in the top row
+                (the bar numbers it would cover are hidden above). A picture of
+                state: no pointer. */}
             {timeSelection && (
               <div
                 aria-hidden="true"
                 className="absolute top-0 bottom-0 z-10 pointer-events-none bg-sky-400/30 border-x border-sky-300"
                 style={{ left: timeSelection.startSec * zoom, width: (timeSelection.endSec - timeSelection.startSec) * zoom }}
               >
-                <span className="absolute top-0 left-1 font-sans text-xs font-bold text-sky-100 leading-none whitespace-nowrap tabular-nums">
-                  {formatRangeReadout(timeSelection)}
+                <span className="absolute top-0 left-1 px-1 rounded-sm bg-sky-900 font-sans text-xs font-bold text-sky-100 leading-none whitespace-nowrap tabular-nums">
+                  {rangeReadout}
                 </span>
               </div>
             )}

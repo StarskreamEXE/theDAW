@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
 import { WHEEL_PROFILES } from '../../lib/timeline/viewport';
+import { formatRangeReadout } from './timelineInteraction';
 import {
   CLIP_EDGE_ZONE_PX,
   MIN_CONTENT_WIDTH_PX,
   RULER_BAR_LABEL_MIN_PX,
+  RULER_CHAR_MAX_PX,
   RULER_TIME_LABEL_MIN_PX,
   ZOOM_FOLLOW_HOLD_MS,
+  barLabelUnderReadout,
   clipChromeLayout,
   createZoomCoalescer,
   fitProjectZoom,
@@ -15,6 +18,7 @@ import {
   planZoom,
   resolveAnchorSec,
   rulerBarLabels,
+  rulerReadoutSpanPx,
   rulerTimeTicks,
   shouldRescrollAfterZoom,
   spanOfClips,
@@ -321,6 +325,53 @@ const near = (a: number, b: number, eps = 1e-9) => assert.ok(Math.abs(a - b) <= 
     }
   }
   assert.ok(RULER_BAR_LABEL_MIN_PX >= 2 + 4 * DIGIT_PX + 4, 'a four-digit bar number fits between bar lines');
+}
+
+// --- The range readout never draws over a bar number ------------------------
+{
+  // The sequence from the review: EDIT at 120 bpm, zoomed in until bar
+  // numbers show, then a time range dragged across bars 5 to 8. The readout
+  // and the bar numbers are both bold 12 px in the ruler's top row, so
+  // "00:08.000 – 00:16.000 · 8.000s" was drawn through 6, 7 and 8. Sweep the
+  // zoom from far out to deep in: every bar number left on screen must clear
+  // the readout's real text, and the bound the ruler hides by must cover it.
+  const DIGIT_PX = 7.2;
+  const bpm = 120;
+  const range = { startSec: 8, endSec: 16, scope: { kind: 'all-tracks' as const } };
+  const readout = formatRangeReadout(range);
+  assert.equal(readout, '00:08.000 – 00:16.000 · 8.000s');
+  // The widest the readout's pill really gets: text at the digit width plus
+  // its 4 px of padding each side, from 4 px into the band.
+  const realLeft = (zoom: number) => range.startSec * zoom + 4;
+  const realRight = (zoom: number) => realLeft(zoom) + 8 + [...readout].length * DIGIT_PX;
+  let sawHidden = false;
+  for (let zoom = 400; zoom >= 2; zoom /= 1.25) {
+    const bars = rulerBarLabels({ startSec: 0, endSec: 60, bpm, zoom });
+    const span = rulerReadoutSpanPx(range.startSec, zoom, readout);
+    assert.ok(span.leftPx <= realLeft(zoom) && span.rightPx >= realRight(zoom), 'the hide bound covers the readout');
+    for (const b of bars) {
+      const left = b.sec * zoom + 2;
+      const right = left + String(b.bar).length * DIGIT_PX;
+      const hidden = barLabelUnderReadout(b, zoom, span);
+      sawHidden ||= hidden;
+      if (!hidden) {
+        assert.ok(
+          right <= realLeft(zoom) || left >= realRight(zoom),
+          `bar ${b.bar} at ${zoom.toFixed(2)} px/s is drawn under the range readout`,
+        );
+      }
+    }
+  }
+  assert.ok(sawHidden, 'the sweep reached a zoom where bar numbers sit under the readout');
+  // Bars clear of the readout keep their numbers: bar 3 (4 s) and a bar well
+  // past the pill at a zoom where the readout ends before it.
+  const zoom = 40;
+  const span = rulerReadoutSpanPx(range.startSec, zoom, readout);
+  assert.equal(barLabelUnderReadout({ bar: 3, sec: 4 }, zoom, span), false);
+  assert.equal(barLabelUnderReadout({ bar: 6, sec: 10 }, zoom, span), true);
+  const firstClear = Math.ceil(span.rightPx / zoom / 2) + 1;
+  assert.equal(barLabelUnderReadout({ bar: firstClear, sec: (firstClear - 1) * 2 }, zoom, span), false);
+  assert.ok(RULER_CHAR_MAX_PX >= DIGIT_PX, 'the character bound is at least a bold 12 px digit');
 }
 
 // --- Clip chrome: header inside the visible part, off the resize zones -------
