@@ -631,6 +631,61 @@ def test_a_dj_run_over_a_full_row_keeps_the_full_label(tmp_path: Path):
     assert row["loudness_lufs"] == full_row["loudness_lufs"]
 
 
+def test_a_dj_run_over_a_stale_full_row_is_labelled_dj(tmp_path: Path):
+    """The sequence: an older analyzer (version 2) wrote a full row, this
+    build's GET reports that row pending, and the DJ tab answers by running
+    the dj profile. The carry-forward keeps the v2 pitch, LUFS and prompt, and
+    keeping the full label saved that old data as a current full row, so GET
+    called it complete and the version heal never re-measured it."""
+    pytest.importorskip("numpy")
+    pytest.importorskip("soundfile")
+    import sqlite3
+    from unittest.mock import patch
+
+    from backend.modules.analysis.engine import (
+        ANALYSIS_VERSION,
+        PROFILE_DJ,
+        profile_of_row,
+    )
+    from backend.modules.analysis.router import get_analysis as get_route
+    from backend.modules.library.store import LibraryStore
+
+    audio_path = _seed_tone(tmp_path, "stale")
+    store = LibraryStore(tmp_path)
+    assert store.db is not None
+    entry_dir = store._dir_for("stale")
+    metadata_path = (entry_dir / "metadata.json") if entry_dir else None
+
+    analyze_and_persist(store.db, "stale", audio_path, metadata_path=metadata_path)
+    # Rewind the full row to what the version-2 analyzer left behind.
+    raw = sqlite3.connect(str(store.db.path))
+    raw.execute(
+        "UPDATE analysis SET version = ? WHERE entry_id = ?",
+        (ANALYSIS_VERSION - 1, "stale"),
+    )
+    raw.commit()
+    raw.close()
+    stale = store.db.get_analysis("stale")
+    assert profile_of_row(stale) == "full"
+    assert int(stale["version"]) < ANALYSIS_VERSION
+
+    with patch("backend.modules.analysis.router.get_library_store", return_value=store):
+        assert get_route("stale")["status"] == "pending"
+        out = analyze_and_persist(
+            store.db,
+            "stale",
+            audio_path,
+            metadata_path=metadata_path,
+            profile=PROFILE_DJ,
+        )
+        row = store.db.get_analysis("stale")
+        assert profile_of_row(row) == PROFILE_DJ, (
+            "a dj run saved a stale full row as a current full one"
+        )
+        assert out["profile"] == PROFILE_DJ
+        assert get_route("stale")["profile"] == PROFILE_DJ
+
+
 def test_a_dj_run_on_a_fresh_entry_is_still_labelled_dj(tmp_path: Path):
     """The label still means something: with no full row behind it, a dj
     run's row says dj."""

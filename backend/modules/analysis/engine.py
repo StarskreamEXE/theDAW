@@ -934,8 +934,16 @@ def _keep_full_label(prior: Optional[dict[str, Any]], payload: dict[str, Any]) -
     reader -- ``GET /api/analysis/{id}``, ``entry.analysis`` -- that a
     complete row was a partial one, and any pass that upgrades dj rows would
     re-analyse it for nothing.
+
+    Only a CURRENT full row keeps the label. A full row from an older
+    ``ANALYSIS_VERSION`` is stale -- ``GET /api/analysis/{id}`` reports it
+    pending so it gets re-measured -- and its carried pitch, LUFS and prompt
+    are old data. Saving that as a current full row hid it from the version
+    heal for good, so it is saved as a dj row and a full pass re-measures it.
     """
     if not prior or profile_of_row(prior) != PROFILE_FULL:
+        return
+    if int(prior.get("version") or 0) < ANALYSIS_VERSION:
         return
     probe = payload.get("ffprobe")
     if isinstance(probe, dict):
