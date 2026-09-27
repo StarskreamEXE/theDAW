@@ -23,6 +23,7 @@ import soundfile as sf
 from scipy.signal import butter, sosfilt
 
 from backend.lib.audio_analysis import measure_loudness
+from backend.modules.analysis.key import MIN_CHROMA_OCTAVES, chroma_plan
 from backend.lib.audio_depth import probe_depth
 
 # ---------------------------------------------------------------------------
@@ -325,12 +326,31 @@ def _extract_mid_level(
         voicing_confidence = 0.0
 
     # ---- Chroma ----
-    chroma = librosa.feature.chroma_cqt(y=mono, sr=sr)
-    chroma_mean = np.mean(chroma, axis=1)
-    chroma_list = [round(float(v), 4) for v in chroma_mean]
+    # Fitted to the clip (backend/modules/analysis/key.py): under about 3 s
+    # the default C1..C8 range gives the low octaves an FFT longer than the
+    # signal, which librosa zero-pads and warns about.
+    plan = chroma_plan(int(mono.size), float(sr))
+    if plan.n_octaves >= MIN_CHROMA_OCTAVES:
+        chroma = librosa.feature.chroma_cqt(
+            y=mono,
+            sr=sr,
+            fmin=plan.fmin,
+            n_octaves=plan.n_octaves,
+            bins_per_octave=plan.bins_per_octave,
+            tuning=plan.tuning,
+        )
+        chroma_mean = np.mean(chroma, axis=1)
+        chroma_list = [round(float(v), 4) for v in chroma_mean]
 
-    # ---- Key / mode ----
-    key_label, key_confidence = _find_key(chroma_mean)
+        # ---- Key / mode ----
+        # A short clip has heard less of the music: its confidence is scaled
+        # by its share of the full analysis length, as detect_key's is.
+        key_label, key_confidence = _find_key(chroma_mean)
+        key_confidence = round(key_confidence * plan.coverage, 4)
+    else:
+        # Too short for three octaves of chroma: no key to report.
+        chroma_list = [0.0] * 12
+        key_label, key_confidence = None, 0.0
 
     # ---- Beat / tempo ----
     tempo, beat_frames = librosa.beat.beat_track(y=mono, sr=sr)
