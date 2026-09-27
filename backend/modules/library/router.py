@@ -1477,6 +1477,10 @@ def _load_perf_set(
     #: yet: the id below is hashed from this, not from the entry ids, so the
     #: id a listing hands the frontend is the id registration hands back.
     signature: list[Any] = []
+    #: The entries exactly as main's listing built them, from the tracks the
+    #: sidecar maps to a live entry. Main hashed its set id over these, so
+    #: this rebuilds the id a browser already stored for the same folder.
+    legacy_entries: list[dict[str, Any]] = []
     for t in tracks:
         if not isinstance(t, dict):
             continue
@@ -1540,6 +1544,15 @@ def _load_perf_set(
             entry["perf"] = perf_block
         entries.append(entry)
         signature.append([fname, label, perf_block])
+        if isinstance(entry_id, str):
+            legacy: dict[str, Any] = {
+                "entryId": entry_id,
+                "label": label,
+                "kind": "audio",
+            }
+            if perf_block:
+                legacy["perf"] = perf_block
+            legacy_entries.append(legacy)
 
     if sidecar_dirty:
         try:
@@ -1552,7 +1565,8 @@ def _load_perf_set(
     name = perf.get("name") if isinstance(perf.get("name"), str) else set_dir.name
     # Deterministic id including a content hash: a rebuilt set (new timeline)
     # gets a NEW id, so the frontend's merge-by-id import picks it up instead
-    # of keeping a stale copy. Old copies stay in localStorage (harmless).
+    # of keeping a stale copy. The rebuilt set's old copy stays in the
+    # browser's storage, as it always has.
     # Hashed over the timeline, NOT over the entry ids: listing a set and then
     # registering it must produce the same id, or the frontend would file the
     # opened set as a second, duplicate list.
@@ -1561,8 +1575,24 @@ def _load_perf_set(
     ).hexdigest()[:8]
     slug = re.sub(r"[^a-z0-9]+", "-", str(name).lower()).strip("-") or "set"
     mtime_ms = int(perf_path.stat().st_mtime * 1000)
+    set_id = f"zad-{slug}-{digest}"
+    # The id main gave this folder: the same slug, hashed over the entry dicts
+    # its listing built (it registered every track as it listed, so its ids are
+    # the ones in the sidecar). A browser that ran main stored the set under
+    # that id; the frontend's import retires it in favour of `id`, carrying
+    # the user's edits and active choice over, instead of showing the set
+    # twice.
+    legacy_ids: list[str] = []
+    if legacy_entries:
+        legacy_digest = hashlib.sha1(
+            json.dumps(legacy_entries, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:8]
+        legacy_id = f"zad-{slug}-{legacy_digest}"
+        if legacy_id != set_id:
+            legacy_ids.append(legacy_id)
     return {
-        "id": f"zad-{slug}-{digest}",
+        "id": set_id,
+        "legacyIds": legacy_ids,
         "name": str(name),
         "entries": entries,
         "createdAt": mtime_ms,
