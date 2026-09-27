@@ -43,8 +43,20 @@ import { autoKeylockRef, DJ_TARGETS, setUserKeylock } from '../state/bindableTar
 import type { WidgetRegistry } from '../components/surface/widgetTypes';
 import type { SurfaceLayout } from '../state/surfaceLayoutStore';
 import { useAppUiStore } from '../state/appUiStore';
-import { useSetlistStore, type SetlistEntry } from '../state/setlistStore';
-import { useDjAutomix } from '../state/djAutomixStore';
+import {
+  isBundledSetId,
+  isPendingBundledRow,
+  useSetlistStore,
+  type SetlistEntry,
+} from '../state/setlistStore';
+import {
+  AUTO_DJ_MIN_TRACKS,
+  djAutomixEntries,
+  firstPlayableOfActiveSet,
+  readyActiveSetForAutomix,
+  useDjAutomix,
+  type AutomixStartMode,
+} from '../state/djAutomixStore';
 import { useDjDeckLoad } from '../state/djDeckLoadStore';
 import { useLibraryStore } from '../state/libraryStore';
 import type { LibraryEntry } from '../state/libraryStore';
@@ -180,6 +192,97 @@ export function automixTransitionSteps(nxt: djEngine.DeckId, cueIn: number): Aut
     { type: 'sync', deck: nxt },
   ];
 }
+
+/** One step a start request makes, in order. */
+export type AutomixStartStep = 'drop-transition' | 'eject' | 'on' | 'reseed';
+
+/** The steps a start request takes once its set is ready, by how it treats
+ *  the decks (see `AutomixStartMode`). `continue` only switches automix on:
+ *  the automix effect seeds from whichever deck is playing, so a start pressed
+ *  mid-track carries the set on from that track, as the Automix chip always
+ *  has. `fresh` drops a stale "transition now", ejects both decks, switches
+ *  automix on and bumps the restart counter, so a mix that is already running
+ *  reseeds from track 1. START AUTO DJ used to take the `fresh` path through
+ *  the Send-to-DJ bridge, which stopped a playing track dead and restarted the
+ *  set. Pure so the order is testable without the engine. */
+export function automixStartSteps(mode: AutomixStartMode): AutomixStartStep[] {
+  return mode === 'fresh' ? ['drop-transition', 'eject', 'on', 'reseed'] : ['on'];
+}
+
+/** What one run of a deck-load effect tells the engine, and which library
+ *  entry the deck holds afterwards (`holds`). */
+export type DeckLoadStep =
+  | { kind: 'keep'; holds: string | null }
+  | { kind: 'clear'; holds: null }
+  | { kind: 'load'; url: string; label: string | null; holds: string };
+
+/**
+ * The deck-load effect's decision.
+ *
+ * The effect re-runs whenever the library resolves an entry, because a deck
+ * can hold a track on no loaded page (a Send-to-DJ id, a bundled-set id) and
+ * only lands its audio once the single-entry lookup comes back. Those re-runs
+ * used to call `djEngine.loadDeck` every time: a lookup for ANY other id
+ * reloaded both decks and rewound a playing one to 0:00, and while the deck's
+ * own entry was unresolved (its lookup in flight, or `refresh()` had just
+ * dropped the id cache) the run passed a null URL and ejected the deck.
+ *
+ * - no entry id: clear the deck if it holds anything;
+ * - an entry still unresolved: a deck already holding THAT entry keeps it; a
+ *   deck asked for a different track stops the old one now and loads the new
+ *   one when its lookup lands;
+ * - a resolved entry whose URL the engine already holds, decoded or still
+ *   decoding: nothing to do;
+ * - otherwise load it. That includes the same URL after its load failed, so
+ *   the next resolve of the entry retries it, as `djEngine.loadDeck` allows.
+ *
+ * @param entry        what `libraryStore.getById(entryId)` answers now; null
+ *                     or undefined while it is unresolved.
+ * @param loadedEntryId the entry this deck was last loaded with.
+ * @param loadedUrl    the URL the engine holds (`djEngine.getStatus(deck)`).
+ * @param holdsAudio   the engine has that URL's audio or is decoding it; false
+ *                     after a failed load.
+ */
+export function deckLoadStep(args: {
+  entryId: string | null;
+  entry: Pick<LibraryEntry, 'audioUrl' | 'title'> | null | undefined;
+  loadedEntryId: string | null;
+  loadedUrl: string | null;
+  holdsAudio: boolean;
+}): DeckLoadStep {
+  const { entryId, entry, loadedEntryId, loadedUrl, holdsAudio } = args;
+  if (!entryId) return loadedUrl ? { kind: 'clear', holds: null } : { kind: 'keep', holds: null };
+  if (!entry) {
+    if (entryId === loadedEntryId) return { kind: 'keep', holds: loadedEntryId };
+    return loadedUrl ? { kind: 'clear', holds: null } : { kind: 'keep', holds: null };
+  }
+  const url = entry.audioUrl || null;
+  if (!url) return loadedUrl ? { kind: 'clear', holds: null } : { kind: 'keep', holds: null };
+  if (url === loadedUrl && holdsAudio) return { kind: 'keep', holds: entryId };
+  return { kind: 'load', url, label: entry.title ?? null, holds: entryId };
+}
+
+/** Run one deck-load step against the engine and record what the deck holds.
+ *  The deck-load effects call this and nothing else. */
+export function syncDeckToEntry(
+  deck: djEngine.DeckId,
+  entryId: string | null,
+  entry: LibraryEntry | null | undefined,
+  held: Record<djEngine.DeckId, string | null>,
+): DeckLoadStep {
+  const st = djEngine.getStatus(deck);
+  const step = deckLoadStep({
+    entryId,
+    entry,
+    loadedEntryId: held[deck],
+    loadedUrl: st.loadedUrl,
+    holdsAudio: st.hasBuffer || st.decoding,
+  });
+  held[deck] = step.holds;
+  if (step.kind === 'load') void djEngine.loadDeck(deck, step.url, step.label);
+  else if (step.kind === 'clear') void djEngine.loadDeck(deck, null, null);
+  return step;
+}
 const PITCH_RANGES = [10, 15] as const;
 type PitchRange = typeof PITCH_RANGES[number];
 
@@ -213,24 +316,11 @@ export interface StartAutoDjState {
   reason: string | null;
 }
 
-/** Automix needs two tracks to have anything to mix between. */
-export const AUTO_DJ_MIN_TRACKS = 2;
-
-/** The rows the automix sequencer can actually put on a deck: a registered
- *  library id and nothing else. The one predicate behind both the effect's
- *  `list.length < AUTO_DJ_MIN_TRACKS` bail-out and the counting below, so the
- *  two can never drift. */
-export function djAutomixEntries(
-  entries: readonly SetlistEntry[] | null | undefined,
-): Array<SetlistEntry & { entryId: string }> {
-  return (entries ?? []).filter((e): e is SetlistEntry & { entryId: string } => !!e.entryId);
-}
-
-/** A bundled row with no id yet that `registerBundled` WILL fill in. An
- *  ad-hoc/VJ row (it has a `url`) or a non-audio slot has no library entry
- *  waiting for it and never will, so neither counts. */
-const isRegisterableBundledRow = (e: SetlistEntry): boolean =>
-  e.entryId === null && !e.url && e.kind === 'audio';
+// The minimum and the playable-row predicate live in djAutomixStore, next to
+// `readyActiveSetForAutomix`, which every start path (the assistant's
+// included) runs before automix turns on. Re-exported so this view stays the
+// one import for the DJ-3 decisions.
+export { AUTO_DJ_MIN_TRACKS, djAutomixEntries };
 
 /** How many tracks of a set the START button may offer to play: the rows
  *  automix can sequence right now, plus — for a bundled set — the rows that
@@ -241,12 +331,13 @@ const isRegisterableBundledRow = (e: SetlistEntry): boolean =>
  *
  *  The gap this leaves is real and is the caller's job: while the rows are
  *  still unregistered this count is ABOVE what `djAutomixEntries` finds, so
- *  anything that starts the mix must register first. See `onStartAutoDj`. */
+ *  anything that starts the mix must register first. See
+ *  `readyActiveSetForAutomix`, which every start path runs. */
 export function djPlayableCount(
   set: { bundled: boolean; entries: readonly SetlistEntry[] } | null | undefined,
 ): number {
   if (!set) return 0;
-  const pending = set.bundled ? set.entries.filter(isRegisterableBundledRow).length : 0;
+  const pending = set.bundled ? set.entries.filter(isPendingBundledRow).length : 0;
   return djAutomixEntries(set.entries).length + pending;
 }
 
@@ -1106,14 +1197,14 @@ export const DJView: React.FC = () => {
   const createSetlist = useSetlistStore((s) => s.create);
   const setActiveSetlist = useSetlistStore((s) => s.setActive);
   const importBundledSetlists = useSetlistStore((s) => s.importBundled);
-  // The header START button registers a bundled set before it starts it —
-  // see `onStartAutoDj`. The ref is that call's in-flight guard, the same job
-  // `registeringId` does for the Sets rows: two fast presses used to be two
-  // POSTs to /register.
-  const registerBundled = useSetlistStore((s) => s.registerBundled);
-  const startRegisterRef = useRef(false);
   const activeSet = activeId ? setlists[activeId] : null;
   useEffect(() => { void importBundledSetlists(); }, [importBundledSetlists]);
+  // Deck tracks and their waveform lanes decode through the engine's context,
+  // so both land on one `djAudioCache` entry. Registered here, on mount, while
+  // no deck holds a track yet: a lane's effect runs before this view's
+  // deck-load effect, so registering only inside `loadDeck` left the first
+  // track of a session decoded twice.
+  useEffect(() => { djEngine.shareDecodeContext(); }, []);
 
   // A deck can hold a track whose page the library's LRU dropped an hour ago,
   // so this goes through the store's id lookup (which fetches the one row it
@@ -1123,10 +1214,12 @@ export const DJView: React.FC = () => {
     void entries;
     return id ? useLibraryStore.getState().getById(id) ?? null : null;
   };
-  const deckATitle = trackById(deckATrack)?.title ?? null;
-  const deckBTitle = trackById(deckBTrack)?.title ?? null;
-  const deckAUrl = trackById(deckATrack)?.audioUrl ?? null;
-  const deckBUrl = trackById(deckBTrack)?.audioUrl ?? null;
+  const deckAEntry = trackById(deckATrack);
+  const deckBEntry = trackById(deckBTrack);
+  const deckATitle = deckAEntry?.title ?? null;
+  const deckBTitle = deckBEntry?.title ?? null;
+  const deckAUrl = deckAEntry?.audioUrl ?? null;
+  const deckBUrl = deckBEntry?.audioUrl ?? null;
 
   const ctlA = useDeck('A', deckATrack, !!deckATrack, quantize, autoGain, gainA);
   const ctlB = useDeck('B', deckBTrack, !!deckBTrack, quantize, autoGain, gainB);
@@ -1194,10 +1287,15 @@ export const DJView: React.FC = () => {
       const aHas = !!deckATrackRef.current;
       const bHas = !!deckBTrackRef.current;
       if (aHas || bHas) { if (aHas) djEngine.playDeck('A'); if (bHas) djEngine.playDeck('B'); return; }
-      const sl = useSetlistStore.getState();
-      const set = sl.activeId ? sl.setlists[sl.activeId] : null;
-      const first = set?.entries.find((e) => e.entryId) ?? null;
-      if (first?.entryId) { pendingPlayRef.current = 'A'; setDeckATrack(first.entryId); }
+      // The active set's first track goes on Deck A and plays. A bundled set
+      // nobody has opened is registered first; it used to have no entry id
+      // to find, and play did nothing.
+      void firstPlayableOfActiveSet().then((firstId) => {
+        // The user may have loaded a deck while a register was out.
+        if (!firstId || deckATrackRef.current || deckBTrackRef.current) return;
+        pendingPlayRef.current = 'A';
+        setDeckATrack(firstId);
+      });
     };
     return registerDjMasterHandler({
       toggle: () => {
@@ -1242,24 +1340,24 @@ export const DJView: React.FC = () => {
     });
   }, [pitchRange]);
 
-  // `libLookupVersion` is load-bearing, not decoration (DJ-3): `trackById`
-  // goes through `libraryStore.getById`, which returns undefined for a track
-  // on no loaded page and kicks off an async single-entry fetch. With
-  // `[deckATrack]` alone nothing re-ran when that fetch landed, so the deck
-  // was loaded with `null` and stayed silently empty — which is every
-  // Send-to-DJ id and every bundled-set id, and is why automix then stalled
-  // on `incomingHasBuffer` forever. Re-running on the lookup bump is cheap:
-  // `loadDeck` no-ops when the url has not changed.
+  // The resolved entry is load-bearing (DJ-3): `trackById` goes through
+  // `libraryStore.getById`, which returns undefined for a track on no loaded
+  // page and kicks off an async single-entry fetch. With `[deckATrack]` alone
+  // nothing re-ran when that fetch landed, so the deck was loaded with `null`
+  // and stayed silently empty — which is every Send-to-DJ id and every
+  // bundled-set id, and is why automix then stalled on `incomingHasBuffer`
+  // forever. `lookupVersion` re-renders this view when the fetch lands, and
+  // the new entry object re-runs the effect. What a re-run may do is
+  // `deckLoadStep`'s call: an entry still unresolved and a URL the deck
+  // already holds both leave the deck alone, so a playing track is never
+  // rewound or ejected by a lookup for some other row.
+  const deckEntryRef = useRef<Record<djEngine.DeckId, string | null>>({ A: null, B: null });
   useEffect(() => {
-    const t = trackById(deckATrack);
-    void djEngine.loadDeck('A', t ? (t.audioUrl ?? null) : null, t?.title ?? null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [deckATrack, libLookupVersion]);
+    syncDeckToEntry('A', deckATrack, deckAEntry, deckEntryRef.current);
+  }, [deckATrack, deckAEntry]);
   useEffect(() => {
-    const t = trackById(deckBTrack);
-    void djEngine.loadDeck('B', t ? (t.audioUrl ?? null) : null, t?.title ?? null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [deckBTrack, libLookupVersion]);
+    syncDeckToEntry('B', deckBTrack, deckBEntry, deckEntryRef.current);
+  }, [deckBTrack, deckBEntry]);
 
   useEffect(() => {
     if (!flash) return;
@@ -1565,22 +1663,47 @@ export const DJView: React.FC = () => {
     });
   }, []);
 
-  // "Send to DJ" bridge: a caller (suggester, imported performance set)
-  // staged the active setlist and tripped the one-shot pendingStart flag —
-  // consume it and switch automix on so the prepared set runs itself.
+  // The one way into automix. START AUTO DJ, the Automix chip and every
+  // bridged request (a Sets row's play button, Send to DJ, the assistant) come
+  // through here, so each of them registers a bundled set before automix turns
+  // on: the automix effect sequences entry ids only, and an unregistered set
+  // used to stop it at once with "needs ≥2 tracks". `mode` says what happens
+  // to the decks (see `automixStartSteps`). The crossfade normalisation lives
+  // in the automix seed block below, so every path gets it.
+  const beginAutomix = async (mode: AutomixStartMode): Promise<void> => {
+    const sl = useSetlistStore.getState();
+    const set = sl.activeId ? sl.setlists[sl.activeId] : null;
+    if (set && isBundledSetId(set.id) && set.entries.some(isPendingBundledRow)) {
+      setFlash('Registering the set…');
+    }
+    const ready = await readyActiveSetForAutomix();
+    if (!ready.ok) {
+      // Never a silent no-op. A register failure was already logged by the
+      // store; "not enough tracks" goes to the log here, where the user reads
+      // failures, as well as to the footer.
+      if (ready.reason === 'too-few') logWarn('dj', ready.message);
+      setFlash(ready.message);
+      return;
+    }
+    for (const step of automixStartSteps(mode)) {
+      if (step === 'drop-transition') useDjAutomix.getState().consumeTransition(); // so a restart does not blend off track 1
+      else if (step === 'eject') { ejectDeck('A'); ejectDeck('B'); }
+      else if (step === 'on') setAutomixOn(true);
+      else setAutomixRestart((n) => n + 1); // re-run the automix effect for a fresh seed even if already on
+    }
+  };
+  const beginAutomixRef = useLatestRef(beginAutomix);
+
+  // "Send to DJ" bridge: a caller (suggester, a Sets row, the assistant)
+  // staged the active setlist and asked for a start, with how that start
+  // treats the decks. Consume it and take the one start path above.
   const automixPendingStart = useDjAutomix((s) => s.pendingStart);
   const automixPendingStop = useDjAutomix((s) => s.pendingStop);
   useEffect(() => {
     if (!automixPendingStart) return;
     useDjAutomix.getState().consumeStart();
-    useDjAutomix.getState().consumeTransition(); // drop a stale "transition now" so the restart doesn't blend off track 1
-    ejectDeck('A'); ejectDeck('B');            // clear decks so the sequencer seeds from track 1
-    // The crossfade normalisation moved into the automix seed block below, so
-    // the manual Automix toggle gets it too (it never did — a parked fader
-    // silenced the deck the seed had just loaded).
-    setAutomixOn(true);
-    setAutomixRestart((n) => n + 1);           // re-run the automix effect for a fresh seed even if already on
-  }, [automixPendingStart]);
+    void beginAutomixRef.current(automixPendingStart);
+  }, [automixPendingStart, beginAutomixRef]);
   useEffect(() => {
     if (!automixPendingStop) return;
     useDjAutomix.getState().consumeStop();
@@ -1922,52 +2045,32 @@ export const DJView: React.FC = () => {
     playableCount: autoDjPlayable,
     automixOn,
   });
+  // A register is out for some set: the store's one in-flight guard, shared
+  // with the Sets rows. A press then says so and does nothing else; a button
+  // that does nothing at all reads as broken, which is the complaint DJ-3
+  // started from.
+  const registerBusy = (): boolean => {
+    if (!useSetlistStore.getState().registeringId) return false;
+    setFlash('Registering the set…');
+    return true;
+  };
+  const onToggleAutomix = () => {
+    if (automixOn) { setAutomixOn(false); return; }
+    if (registerBusy()) return;
+    void beginAutomix('continue');
+  };
   const onStartAutoDj = async (intent: StartAutoDjIntent) => {
     switch (intent) {
-      // Both go through the djAutomix bridge rather than `setAutomixOn`, so
-      // the button inherits exactly what Send-to-DJ gets: eject both decks,
-      // reset the crossfader to full Deck A, reseed from track 1.
       case 'start': {
+        if (registerBusy()) return;
         // `autoDjPlayable` counts bundled rows that have no library entry
         // yet, so the button offers to start a set the automix effect would
-        // find EMPTY (it sequences `entryId`s only) — it would bail on
-        // `< AUTO_DJ_MIN_TRACKS`, un-toggle itself and flash for 2.2s.
-        // Register first, exactly as the Sets row's ▶ does (see `openSet`):
-        // same order, same in-flight guard, same ProcessingLog warning.
-        if (activeSet && isBundledSetId(activeSet.id)
-            && activeSet.entries.some(isRegisterableBundledRow)) {
-          if (startRegisterRef.current) {
-            // A register is already in flight. Say so — a button that does
-            // nothing at all reads as broken, which is the whole complaint
-            // this ticket started from.
-            setFlash('Registering the set…');
-            return;
-          }
-          startRegisterRef.current = true;
-          try {
-            const registered = await registerBundled(activeSet.id);
-            // The register is a network round-trip and the user can switch
-            // sets while it is out. Starting the mix on the set that was
-            // active when the press happened would eject both decks and
-            // sequence a set nobody is looking at.
-            if (useSetlistStore.getState().activeId !== activeSet.id) {
-              setFlash('The active set changed — press START AUTO DJ again');
-              return;
-            }
-            if (registered === null) return;      // registerBundled already logged why
-            const playable = djAutomixEntries(registered).length;
-            if (playable < AUTO_DJ_MIN_TRACKS) {
-              logWarn(
-                'dj',
-                `"${activeSet.name}" has ${playable} playable track${playable === 1 ? '' : 's'} — Auto-DJ needs ${AUTO_DJ_MIN_TRACKS}.`,
-              );
-              return;
-            }
-          } finally {
-            startRegisterRef.current = false;
-          }
-        }
-        useDjAutomix.getState().requestStart();
+        // find empty until it is registered; `beginAutomix` registers first.
+        // `continue`, the Automix chip's behavior: a deck that is playing
+        // keeps playing and the set runs on from that track. Through the
+        // Send-to-DJ bridge this press ejected both decks and restarted the
+        // set from track 1 under a playing track.
+        await beginAutomix('continue');
         break;
       }
       case 'stop': useDjAutomix.getState().requestStop(); break;
@@ -2012,7 +2115,7 @@ export const DJView: React.FC = () => {
     vinylSpinA, setVinylSpinA, vinylSpinB, setVinylSpinB,
     limiterOn, setLimiterOn, cueSupported,
     midiMapOn: midiMapOpen, onToggleMidiMap: () => setMidiMapOpen((v) => !v),
-    automixOn, onToggleAutomix: () => setAutomixOn((v) => !v),
+    automixOn, onToggleAutomix,
   });
 
   return (
@@ -3344,10 +3447,6 @@ const TrackBrowser: React.FC<{ source: Source; setSource: (s: Source) => void; o
 /** Source tree — every entry is live: filtered views over the library
  *  (Library / Favorites / Generated / Imports), real Online Download, and the
  *  user's Sets. No placeholder/streaming stubs. */
-/** Backend-bundled sets are `zad-…`; only those have tracks a register call
- *  can fill in (see `state/setlistStore`). */
-const isBundledSetId = (id: string): boolean => id.startsWith('zad-');
-
 const SourceTree: React.FC<{ source: Source; setSource: (s: Source) => void; libCount: number }> = ({ source, setSource, libCount }) => {
   const entries = useLibraryStore((s) => s.entries);
   const libRevision = useLibraryStore((s) => s.revision);
@@ -3358,36 +3457,34 @@ const SourceTree: React.FC<{ source: Source; setSource: (s: Source) => void; lib
   const activeSetId = useSetlistStore((s) => s.activeId);
   const registerBundled = useSetlistStore((s) => s.registerBundled);
   const sets = Object.values(setlists).sort((a, b) => b.updatedAt - a.updatedAt);
-  // Which set has a `/register` POST in flight. Doubles as the double-click
-  // guard: the old row fired `registerBundled` un-awaited with no busy state,
-  // so two fast clicks POSTed twice.
-  const [registeringId, setRegisteringId] = useState<string | null>(null);
+  // Which set has a `/register` POST in flight: the store's one guard, shared
+  // with START AUTO DJ and the Automix chip, so a row pressed while either of
+  // those is registering cannot POST again. The rows used to keep their own
+  // flag, which the header never saw.
+  const registeringId = useSetlistStore((s) => s.registeringId);
 
   /** Activate + register a set. Reports through the ProcessingLog instead of
    *  the 2.2-second footer flash, which is where the user already reads
    *  failures — and never returns silently on "not enough tracks", which used
    *  to be an outright no-op. */
   const openSet = async (id: string, name: string, autoDj: boolean): Promise<void> => {
-    if (registeringId) return;
+    if (useSetlistStore.getState().registeringId) return;
     setActive(id);
     setSource({ kind: 'set', id });
-    setRegisteringId(id);
-    try {
-      const registered = await registerBundled(id);
-      if (registered === null) return; // registerBundled already logged why
-      const playable = djAutomixEntries(registered).length;
-      if (!autoDj) return;
-      if (playable < AUTO_DJ_MIN_TRACKS) {
-        logWarn(
-          'dj',
-          `"${name}" has ${playable} playable track${playable === 1 ? '' : 's'} — Auto-DJ needs ${AUTO_DJ_MIN_TRACKS}.`,
-        );
-        return;
-      }
-      useDjAutomix.getState().requestStart();
-    } finally {
-      setRegisteringId((cur) => (cur === id ? null : cur));
+    const registered = await registerBundled(id);
+    if (registered === null) return; // registerBundled already logged why
+    const playable = djAutomixEntries(registered).length;
+    if (!autoDj) return;
+    if (playable < AUTO_DJ_MIN_TRACKS) {
+      logWarn(
+        'dj',
+        `"${name}" has ${playable} playable track${playable === 1 ? '' : 's'} — Auto-DJ needs ${AUTO_DJ_MIN_TRACKS}.`,
+      );
+      return;
     }
+    // This set's play button means "play this set", from the top, even
+    // over a mix already running on another set.
+    useDjAutomix.getState().requestStart('fresh');
   };
 
   /**
@@ -4301,7 +4398,7 @@ function buildDjRegistry(p: DjRegArgs): WidgetRegistry {
   ) };
 
   reg.automix = { id: 'automix', label: 'Automix', group: 'Mixer', kind: 'button', source: 'builtin', render: () => center(
-    <button onClick={p.onToggleAutomix} title="Automix — auto-sequence + beatmatch-crossfade the active set" className={`w-full min-w-0 px-1 py-0.5 rounded text-[8px] font-black uppercase tracking-wider truncate border transition-colors ${p.automixOn ? 'border-emerald-400/60 bg-emerald-500/15 text-emerald-200 animate-pulse' : 'border-white/10 text-zinc-400 hover:text-zinc-100 hover:border-white/25'}`}>{p.automixOn ? 'Automix ●' : 'Automix'}</button>
+    <button type="button" onClick={p.onToggleAutomix} aria-pressed={p.automixOn} title="Automix — auto-sequence + beatmatch-crossfade the active set" className={`w-full min-w-0 px-1 py-0.5 rounded font-sans text-xs font-black uppercase tracking-wider truncate border transition-colors ${p.automixOn ? 'border-emerald-400/60 bg-emerald-500/15 text-emerald-200 animate-pulse' : 'border-white/10 text-zinc-400 hover:text-zinc-100 hover:border-white/25'}`}>{p.automixOn ? 'Automix ●' : 'Automix'}</button>
   ) };
 
   reg.keymatch = { id: 'keymatch', label: 'Key Match', group: 'Mixer', kind: 'button', source: 'builtin', render: () => center(
