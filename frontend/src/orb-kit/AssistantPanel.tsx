@@ -24,6 +24,7 @@ import {
 } from './assistantEffort';
 import { contextPercentage, fetchContextUsage, type ContextUsage } from './contextUsage';
 import { PermissionModeSelect } from './permission/PermissionModeSelect';
+import { UserClaudeConfigToggle } from './permission/UserClaudeConfigToggle';
 import { useAssistantPermissionStore } from './permission/assistantPermissionStore';
 import {
     loadConversations,
@@ -1367,13 +1368,13 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                                 <label htmlFor> for free. */}
                             {shouldShowPermissionSelect(selectedProvider) && (
                                 <div>
-                                    <label htmlFor="assistant-effort" className="text-[10px] text-muted block mb-0.5">Effort</label>
+                                    <label htmlFor="assistant-effort" className="text-xs font-bold text-muted block mb-0.5">Effort</label>
                                     <select
                                         id="assistant-effort"
                                         name="assistant-effort"
                                         value={effort}
                                         onChange={(e) => setEffort(normalizeEffort(e.target.value))}
-                                        className="w-full bg-black/30 border border-white/10 rounded px-2 py-1 text-[11px] text-white cursor-pointer hover:border-white/20 focus:outline-none focus:border-primary/50 transition-colors"
+                                        className="w-full bg-black/30 border border-white/10 rounded px-2 py-1 text-xs text-white cursor-pointer hover:border-white/20 focus:outline-none focus:border-primary/50 transition-colors"
                                     >
                                         {EFFORT_OPTIONS.map((level) => (
                                             <option key={level} value={level} className="bg-black text-white">
@@ -1383,6 +1384,11 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                                     </select>
                                 </div>
                             )}
+                            {/* Whether the Claude CLI loads the user's own
+                                ~/.claude settings, CLAUDE.md, skills, agents and
+                                MCP servers. An app setting (data/settings.json),
+                                read by the backend on every turn; Claude only. */}
+                            {shouldShowPermissionSelect(selectedProvider) && <UserClaudeConfigToggle />}
                             <div className="flex items-center justify-between text-[10px] pt-0.5">
                                 {/* The CLI reports the model it actually loaded,
                                     which can differ from the one requested (a

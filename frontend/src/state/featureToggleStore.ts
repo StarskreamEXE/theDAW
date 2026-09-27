@@ -129,6 +129,17 @@ export interface LibrarySettings {
   media_roots_redacted?: boolean;
 }
 
+/** The in-app Claude Code session's setup (backend settings `assistant`). */
+export interface AssistantSettings {
+  /** "Use my Claude settings and MCP servers". True (the default): the session
+   *  loads the user's own ~/.claude settings, CLAUDE.md, skills, agents and MCP
+   *  servers next to theDAW's relay, and the user's own allow rules approve
+   *  what they match. False: only this project's settings and theDAW's own MCP
+   *  servers, so the permission mode is the only authority. The backend reads
+   *  it on every turn and respawns the session when it changes. */
+  use_user_claude_config: boolean;
+}
+
 export interface FeatureSettings {
   schema_version: number;
   app: AppSettings;
@@ -141,6 +152,7 @@ export interface FeatureSettings {
   io: IoSettings;
   models: ModelsSettings;
   library: LibrarySettings;
+  assistant: AssistantSettings;
 }
 
 export const DEFAULT_FEATURE_SETTINGS: FeatureSettings = {
@@ -191,6 +203,9 @@ export const DEFAULT_FEATURE_SETTINGS: FeatureSettings = {
   },
   library: {
     media_roots: [],
+  },
+  assistant: {
+    use_user_claude_config: true,
   },
 };
 
@@ -250,6 +265,9 @@ function mergeSettings(base: FeatureSettings, patch: FeatureSettingsPatch): Feat
     // Same wholesale-replace rule, same tolerance for an older backend that
     // does not send the section at all.
     library: { ...DEFAULT_FEATURE_SETTINGS.library, ...(base.library ?? {}), ...(patch.library ?? {}) },
+    // Tolerant of a backend (or a persisted mirror) that predates the section:
+    // the switch then reads as its default, ON.
+    assistant: { ...DEFAULT_FEATURE_SETTINGS.assistant, ...(base.assistant ?? {}), ...(patch.assistant ?? {}) },
   };
   if (patch.schema_version != null) next.schema_version = patch.schema_version;
   return next;
@@ -359,6 +377,15 @@ export const useFeatureToggleStore = create<FeatureToggleState>()(
     {
       name: 'thedaw-feature-settings',
       partialize: (s) => ({ settings: s.settings }),
+      // A mirror saved by an older build lacks the sections added since (the
+      // `assistant` switch, the folder lists); fill them from the defaults so
+      // a reader never finds a section missing before the first refresh.
+      merge: (persisted, current) => {
+        const saved = (persisted as { settings?: FeatureSettingsPatch } | undefined)?.settings;
+        return saved && typeof saved === 'object'
+          ? { ...current, settings: mergeSettings(DEFAULT_FEATURE_SETTINGS, saved) }
+          : current;
+      },
     },
   ),
 );
