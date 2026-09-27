@@ -52,6 +52,7 @@ import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -62,8 +63,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
-from typing import IO, Iterator, Optional
+from typing import IO, Callable, Iterator, Optional
 from backend.lib import paths
+from backend.lib.atomic import atomic_write
 from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
@@ -122,15 +124,35 @@ LYRIA_REPO = "StarskreamEXE/lyria-3-pro"
 LYRIA_REPO_URL = f"https://github.com/{LYRIA_REPO}.git"
 GIT_CLONE_TIMEOUT_SEC = 900.0
 
+# The one commit of LYRIA_REPO that Install checks out and that an existing
+# clean checkout is moved to (see _update_checkout). The child is a Node app
+# handed the user's provider keys, so what runs is a commit that was read, not
+# whatever the repo's HEAD is on the day of the install. This commit has
+# server/keys.ts, which reads GEMINI_API_KEY / OPENROUTER_API_KEY plus the
+# numbered GEMINI_API_KEY_2 .. _10 variables (its numberedEnvValues) -- the
+# variables _child_env fills. Before moving the pin, read the new commit's
+# server.ts and server/keys.ts: how it reads keys, and where it sends them.
+LYRIA_PINNED_COMMIT = "ef8b16f4f167a85654dd3138bee9168ef54644ca"
+# One depth-1 fetch of that commit, per update attempt.
+GIT_FETCH_TIMEOUT_SEC = 120.0
+# A failed update (offline, GitHub down) is retried after this long rather
+# than on every spawn, so a stalled network does not delay every start.
+CHECKOUT_RETRY_SEC = 600.0
+# server/keys.ts numberedEnvValues reads <VAR>_2 up to <VAR>_10, so a checkout
+# that reads lists takes at most this many keys per provider from theDAW.
+CHILD_KEY_LIMIT = 10
+
 # The provider keys theDAW hands the child (see _child_env). Per provider the
 # order is: the OS environment's value(s), then what was stored here (POST
-# /api/lyria/key[s]), then the assistant's key pool, so a key pasted for the
-# assistant serves Lyria too. EVERY key is passed, not just the first: the
-# embedded app takes an ordered comma-separated list per provider and fails
-# over from a rejected key (invalid, out of credit, or a quota wall) to the
-# next one -- see its server/keys.ts. That matters because Google's free tier
-# grants zero Lyria requests per day, so a lone Gemini key is often a dead end
-# that the next key, or an OpenRouter key, recovers from.
+# /api/lyria/key[s]), then keys from the assistant's key pool. From the pool
+# the child gets the FIRST Gemini key when neither of the other sources has
+# one (what theDAW always handed it), and every pooled Gemini, OpenRouter and
+# openrouter-free key only after the user turns on "share the key pool" in the
+# Lyria card (share_pool in the key file). A checkout with server/keys.ts
+# fails over from a rejected key (invalid, out of credit, or a quota wall) to
+# the next one, which matters because Google's free tier grants zero Lyria
+# requests per day; an older checkout reads one key per provider, so it is
+# handed only the first (see checkout_reads_key_lists).
 #
 # The file name still says "gemini" although its CONTENTS are now per-provider
 # (see _read_store): .gitignore ignores exactly ``data/lyria_gemini_key.json``,
@@ -142,6 +164,15 @@ _KEY_FILE_VERSION = 2
 # new shape is written over the old one. ``*.bak`` is already gitignored.
 _KEY_FILE_BACKUP = _KEY_FILE.with_name(_KEY_FILE.name + ".bak")
 
+# Checkouts whose dependencies changed under them (_update_checkout moved one
+# to a commit with a different package.json / package-lock.json) and whose npm
+# install has not finished yet. Written before the move and cleared only when
+# npm install succeeds, so a failed or interrupted install is run again on the
+# next start: node_modules still exists at that point (the old one, or a
+# half-written one), so its presence alone says nothing. Kept in theDAW's data
+# folder, never in the user's checkout.
+_DEPS_PENDING_FILE = paths.data_path("lyria_deps_pending.json")
+
 # The providers theDAW can hand keys to. Both are the embedded app's own
 # (server.ts reads GEMINI_API_KEY and OPENROUTER_API_KEY).
 LYRIA_PROVIDERS: tuple[str, ...] = ("gemini", "openrouter")
@@ -151,7 +182,8 @@ _PROVIDER_ENV_VAR = {
 }
 # key_pool pools that hold keys for each provider. "openrouter-free" is its own
 # pool in backend/key_pool.py (PROVIDER_ENV_MAP) with its own entries, so it is
-# folded in rather than assumed to be the same list as "openrouter".
+# folded in rather than assumed to be the same list as "openrouter". Read in
+# full only when the user shares the pool (see resolved_keys).
 _PROVIDER_POOLS = {
     "gemini": ("gemini",),
     "openrouter": ("openrouter", "openrouter-free"),
@@ -257,20 +289,44 @@ def resolve_config() -> LyriaConfig:
     )
 
 
+def _numbered_vars(var: str) -> list[str]:
+    """``<var>_2`` .. ``<var>_<CHILD_KEY_LIMIT>``: the extra slots server/keys.ts
+    reads (numberedEnvValues), in order."""
+    return [f"{var}_{n}" for n in range(2, CHILD_KEY_LIMIT + 1)]
+
+
+def checkout_reads_key_lists(project_path: Path) -> bool:
+    """True when the checkout reads more than one key per provider.
+
+    Lyria's server/keys.ts (commit 981d5a4 on) resolves ``GEMINI_API_KEY``
+    plus ``GEMINI_API_KEY_2`` .. ``_10`` through ``numberedEnvValues``, and
+    server.ts calls it for both providers. A checkout from before that reads
+    ``process.env.GEMINI_API_KEY`` as ONE key (its server.ts:13), so a list in
+    that variable is sent to Google as a single invalid key. Both files are
+    checked so a half-merged tree does not count."""
+    try:
+        keys_ts = (project_path / "server" / "keys.ts").read_text(encoding="utf-8")
+        server_ts = (project_path / "server.ts").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    return "numberedEnvValues" in keys_ts and "numberedEnvValues(" in server_ts
+
+
 def _child_env(cfg: LyriaConfig) -> dict[str, str]:
     """Build the child's environment.
 
     theDAW owns the spawn, so it owns the env -- this is what lets us drive
-    Lyria's cost mode and key resolution WITHOUT modifying its source. Lyria
-    already reads all of these (server.ts:10 dotenv, :13 GEMINI_API_KEY,
-    :33-36 OPENROUTER_API_KEY, :102 PORT), and its in-app Settings modal still
-    overrides the keys per-request via x-*-api-key headers, so a user who
-    prefers the in-app flow is unaffected.
+    Lyria's cost mode and key resolution WITHOUT modifying its source. Every
+    Lyria checkout reads ``GEMINI_API_KEY``, ``OPENROUTER_API_KEY``,
+    ``AI_PROVIDER``, ``LYRIA_MOCK`` and ``PORT`` from its environment, and its
+    in-app Settings modal still overrides the keys per request via
+    x-*-api-key headers, so a user who prefers the in-app flow is unaffected.
 
-    Both provider variables are handed the FULL ordered list theDAW knows
-    about, comma-separated, because the child walks that list and skips a
-    rejected key (server/keys.ts). Passing one key throws away the failover
-    the child was built for. No key value is ever logged.
+    ``GEMINI_API_KEY`` and ``OPENROUTER_API_KEY`` each carry exactly ONE key,
+    the first of the provider's ordered list, because that is all a checkout
+    without server/keys.ts can read. The rest of the list goes into the
+    numbered ``_2`` .. ``_10`` variables, and only for a checkout that reads
+    them (checkout_reads_key_lists). No key value is ever logged.
     """
     env = child_env()
     env["PORT"] = str(cfg.port)
@@ -280,27 +336,42 @@ def _child_env(cfg: LyriaConfig) -> dict[str, str]:
         # Explicit opt-in to real spending: clear any inherited mock flag so a
         # stale value in the parent's environment can't silently re-enable it.
         env.pop("LYRIA_MOCK", None)
-    # Pass through every key theDAW already holds so the user needn't re-enter
-    # them. A provider with no keys has its variable REMOVED rather than left
-    # at whatever the parent inherited (a blank or whitespace-only value would
-    # otherwise reach the child); Lyria then reports it as unconfigured via its
-    # own /api/settings/status, and its Settings modal still works.
+    # Every provider slot is cleared first and then filled from the resolved
+    # list, so nothing the parent inherited (a blank value, a stale numbered
+    # key the list no longer holds) reaches the child behind theDAW's back.
+    # env_keys() already folded the OS environment's own values into the list.
+    # A provider with no keys is left unset; Lyria then reports it as
+    # unconfigured via its own /api/settings/status, and its Settings modal
+    # still works.
+    reads_lists = checkout_reads_key_lists(cfg.project_path)
     resolved: dict[str, list[str]] = {}
+    passed: dict[str, int] = {}
     for provider in LYRIA_PROVIDERS:
         keys, _source = resolved_keys(provider)
         resolved[provider] = keys
         var = _PROVIDER_ENV_VAR[provider]
-        if keys:
-            env[var] = ",".join(keys)
-        else:
-            env.pop(var, None)
+        env.pop(var, None)
+        for numbered in _numbered_vars(var):
+            env.pop(numbered, None)
+        if not keys:
+            passed[provider] = 0
+            continue
+        env[var] = keys[0]
+        extra = keys[1:CHILD_KEY_LIMIT] if reads_lists else []
+        for numbered, key in zip(_numbered_vars(var), extra):
+            env[numbered] = key
+        passed[provider] = 1 + len(extra)
     ai_provider = _child_ai_provider(resolved)
     if ai_provider:
         env["AI_PROVIDER"] = ai_provider
     log.info(
-        "lyria.sidecar: child keys -- gemini=%d openrouter=%d provider=%s",
+        "lyria.sidecar: child keys -- gemini=%d/%d openrouter=%d/%d "
+        "(handed/held; this checkout reads %s) provider=%s",
+        passed["gemini"],
         len(resolved["gemini"]),
+        passed["openrouter"],
         len(resolved["openrouter"]),
+        f"up to {CHILD_KEY_LIMIT} keys" if reads_lists else "one key",
         ai_provider or "child default",
     )
     return env
@@ -386,17 +457,19 @@ def _split_keys(raw: object) -> list[str]:
 
 
 def _read_store() -> dict:
-    """The stored per-provider key lists and provider preference.
+    """The stored per-provider key lists, provider preference and pool share.
 
     Migrates the legacy single-Gemini shape (``{"key": "..."}``) transparently
     on read: that key becomes the FIRST Gemini entry, so the key a user
-    already saved keeps being the one tried first. Never raises -- an
-    unreadable or corrupt file reads as "nothing stored", exactly as the
-    single-key version did.
+    already saved keeps being the one tried first. _write_store keeps that
+    ``key`` field in step with the first stored Gemini key, so reading it back
+    changes nothing. Never raises -- an unreadable or corrupt file reads as
+    "nothing stored", exactly as the single-key version did.
     """
     store: dict = {
         "providers": {provider: [] for provider in LYRIA_PROVIDERS},
         "provider_preference": None,
+        "share_pool": False,
     }
     try:
         raw = json.loads(_KEY_FILE.read_text(encoding="utf-8"))
@@ -419,6 +492,8 @@ def _read_store() -> dict:
     preference = raw.get("provider_preference")
     if isinstance(preference, str) and preference.strip().lower() in LYRIA_PROVIDERS:
         store["provider_preference"] = preference.strip().lower()
+    # Only a literal true shares the pool: a hand-edited "yes" or 1 fails safe.
+    store["share_pool"] = raw.get("share_pool") is True
     return store
 
 
@@ -438,11 +513,18 @@ def _write_store(store: dict) -> None:
     The backup exists because this is user data theDAW did not create: a
     migration that turns out to be wrong must not be the end of the key the
     user saved months ago.
+
+    Both files are written with atomic_write, so a crash mid-write leaves the
+    previous file whole: _read_store reads a torn file as "nothing stored",
+    and the next add_key would then write that empty list over every key.
+
+    ``key`` repeats the first stored Gemini key in the single-key shape older
+    theDAW builds read (``json.loads(...).get("key")``), so a user who runs
+    one of those against this data dir keeps the Gemini key they saved here.
     """
-    _KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
     if _is_legacy_file() and not _KEY_FILE_BACKUP.exists():
         try:
-            _KEY_FILE_BACKUP.write_bytes(_KEY_FILE.read_bytes())
+            atomic_write(_KEY_FILE_BACKUP, _KEY_FILE.read_bytes(), mode=0o600)
             log.info(
                 "lyria.sidecar: migrated %s to per-provider keys (backup: %s)",
                 _KEY_FILE.name,
@@ -450,15 +532,19 @@ def _write_store(store: dict) -> None:
             )
         except OSError as e:
             log.warning("lyria.sidecar: could not back up %s: %s", _KEY_FILE.name, e)
-    payload = {
-        "version": _KEY_FILE_VERSION,
-        "providers": {
-            provider: list(store["providers"].get(provider, []))
-            for provider in LYRIA_PROVIDERS
-        },
-        "provider_preference": store.get("provider_preference"),
+    providers = {
+        provider: list(store["providers"].get(provider, []))
+        for provider in LYRIA_PROVIDERS
     }
-    _KEY_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    payload: dict = {
+        "version": _KEY_FILE_VERSION,
+        "providers": providers,
+        "provider_preference": store.get("provider_preference"),
+        "share_pool": store.get("share_pool") is True,
+    }
+    if providers["gemini"]:
+        payload["key"] = providers["gemini"][0]
+    atomic_write(_KEY_FILE, json.dumps(payload, indent=2), mode=0o600)
 
 
 def stored_keys(provider: str) -> list[str]:
@@ -467,14 +553,38 @@ def stored_keys(provider: str) -> list[str]:
 
 
 def env_keys(provider: str) -> list[str]:
-    """The OS environment's keys for a provider, in order. The variable may
-    itself hold a comma/newline-separated list."""
-    return _split_keys(os.getenv(_PROVIDER_ENV_VAR[normalize_provider(provider)]))
+    """The OS environment's keys for a provider, in order: the variable itself
+    (which may hold a comma/newline-separated list), then the numbered
+    ``_2`` .. ``_10`` variables server/keys.ts also reads. _child_env clears
+    those slots and refills them from the resolved list, so they are read
+    here or they would be dropped."""
+    var = _PROVIDER_ENV_VAR[normalize_provider(provider)]
+    raw = [os.getenv(var) or ""]
+    raw.extend(os.getenv(numbered) or "" for numbered in _numbered_vars(var))
+    return _split_keys(raw)
+
+
+def pool_shared() -> bool:
+    """True when the user turned on "share the key pool" in the Lyria card."""
+    return _read_store()["share_pool"]
+
+
+def set_pool_shared(share: bool) -> bool:
+    """Store the pool-share switch. Returns the stored value."""
+    value = share is True
+    with _key_file_lock:
+        store = _read_store()
+        store["share_pool"] = value
+        _write_store(store)
+    log.info(
+        "lyria.sidecar: key pool %s with Lyria", "shared" if value else "not shared"
+    )
+    return value
 
 
 def pooled_keys(provider: str) -> list[str]:
     """Every key the assistant's key pool holds for a provider, in order,
-    across each pool that feeds it."""
+    across each pool that feeds it -- whether or not it is shared."""
     provider = normalize_provider(provider)
     out: list[str] = []
     try:
@@ -490,14 +600,34 @@ def pooled_keys(provider: str) -> list[str]:
     return out
 
 
+def _pool_keys_for_child(
+    provider: str, env: list[str], stored: list[str], share: bool
+) -> list[str]:
+    """The pooled keys the child may have for a provider.
+
+    Shared pool: all of them. Otherwise only the first pooled GEMINI key, and
+    only when the environment and the Lyria card hold no Gemini key -- the
+    one pooled key theDAW has always handed the child, so a key pasted for
+    the assistant still starts Lyria. OpenRouter and openrouter-free keys
+    were never handed over and stay with the assistant until the user shares
+    the pool."""
+    if share:
+        return pooled_keys(provider)
+    if provider == "gemini" and not env and not stored:
+        return pooled_keys("gemini")[:1]
+    return []
+
+
 def resolved_keys(provider: str) -> tuple[list[str], str]:
-    """Every key the child will be handed for a provider, in the order it will
-    try them, plus where the FIRST one comes from: ``env`` | ``file`` |
-    ``pool`` | ``none`` (the source labels the UI has always shown)."""
+    """Every key theDAW holds for the child for a provider, in the order it
+    will try them, plus where the FIRST one comes from: ``env`` | ``file`` |
+    ``pool`` | ``none`` (the source labels the UI has always shown). How many
+    of them a checkout actually receives is _child_env's business: one, or up
+    to CHILD_KEY_LIMIT for a checkout that reads lists."""
     provider = normalize_provider(provider)
     env = env_keys(provider)
     stored = stored_keys(provider)
-    pooled = pooled_keys(provider)
+    pooled = _pool_keys_for_child(provider, env, stored, pool_shared())
     ordered: list[str] = []
     for key in (*env, *stored, *pooled):
         if key not in ordered:
@@ -595,25 +725,39 @@ def remove_key(provider: str, index: int) -> bool:
 def key_summary() -> dict:
     """Counts and sources only -- never a key value, not even a prefix.
 
-    ``count`` is what the child is handed (de-duplicated across sources), so
-    it can be smaller than ``env + stored + pool`` when the same key reaches
-    us twice. ``stored`` is the length of the removable list, which is what
-    DELETE /api/lyria/keys indexes into.
+    ``count`` is what theDAW holds for the child (de-duplicated across
+    sources), so it can be smaller than ``env + stored + pool`` when the same
+    key reaches us twice. ``handed`` is how many of those the configured
+    checkout receives: all of them up to CHILD_KEY_LIMIT when it reads lists,
+    otherwise one. ``stored`` is the length of the removable list, which is
+    what DELETE /api/lyria/keys indexes into. ``pool`` counts the pooled keys
+    that go to the child; ``pool_available`` counts every key the pool holds,
+    so the card can say what sharing it would add.
     """
+    share = pool_shared()
+    reads_lists = checkout_reads_key_lists(resolve_config().project_path)
+    limit = CHILD_KEY_LIMIT if reads_lists else 1
     providers: dict[str, dict] = {}
     for provider in LYRIA_PROVIDERS:
         keys, source = resolved_keys(provider)
+        env = env_keys(provider)
+        stored = stored_keys(provider)
         providers[provider] = {
             "count": len(keys),
+            "handed": min(len(keys), limit),
             "source": source,
             "configured": bool(keys),
-            "env": len(env_keys(provider)),
-            "stored": len(stored_keys(provider)),
-            "pool": len(pooled_keys(provider)),
+            "env": len(env),
+            "stored": len(stored),
+            "pool": len(_pool_keys_for_child(provider, env, stored, share)),
+            "pool_available": len(pooled_keys(provider)),
         }
     return {
         "providers": providers,
         "provider_preference": provider_preference(),
+        "share_pool": share,
+        "reads_key_lists": reads_lists,
+        "key_limit": limit,
         "mock": is_mock(),
     }
 
@@ -705,8 +849,52 @@ def _is_lyria_server(port: int) -> bool:
     )
 
 
+def _pending_projects() -> list[str]:
+    try:
+        raw = json.loads(_DEPS_PENDING_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    projects = raw.get("projects") if isinstance(raw, dict) else None
+    if not isinstance(projects, list):
+        return []
+    return [p for p in projects if isinstance(p, str)]
+
+
+def deps_pending(project: Path) -> bool:
+    """True when _update_checkout moved ``project`` to a commit with other
+    dependencies and their npm install has not succeeded since."""
+    return _norm(str(project)) in _pending_projects()
+
+
+def _set_deps_pending(project: Path, pending: bool) -> None:
+    """Record or clear ``project`` in _DEPS_PENDING_FILE. Raises OSError when
+    the record cannot be written."""
+    key = _norm(str(project))
+    current = _pending_projects()
+    if (key in current) == pending:
+        return
+    projects = [*current, key] if pending else [p for p in current if p != key]
+    atomic_write(_DEPS_PENDING_FILE, json.dumps({"projects": projects}, indent=2))
+
+
+def _clear_deps_pending(project: Path) -> None:
+    """Clear ``project`` from _DEPS_PENDING_FILE after its npm install
+    succeeded. A record that cannot be cleared costs one more npm install on
+    the next start, so it is logged and the start goes on."""
+    try:
+        _set_deps_pending(project, False)
+    except OSError as e:
+        log.warning(
+            "lyria.sidecar: could not clear %s (%s); npm install runs again on "
+            "the next start",
+            _DEPS_PENDING_FILE.name,
+            e,
+        )
+
+
 def _ensure_deps(cfg: LyriaConfig) -> None:
-    """Install node_modules when missing.
+    """Install node_modules when missing, or when a checkout move left its
+    dependencies uninstalled (deps_pending).
 
     Hoisted into its own function deliberately: vj/sidecar.py has this check
     inline in ensure_running() only, so its _ensure_build() path can run
@@ -721,38 +909,54 @@ def _ensure_deps(cfg: LyriaConfig) -> None:
     """
     with _spawn_lock:
         node_modules = cfg.project_path / "node_modules"
-        if node_modules.is_dir():
+        pending = deps_pending(cfg.project_path)
+        if node_modules.is_dir() and not pending:
             return
-        log.info("lyria.sidecar: node_modules missing -- running npm install")
-        try:
-            # Output goes to the sidecar log so install failures are
-            # diagnosable; the timeout stops a hung npm (network stall) from
-            # pinning _spawn_lock forever.
-            with _sidecar_log_handle() as install_log:
-                rc = subprocess.call(
-                    [cfg.npm_path, "install"],
-                    cwd=str(cfg.project_path),
-                    stdout=install_log,
-                    stderr=subprocess.STDOUT,
-                    shell=False,
-                    timeout=NPM_INSTALL_TIMEOUT_SEC,
-                    env=child_env(),
-                )
-        except FileNotFoundError as e:
-            raise RuntimeError(
-                f"Lyria sidecar: npm not found ({e}). Install Node.js."
-            ) from e
-        except subprocess.TimeoutExpired as e:
-            raise RuntimeError(
-                f"npm install timed out after {int(NPM_INSTALL_TIMEOUT_SEC)}s in "
-                f"{cfg.project_path} -- check the network, then retry."
-            ) from e
-        if rc != 0:
-            raise RuntimeError(
-                f"npm install failed in {cfg.project_path} (rc={rc}). See "
-                f"{SIDECAR_LOG_PATH} for the full output, then retry."
+        if pending:
+            log.info(
+                "lyria.sidecar: the checkout moved and its npm install did not "
+                "finish -- running npm install"
             )
-        log.info("lyria.sidecar: npm install complete")
+        else:
+            log.info("lyria.sidecar: node_modules missing -- running npm install")
+        _run_npm_install(cfg)
+        if pending:
+            _clear_deps_pending(cfg.project_path)
+
+
+def _run_npm_install(cfg: LyriaConfig) -> None:
+    """``npm install`` in the checkout. The caller holds _spawn_lock: this is
+    the body _ensure_deps and _update_checkout share, and neither may run it
+    while the other is."""
+    try:
+        # Output goes to the sidecar log so install failures are diagnosable;
+        # the timeout stops a hung npm (network stall) from pinning
+        # _spawn_lock forever.
+        with _sidecar_log_handle() as install_log:
+            rc = subprocess.call(
+                [cfg.npm_path, "install"],
+                cwd=str(cfg.project_path),
+                stdout=install_log,
+                stderr=subprocess.STDOUT,
+                shell=False,
+                timeout=NPM_INSTALL_TIMEOUT_SEC,
+                env=child_env(),
+            )
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            f"Lyria sidecar: npm not found ({e}). Install Node.js."
+        ) from e
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"npm install timed out after {int(NPM_INSTALL_TIMEOUT_SEC)}s in "
+            f"{cfg.project_path} -- check the network, then retry."
+        ) from e
+    if rc != 0:
+        raise RuntimeError(
+            f"npm install failed in {cfg.project_path} (rc={rc}). See "
+            f"{SIDECAR_LOG_PATH} for the full output, then retry."
+        )
+    log.info("lyria.sidecar: npm install complete")
 
 
 def detect_lan_ip() -> Optional[str]:
@@ -809,7 +1013,7 @@ def probe() -> dict:
     openrouter_list, or_key_source = resolved_keys("openrouter")
     key = gemini_list[0] if gemini_list else None
     or_key = openrouter_list[0] if openrouter_list else None
-    deps_installed = (pkg / "node_modules").is_dir()
+    deps_installed = (pkg / "node_modules").is_dir() and not deps_pending(pkg)
     install = install_status()
     installing = install.get("status") in ("cloning", "installing")
 
@@ -870,6 +1074,7 @@ def probe() -> dict:
         "project_exists": pkg_json.is_file(),
         "repo": LYRIA_REPO,
         "repo_url": LYRIA_REPO_URL,
+        "pinned_commit": LYRIA_PINNED_COMMIT,
         "port": cfg.port,
         "mock": cfg.mock,
         "deps_installed": deps_installed,
@@ -880,10 +1085,14 @@ def probe() -> dict:
         "gemini_key_source": key_source,
         "openrouter_key": bool(or_key),
         "openrouter_key_source": or_key_source,
-        # Counts, never values: how many keys the child would be handed.
+        # Counts, never values: how many keys theDAW holds for the child.
         "gemini_keys": len(gemini_list),
         "openrouter_keys": len(openrouter_list),
         "provider_preference": provider_preference(),
+        # Whether this checkout takes a key list (server/keys.ts) or one key
+        # per provider, and what the last pinned-commit check found.
+        "reads_key_lists": checkout_reads_key_lists(pkg),
+        "checkout": checkout_state(),
         "listening": listening,
         "process_alive": _proc is not None and _proc.poll() is None,
         "url": _resolved_url or f"http://127.0.0.1:{cfg.port}",
@@ -922,6 +1131,334 @@ def _set_install(**fields: object) -> None:
         _install_state.update(fields)
 
 
+# ── the pinned commit: clone at it, move a clean checkout to it ─────────────
+
+
+def _git_env() -> dict[str, str]:
+    """child_env() plus GIT_TERMINAL_PROMPT=0: a repo that asks for
+    credentials fails at once instead of waiting on a prompt nobody sees."""
+    env = child_env()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
+def _git_creationflags() -> int:
+    return subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+
+def _git_run(
+    git: str, args: list[str], cwd: Path, timeout: float = 60.0
+) -> subprocess.CompletedProcess[str]:
+    """One git command in ``cwd``, output captured. Never raises for a
+    non-zero exit; a timeout raises subprocess.TimeoutExpired."""
+    return subprocess.run(
+        [git, *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        creationflags=_git_creationflags(),
+        env=_git_env(),
+        check=False,
+    )
+
+
+def _last_line(text: str) -> str:
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def _remove_staging(path: Path) -> None:
+    """Delete a staging folder this module created. git marks its pack files
+    read-only, which stops shutil.rmtree on Windows, so the handler clears
+    that bit and retries once. The folder only ever holds a fresh clone, never
+    a node_modules or a junction."""
+
+    def _clear_readonly(
+        func: Callable[[str], object], target: str, _exc: BaseException
+    ) -> None:
+        os.chmod(target, stat.S_IWRITE)
+        func(target)
+
+    if path.exists():
+        shutil.rmtree(path, onexc=_clear_readonly)
+
+
+def _clone_pinned(git: str, target: Path, out: IO[bytes] | int) -> None:
+    """Put exactly LYRIA_PINNED_COMMIT at ``target``.
+
+    ``git clone`` can only take a branch, so this is init + a depth-1 fetch of
+    the commit + a detached checkout, run in a staging folder beside
+    ``target`` and renamed into place at the end. A failure at any step
+    leaves ``target`` as it was (missing or empty) and removes the staging
+    folder, so Install can simply run again. Raises RuntimeError naming the
+    step, or subprocess.TimeoutExpired."""
+    staging = target.with_name(f".{target.name}.install-staging")
+    _remove_staging(staging)
+    in_staging = ["-C", str(staging)]
+    steps = [
+        ("init", ["init", "-q", str(staging)]),
+        ("remote add", [*in_staging, "remote", "add", "origin", LYRIA_REPO_URL]),
+        (
+            "fetch",
+            [*in_staging, "fetch", "--depth", "1", "origin", LYRIA_PINNED_COMMIT],
+        ),
+        (
+            "checkout",
+            [*in_staging, "checkout", "-q", "--detach", LYRIA_PINNED_COMMIT],
+        ),
+    ]
+    try:
+        for step, args in steps:
+            rc = subprocess.call(
+                [git, *args],
+                cwd=str(target.parent),
+                stdout=out,
+                stderr=subprocess.STDOUT,
+                shell=False,
+                timeout=GIT_CLONE_TIMEOUT_SEC,
+                creationflags=_git_creationflags(),
+                env=_git_env(),
+            )
+            if rc != 0:
+                raise RuntimeError(
+                    f"git {step} failed (rc={rc}) while fetching {LYRIA_REPO} at "
+                    f"{LYRIA_PINNED_COMMIT[:7]}. See {SIDECAR_LOG_PATH} for the "
+                    "output (network? GitHub reachable?), then retry."
+                )
+        if target.exists():
+            target.rmdir()  # empty: _install_worker refuses a non-empty one
+        staging.rename(target)
+    except BaseException:
+        try:
+            _remove_staging(staging)
+        except OSError as e:
+            log.warning("lyria.sidecar: could not remove %s: %s", staging, e)
+        raise
+
+
+_checkout_lock = Lock()
+_checkout_state: dict = {
+    # unchecked | current | updated | newer | dirty | branch | failed | managed
+    # | not_git
+    "state": "unchecked",
+    "commit": None,
+    "pinned_commit": LYRIA_PINNED_COMMIT,
+    "reason": "",
+    "checked_at": None,
+}
+
+
+def checkout_state() -> dict:
+    """What the last _update_checkout found or did. ``reason`` is a sentence
+    for the Lyria panel whenever the checkout was left where it is."""
+    with _checkout_lock:
+        return dict(_checkout_state)
+
+
+def _set_checkout(state: str, commit: Optional[str], reason: str = "") -> dict:
+    with _checkout_lock:
+        _checkout_state.update(
+            state=state, commit=commit, reason=reason, checked_at=time.time()
+        )
+        return dict(_checkout_state)
+
+
+def _update_checkout(cfg: LyriaConfig, *, retry_now: bool = False) -> dict:
+    """Move an existing checkout to LYRIA_PINNED_COMMIT when that is safe.
+
+    Called right before a spawn (nothing of ours is running from the tree).
+    It leaves the checkout alone, and says why in checkout_state(), when:
+      * theDAW_LYRIA_PROJECT names it (a checkout the user manages),
+      * it is not a git checkout, or git is missing,
+      * the pinned commit is already in its history (``newer``),
+      * it has local changes to tracked files (``dirty``),
+      * it is on a branch of its own: only a detached HEAD, or the default
+        branch tracking origin (the two shapes an Install leaves), is moved
+        (``branch``),
+      * the fetch or the checkout fails (``failed``; retried after
+        CHECKOUT_RETRY_SEC rather than on every spawn, unless ``retry_now``,
+        which restart() passes for a restart the user asked for).
+    Untracked files (the app's own generations and projects) survive a
+    checkout; git refuses one that would overwrite them, which lands in
+    ``failed`` with git's own message. When package.json or
+    package-lock.json differ at the pin, or node_modules is missing, the
+    checkout is recorded in _DEPS_PENDING_FILE before the move and npm install
+    runs after it; the record is cleared only when that install succeeds, so
+    _ensure_deps runs it again after a failure. Raises RuntimeError only for
+    that npm install."""
+    project = cfg.project_path
+    pin7 = LYRIA_PINNED_COMMIT[:7]
+    if os.getenv("theDAW_LYRIA_PROJECT"):
+        return _set_checkout(
+            "managed",
+            None,
+            f"theDAW_LYRIA_PROJECT points at {project}, a checkout you manage, so "
+            f"theDAW does not move it to {pin7}.",
+        )
+    git = _git_path()
+    if not git or not (project / ".git").exists():
+        return _set_checkout(
+            "not_git",
+            None,
+            f"{project} is not a git checkout theDAW can update"
+            + ("" if git else " (git is not installed)")
+            + f", so it stays as it is instead of moving to {pin7}.",
+        )
+    with _spawn_lock:
+        head: Optional[str] = None
+        try:
+            rev = _git_run(git, ["rev-parse", "HEAD"], project)
+            head = rev.stdout.strip()
+            if rev.returncode != 0 or not head:
+                return _set_checkout(
+                    "not_git",
+                    None,
+                    f"git cannot read {project} "
+                    f"({_last_line(rev.stderr) or f'rc={rev.returncode}'}), so it "
+                    f"stays as it is instead of moving to {pin7}.",
+                )
+            if head == LYRIA_PINNED_COMMIT:
+                return _set_checkout("current", head)
+            last = checkout_state()
+            if (
+                not retry_now
+                and last["state"] == "failed"
+                and last["commit"] == head
+                and last["checked_at"] is not None
+                and time.time() - last["checked_at"] < CHECKOUT_RETRY_SEC
+            ):
+                return last
+
+            def _pin_in_history() -> bool:
+                known = _git_run(
+                    git,
+                    ["cat-file", "-e", f"{LYRIA_PINNED_COMMIT}^{{commit}}"],
+                    project,
+                )
+                if known.returncode != 0:
+                    return False
+                return (
+                    _git_run(
+                        git,
+                        ["merge-base", "--is-ancestor", LYRIA_PINNED_COMMIT, "HEAD"],
+                        project,
+                    ).returncode
+                    == 0
+                )
+
+            if _pin_in_history():
+                return _set_checkout("newer", head)
+            dirty = _git_run(
+                git, ["status", "--porcelain", "--untracked-files=no"], project
+            )
+            if dirty.returncode != 0 or dirty.stdout.strip():
+                return _set_checkout(
+                    "dirty",
+                    head,
+                    f"The Lyria checkout at {project} has local changes to tracked "
+                    f"files, so theDAW left it at {head[:7]} instead of moving it to "
+                    f"{pin7}. Commit or discard them, then restart Lyria.",
+                )
+            branch = _own_branch(git, project)
+            if branch:
+                return _set_checkout(
+                    "branch",
+                    head,
+                    f"The Lyria checkout at {project} is on its own branch "
+                    f"'{branch}', so theDAW left it at {head[:7]} instead of moving "
+                    f"it to {pin7}. Switch it to a detached HEAD or its default "
+                    "branch, then restart Lyria.",
+                )
+            fetch = _git_run(
+                git,
+                ["fetch", "--depth", "1", LYRIA_REPO_URL, LYRIA_PINNED_COMMIT],
+                project,
+                timeout=GIT_FETCH_TIMEOUT_SEC,
+            )
+            if fetch.returncode != 0:
+                return _set_checkout(
+                    "failed",
+                    head,
+                    f"Could not fetch {LYRIA_REPO} at {pin7}, so Lyria runs from "
+                    f"{head[:7]}: {_last_line(fetch.stderr) or f'rc={fetch.returncode}'}",
+                )
+            if _pin_in_history():
+                return _set_checkout("newer", head)
+            deps_same = _git_run(
+                git,
+                [
+                    "diff",
+                    "--quiet",
+                    head,
+                    LYRIA_PINNED_COMMIT,
+                    "--",
+                    "package.json",
+                    "package-lock.json",
+                ],
+                project,
+            )
+            needs_install = (
+                deps_same.returncode != 0 or not (project / "node_modules").is_dir()
+            )
+            if needs_install:
+                # Recorded BEFORE the move: a crash between the two costs
+                # one extra npm install, never a checkout left on the old
+                # dependencies.
+                _set_deps_pending(project, True)
+            moved = _git_run(
+                git, ["checkout", "-q", "--detach", LYRIA_PINNED_COMMIT], project
+            )
+            if moved.returncode != 0:
+                if needs_install:
+                    _clear_deps_pending(project)
+                return _set_checkout(
+                    "failed",
+                    head,
+                    f"git could not move the Lyria checkout from {head[:7]} to "
+                    f"{pin7}: {_last_line(moved.stderr) or f'rc={moved.returncode}'}",
+                )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            # ``head`` is kept so a stalled fetch is retried after
+            # CHECKOUT_RETRY_SEC, not on every spawn.
+            return _set_checkout(
+                "failed",
+                head,
+                f"Could not check the Lyria checkout against {pin7}, so it stays "
+                f"as it is: {e}",
+            )
+        log.info("lyria.sidecar: moved %s from %s to %s", project, head[:7], pin7)
+        if needs_install:
+            log.info("lyria.sidecar: dependencies changed -- running npm install")
+            _run_npm_install(cfg)
+            _clear_deps_pending(project)
+        return _set_checkout("updated", LYRIA_PINNED_COMMIT, f"Moved from {head[:7]}.")
+
+
+def _own_branch(git: str, project: Path) -> Optional[str]:
+    """The checkout's branch when it is one theDAW must not move off: None
+    for a detached HEAD (what Install leaves) or for the default branch
+    tracking origin's (what an older `git clone --depth 1` Install left),
+    the branch name for anything else."""
+    current = _git_run(git, ["symbolic-ref", "-q", "--short", "HEAD"], project)
+    if current.returncode != 0:
+        return None  # detached
+    name = current.stdout.strip()
+    upstream = _git_run(
+        git,
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        project,
+    ).stdout.strip()
+    default = _git_run(
+        git, ["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"], project
+    ).stdout.strip()
+    if upstream == f"origin/{name}" and default == f"origin/{name}":
+        return None
+    return name
+
+
 def _install_worker(cfg: LyriaConfig, need_clone: bool, git: str) -> None:
     try:
         if need_clone:
@@ -935,27 +1472,19 @@ def _install_worker(cfg: LyriaConfig, need_clone: bool, git: str) -> None:
             _set_install(
                 status="cloning",
                 step="clone",
-                message=f"Cloning {LYRIA_REPO} into {target}",
+                message=(
+                    f"Cloning {LYRIA_REPO} at {LYRIA_PINNED_COMMIT[:7]} into {target}"
+                ),
             )
-            log.info("lyria.sidecar: git clone %s -> %s", LYRIA_REPO_URL, target)
-            creationflags = 0
-            if sys.platform == "win32":
-                creationflags = subprocess.CREATE_NO_WINDOW
+            log.info(
+                "lyria.sidecar: clone %s at %s -> %s",
+                LYRIA_REPO_URL,
+                LYRIA_PINNED_COMMIT,
+                target,
+            )
             with _sidecar_log_handle() as out:
-                rc = subprocess.call(
-                    [git, "clone", "--depth", "1", LYRIA_REPO_URL, str(target)],
-                    stdout=out,
-                    stderr=subprocess.STDOUT,
-                    shell=False,
-                    timeout=GIT_CLONE_TIMEOUT_SEC,
-                    creationflags=creationflags,
-                    env=child_env(),
-                )
-            if rc != 0:
-                raise RuntimeError(
-                    f"git clone failed (rc={rc}). See {SIDECAR_LOG_PATH} for the "
-                    "output (network? GitHub reachable?), then retry."
-                )
+                _clone_pinned(git, target, out)
+            _set_checkout("current", LYRIA_PINNED_COMMIT)
         _set_install(
             status="installing",
             step="npm",
@@ -971,7 +1500,10 @@ def _install_worker(cfg: LyriaConfig, need_clone: bool, git: str) -> None:
     except subprocess.TimeoutExpired:
         _set_install(
             status="error",
-            error=f"git clone timed out after {int(GIT_CLONE_TIMEOUT_SEC)}s.",
+            error=(
+                f"Fetching {LYRIA_REPO} timed out after {int(GIT_CLONE_TIMEOUT_SEC)}s "
+                "-- check the network, then retry."
+            ),
             finished_at=time.time(),
         )
     except Exception as e:  # noqa: BLE001 - every failure must land in the status
@@ -1001,7 +1533,11 @@ def start_install() -> dict:
             "Node.js is not installed (npm/node not on PATH). Install Node.js LTS "
             "(nodejs.org), restart theDAW, then press Install again."
         )
-    if not need_clone and (cfg.project_path / "node_modules").is_dir():
+    if (
+        not need_clone
+        and (cfg.project_path / "node_modules").is_dir()
+        and not deps_pending(cfg.project_path)
+    ):
         _set_install(
             status="done",
             step=None,
@@ -1016,7 +1552,7 @@ def start_install() -> dict:
         status="cloning" if need_clone else "installing",
         step="clone" if need_clone else "npm",
         message=(
-            f"Cloning {LYRIA_REPO} into {cfg.project_path}"
+            f"Cloning {LYRIA_REPO} at {LYRIA_PINNED_COMMIT[:7]} into {cfg.project_path}"
             if need_clone
             else "Installing Node dependencies (npm install)"
         ),
@@ -1151,11 +1687,12 @@ def _terminate_proc(proc: subprocess.Popen[bytes]) -> None:
             pass
 
 
-def ensure_running(*, wait_for_ready: bool = True) -> str:
+def ensure_running(*, wait_for_ready: bool = True, retry_checkout: bool = False) -> str:
     """Spawn the Lyria Express server if it isn't already, and return the URL
     it serves on. Safe to call repeatedly -- no-ops if the port is already
     listening AND confirmed to be our sidecar (INT-001), even if some other
-    process started it."""
+    process started it. ``retry_checkout`` makes the pinned-commit check run
+    even when it failed less than CHECKOUT_RETRY_SEC ago (restart())."""
     global _proc, _resolved_url, _stop_requested
     cfg = resolve_config()
     # 127.0.0.1, not localhost -- see _port_is_listening for why.
@@ -1197,16 +1734,22 @@ def ensure_running(*, wait_for_ready: bool = True) -> str:
             if not proc_alive:
                 if not cfg.project_path.is_dir():
                     raise RuntimeError(
-                        f"Lyria project not found at {cfg.project_path}. Clone "
-                        "StarskreamEXE/lyria-3-pro beside this repo, or set "
-                        "theDAW_LYRIA_PROJECT to override."
+                        f"Lyria project not found at {cfg.project_path}. Press "
+                        "Install on the Lyria card in Settings > Models, or set "
+                        "theDAW_LYRIA_PROJECT to an existing checkout."
                     )
                 # A stop() from BEFORE this attempt began is stale -- clear it
                 # so a fresh attempt isn't haunted by an old request that
                 # already had its effect (or had nothing to act on).
                 _consume_stop_requested()
+                # Nothing of ours runs from the tree at this point, so this is
+                # the one safe moment to move it to the pinned commit. A
+                # checkout it leaves alone still starts: _child_env hands an
+                # old checkout one key per provider.
+                _update_checkout(cfg, retry_now=retry_checkout)
                 _ensure_deps(cfg)  # npm install -- runs outside _state_lock
-                # A stop() may have arrived while _ensure_deps (up to
+                # A stop() may have arrived while _update_checkout (a fetch,
+                # up to GIT_FETCH_TIMEOUT_SEC) or _ensure_deps (up to
                 # NPM_INSTALL_TIMEOUT_SEC) was running -- with nothing yet
                 # spawned, stop()'s own "_proc is None" check has nothing to
                 # terminate, so this is the only place that can prevent the
@@ -1339,3 +1882,187 @@ def stop() -> bool:
     finally:
         _stopping.clear()
     return True
+
+
+# ── an adopted Lyria: one this process did not spawn ─────────────────────────
+#
+# ensure_running() adopts a confirmed Lyria that is already on the port -- most
+# often a child an earlier backend session spawned and a crash left behind.
+# That process keeps the keys and cost mode of the session that started it, and
+# stop() cannot end it (it holds no handle). restart() below is the way out:
+# it ends such a process, but only one that answers as Lyria AND runs from the
+# configured checkout, so it can never kill another program on the port.
+
+
+class RestartRefused(RuntimeError):
+    """stop_adopted() will not end what holds the port; the message says what
+    the user can do instead. POST /restart answers it with a 409."""
+
+
+@dataclass(frozen=True)
+class _Listener:
+    pid: int
+    name: str
+    cwd: str
+    cmdline: str
+    create_time: Optional[float]
+
+
+def _port_listeners(port: int) -> Optional[list[_Listener]]:
+    """The processes listening on ``port``, or None when the connection table
+    cannot be read (that can need administrator rights)."""
+    try:
+        import psutil
+    except ImportError:  # psutil is a base dependency (pyproject.toml)
+        return None
+    try:
+        conns = psutil.net_connections(kind="inet")
+    except (psutil.AccessDenied, PermissionError, OSError):
+        return None
+    found: list[_Listener] = []
+    seen: set[int] = set()
+    for conn in conns:
+        if conn.status != psutil.CONN_LISTEN or not conn.laddr:
+            continue
+        if conn.laddr.port != port or conn.pid is None or conn.pid in seen:
+            continue
+        seen.add(conn.pid)
+        name, cwd, cmdline, created = "", "", "", None
+        try:
+            proc = psutil.Process(conn.pid)
+            name = proc.name()
+            cmdline = " ".join(proc.cmdline())
+            created = proc.create_time()
+            try:
+                cwd = proc.cwd()
+            except (psutil.AccessDenied, OSError):
+                cwd = ""
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+        found.append(_Listener(conn.pid, name, cwd, cmdline, created))
+    return found
+
+
+def _norm(path: str) -> str:
+    return path.replace("\\", "/").rstrip("/").lower()
+
+
+def _runs_from_checkout(listener: _Listener, project: Path) -> bool:
+    """True when the process's working directory is the checkout (``npm run
+    dev`` runs there) or its command line names a file inside it. Compared
+    case-insensitively with both separators, as Windows mixes them."""
+    root = _norm(str(project))
+    cwd = _norm(listener.cwd)
+    if cwd and (cwd == root or cwd.startswith(root + "/")):
+        return True
+    return (root + "/") in _norm(listener.cmdline)
+
+
+def _kill_listener(listener: _Listener) -> None:
+    """End one listener's process tree, after checking the PID still belongs
+    to the process that was identified (Windows reuses PIDs quickly)."""
+    try:
+        import psutil
+    except ImportError:
+        return
+    try:
+        proc = psutil.Process(listener.pid)
+        if (
+            listener.create_time is not None
+            and abs(proc.create_time() - listener.create_time) > 0.001
+        ):
+            return
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return
+    if sys.platform == "win32":
+        subprocess.call(
+            ["taskkill", "/PID", str(listener.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=child_env(),
+        )
+        return
+    try:
+        tree = [*proc.children(recursive=True), proc]
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        tree = [proc]
+    for member in tree:
+        try:
+            member.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    _gone, alive = psutil.wait_procs(tree, timeout=_TERMINATE_WAIT_SEC)
+    for member in alive:
+        try:
+            member.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+
+def adopted_running() -> bool:
+    """True when a confirmed Lyria serves the port and this process did not
+    spawn it, i.e. it runs with keys and a cost mode theDAW did not hand it."""
+    if owns_process():
+        return False
+    port = resolve_config().port
+    return _port_is_listening(port) and _is_lyria_server(port)
+
+
+def stop_adopted() -> bool:
+    """End an adopted Lyria that runs from the configured checkout. Returns
+    True when one was stopped, False when there was none. Raises
+    RestartRefused, naming what to do, when the port is held by something
+    that is not Lyria, by a Lyria from another folder, or by a process this
+    user cannot see; RuntimeError when the process does not exit."""
+    cfg = resolve_config()
+    if owns_process() or not _port_is_listening(cfg.port):
+        return False
+    if not _is_lyria_server(cfg.port):
+        raise RestartRefused(str(_port_collision_error(cfg)))
+    found = _port_listeners(cfg.port)
+    if not found:
+        raise RestartRefused(
+            f"A Lyria started outside this session holds port {cfg.port}, but "
+            "theDAW cannot see which process it is (that can need administrator "
+            "rights). Close it, then press Restart again."
+        )
+    strangers = [
+        item for item in found if not _runs_from_checkout(item, cfg.project_path)
+    ]
+    if strangers:
+        where = strangers[0].cwd or strangers[0].name or f"pid {strangers[0].pid}"
+        raise RestartRefused(
+            f"The Lyria on port {cfg.port} runs from {where}, not from "
+            f"{cfg.project_path}. Stop it there, then press Restart again."
+        )
+    # Held for the whole teardown, as stop() does, so a concurrent
+    # ensure_running() waits instead of adopting the server that is exiting.
+    _stopping.set()
+    try:
+        for listener in found:
+            _kill_listener(listener)
+        deadline = time.monotonic() + _STOPPING_WAIT_TIMEOUT_SEC
+        while _port_is_listening(cfg.port) and time.monotonic() < deadline:
+            time.sleep(PORT_POLL_INTERVAL_SEC)
+    finally:
+        _stopping.clear()
+    if _port_is_listening(cfg.port):
+        raise RuntimeError(
+            f"The Lyria on port {cfg.port} did not stop. Close it, then press "
+            "Restart again."
+        )
+    log.info("lyria.sidecar: stopped an adopted Lyria on port %d", cfg.port)
+    return True
+
+
+def restart() -> str:
+    """Stop the Lyria serving the port -- this process's child, or an adopted
+    one from the configured checkout -- and start a fresh child, which reads
+    the current keys, provider and cost mode at spawn. Returns its URL.
+    Raises RestartRefused or RuntimeError as stop_adopted() and
+    ensure_running() do."""
+    stop()
+    stop_adopted()
+    # A restart is the user asking for another try, so a failed pinned-commit
+    # check (no network a minute ago) is not waited out for CHECKOUT_RETRY_SEC.
+    return ensure_running(retry_checkout=True)
