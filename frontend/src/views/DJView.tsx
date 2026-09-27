@@ -59,6 +59,7 @@ import { buildBeatgrid } from '../lib/beatgrid';
 import { chooseNextIndex, eqSwap, fadeStep, mixOutPoint, PHASE_DEADBAND_SEC, planTransition, residualNudge, tempoMatch } from '../lib/djAutomixPlan';
 import { rgb, rgba, type RGB } from '../lib/trackColor';
 import { DJSemanticWaveform } from '../components/audio/DJSemanticWaveform';
+import { WaveformModeLegend, WaveformModeToggle } from '../components/audio/WaveformModeControl';
 import { SlideKnob } from '../components/audio/SlideKnob';
 import { SlideFader } from '../components/audio/SlideFader';
 import { SlidePad } from '../components/audio/SlidePad';
@@ -4024,11 +4025,19 @@ function buildDjRegistry(p: DjRegArgs): WidgetRegistry {
     <WaveLane deckId="B" accent="cyan" entryId={p.deckBTrack} hasTrack={p.hasB} audioUrl={p.deckBUrl} ctl={p.ctlB} onLoadDrop={p.loadDropOntoDeck} mode="overview" compact />
   ));
   pinned('hero', 'Waveforms', (
-    <div className="relative h-full w-full flex flex-col gap-1.5">
-      <WaveLane deckId="A" accent="purple" entryId={p.deckATrack} hasTrack={p.hasA} audioUrl={p.deckAUrl} ctl={p.ctlA} onLoadDrop={p.loadDropOntoDeck} mode="detail" />
-      <WaveLane deckId="B" accent="cyan" entryId={p.deckBTrack} hasTrack={p.hasB} audioUrl={p.deckBUrl} ctl={p.ctlB} onLoadDrop={p.loadDropOntoDeck} mode="detail" />
-      <div className="absolute top-0 bottom-0 left-1/2 z-40 w-px -translate-x-1/2 pointer-events-none bg-white shadow-[0_0_7px_rgba(255,255,255,0.95)]">
-        <div className="absolute -top-0.5 left-1/2 h-0 w-0 -translate-x-1/2 border-l-[5px] border-r-[5px] border-t-[6px] border-l-transparent border-r-transparent border-t-white" />
+    <div className="h-full w-full flex flex-col gap-1">
+      {/* The decks draw in the app-wide waveform colour mode: its legend and
+          its toggle sit here, above the lanes, where the colours are. */}
+      <div className="shrink-0 flex items-center gap-2 min-w-0">
+        <WaveformModeToggle variant="toolbar" className="shrink-0" />
+        <WaveformModeLegend className="flex-1" />
+      </div>
+      <div className="relative flex-1 min-h-0 flex flex-col gap-1.5">
+        <WaveLane deckId="A" accent="purple" entryId={p.deckATrack} hasTrack={p.hasA} audioUrl={p.deckAUrl} ctl={p.ctlA} onLoadDrop={p.loadDropOntoDeck} mode="detail" />
+        <WaveLane deckId="B" accent="cyan" entryId={p.deckBTrack} hasTrack={p.hasB} audioUrl={p.deckBUrl} ctl={p.ctlB} onLoadDrop={p.loadDropOntoDeck} mode="detail" />
+        <div className="absolute top-0 bottom-0 left-1/2 z-40 w-px -translate-x-1/2 pointer-events-none bg-white shadow-[0_0_7px_rgba(255,255,255,0.95)]">
+          <div className="absolute -top-0.5 left-1/2 h-0 w-0 -translate-x-1/2 border-l-[5px] border-r-[5px] border-t-[6px] border-l-transparent border-r-transparent border-t-white" />
+        </div>
       </div>
     </div>
   ));

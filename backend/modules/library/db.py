@@ -429,7 +429,7 @@ SEARCH_SHORT_VALUE_MAX = 200
 #: The version of what :func:`search_text` and :func:`short_grams` index.
 #: Bump it when either changes: the next open rebuilds the index from
 #: scratch.
-SEARCH_TEXT_VERSION = 2
+SEARCH_TEXT_VERSION = 3
 
 #: ``schema_meta`` key holding the highest ``entries.rowid`` an in-progress
 #: (re)build of the search index has durably indexed. Written in the same
@@ -486,6 +486,10 @@ SHORT_WORD_MAX = 2
 #: (``router._analysis_payload``), and so the ones main's matcher searched.
 ANALYSIS_SCALAR_KEYS = (
     "bpm",
+    # The tempo detector's own confidence in ``bpm``, 0..1 (clamped where it
+    # is measured). Without it only GET /api/analysis/{id} carried the number
+    # and every list-driven surface saw a BPM with no confidence behind it.
+    "bpm_confidence",
     "key",
     "key_confidence",
     "scale",
@@ -1379,6 +1383,7 @@ DEFAULT_DELETE_BATCH = 500
 _ANALYSIS_LIST_COLUMNS = (
     "entry_id",
     "bpm",
+    "bpm_confidence",
     "key",
     "key_confidence",
     "scale",
