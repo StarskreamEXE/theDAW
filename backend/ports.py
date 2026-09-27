@@ -16,6 +16,7 @@ This gives every launcher one portable way to ask and to act:
     python -m backend.ports --check     # report, exit 1 if anything is bound
     python -m backend.ports --free      # stop theDAW's own stale listeners
     python -m backend.ports --free --all-ports
+    python -m backend.ports --require-frontend-port   # exit 1 if 5173 is taken
 
 All three shipped launchers (``theDAW.bat``, ``theDAW-desktop.bat``,
 ``theDAW.sh``) now call ``--free --all-ports`` instead of their old native
@@ -111,13 +112,14 @@ FRONTEND_PORT_ENV = "theDAW_FRONTEND_PORT"
 def frontend_port() -> int:
     """The port the web UI is serving on this launch.
 
-    ``FRONTEND_PORT`` is only the preferred one. When another program already
-    holds it, ``backend/_devstack.py`` leaves that program running, puts the web
-    UI on the next free port and exports the choice as ``theDAW_FRONTEND_PORT``
-    for the backend child. Anything that ADVERTISES the web UI's address -- the
-    Mobile Access link and QR code from ``GET /api/network/lan`` above all --
-    has to read it here, because sending a second device to 5173 when the UI
-    moved to 5174 sends it to the other program instead of to theDAW.
+    The launchers start the web UI on ``FRONTEND_PORT`` only, and stop with the
+    holder's name when another program has it (:func:`frontend_port_blocker`).
+    Whoever started the web UI still exports the port it serves on as
+    ``theDAW_FRONTEND_PORT`` for the backend child -- ``backend/_devstack.py``
+    in web mode, the desktop shell from its renderer URL -- and anything that
+    ADVERTISES the web UI's address, the Mobile Access link and QR code from
+    ``GET /api/network/lan`` above all, reads it here, so the address a second
+    device is sent to is the one actually serving theDAW.
 
     Anything unusable in the environment (empty, not a number, out of the 1-65535
     range) falls back to the table rather than raising: a bad value must not stop
@@ -570,6 +572,53 @@ def describe_occupant(port: int = BACKEND_PORT) -> Optional[str]:
     )
 
 
+def frontend_port_blocker(port: Optional[int] = None) -> Optional[str]:
+    """Why theDAW's web UI cannot start on ``port``, or None when it can.
+
+    ``port`` defaults to ``FRONTEND_PORT``, read at call time.
+
+    The web UI does not move to another port when this one is taken. A browser
+    keeps theDAW's saved settings (every store the frontend persists in
+    localStorage) and its microphone and MIDI permissions per ORIGIN, and the
+    port is part of the origin. On 5174 the app opens with every setting at its
+    default and every permission un-granted, and whatever the user changes
+    there is missing again the next time theDAW gets 5173. Stopping with the
+    holder's name loses nothing; the launchers print this and stop.
+    """
+    if port is None:
+        port = FRONTEND_PORT
+    if is_port_free(port):
+        return None
+    why = (
+        f"theDAW's web UI runs only on port {port}: your browser keeps theDAW's "
+        "saved settings and its microphone and MIDI permissions under that one "
+        "address, and on any other port they would all start empty."
+    )
+    found = holders([port])
+    if not found:
+        return (
+            f"Port {port} is already in use, but this process cannot see which "
+            "program holds it (that usually needs administrator rights). "
+            f"{why} Close the other program, then start theDAW again."
+        )
+    holder = found[0]
+    safe = holder.name.encode("ascii", "backslashreplace").decode("ascii")
+    where = ""
+    if holder.cwd:
+        folder = holder.cwd.encode("ascii", "backslashreplace").decode("ascii")
+        where = f", running in {folder}"
+    if holder.ours:
+        return (
+            f"theDAW's web UI from this folder is still running on port {port} "
+            f"({safe}, pid {holder.pid}) and could not be stopped. Close the "
+            "other theDAW window, then start theDAW again."
+        )
+    return (
+        f"Port {port} is held by another program: {safe} (pid {holder.pid}{where}). "
+        f"{why} Close that program, then start theDAW again."
+    )
+
+
 def _main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m backend.ports",
@@ -584,6 +633,14 @@ def _main(argv: Optional[list[str]] = None) -> int:
     mode.add_argument(
         "--free", action="store_true", help="stop theDAW's own stale listeners"
     )
+    mode.add_argument(
+        "--require-frontend-port",
+        action="store_true",
+        help=(
+            f"exit 1, naming the program, when anything else holds port "
+            f"{FRONTEND_PORT}, the only port the web UI runs on"
+        ),
+    )
     parser.add_argument(
         "--all-ports",
         action="store_true",
@@ -594,6 +651,13 @@ def _main(argv: Optional[list[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
     ports = ALL_PORTS if args.all_ports else DEFAULT_PORTS
+
+    if args.require_frontend_port:
+        blocker = frontend_port_blocker()
+        if blocker is None:
+            return 0
+        print(f"[ports] theDAW cannot start: {blocker}")
+        return 1
 
     if args.check:
         bound = holders(ports)

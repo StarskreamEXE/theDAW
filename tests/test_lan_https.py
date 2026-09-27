@@ -835,9 +835,9 @@ def test_the_https_address_is_offered_only_while_something_is_listening(
 def test_the_http_port_is_the_one_the_web_ui_really_took(
     network_router: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When another program held 5173, the launcher put the web UI on the next
-    free port and told this process which one (theDAW_FRONTEND_PORT). Sending a
-    second device to 5173 anyway would send it to the OTHER program."""
+    """Whoever started the web UI tells this process the port it serves on
+    (theDAW_FRONTEND_PORT). The address handed to a second device is that
+    port, never one assumed from the table."""
     monkeypatch.setattr(network_router, "_probe_once", lambda port: False)
     monkeypatch.setenv("theDAW_FRONTEND_PORT", "5178")
     assert network_router.get_lan()["http_port"] == 5178

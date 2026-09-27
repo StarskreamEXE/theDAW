@@ -2912,9 +2912,9 @@ except Exception as _sway_mount_err:  # noqa: BLE001 — never block boot on Swa
 # packaged desktop bundles ship a dist), so the desktop UI AND the phone
 # companion entry (frontend/mobile.html -> /mobile.html, with /assets at root)
 # are both reachable over http on the LAN. In pure dev (no dist) it is a no-op:
-# Vite serves the UI on ports.frontend_port() — :5173 unless another program
-# held it and the launcher moved the UI to the next free port — proxies /api to
-# :8600, and the phone loads http://<lan-ip>:<that port>/mobile.html directly.
+# Vite serves the UI on ports.frontend_port() -- :5173, the only port the
+# launchers start it on -- proxies /api to :8600, and the phone loads
+# http://<lan-ip>:<that port>/mobile.html directly.
 # GET /api/network/lan hands out that address; never hard-code 5173 here.
 _ui_dist = PROJECT_ROOT / "frontend" / "dist"
 _serve_ui = (

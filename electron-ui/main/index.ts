@@ -300,8 +300,8 @@ function buildBaseEnv(): NodeJS.ProcessEnv {
 // the token out.
 function buildBackendEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...buildBaseEnv(), THEDAW_LAUNCH_TOKEN: LAUNCH_TOKEN }
-  // The renderer's dev server steps past 5173 when another program holds it,
-  // so tell the backend the port it actually got; /api/network/lan reports it
+  // Tell the backend the port the renderer's dev server actually got (5173,
+  // strictPort in electron.vite.config.ts); /api/network/lan reports it
   // (backend.ports.frontend_port). A packaged build has no dev server and the
   // backend keeps its default.
   const rendererPort = rendererDevPort(process.env.ELECTRON_RENDERER_URL)

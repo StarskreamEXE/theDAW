@@ -237,6 +237,14 @@ if not exist "electron-ui\node_modules\electron\dist\electron.exe" (
     goto :stopped
 )
 
+:: The desktop window loads http://localhost:5173 as well, and its saved
+:: settings and mic/MIDI permissions belong to that address. When another
+:: program holds 5173 the launch stops here with that program's name, since
+:: on any other port the window would open with all of them empty.
+ver >nul
+if exist ".venv\Scripts\python.exe" ".venv\Scripts\python.exe" -m backend.ports --require-frontend-port
+if errorlevel 1 goto :stopped
+
 pushd electron-ui
 call npm run dev
 popd

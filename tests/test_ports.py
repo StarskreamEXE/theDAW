@@ -691,6 +691,64 @@ def test_port_in_use_exit_code_cannot_be_mistaken_for_a_respawn():
 
 
 # ---------------------------------------------------------------------------
+# --require-frontend-port: the web UI never moves to a new browser origin
+# ---------------------------------------------------------------------------
+
+
+def test_require_frontend_port_names_the_program_holding_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    """Another program on the web UI's port stops the launch with that
+    program's name, pid and folder, and exits 1 so a launcher can stop. The
+    program itself is left running."""
+    here = tmp_path / "theDAW"
+    here.mkdir()
+    monkeypatch.setattr(ports, "repo_root", lambda: here)
+    stranger = _fake_checkout(tmp_path / "someone-elses-app")
+
+    with _listening_child(stranger, ["-m", "backend.run"]) as (proc, port):
+        monkeypatch.setattr(ports, "FRONTEND_PORT", port)
+        assert ports._main(["--require-frontend-port"]) == 1
+        out = capsys.readouterr().out
+        assert f"pid {proc.pid}" in out
+        assert "someone-elses-app" in out
+        assert "saved settings" in out
+        out.encode("ascii")
+        assert proc.poll() is None
+
+
+def test_require_frontend_port_is_silent_and_zero_when_the_port_is_free(
+    monkeypatch: pytest.MonkeyPatch, capsys, unused_port: int
+):
+    monkeypatch.setattr(ports, "FRONTEND_PORT", unused_port)
+    assert ports._main(["--require-frontend-port"]) == 0
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("name", ("theDAW.bat", "theDAW-desktop.bat"))
+def test_the_desktop_launch_checks_the_web_ui_port_before_electron_starts(name: str):
+    """The desktop window loads http://localhost:5173 too. The launcher asks
+    first and stops on a non-zero answer, before electron-vite runs."""
+    code = _code_lines(_launcher(name))
+    check = code.index("-m backend.ports --require-frontend-port")
+    launch = code.index("pushd electron-ui\ncall npm run dev")
+    assert check < launch
+    assert "if errorlevel 1" in code[check:launch]
+
+
+def test_the_desktop_renderer_never_slides_off_the_web_ui_port():
+    """Without strictPort, electron-vite moves to 5174 when 5173 is taken, and
+    the window opens on a new origin with none of its saved settings."""
+    text = (REPO_ROOT / "electron-ui" / "electron.vite.config.ts").read_text(
+        encoding="utf-8"
+    )
+    server = text[text.index("server: {") :]
+    server = server[: server.index("fs: {")]
+    assert re.search(r"\bport:\s*5173\b", server)
+    assert re.search(r"\bstrictPort:\s*true\b", server)
+
+
+# ---------------------------------------------------------------------------
 # frontend_port(): the port the web UI REALLY took this launch
 # ---------------------------------------------------------------------------
 
