@@ -44,6 +44,7 @@ import FeatureGateNotices from '../../notices/FeatureGateNotices';
 import { useStatusBarStore } from '../../state/statusBarStore';
 import { backendHttpBase, lanReachablePort } from '../../lib/backendBase';
 import { pairedShareLink } from '../../lib/shareLink';
+import { clickNewPairingLink, scheduleDisarm, type RevokeState } from '../../lib/pairingRevoke';
 import { setXrHostPosture, onXrPeersChanged, kickXrPeer, type XrPeer } from '../../state/xrControlClient';
 import { useEditThemeStore } from '../../state/editThemeStore';
 import { resolveEditThemeVars } from '../../lib/editThemes';
@@ -298,37 +299,21 @@ export const Shell: React.FC = () => {
     [shareUrl, lanPairingToken],
   );
 
-  // POST /api/pairing/token/regenerate replaces the token (same gate as the
-  // read), so every link handed out before stops working. It un-pairs every
-  // device already paired, hence two clicks: the first arms it for a few
-  // seconds, the second makes the new link.
+  // "New pairing link" replaces the token (POST /api/pairing/token/regenerate,
+  // same gate as the read), so every link handed out before stops working. It
+  // un-pairs every device already paired, hence two clicks: the first arms it
+  // for a few seconds, the second makes the new link. See lib/pairingRevoke.ts.
   const [revokeArmed, setRevokeArmed] = React.useState(false);
-  const [revokeState, setRevokeState] = React.useState<'idle' | 'busy' | 'done' | 'failed'>('idle');
-  React.useEffect(() => {
-    if (!revokeArmed) return;
-    const timer = window.setTimeout(() => setRevokeArmed(false), 4000);
-    return () => window.clearTimeout(timer);
-  }, [revokeArmed]);
-  const revokePairing = async () => {
-    if (!revokeArmed) {
-      setRevokeArmed(true);
-      return;
-    }
-    setRevokeArmed(false);
-    setRevokeState('busy');
-    try {
-      const r = await fetch('/api/pairing/token/regenerate', { method: 'POST' });
-      const j = r.ok ? ((await r.json()) as { token?: string }) : null;
-      if (j?.token) {
-        setLanPairingToken(j.token);
-        setRevokeState('done');
-      } else {
-        setRevokeState('failed');
-      }
-    } catch {
-      setRevokeState('failed');
-    }
-  };
+  const [revokeState, setRevokeState] = React.useState<RevokeState>('idle');
+  React.useEffect(() => scheduleDisarm(revokeArmed, setRevokeArmed), [revokeArmed]);
+  const revokePairing = () =>
+    clickNewPairingLink({
+      armed: revokeArmed,
+      state: revokeState,
+      setArmed: setRevokeArmed,
+      setState: setRevokeState,
+      adoptToken: setLanPairingToken,
+    });
 
   const companionUrl = useMemo(() => {
     const base = (shareUrl || '').replace(/\/+$/, '');
