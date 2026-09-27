@@ -7,8 +7,11 @@
 #     vst3_probe CLI, which is how the layer is exercised against real plugins without the
 #     rest of the host existing.
 #
-#   cmake -S native/vst-host/src/vst3 -B build/vst-host-vst3-probe -A x64
+#   cmake -S native/vst-host/src/vst3 -B build/vst-host-vst3-probe -G "Visual Studio 17 2022" -A x64
 #   cmake --build build/vst-host-vst3-probe --config Release
+#
+# Name the Visual Studio generator you have installed: -A is accepted only by the
+# Visual Studio generators, and a CMake whose default is Ninja rejects it.
 
 cmake_minimum_required(VERSION 3.20)
 
