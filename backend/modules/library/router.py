@@ -40,6 +40,7 @@ import mimetypes
 import re
 import tempfile
 import threading
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any, Optional
 
@@ -54,7 +55,7 @@ from fastapi import (
     Query,
     UploadFile,
 )
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from . import media_roots
@@ -1912,8 +1913,13 @@ def download_bundle(entry_id: str) -> Response:
 #: The cut follows the walk, so it takes from the far edge of the family, never
 #: from the near one: a hop is admitted in full before the next hop is looked
 #: at, and the root's own parents and children are the first hop. When the cap
-#: bites, the answer says so (``truncated``) and names the cap it was cut at.
+#: bites, the answer says so (``truncated`` and ``capped``) and names the cap
+#: it was cut at. The cap bounds what one screen draws; ``/lineage/full`` is the
+#: walk that carries the whole family, for an export or an explicit request.
 LINEAGE_MAX_NODES = 600
+
+#: The deepest walk either lineage route takes, in hops from the song.
+LINEAGE_MAX_DEPTH = 10
 
 #: The most relation rows ONE hop of the walk may read.
 #:
@@ -2057,7 +2063,13 @@ def get_lineage(entry_id: str, depth: int = 3) -> dict[str, Any]:
 
     BFS over the ``relations`` table in both directions (parents AND
     children). Cheap because edges are indexed both ways, and bounded by
-    :data:`LINEAGE_MAX_NODES` so an enormous family is cut rather than sent."""
+    :data:`LINEAGE_MAX_NODES` so an enormous family is cut rather than sent.
+
+    ``truncated`` says more of the family exists than the answer holds, for
+    any reason. ``capped`` says a bound of this route cut it (the node cap or
+    the per-hop read), which is the case ``/lineage/full`` answers in full; a
+    family that is only deeper than ``depth`` is ``truncated`` and not
+    ``capped``."""
     store = get_store()
     if store.db is None:
         raise HTTPException(503, "library DB not available")
@@ -2065,24 +2077,24 @@ def get_lineage(entry_id: str, depth: int = 3) -> dict[str, Any]:
     if record is None:
         raise HTTPException(404, f"entry {entry_id!r} not found")
 
-    depth = max(0, min(int(depth), 10))
+    depth = max(0, min(int(depth), LINEAGE_MAX_DEPTH))
     seen_ids: set[str] = {entry_id}
     edges: list[dict[str, Any]] = []
     frontier: list[str] = [entry_id]
-    truncated = False
+    capped = False
     for _ in range(depth):
         hop_rows, hop_cut = _lineage_relation_rows(
             store.db, frontier, LINEAGE_MAX_EDGES_PER_HOP
         )
         if hop_cut:
-            truncated = True
+            capped = True
         next_frontier: list[str] = []
         for e in hop_rows:
             for nb in (e["from_id"], e["to_id"]):
                 if nb in seen_ids:
                     continue
                 if len(seen_ids) >= LINEAGE_MAX_NODES:
-                    truncated = True
+                    capped = True
                     continue
                 seen_ids.add(nb)
                 next_frontier.append(nb)
@@ -2093,11 +2105,13 @@ def get_lineage(entry_id: str, depth: int = 3) -> dict[str, Any]:
         # The hop that hit a bound is finished — so the near family is whole —
         # and then the walk stops rather than filling up on distant cousins.
         frontier = next_frontier
-        if truncated or not frontier:
+        if capped or not frontier:
             break
+    truncated = capped
     # Relatives the DEPTH never reached are left out just as surely as ones a
-    # cap refused, and `truncated` is this answer's only word for "there is
-    # more of this family than you are looking at". But a frontier is not
+    # cap refused, and `truncated` is this answer's word for "there is more of
+    # this family than you are looking at" (`capped` covers the caps alone,
+    # which loading the whole family can undo). But a frontier is not
     # itself evidence of one: a family whose last generation lands exactly on
     # the final hop leaves the walk holding a frontier with nothing beyond it,
     # and calling that cut tells the user part of their family is hidden when
@@ -2121,24 +2135,9 @@ def get_lineage(entry_id: str, depth: int = 3) -> dict[str, Any]:
 
     # Materialize node payloads for everything we touched.
     rows_by_id = _lineage_entry_rows(store.db, list(seen_ids))
-    nodes: list[dict[str, Any]] = []
-    for node_id in seen_ids:
-        node_row = rows_by_id.get(node_id)
-        if node_row is not None:
-            nodes.append(
-                {
-                    "id": node_id,
-                    "kind": "entry",
-                    "title": node_row.get("title"),
-                    "source": node_row.get("source"),
-                    "duration_sec": node_row.get("duration_sec"),
-                }
-            )
-        else:
-            # Stem / midi / external label — keep it in the graph
-            # without a full row so the visualization can show it as
-            # a placeholder.
-            nodes.append({"id": node_id, "kind": "external"})
+    nodes = [
+        _lineage_node_payload(node_id, rows_by_id.get(node_id)) for node_id in seen_ids
+    ]
 
     # Dedup edges by (from, to, kind).
     seen_edges = set()
@@ -2155,8 +2154,210 @@ def get_lineage(entry_id: str, depth: int = 3) -> dict[str, Any]:
         "nodes": nodes,
         "edges": deduped_edges,
         "truncated": truncated,
+        "capped": capped,
         "node_cap": LINEAGE_MAX_NODES,
     }
+
+
+#: Rows one read of the whole-family walk takes from SQLite at a time, so one
+#: hub's relations never sit in memory whole.
+_LINEAGE_FULL_FETCH = 2000
+
+#: Edge text held in memory before the whole-family walk spills it to disk.
+#: The JSON carries the nodes before the edges, and the edges are found during
+#: the same walk, so they wait in a temporary file until the nodes are sent.
+_LINEAGE_FULL_SPOOL_BYTES = 8 * 1024 * 1024
+
+#: The columns an edge of the whole-family answer carries: the whole
+#: ``relations`` row, as Save lineage wrote it before the cap (weight, metadata
+#: and time included). The screen route sends three of them; a saved family is
+#: a record, not a drawing.
+_LINEAGE_FULL_EDGE_COLUMNS = (
+    "id",
+    "from_id",
+    "to_id",
+    "kind",
+    "weight",
+    "metadata_json",
+    "created_at",
+)
+_LINEAGE_FULL_EDGE_SELECT = ", ".join(_LINEAGE_FULL_EDGE_COLUMNS)
+
+
+def _lineage_node_payload(node_id: str, row: dict[str, Any] | None) -> dict[str, Any]:
+    """One node as both lineage routes send it."""
+    if row is None:
+        # Stem / midi / external label: kept in the graph without a full row
+        # so the visualization can show it as a placeholder.
+        return {"id": node_id, "kind": "external"}
+    return {
+        "id": node_id,
+        "kind": "entry",
+        "title": row.get("title"),
+        "source": row.get("source"),
+        "duration_sec": row.get("duration_sec"),
+    }
+
+
+def _lineage_has_unseen(db: LibraryDB, ids: list[str], hop_of: dict[str, int]) -> bool:
+    """Whether any song related to ``ids`` is missing from ``hop_of``.
+
+    Stops at the first one, so a wide last generation costs only the rows read
+    before the answer is known."""
+    with db._writelock:
+        cur = db._conn.cursor()
+        try:
+            for column, other in (("from_id", "to_id"), ("to_id", "from_id")):
+                for chunk in _chunks(ids, _MAX_SQL_PARAMS):
+                    marks = ", ".join("?" * len(chunk))
+                    cur.execute(
+                        f"SELECT {other} FROM relations WHERE {column} IN ({marks})",
+                        list(chunk),
+                    )
+                    while True:
+                        rows = cur.fetchmany(_LINEAGE_FULL_FETCH)
+                        if not rows:
+                            break
+                        if any(str(r[0]) not in hop_of for r in rows):
+                            return True
+        finally:
+            cur.close()
+    return False
+
+
+def _lineage_full_hop(
+    db: LibraryDB,
+    chunk: Sequence[str],
+    hop: int,
+    hop_of: dict[str, int],
+    write_edge: Callable[[dict[str, Any]], None],
+) -> list[str]:
+    """Walk one chunk of generation ``hop``: every relation touching it.
+
+    Songs reached for the first time get ``hop + 1`` in ``hop_of`` and are
+    returned. Each edge goes to ``write_edge`` once: from the side of the
+    endpoint the walk reached first, and from its ``from_id`` side when both
+    ends are in the same generation. ``relations`` is UNIQUE on (from_id,
+    to_id, kind), so a key is one row, and every row with a given end is read
+    by the one statement whose chunk holds that end. The write lock is held for
+    this chunk only."""
+    found: list[str] = []
+    marks = ", ".join("?" * len(chunk))
+    with db._writelock:
+        cur = db._conn.cursor()
+        try:
+            for column, other in (("from_id", "to_id"), ("to_id", "from_id")):
+                cur.execute(
+                    f"SELECT {_LINEAGE_FULL_EDGE_SELECT} FROM relations "
+                    f"WHERE {column} IN ({marks})",
+                    list(chunk),
+                )
+                while True:
+                    rows = cur.fetchmany(_LINEAGE_FULL_FETCH)
+                    if not rows:
+                        break
+                    for row in rows:
+                        far = str(row[other])
+                        far_hop = hop_of.get(far)
+                        if far_hop is None:
+                            far_hop = hop + 1
+                            hop_of[far] = far_hop
+                            found.append(far)
+                        if far_hop < hop or (far_hop == hop and column == "to_id"):
+                            continue
+                        write_edge({k: row[k] for k in _LINEAGE_FULL_EDGE_COLUMNS})
+        finally:
+            cur.close()
+    return found
+
+
+def _lineage_full_chunks(db: LibraryDB, entry_id: str, depth: int) -> Iterator[str]:
+    """The whole family within ``depth`` hops, as JSON text in pieces.
+
+    The same document ``/lineage`` answers (``root``, ``nodes``, ``edges``,
+    ``truncated``, ``capped``) with no node cap and no per-hop bound, plus
+    ``depth``, ``node_count`` and ``edge_count``. The counts come last, so a
+    reader can tell a whole answer from one cut off mid-stream.
+
+    What stays in memory is the map of song id to hop and one fetch of rows;
+    the edges wait in a spooled temporary file while the nodes are sent. The
+    write lock is taken per chunk of ids inside :func:`_lineage_full_hop` and
+    is never held across a ``yield``."""
+    hop_of: dict[str, int] = {entry_id: 0}
+    edge_count = 0
+    spool = tempfile.SpooledTemporaryFile(
+        max_size=_LINEAGE_FULL_SPOOL_BYTES, mode="w+", encoding="utf-8"
+    )
+
+    def write_edge(edge: dict[str, Any]) -> None:
+        nonlocal edge_count
+        if edge_count:
+            spool.write(", ")
+        spool.write(json.dumps(edge))
+        edge_count += 1
+
+    def nodes_json(ids: list[str]) -> str:
+        rows = _lineage_entry_rows(db, ids)
+        return ", ".join(json.dumps(_lineage_node_payload(i, rows.get(i))) for i in ids)
+
+    try:
+        yield f'{{"root": {json.dumps(entry_id)}, "depth": {depth}, "nodes": ['
+        yield nodes_json([entry_id])
+        node_count = 1
+        frontier: list[str] = [entry_id]
+        hop = 0
+        while frontier and hop < depth:
+            next_frontier: list[str] = []
+            for chunk in _chunks(frontier, _MAX_SQL_PARAMS):
+                found = _lineage_full_hop(db, chunk, hop, hop_of, write_edge)
+                if found:
+                    yield ", " + nodes_json(found)
+                    node_count += len(found)
+                    next_frontier.extend(found)
+            frontier = next_frontier
+            hop += 1
+        # Relatives past the depth are left out, and the answer says so the
+        # way the capped route does. The last generation reached is the
+        # frontier the walk stopped holding.
+        truncated = bool(frontier) and _lineage_has_unseen(db, frontier, hop_of)
+        yield '], "edges": ['
+        spool.seek(0)
+        while True:
+            block = spool.read(1 << 16)
+            if not block:
+                break
+            yield block
+        tail = {
+            "truncated": truncated,
+            "capped": False,
+            "node_cap": None,
+            "node_count": node_count,
+            "edge_count": edge_count,
+        }
+        yield "], " + json.dumps(tail)[1:]
+    finally:
+        spool.close()
+
+
+@router.get("/{entry_id}/lineage/full")
+def get_lineage_full(entry_id: str, depth: int = 8) -> StreamingResponse:
+    """The whole family within ``depth`` hops of ``entry_id``, streamed.
+
+    ``/lineage`` stops at :data:`LINEAGE_MAX_NODES` so one screen never has to
+    draw an enormous family. This walk has no node cap: Save lineage writes the
+    whole family with it, and INFO loads it when the user asks for the whole
+    family. The JSON is written while the walk runs, so the server never holds
+    the family's whole answer in memory."""
+    store = get_store()
+    if store.db is None:
+        raise HTTPException(503, "library DB not available")
+    if store.get_entry(entry_id) is None:
+        raise HTTPException(404, f"entry {entry_id!r} not found")
+    depth = max(0, min(int(depth), LINEAGE_MAX_DEPTH))
+    return StreamingResponse(
+        _lineage_full_chunks(store.db, entry_id, depth),
+        media_type="application/json",
+    )
 
 
 @router.get("/_all/stems")

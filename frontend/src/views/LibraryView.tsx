@@ -43,6 +43,7 @@ import { useFeatureToggleStore } from '../state/featureToggleStore';
 import { logError, logInfo, logWarn } from '../state/logStore';
 import { addBlobsToChimera } from '../lib/chimeraClient';
 import { saveFile, extOfName } from '../lib/saveFile';
+import { saveWholeLineage } from '../lib/lineageFamily';
 import { basenameOf } from '../lib/placesClient';
 import { KnownFilesMenu } from '../components/ui/KnownFilesMenu';
 import {
@@ -2501,8 +2502,8 @@ interface LibraryActionsToolbarProps {
  *  anchored to the click. Empty selection disables destructive actions
  *  (delete / fuse / inpaint) but leaves SELECT / DOWNLOAD / OPTIONS
  *  usable so the user can act on the visible set without selecting
- *  first. */
-const LibraryActionsToolbar: React.FC<LibraryActionsToolbarProps> = ({
+ *  first. Exported so its DOWNLOAD menu is tested on its own. */
+export const LibraryActionsToolbar: React.FC<LibraryActionsToolbarProps> = ({
   selectedEntries,
   selectedCount,
   totalCount,
@@ -2556,11 +2557,8 @@ const LibraryActionsToolbar: React.FC<LibraryActionsToolbarProps> = ({
           kind: 'zip',
         });
       } else if (kind === 'lineage') {
-        result = await saveFile({
-          url: `/api/library/${entry.id}/lineage?depth=8`,
-          suggestedName: `${fileSafe(entry.title)}-lineage.json`,
-          kind: 'lineage-json',
-        });
+        // The whole family of each song, with its size said before its dialog.
+        result = await saveWholeLineage(entry, `${fileSafe(entry.title)}-lineage.json`);
       } else {
         // Build a metadata JSON client-side from what the store already
         // has cached — no backend round-trip. If the user needs the
