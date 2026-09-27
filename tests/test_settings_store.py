@@ -59,7 +59,10 @@ def test_v7_file_gains_io_without_losing_existing_choices():
     assert merged["library"] == {"media_roots": []}
     # v10 -> v11 added the assistant section, ON: the in-app Claude keeps the
     # user's own Claude settings and MCP servers it had before.
-    assert merged["assistant"] == {"use_user_claude_config": True}
+    assert merged["assistant"] == {
+        "use_user_claude_config": True,
+        "always_allow_rules": [],
+    }
     # v11 -> v12 moved the LAN HTTPS switch into a section of its own; absent
     # means on.
     assert merged["lan"] == {"https": True}

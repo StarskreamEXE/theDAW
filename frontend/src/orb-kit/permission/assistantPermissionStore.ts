@@ -37,7 +37,7 @@ export const PERMISSION_MODE_OPTIONS: PermissionModeOption[] = [
     value: 'ask',
     label: 'Ask before acting',
     description:
-      'Reading is free; every edit, command or sub-agent asks you first. The default.',
+      'Reading is free; every edit, command or sub-agent asks you first, including what your Claude allow rules cover unless you mark a rule Always allow. The default.',
   },
   {
     value: 'accept_edits',

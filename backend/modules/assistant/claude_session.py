@@ -246,6 +246,10 @@ class ClaudeSession:
     # True when the child loads the user's own Claude settings and MCP servers
     # (see build_base_args / _mcp_config_args). A change respawns the child.
     use_user_config: bool = False
+    # The permission rules the child was given (``permission_rules_key``). A
+    # turn whose rules differ -- a rule marked "always allow", or an allow rule
+    # added to a settings file since -- respawns the child.
+    permission_rules_key: str = ""
     claude_session_id: Optional[str] = None
     mcp_config_path: str = ""
     mcp_config_written: bool = False
@@ -375,8 +379,9 @@ def build_base_args(
       then approve the commands they match without asking theDAW, as they do
       in the user's terminal, except where ``permission_rules`` (passed with
       ``--settings`` in both setups) sends a call to decide() first: every
-      edit, command, sub-agent and MCP tool in Read-only mode, and every edit
-      of the assistant's own code.
+      edit, command, sub-agent and MCP tool in Read-only mode, every call an
+      allow rule matches in Ask mode (unless the user marked the rule "always
+      allow"), and every edit of the assistant's own code.
     * ``False`` -> ``project,local``. The CLI applies USER-level settings BEFORE
       it consults the host permission prompt. On the machine this was proven
       on, the user settings set ``permissions.defaultMode = "bypassPermissions"``
@@ -575,7 +580,61 @@ def _cli_absolute_rule_path(path: Path) -> str:
     return "/" + posix
 
 
-def permission_rules(permission_mode: str, repo_root: Path = REPO_ROOT) -> dict:
+def claude_config_dir() -> Path:
+    """The CLI's user config folder: ``CLAUDE_CONFIG_DIR``, else ``~/.claude``."""
+    configured = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    return Path(configured).expanduser() if configured else Path.home() / ".claude"
+
+
+def _allow_rules_in(path: Path) -> list[str]:
+    """``permissions.allow`` of one settings file; [] when absent or unreadable."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    perms = payload.get("permissions") if isinstance(payload, dict) else None
+    allow = perms.get("allow") if isinstance(perms, dict) else None
+    if not isinstance(allow, list):
+        return []
+    return [r.strip() for r in allow if isinstance(r, str) and r.strip()]
+
+
+def loaded_allow_rules(
+    use_user_config: bool, repo_root: Optional[Path] = None
+) -> list[dict]:
+    """
+    Every allow rule the child's setting sources carry, once each, with where
+    it came from: ``user`` (``~/.claude/settings.json``, only when the session
+    uses the user's own setup, see ``build_base_args``), ``project``
+    (``.claude/settings.json``) and ``local`` (``.claude/settings.local.json``).
+    ``repo_root`` defaults to ``REPO_ROOT``, read at call time.
+    """
+    repo_root = repo_root or REPO_ROOT
+    files = []
+    if use_user_config:
+        files.append(("user", claude_config_dir() / "settings.json"))
+    files += [
+        ("project", repo_root / ".claude" / "settings.json"),
+        ("local", repo_root / ".claude" / "settings.local.json"),
+    ]
+    seen: set[str] = set()
+    rules: list[dict] = []
+    for source, path in files:
+        for rule in _allow_rules_in(path):
+            if rule in seen:
+                continue
+            seen.add(rule)
+            rules.append({"rule": rule, "source": source, "path": str(path)})
+    return rules
+
+
+def permission_rules(
+    permission_mode: str,
+    repo_root: Optional[Path] = None,
+    *,
+    use_user_config: bool = False,
+    always_allow: tuple[str, ...] | list[str] = (),
+) -> dict:
     """
     The ``--settings`` payload for a child in ``permission_mode``.
 
@@ -583,6 +642,12 @@ def permission_rules(permission_mode: str, repo_root: Path = REPO_ROOT) -> dict:
       entry (an ``Edit(path)`` rule governs every built-in tool that writes
       files), so a write to the assistant's own surface always reaches
       decide(), which asks the user.
+    * ``ask``: also an ask rule mirroring each loaded allow rule
+      (``loaded_allow_rules``) the user has not marked "always allow" in the
+      assistant panel (settings ``assistant.always_allow_rules``). The CLI
+      checks ask rules before allow rules, so a call such a rule matches
+      reaches decide() and the user is asked, where it used to run unasked.
+      theDAW's own read-only ``ALLOWED_TOOLS`` are not mirrored.
     * ``readonly``: also a bare ask rule for every edit, shell and sub-agent
       tool, and ``mcp__*`` for every MCP tool, so each one reaches decide(),
       which refuses all but reads.
@@ -590,11 +655,35 @@ def permission_rules(permission_mode: str, repo_root: Path = REPO_ROOT) -> dict:
     Paths are absolute (``//...``): a ``/path`` rule anchors at a place that
     depends on where the CLI thinks the rule came from.
     """
+    repo_root = repo_root or REPO_ROOT
     root = _cli_absolute_rule_path(repo_root)
     ask = [f"Edit({root}/{glob})" for glob in permissions.SELF_SURFACE_GLOBS]
+    if permission_mode == "ask":
+        keep = set(always_allow)
+        for entry in loaded_allow_rules(use_user_config, repo_root):
+            rule = entry["rule"]
+            if rule in keep or rule in ALLOWED_TOOLS or rule in ask:
+                continue
+            ask.append(rule)
     if permission_mode == "readonly":
         ask += [*READONLY_ASK_TOOLS, "mcp__*"]
     return {"permissions": {"ask": ask}}
+
+
+def permission_rules_key(
+    permission_mode: str,
+    *,
+    use_user_config: bool = False,
+    always_allow: tuple[str, ...] | list[str] = (),
+) -> str:
+    """A stable text form of ``permission_rules``, to tell whether a child's
+    rules still hold."""
+    return json.dumps(
+        permission_rules(
+            permission_mode, use_user_config=use_user_config, always_allow=always_allow
+        ),
+        sort_keys=True,
+    )
 
 
 def _permission_settings_path(relay_id: str, permission_mode: str) -> Path:
@@ -604,19 +693,27 @@ def _permission_settings_path(relay_id: str, permission_mode: str) -> Path:
     return Path(tempfile.gettempdir()) / f"thedaw-permissions-{relay_id}-{mode}.json"
 
 
-def _permission_settings_args(relay_id: str, permission_mode: str) -> list[str]:
+def _permission_settings_args(
+    relay_id: str,
+    permission_mode: str,
+    *,
+    use_user_config: bool = False,
+    always_allow: tuple[str, ...] | list[str] = (),
+) -> list[str]:
     """
     Write this child's permission rules and return ``["--settings", path]``.
 
     Raises ``OSError`` when the file cannot be written. Fail CLOSED: a child
     spawned without these rules would let the loaded allow rules approve edits
-    in Read-only mode and writes to the assistant's own code, so the caller
-    turns the error into a failed turn and no child starts.
+    in Read-only mode, matched calls in Ask mode, and writes to the assistant's
+    own code, so the caller turns the error into a failed turn and no child
+    starts.
     """
     path = _permission_settings_path(relay_id, permission_mode)
-    path.write_text(
-        json.dumps(permission_rules(permission_mode), indent=2), encoding="utf-8"
+    rules = permission_rules(
+        permission_mode, use_user_config=use_user_config, always_allow=always_allow
     )
+    path.write_text(json.dumps(rules, indent=2), encoding="utf-8")
     return ["--settings", str(path)]
 
 
@@ -1306,6 +1403,7 @@ async def spawn(
     extra_servers: Optional[dict] = None,
     fallback_model: Optional[str] = None,
     use_user_config: bool = False,
+    always_allow: tuple[str, ...] = (),
 ) -> ClaudeSession:
     """Spawn a fresh persistent child for a conversation and register it."""
     await _reap_lru_if_needed()
@@ -1322,9 +1420,17 @@ async def spawn(
         fallback_model=fallback_model,
         use_user_config=use_user_config,
     )
+    rules_key = permission_rules_key(
+        permission_mode, use_user_config=use_user_config, always_allow=always_allow
+    )
     try:
         # First, so a failed write leaves nothing else behind to clean up.
-        args += _permission_settings_args(relay_id, permission_mode)
+        args += _permission_settings_args(
+            relay_id,
+            permission_mode,
+            use_user_config=use_user_config,
+            always_allow=always_allow,
+        )
     except OSError:
         _unlink_permission_settings(relay_id)
         raise
@@ -1371,6 +1477,7 @@ async def spawn(
         effort=effort,
         permission_mode=permission_mode,
         use_user_config=use_user_config,
+        permission_rules_key=rules_key,
         claude_session_id=claude_session_id if resume else None,
         mcp_config_path=mcp_config_path,
         mcp_config_written=written,
@@ -1397,6 +1504,7 @@ async def _respawn(
     port: int,
     extra_servers: Optional[dict] = None,
     use_user_config: bool = False,
+    always_allow: tuple[str, ...] = (),
 ) -> None:
     """
     Respawn a session's child in place (model / effort / permission-mode change,
@@ -1424,7 +1532,15 @@ async def _respawn(
     )
     # Raises before anything changed, so the session stays whole on its old
     # child (see the spawn-first note below).
-    args += _permission_settings_args(session.relay_id, permission_mode)
+    rules_key = permission_rules_key(
+        permission_mode, use_user_config=use_user_config, always_allow=always_allow
+    )
+    args += _permission_settings_args(
+        session.relay_id,
+        permission_mode,
+        use_user_config=use_user_config,
+        always_allow=always_allow,
+    )
     mcp_args, written = _mcp_config_args(
         session.relay_id,
         session.mcp_config_path,
@@ -1468,6 +1584,7 @@ async def _respawn(
     session.effort = effort
     session.permission_mode = permission_mode
     session.use_user_config = use_user_config
+    session.permission_rules_key = rules_key
     session.stdout_buf = ""
     session.stderr = ""
     session.first_turn_pending = not can_resume
@@ -1677,6 +1794,7 @@ async def stream_turn(
     on_control_request: Optional[ControlHook] = None,
     fallback_model: Optional[str] = None,
     use_user_config: bool = False,
+    always_allow: tuple[str, ...] = (),
 ) -> AsyncIterator[str]:
     """
     Run ONE chat turn on the conversation's persistent session, yielding SSE
@@ -1692,6 +1810,10 @@ async def stream_turn(
     over the isolated setup (see ``build_base_args`` / ``_mcp_config_args``). It
     is fixed at spawn, so a turn that asks for the other value respawns the
     child, exactly like a model change.
+
+    ``always_allow`` lists the allow rules the user marked "always allow"
+    (``permission_rules``). The child is respawned whenever the rules it would
+    get now differ from the ones it was given.
 
     stdin is never closed. The child is never killed here: a consumer that
     disappears mid-turn (client disconnect) interrupts the turn and leaves the
@@ -1746,6 +1868,12 @@ async def stream_turn(
                             or session.effort != effort
                             or session.permission_mode != permission_mode
                             or session.use_user_config != use_user_config
+                            or session.permission_rules_key
+                            != permission_rules_key(
+                                permission_mode,
+                                use_user_config=use_user_config,
+                                always_allow=always_allow,
+                            )
                         ):
                             await _respawn(
                                 session,
@@ -1756,6 +1884,7 @@ async def stream_turn(
                                 port=port,
                                 extra_servers=extra_servers,
                                 use_user_config=use_user_config,
+                                always_allow=always_allow,
                             )
                         if session is None:
                             session = await spawn(
@@ -1768,6 +1897,7 @@ async def stream_turn(
                                 extra_servers=extra_servers,
                                 fallback_model=fallback_model,
                                 use_user_config=use_user_config,
+                                always_allow=always_allow,
                             )
                     except Exception as exc:
                         # Any failure to start the CLI is a turn error, never an

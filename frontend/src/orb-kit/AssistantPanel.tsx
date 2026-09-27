@@ -25,6 +25,7 @@ import {
 import { contextPercentage, fetchContextUsage, type ContextUsage } from './contextUsage';
 import { PermissionModeSelect } from './permission/PermissionModeSelect';
 import { UserClaudeConfigToggle } from './permission/UserClaudeConfigToggle';
+import { AllowRulesList } from './permission/AllowRulesList';
 import { useAssistantPermissionStore } from './permission/assistantPermissionStore';
 import {
     loadConversations,
@@ -1455,6 +1456,9 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                                 MCP servers. An app setting (data/settings.json),
                                 read by the backend on every turn; Claude only. */}
                             {shouldShowPermissionSelect(selectedProvider) && <UserClaudeConfigToggle />}
+                            {/* The loaded allow rules; in Ask mode each one asks
+                                unless marked Always allow. Claude only. */}
+                            {shouldShowPermissionSelect(selectedProvider) && <AllowRulesList />}
                             <div className="flex items-center justify-between text-xs pt-0.5">
                                 {/* The CLI reports the model it actually loaded,
                                     which can differ from the one requested (a

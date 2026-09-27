@@ -91,9 +91,13 @@ def _redacted_for(request: Request, settings: dict[str, Any]) -> dict[str, Any]:
 
 #: Keys that decide what the in-app Claude Code session may load and do without
 #: asking. Turning ``use_user_claude_config`` on hands the session the user's
-#: own allow rules, hooks and MCP servers, so a LAN caller must never be able to
-#: flip it; reading it back is harmless, so it is not redacted.
-_ASSISTANT_KEYS = (("assistant", "use_user_claude_config"),)
+#: own allow rules, hooks and MCP servers, and ``always_allow_rules`` lets
+#: matched calls run unasked in Ask mode, so a LAN caller must never be able to
+#: change either; reading them back is harmless, so they are not redacted.
+_ASSISTANT_KEYS = (
+    ("assistant", "use_user_claude_config"),
+    ("assistant", "always_allow_rules"),
+)
 
 
 def _touched(payload: dict[str, Any], keys: tuple[tuple[str, str], ...]) -> bool:
@@ -131,9 +135,16 @@ def patch_settings(
     if _touched(payload, _ASSISTANT_KEYS):
         # 403 unless this machine's own UI or the desktop shell is asking.
         require_loopback_or_launch_token(request)
-        value = payload["assistant"]["use_user_claude_config"]
-        if not isinstance(value, bool):
+        assistant = payload["assistant"]
+        if "use_user_claude_config" in assistant and not isinstance(
+            assistant["use_user_claude_config"], bool
+        ):
             raise HTTPException(400, "use_user_claude_config must be true or false")
+        if "always_allow_rules" in assistant and not (
+            isinstance(assistant["always_allow_rules"], list)
+            and all(isinstance(r, str) for r in assistant["always_allow_rules"])
+        ):
+            raise HTTPException(400, "always_allow_rules must be a list of rules")
     if _local_only_touched(payload):
         # 403 unless this machine's own UI or the desktop shell is asking.
         require_loopback_or_launch_token(request)
