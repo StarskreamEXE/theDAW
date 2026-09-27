@@ -1966,9 +1966,8 @@ export const DJView: React.FC = () => {
           djEngine.seekDeck(current, firstBeat);
         }
         djEngine.playDeck(current);
-        // The set has begun: from here a deck that stops at the end of its
-        // track (or is ejected) is dead air and is rescued, while a deck paused
-        // mid-track holds the plan until it plays again (see `deckRun`).
+        // The set has begun: a deck that stops at its end (or is ejected) is
+        // now dead air and is rescued; a paused deck holds the plan (deckRun).
         if (automixRef.current) automixRef.current.started = true;
         if (!analyzed) setFlash('Automix: starting before analysis landed — first mix may be unmatched');
       }, 150);
