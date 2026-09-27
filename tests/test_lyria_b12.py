@@ -1874,13 +1874,147 @@ def test_8039b45_edits_after_this_build_replace_its_lists(builds):
 
 
 def test_8039b45_clearing_every_key_stays_cleared(builds):
+    """This build -> 8039b45 (removes every key) -> this build. The keys stay
+    gone, the preference 8039b45 read and wrote back stays, and so does the
+    pool switch, which 8039b45 has no field for: its store without
+    ``share_pool`` is not the user turning sharing off."""
     _this_build_saves_everything()
 
     builds.old.clear_gemini_key()
     assert builds.old.remove_key("openrouter", 0) is True
 
-    assert _this_build_state()["gemini"] == []
-    assert _this_build_state()["openrouter"] == []
+    assert _this_build_state() == {
+        "gemini": [],
+        "openrouter": [],
+        "preference": "openrouter",
+        "share": True,
+    }
+    _assert_every_build_agrees(builds)
+
+
+def test_main_resaves_a_key_this_build_holds_then_8039b45_edits(builds):
+    """This build -> main POST of this build's first Gemini key (the key
+    main's card shows) -> 8039b45 (adds an OpenRouter key) -> this build.
+    8039b45 opened on main's one key, which this build also holds, so the one
+    key the two share proves nothing: 8039b45 never saw the other keys or the
+    preference, and they stay behind what it wrote."""
+    _this_build_saves_everything()
+    assert builds.main.gemini_key() == ("this-g1", "file")
+    builds.main.set_gemini_key("this-g1")
+
+    assert builds.old.stored_keys("gemini") == ["this-g1"]
+    assert builds.old.stored_keys("openrouter") == []
+    builds.old.add_key("openrouter", "old-o5")
+
+    assert _this_build_state() == {
+        "gemini": ["this-g1", "this-g2"],
+        "openrouter": ["old-o5", "this-o1"],
+        "preference": "openrouter",
+        "share": True,
+    }
+    _assert_every_build_agrees(builds)
+
+
+def test_main_resaves_a_key_this_build_holds_then_8039b45_picks_a_provider(builds):
+    """This build -> main POST of a Gemini key this build holds -> 8039b45
+    (picks Gemini as the provider, touching no key) -> this build. The
+    provider 8039b45 picked wins; the keys it never saw stay."""
+    _this_build_saves_everything()
+    builds.main.set_gemini_key("this-g2")
+
+    assert builds.old.stored_keys("gemini") == ["this-g2"]
+    builds.old.set_provider_preference("gemini")
+
+    assert _this_build_state() == {
+        "gemini": ["this-g2", "this-g1"],
+        "openrouter": ["this-o1"],
+        "preference": "gemini",
+        "share": True,
+    }
+    _assert_every_build_agrees(builds)
+
+
+def test_8039b45_removing_the_second_gemini_key_sticks(builds):
+    """This build (two Gemini keys, OpenRouter preferred) -> 8039b45 (removes
+    the second Gemini key) -> this build. What 8039b45 wrote shares only the
+    first Gemini key with this build's store, as a write made from main's
+    file would, but it carries the preference, which main's file has no
+    field for: 8039b45 read this build's store, and the removal stands."""
+    sidecar.add_key("gemini", "this-g1")
+    sidecar.add_key("gemini", "this-g2")
+    sidecar.set_provider_preference("openrouter")
+    sidecar.set_pool_shared(True)
+
+    assert builds.old.stored_keys("gemini") == ["this-g1", "this-g2"]
+    assert builds.old.remove_key("gemini", 1) is True
+
+    assert _this_build_state() == {
+        "gemini": ["this-g1"],
+        "openrouter": [],
+        "preference": "openrouter",
+        "share": True,
+    }
+    _assert_every_build_agrees(builds)
+
+
+def test_main_deletes_then_resaves_a_key_this_build_held(builds):
+    """This build -> main DELETE -> main POST of this build's second Gemini
+    key -> this build. main's DELETE forgot every Gemini key, as this build's
+    own DELETE does; the key main saved again is the one Gemini key left, and
+    nothing else changes."""
+    _this_build_saves_everything()
+
+    assert builds.main.clear_gemini_key() is True
+    builds.main.set_gemini_key("this-g2")
+
+    assert _this_build_state() == {
+        "gemini": ["this-g2"],
+        "openrouter": ["this-o1"],
+        "preference": "openrouter",
+        "share": True,
+    }
+    _assert_every_build_agrees(builds)
+
+
+def test_main_deletes_and_resaves_then_8039b45_edits_before_this_build_opens(
+    builds,
+):
+    """This build -> main DELETE -> main POST -> 8039b45 (adds an OpenRouter
+    key to main's one key) -> this build. The delete forgot the Gemini keys;
+    main's fresh key, 8039b45's key and this build's OpenRouter key, the
+    preference and the pool switch all stay."""
+    _this_build_saves_everything()
+    assert builds.main.clear_gemini_key() is True
+    builds.main.set_gemini_key("fresh")
+
+    assert builds.old.stored_keys("gemini") == ["fresh"]
+    builds.old.add_key("openrouter", "old-o5")
+
+    assert _this_build_state() == {
+        "gemini": ["fresh"],
+        "openrouter": ["old-o5", "this-o1"],
+        "preference": "openrouter",
+        "share": True,
+    }
+    _assert_every_build_agrees(builds)
+
+
+def test_main_then_8039b45_then_this_build_on_a_folder_this_build_never_wrote(
+    builds,
+):
+    """main POST -> 8039b45 (adds an OpenRouter key) -> this build, with no
+    copy beside the key file. 8039b45's store is the whole story; this
+    build's first read writes main's ``key`` back into it."""
+    builds.main.set_gemini_key("main-x")
+    builds.old.add_key("openrouter", "old-o1")
+    assert builds.main.gemini_key() == (None, "none")
+
+    assert _this_build_state() == {
+        "gemini": ["main-x"],
+        "openrouter": ["old-o1"],
+        "preference": None,
+        "share": False,
+    }
     _assert_every_build_agrees(builds)
 
 

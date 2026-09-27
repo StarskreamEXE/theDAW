@@ -677,6 +677,33 @@ def _recorded_identity(record: object) -> Optional[tuple[int, int]]:
     return None
 
 
+def _written_from_mains_file(written: dict, base: dict) -> bool:
+    """True when an 8039b45 store over the key file shows no sign of having
+    been written from this build's store (``base``), so it must have been
+    written from a file main had overwritten.
+
+    8039b45 opened on main's ``{"key": ...}`` sees that one key as its first
+    Gemini key and nothing else: no other key and no preference. main's card
+    shows the first Gemini key this build wrote into ``key``, so main saving
+    it again is ordinary and that key is left out of the test. A write from
+    this build's store carries every key the user did not remove and the
+    preference the user did not change, so either of these is the sign:
+      * another key of ``base`` is in the write;
+      * the write holds ``base``'s preference (main's file has none to give).
+    Without either sign the write never saw ``base``'s keys and could not
+    have removed them. An empty write is the user clearing every key and
+    counts as seen; so does any write when ``base`` holds no key."""
+    written_keys = _all_keys(written)
+    base_keys = _all_keys(base)
+    if not written_keys or not base_keys:
+        return False
+    mains_key = set(written["providers"]["gemini"][:1])
+    if (written_keys - mains_key) & base_keys:
+        return False
+    preference = base.get("provider_preference")
+    return preference is None or written.get("provider_preference") != preference
+
+
 def _reconcile(key_file: _KeyFileView, copy: object) -> tuple[dict, str]:
     """The store the key file and the copy beside it describe, and how the
     key file got the way it is.
@@ -701,11 +728,11 @@ def _reconcile(key_file: _KeyFileView, copy: object) -> tuple[dict, str]:
     after this build wrote it, which only happens after main's DELETE (main
     and 8039b45 overwrite in place), so that DELETE is applied first.
     Otherwise main's one key goes first and the rest stay behind it; and an
-    8039b45 store replaces the lists, unless it shares no key at all with
-    the copy -- then it was written from a file main had overwritten, never
-    saw this build's keys, and could not have removed them, so they stay
-    behind its own. Without a copy each file is read on its own terms, as
-    before the copy existed.
+    8039b45 store replaces the lists, unless it shows no sign of having read
+    the copy's store (_written_from_mains_file) -- then it was written from
+    a file main had overwritten, never saw this build's keys, and could not
+    have removed them, so they stay behind its own. Without a copy each file
+    is read on its own terms, as before the copy existed.
 
     Kinds: ``none``, ``legacy`` and ``torn`` (nothing to reconcile, nothing
     rewritten); ``ours``; everything else is a change another build made,
@@ -761,11 +788,7 @@ def _reconcile(key_file: _KeyFileView, copy: object) -> tuple[dict, str]:
             _union_stores(written, _forget_gemini(base)),
             "older_list_after_delete",
         )
-    elif (
-        _all_keys(written)
-        and _all_keys(base)
-        and not (_all_keys(written) & _all_keys(base))
-    ):
+    elif _written_from_mains_file(written, base):
         store, kind = _union_stores(written, base), "older_list_blind"
     else:
         store, kind = written, "older_list"
