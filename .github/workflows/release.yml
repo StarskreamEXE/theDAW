@@ -252,9 +252,42 @@ jobs:
           ref: ${{ env.SWAY_REF }}
           token: ${{ secrets.SWAY_REPO_TOKEN || github.token }}
           path: SwayCommand
+      # FFmpeg for the Apple Silicon app, built from the latest FFmpeg release
+      # with libsoxr and librubberband (no maintained static arm64 build has
+      # both). electron-ui/scripts/build-ffmpeg-macos.sh verifies the tarball's
+      # signature, links Homebrew's libraries, and relinks every dylib into
+      # ffmpeg-libs/ beside the binaries so the app never loads the user's
+      # Homebrew. The build is cached under a key made of the FFmpeg version,
+      # a hash of every Homebrew formula version it links, and the script
+      # itself, so it rebuilds only when one of those changes.
+      - name: Resolve the FFmpeg build key
+        id: ffmpeg-key
+        run: |
+          brew update --quiet
+          key="$(bash electron-ui/scripts/build-ffmpeg-macos.sh key)"
+          echo "FFmpeg build key: $key"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+      - name: Restore the built FFmpeg
+        id: ffmpeg-cache
+        uses: actions/cache@v6
+        with:
+          path: electron-ui/build-resources/ffmpeg-macos-arm64
+          key: ffmpeg-macos-arm64-${{ steps.ffmpeg-key.outputs.key }}-${{ hashFiles('electron-ui/scripts/build-ffmpeg-macos.sh') }}
+      - name: Build FFmpeg from source
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: bash electron-ui/scripts/build-ffmpeg-macos.sh build
+      # Runs on a cache hit too: the soxr and rubberband probes, the encoders
+      # theDAW uses, code signatures, and no /opt/homebrew or /usr/local path
+      # left in any `otool -L` or rpath. Any failure fails the job.
+      - name: Verify the built FFmpeg
+        run: bash electron-ui/scripts/build-ffmpeg-macos.sh verify
       - name: Build the macOS disk image
         env:
           SWAY_PROJECT: ${{ github.workspace }}/SwayCommand
+          # The tool fetch must use the FFmpeg built above, never fall back.
+          THEDAW_MAC_FFMPEG_REQUIRED: "1"
         run: npm run dist:mac:ci
         working-directory: electron-ui
       - uses: actions/upload-artifact@v7

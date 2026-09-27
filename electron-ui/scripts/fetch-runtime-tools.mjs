@@ -15,8 +15,8 @@
 //             FULL release build (the build winget's Gyan.FFmpeg installs,
 //             which install/setup.ps1 offers)
 //   - darwin: uv from the Astral release tarball for the host arch; ffmpeg +
-//             ffprobe from evermeet.cx on Intel and Martin Riedl's build
-//             server on Apple Silicon (see fetchFfmpegMac)
+//             ffprobe from evermeet.cx on Intel, and on Apple Silicon the
+//             build scripts/build-ffmpeg-macos.sh made (see fetchFfmpegMac)
 //   - linux:  unsupported here; the Linux path ships via Docker, so the script
 //             exits with a clear message instead of fetching anything
 //
@@ -34,6 +34,7 @@ import {
   readdirSync,
   readFileSync,
   copyFileSync,
+  cpSync,
   chmodSync,
   createWriteStream,
   renameSync,
@@ -95,6 +96,10 @@ const GYAN_BASE = 'https://www.gyan.dev/ffmpeg/builds'
 // newest build id is read from the build history page instead.
 const EVERMEET_INFO = 'https://evermeet.cx/ffmpeg/info'
 const RIEDL_BASE = 'https://ffmpeg.martin-riedl.de'
+// Where scripts/build-ffmpeg-macos.sh leaves the Apple Silicon build: ffmpeg,
+// ffprobe and the ffmpeg-libs/ folder of relinked dylibs they load.
+const MAC_BUILT_DIR =
+  process.env.THEDAW_MAC_FFMPEG_DIR || resolve(__dirname, '..', 'build-resources', 'ffmpeg-macos-arm64')
 
 // The probes the backend runs (backend/lib/ffmpeg_tools.py): 50 ms of sine
 // resampled through soxr, and 200 ms stretched through rubberband, both into
@@ -411,18 +416,48 @@ async function fetchFfmpegWin() {
 }
 
 // macOS. evermeet.cx builds Intel binaries with libsoxr and librubberband and
-// does not build for Apple Silicon. Martin Riedl's server is the maintained
-// static Apple Silicon build, and its published configuration (versions.txt
-// beside each build) has neither library. So an Intel host gets evermeet and
-// must pass both probes; an Apple Silicon host gets Martin Riedl's latest
-// release with its SHA-256 checked, and the missing libraries are reported as
-// a warning on every fetch rather than failing the release. In the packaged
-// app the backend (backend/lib/ffmpeg_tools.py) then prefers a Homebrew
-// ffmpeg, which has both, and names the gap to the user when there is none.
+// does not build for Apple Silicon, and no maintained static Apple Silicon
+// build has both (Martin Riedl's published configuration has neither). So:
+//   - Intel: evermeet's latest release, which must pass both probes.
+//   - Apple Silicon: the build scripts/build-ffmpeg-macos.sh made (the
+//     macos-dmg release job runs it), copied with its ffmpeg-libs/ folder and
+//     required to pass both probes. Without one, Martin Riedl's latest release
+//     with its SHA-256 checked and a warning, so a local dev build still gets
+//     an ffmpeg; THEDAW_MAC_FFMPEG_REQUIRED=1 (set by the release job) turns
+//     that fallback into a failure.
 async function fetchFfmpegMac() {
   if (process.arch === 'x64') return fetchFfmpegMacEvermeet()
-  if (process.arch === 'arm64') return fetchFfmpegMacRiedl()
+  if (process.arch === 'arm64') {
+    if (present(join(MAC_BUILT_DIR, 'ffmpeg')) && present(join(MAC_BUILT_DIR, 'ffprobe'))) {
+      return installFfmpegMacBuilt()
+    }
+    if (process.env.THEDAW_MAC_FFMPEG_REQUIRED === '1') {
+      throw new Error(
+        `no built FFmpeg in ${MAC_BUILT_DIR}; run scripts/build-ffmpeg-macos.sh build first ` +
+          '(the macos-dmg job in .github/workflows/release.yml does)',
+      )
+    }
+    warn(`no built FFmpeg in ${MAC_BUILT_DIR} (scripts/build-ffmpeg-macos.sh build makes one); using Martin Riedl's build`)
+    return fetchFfmpegMacRiedl()
+  }
   throw new Error(`no macOS ffmpeg source configured for arch '${process.arch}'`)
+}
+
+// Copy the Apple Silicon build into resources/tools: ffmpeg and ffprobe load
+// their dylibs from @loader_path/ffmpeg-libs, so the folder travels with them.
+function installFfmpegMacBuilt() {
+  const ffmpeg = join(toolsDir, 'ffmpeg')
+  const ffprobe = join(toolsDir, 'ffprobe')
+  const libsSrc = join(MAC_BUILT_DIR, 'ffmpeg-libs')
+  const libsDest = join(toolsDir, 'ffmpeg-libs')
+  rmSync(libsDest, { recursive: true, force: true })
+  if (existsSync(libsSrc)) {
+    cpSync(libsSrc, libsDest, { recursive: true })
+    log(`installed ${libsDest}`)
+  }
+  install(join(MAC_BUILT_DIR, 'ffmpeg'), ffmpeg)
+  install(join(MAC_BUILT_DIR, 'ffprobe'), ffprobe)
+  requireSoxrAndRubberband(ffmpeg, ffprobe)
 }
 
 async function fetchFfmpegMacEvermeet() {
@@ -501,8 +536,8 @@ function warnMissing(p) {
   warn(
     `the bundled Apple Silicon FFmpeg lacks ${[!p.soxr && 'libsoxr', !p.rubberband && 'librubberband']
       .filter(Boolean)
-      .join(' and ')}: no maintained static arm64 build with them was found. ` +
-      'In the packaged app, Classical Upsample, Super-Res and High-Quality SRC (libsoxr) and ' +
+      .join(' and ')}. scripts/build-ffmpeg-macos.sh build makes one that has both. ` +
+      'Without it, Classical Upsample, Super-Res and High-Quality SRC (libsoxr) and ' +
       "Chimera's rubberband stretch need a Homebrew ffmpeg (brew install ffmpeg), which the backend prefers when present.",
   )
 }
