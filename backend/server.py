@@ -42,6 +42,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
+from backend.admin_routes import SHUTDOWN_HANDLERS_STATE
 from backend.admin_routes import router as admin_router
 from backend.lib.audio_io import load_audio, load_audio_array, save_audio, save_subtype
 from backend.assistant_routes import mcp_relay_router
@@ -66,11 +67,17 @@ logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
-async def _lifespan(_: FastAPI):
+async def _lifespan(app_: FastAPI):
     """FastAPI lifespan (replaces the deprecated on_event hooks). The startup
     and shutdown bodies live in `_on_startup` / `_on_shutdown` below; globals
-    resolve at call time, so their later definition is fine."""
+    resolve at call time, so their later definition is fine.
+
+    `_on_shutdown` is also published on `app.state` for POST
+    /api/admin/shutdown and /restart: they end the process with os._exit, which
+    never reaches the code after `yield`, so they run the same handlers first
+    (backend/admin_routes.py)."""
     await _on_startup()
+    setattr(app_.state, SHUTDOWN_HANDLERS_STATE, _on_shutdown)
     yield
     await _on_shutdown()
 
