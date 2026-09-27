@@ -123,9 +123,11 @@ class OtherBridge:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
         )
         self._lines: queue.Queue[str] = queue.Queue()
-        threading.Thread(target=self._pump, daemon=True).start()
+        self._pump_thread = threading.Thread(target=self._pump, daemon=True)
+        self._pump_thread.start()
         port_text, pid_text = self._lines.get(timeout=20).split()
         self.port = int(port_text)
         # The process that owns the socket reports its own pid: on Windows a
@@ -144,13 +146,18 @@ class OtherBridge:
             return None
 
     def close(self) -> None:
-        assert self.proc.stdin is not None
+        """Stop the process and close both pipes. The pump reads stdout to
+        its end once the process exits, so it is joined before stdout is
+        closed under it."""
+        assert self.proc.stdin is not None and self.proc.stdout is not None
         self.proc.stdin.close()
         try:
             self.proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             self.proc.kill()
             self.proc.wait(timeout=10)
+        self._pump_thread.join(timeout=10)
+        self.proc.stdout.close()
 
 
 @pytest.fixture
