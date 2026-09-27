@@ -572,6 +572,34 @@ def test_a_lan_caller_cannot_move_the_headset(headset, other_bridge, monkeypatch
     assert headset.reverse[device_port] == device_port
 
 
+def test_a_lan_caller_cannot_read_who_holds_the_headset(
+    headset, other_bridge, monkeypatch
+):
+    """Sequence: the Node bridge serves the headset; an unpaired LAN device
+    polls GET /status, then opens the bridge WebSocket. Neither may run adb for
+    it or hand it the holder's pid and process name."""
+    other = other_bridge()
+    device_port = other.port
+    _headset_dials(monkeypatch, device_port)
+    headset.reverse[device_port] = device_port
+    app = FastAPI()
+    app.include_router(questmidi_router.router, prefix="/api/questmidi")
+    with TestClient(app, client=("10.20.30.40", 50000)) as lan:
+        for _ in range(3):
+            assert lan.get("/api/questmidi/status").status_code == 403
+        assert headset.calls == [], "a LAN GET made the backend run adb"
+
+        with lan.websocket_connect("/api/questmidi/ws") as ws:
+            frame = _first_frame(ws)
+        assert frame["type"] == "status"
+        holder = frame["headset_holder"]
+        assert holder is not None and holder["port"] == device_port
+        assert holder["pid"] == 0 and holder["name"] == ""
+        # The LAN caller may not stop the bridge; stop it on the app's own loop.
+        lan.portal.call(bridge.stop)
+    assert headset.midi_reversals(device_port) == []
+
+
 def test_a_program_that_takes_the_headset_mid_session_reaches_the_open_socket(
     headset, other_bridge, client, monkeypatch
 ):
