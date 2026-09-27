@@ -86,6 +86,10 @@ class ToolSpec:
     license: str = ""
     viz: str = "spectrum"  # frontend hero visualization archetype
     flagship: bool = False
+    # Libraries the tool's FFmpeg command needs beyond a plain build, e.g.
+    # ("soxr",). build_router's manifest reports the tool unavailable, with
+    # the reason, when the resolved FFmpeg lacks one (backend/core/module_base).
+    requires: tuple[str, ...] = ()
     # handler is attached at registration time, not serialized:
     handler: Optional[Callable[..., Any]] = field(default=None, repr=False)
 
@@ -116,6 +120,7 @@ class ToolSpec:
             "viz": self.viz,
             "flagship": self.flagship,
             "implemented": self.handler is not None,
+            "requires": list(self.requires),
             "params": [p.to_dict() for p in self.params],
         }
         return d

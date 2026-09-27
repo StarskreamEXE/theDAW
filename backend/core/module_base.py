@@ -32,7 +32,7 @@ from pathlib import Path
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, Response
 
-from ..lib import ffmpeg
+from ..lib import ffmpeg, ffmpeg_tools
 from ..lib.audio_depth import ffmpeg_pcm_args, probe_depth
 from ..lib.filtergraph import FilterGraph
 from ..lib.params import ToolSpec
@@ -48,6 +48,21 @@ MIME = {
 }
 
 
+def tool_manifest(tool: ToolSpec) -> dict:
+    """``tool.to_dict()`` plus whether it can run on this machine.
+
+    ``available`` is False, with ``unavailable_reason`` naming the missing
+    library, the fix and the FFmpeg in use, when the tool requires libsoxr and
+    the resolved FFmpeg has none. It reads the resolution the startup probe
+    cached (the same one ``GET /api/health`` reports) and never probes; before
+    that probe finishes a tool reads as available."""
+    d = tool.to_dict()
+    reason = ffmpeg_tools.soxr_unavailable_reason() if "soxr" in tool.requires else None
+    d["available"] = reason is None
+    d["unavailable_reason"] = reason
+    return d
+
+
 def build_router(family: str, tools: list[ToolSpec]) -> APIRouter:
     router = APIRouter()
     by_id = {t.id: t for t in tools}
@@ -57,7 +72,7 @@ def build_router(family: str, tools: list[ToolSpec]) -> APIRouter:
         return {
             "family": family,
             "count": len(tools),
-            "tools": [t.to_dict() for t in tools],
+            "tools": [tool_manifest(t) for t in tools],
         }
 
     @router.get("/tools/{tool_id}")
@@ -65,7 +80,7 @@ def build_router(family: str, tools: list[ToolSpec]) -> APIRouter:
         tool = by_id.get(tool_id)
         if not tool:
             raise HTTPException(404, f"Unknown tool: {tool_id}")
-        return tool.to_dict()
+        return tool_manifest(tool)
 
     @router.post("/process")
     async def process(

@@ -399,6 +399,15 @@ def soxr_problem(cmd: Iterable[str], resolution: Resolution) -> Optional[str]:
     return soxr_missing_message(build.ffmpeg, resolution.checked)
 
 
+def soxr_unavailable_reason() -> Optional[str]:
+    """The soxr error for the last resolution, or None when its build has
+    libsoxr or nothing has been resolved yet. Never probes."""
+    result = _last
+    if result is None or result.build is None or result.build.soxr:
+        return None
+    return soxr_missing_message(result.build.ffmpeg, result.checked)
+
+
 def soxr_missing_message(
     ffmpeg_path: str, checked: Optional[list[tuple[str, Optional[bool]]]] = None
 ) -> str:
@@ -408,9 +417,18 @@ def soxr_missing_message(
     also = f" Also checked, none has libsoxr: {'; '.join(others)}." if others else ""
     return (
         "This FFmpeg has no libsoxr; install the full FFmpeg build "
-        "(gyan.dev full build, winget package Gyan.FFmpeg on Windows), "
-        f"then restart theDAW.{also} FFmpeg in use: {ffmpeg_path}"
+        f"({_full_build_hint()}), then restart theDAW.{also} "
+        f"FFmpeg in use: {ffmpeg_path}"
     )
+
+
+def _full_build_hint() -> str:
+    """Where the full build comes from on this platform."""
+    if sys.platform == "win32":
+        return "gyan.dev full build, winget package Gyan.FFmpeg"
+    if sys.platform == "darwin":
+        return "Homebrew's ffmpeg formula"
+    return "your distribution's ffmpeg package"
 
 
 def status() -> dict:

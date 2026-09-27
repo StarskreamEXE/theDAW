@@ -415,3 +415,79 @@ def test_health_carries_the_ffmpeg_status(resolved):
     body = asyncio.run(server.health())
     assert body["ffmpeg"]["path"] == "/opt/essentials/ffmpeg"
     assert body["ffmpeg"]["soxr"] is False
+
+
+# --------------------------------------------------------------------------- #
+#  the tools manifest
+# --------------------------------------------------------------------------- #
+
+
+def _manifest(family: str, tools) -> dict:
+    from backend.core.module_base import build_router
+
+    app = FastAPI()
+    app.include_router(build_router(family, tools), prefix=f"/api/edit/{family}")
+    client = TestClient(app)
+    return client.get(f"/api/edit/{family}/tools").json()
+
+
+def test_manifest_marks_soxr_tools_unavailable_with_the_reason(resolved):
+    from backend.modules.delivery.router import TOOLS as DELIVERY
+    from backend.modules.enhance.router import TOOLS as ENHANCE
+
+    resolved(_build("/opt/essentials/ffmpeg", soxr=False))
+    by_id = {t["id"]: t for t in _manifest("enhance", ENHANCE)["tools"]}
+    by_id |= {t["id"]: t for t in _manifest("delivery", DELIVERY)["tools"]}
+
+    for tid in ("super_res", "classical_upsample", "high_quality_src"):
+        assert by_id[tid]["requires"] == ["soxr"]
+        assert by_id[tid]["available"] is False
+        reason = by_id[tid]["unavailable_reason"]
+        assert "This FFmpeg has no libsoxr; install the full FFmpeg build" in reason
+        assert "/opt/essentials/ffmpeg" in reason
+    assert by_id["uncrush"]["available"] is True
+    assert by_id["uncrush"]["unavailable_reason"] is None
+
+
+def test_manifest_reads_available_on_a_soxr_build_and_before_any_probe(
+    resolved, monkeypatch: pytest.MonkeyPatch
+):
+    from backend.modules.enhance.router import TOOLS as ENHANCE
+
+    resolved(_build("/opt/full/ffmpeg", soxr=True))
+    assert all(t["available"] for t in _manifest("enhance", ENHANCE)["tools"])
+
+    monkeypatch.setattr(ffmpeg_tools, "_last", None)
+    monkeypatch.setattr(ffmpeg_tools, "_resolution", None)
+    monkeypatch.setattr(
+        ffmpeg_tools,
+        "resolve",
+        lambda force=False: pytest.fail("the manifest must never probe"),
+    )
+    assert all(t["available"] for t in _manifest("enhance", ENHANCE)["tools"])
+
+
+def test_every_tool_whose_ffmpeg_command_uses_soxr_declares_it():
+    """A new soxr tool that forgets ``requires`` would read as available on a
+    build that cannot run it."""
+    import inspect
+
+    from backend.modules.creative_fx.router import TOOLS as CREATIVE_FX
+    from backend.modules.creative_neural.router import TOOLS as CREATIVE_NEURAL
+    from backend.modules.delivery.router import TOOLS as DELIVERY
+    from backend.modules.enhance.router import TOOLS as ENHANCE
+    from backend.modules.mastering.router import TOOLS as MASTERING
+    from backend.modules.restoration.router import TOOLS as RESTORATION
+
+    for tool in [
+        *CREATIVE_FX,
+        *CREATIVE_NEURAL,
+        *DELIVERY,
+        *ENHANCE,
+        *MASTERING,
+        *RESTORATION,
+    ]:
+        if tool.handler is None:
+            continue
+        uses_soxr = ffmpeg_tools.SOXR_MARKER in inspect.getsource(tool.handler)
+        assert uses_soxr == ("soxr" in tool.requires), tool.id
