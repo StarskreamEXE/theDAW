@@ -40,8 +40,8 @@ const toolsDir = resolve(__dirname, '..', 'resources', 'tools')
 // Pinned uv release. SYNC RULE: bump this deliberately after checking
 // https://github.com/astral-sh/uv/releases — never float a 'latest' URL here,
 // because an unpinned fetch makes two builds of the same commit differ.
-// 0.11.26 was the latest stable release when this pin was written (2026-07).
-const UV_VERSION = '0.11.26'
+// 0.12.19 was the latest stable release when this pin was written (2026-09).
+const UV_VERSION = '0.12.19'
 
 function uvUrl() {
   const base = `https://github.com/astral-sh/uv/releases/download/${UV_VERSION}`
@@ -56,9 +56,10 @@ function uvUrl() {
 
 // Pinned Node.js runtime — used to run the bundled VST Foundry fullstack
 // server (node dist/server.cjs). SYNC RULE: bump deliberately after checking
-// https://nodejs.org/dist/ for the latest v22 LTS; never float 'latest'.
-// 22.23.1 was the latest v22 LTS when this pin was written (2026-07).
-const NODE_VERSION = '22.23.1'
+// https://nodejs.org/dist/ for the latest Active LTS (frontend/.nvmrc carries the
+// same version); never float 'latest'.
+// 24.21.0 was the latest Active LTS when this pin was written (2026-09).
+const NODE_VERSION = '24.21.0'
 
 function nodeUrl() {
   const base = `https://nodejs.org/dist/v${NODE_VERSION}`
@@ -72,19 +73,20 @@ function nodeUrl() {
 // Windows FFmpeg comes from gyan.dev exactly as before (matching
 // install/setup.ps1). macOS FFmpeg + ffprobe come from Martin Riedl's static
 // build server (https://ffmpeg.martin-riedl.de), pinned to the immutable
-// versioned 8.1.1 release paths per arch. The server's
+// versioned 9.0.2 release paths per arch. The server's
 // /redirect/latest/macos/arm64/release/ convenience endpoint returned 404 when
-// this was written (2026-07) while the versioned paths below were verified
-// reachable, so the pin doubles as the reliability fix.
+// this pin was first written (2026-07) while the versioned paths were
+// reachable, so the pin doubles as the reliability fix. The 9.0.2 paths below
+// were checked reachable on 2026-09-27.
 const FFMPEG_WIN_URL = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
 const FFMPEG_MAC_URLS = {
   arm64: {
-    ffmpeg: 'https://ffmpeg.martin-riedl.de/download/macos/arm64/1778761665_8.1.1/ffmpeg.zip',
-    ffprobe: 'https://ffmpeg.martin-riedl.de/download/macos/arm64/1778761665_8.1.1/ffprobe.zip',
+    ffmpeg: 'https://ffmpeg.martin-riedl.de/download/macos/arm64/1789931890_9.0.2/ffmpeg.zip',
+    ffprobe: 'https://ffmpeg.martin-riedl.de/download/macos/arm64/1789931890_9.0.2/ffprobe.zip',
   },
   x64: {
-    ffmpeg: 'https://ffmpeg.martin-riedl.de/download/macos/amd64/1778768838_8.1.1/ffmpeg.zip',
-    ffprobe: 'https://ffmpeg.martin-riedl.de/download/macos/amd64/1778768838_8.1.1/ffprobe.zip',
+    ffmpeg: 'https://ffmpeg.martin-riedl.de/download/macos/amd64/1789931006_9.0.2/ffmpeg.zip',
+    ffprobe: 'https://ffmpeg.martin-riedl.de/download/macos/amd64/1789931006_9.0.2/ffprobe.zip',
   },
 }
 

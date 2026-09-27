@@ -32,8 +32,9 @@ concurrency:
 env:
   # uv is installed with pipx, the same first-party-only pattern lint.yml
   # uses for ruff. Pinned so a uv release can never quietly change what CI
-  # resolves out of uv.lock. Bump deliberately.
-  UV_VERSION: "0.9.5"
+  # resolves out of uv.lock. Bump deliberately, together with build-vst-host.yml,
+  # the Dockerfile's ghcr.io/astral-sh/uv tag and fetch-runtime-tools.mjs.
+  UV_VERSION: "0.12.19"
 
 jobs:
   # uv.lock must install on every platform theDAW ships to, not only on this
@@ -46,8 +47,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version-file: .python-version
       - name: Install uv
@@ -69,7 +70,7 @@ jobs:
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # ffmpeg/ffprobe back the analysis probe, the chimera mashup endpoint
       # and the library video-thumbnail tests. Every one of those tests skips
@@ -84,7 +85,7 @@ jobs:
       # .python-version is the repo's interpreter pin (3.12). Reading it here
       # means this job can never drift from what developers and theDAW.bat
       # use, and it gives pipx an interpreter to install uv against.
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version-file: .python-version
 
@@ -148,8 +149,8 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           # frontend/.nvmrc is the single source of truth for the Node
           # version, so this job cannot drift from a developer's shell.
@@ -169,8 +170,8 @@ jobs:
       # executed them.
       - name: Frontend tests
         run: npm test
-      # electron-ui has no test runner of its own; its three suites cover code that
-      # ships (download naming, the LAN HTTPS helper, VST-host staging) and run
-      # on this job's toolchain.
+      # electron-ui has no test runner of its own; its four suites cover code that
+      # ships (download naming, the dialog start folder, the LAN HTTPS helper,
+      # VST-host staging) and run on this job's toolchain.
       - name: Electron shell tests
         run: npm run test:electron
