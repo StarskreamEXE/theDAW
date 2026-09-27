@@ -3,6 +3,8 @@ import { WHEEL_PROFILES } from '../../lib/timeline/viewport';
 import {
   CLIP_EDGE_ZONE_PX,
   MIN_CONTENT_WIDTH_PX,
+  RULER_BAR_LABEL_MIN_PX,
+  RULER_TIME_LABEL_MIN_PX,
   ZOOM_FOLLOW_HOLD_MS,
   clipChromeLayout,
   createZoomCoalescer,
@@ -231,11 +233,11 @@ const near = (a: number, b: number, eps = 1e-9) => assert.ok(Math.abs(a - b) <= 
 
 // --- Ruler bar numbers -------------------------------------------------------
 {
-  // 120 bpm, 4/4: a bar is 2 s. At 12 px/s bars are 24 px apart: labelled.
-  const labels = rulerBarLabels({ startSec: 0, endSec: 7, bpm: 120, zoom: 12 });
+  // 120 bpm, 4/4: a bar is 2 s. At 18 px/s bars are 36 px apart: labelled.
+  const labels = rulerBarLabels({ startSec: 0, endSec: 7, bpm: 120, zoom: 18 });
   assert.deepEqual(labels, [{ bar: 1, sec: 0 }, { bar: 2, sec: 2 }, { bar: 3, sec: 4 }, { bar: 4, sec: 6 }]);
-  // 11 px/s: 22 px apart, too dense: none.
-  assert.deepEqual(rulerBarLabels({ startSec: 0, endSec: 7, bpm: 120, zoom: 11 }), []);
+  // 17 px/s: 34 px apart, too dense for bold 12 px numbers: none.
+  assert.deepEqual(rulerBarLabels({ startSec: 0, endSec: 7, bpm: 120, zoom: 17 }), []);
   // Windowed: starts at the first bar inside the window.
   assert.deepEqual(rulerBarLabels({ startSec: 3, endSec: 6, bpm: 120, zoom: 50 }), [{ bar: 3, sec: 4 }, { bar: 4, sec: 6 }]);
   assert.throws(() => rulerBarLabels({ startSec: 0, endSec: 1, bpm: NaN, zoom: 10 }), RangeError);
@@ -248,9 +250,10 @@ const near = (a: number, b: number, eps = 1e-9) => assert.ok(Math.abs(a - b) <= 
   // step no matter what (15 px apart, below any legible width); the fixed
   // step must widen until labels are readable.
   const farOut = rulerTimeTicks({ startSec: 0, endSec: 300, zoom: 1.51 });
-  for (const t of farOut) assert.ok(t.sec === 0 || t.sec * 1.51 >= 50, `${t.sec}s at 1.51px/s is ${t.sec * 1.51}px from 0, below 50px`);
+  const minPx = RULER_TIME_LABEL_MIN_PX;
+  for (const t of farOut) assert.ok(t.sec === 0 || t.sec * 1.51 >= minPx, `${t.sec}s at 1.51px/s is ${t.sec * 1.51}px from 0, below ${minPx}px`);
   for (let i = 1; i < farOut.length; i++) {
-    assert.ok((farOut[i].sec - farOut[i - 1].sec) * 1.51 >= 50 - 1e-9, 'consecutive ticks must be >= minPx apart');
+    assert.ok((farOut[i].sec - farOut[i - 1].sec) * 1.51 >= minPx - 1e-9, 'consecutive ticks must be >= minPx apart');
   }
   assert.deepEqual(farOut.map((t) => t.sec), [0, 60, 120, 180, 240, 300]);
 
@@ -274,12 +277,50 @@ const near = (a: number, b: number, eps = 1e-9) => assert.ok(Math.abs(a - b) <= 
   const veryFarOut = rulerTimeTicks({ startSec: 0, endSec: 14400, zoom: 0.02 });
   assert.ok(veryFarOut.length >= 2, 'must still produce ticks for a long session at extreme zoom-out');
   for (let i = 1; i < veryFarOut.length; i++) {
-    assert.ok((veryFarOut[i].sec - veryFarOut[i - 1].sec) * 0.02 >= 50 - 1e-9);
+    assert.ok((veryFarOut[i].sec - veryFarOut[i - 1].sec) * 0.02 >= RULER_TIME_LABEL_MIN_PX - 1e-9);
   }
 
   assert.deepEqual(rulerTimeTicks({ startSec: 5, endSec: 1, zoom: 10 }), []);
   assert.throws(() => rulerTimeTicks({ startSec: 0, endSec: 1, zoom: 0 }), RangeError);
   assert.throws(() => rulerTimeTicks({ startSec: 0, endSec: 1, zoom: NaN }), RangeError);
+}
+
+// --- Ruler labels at their real size: bold 12 px, never touching ------------
+{
+  // The ruler draws its labels in bold 12 px sans (WaveformEditor.tsx). A
+  // tabular digit there is at most ~7.2 px, a colon ~3.5 px, and a time label
+  // starts 4 px past its tick. Sweep the whole zoom range the way a user
+  // zooms out from the deepest zoom, over a 2 h session, and check every pair
+  // of neighbours on screen keeps a gap. Before, the spacing was chosen for
+  // 8 px mono text: at 12 px, bar numbers from 100 up touched at 24 px apart.
+  const DIGIT_PX = 7.2;
+  const COLON_PX = 3.5;
+  const GAP_PX = 6;
+  const timeLabel = (sec: number) => `${Math.floor(sec / 60).toString().padStart(2, '0')}:${Math.floor(sec % 60).toString().padStart(2, '0')}`;
+  const labelPx = (text: string) => [...text].reduce((w, ch) => w + (ch === ':' ? COLON_PX : DIGIT_PX), 0);
+  const sessionSec = 2 * 3600;
+  for (let zoom = 400; zoom >= 0.25; zoom /= 1.25) {
+    // Look at two screens around 1:50:00, where labels are widest.
+    const startSec = Math.max(0, 6600 - 1920 / zoom);
+    const endSec = Math.min(sessionSec, 6600 + 1920 / zoom);
+    const ticks = rulerTimeTicks({ startSec, endSec, zoom });
+    for (let i = 1; i < ticks.length; i++) {
+      const prevRight = ticks[i - 1].sec * zoom + 4 + labelPx(timeLabel(ticks[i - 1].sec));
+      assert.ok(
+        ticks[i].sec * zoom - prevRight >= GAP_PX,
+        `time labels ${timeLabel(ticks[i - 1].sec)} and ${timeLabel(ticks[i].sec)} at ${zoom.toFixed(2)} px/s leave ${(ticks[i].sec * zoom - prevRight).toFixed(1)} px`,
+      );
+    }
+    const bars = rulerBarLabels({ startSec, endSec, bpm: 174, zoom });
+    for (let i = 1; i < bars.length; i++) {
+      const prevRight = bars[i - 1].sec * zoom + 2 + labelPx(String(bars[i - 1].bar));
+      assert.ok(
+        bars[i].sec * zoom - prevRight >= 4,
+        `bar numbers ${bars[i - 1].bar} and ${bars[i].bar} at ${zoom.toFixed(2)} px/s overlap`,
+      );
+    }
+  }
+  assert.ok(RULER_BAR_LABEL_MIN_PX >= 2 + 4 * DIGIT_PX + 4, 'a four-digit bar number fits between bar lines');
 }
 
 // --- Clip chrome: header inside the visible part, off the resize zones -------

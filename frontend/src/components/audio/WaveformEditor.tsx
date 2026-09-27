@@ -13,6 +13,7 @@ import { addBlobsToChimera } from '../../lib/chimeraClient';
 import { stripSourceId } from '../../lib/displayName';
 import { SlideTrack } from './SlideTrack';
 import { SemanticWave } from './SemanticWave';
+import { WaveformModeToggle } from './WaveformModeControl';
 import { MetamorphPanel } from './MetamorphPanel';
 import { useMorphStore } from '../../state/morphEngine';
 import { useMetamorphPanelRequest } from '../../state/metamorphPanelRequestStore';
@@ -1277,6 +1278,10 @@ const TrackInputMeter: React.FC<{ trackId: string; trackName: string }> = ({ tra
  * The DJ decks (a different surface, a different job: cueing one track at a
  * time, not comparing levels across an arrangement) keep `SemanticWave`'s
  * own default of `true`.
+ *
+ * `showModeToggle={false}`: the clip body carries the trim handles, the fade
+ * grips and the inpaint drag target, and a narrow clip is all body. The
+ * colour mode toggle lives in the EDIT toolbar instead.
  */
 const ClipWave: React.FC<{ clip: AudioClip; height: number; selected: boolean }> = ({ clip, height, selected }) => {
   // One object URL per source Blob, acquired inside the effect that releases
@@ -1303,7 +1308,7 @@ const ClipWave: React.FC<{ clip: AudioClip; height: number; selected: boolean }>
   return (
     <div className="h-full w-full" style={{ opacity: selected ? 1 : 0.85 }}>
       {url && (
-        <SemanticWave audioUrl={url} height={height} viewportStart={viewportStart} viewportEnd={Math.max(viewportStart + 1e-4, viewportEnd)} transparentBg normalize={false} />
+        <SemanticWave audioUrl={url} height={height} viewportStart={viewportStart} viewportEnd={Math.max(viewportStart + 1e-4, viewportEnd)} transparentBg normalize={false} showModeToggle={false} />
       )}
     </div>
   );
@@ -6261,6 +6266,10 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             >
               <BoxSelect className="w-3 h-3" />
             </button>
+            {/* The waveform colour mode for every clip (and every waveform in
+                the app); a button inside each clip covered its trim handle
+                and fade grip. */}
+            <WaveformModeToggle variant="toolbar" />
             <button
               onClick={() => setShowShortcuts(true)}
               aria-label="Keyboard shortcuts"
@@ -7284,15 +7293,17 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             {renderRuler.map((tick) => (
               <div
                 key={tick.sec}
-                className="absolute top-0 bottom-0 flex items-center px-1 border-l border-white/5 pointer-events-none"
+                className="absolute top-0 bottom-0 flex items-end pb-0.5 px-1 border-l border-white/5 pointer-events-none"
                 style={{ left: tick.sec * zoom }}
               >
-                <span className={`text-[8px] font-mono ${tick.major ? 'text-zinc-500' : 'text-zinc-700'}`}>
+                {/* Bold 12 px sans in the ruler's lower half; bar numbers take
+                    the upper half. RULER_TIME_LABEL_MIN_PX is sized for it. */}
+                <span className={`font-sans text-xs font-bold leading-none tabular-nums ${tick.major ? 'text-zinc-300' : 'text-zinc-500'}`}>
                   {formatTimecode(tick.sec).replace(/\.00$/, '')}
                 </span>
               </div>
             ))}
-            {/* Bar numbers (F05) at bar lines, once bars are >= 24 px apart. */}
+            {/* Bar numbers (F05) at bar lines, once bars are RULER_BAR_LABEL_MIN_PX apart. */}
             {barLabels.map((b) => (
               <div
                 key={`bar-${b.bar}`}
@@ -7300,7 +7311,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                 className="absolute top-0 h-2.5 border-l border-purple-300/40 pointer-events-none"
                 style={{ left: b.sec * zoom }}
               >
-                <span className="absolute top-0 left-0.5 text-[8px] font-mono leading-none text-purple-300/80">{b.bar}</span>
+                <span className="absolute top-0 left-0.5 font-sans text-xs font-bold leading-none tabular-nums text-purple-300">{b.bar}</span>
               </div>
             ))}
             {/* Loop region (shift-drag the ruler to set; LOOP toggles it) */}
@@ -7318,7 +7329,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                 className="absolute top-0 bottom-0 z-10 pointer-events-none bg-sky-400/30 border-x border-sky-300"
                 style={{ left: timeSelection.startSec * zoom, width: (timeSelection.endSec - timeSelection.startSec) * zoom }}
               >
-                <span className="absolute top-0.5 left-1 text-[8px] font-mono text-sky-100 leading-none whitespace-nowrap">
+                <span className="absolute top-0 left-1 font-sans text-xs font-bold text-sky-100 leading-none whitespace-nowrap tabular-nums">
                   {formatRangeReadout(timeSelection)}
                 </span>
               </div>

@@ -28,10 +28,15 @@ export const ZOOM_STEP_FACTOR = 1.25;
 export const FIT_MARGIN_FRAC = 0.05;
 /** Width (local px) of each clip's resize-handle zone the header must leave free. */
 export const CLIP_EDGE_ZONE_PX = 6;
-/** Bar numbers show on the ruler once bars are at least this far apart (local px). */
-export const RULER_BAR_LABEL_MIN_PX = 24;
-/** Time labels (mm:ss) never render closer together than this (local px). */
-export const RULER_TIME_LABEL_MIN_PX = 50;
+/** Bar numbers show on the ruler once bars are at least this far apart (local
+ *  px). Sized for the ruler's bold 12 px numbers: a four-digit bar number is
+ *  about 29 px wide, and at the old 24 px three digits already touched. */
+export const RULER_BAR_LABEL_MIN_PX = 36;
+/** Time labels (mm:ss) never render closer together than this (local px).
+ *  Sized for the ruler's bold 12 px labels: "mm:ss" is about 32 px plus 4 px
+ *  of padding, "mmm:ss" past 100 minutes about 39 px, so neighbours keep a
+ *  gap of at least a dozen px. */
+export const RULER_TIME_LABEL_MIN_PX = 56;
 /** Follow-playhead paging holds off this long (ms) after the last zoom. */
 export const ZOOM_FOLLOW_HOLD_MS = 400;
 /**
