@@ -10,6 +10,11 @@ Two setup bugs, reported 2026-09-22, both reproduced here with the real tools:
   SDK 10.0.19041 expands a macro to ``defined``, the conforming preprocessor
   reports that as C5105, and /WX made it a failed build.
 
+The VST3 layer those builds link had passed /WX only by switching warnings
+off: /wd4324 for the ring's padded indices, a C4996 pragma around a vendored
+header's strcpy, and _CRT_SECURE_NO_WARNINGS on the host. None is left, and the
+layer still has to compile clean.
+
 Windows only, and only with CMake and the Visual Studio C++ build tools
 present. Everything is built under pytest's tmp_path; ``-ConfigureOnly`` never
 compiles or copies into ``native/vst-host/bin``, and the compile step builds the
@@ -141,3 +146,72 @@ def test_the_host_keeps_the_conforming_preprocessor_and_warnings_as_errors():
     assert "/Zc:preprocessor" in text
     assert "target_compile_options(thedaw-vst-host PRIVATE /WX)" in text
     assert "/wd5105" not in text.lower()
+
+
+def _warning_switches_off() -> list[str]:
+    """Every place under native/vst-host, vendored headers aside, that turns a
+    compiler warning off instead of removing its cause."""
+    found: list[str] = []
+    for path in sorted(HOST.rglob("*")):
+        if not path.is_file() or "third_party" in path.parts:
+            continue
+        if path.suffix not in {".cpp", ".h", ".hpp", ".txt", ".cmake", ".ps1"}:
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for number, line in enumerate(text.splitlines(), 1):
+            low = line.lower()
+            if (
+                "/wd" in low
+                or "warning(disable" in low
+                or "_crt_secure_no_warnings" in low
+            ):
+                found.append(f"{path.relative_to(HOST)}:{number}: {line.strip()}")
+    return found
+
+
+def test_the_vst3_layer_compiles_at_w4_wx_with_no_warning_switched_off(tmp_path: Path):
+    """setup.ps1 builds the host with the VST3 layer ON and warnings as errors.
+    The layer built only because /wd4324 and a C4996 pragma switched two
+    warnings off; the build has to pass with neither."""
+    assert _warning_switches_off() == []
+
+    build = tmp_path / "b"
+    configured = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(HOST / "build.ps1"),
+            "-ConfigureOnly",
+            "-Vst3",
+            "ON",
+            "-BuildDir",
+            str(build),
+        ],
+        capture_output=True,
+        text=True,
+        env=_env_without_generator(),
+        timeout=300,
+    )
+    assert configured.returncode == 0, configured.stdout + configured.stderr
+
+    built = subprocess.run(
+        [
+            "cmake",
+            "--build",
+            str(build),
+            "--config",
+            "Release",
+            "--parallel",
+            "--target",
+            "thedaw_vst3",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    log = built.stdout + built.stderr
+    assert built.returncode == 0, log[-4000:]
+    assert "warning C" not in log, log[-4000:]

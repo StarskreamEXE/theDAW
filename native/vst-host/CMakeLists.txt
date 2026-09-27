@@ -54,7 +54,6 @@ target_compile_definitions(thedaw-vst-host PRIVATE
     _UNICODE
     WIN32_LEAN_AND_MEAN
     NOMINMAX
-    _CRT_SECURE_NO_WARNINGS
 )
 
 if(MSVC)
