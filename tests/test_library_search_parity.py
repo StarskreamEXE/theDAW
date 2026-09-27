@@ -272,6 +272,9 @@ def test_search_finds_everything_main_found(client: TestClient, tmp_path: Path):
         by_title["Untitled 7"],
         {
             "bpm": 123.0,
+            # Every listing carries the tempo detector's confidence, so the
+            # client matcher reads it like any other analysis value.
+            "bpm_confidence": 0.231,
             "key": "F#",
             "scale": "minor",
             "genre": "ambient",
@@ -291,6 +294,7 @@ def test_search_finds_everything_main_found(client: TestClient, tmp_path: Path):
         "ambient works": {"Untitled 7"},  # an embedded album, two words
         "phex": {"Untitled 7"},  # inside a word
         "88.5": {"Harbor Nights"},  # a fractional BPM
+        "0.231": {"Untitled 7"},  # the BPM's confidence
         "bb": {"Harbor Nights"},  # a two-letter key
         "small-rf": {"Sunshine Avenue"},  # the model, punctuation and all
         "distortion": {"Sunshine Avenue"},  # the negative prompt
