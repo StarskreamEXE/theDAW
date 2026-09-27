@@ -59,7 +59,7 @@ assert.equal(useDjRhythmStore.getState().byEntry['song-1'], before, 'a read leav
 const block = readFileSync(fileURLToPath(new URL('../components/layout/RhythmBlock.tsx', import.meta.url)), 'utf8');
 assert.match(block, /\/run`, \{ method: 'POST' \}\);[\s\S]{0,300}invalidateRhythm\(entryId\);/, 'RhythmBlock invalidates after a run');
 const dj = readFileSync(fileURLToPath(new URL('../views/DJView.tsx', import.meta.url)), 'utf8');
-assert.ok(dj.includes('useEffect(() => { if (entryId && !rhythm) void ensureRhythm(entryId); }, [entryId, rhythm, ensureRhythm]);'),
-  'the deck re-asks when its entry is forgotten');
+assert.ok(dj.includes('const rhythm = useDeckRhythm(entryId);'),
+  'the deck reads its rhythm through useDeckRhythm, which re-asks on invalidation (djRhythmStore.deck.test.tsx)');
 
 console.log('rhythmSeed.invalidate: ok');

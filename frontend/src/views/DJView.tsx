@@ -64,7 +64,7 @@ import { fetchLibraryMatchCount, plainLibraryQuery } from '../lib/backendLocalPr
 import type { LibrarySortBy } from '../lib/libraryRows';
 import { useDjAnalysisStore } from '../state/djAnalysisStore';
 import { useDjCuesStore, HOTCUE_SLOTS } from '../state/djCuesStore';
-import { useDjRhythmStore } from '../state/djRhythmStore';
+import { useDeckRhythm } from '../state/djRhythmStore';
 import { seedCues as computeSeedCues } from '../lib/djCueSeed';
 import { toCamelot, keyLabel } from '../lib/camelot';
 import { buildBeatgrid } from '../lib/beatgrid';
@@ -1002,16 +1002,10 @@ function useDeck(deckId: djEngine.DeckId, entryId: string | null, hasTrack: bool
   // slots only; never on a track the user has touched), so this side can
   // stay a plain "whenever the inputs improve, offer a seed".
   const seedCuesInto = useDjCuesStore((s) => s.seedCues);
-  const ensureRhythm = useDjRhythmStore((s) => s.ensureRhythm);
-  const rhythm = useDjRhythmStore((s) => (entryId ? s.byEntry[entryId] : undefined));
+  // Cheap GET only, re-asked whenever a rhythm run elsewhere in the app calls
+  // `invalidateRhythm` for this entry. See `useDeckRhythm`.
+  const rhythm = useDeckRhythm(entryId);
   const durationSec = a?.duration_sec ?? 0;
-
-  // Cheap GET only. A cache miss is left alone — `/run` is a full re-analysis
-  // and has no business firing because a deck loaded. See djRhythmStore.
-  // Also re-asks when the entry is forgotten: a finished rhythm run elsewhere
-  // in the app calls `invalidateRhythm`, and the loaded deck picks up the new
-  // bar lines instead of waiting for its next load.
-  useEffect(() => { if (entryId && !rhythm) void ensureRhythm(entryId); }, [entryId, rhythm, ensureRhythm]);
 
   useEffect(() => {
     if (!entryId) return;
