@@ -71,6 +71,7 @@ exercise the identity check without the real Lyria checkout.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import http.server
 import io
 import json
@@ -92,11 +93,26 @@ from backend.modules.lyria import sidecar
 
 
 @pytest.fixture(autouse=True)
-def _reset_sidecar_module_state():
+def _reset_sidecar_module_state(tmp_path, monkeypatch):
     """The sidecar tracks its child process/URL/stop-request in module
     globals, which persist across tests in the same process. Reset them
     around every test so one test's fake spawned process can't leak into the
-    next test's "is anything running" checks."""
+    next test's "is anything running" checks.
+
+    Every file the sidecar writes is moved under tmp_path too: the key file
+    and its copy (probe() reads them, and a read writes back what another
+    build changed), the pending-install record, and the sidecar log a spawn
+    appends to. No test writes into the checkout's data/."""
+    monkeypatch.setattr(sidecar, "_KEY_FILE", tmp_path / "lyria_gemini_key.json")
+    monkeypatch.setattr(
+        sidecar, "_KEY_FILE_BACKUP", tmp_path / "lyria_gemini_key.json.bak"
+    )
+    monkeypatch.setattr(
+        sidecar, "_DEPS_PENDING_FILE", tmp_path / "lyria_deps_pending.json"
+    )
+    monkeypatch.setattr(
+        sidecar, "SIDECAR_LOG_PATH", tmp_path / "logs" / "lyria-sidecar.log"
+    )
     sidecar._proc = None
     sidecar._resolved_url = None
     sidecar._stop_requested = False
@@ -1716,6 +1732,253 @@ def test_gemini_keys_main_deleted_stay_deleted_when_main_saves_a_new_one(
     sidecar.add_key("openrouter", "this-o2")
     assert main.gemini_key() == ("fresh", "file")
     assert sidecar.stored_keys("gemini") == ["fresh"]
+
+
+def _build_8039b45(path, monkeypatch) -> object:
+    """8039b45's own Lyria sidecar module (a verbatim copy in
+    tests/fixtures/pr207_8039b45), its key file pointed at ``path``: the first
+    multi-key build, which writes the whole per-provider store over the key
+    file in place, without ``key`` or ``share_pool``."""
+    import importlib.util
+    from pathlib import Path
+
+    source = Path(__file__).parent / "fixtures" / "pr207_8039b45" / "lyria_sidecar.py"
+    spec = importlib.util.spec_from_file_location("lyria_sidecar_8039b45", source)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    module._KEY_FILE = path
+    module._KEY_FILE_BACKUP = path.with_name(path.name + ".8039b45.bak")
+    return module
+
+
+@pytest.fixture
+def builds(lyria_keys, monkeypatch):
+    """The three builds that write data/lyria_gemini_key.json, all pointed at
+    one key file: main (851f6a0), 8039b45, and this build (``sidecar``)."""
+    return SimpleNamespace(
+        main=_main_build(lyria_keys.path, monkeypatch),
+        old=_build_8039b45(lyria_keys.path, monkeypatch),
+        path=lyria_keys.path,
+        copy=lyria_keys.path.with_name("lyria_provider_keys.json"),
+    )
+
+
+def _this_build_state() -> dict:
+    return {
+        "gemini": sidecar.stored_keys("gemini"),
+        "openrouter": sidecar.stored_keys("openrouter"),
+        "preference": sidecar.provider_preference(),
+        "share": sidecar.pool_shared(),
+    }
+
+
+def _assert_every_build_agrees(builds) -> None:
+    """After this build has read the files: main finds the first Gemini key,
+    8039b45 finds every list and the preference, and the copy's record
+    matches the key file, so the next read is this build's own write."""
+    state = _this_build_state()
+    first = state["gemini"][0] if state["gemini"] else None
+    assert builds.main.gemini_key() == ((first, "file") if first else (None, "none"))
+    for provider in ("gemini", "openrouter"):
+        assert builds.old.stored_keys(provider) == state[provider], provider
+    assert builds.old.provider_preference() == state["preference"]
+    copy = json.loads(builds.copy.read_text(encoding="utf-8"))
+    digest = hashlib.sha256(builds.path.read_bytes()).hexdigest()
+    assert copy["key_file"]["sha256"] == digest
+
+
+def _this_build_saves_everything() -> None:
+    sidecar.add_key("gemini", "this-g1")
+    sidecar.add_key("gemini", "this-g2")
+    sidecar.add_key("openrouter", "this-o1")
+    sidecar.set_provider_preference("openrouter")
+    sidecar.set_pool_shared(True)
+
+
+def test_main_deletes_then_saves_without_this_build_opening_between(builds):
+    """This build -> main DELETE -> main POST -> this build. main unlinked the
+    file and wrote a fresh one; this build never saw the missing file. The
+    fresh file has a new identity, which only a delete produces, so the
+    deleted Gemini keys stay deleted and everything else stays."""
+    _this_build_saves_everything()
+
+    assert builds.main.clear_gemini_key() is True
+    builds.main.set_gemini_key("fresh")
+
+    assert _this_build_state() == {
+        "gemini": ["fresh"],
+        "openrouter": ["this-o1"],
+        "preference": "openrouter",
+        "share": True,
+    }
+    _assert_every_build_agrees(builds)
+
+
+def test_main_saves_twice_without_this_build_opening_between(builds):
+    """This build -> main POST x2 -> this build. main's second key replaced
+    its first, as it does in main; the keys main never saw stay behind it."""
+    _this_build_saves_everything()
+
+    builds.main.set_gemini_key("main-x")
+    builds.main.set_gemini_key("main-y")
+
+    assert _this_build_state()["gemini"] == ["main-y", "this-g1", "this-g2"]
+    assert _this_build_state()["openrouter"] == ["this-o1"]
+    _assert_every_build_agrees(builds)
+
+
+def test_main_saves_and_this_build_reading_hands_8039b45_every_list(builds):
+    """This build -> main POST -> this build reads only (the Settings card
+    opens) -> 8039b45. The read writes main's key back into the full store,
+    so 8039b45 opens on every list instead of main's one key."""
+    _this_build_saves_everything()
+    builds.main.set_gemini_key("main-x")
+
+    assert sidecar.stored_keys("gemini") == ["main-x", "this-g1", "this-g2"]
+
+    assert builds.old.stored_keys("gemini") == ["main-x", "this-g1", "this-g2"]
+    assert builds.old.stored_keys("openrouter") == ["this-o1"]
+    assert builds.main.gemini_key() == ("main-x", "file")
+
+
+def test_8039b45_edits_after_this_build_replace_its_lists(builds):
+    """This build -> 8039b45 (removes the OpenRouter key, adds a Gemini key,
+    clears the preference) -> this build. 8039b45 read every list, so what it
+    wrote is the user's decision; the pool switch, which 8039b45 does not
+    know, stays."""
+    _this_build_saves_everything()
+
+    assert builds.old.stored_keys("openrouter") == ["this-o1"]
+    assert builds.old.remove_key("openrouter", 0) is True
+    builds.old.add_key("gemini", "old-g3")
+    builds.old.set_provider_preference(None)
+
+    assert _this_build_state() == {
+        "gemini": ["this-g1", "this-g2", "old-g3"],
+        "openrouter": [],
+        "preference": None,
+        "share": True,
+    }
+    _assert_every_build_agrees(builds)
+
+
+def test_8039b45_clearing_every_key_stays_cleared(builds):
+    _this_build_saves_everything()
+
+    builds.old.clear_gemini_key()
+    assert builds.old.remove_key("openrouter", 0) is True
+
+    assert _this_build_state()["gemini"] == []
+    assert _this_build_state()["openrouter"] == []
+    _assert_every_build_agrees(builds)
+
+
+def test_main_saves_then_8039b45_edits_before_this_build_opens(builds):
+    """This build -> main POST -> 8039b45 (adds an OpenRouter key) -> this
+    build. 8039b45 opened on main's one key, so it never saw this build's
+    other keys or its preference and could not have removed them: they stay
+    behind what 8039b45 wrote."""
+    _this_build_saves_everything()
+    builds.main.set_gemini_key("main-x")
+
+    assert builds.old.stored_keys("gemini") == ["main-x"]
+    builds.old.add_key("openrouter", "old-o5")
+
+    assert _this_build_state() == {
+        "gemini": ["main-x", "this-g1", "this-g2"],
+        "openrouter": ["old-o5", "this-o1"],
+        "preference": "openrouter",
+        "share": True,
+    }
+    _assert_every_build_agrees(builds)
+
+
+def test_main_deletes_then_8039b45_saves_before_this_build_opens(builds):
+    """This build -> main DELETE -> 8039b45 (adds an OpenRouter key to the
+    empty store it opened on) -> this build. main's delete forgets the Gemini
+    keys; the OpenRouter key this build held stays behind 8039b45's."""
+    _this_build_saves_everything()
+    assert builds.main.clear_gemini_key() is True
+
+    builds.old.add_key("openrouter", "old-o7")
+
+    assert _this_build_state() == {
+        "gemini": [],
+        "openrouter": ["old-o7", "this-o1"],
+        "preference": "openrouter",
+        "share": True,
+    }
+    _assert_every_build_agrees(builds)
+
+
+def test_8039b45_edits_then_main_saves_before_this_build_opens(builds):
+    """This build -> 8039b45 (adds a Gemini key) -> main POST -> this build.
+    main wrote its one key over 8039b45's whole store in place, so 8039b45's
+    edit exists in no file any more: this build keeps the store it last
+    wrote and puts main's key first. Nothing this build saved is lost."""
+    _this_build_saves_everything()
+    builds.old.add_key("gemini", "old-g3")
+
+    builds.main.set_gemini_key("main-x")
+
+    assert _this_build_state() == {
+        "gemini": ["main-x", "this-g1", "this-g2"],
+        "openrouter": ["this-o1"],
+        "preference": "openrouter",
+        "share": True,
+    }
+    _assert_every_build_agrees(builds)
+
+
+def test_8039b45_first_then_this_build_then_main(builds):
+    """8039b45 -> this build -> main POST -> this build, on a data folder
+    this build never wrote. 8039b45's store has no ``key``, so main found no
+    Gemini key in it; this build's first read writes it back, and main then
+    finds the first Gemini key and saves over it."""
+    builds.old.add_key("gemini", "old-g1")
+    builds.old.add_key("openrouter", "old-o1")
+    assert builds.main.gemini_key() == (None, "none")
+
+    assert sidecar.stored_keys("gemini") == ["old-g1"]
+    assert builds.main.gemini_key() == ("old-g1", "file")
+    _assert_every_build_agrees(builds)
+
+    builds.main.set_gemini_key("main-x")
+
+    assert _this_build_state()["gemini"] == ["main-x", "old-g1"]
+    assert _this_build_state()["openrouter"] == ["old-o1"]
+    _assert_every_build_agrees(builds)
+
+
+def test_main_first_then_this_build_then_8039b45_then_main_deletes(builds):
+    """main POST -> this build (adds an OpenRouter key) -> 8039b45 (adds a
+    Gemini key) -> main DELETE -> this build."""
+    builds.main.set_gemini_key("main-x")
+    sidecar.add_key("openrouter", "this-o1")
+    assert builds.old.stored_keys("gemini") == ["main-x"]
+    builds.old.add_key("gemini", "old-g2")
+    assert sidecar.stored_keys("gemini") == ["main-x", "old-g2"]
+
+    assert builds.main.clear_gemini_key() is True
+
+    assert _this_build_state()["gemini"] == []
+    assert _this_build_state()["openrouter"] == ["this-o1"]
+    _assert_every_build_agrees(builds)
+
+
+def test_a_key_file_with_no_file_index_still_reconciles(builds, monkeypatch):
+    """A filesystem that reports no file index (FAT: st_ino 0) cannot show a
+    delete-then-save, so main's fresh key goes first and the rest stay; no
+    key is lost."""
+    monkeypatch.setattr(sidecar, "_file_identity", lambda path: None)
+    _this_build_saves_everything()
+
+    assert builds.main.clear_gemini_key() is True
+    builds.main.set_gemini_key("fresh")
+
+    assert _this_build_state()["gemini"] == ["fresh", "this-g1", "this-g2"]
+    assert _this_build_state()["openrouter"] == ["this-o1"]
 
 
 class _TornWriter:

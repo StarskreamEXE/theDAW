@@ -45,6 +45,7 @@ Lifecycle:
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 import logging
@@ -163,14 +164,17 @@ _KEY_FILE_VERSION = 2
 # Copy of the pre-migration (single-Gemini) file, kept once, the first time the
 # new shape is written over the old one. ``*.bak`` is already gitignored.
 _KEY_FILE_BACKUP = _KEY_FILE.with_name(_KEY_FILE.name + ".bak")
-# Every write stores the same payload here too (_key_copy_file). main's POST
-# /api/lyria/key writes ``{"key": ...}`` over the whole key file and its
-# DELETE unlinks it, which dropped every other key, the provider choice and
-# the pool share; no build before this one knows this file, so it still holds
-# them when this build opens again (_read_store). Named in .gitignore.
+# Every write stores the same payload here too (_key_copy_file), with a record
+# of the key file it wrote. main's POST /api/lyria/key writes ``{"key": ...}``
+# over the whole key file and its DELETE unlinks it; 8039b45 writes its own
+# lists over it. No build before this one knows this file, so it still holds
+# this build's store when this build opens again, and the record tells which
+# build changed the key file since (_reconcile). Named in .gitignore, and in
+# every backup (backend/modules/backup/service.py restores both files through
+# restore_key_files).
 _KEY_COPY_NAME = "lyria_provider_keys.json"
 
-# Checkouts whose dependencies changed under them (_update_checkout moved one
+# Checkouts whose dependencies changed under them (Update moved one
 # to a commit with a different package.json / package-lock.json) and whose npm
 # install has not finished yet. Written before the move and cleared only when
 # npm install succeeds, so a failed or interrupted install is run again on the
@@ -196,8 +200,8 @@ _PROVIDER_POOLS = {
 }
 # Serializes the read-modify-write of the key file so two concurrent route
 # handlers (add + remove, say) cannot lose one another's edit. Reentrant:
-# _read_store takes it to write main's delete into the copy, and the writers
-# call _read_store while they hold it.
+# _read_store takes it to write another build's change back into both files,
+# and the writers call _read_store while they hold it.
 _key_file_lock = RLock()
 
 
@@ -464,43 +468,23 @@ def _split_keys(raw: object) -> list[str]:
     return out
 
 
-def _read_store() -> dict:
-    """The stored per-provider key lists, provider preference and pool share.
-
-    Migrates the legacy single-Gemini shape (``{"key": "..."}``) transparently
-    on read: that key becomes the FIRST Gemini entry, so the key a user
-    already saved keeps being the one tried first. _write_store keeps that
-    ``key`` field in step with the first stored Gemini key, so reading it back
-    changes nothing. When the key file has lost that shape (main wrote its
-    single key over it, or deleted it), the copy _write_store keeps beside it
-    supplies the rest. Never raises -- an unreadable or corrupt file with no
-    copy reads as "nothing stored", exactly as the single-key version did.
-    """
-    store: dict = {
+def _empty_store() -> dict:
+    return {
         "providers": {provider: [] for provider in LYRIA_PROVIDERS},
         "provider_preference": None,
         "share_pool": False,
     }
-    exists, raw = _read_key_json(_KEY_FILE)
-    _copy_exists, copy = _read_key_json(_key_copy_file())
-    per_provider = isinstance(raw, dict) and isinstance(raw.get("providers"), dict)
-    if not per_provider and isinstance(copy, dict):
-        # The key file lost the per-provider shape this build wrote next to
-        # the copy: main saved a key over it, or deleted it. The copy holds
-        # everything this build kept; main's own key, when there is one, goes
-        # first, as the single-key migration below does. A deleted file
-        # forgets every Gemini key, exactly as this build's own DELETE
-        # /api/lyria/key does, and leaves everything else; the forget is
-        # written into the copy so main's next save cannot bring them back.
-        base = copy
-        if not exists:
-            base = _forget_gemini(copy)
-            _forget_copy_gemini()
-        elif isinstance(raw, dict):
-            base = {**copy, "key": raw.get("key")}
-        else:
-            base = {**copy, "key": None}
-        raw = base
+
+
+def _store_from_payload(raw: object) -> dict:
+    """A store from one parsed key-file payload, whichever build wrote it.
+
+    Migrates the legacy single-Gemini shape (``{"key": "..."}``) on the way:
+    that key becomes the FIRST Gemini entry, so the key a user already saved
+    keeps being the one tried first. _write_store keeps that ``key`` field in
+    step with the first stored Gemini key, so reading it back changes
+    nothing."""
+    store = _empty_store()
     if not isinstance(raw, dict):
         return store
     providers = raw.get("providers")
@@ -509,12 +493,7 @@ def _read_store() -> dict:
             store["providers"][provider] = _split_keys(providers.get(provider))
     legacy = _split_keys(raw.get("key"))
     if legacy:
-        gemini = list(store["providers"]["gemini"])
-        for key in reversed(legacy):
-            if key in gemini:
-                gemini.remove(key)
-            gemini.insert(0, key)
-        store["providers"]["gemini"] = gemini
+        store["providers"]["gemini"] = _keys_first(legacy, store["providers"]["gemini"])
     preference = raw.get("provider_preference")
     if isinstance(preference, str) and preference.strip().lower() in LYRIA_PROVIDERS:
         store["provider_preference"] = preference.strip().lower()
@@ -523,45 +502,239 @@ def _read_store() -> dict:
     return store
 
 
-def _forget_gemini(payload: dict) -> dict:
-    """``payload`` with its Gemini list emptied and its ``key`` dropped."""
-    out = {**payload, "providers": {**(payload.get("providers") or {})}}
+def _keys_first(first: list[str], rest: list[str]) -> list[str]:
+    """``first`` in order, then every key of ``rest`` it does not hold."""
+    return [*first, *(key for key in rest if key not in first)]
+
+
+def _copy_store(store: dict) -> dict:
+    return {
+        "providers": {
+            provider: list(store["providers"].get(provider, []))
+            for provider in LYRIA_PROVIDERS
+        },
+        "provider_preference": store.get("provider_preference"),
+        "share_pool": store.get("share_pool") is True,
+    }
+
+
+def _forget_gemini(store: dict) -> dict:
+    """``store`` with its Gemini list emptied."""
+    out = _copy_store(store)
     out["providers"]["gemini"] = []
-    out.pop("key", None)
     return out
 
 
-def _forget_copy_gemini() -> None:
-    """Write main's delete of the key file into the copy.
+def _all_keys(store: dict) -> set[str]:
+    return {key for keys in store["providers"].values() for key in keys}
 
-    The copy keeps every Gemini key this build saved. Left as it is, main's
-    next save (``{"key": ...}`` over a fresh file) reads as main saving over
-    this build's keys, and every key the user deleted in main comes back
-    behind the new one. Nothing is written when the copy holds no Gemini key.
-    Never raises: a copy that cannot be written only costs the forget.
+
+def _union_stores(first: dict, second: dict) -> dict:
+    """Every key of both, ``first``'s ahead of ``second``'s, per provider, and
+    ``first``'s preference unless it has none. The pool switch is
+    ``first``'s; ``second``'s counts only when ``first`` holds no key and no
+    preference (an empty store has no switch worth keeping)."""
+    out = _copy_store(first)
+    for provider in LYRIA_PROVIDERS:
+        out["providers"][provider] = _keys_first(
+            first["providers"][provider], second["providers"][provider]
+        )
+    if out["provider_preference"] is None:
+        out["provider_preference"] = second.get("provider_preference")
+    if not _all_keys(first) and first.get("provider_preference") is None:
+        out["share_pool"] = second.get("share_pool") is True
+    return out
+
+
+@dataclass(frozen=True)
+class _KeyFileView:
+    """The key file as the reader found it: whether it exists, its parsed
+    JSON (None when it does not parse), the sha256 of its bytes, and its file
+    identity (volume, file index) when the filesystem has one."""
+
+    exists: bool
+    raw: object
+    digest: Optional[str]
+    identity: Optional[tuple[int, int]]
+
+
+def _file_identity(path: Path) -> Optional[tuple[int, int]]:
+    """``(st_dev, st_ino)`` of ``path``, or None when the file is missing or
+    the filesystem reports no file index (st_ino 0, as FAT does)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if not st.st_ino:
+        return None
+    return (int(st.st_dev), int(st.st_ino))
+
+
+def _view_bytes(data: Optional[bytes]) -> _KeyFileView:
+    """A view of key-file bytes that did not come from disk (a backup)."""
+    if data is None:
+        return _KeyFileView(False, None, None, None)
+    try:
+        raw: object = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raw = None
+    return _KeyFileView(True, raw, hashlib.sha256(data).hexdigest(), None)
+
+
+def _view_key_file(path: Path) -> _KeyFileView:
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return _KeyFileView(False, None, None, None)
+    except OSError:
+        return _KeyFileView(True, None, None, None)
+    view = _view_bytes(data)
+    return _KeyFileView(True, view.raw, view.digest, _file_identity(path))
+
+
+def _recorded_identity(record: object) -> Optional[tuple[int, int]]:
+    if not isinstance(record, dict):
+        return None
+    ident = record.get("id")
+    if (
+        isinstance(ident, list)
+        and len(ident) == 2
+        and all(isinstance(n, int) and not isinstance(n, bool) for n in ident)
+    ):
+        return (ident[0], ident[1])
+    return None
+
+
+def _reconcile(key_file: _KeyFileView, copy: object) -> tuple[dict, str]:
+    """The store the key file and the copy beside it describe, and how the
+    key file got the way it is.
+
+    Three builds write ``data/lyria_gemini_key.json``, each its own way:
+      * main (851f6a0 and before) writes ``{"key": ...}`` over the whole
+        file in place (``write_text``) and its DELETE unlinks the file. It
+        reads ``.get("key")`` only.
+      * 8039b45 (the first multi-key build) writes the whole per-provider
+        store in place, without ``key`` or ``share_pool``, from whatever it
+        read: every list when this build wrote last, or main's one key when
+        main did.
+      * this build writes the key file atomically (a new file each time)
+        with ``key`` repeating the first Gemini key, then the same store to
+        ``lyria_provider_keys.json`` (the copy, which neither older build
+        knows) with a record of the key file it wrote: its sha256 and its
+        file identity.
+    The record is what tells them apart. Bytes that match it are this
+    build's own last write. A missing file is main's DELETE: the Gemini
+    keys go, as this build's own DELETE /api/lyria/key does, and nothing
+    else. A file with another identity on the same volume was created again
+    after this build wrote it, which only happens after main's DELETE (main
+    and 8039b45 overwrite in place), so that DELETE is applied first.
+    Otherwise main's one key goes first and the rest stay behind it; and an
+    8039b45 store replaces the lists, unless it shares no key at all with
+    the copy -- then it was written from a file main had overwritten, never
+    saw this build's keys, and could not have removed them, so they stay
+    behind its own. Without a copy each file is read on its own terms, as
+    before the copy existed.
+
+    Kinds: ``none``, ``legacy`` and ``torn`` (nothing to reconcile, nothing
+    rewritten); ``ours``; everything else is a change another build made,
+    which _read_store writes back into both files at once."""
+    base = (
+        _store_from_payload(copy)
+        if isinstance(copy, dict) and isinstance(copy.get("providers"), dict)
+        else None
+    )
+    record = copy.get("key_file") if isinstance(copy, dict) else None
+    recorded_digest = record.get("sha256") if isinstance(record, dict) else None
+    if base is not None and key_file.exists and key_file.digest is not None:
+        if key_file.digest == recorded_digest:
+            return base, "ours"
+    raw = key_file.raw
+    if not key_file.exists:
+        if base is None:
+            return _empty_store(), "none"
+        return _forget_gemini(base), "main_deleted"
+    if not isinstance(raw, dict):
+        # A torn write (main's write_text cut short) or junk.
+        if base is None:
+            return _empty_store(), "torn"
+        return base, "torn_copy"
+    recorded_id = _recorded_identity(record)
+    recreated = (
+        recorded_id is not None
+        and key_file.identity is not None
+        and recorded_id[0] == key_file.identity[0]
+        and recorded_id[1] != key_file.identity[1]
+    )
+    if not isinstance(raw.get("providers"), dict):
+        # main's single-key shape.
+        if base is None:
+            return _store_from_payload(raw), "legacy"
+        main_keys = _split_keys(raw.get("key"))
+        store = _forget_gemini(base) if recreated else _copy_store(base)
+        store["providers"]["gemini"] = _keys_first(
+            main_keys, store["providers"]["gemini"]
+        )
+        return store, "main_resaved" if recreated else "main_saved"
+    written = _store_from_payload(raw)
+    if "share_pool" in raw:
+        # This build's own shape, but not the write the copy records (the
+        # copy predates the record, or a crash fell between the two writes):
+        # the key file is complete and is the newer of the two.
+        return written, "ours_unrecorded"
+    # 8039b45's shape. It has no pool switch, so this build's stays.
+    if base is None:
+        return written, "older_list"
+    if recreated:
+        store, kind = (
+            _union_stores(written, _forget_gemini(base)),
+            "older_list_after_delete",
+        )
+    elif (
+        _all_keys(written)
+        and _all_keys(base)
+        and not (_all_keys(written) & _all_keys(base))
+    ):
+        store, kind = _union_stores(written, base), "older_list_blind"
+    else:
+        store, kind = written, "older_list"
+    store["share_pool"] = base["share_pool"]
+    return store, kind
+
+
+# Kinds _reconcile reports that leave nothing to write back.
+_SETTLED_KINDS = frozenset({"none", "legacy", "torn", "ours"})
+
+
+def _read_store() -> dict:
+    """The stored per-provider key lists, provider preference and pool share.
+
+    Reads the key file and the copy beside it and reconciles them
+    (_reconcile). When another build changed the key file, the result is
+    written back into both files at once, so main finds the first Gemini key
+    in ``key`` again, 8039b45 finds every list, and the copy's record matches
+    the key file for the next read. Never raises -- an unreadable or corrupt
+    file with no copy reads as "nothing stored", exactly as the single-key
+    version did, and a write-back that fails is logged and tried again on
+    the next read.
     """
     with _key_file_lock:
-        if _KEY_FILE.exists():
-            return
-        _exists, copy = _read_key_json(_key_copy_file())
-        if not isinstance(copy, dict):
-            return
-        providers = copy.get("providers")
-        gemini = providers.get("gemini") if isinstance(providers, dict) else None
-        if not _split_keys(gemini) and not _split_keys(copy.get("key")):
-            return
-        try:
-            atomic_write(
-                _key_copy_file(),
-                json.dumps(_forget_gemini(copy), indent=2),
-                mode=0o600,
+        key_file = _view_key_file(_KEY_FILE)
+        _copy_exists, copy = _read_key_json(_key_copy_file())
+        store, kind = _reconcile(key_file, copy)
+        if kind not in _SETTLED_KINDS:
+            log.info(
+                "lyria.sidecar: %s was changed by another build (%s); "
+                "writing the reconciled keys back",
+                _KEY_FILE.name,
+                kind,
             )
-        except OSError as e:
-            log.warning(
-                "lyria.sidecar: could not forget deleted Gemini keys in %s: %s",
-                _KEY_COPY_NAME,
-                e,
-            )
+            try:
+                _write_store(store)
+            except OSError as e:
+                log.warning(
+                    "lyria.sidecar: could not write the reconciled keys back: %s", e
+                )
+        return store
 
 
 def _key_copy_file() -> Path:
@@ -605,12 +778,15 @@ def _write_store(store: dict) -> None:
     Every file is written with atomic_write, so a crash mid-write leaves the
     previous file whole: _read_store reads a torn file as "nothing stored",
     and the next add_key would then write that empty list over every key.
-    The same payload also goes to the copy beside the key file
-    (_key_copy_file), which no older build writes.
 
-    ``key`` repeats the first stored Gemini key in the single-key shape older
-    theDAW builds read (``json.loads(...).get("key")``), so a user who runs
-    one of those against this data dir keeps the Gemini key they saved here.
+    ``key`` repeats the first stored Gemini key in the single-key shape main
+    reads (``json.loads(...).get("key")``), so a user who runs main against
+    this data dir keeps the Gemini key they saved here. The key file goes
+    first; the copy follows with the record of what was just written (its
+    sha256 and file identity), which is how _reconcile recognises this
+    build's own write. A crash between the two leaves a key file in this
+    build's shape that the copy does not record, and _reconcile believes the
+    key file then.
     """
     if _is_legacy_file() and not _KEY_FILE_BACKUP.exists():
         try:
@@ -634,12 +810,86 @@ def _write_store(store: dict) -> None:
     }
     if providers["gemini"]:
         payload["key"] = providers["gemini"][0]
-    text = json.dumps(payload, indent=2)
-    # The copy first: a crash between the two leaves the key file as it was,
-    # still in the per-provider shape, and that file is what _read_store
-    # believes over the copy.
-    atomic_write(_key_copy_file(), text, mode=0o600)
-    atomic_write(_KEY_FILE, text, mode=0o600)
+    data = json.dumps(payload, indent=2).encode("utf-8")
+    atomic_write(_KEY_FILE, data, mode=0o600)
+    identity = _file_identity(_KEY_FILE)
+    copy = {
+        **payload,
+        "key_file": {
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "id": list(identity) if identity is not None else None,
+        },
+    }
+    atomic_write(
+        _key_copy_file(), json.dumps(copy, indent=2).encode("utf-8"), mode=0o600
+    )
+
+
+def settle_key_files() -> None:
+    """Reconcile the key file and its copy now, writing back whatever another
+    build changed. The backup export runs this first, so the archive holds a
+    key file and a copy that agree."""
+    _read_store()
+
+
+def restore_key_files(
+    key_file_bytes: Optional[bytes], copy_bytes: Optional[bytes], mode: str
+) -> bool:
+    """Bring the Lyria keys in a backup archive back. Returns True when the
+    archive held a store to restore.
+
+    The backup service hands both files here instead of writing them itself:
+    written as plain files, a main backup's ``{"key": ...}`` would sit
+    beside this build's copy, and the restored file's new identity would read
+    as main having deleted and saved it (_reconcile), forgetting every other
+    Gemini key. Here each archive is read on its own terms -- the archive's
+    copy with its key file, never this machine's file identities -- and:
+      * ``replace``: the archive's store becomes the store, except that an
+        archive holding main's single key only (a backup of main's own data
+        folder) cannot express the other keys, so its key goes first and the
+        keys held now stay behind it, as main saving that key would;
+      * ``merge``: every key held now stays first, the archive's follow.
+    Both files are then written together (_write_store). Raises OSError when
+    they cannot be written."""
+    view = _view_bytes(key_file_bytes)
+    copy: object = None
+    if copy_bytes is not None:
+        try:
+            copy = json.loads(copy_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            copy = None
+    if not view.exists and not isinstance(copy, dict):
+        return False
+    archived, kind = _reconcile(view, copy)
+    if kind in ("none", "torn"):
+        return False
+    with _key_file_lock:
+        current = _read_store()
+        if mode == "merge":
+            store = _union_stores(current, archived)
+        elif kind == "legacy":
+            store = _copy_store(current)
+            store["providers"]["gemini"] = _keys_first(
+                archived["providers"]["gemini"], current["providers"]["gemini"]
+            )
+            if store["provider_preference"] is None:
+                store["provider_preference"] = archived["provider_preference"]
+        else:
+            store = archived
+            if kind == "older_list" and not isinstance(copy, dict):
+                # A backup of 8039b45's own folder: that build has no pool
+                # switch, so the one set here stays.
+                store["share_pool"] = current["share_pool"]
+        _write_store(store)
+    log.info(
+        "lyria.sidecar: restored Lyria keys from a backup (%s, %s): gemini=%d "
+        "openrouter=%d",
+        mode,
+        kind,
+        len(store["providers"]["gemini"]),
+        len(store["providers"]["openrouter"]),
+    )
+    return True
 
 
 def stored_keys(provider: str) -> list[str]:
