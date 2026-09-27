@@ -18,10 +18,11 @@ the binary is monkeypatched.
 """
 
 import asyncio
+import importlib.util
 import json
 import sys
 import types
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import httpx
 import pytest
@@ -79,14 +80,16 @@ def frame_types(lines: list[str]) -> list[str]:
     ]
 
 
-async def engine_turn(conversation_id: str, text: str, use_user_config: bool):
+async def engine_turn(
+    conversation_id: str, text: str, use_user_config: bool, permission_mode="ask"
+):
     lines = []
     async for line in cs.stream_turn(
         conversation_id,
         prompt_ndjson_line=cs.build_user_ndjson_line(text),
         model="claude-test",
         effort="high",
-        permission_mode="ask",
+        permission_mode=permission_mode,
         port=0,
         use_user_config=use_user_config,
     ):
@@ -106,18 +109,26 @@ def stdin_user_turns(log_path: Path) -> list[str]:
 # ---------------------------------------------------------------------------
 # The switch in data/settings.json across builds
 # ---------------------------------------------------------------------------
-def _older_build_reopens(path: Path, schema_version: int) -> None:
-    """What an older build (main, schema 8; PR #207 head, schema 10) writes when
-    it opens this file.
+FIXTURES = Path(__file__).parent / "fixtures"
 
-    Its ``_merge_defaults`` copies a section it does not know VERBATIM
-    (``else: merged[section] = value``), stamps its own schema_version, and
-    ``_load`` re-persists because the version changed. So the `assistant`
-    section survives, and the schema number goes back down.
-    """
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["schema_version"] = schema_version
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+def _older_store_module(name: str):
+    """An older build's settings store, loaded from its verbatim copy."""
+    spec = importlib.util.spec_from_file_location(name, FIXTURES / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _older_build_reopens(path: Path, name: str, schema_version: int) -> None:
+    """Open the file with an older build's OWN store code (main, schema 8; PR
+    #207 head, schema 10), and save one of that build's own toggles through it
+    the way its settings page would."""
+    store = _older_store_module(name).SettingsStore(path)
+    store.patch({"stems": {"auto_on_import": True}})
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    # That build's code really ran: it stamped its own schema back on disk.
+    assert on_disk["schema_version"] == schema_version
 
 
 def test_a_file_from_main_gains_the_switch_on_and_keeps_the_users_choice(tmp_path):
@@ -145,12 +156,14 @@ def test_a_file_from_main_gains_the_switch_on_and_keeps_the_users_choice(tmp_pat
     # The user turns it off.
     store.patch({"assistant": {"use_user_claude_config": False}})
 
-    # main opens the file, then this build again: the choice survives both.
-    _older_build_reopens(path, 8)
+    # main opens and saves the file, then this build again: the choice survives.
+    _older_build_reopens(path, "settings_store_main_851f6a0", 8)
     assert SettingsStore(path).get_value("assistant", "use_user_claude_config") is False
-    _older_build_reopens(path, 10)
+    # The same through the PR #207 head.
+    _older_build_reopens(path, "settings_store_pr207_8039b45", 10)
     reopened = SettingsStore(path)
     assert reopened.get_value("assistant", "use_user_claude_config") is False
+    assert reopened.get_value("stems", "auto_on_import") is True
     assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 11
 
 
@@ -367,11 +380,117 @@ def test_the_app_setting_drives_the_session_turn_by_turn(
             assert "--strict-mcp-config" in arg_sets[1]
             assert cs.sessions["conv-app"].use_user_config is False
 
+            # The respawned child RESUMES the conversation, so it is not seeded
+            # again: the message itself must carry the setup now in force, or
+            # the model keeps believing the user's servers are loaded.
+            assert "--resume" in arg_sets[1]
+            switched = stdin_user_turns(log_path)[1]
+            assert "Provider Mode" not in switched
+            assert ar.CLAUDE_MCP_SURFACE_ISOLATED.removeprefix("- ") in switched
+            assert ar.CLAUDE_MCP_SURFACE_USER_CONFIG.removeprefix("- ") not in switched
+
             # A new conversation while it is off is seeded with the narrow line.
             third = await http.post("/api/assistant/chat", json=_chat("conv-app2", "c"))
             assert third.status_code == 200, third.text
             seeds = [t for t in stdin_user_turns(log_path) if "Provider Mode" in t]
             assert ar.CLAUDE_MCP_SURFACE_ISOLATED in seeds[-1]
             assert ar.CLAUDE_MCP_SURFACE_USER_CONFIG not in seeds[-1]
+
+    run(body)
+
+
+# ---------------------------------------------------------------------------
+# The loaded allow rules cannot outvote theDAW's permission mode
+# ---------------------------------------------------------------------------
+def _settings_file(args: list[str]) -> Path:
+    return Path(args[args.index("--settings") + 1])
+
+
+def _settings_rules(args: list[str]) -> list[str]:
+    """The ask rules in the ``--settings`` file a spawn was given."""
+    payload = json.loads(_settings_file(args).read_text(encoding="utf-8"))
+    return payload["permissions"]["ask"]
+
+
+def _self_surface_rules() -> list[str]:
+    root = cs._cli_absolute_rule_path(cs.REPO_ROOT)
+    return [f"Edit({root}/{glob})" for glob in ar.permissions.SELF_SURFACE_GLOBS]
+
+
+def test_rule_paths_use_the_clis_absolute_form():
+    windows = PureWindowsPath("G:/Users/dtruj/Dev/theDAW")
+    assert cs._cli_absolute_rule_path(windows) == "//g/Users/dtruj/Dev/theDAW"
+    posix = PurePosixPath("/home/me/theDAW")
+    assert cs._cli_absolute_rule_path(posix) == "//home/me/theDAW"
+
+
+@pytest.mark.parametrize("use_user_config", [True, False])
+def test_read_only_then_ask_then_teardown(monkeypatch, use_user_config):
+    """Read-only with allow rules loaded, then the user picks Ask, then the
+    conversation ends.
+
+    Every loaded setting source can carry allow rules (the user's
+    ~/.claude/settings.json with the switch on, this project's
+    .claude/settings*.json either way), and the CLI approves what they match
+    without asking theDAW, so decide() never saw a matched `git commit` or an
+    Edit of the assistant's own code in Read-only mode. The child now gets ask
+    rules, which the CLI checks before any allow rule."""
+    arg_sets = use_fake_cli(monkeypatch)
+
+    async def body():
+        await engine_turn("conv-ro", "one", use_user_config, permission_mode="readonly")
+        readonly = _settings_rules(arg_sets[0])
+        for tool in ("Bash", "PowerShell", "Edit", "Write", "NotebookEdit", "Agent"):
+            assert tool in readonly, tool
+        assert "mcp__*" in readonly
+        for rule in _self_surface_rules():
+            assert rule in readonly
+        readonly_file = _settings_file(arg_sets[0])
+
+        # The user switches to Ask: the respawned child keeps the self-surface
+        # rules and loses the read-only ones.
+        await engine_turn("conv-ro", "two", use_user_config, permission_mode="ask")
+        assert len(arg_sets) == 2
+        assert _settings_rules(arg_sets[1]) == _self_surface_rules()
+        ask_file = _settings_file(arg_sets[1])
+        assert ask_file != readonly_file
+
+        # Teardown removes every rules file the conversation's children got.
+        relay_id = cs.sessions["conv-ro"].relay_id
+        assert relay_id in readonly_file.name
+        await cs.teardown("conv-ro", kill=True)
+        assert not readonly_file.exists()
+        assert not ask_file.exists()
+
+    run(body)
+
+
+def test_no_rules_file_means_no_child(monkeypatch):
+    """Fail closed: a child without the rules would let allow rules approve
+    edits in Read-only mode, so an unwritable rules file fails the turn."""
+    arg_sets = use_fake_cli(monkeypatch)
+
+    def refuse(relay_id, permission_mode):
+        raise OSError("disk full")
+
+    async def body():
+        await engine_turn("conv-rules", "one", True, permission_mode="ask")
+        session = cs.sessions["conv-rules"]
+        first_proc = session.proc
+
+        monkeypatch.setattr(cs, "_permission_settings_args", refuse)
+        # A mode switch cannot respawn without its rules: the turn errors and
+        # the session stays whole on its old child, still in Ask.
+        lines = await engine_turn("conv-rules", "two", True, permission_mode="readonly")
+        assert "error" in frame_types(lines)
+        assert len(arg_sets) == 1
+        assert session.proc is first_proc
+        assert session.permission_mode == "ask"
+
+        # A brand-new conversation gets no child at all.
+        lines = await engine_turn("conv-rules-2", "one", True)
+        assert "error" in frame_types(lines)
+        assert len(arg_sets) == 1
+        assert "conv-rules-2" not in cs.sessions
 
     run(body)

@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
 from backend.lib.launch_token import child_env
+from backend.modules.assistant import permissions
 
 logger = logging.getLogger(__name__)
 
@@ -371,8 +372,11 @@ def build_base_args(
       in-app Claude always loaded before this engine: the user's
       ``~/.claude/settings.json``, ``~/.claude/CLAUDE.md`` and rules, and their
       skills, commands and agents all come with it. The user's own allow rules
-      then approve the commands they match without asking theDAW, exactly as
-      they do in the user's terminal.
+      then approve the commands they match without asking theDAW, as they do
+      in the user's terminal, except where ``permission_rules`` (passed with
+      ``--settings`` in both setups) sends a call to decide() first: every
+      edit, command, sub-agent and MCP tool in Read-only mode, and every edit
+      of the assistant's own code.
     * ``False`` -> ``project,local``. The CLI applies USER-level settings BEFORE
       it consults the host permission prompt. On the machine this was proven
       on, the user settings set ``permissions.defaultMode = "bypassPermissions"``
@@ -539,6 +543,87 @@ def _mcp_config_args(
     fallback = write_empty_mcp_config(relay_id)
     args = ["--mcp-config", fallback] if fallback else []
     return [*args, "--strict-mcp-config"], False
+
+
+# ---------------------------------------------------------------------------
+# Permission rules every child is spawned with (``--settings``)
+# ---------------------------------------------------------------------------
+# decide() (permissions.py) only ever sees a tool call the CLI turns into a
+# control_request, and the CLI approves a call an ALLOW rule matches before it
+# asks anyone. Any loaded setting source can carry allow rules: the user's
+# ~/.claude/settings.json when the session uses the user's own setup, and this
+# project's .claude/settings*.json in either setup. The CLI checks deny, then
+# ask, then allow, and an ask rule from any source beats an allow rule from any
+# other, so these ask rules send the calls theDAW must govern to decide() no
+# matter what the loaded allow rules say.
+
+
+# The edit, shell and sub-agent tools (permissions.EDIT_TOOLS, SHELL_TOOLS,
+# AGENT_TOOLS) under the names the installed CLI has (2.1.283's tools
+# reference). permissions.py also knows `MultiEdit` and `Task`, older names
+# this CLI no longer has; an `Edit` rule already covers every file-writing tool.
+READONLY_ASK_TOOLS = ("Agent", "Bash", "Edit", "NotebookEdit", "PowerShell", "Write")
+
+
+def _cli_absolute_rule_path(path: Path) -> str:
+    """``path`` in the CLI's absolute rule form: ``//`` plus its POSIX spelling,
+    with a Windows drive written the way the CLI normalises it before matching
+    (``G:\\Users\\x`` -> ``//g/Users/x``)."""
+    posix = path.as_posix()
+    if re.match(r"^[A-Za-z]:/", posix):
+        posix = f"/{posix[0].lower()}{posix[2:]}"
+    return "/" + posix
+
+
+def permission_rules(permission_mode: str, repo_root: Path = REPO_ROOT) -> dict:
+    """
+    The ``--settings`` payload for a child in ``permission_mode``.
+
+    * Every mode: an ``Edit`` ask rule per ``permissions.SELF_SURFACE_GLOBS``
+      entry (an ``Edit(path)`` rule governs every built-in tool that writes
+      files), so a write to the assistant's own surface always reaches
+      decide(), which asks the user.
+    * ``readonly``: also a bare ask rule for every edit, shell and sub-agent
+      tool, and ``mcp__*`` for every MCP tool, so each one reaches decide(),
+      which refuses all but reads.
+
+    Paths are absolute (``//...``): a ``/path`` rule anchors at a place that
+    depends on where the CLI thinks the rule came from.
+    """
+    root = _cli_absolute_rule_path(repo_root)
+    ask = [f"Edit({root}/{glob})" for glob in permissions.SELF_SURFACE_GLOBS]
+    if permission_mode == "readonly":
+        ask += [*READONLY_ASK_TOOLS, "mcp__*"]
+    return {"permissions": {"ask": ask}}
+
+
+def _permission_settings_path(relay_id: str, permission_mode: str) -> Path:
+    """Per-relay, per-mode file, so a respawn into another mode never rewrites
+    the file the outgoing child loaded, and teardown can find every one."""
+    mode = permission_mode if permission_mode in CLI_PERMISSION_MODES else "other"
+    return Path(tempfile.gettempdir()) / f"thedaw-permissions-{relay_id}-{mode}.json"
+
+
+def _permission_settings_args(relay_id: str, permission_mode: str) -> list[str]:
+    """
+    Write this child's permission rules and return ``["--settings", path]``.
+
+    Raises ``OSError`` when the file cannot be written. Fail CLOSED: a child
+    spawned without these rules would let the loaded allow rules approve edits
+    in Read-only mode and writes to the assistant's own code, so the caller
+    turns the error into a failed turn and no child starts.
+    """
+    path = _permission_settings_path(relay_id, permission_mode)
+    path.write_text(
+        json.dumps(permission_rules(permission_mode), indent=2), encoding="utf-8"
+    )
+    return ["--settings", str(path)]
+
+
+def _unlink_permission_settings(relay_id: str) -> None:
+    """Remove every permission-rules file this relay's children were given."""
+    for mode in (*CLI_PERMISSION_MODES, "other"):
+        _unlink_quietly(_permission_settings_path(relay_id, mode))
 
 
 # ---------------------------------------------------------------------------
@@ -1237,6 +1322,12 @@ async def spawn(
         fallback_model=fallback_model,
         use_user_config=use_user_config,
     )
+    try:
+        # First, so a failed write leaves nothing else behind to clean up.
+        args += _permission_settings_args(relay_id, permission_mode)
+    except OSError:
+        _unlink_permission_settings(relay_id)
+        raise
     mcp_args, written = _mcp_config_args(
         relay_id,
         mcp_config_path,
@@ -1256,6 +1347,7 @@ async def spawn(
         # loop) and cancellation must clean up exactly like OSError does.
         _unlink_quietly(mcp_config_path)
         _unlink_quietly(_fallback_config_path(relay_id))
+        _unlink_permission_settings(relay_id)
         raise
     # Exactly one INFO line per child spawn, emitted once the child exists so it
     # can carry the real pid (the live proof greps for this wording).
@@ -1314,7 +1406,9 @@ async def _respawn(
     the old child's late handlers hit the stale-proc guard and no-op. relay_id
     and mcp_config_path are reused, so relay routing survives the swap.
 
-    The MCP config is re-written on every respawn: a spawn whose config write
+    The permission rules are written for the new mode (see
+    ``permission_rules``), and the MCP config is re-written on every respawn:
+    a spawn whose config write
     failed gets its relay back as soon as a retry succeeds, and a retry that
     still fails re-arms the "relay unavailable" warning for the new child.
     """
@@ -1328,6 +1422,9 @@ async def _respawn(
         fallback_model=fallback_model,
         use_user_config=use_user_config,
     )
+    # Raises before anything changed, so the session stays whole on its old
+    # child (see the spawn-first note below).
+    args += _permission_settings_args(session.relay_id, permission_mode)
     mcp_args, written = _mcp_config_args(
         session.relay_id,
         session.mcp_config_path,
@@ -1420,10 +1517,12 @@ async def teardown(conversation_id: str, kill: bool) -> None:
             task.cancel()
     if kill:
         await _kill_proc(session.proc)
-    # Both of this session's runtime temp files: the per-session config and the
-    # per-relay fail-closed fallback (present only if a write ever failed).
+    # This session's runtime temp files: the per-session config, the per-relay
+    # fail-closed fallback (present only if a write ever failed) and the
+    # permission rules of every mode its children ran in.
     _unlink_quietly(session.mcp_config_path)
     _unlink_quietly(_fallback_config_path(session.relay_id))
+    _unlink_permission_settings(session.relay_id)
     for sid in session.aliased_sids:
         sid_to_conversation.pop(sid, None)
     # NOTE: the creation lock is deliberately NOT dropped here — see

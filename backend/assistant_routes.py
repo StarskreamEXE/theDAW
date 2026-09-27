@@ -295,7 +295,7 @@ When the selected provider is Claude Code, you are not only a chat assistant. Yo
 
 ### Self-enhancement — extending your own tool surface
 - You are allowed to extend your own capabilities. When the user wants something no DAW tool covers, you may add the tool: declare it in `backend/modules/assistant/tool_catalog.py`, implement the browser handler in `frontend/src/orb-kit/actionHandlers.ts`, give it a tier in `frontend/src/orb-kit/tool-tiers.ts`, surface any new state it needs in `frontend/src/orb-kit/appContext.ts`, and wire the routing in `backend/assistant_routes.py`.
-- Touching your own surface ALWAYS prompts the user, in every mode except readonly (where it is denied). That is deliberate. Never try to route around it.
+- Editing your own surface ALWAYS prompts the user, in every mode except readonly (where it is denied). That is deliberate. Never try to route around it, and never change your own surface through a shell command.
 - Explain the new tool BEFORE you edit: what it will do, which files it touches, and what the user will be able to ask for once it exists. Then make the edit.
 - After a backend Python edit, tell the user the backend restarts to pick the change up, and that this conversation resumes on their next message — the session is re-established for them automatically.
 
@@ -333,8 +333,10 @@ CLAUDE_MCP_SURFACE_ISOLATED = (
 CLAUDE_MCP_SURFACE_USER_CONFIG = (
     "- This session loads the user's own Claude Code setup: their MCP servers, "
     "settings, CLAUDE.md, skills and agents, next to the `thedaw` relay server (plus "
-    "the underfit trainer when that profile is active). A command the user's own "
-    "allow rules match runs without a permission prompt, in every mode."
+    "the underfit trainer when that profile is active). Outside readonly mode, a "
+    "command or tool the user's own allow rules match runs without a permission "
+    "prompt; such a command is not checked against your own surface, so never use "
+    "one to change it."
 )
 
 
@@ -345,6 +347,22 @@ def _claude_code_system_block(system_block: str, use_user_config: bool) -> str:
     return system_block.replace(
         CLAUDE_MCP_SURFACE_ISOLATED, CLAUDE_MCP_SURFACE_USER_CONFIG
     )
+
+
+def _claude_setup_line(use_user_config: bool) -> str:
+    """The MCP-surface line as the footer of every message to the child.
+
+    A child respawned with ``--resume`` (the user switched the setting mid-
+    conversation, or an idle child was reaped) is never re-seeded, so the
+    seed's copy of this line would go stale. The footer states the setup in
+    force NOW, next to the ``Permission mode:`` line, for the same reason.
+    """
+    line = (
+        CLAUDE_MCP_SURFACE_USER_CONFIG
+        if use_user_config
+        else CLAUDE_MCP_SURFACE_ISOLATED
+    )
+    return line.removeprefix("- ")
 
 
 def _claude_use_user_config() -> bool:
@@ -1182,7 +1200,9 @@ def _latest_client_system_text(messages: list) -> str:
     return ""
 
 
-def _build_claude_turn_texts(req: ChatRequest, permission_mode: str) -> tuple[str, str]:
+def _build_claude_turn_texts(
+    req: ChatRequest, permission_mode: str, setup_line: str = ""
+) -> tuple[str, str]:
     """
     Build ``(turn_text, seed_text)`` — the Foundry's ``buildClaudePrompt`` resume
     semantics.
@@ -1205,10 +1225,14 @@ def _build_claude_turn_texts(req: ChatRequest, permission_mode: str) -> tuple[st
     harmlessly.
 
     Both texts end with the ``Permission mode:`` line, because the mode can change
-    between turns and the model must answer to the one in force NOW.
+    between turns and the model must answer to the one in force NOW. The same
+    holds for ``setup_line`` (see ``_claude_setup_line``), which sits right
+    above it when given; the seed leaves it out when its system block already
+    says it.
     """
     staged = req.staged_attachments or []
     mode_line = f"Permission mode: {permission_mode}"
+    footer = f"{setup_line}\n{mode_line}" if setup_line else mode_line
     attachments = _claude_attachments_block(staged)
     last_user, last_index = _last_user_text(req.messages)
 
@@ -1220,7 +1244,7 @@ def _build_claude_turn_texts(req: ChatRequest, permission_mode: str) -> tuple[st
     turn_body = attachments + last_user
     if turn_body.strip() and app_context:
         turn_body = f"{app_context}\n\n{SEED_REQUEST_HEADER}\n{turn_body}"
-    turn_text = f"{turn_body}\n\n{mode_line}" if turn_body.strip() else ""
+    turn_text = f"{turn_body}\n\n{footer}" if turn_body.strip() else ""
 
     sections: list[str] = []
     system_block = (req.claude_system_block or "").strip()
@@ -1240,7 +1264,7 @@ def _build_claude_turn_texts(req: ChatRequest, permission_mode: str) -> tuple[st
         sections.append(SEED_HISTORY_HEADER + "\n" + "\n\n".join(history))
 
     sections.append(f"{SEED_REQUEST_HEADER}\n{attachments}{last_user}")
-    sections.append(mode_line)
+    sections.append(mode_line if setup_line in system_block else footer)
     return turn_text, "\n\n---\n\n".join(sections)
 
 
@@ -1294,15 +1318,17 @@ async def _stream_claude(req: ChatRequest, request: Optional[Request]):
         or CLAUDE_DEFAULT_PERMISSION_MODE
     )
 
-    # Read ONCE per turn: the seed's MCP-surface line and the child's spawn
-    # flags must describe the same setup.
+    # Read ONCE per turn: the MCP-surface line (in the seed and in every
+    # message's footer) and the child's spawn flags must describe one setup.
     use_user_config = _claude_use_user_config()
     if req.claude_system_block:
         req.claude_system_block = _claude_code_system_block(
             req.claude_system_block, use_user_config
         )
 
-    turn_text, seed_text = _build_claude_turn_texts(req, permission_mode)
+    turn_text, seed_text = _build_claude_turn_texts(
+        req, permission_mode, _claude_setup_line(use_user_config)
+    )
     if not turn_text.strip():
         yield _sse_frame(
             {"type": "error", "message": "No prompt content found in messages"}
