@@ -150,6 +150,7 @@ import { useFeatureToggleStore } from '../../state/featureToggleStore';
 import { punchWindowFrom, useRecordingPrefs, useRecordingStore, type RecordingStatus } from '../../state/recordingStore';
 import type { LevelFrame } from '../../lib/recordingEngine';
 import { SurfaceAudio } from './IoDeviceSelect';
+import { acquireObjectUrl } from '../../lib/sharedObjectUrl';
 
 const TRACK_HEADER_PX = 180;
 
@@ -1261,8 +1262,9 @@ const TrackInputMeter: React.FC<{ trackId: string; trackName: string }> = ({ tra
 /**
  * ClipWave — the DJ-style semantic waveform for a timeline audio clip. Renders
  * only the clip's trim window of its source audio (viewport mapped from
- * offsetIntoSource/sourceDuration). Owns one object URL per clip, revoked on
- * unmount. No per-clip playhead — the timeline draws a global one over clips.
+ * offsetIntoSource/sourceDuration). Shares one object URL per source Blob
+ * (`lib/sharedObjectUrl`), revoked a few seconds after the last clip using it
+ * unmounts. No per-clip playhead — the timeline draws a global one over clips.
  *
  * `normalize={false}` (D16): the EDIT timeline draws every clip at its
  * ABSOLUTE amplitude, not scaled up to fill the lane by each clip's own
@@ -1277,20 +1279,19 @@ const TrackInputMeter: React.FC<{ trackId: string; trackName: string }> = ({ tra
  * own default of `true`.
  */
 const ClipWave: React.FC<{ clip: AudioClip; height: number; selected: boolean }> = ({ clip, height, selected }) => {
-  // The object URL is minted INSIDE the effect that revokes it, so each mount
-  // owns exactly the URL its own cleanup tears down. Creating it in a useMemo
-  // and revoking it from a cleanup keyed on the same value is what left every
-  // clip blank in dev: StrictMode's mount -> cleanup -> remount revoked the URL
-  // before the remount handed that very same (now dead) blob: URL to
-  // SemanticWave, whose fetch then failed with "TypeError: Failed to fetch" and
-  // left the bin list empty. A fresh URL per mount survives the double-invoke.
+  // One object URL per source Blob, acquired inside the effect that releases
+  // it. The URL is the waveform decode cache's key, so a fresh URL per mount
+  // made every remount a second fetch and decode and filled the cache with
+  // keys nobody read again. Releasing only schedules the revoke: StrictMode's
+  // mount -> cleanup -> remount gets the same, still-live URL back (revoking
+  // on cleanup is what once left every clip blank with "Failed to fetch").
   const [url, setUrl] = useState<string | null>(null);
   useEffect(() => {
-    const objectUrl = URL.createObjectURL(clip.audioBlob);
-    setUrl(objectUrl);
+    const shared = acquireObjectUrl(clip.audioBlob);
+    setUrl(shared.url);
     return () => {
-      setUrl((current) => (current === objectUrl ? null : current));
-      try { URL.revokeObjectURL(objectUrl); } catch { /* ignore */ }
+      setUrl((current) => (current === shared.url ? null : current));
+      shared.release();
     };
   }, [clip.audioBlob]);
   const dur = clip.sourceDuration > 0 ? clip.sourceDuration : clip.durationSec || 1;
