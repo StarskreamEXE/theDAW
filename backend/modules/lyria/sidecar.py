@@ -164,6 +164,15 @@ _KEY_FILE_VERSION = 2
 # new shape is written over the old one. ``*.bak`` is already gitignored.
 _KEY_FILE_BACKUP = _KEY_FILE.with_name(_KEY_FILE.name + ".bak")
 
+# Checkouts whose dependencies changed under them (_update_checkout moved one
+# to a commit with a different package.json / package-lock.json) and whose npm
+# install has not finished yet. Written before the move and cleared only when
+# npm install succeeds, so a failed or interrupted install is run again on the
+# next start: node_modules still exists at that point (the old one, or a
+# half-written one), so its presence alone says nothing. Kept in theDAW's data
+# folder, never in the user's checkout.
+_DEPS_PENDING_FILE = paths.data_path("lyria_deps_pending.json")
+
 # The providers theDAW can hand keys to. Both are the embedded app's own
 # (server.ts reads GEMINI_API_KEY and OPENROUTER_API_KEY).
 LYRIA_PROVIDERS: tuple[str, ...] = ("gemini", "openrouter")
@@ -840,8 +849,52 @@ def _is_lyria_server(port: int) -> bool:
     )
 
 
+def _pending_projects() -> list[str]:
+    try:
+        raw = json.loads(_DEPS_PENDING_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    projects = raw.get("projects") if isinstance(raw, dict) else None
+    if not isinstance(projects, list):
+        return []
+    return [p for p in projects if isinstance(p, str)]
+
+
+def deps_pending(project: Path) -> bool:
+    """True when _update_checkout moved ``project`` to a commit with other
+    dependencies and their npm install has not succeeded since."""
+    return _norm(str(project)) in _pending_projects()
+
+
+def _set_deps_pending(project: Path, pending: bool) -> None:
+    """Record or clear ``project`` in _DEPS_PENDING_FILE. Raises OSError when
+    the record cannot be written."""
+    key = _norm(str(project))
+    current = _pending_projects()
+    if (key in current) == pending:
+        return
+    projects = [*current, key] if pending else [p for p in current if p != key]
+    atomic_write(_DEPS_PENDING_FILE, json.dumps({"projects": projects}, indent=2))
+
+
+def _clear_deps_pending(project: Path) -> None:
+    """Clear ``project`` from _DEPS_PENDING_FILE after its npm install
+    succeeded. A record that cannot be cleared costs one more npm install on
+    the next start, so it is logged and the start goes on."""
+    try:
+        _set_deps_pending(project, False)
+    except OSError as e:
+        log.warning(
+            "lyria.sidecar: could not clear %s (%s); npm install runs again on "
+            "the next start",
+            _DEPS_PENDING_FILE.name,
+            e,
+        )
+
+
 def _ensure_deps(cfg: LyriaConfig) -> None:
-    """Install node_modules when missing.
+    """Install node_modules when missing, or when a checkout move left its
+    dependencies uninstalled (deps_pending).
 
     Hoisted into its own function deliberately: vj/sidecar.py has this check
     inline in ensure_running() only, so its _ensure_build() path can run
@@ -856,10 +909,19 @@ def _ensure_deps(cfg: LyriaConfig) -> None:
     """
     with _spawn_lock:
         node_modules = cfg.project_path / "node_modules"
-        if node_modules.is_dir():
+        pending = deps_pending(cfg.project_path)
+        if node_modules.is_dir() and not pending:
             return
-        log.info("lyria.sidecar: node_modules missing -- running npm install")
+        if pending:
+            log.info(
+                "lyria.sidecar: the checkout moved and its npm install did not "
+                "finish -- running npm install"
+            )
+        else:
+            log.info("lyria.sidecar: node_modules missing -- running npm install")
         _run_npm_install(cfg)
+        if pending:
+            _clear_deps_pending(cfg.project_path)
 
 
 def _run_npm_install(cfg: LyriaConfig) -> None:
@@ -951,7 +1013,7 @@ def probe() -> dict:
     openrouter_list, or_key_source = resolved_keys("openrouter")
     key = gemini_list[0] if gemini_list else None
     or_key = openrouter_list[0] if openrouter_list else None
-    deps_installed = (pkg / "node_modules").is_dir()
+    deps_installed = (pkg / "node_modules").is_dir() and not deps_pending(pkg)
     install = install_status()
     installing = install.get("status") in ("cloning", "installing")
 
@@ -1179,7 +1241,8 @@ def _clone_pinned(git: str, target: Path, out: IO[bytes] | int) -> None:
 
 _checkout_lock = Lock()
 _checkout_state: dict = {
-    # unchecked | current | updated | newer | dirty | failed | managed | not_git
+    # unchecked | current | updated | newer | dirty | branch | failed | managed
+    # | not_git
     "state": "unchecked",
     "commit": None,
     "pinned_commit": LYRIA_PINNED_COMMIT,
@@ -1203,7 +1266,7 @@ def _set_checkout(state: str, commit: Optional[str], reason: str = "") -> dict:
         return dict(_checkout_state)
 
 
-def _update_checkout(cfg: LyriaConfig) -> dict:
+def _update_checkout(cfg: LyriaConfig, *, retry_now: bool = False) -> dict:
     """Move an existing checkout to LYRIA_PINNED_COMMIT when that is safe.
 
     Called right before a spawn (nothing of ours is running from the tree).
@@ -1212,13 +1275,20 @@ def _update_checkout(cfg: LyriaConfig) -> dict:
       * it is not a git checkout, or git is missing,
       * the pinned commit is already in its history (``newer``),
       * it has local changes to tracked files (``dirty``),
+      * it is on a branch of its own: only a detached HEAD, or the default
+        branch tracking origin (the two shapes an Install leaves), is moved
+        (``branch``),
       * the fetch or the checkout fails (``failed``; retried after
-        CHECKOUT_RETRY_SEC rather than on every spawn).
+        CHECKOUT_RETRY_SEC rather than on every spawn, unless ``retry_now``,
+        which restart() passes for a restart the user asked for).
     Untracked files (the app's own generations and projects) survive a
     checkout; git refuses one that would overwrite them, which lands in
-    ``failed`` with git's own message. After a move, npm install runs when
-    package.json or package-lock.json changed, or node_modules is missing.
-    Raises RuntimeError only for that npm install."""
+    ``failed`` with git's own message. When package.json or
+    package-lock.json differ at the pin, or node_modules is missing, the
+    checkout is recorded in _DEPS_PENDING_FILE before the move and npm install
+    runs after it; the record is cleared only when that install succeeds, so
+    _ensure_deps runs it again after a failure. Raises RuntimeError only for
+    that npm install."""
     project = cfg.project_path
     pin7 = LYRIA_PINNED_COMMIT[:7]
     if os.getenv("theDAW_LYRIA_PROJECT"):
@@ -1254,7 +1324,8 @@ def _update_checkout(cfg: LyriaConfig) -> dict:
                 return _set_checkout("current", head)
             last = checkout_state()
             if (
-                last["state"] == "failed"
+                not retry_now
+                and last["state"] == "failed"
                 and last["commit"] == head
                 and last["checked_at"] is not None
                 and time.time() - last["checked_at"] < CHECKOUT_RETRY_SEC
@@ -1291,6 +1362,16 @@ def _update_checkout(cfg: LyriaConfig) -> dict:
                     f"files, so theDAW left it at {head[:7]} instead of moving it to "
                     f"{pin7}. Commit or discard them, then restart Lyria.",
                 )
+            branch = _own_branch(git, project)
+            if branch:
+                return _set_checkout(
+                    "branch",
+                    head,
+                    f"The Lyria checkout at {project} is on its own branch "
+                    f"'{branch}', so theDAW left it at {head[:7]} instead of moving "
+                    f"it to {pin7}. Switch it to a detached HEAD or its default "
+                    "branch, then restart Lyria.",
+                )
             fetch = _git_run(
                 git,
                 ["fetch", "--depth", "1", LYRIA_REPO_URL, LYRIA_PINNED_COMMIT],
@@ -1319,10 +1400,20 @@ def _update_checkout(cfg: LyriaConfig) -> dict:
                 ],
                 project,
             )
+            needs_install = (
+                deps_same.returncode != 0 or not (project / "node_modules").is_dir()
+            )
+            if needs_install:
+                # Recorded BEFORE the move: a crash between the two costs
+                # one extra npm install, never a checkout left on the old
+                # dependencies.
+                _set_deps_pending(project, True)
             moved = _git_run(
                 git, ["checkout", "-q", "--detach", LYRIA_PINNED_COMMIT], project
             )
             if moved.returncode != 0:
+                if needs_install:
+                    _clear_deps_pending(project)
                 return _set_checkout(
                     "failed",
                     head,
@@ -1339,10 +1430,33 @@ def _update_checkout(cfg: LyriaConfig) -> dict:
                 f"as it is: {e}",
             )
         log.info("lyria.sidecar: moved %s from %s to %s", project, head[:7], pin7)
-        if deps_same.returncode != 0 or not (project / "node_modules").is_dir():
+        if needs_install:
             log.info("lyria.sidecar: dependencies changed -- running npm install")
             _run_npm_install(cfg)
+            _clear_deps_pending(project)
         return _set_checkout("updated", LYRIA_PINNED_COMMIT, f"Moved from {head[:7]}.")
+
+
+def _own_branch(git: str, project: Path) -> Optional[str]:
+    """The checkout's branch when it is one theDAW must not move off: None
+    for a detached HEAD (what Install leaves) or for the default branch
+    tracking origin's (what an older `git clone --depth 1` Install left),
+    the branch name for anything else."""
+    current = _git_run(git, ["symbolic-ref", "-q", "--short", "HEAD"], project)
+    if current.returncode != 0:
+        return None  # detached
+    name = current.stdout.strip()
+    upstream = _git_run(
+        git,
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        project,
+    ).stdout.strip()
+    default = _git_run(
+        git, ["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"], project
+    ).stdout.strip()
+    if upstream == f"origin/{name}" and default == f"origin/{name}":
+        return None
+    return name
 
 
 def _install_worker(cfg: LyriaConfig, need_clone: bool, git: str) -> None:
@@ -1419,7 +1533,11 @@ def start_install() -> dict:
             "Node.js is not installed (npm/node not on PATH). Install Node.js LTS "
             "(nodejs.org), restart theDAW, then press Install again."
         )
-    if not need_clone and (cfg.project_path / "node_modules").is_dir():
+    if (
+        not need_clone
+        and (cfg.project_path / "node_modules").is_dir()
+        and not deps_pending(cfg.project_path)
+    ):
         _set_install(
             status="done",
             step=None,
@@ -1569,11 +1687,12 @@ def _terminate_proc(proc: subprocess.Popen[bytes]) -> None:
             pass
 
 
-def ensure_running(*, wait_for_ready: bool = True) -> str:
+def ensure_running(*, wait_for_ready: bool = True, retry_checkout: bool = False) -> str:
     """Spawn the Lyria Express server if it isn't already, and return the URL
     it serves on. Safe to call repeatedly -- no-ops if the port is already
     listening AND confirmed to be our sidecar (INT-001), even if some other
-    process started it."""
+    process started it. ``retry_checkout`` makes the pinned-commit check run
+    even when it failed less than CHECKOUT_RETRY_SEC ago (restart())."""
     global _proc, _resolved_url, _stop_requested
     cfg = resolve_config()
     # 127.0.0.1, not localhost -- see _port_is_listening for why.
@@ -1627,7 +1746,7 @@ def ensure_running(*, wait_for_ready: bool = True) -> str:
                 # the one safe moment to move it to the pinned commit. A
                 # checkout it leaves alone still starts: _child_env hands an
                 # old checkout one key per provider.
-                _update_checkout(cfg)
+                _update_checkout(cfg, retry_now=retry_checkout)
                 _ensure_deps(cfg)  # npm install -- runs outside _state_lock
                 # A stop() may have arrived while _update_checkout (a fetch,
                 # up to GIT_FETCH_TIMEOUT_SEC) or _ensure_deps (up to
@@ -1944,4 +2063,6 @@ def restart() -> str:
     ensure_running() do."""
     stop()
     stop_adopted()
-    return ensure_running()
+    # A restart is the user asking for another try, so a failed pinned-commit
+    # check (no network a minute ago) is not waited out for CHECKOUT_RETRY_SEC.
+    return ensure_running(retry_checkout=True)

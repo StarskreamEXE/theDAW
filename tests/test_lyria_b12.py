@@ -1355,6 +1355,9 @@ def lyria_keys(tmp_path, monkeypatch):
     monkeypatch.setattr(
         sidecar, "_KEY_FILE_BACKUP", tmp_path / "lyria_gemini_key.json.bak"
     )
+    monkeypatch.setattr(
+        sidecar, "_DEPS_PENDING_FILE", tmp_path / "lyria_deps_pending.json"
+    )
     for var in (*_KEY_VARS, *_NUMBERED, "AI_PROVIDER", "theDAW_LYRIA_PROJECT"):
         monkeypatch.delenv(var, raising=False)
     pools: dict[str, list[str]] = {}
@@ -2532,7 +2535,8 @@ def test_a_checkout_named_by_theDAW_LYRIA_PROJECT_is_not_moved(pinned, monkeypat
     assert _git("rev-parse", "HEAD", cwd=checkout) == pinned.upstream.a
 
 
-def test_changed_dependencies_run_npm_install_after_the_move(pinned, monkeypatch):
+def _pin_with_a_new_dependency(pinned, monkeypatch) -> str:
+    """Add commit D to the upstream with a changed package.json and pin it."""
     upstream = pinned.upstream
     (upstream.path / "package.json").write_text(
         '{"name": "lyria-3-pro", "dependencies": {"new-dep": "1.0.0"}}\n',
@@ -2541,12 +2545,159 @@ def test_changed_dependencies_run_npm_install_after_the_move(pinned, monkeypatch
     _git("commit", "-q", "-am", "D: new dependency", cwd=upstream.path)
     pin = _git("rev-parse", "HEAD", cwd=upstream.path)
     monkeypatch.setattr(sidecar, "LYRIA_PINNED_COMMIT", pin)
-    checkout = _existing_install(pinned, upstream.a)
+    return pin
+
+
+def test_changed_dependencies_run_npm_install_after_the_move(pinned, monkeypatch):
+    _pin_with_a_new_dependency(pinned, monkeypatch)
+    checkout = _existing_install(pinned, pinned.upstream.a)
 
     state = sidecar._update_checkout(_cfg(checkout))
 
     assert state["state"] == "updated"
     assert len(pinned.npm_runs) == 1
+    assert sidecar.deps_pending(checkout) is False
+
+
+def test_a_failed_npm_install_after_the_move_runs_again_on_the_next_start(
+    pinned, monkeypatch
+):
+    """A pin bump changes package.json. The user opens the Lyria tab: the
+    checkout moves and npm install fails (a network blip), so the tab shows
+    the error. The user presses Retry: the checkout is already at the pin and
+    node_modules (the old one) still exists, and npm install must run again
+    before Lyria spawns against it."""
+    pin = _pin_with_a_new_dependency(pinned, monkeypatch)
+    checkout = _existing_install(pinned, pinned.upstream.a)
+    attempts: list[str] = []
+
+    def _npm_install(cfg):
+        attempts.append("npm install")
+        if len(attempts) == 1:
+            raise RuntimeError("npm install failed (rc=1)")
+
+    monkeypatch.setattr(sidecar, "_run_npm_install", _npm_install)
+
+    with pytest.raises(RuntimeError, match="npm install failed"):
+        _spawn_capturing_env(monkeypatch, checkout)
+    assert _git("rev-parse", "HEAD", cwd=checkout) == pin
+    assert (checkout / "node_modules").is_dir()
+    assert sidecar.deps_pending(checkout) is True
+    assert sidecar.probe()["deps_installed"] is False
+
+    env = _spawn_capturing_env(monkeypatch, checkout)  # Retry
+
+    assert attempts == ["npm install", "npm install"]
+    assert sidecar.deps_pending(checkout) is False
+    assert env, "Lyria spawned once the dependencies were installed"
+    assert sidecar.checkout_state()["state"] == "current"
+
+
+def test_the_install_button_does_not_call_a_half_installed_checkout_done(
+    pinned, monkeypatch
+):
+    """Same failed install after a move, then the Install button on the card:
+    it must run npm install, not report "Already installed"."""
+    _pin_with_a_new_dependency(pinned, monkeypatch)
+    checkout = _existing_install(pinned, pinned.upstream.a)
+
+    def _npm_fails(cfg):
+        raise RuntimeError("npm install failed (rc=1)")
+
+    monkeypatch.setattr(sidecar, "_run_npm_install", _npm_fails)
+    with pytest.raises(RuntimeError, match="npm install failed"):
+        _spawn_capturing_env(monkeypatch, checkout)
+
+    ran: list[object] = []
+    monkeypatch.setattr(sidecar, "_run_npm_install", lambda cfg: ran.append(cfg))
+    monkeypatch.setattr(sidecar, "_npm_path", lambda: "npm")
+    monkeypatch.setattr(sidecar, "_node_path", lambda: "node")
+    monkeypatch.setattr(sidecar, "_install_state", dict(sidecar._install_state))
+
+    state = sidecar.start_install()
+    assert not state.get("already_installed")
+    for _ in range(200):
+        if sidecar.install_status()["status"] in ("done", "error"):
+            break
+        time.sleep(0.02)
+    assert sidecar.install_status()["status"] == "done"
+    assert len(ran) == 1
+    assert sidecar.deps_pending(checkout) is False
+
+
+def test_a_move_git_refuses_leaves_no_install_pending(pinned, monkeypatch):
+    _pin_with_a_new_dependency(pinned, monkeypatch)
+    checkout = _existing_install(pinned, pinned.upstream.a)
+    real_git_run = sidecar._git_run
+
+    def _refuse_checkout(git, args, cwd, timeout=60.0):
+        if args[:1] == ["checkout"]:
+            return subprocess.CompletedProcess(args, 1, "", "error: refused\n")
+        return real_git_run(git, args, cwd, timeout)
+
+    monkeypatch.setattr(sidecar, "_git_run", _refuse_checkout)
+    state = sidecar._update_checkout(_cfg(checkout))
+
+    assert state["state"] == "failed"
+    assert _git("rev-parse", "HEAD", cwd=checkout) == pinned.upstream.a
+    assert sidecar.deps_pending(checkout) is False
+    assert pinned.npm_runs == []
+
+
+def test_a_restart_retries_a_failed_fetch_at_once(pinned, monkeypatch):
+    """No network when Lyria opened: the fetch failed and the panel says so.
+    The network comes back and the user presses Restart. The checkout moves
+    then, not CHECKOUT_RETRY_SEC later."""
+    checkout = _existing_install(pinned, pinned.upstream.a)
+    real_uri = sidecar.LYRIA_REPO_URL
+    monkeypatch.setattr(
+        sidecar, "LYRIA_REPO_URL", (pinned.root / "no-such-repo").as_uri()
+    )
+    _spawn_capturing_env(monkeypatch, checkout)
+    assert sidecar.checkout_state()["state"] == "failed"
+
+    monkeypatch.setattr(sidecar, "LYRIA_REPO_URL", real_uri)  # back online
+    real_ensure = sidecar.ensure_running
+    monkeypatch.setattr(
+        sidecar,
+        "ensure_running",
+        lambda **kw: real_ensure(wait_for_ready=False, **kw),
+    )
+    monkeypatch.setattr(sidecar, "stop_adopted", lambda: False)
+    monkeypatch.setattr(sidecar, "_terminate_proc", lambda proc: None)
+
+    sidecar.restart()
+
+    assert _git("rev-parse", "HEAD", cwd=checkout) == pinned.upstream.b
+    assert sidecar.checkout_state()["state"] == "updated"
+
+
+def test_a_checkout_on_its_own_branch_is_left_alone_and_says_why(pinned):
+    """A developer's clean clone on a feature branch cut before the pin: its
+    working tree stays on that branch."""
+    checkout = pinned.root / "dev-lyria"
+    _git("clone", "-q", pinned.upstream.uri, str(checkout))
+    _git("checkout", "-q", "-b", "my-feature", pinned.upstream.a, cwd=checkout)
+
+    state = sidecar._update_checkout(_cfg(checkout))
+
+    assert state["state"] == "branch"
+    assert "my-feature" in state["reason"]
+    assert _git("rev-parse", "HEAD", cwd=checkout) == pinned.upstream.a
+    assert _git("symbolic-ref", "--short", "HEAD", cwd=checkout) == "my-feature"
+
+
+def test_a_default_branch_clone_from_an_older_install_is_moved(pinned):
+    """An older Install cloned the repo, which leaves its default branch
+    tracking origin's. That shape is theDAW's own and is moved to the pin."""
+    checkout = pinned.root / "lyria"
+    _git("clone", "-q", pinned.upstream.uri, str(checkout))
+    _git("reset", "-q", "--hard", pinned.upstream.a, cwd=checkout)
+
+    state = sidecar._update_checkout(_cfg(checkout))
+
+    assert state["state"] == "updated"
+    assert _git("rev-parse", "HEAD", cwd=checkout) == pinned.upstream.b
 
 
 def test_install_clones_exactly_the_pinned_commit(pinned):

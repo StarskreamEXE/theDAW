@@ -32,7 +32,7 @@ interface LyriaUrlReply {
 }
 
 /** Checkout states the backend left alone, with a reason worth reading. */
-const CHECKOUT_LEFT_ALONE = new Set(['dirty', 'failed', 'not_git', 'managed']);
+const CHECKOUT_LEFT_ALONE = new Set(['dirty', 'branch', 'failed', 'not_git', 'managed']);
 
 /** The sentence to show under the header, or '' when there is nothing to say. */
 export function lyriaCheckoutNote(checkout: LyriaCheckout | undefined): string {
@@ -321,14 +321,21 @@ export const LyriaPanel: React.FC = () => {
         )}
         {/* An adopted Lyria (left over from an earlier session, or launched
             by hand) has the keys and cost mode it started with. This is the
-            one control that hands it the current ones. */}
-        {status === 'ready' && external && (
+            one control that hands it the current ones. It also shows while
+            the checkout note is up: the checkout is checked again only when
+            Lyria starts, so after fixing what the note names (discarding
+            local changes, reconnecting) a restart is how the move happens.
+            The visible text names the button. */}
+        {status === 'ready' && (external || checkoutNote) && (
           <button
             type="button"
             onClick={() => void restartLyria()}
             disabled={restarting}
-            aria-label="Restart Lyria with the current keys"
-            title="This Lyria was not started by this session of theDAW (a leftover from an earlier run, or one launched by hand), so it still has the keys and cost mode it started with. Restart it to hand it the current keys and cost mode."
+            title={
+              external
+                ? 'This Lyria was not started by this session of theDAW (a leftover from an earlier run, or one launched by hand), so it still has the keys and cost mode it started with. Restart it to hand it the current keys and cost mode.'
+                : 'Stop Lyria, check the checkout against the pinned commit again, and start it with the current keys and cost mode.'
+            }
             className="px-2 py-0.5 rounded border border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/20 text-amber-200 text-xs font-bold uppercase tracking-wide flex items-center gap-1 shrink-0 disabled:opacity-40"
           >
             {restarting ? <Loader2 className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />} Restart with
