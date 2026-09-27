@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -43,6 +44,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from backend.lib import paths
+from backend.lib.atomic import atomic_write
 from backend.lib.launch_token import child_env
 
 log = logging.getLogger(__name__)
@@ -91,8 +93,11 @@ async def health() -> dict:
 # The extended sidecar runs inside WSL2 (JAX needs the Linux CUDA stack). The
 # spawn mirrors the bundled MRT2-Studio.vbs launcher: same distro detection
 # (``.wsl_distro`` written by Setup, fallback Ubuntu), same venv, no console
-# window. ``stop_engine`` also kills the bundled Studio server so two engines
-# never contend for the GPU.
+# window. ``stop_engine`` stops the engine THIS checkout started (by the pid
+# recorded in ``_PID_FILE``, checked against this checkout's script path before
+# any signal) and this checkout's own bundled Studio server, so two engines of
+# this app never contend for the GPU. An engine another checkout started runs
+# a different path and is left running.
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _ENGINE_SCRIPT = _REPO_ROOT / "sidecars" / "magenta" / "server.py"
@@ -111,8 +116,21 @@ _WSL_PYTHON = os.getenv("THEDAW_MAGENTA_WSL_PY", "~/mrt2/.venv/bin/python")
 # zero-config cross-platform path is to run the engine yourself and set
 # THEDAW_MAGENTA_URL — then no interpreter is needed here at all.
 _NATIVE_PYTHON = os.getenv("THEDAW_MAGENTA_PYTHON", "~/mrt2/.venv/bin/python")
-# pkill pattern matching BOTH magenta engines (extended + bundled Studio).
-_ENGINE_PKILL_PATTERN = "sidecars/magenta/server.py|studio_server.py"
+# The bundled Studio server of THIS checkout (started by MRT2-Studio.vbs from
+# this checkout's sidecars folder). Its path identifies it, as the engine
+# script's path identifies ours.
+_STUDIO_SCRIPT = (
+    _REPO_ROOT / "sidecars" / "magenta-rt2-nvidia" / "app" / "studio_server.py"
+)
+# The Linux-side pid of the engine this checkout's backend spawned. Written by
+# the spawn itself (the WSL bash on Windows, this process elsewhere), so a
+# backend that restarted while the engine kept running still stops its own
+# engine and nobody else's.
+_PID_FILE = paths.data_path("magenta_engine.pid")
+# Any magenta engine at all, for reporting the ones left running.
+_ANY_ENGINE_MARKERS = ("sidecars/magenta/server.py", "studio_server.py")
+# How long a stopped engine gets to exit on SIGTERM before SIGKILL.
+_ENGINE_STOP_GRACE_SEC = 5.0
 # Where the vendored sidecar keeps model assets (``mrt models init`` /
 # ``mrt checkpoints download`` write here; the engine loads from here).
 _ASSETS_DIR = "~/Documents/Magenta/magenta-rt-v2"
@@ -779,11 +797,26 @@ def start_engine(shard: bool = False) -> dict:
             # the Windows process environment).
             distro = _wsl_distro()
             shard_env = "THEDAW_MAGENTA_SHARD=1 " if shard else ""
+            # The bash records its own pid, which ``exec`` hands on to the
+            # engine, so ``stop_engine`` can signal exactly this process. The
+            # record is written beside and renamed over, so a reader never sees
+            # half a pid. A record that cannot be written leaves the engine
+            # starting all the same.
+            pid_path = _wsl_path(_PID_FILE)
+            pid_file = shlex.quote(pid_path)
+            pid_tmp = shlex.quote(pid_path + ".tmp")
+            pid_dir = shlex.quote(_wsl_path(_PID_FILE.parent))
             bash_cmd = (
+                f"{{ mkdir -p {pid_dir} && echo $$ > {pid_tmp} "
+                f"&& mv -f {pid_tmp} {pid_file}; }} 2>/dev/null; "
                 f"MRT2_PORT={port} MRT2_MODEL={model} {shard_env}"
                 f"exec {_WSL_PYTHON} '{_wsl_path(_ENGINE_SCRIPT)}'"
             )
-            cmd = ["wsl.exe", "-d", distro, "--", "bash", "-lc", bash_cmd]
+            # --exec hands the script to this bash untouched. Through "--" the
+            # distro's default shell would read the line first and expand $$
+            # to its own pid, which is the engine's only while that shell
+            # happens to exec its last command.
+            cmd = ["wsl.exe", "-d", distro, "--exec", "bash", "-lc", bash_cmd]
             descriptor: dict = {"distro": distro}
         else:
             # Linux/macOS: spawn the engine venv python directly — no WSL, no
@@ -801,7 +834,7 @@ def start_engine(shard: bool = False) -> dict:
             popen_env["MRT2_MODEL"] = model
             if shard:
                 popen_env["THEDAW_MAGENTA_SHARD"] = "1"
-            cmd = [str(native_py), str(_ENGINE_SCRIPT)]
+            cmd = [str(native_py), _engine_side_path(_ENGINE_SCRIPT)]
             descriptor = {"native": True, "python": str(native_py)}
 
         # Capture the sidecar's output to a logfile instead of DEVNULL — a
@@ -819,6 +852,12 @@ def start_engine(shard: bool = False) -> dict:
                 creationflags=creationflags,
                 shell=False,
             )
+        if sys.platform != "win32":
+            # The native engine IS the child, so its pid is known here.
+            try:
+                atomic_write(_PID_FILE, f"{_engine_proc.pid}\n")
+            except OSError as e:
+                log.warning("magenta.engine: could not record the engine pid: %s", e)
         return {
             "spawned": True,
             "model": model,
@@ -828,10 +867,143 @@ def start_engine(shard: bool = False) -> dict:
         }
 
 
+def _linux_cmd(*argv: str) -> list[str]:
+    """``argv`` run where the engine runs: inside the WSL distro on Windows
+    (``--exec``, no shell, so nothing in ``argv`` is interpreted), natively on
+    Linux/macOS."""
+    if sys.platform == "win32":
+        return ["wsl.exe", "-d", _wsl_distro(), "--exec", *argv]
+    return list(argv)
+
+
+def _engine_side_path(p: Path) -> str:
+    """``p`` as the engine's side spells it in a process's arguments: the
+    spelling the spawn below hands the engine."""
+    return _wsl_path(p) if sys.platform == "win32" else str(p)
+
+
+def _args_name(args: str, path: str) -> bool:
+    """Whether a process's ``args`` hold ``path`` as a whole argument: a
+    checkout at ``/srv/home/u/theDAW`` is not the one at ``/home/u/theDAW``.
+    Case-blind on Windows: the drive is case-blind there, and the .vbs launcher
+    builds its path from its own spelling of the folder."""
+    flags = re.IGNORECASE if sys.platform == "win32" else 0
+    return re.search(rf"(?:^|\s){re.escape(path)}(?:\s|$)", args, flags) is not None
+
+
+def _engine_processes() -> dict[int, str] | None:
+    """Every process on the engine's side as ``{pid: args}``, or None when
+    the listing could not be taken."""
+    try:
+        out = subprocess.run(
+            _linux_cmd("ps", "-A", "-o", "pid=", "-o", "args="),
+            timeout=20,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            shell=False,
+            creationflags=_no_window_flags(),
+            env=child_env(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning("magenta.engine: could not list the engine processes: %s", e)
+        return None
+    if out.returncode != 0:
+        log.warning(
+            "magenta.engine: listing the engine processes failed (%s): %s",
+            out.returncode,
+            (out.stderr or "").strip()[:200],
+        )
+        return None
+    table: dict[int, str] = {}
+    for line in (out.stdout or "").splitlines():
+        head, _, args = line.strip().partition(" ")
+        if head.isdigit():
+            table[int(head)] = args.strip()
+    return table
+
+
+def _recorded_engine_pid() -> int | None:
+    try:
+        text = _PID_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return int(text) if text.isdigit() else None
+
+
+def _own_engine_pids(table: dict[int, str]) -> dict[int, str]:
+    """The processes this checkout owns, each with the script path that makes
+    it ours: the recorded engine pid while that process still runs this
+    checkout's engine script (a pid the system has since given to anything
+    else is not ours), and every process running this checkout's bundled
+    Studio server."""
+    own: dict[int, str] = {}
+    pid = _recorded_engine_pid()
+    engine = _engine_side_path(_ENGINE_SCRIPT)
+    if pid is not None and _args_name(table.get(pid, ""), engine):
+        own[pid] = engine
+    studio = _engine_side_path(_STUDIO_SCRIPT)
+    for other, args in sorted(table.items()):
+        if other not in own and _args_name(args, studio):
+            own[other] = studio
+    return own
+
+
+def _signal(sig: str, pids: list[int]) -> None:
+    try:
+        subprocess.run(
+            _linux_cmd("kill", f"-{sig}", *(str(p) for p in pids)),
+            timeout=20,
+            capture_output=True,
+            shell=False,
+            creationflags=_no_window_flags(),
+            env=child_env(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning("magenta.engine: kill -%s %s failed: %s", sig, pids, e)
+
+
+def _stop_pids(own: dict[int, str]) -> list[int]:
+    """SIGTERM the processes in ``own``, give them ``_ENGINE_STOP_GRACE_SEC``
+    to exit, SIGKILL whatever remains. A process counts as gone once its pid no
+    longer runs its script (exited, a zombie awaiting its parent, or a pid
+    already reused). Returns the pids that are gone."""
+    pids = list(own)
+
+    def still_running(table: dict[int, str]) -> list[int]:
+        return [p for p in pids if _args_name(table.get(p, ""), own[p])]
+
+    _signal("TERM", pids)
+    deadline = time.monotonic() + _ENGINE_STOP_GRACE_SEC
+    alive = pids
+    while True:
+        table = _engine_processes()
+        if table is None:
+            break
+        alive = still_running(table)
+        if not alive or time.monotonic() >= deadline:
+            break
+        time.sleep(0.25)
+    if alive:
+        _signal("KILL", alive)
+        table = _engine_processes()
+        if table is not None:
+            alive = still_running(table)
+    return [p for p in pids if p not in alive]
+
+
 def stop_engine() -> dict:
-    """Stop every magenta engine: our tracked child plus any engine started
-    outside the app (the .vbs launcher, a manual run). On Windows that reap
-    runs via pkill inside WSL; on Linux/macOS it runs pkill natively."""
+    """Stop the magenta engine this checkout started, and this checkout's own
+    bundled Studio server. Nothing else is signalled: an engine another
+    checkout started runs a different script path and is only reported, in
+    ``left_running``.
+
+    The spawned child is ended first. On Windows that child is ``wsl.exe``,
+    and ending it is not certain to end the Linux process behind it (nor is
+    there a child at all after the backend restarted), so the engine itself is
+    found by the pid its spawn recorded (``_PID_FILE``) and signalled only
+    while that pid still runs this checkout's engine script."""
     global _engine_proc
     with _engine_lock:
         terminated = False
@@ -845,32 +1017,35 @@ def stop_engine() -> dict:
                 proc.kill()
                 terminated = True
         _engine_proc = None
-        pkilled = False
-        if sys.platform == "win32":
-            reap_cmd = [
-                "wsl.exe",
-                "-d",
-                _wsl_distro(),
-                "--",
-                "bash",
-                "-lc",
-                f"pkill -f '{_ENGINE_PKILL_PATTERN}' || true",
-            ]
-        else:
-            reap_cmd = ["pkill", "-f", _ENGINE_PKILL_PATTERN]
-        try:
-            rc = subprocess.run(
-                reap_cmd,
-                timeout=20,
-                capture_output=True,
-                shell=False,
-                env=child_env(),
-            ).returncode
-            # native pkill returns 1 when nothing matched (not an error here).
-            pkilled = rc == 0
-        except Exception as e:
-            log.warning("magenta.engine: pkill failed: %s", e)
-        return {"terminated": terminated, "pkilled": pkilled}
+        reaped: list[int] = []
+        left_running: list[dict] = []
+        table = _engine_processes()
+        if table is not None:
+            own = _own_engine_pids(table)
+            if own:
+                reaped = _stop_pids(own)
+            for pid, args in sorted(table.items()):
+                named = args.replace("\\", "/")
+                if pid not in own and any(m in named for m in _ANY_ENGINE_MARKERS):
+                    left_running.append({"pid": pid, "args": args})
+            if left_running:
+                log.warning(
+                    "magenta.engine: left running, not started by this checkout: %s",
+                    "; ".join(f"{e['pid']} {e['args']}" for e in left_running),
+                )
+            # The record is spent unless its pid still runs our engine (a
+            # SIGKILL that did not land keeps it, for the next stop).
+            recorded = _recorded_engine_pid()
+            if recorded is not None and (recorded not in own or recorded in reaped):
+                try:
+                    _PID_FILE.unlink(missing_ok=True)
+                except OSError as e:
+                    log.debug("magenta.engine: pid record not removed: %s", e)
+        return {
+            "terminated": terminated,
+            "reaped": reaped,
+            "left_running": left_running,
+        }
 
 
 class GenerationCancelled(RuntimeError):

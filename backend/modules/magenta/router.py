@@ -333,10 +333,11 @@ async def probe():
 
 # ── engine lifecycle: the Model dropdown's GPU swap, no terminal anywhere ────
 #
-# /engine/start parks the SA3 model in CPU RAM (frees VRAM), stops any OTHER
-# magenta engine (including the bundled JSON-protocol Studio server), and spawns
-# the extended sidecar in WSL2. /engine/stop kills every magenta engine and
-# swaps SA3 back onto the GPU. Both refuse with 409 while a generation runs.
+# /engine/start parks the SA3 model in CPU RAM (frees VRAM), stops the engine
+# this checkout started before (and this checkout's bundled JSON-protocol Studio
+# server), and spawns the extended sidecar in WSL2. /engine/stop stops those same
+# engines and swaps SA3 back onto the GPU; another checkout's engine is left
+# running (sidecar.stop_engine). Both refuse with 409 while a generation runs.
 
 
 async def _start_engine(refresh: bool) -> dict:

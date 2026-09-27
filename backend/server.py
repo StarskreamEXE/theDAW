@@ -395,8 +395,10 @@ def _ensure_gpu_clear_of_magenta() -> None:
 
         listening = magenta_sidecar.engine_process_alive()
         if not listening:
-            # Engines started outside this process (the .vbs launcher, a
-            # manual run): probe the two known ports cheaply.
+            # Engines started outside this process (a backend of this checkout
+            # that restarted, this checkout's .vbs Studio launcher): probe the
+            # two known ports cheaply. stop_engine stops only those; another
+            # checkout's engine is logged as left running.
             for port in (8777, 8778):
                 try:
                     with socket.create_connection(("127.0.0.1", port), timeout=0.25):
