@@ -25,6 +25,7 @@ import { pathToFileURL } from 'url'
 // carries meaning is transliterated rather than dropped, so a key of F-sharp
 // still reads as F# in the log.
 import { plainAscii } from '../../frontend/src/lib/plainText'
+import { stopBackend } from './backendStop'
 import { AutoDownloadClaims, uniqueDownloadPath } from './downloadNaming'
 import {
   lanHttpsLogLine,
@@ -299,8 +300,8 @@ function buildBaseEnv(): NodeJS.ProcessEnv {
 // the token out.
 function buildBackendEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...buildBaseEnv(), THEDAW_LAUNCH_TOKEN: LAUNCH_TOKEN }
-  // The renderer's dev server steps past 5173 when another program holds it,
-  // so tell the backend the port it actually got; /api/network/lan reports it
+  // Tell the backend the port the renderer's dev server actually got (5173,
+  // strictPort in electron.vite.config.ts); /api/network/lan reports it
   // (backend.ports.frontend_port). A packaged build has no dev server and the
   // backend keeps its default.
   const rendererPort = rendererDevPort(process.env.ELECTRON_RENDERER_URL)
@@ -573,72 +574,50 @@ function spawnBackend(): void {
 // ---------------------------------------------------------------------------
 
 function killBackend(): Promise<void> {
-  return new Promise((resolve) => {
-    // Before the early return below: the LAN listener exists whether or not
-    // this process spawned the backend, and it must not outlive the app.
-    killLanHttps()
-    if (!backendProcess || !weSpawnedBackend) {
-      resolve()
-      return
-    }
+  // Before the early return below: the LAN listener exists whether or not
+  // this process spawned the backend, and it must not outlive the app.
+  killLanHttps()
+  if (!backendProcess || !weSpawnedBackend) return Promise.resolve()
 
-    log('Killing backend process...')
-    const proc = backendProcess
-    const pid = proc.pid
-    let settled = false
-
-    const settle = (): void => {
-      if (settled) return
-      settled = true
-      resolve()
-    }
-
-    proc.on('exit', () => {
-      log('Backend process terminated.')
-      settle()
-    })
-
-    // Step 1: attempt graceful HTTP shutdown
-    globalThis
-      .fetch(SHUTDOWN_URL, {
-        method: 'POST',
-        signal: AbortSignal.timeout(2000),
-      })
-      .then(() => log('Sent shutdown request to backend.'))
-      .catch(() => log('Shutdown endpoint unreachable — will force-kill.'))
-
-    // Step 2: after a grace period, force-kill the process tree
-    setTimeout(() => {
-      if (settled) return
-      if (!pid) {
-        settle()
-        return
-      }
-      log('Grace period expired — force-killing backend tree...')
-
-      try {
-        if (process.platform === 'win32') {
-          execFile('taskkill', ['/F', '/T', '/PID', String(pid)], { env: buildBaseEnv() }, (err) => {
-            if (err) log(`taskkill error: ${err.message}`)
-            else log('taskkill /T completed.')
-            settle()
-          })
-        } else {
-          // Kill the process group (negative PID) created by detached:true
-          process.kill(-pid, 'SIGKILL')
-          log('Sent SIGKILL to backend process group.')
-          settle()
+  log('Stopping the backend...')
+  const proc = backendProcess
+  const pid = proc.pid
+  // The order lives in ./backendStop.ts: ask the backend to shut down, wait out
+  // its shutdown handlers when it accepts, force-kill its tree when it refuses,
+  // never answers or runs past its budget.
+  return stopBackend({
+    requestShutdown: () =>
+      globalThis
+        .fetch(SHUTDOWN_URL, { method: 'POST', signal: AbortSignal.timeout(2000) })
+        .then((response) => response.ok),
+    onExit: (listener) => {
+      proc.on('exit', listener)
+    },
+    forceKill: () =>
+      new Promise<void>((done) => {
+        if (!pid) {
+          done()
+          return
         }
-      } catch {
-        settle()
-      }
-    }, 3000)
-
-    // Step 3: hard deadline so quit is never blocked forever
-    setTimeout(() => {
-      settle()
-    }, 6000)
-  })
+        try {
+          if (process.platform === 'win32') {
+            execFile('taskkill', ['/F', '/T', '/PID', String(pid)], { env: buildBaseEnv() }, (err) => {
+              if (err) log(`taskkill error: ${err.message}`)
+              else log('taskkill /T completed.')
+              done()
+            })
+          } else {
+            // Kill the process group (negative PID) created by detached:true
+            process.kill(-pid, 'SIGKILL')
+            log('Sent SIGKILL to backend process group.')
+            done()
+          }
+        } catch {
+          done()
+        }
+      }),
+    log,
+  }).then(() => undefined)
 }
 
 // ---------------------------------------------------------------------------

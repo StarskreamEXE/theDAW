@@ -42,6 +42,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
+from backend.admin_routes import SHUTDOWN_HANDLERS_STATE
 from backend.admin_routes import router as admin_router
 from backend.lib.audio_io import load_audio, load_audio_array, save_audio, save_subtype
 from backend.assistant_routes import mcp_relay_router
@@ -66,11 +67,17 @@ logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
-async def _lifespan(_: FastAPI):
+async def _lifespan(app_: FastAPI):
     """FastAPI lifespan (replaces the deprecated on_event hooks). The startup
     and shutdown bodies live in `_on_startup` / `_on_shutdown` below; globals
-    resolve at call time, so their later definition is fine."""
+    resolve at call time, so their later definition is fine.
+
+    `_on_shutdown` is also published on `app.state` for POST
+    /api/admin/shutdown and /restart: they end the process with os._exit, which
+    never reaches the code after `yield`, so they run the same handlers first
+    (backend/admin_routes.py)."""
     await _on_startup()
+    setattr(app_.state, SHUTDOWN_HANDLERS_STATE, _on_shutdown)
     yield
     await _on_shutdown()
 
@@ -1204,6 +1211,20 @@ async def _on_startup():
 
 
 async def _on_shutdown() -> None:
+    # The live VST hosts go first. POST /api/admin/shutdown gives this whole
+    # function one time budget (admin_routes.SHUTDOWN_HANDLER_BUDGET_SEC), and
+    # the sidecar stops below can wait many seconds each; the plugin state the
+    # hosts save is the user's work, and a slow sidecar must never cut it off.
+    try:
+        from backend.modules.vst.live_host import kill_all as stop_live_vst_hosts
+
+        # One native plugin host per live chain entry; each is asked to save
+        # its state before it is signalled, so this blocks — off the loop too.
+        await asyncio.to_thread(stop_live_vst_hosts)
+    except Exception:
+        # Never blocks the exit, but a failed stop can drop plugin state and
+        # leave host processes running; this line is the only trace of why.
+        logger.warning("shutdown: stopping the live VST hosts failed", exc_info=True)
     try:
         from backend.core.background_workers import get_background_queue
 
@@ -1228,15 +1249,7 @@ async def _on_shutdown() -> None:
         # Off the loop: sidecar stops block on process waits.
         await asyncio.to_thread(stop_all_sidecars)
     except Exception:
-        pass
-    try:
-        from backend.modules.vst.live_host import kill_all as stop_live_vst_hosts
-
-        # One native plugin host per live chain entry; each is asked to save
-        # its state before it is signalled, so this blocks — off the loop too.
-        await asyncio.to_thread(stop_live_vst_hosts)
-    except Exception:
-        pass
+        logger.warning("shutdown: stopping the sidecars failed", exc_info=True)
 
 
 @app.get("/api/modules")
@@ -2905,9 +2918,9 @@ except Exception as _sway_mount_err:  # noqa: BLE001 — never block boot on Swa
 # packaged desktop bundles ship a dist), so the desktop UI AND the phone
 # companion entry (frontend/mobile.html -> /mobile.html, with /assets at root)
 # are both reachable over http on the LAN. In pure dev (no dist) it is a no-op:
-# Vite serves the UI on ports.frontend_port() — :5173 unless another program
-# held it and the launcher moved the UI to the next free port — proxies /api to
-# :8600, and the phone loads http://<lan-ip>:<that port>/mobile.html directly.
+# Vite serves the UI on ports.frontend_port() -- :5173, the only port the
+# launchers start it on -- proxies /api to :8600, and the phone loads
+# http://<lan-ip>:<that port>/mobile.html directly.
 # GET /api/network/lan hands out that address; never hard-code 5173 here.
 _ui_dist = PROJECT_ROOT / "frontend" / "dist"
 _serve_ui = (
