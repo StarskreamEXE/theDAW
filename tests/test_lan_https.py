@@ -74,17 +74,27 @@ def test_it_is_on_by_default_with_no_settings_file_at_all() -> None:
     so an absent setting -- an empty dict, or a settings file that could not be
     read -- means ON."""
     assert lan_https.plan_lan_https({}, {}, LAN, CERT).enabled is True
+    assert lan_https.plan_lan_https({"lan": {}}, {}, LAN, CERT).enabled is True
+    assert lan_https.plan_lan_https({"lan": None}, {}, LAN, CERT).enabled is True
     assert lan_https.plan_lan_https({"app": {}}, {}, LAN, CERT).enabled is True
     assert lan_https.plan_lan_https({"app": None}, {}, LAN, CERT).enabled is True
 
 
+#: Where the switch is stored: ``lan.https``, and the schema-10 ``app.lan_https``
+#: a launcher still reads until the backend's store has moved it.
+SETTING_PLACES = [("lan", "https"), ("app", "lan_https")]
+
+
+@pytest.mark.parametrize(("section", "key"), SETTING_PLACES)
 @pytest.mark.parametrize("stored", [False, "false", "0", "no", "off", "OFF"])
-def test_the_setting_turns_it_off_and_says_so(stored: Any) -> None:
-    plan = lan_https.plan_lan_https({"app": {"lan_https": stored}}, {}, LAN, CERT)
+def test_the_setting_turns_it_off_and_says_so(
+    stored: Any, section: str, key: str
+) -> None:
+    plan = lan_https.plan_lan_https({section: {key: stored}}, {}, LAN, CERT)
     assert plan.enabled is False
     assert plan.url is None
     assert plan.reason is not None
-    assert "app.lan_https" in plan.reason
+    assert f"{section}.{key}" in plan.reason
     assert plan.log_line().startswith("LAN (https): off - ")
     # It names the levers that exist. It used to say "in Settings", and there
     # is no Settings control for this -- the file and the environment variable
@@ -93,13 +103,28 @@ def test_the_setting_turns_it_off_and_says_so(stored: Any) -> None:
     assert f"{lan_https.ENV_ENABLED}=1" in plan.reason
 
 
+@pytest.mark.parametrize(("section", "key"), SETTING_PLACES)
 @pytest.mark.parametrize("stored", [True, "true", "1", "on", "yes", "anything else"])
-def test_any_other_setting_value_leaves_it_on(stored: Any) -> None:
+def test_any_other_setting_value_leaves_it_on(
+    stored: Any, section: str, key: str
+) -> None:
     """Only ``false`` is off. A value nobody recognises must not silently take
     the feature away."""
-    assert lan_https.plan_lan_https(
-        {"app": {"lan_https": stored}}, {}, LAN, CERT
-    ).enabled
+    assert lan_https.plan_lan_https({section: {key: stored}}, {}, LAN, CERT).enabled
+
+
+def test_an_off_in_either_place_wins_and_names_its_key() -> None:
+    """A schema-10 build writes ``app.lan_https: true`` from its defaults and
+    keeps ``lan`` whole, so the two places can disagree. The one thing this
+    setting must never do is come back on after the user switched it off."""
+    old_off = {"lan": {"https": True}, "app": {"lan_https": False}}
+    new_off = {"lan": {"https": False}, "app": {"lan_https": True}}
+    for settings, named in ((old_off, "app.lan_https"), (new_off, "lan.https")):
+        plan = lan_https.plan_lan_https(settings, {}, LAN, CERT)
+        assert plan.enabled is False
+        assert plan.reason is not None and named in plan.reason
+        assert lan_https.stored_off_key(settings) == named
+    assert lan_https.stored_off_key({"lan": {"https": True}}) is None
 
 
 def test_the_environment_can_turn_it_off_for_one_launch() -> None:
@@ -109,8 +134,11 @@ def test_the_environment_can_turn_it_off_for_one_launch() -> None:
     assert lan_https.ENV_ENABLED in plan.reason
 
 
-def test_the_environment_can_turn_it_back_on_over_the_setting() -> None:
-    settings = {"app": {"lan_https": False}}
+@pytest.mark.parametrize(("section", "key"), SETTING_PLACES)
+def test_the_environment_can_turn_it_back_on_over_the_setting(
+    section: str, key: str
+) -> None:
+    settings = {section: {key: False}}
     env = {lan_https.ENV_ENABLED: "1"}
     assert lan_https.plan_lan_https(settings, env, LAN, CERT).enabled is True
 
@@ -140,9 +168,9 @@ def test_the_first_real_address_is_the_one_devices_are_told_to_use() -> None:
 def test_being_switched_off_is_checked_before_the_address_and_the_cert() -> None:
     """resolve_plan short-circuits on the cheap answer so a switched-off launch
     never shells out to openssl; blocking_reason is what it asks."""
-    off = {"app": {"lan_https": False}}
+    off = {"lan": {"https": False}}
     assert lan_https.blocking_reason(off, {}, []) is not None
-    assert "app.lan_https" in str(lan_https.blocking_reason(off, {}, []))
+    assert "lan.https" in str(lan_https.blocking_reason(off, {}, []))
     assert lan_https.blocking_reason({}, {}, LAN) is None
 
 
@@ -297,7 +325,8 @@ def test_the_cli_always_prints_one_plan_and_exits_zero(
 @pytest.mark.parametrize(
     ("settings", "addresses"),
     [
-        ({"app": {"lan_https": False}}, LAN),  # switched off
+        ({"lan": {"https": False}}, LAN),  # switched off
+        ({"app": {"lan_https": False}}, LAN),  # switched off, schema 10
         ({}, []),  # no network
     ],
 )

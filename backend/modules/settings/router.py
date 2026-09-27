@@ -44,6 +44,12 @@ router = APIRouter()
 #: rest of this route is a feature-toggle panel the phone companion uses.
 _FOLDER_LIST_KEYS = (("library", "media_roots"), ("models", "extra_folders"))
 
+#: Sections that decide how this machine serves the network. ``lan.https``
+#: says whether the next launch opens the LAN HTTPS listener, so a device on
+#: the LAN could otherwise switch the secure address off for every other
+#: device, or back on after the user turned it off. Held to the strict tier.
+_LOCAL_ONLY_SECTIONS = ("lan",)
+
 
 def _caller_may_see_folders(request: Request) -> bool:
     """The PATCH guard as a question rather than an answer.
@@ -86,6 +92,10 @@ def _folder_lists_touched(payload: dict[str, Any]) -> bool:
     )
 
 
+def _local_only_touched(payload: dict[str, Any]) -> bool:
+    return any(section in payload for section in _LOCAL_ONLY_SECTIONS)
+
+
 @router.get("")
 @router.get("/")
 def get_settings(request: Request) -> dict[str, Any]:
@@ -103,6 +113,9 @@ def patch_settings(
 ) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return _redacted_for(request, get_store().get_all())
+    if _local_only_touched(payload):
+        # 403 unless this machine's own UI or the desktop shell is asking.
+        require_loopback_or_launch_token(request)
     if _folder_lists_touched(payload):
         # 403 unless this machine's own UI or the desktop shell is asking.
         require_loopback_or_launch_token(request)
