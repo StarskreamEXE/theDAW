@@ -176,8 +176,14 @@ export interface LibraryState {
   getById: (id: string) => LibraryEntry | undefined;
   /** The full record for `id` (with full lyrics), fetched once and cached. */
   ensureEntry: (id: string) => Promise<LibraryEntry | null>;
-  /** Every id matching the current filters. Throws `LibraryIdCapError`. */
-  listFilteredIds: () => Promise<string[]>;
+  /**
+   * Every id matching the current filters. Throws `LibraryIdCapError`.
+   * `partial` is for the callers that follow the list on screen (play the
+   * list, a shift-click range, revealing a track): while the search index is
+   * still being built they get the matches the list shows. Without it
+   * (select-all) a search then throws `LibrarySearchIndexBuildingError`.
+   */
+  listFilteredIds: (options?: { partial?: boolean }) => Promise<string[]>;
   /** Load `fields`' facets for the current query, or answer from the cache. */
   ensureFacets: (fields: readonly LibraryFacetField[]) => Promise<void>;
   /**
@@ -598,10 +604,12 @@ export const useLibraryStore = create<LibraryState>()((set, get) => {
       return run;
     },
 
-    listFilteredIds: async () => {
+    listFilteredIds: async (options) => {
       // An unpaged library has every row in hand: those ARE every id.
       if (!get().paged) return get().entries.map((e) => e.id);
-      const res = await fetchLibraryIds(get().getQuery());
+      const res = await fetchLibraryIds(get().getQuery(), undefined, undefined, {
+        partial: options?.partial === true,
+      });
       if (res === null) return get().entries.map((e) => e.id);
       return res.ids;
     },
@@ -641,6 +649,10 @@ export const useLibraryStore = create<LibraryState>()((set, get) => {
             set({ facets: answer.facets });
           }
         } catch (e) {
+          // The library is still opening: nothing failed. The dropdowns keep
+          // what they have, and the first page after the open carries a new
+          // revision, which asks for the facets again.
+          if (e instanceof LibraryOpeningError) return;
           logError('library', `facets failed: ${e instanceof Error ? e.message : String(e)}`);
         } finally {
           facetsInFlight.delete(key);

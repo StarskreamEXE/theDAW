@@ -190,3 +190,15 @@ export function searchCoverageText(coverage: LibrarySearchCoverage): string {
     'until the search index finishes building.'
   );
 }
+
+/**
+ * What an empty list says while the backend refuses it (`libraryOpening`):
+ * it appears once the library has opened, or, after a failed open, where
+ * the reason and the Retry button are.
+ */
+export function libraryOpeningText(status: LibraryIndexStatus | null): string {
+  if (status?.phase === 'failed' && !status.opened) {
+    return 'The library could not be opened. The reason and a Retry button are above the list.';
+  }
+  return 'The list appears when the library has finished opening.';
+}

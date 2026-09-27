@@ -27,12 +27,21 @@ export interface LibraryIndexProgressViewProps {
   libraryOpening: boolean;
   /** The last searched page's coverage, when the list is searched. */
   searchCoverage: LibrarySearchCoverage | null;
+  /** The failure alert's Retry button; no button without it. */
+  onRetry?: () => void;
+  /** True while a Retry request is out (the button is disabled). */
+  retrying?: boolean;
+  /** The last Retry request's failure, shown under the button. */
+  retryError?: string | null;
 }
 
 export const LibraryIndexProgressView: React.FC<LibraryIndexProgressViewProps> = ({
   status,
   libraryOpening,
   searchCoverage,
+  onRetry,
+  retrying = false,
+  retryError = null,
 }) => {
   const labelId = useId();
   const partialSearch = searchCoverage !== null && !searchCoverage.complete;
@@ -46,6 +55,18 @@ export const LibraryIndexProgressView: React.FC<LibraryIndexProgressViewProps> =
       >
         <p>{status.label || 'The library could not be opened'}</p>
         {status.error && <p className="mt-0.5 wrap-break-word text-rose-200">{status.error}</p>}
+        {onRetry && (
+          <button
+            type="button"
+            onClick={onRetry}
+            disabled={retrying}
+            aria-label={retrying ? 'Retrying' : 'Retry opening the library'}
+            className="mt-1.5 rounded border border-rose-400/60 bg-rose-500/20 px-2 py-0.5 text-xs font-bold text-rose-50 hover:bg-rose-500/35 disabled:opacity-50"
+          >
+            {retrying ? 'Retrying…' : 'Retry'}
+          </button>
+        )}
+        {retryError && <p className="mt-0.5 wrap-break-word text-rose-200">Retry failed: {retryError}</p>}
       </div>
     );
   }
@@ -124,6 +145,9 @@ export const LibraryIndexProgress: React.FC = () => {
   const libraryOpening = useLibraryStore((s) => s.libraryOpening);
   const searchQuery = useLibraryStore((s) => s.searchQuery);
   const searchIndex = useLibraryStore((s) => s.searchIndex);
+  const retry = useLibraryIndexStatus((s) => s.retry);
+  const retrying = useLibraryIndexStatus((s) => s.retrying);
+  const retryError = useLibraryIndexStatus((s) => s.retryError);
 
   useEffect(() => {
     // Once per mount: a library opened before the tab was shown answers
@@ -136,6 +160,11 @@ export const LibraryIndexProgress: React.FC = () => {
       status={status}
       libraryOpening={libraryOpening}
       searchCoverage={searchQuery.trim() ? searchIndex : null}
+      onRetry={() => {
+        void retry();
+      }}
+      retrying={retrying}
+      retryError={retryError}
     />
   );
 };

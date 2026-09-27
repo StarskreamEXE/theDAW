@@ -22,6 +22,7 @@ import {
   asIndexStatus,
   formatEta,
   indexProgressView,
+  libraryOpeningText,
   searchCoverageText,
   type LibraryIndexStatus,
 } from '../../lib/libraryIndexStatus.ts';
@@ -120,6 +121,31 @@ assert.equal(
   assert.ok(html.includes('The search index build stopped'));
   assert.ok(html.includes('disk full'));
   assert.ok(!html.includes('role="progressbar"'));
+  assert.ok(!html.includes('<button'), 'no Retry button without a handler');
+}
+
+// ── failed with a Retry handler: a real, named button in the alert ─────────
+{
+  const failed = snap({ phase: 'failed', label: 'The library could not be opened', error: 'the folder cannot be read', opened: false });
+  const html = renderToStaticMarkup(
+    <LibraryIndexProgressView status={failed} libraryOpening searchCoverage={null} onRetry={() => {}} />,
+  );
+  assert.ok(html.includes('role="alert"'));
+  assert.ok(/<button type="button"[^>]*aria-label="Retry opening the library"[^>]*>Retry<\/button>/.test(html), html);
+  assert.ok(html.includes('text-xs font-bold'), 'the button text is bold sans at 12 px');
+  const busy = renderToStaticMarkup(
+    <LibraryIndexProgressView status={failed} libraryOpening searchCoverage={null} onRetry={() => {}} retrying retryError="HTTP 500" />,
+  );
+  assert.ok(busy.includes('disabled=""'), 'disabled while the request is out');
+  assert.ok(busy.includes('>Retrying…<'));
+  assert.ok(busy.includes('Retry failed: HTTP 500'));
+  // The empty list points at the alert after a failed open, not at a wait.
+  assert.equal(
+    libraryOpeningText(failed),
+    'The library could not be opened. The reason and a Retry button are above the list.',
+  );
+  assert.equal(libraryOpeningText(snap({ phase: 'upgrade' })), 'The list appears when the library has finished opening.');
+  assert.equal(libraryOpeningText(null), 'The list appears when the library has finished opening.');
 }
 
 // ── a search during the build says what it covers ──────────────────────────

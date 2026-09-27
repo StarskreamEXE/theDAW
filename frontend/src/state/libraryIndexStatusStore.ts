@@ -16,9 +16,14 @@
  * builds), and the step from a working phase to `ready` (every search answer
  * cached meanwhile covered part of the library). Both ask the counts store
  * for the new library revision and fetch the visible range again.
+ *
+ * A failed open (or a search index build that stopped) stays `failed`: the
+ * backend's status route never starts another attempt. `retry` is the alert's
+ * Retry button: it asks the backend to try again and watches the new attempt.
  */
 import { create } from 'zustand';
 import {
+  asIndexStatus,
   fetchLibraryIndexStatus,
   isWorkingPhase,
   type LibraryIndexStatus,
@@ -35,6 +40,17 @@ export const INDEX_STATUS_RETRY_MS = 3000;
 
 export type IndexStatusFetcher = (signal?: AbortSignal) => Promise<LibraryIndexStatus | null>;
 
+/**
+ * `POST /api/library/retry-open`: open the library again after a failed open,
+ * or restart a search index build that stopped. Answers the snapshot of the
+ * new attempt.
+ */
+export async function requestLibraryRetry(base: string = '/api/library'): Promise<LibraryIndexStatus | null> {
+  const r = await fetch(`${base}/retry-open`, { method: 'POST' });
+  if (!r.ok) throw new Error(`library.retry-open: HTTP ${r.status}`);
+  return asIndexStatus(await r.json());
+}
+
 export interface LibraryIndexStatusState {
   /** The last snapshot, or null before the first answer. */
   status: LibraryIndexStatus | null;
@@ -46,6 +62,12 @@ export interface LibraryIndexStatusState {
   watch: () => void;
   /** Stop polling (the next `watch` starts again). */
   stop: () => void;
+  /** True while a Retry request is out. */
+  retrying: boolean;
+  /** The last Retry request's failure, or null. */
+  retryError: string | null;
+  /** The failure alert's Retry button: try again, then watch the attempt. */
+  retry: () => Promise<void>;
 }
 
 let fetcher: IndexStatusFetcher = (signal) => fetchLibraryIndexStatus(signal);
@@ -60,7 +82,31 @@ let reopenAsked = false;
 export function setIndexStatusFetcher(next: IndexStatusFetcher): void {
   fetcher = next;
   useLibraryIndexStatus.getState().stop();
-  useLibraryIndexStatus.setState({ status: null, supported: true });
+  useLibraryIndexStatus.setState({ status: null, supported: true, retrying: false, retryError: null });
+}
+
+/**
+ * Resolves once the library answers requests (`opened`, even while the
+ * search index still builds) or its open has failed, watching until then.
+ * What a request refused with "the library is opening" waits on before it
+ * asks again. `refused` is the snapshot that refusal carried: it replaces
+ * whatever this store last heard (which may be a `ready` from before the
+ * backend restarted), so the wait is for a poll after the refusal.
+ */
+export function whenLibraryOpen(refused?: LibraryIndexStatus): Promise<LibraryIndexStatus | null> {
+  const settled = (s: LibraryIndexStatusState): boolean =>
+    !s.supported || (s.status !== null && (s.status.opened || s.status.phase === 'ready' || s.status.phase === 'failed'));
+  if (refused) useLibraryIndexStatus.setState({ status: refused });
+  const now = useLibraryIndexStatus.getState();
+  if (settled(now)) return Promise.resolve(now.status);
+  return new Promise((resolve) => {
+    const unsubscribe = useLibraryIndexStatus.subscribe((s) => {
+      if (!settled(s)) return;
+      unsubscribe();
+      resolve(s.status);
+    });
+    useLibraryIndexStatus.getState().watch();
+  });
 }
 
 /** Ask for the list (and the counts) again. */
@@ -108,7 +154,9 @@ export const useLibraryIndexStatus = create<LibraryIndexStatusState>((set, get) 
     }
     const previous = get().status;
     set({ status: next });
-    if (next.opened && !reopenAsked && useLibraryStore.getState().libraryOpening) {
+    const refused =
+      useLibraryStore.getState().libraryOpening || useLibraryCounts.getState().status === 'opening';
+    if (next.opened && !reopenAsked && refused) {
       // The store answers now (the search index may still be building): the
       // list that was refused during the upgrade can be shown.
       reopenAsked = true;
@@ -128,6 +176,8 @@ export const useLibraryIndexStatus = create<LibraryIndexStatusState>((set, get) 
     status: null,
     supported: true,
     watching: false,
+    retrying: false,
+    retryError: null,
     watch: () => {
       if (!get().supported || get().watching) return;
       set({ watching: true });
@@ -143,7 +193,33 @@ export const useLibraryIndexStatus = create<LibraryIndexStatusState>((set, get) 
       controller = null;
       set({ watching: false });
     },
+    retry: async () => {
+      if (get().retrying) return;
+      set({ retrying: true, retryError: null });
+      try {
+        const next = await requestLibraryRetry();
+        logInfo('library', 'Retry: the backend is trying again');
+        // The next refusal of the list starts from a clean slate, so the
+        // open that succeeds refetches it.
+        reopenAsked = false;
+        if (next) set({ status: next });
+        get().stop();
+        get().watch();
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        set({ retryError: msg });
+        logWarn('library', `retry failed: ${msg}`);
+      } finally {
+        set({ retrying: false });
+      }
+    },
   };
+});
+
+// The counts were refused because the library is opening: watch, so they are
+// asked for again once it has opened.
+useLibraryCounts.subscribe((s, prev) => {
+  if (s.status === 'opening' && prev.status !== 'opening') useLibraryIndexStatus.getState().watch();
 });
 
 // The list says the library is opening, or a search says the index is still

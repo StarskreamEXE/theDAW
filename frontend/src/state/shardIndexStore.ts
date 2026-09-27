@@ -11,6 +11,8 @@ import { create } from 'zustand';
 import { useLibraryStore, type LibraryEntry } from './libraryStore';
 import { useLibraryCounts } from './libraryCountsStore';
 import { resolveLibraryEntryRef } from '../lib/backendLocalProvider';
+import { LibraryOpeningError } from '../lib/libraryIndexStatus';
+import { whenLibraryOpen } from './libraryIndexStatusStore';
 import { logError, logInfo } from './logStore';
 import type { LoomQuery, LoomRole } from '../lib/loomScore';
 
@@ -206,6 +208,11 @@ let refCacheRevision = -1;
  * fragment — to an id, over the WHOLE library: the backend answers it
  * (`GET /api/library/entries/resolve`), so a song on no page the LIBRARY tab
  * has loaded is found all the same. An id already in hand is answered at once.
+ *
+ * While the backend is still opening the library the route answers 503: the
+ * lookup waits until the library has opened and asks again, so a LOOM score
+ * opened during a schema upgrade finds its tracks once the upgrade is over.
+ * A failed open answers null, with the reason in the LOG.
  */
 export function resolveEntryRef(ref: string): Promise<string | null> {
   // An id on a loaded page. Not `getById`: that fetches an id it does not
@@ -218,13 +225,23 @@ export function resolveEntryRef(ref: string): Promise<string | null> {
   }
   const cached = refCache.get(ref);
   if (cached) return cached;
-  const run = resolveLibraryEntryRef(ref)
-    .then((id) => (id === undefined ? resolveEntryRefIn(ref, useLibraryStore.getState().entries) : id))
-    .catch((e: unknown) => {
-      refCache.delete(ref);
-      logError('loom', `Could not look up "${ref}" in the library: ${e instanceof Error ? e.message : String(e)}`);
-      return null;
-    });
+  const ask = async (): Promise<string | null> => {
+    for (;;) {
+      try {
+        const id = await resolveLibraryEntryRef(ref);
+        return id === undefined ? resolveEntryRefIn(ref, useLibraryStore.getState().entries) : id;
+      } catch (e) {
+        if (!(e instanceof LibraryOpeningError) || e.status.phase === 'failed') throw e;
+        const status = await whenLibraryOpen(e.status);
+        if (status === null || status.phase === 'failed') throw e;
+      }
+    }
+  };
+  const run = ask().catch((e: unknown) => {
+    refCache.delete(ref);
+    logError('loom', `Could not look up "${ref}" in the library: ${e instanceof Error ? e.message : String(e)}`);
+    return null;
+  });
   refCache.set(ref, run);
   return run;
 }

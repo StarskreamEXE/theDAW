@@ -3,6 +3,8 @@ import { Database, Loader2, Minimize2 } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { useLibraryStore } from '../state/libraryStore';
 import { LibraryIndexProgress } from '../components/library/LibraryIndexProgress';
+import { useLibraryIndexStatus } from '../state/libraryIndexStatusStore';
+import { libraryOpeningText } from '../lib/libraryIndexStatus';
 import { useCatalogueUiStore, selectSearchState } from './catalogueUiStore';
 import { applyCatalogueServerQuery, filterAndSort, isServerOnly } from './catalogSearch';
 import { CatalogueFilterBar } from './CatalogueFilterBar';
@@ -39,6 +41,7 @@ export const CatalogueView: React.FC<{ onCollapse?: () => void }> = ({ onCollaps
   const pagesLoading = useLibraryStore((s) => s.pagesLoading);
   const pageError = useLibraryStore((s) => s.pageError);
   const libraryOpening = useLibraryStore((s) => s.libraryOpening);
+  const indexStatus = useLibraryIndexStatus((s) => s.status);
   const entryAt = useLibraryStore((s) => s.entryAt);
   const getById = useLibraryStore((s) => s.getById);
   const lookupVersion = useLibraryStore((s) => s.lookupVersion);
@@ -173,11 +176,11 @@ export const CatalogueView: React.FC<{ onCollapse?: () => void }> = ({ onCollaps
             <div className="flex-1 flex flex-col items-center justify-center opacity-30 italic gap-2">
               <Database className="w-8 h-8" />
               {libraryOpening ? (
-                <p className="text-xs font-bold not-italic">The list appears when the library has finished opening.</p>
+                <p className="text-xs font-bold not-italic">{libraryOpeningText(indexStatus)}</p>
               ) : searchState.query.trim() || !serverOnly || searchState.onlyFavorites ? (
-                <p className="text-[11px]">No entries match your search.</p>
+                <p className="text-xs font-bold">No entries match your search.</p>
               ) : (
-                <p className="text-[11px]">Library is empty — generate or import a track.</p>
+                <p className="text-xs font-bold">Library is empty — generate or import a track.</p>
               )}
             </div>
           ) : viewMode === 'list' ? (
