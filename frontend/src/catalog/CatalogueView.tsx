@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Database, Loader2, Minimize2 } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { useLibraryStore } from '../state/libraryStore';
+import { LibraryIndexProgress } from '../components/library/LibraryIndexProgress';
 import { useCatalogueUiStore, selectSearchState } from './catalogueUiStore';
 import { applyCatalogueServerQuery, filterAndSort, isServerOnly } from './catalogSearch';
 import { CatalogueFilterBar } from './CatalogueFilterBar';
@@ -37,6 +38,7 @@ export const CatalogueView: React.FC<{ onCollapse?: () => void }> = ({ onCollaps
   const total = useLibraryStore((s) => s.total);
   const pagesLoading = useLibraryStore((s) => s.pagesLoading);
   const pageError = useLibraryStore((s) => s.pageError);
+  const libraryOpening = useLibraryStore((s) => s.libraryOpening);
   const entryAt = useLibraryStore((s) => s.entryAt);
   const getById = useLibraryStore((s) => s.getById);
   const lookupVersion = useLibraryStore((s) => s.lookupVersion);
@@ -144,6 +146,11 @@ export const CatalogueView: React.FC<{ onCollapse?: () => void }> = ({ onCollaps
           <Loader2 className="w-2.5 h-2.5 animate-spin text-purple-400" aria-label="Loading more rows" />
         )}
       </div>
+      {/* The backend opening the library (upgrade, first read, search index
+          build); hidden once it is ready. */}
+      <div className="shrink-0 mx-2 mb-1 empty:hidden">
+        <LibraryIndexProgress />
+      </div>
       {pageError && (
         <div
           role="alert"
@@ -165,7 +172,9 @@ export const CatalogueView: React.FC<{ onCollapse?: () => void }> = ({ onCollaps
           {rowCount === 0 && pagesLoading === 0 ? (
             <div className="flex-1 flex flex-col items-center justify-center opacity-30 italic gap-2">
               <Database className="w-8 h-8" />
-              {searchState.query.trim() || !serverOnly || searchState.onlyFavorites ? (
+              {libraryOpening ? (
+                <p className="text-xs font-bold not-italic">The list appears when the library has finished opening.</p>
+              ) : searchState.query.trim() || !serverOnly || searchState.onlyFavorites ? (
                 <p className="text-[11px]">No entries match your search.</p>
               ) : (
                 <p className="text-[11px]">Library is empty — generate or import a track.</p>

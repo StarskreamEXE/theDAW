@@ -27,6 +27,7 @@ import { MicRecorder } from '../components/audio/MicRecorder';
 import { Section } from '../components/ui/Section';
 import { useLibraryStore, LibraryIdCapError, type LibraryEntry } from '../state/libraryStore';
 import { LibraryStatsStrip } from '../components/library/LibraryStatsStrip';
+import { LibraryIndexProgress } from '../components/library/LibraryIndexProgress';
 import {
   describeBulkConflict,
   LibraryBulkConflictError,
@@ -912,6 +913,7 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
   const total = useLibraryStore((s) => s.total);
   const pagesLoading = useLibraryStore((s) => s.pagesLoading);
   const pageError = useLibraryStore((s) => s.pageError);
+  const libraryOpening = useLibraryStore((s) => s.libraryOpening);
   const entryAt = useLibraryStore((s) => s.entryAt);
   const ensureRange = useLibraryStore((s) => s.ensureRange);
   const getById = useLibraryStore((s) => s.getById);
@@ -1667,6 +1669,10 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
           LIBRARY ANALYSIS section. */}
       <LibraryStatsStrip total={total} searchQuery={searchQuery} loadedRows={entries.length} />
 
+      {/* The backend opening the library: schema upgrade, first read, search
+          index build. Hidden once the library is ready. */}
+      <LibraryIndexProgress />
+
       {/* Stems running banner. Shows live phase + progress + an Abort
           button so the user can bail without right-click-finding the
           original entry. */}
@@ -2148,7 +2154,9 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
           {total === 0 && pagesLoading === 0 && !pageError ? (
             <div className="py-8 flex flex-col items-center justify-center opacity-30 italic gap-2">
               <Database className="w-8 h-8" />
-              {searchQuery.trim() || onlyFavorites ? (
+              {libraryOpening ? (
+                <p className="text-xs font-bold not-italic">The list appears when the library has finished opening.</p>
+              ) : searchQuery.trim() || onlyFavorites ? (
                 <p>No entries match your filter.</p>
               ) : (
                 <>

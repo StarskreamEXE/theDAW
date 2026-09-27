@@ -18,6 +18,7 @@ import { fetchBlobWithRetry } from './fetchRetry';
 import type { LibraryFacetField, LibraryFacetValue, LibraryFacets } from './libraryFacets';
 import { stripSourceId } from './displayName';
 import { logWarn } from '../state/logStore';
+import { asSearchCoverage, openingErrorFrom, type LibrarySearchCoverage } from './libraryIndexStatus';
 
 export type {
   LibraryFacetField,
@@ -475,6 +476,12 @@ export interface LibraryPage {
   limit: number;
   /** The `library_revision` the page was read at. */
   revision: number;
+  /**
+   * A searched page's `search_index`, or null when the page was not searched
+   * (or the backend does not say). `complete: false` means the search index
+   * is still being built and the page covers the indexed entries only.
+   */
+  searchIndex?: LibrarySearchCoverage | null;
 }
 
 /**
@@ -542,6 +549,7 @@ const asPage = (body: unknown): LibraryPage | null => {
     offset?: unknown;
     limit?: unknown;
     revision?: unknown;
+    search_index?: unknown;
   };
   if (typeof b.total !== 'number' || !Number.isFinite(b.total)) return null;
   if (!Array.isArray(b.entries)) return null;
@@ -551,6 +559,7 @@ const asPage = (body: unknown): LibraryPage | null => {
     offset: typeof b.offset === 'number' ? b.offset : 0,
     limit: typeof b.limit === 'number' ? b.limit : LIBRARY_PAGE_SIZE,
     revision: typeof b.revision === 'number' ? b.revision : 0,
+    searchIndex: asSearchCoverage(b.search_index),
   };
 };
 
@@ -581,6 +590,9 @@ export async function fetchLibraryList(
   params.set('offset', String(offset));
   const r = await fetch(`${base}/entries?${params.toString()}`, { signal });
   if (!r.ok) {
+    // 503 while the library is still opening: the caller shows the progress.
+    const opening = await openingErrorFrom(r);
+    if (opening) throw opening;
     const detail = await errorText(r);
     if (r.status === 400 && detail.startsWith('sort must be one of')) {
       throw new LibrarySortUnsupportedError(query.sort, detail);
