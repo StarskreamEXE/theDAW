@@ -9,12 +9,14 @@ warned. detect_key now fits the analysis to the clip and scales its
 confidence by how much of the 3 s the clip held.
 
 Each test runs with UserWarnings raised as errors (librosa's "n_fft is too
-large" is one), so a clip that still gets an FFT larger than itself fails the
-test.
+large" is one). detect_key reports a chroma_cqt that raised as "no key", so the
+key tests fail on such a warning through their key assertion; the sweeps record
+the warnings and assert there are none.
 """
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -98,14 +100,11 @@ def test_a_long_clip_keeps_librosas_default_analysis(tmp_path: Path) -> None:
     y = _progression(2, 4.0)
     path = tmp_path / "long.wav"
     save_audio(path, y[None, :], SR)
-    plan = key_mod.chroma_plan(y.size, SR)
-    assert (plan.bins_per_octave, plan.n_octaves, plan.tuning, plan.coverage) == (
-        36,
-        7,
-        None,
-        1.0,
-    )
+    plan = key_mod.chroma_plan(y, SR)
+    assert (plan.bins_per_octave, plan.n_octaves, plan.coverage) == (36, 7, 1.0)
     assert plan.fmin == pytest.approx(librosa.note_to_hz("C1"))
+    # The tuning chroma_cqt would estimate for itself at 36 bins.
+    assert plan.tuning == librosa.estimate_tuning(y=y, sr=SR, bins_per_octave=36)
 
     result = key_mod.detect_key(path, y_sr=(y, SR))
     chroma = librosa.feature.chroma_cqt(y=y, sr=SR, hop_length=512)
@@ -113,21 +112,75 @@ def test_a_long_clip_keeps_librosas_default_analysis(tmp_path: Path) -> None:
     assert result["confidence"] == pytest.approx(max(major + minor))
 
 
-@pytest.mark.parametrize("sr", [16000, 22050, 44100, 48000])
+def _librosa_top_fft(sr: int, bins: int) -> int:
+    """The FFT librosa's CQT gives the top octave (C7..B7) at ``sr``, taken
+    from librosa's own filter lengths."""
+    import librosa
+
+    freqs = librosa.interval_frequencies(
+        n_bins=bins,
+        fmin=librosa.note_to_hz("C7"),
+        intervals="equal",
+        bins_per_octave=bins,
+    )
+    lengths, _ = librosa.filters.wavelet_lengths(freqs=freqs, sr=sr)
+    return int(2 ** np.ceil(np.log2(np.max(lengths))))
+
+
+# The rates callers decode at, and odd native rates the analyzer meets at the
+# file's own rate. 31.5 and 62 kHz are where a Q of 1 / (2**(1/b) - 1), a
+# little under librosa's, rounds to a power of two below librosa's FFT.
+_RATES = [11025, 15500, 15700, 16000, 22050, 31000, 31500, 44100, 48000, 62000]
+
+
+def _fft_warnings(path: Path, y: np.ndarray, sr: int, hop: int = 512) -> list[str]:
+    """librosa's "n_fft is too large" warnings from one detect_key call.
+    Recorded, not raised: detect_key reports a chroma_cqt failure as "no key",
+    so a warning raised inside it would never reach the test."""
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("always")
+        key_mod.detect_key(path, y_sr=(y, sr), chroma_hop=hop)
+    return [str(w.message) for w in seen if "too large" in str(w.message)]
+
+
+@pytest.mark.parametrize("sr", _RATES)
 @pytest.mark.parametrize("hop", [512, 2048])
 def test_no_length_gets_an_fft_larger_than_itself(
     tmp_path: Path, sr: int, hop: int
 ) -> None:
-    """Lengths on both sides of every octave boundary of both plans, at the
-    rates callers decode at and the two hop sizes they pass."""
+    """Lengths on both sides of every octave boundary of both plans, with the
+    boundaries taken from librosa's filter lengths, plus a stride through the
+    first three seconds, at each rate and at the two hop sizes callers pass.
+    librosa's own warning is the judge: it fires for any octave whose FFT is
+    longer than the signal that octave runs on."""
     path = tmp_path / "x.wav"
     path.write_bytes(b"")
-    lengths: set[int] = set()
+    lengths: set[int] = set(range(300, 3 * sr, sr // 7))
     for bins in (key_mod._SHORT_BINS_PER_OCTAVE, key_mod._FULL_BINS_PER_OCTAVE):
-        fft = key_mod._octave_fft_size(sr, bins)
+        fft = _librosa_top_fft(sr, bins)
         for i in range(key_mod._FULL_OCTAVES):
             edge = fft * 2**i
             lengths.update({edge - 1, edge, edge + 1})
     for n in sorted(lengths):
         y = _progression(9, n / sr, sr)
-        key_mod.detect_key(path, y_sr=(y, sr), chroma_hop=hop)
+        assert _fft_warnings(path, y, sr, hop) == [], (sr, hop, n)
+
+
+def test_the_31500_hz_clip_the_old_q_let_through(tmp_path: Path) -> None:
+    """8192 samples at 31.5 kHz: the plan that modelled Q as 1 / (2**(1/b) - 1)
+    chose 12 bins over 6 octaves there, and librosa warned "n_fft=512 is too
+    large for input signal of length=256"."""
+    path = tmp_path / "x.wav"
+    path.write_bytes(b"")
+    y = _progression(9, 8192 / 31500, 31500)
+    assert _fft_warnings(path, y, 31500) == []
+    result = key_mod.detect_key(path, y_sr=(y, 31500))
+    assert result["key"] is not None
+
+
+def test_silence_reports_no_key(tmp_path: Path) -> None:
+    path = tmp_path / "x.wav"
+    path.write_bytes(b"")
+    y = np.zeros(SR * 2, dtype=np.float32)
+    result = key_mod.detect_key(path, y_sr=(y, SR))
+    assert result == {"key": None, "scale": None, "confidence": None, "strength": None}

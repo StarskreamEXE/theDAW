@@ -38,32 +38,106 @@ MIN_CHROMA_OCTAVES = 3
 _TUNING_FFT = 2048
 
 
-def _octave_fft_size(sr: float, bins_per_octave: int) -> int:
-    """The FFT size librosa's CQT gives each octave at sample rate ``sr``.
+@dataclass(frozen=True)
+class _OctaveFrame:
+    """One octave of librosa's CQT: its FFT size, the length of the signal it
+    runs on, and how many times that signal was halved to get there."""
 
-    The CQT runs octave by octave, halving the signal between octaves, and
-    every octave's filters are the same length in samples: the longest one,
-    the lowest bin of the top octave (C7 here), is ``Q * sr / f`` long with
-    ``Q = 1 / (2 ** (1 / bins) - 1)``. Each octave's FFT is that length
-    rounded up to a power of two.
+    n_fft: int
+    length: int
+    halvings: int
+
+
+def _two_factors(x: int) -> int:
+    count = 0
+    while x > 0 and x % 2 == 0:
+        count += 1
+        x //= 2
+    return count
+
+
+def _octave_frames(
+    n_samples: int,
+    sr: float,
+    hop_length: int,
+    bins_per_octave: int,
+    n_octaves: int,
+    fmin: float,
+) -> Optional[list[_OctaveFrame]]:
+    """The octaves ``librosa.cqt`` computes for this signal, top octave first.
+
+    A replay of librosa.core.constantq.vqt without the transform. The filter
+    lengths come from ``librosa.filters.wavelet_lengths``, so the Q is
+    librosa's own (``filter_scale / alpha``, ``alpha = (r**2 - 1) / (r**2 +
+    1)``). Each octave's FFT is its longest filter rounded up to a power of
+    two. The signal is halved where vqt halves it: the early downsampling
+    before the first octave, and between octaves while the hop is even and the
+    next octave's top bin is at most a fifth of the rate; a halved signal is
+    ``ceil(n / 2)`` long (librosa.resample). ``fmin`` is the tuned bottom
+    frequency, the one vqt computes from the tuning. None when librosa would
+    refuse the range (its top filter reaches past Nyquist).
     """
-    q = 1.0 / (2.0 ** (1.0 / bins_per_octave) - 1.0)
-    top_octave_low_hz = _C1_HZ * 2.0 ** (_FULL_OCTAVES - 1)
-    return 2 ** math.ceil(math.log2(q * sr / top_octave_low_hz))
+    import librosa
+    import numpy as np
+
+    n_bins = bins_per_octave * n_octaves
+    freqs = librosa.interval_frequencies(
+        n_bins=n_bins,
+        fmin=fmin,
+        intervals="equal",
+        bins_per_octave=bins_per_octave,
+        sort=True,
+    )
+    _lengths, cutoff = librosa.filters.wavelet_lengths(freqs=freqs, sr=sr)
+    nyquist = sr / 2.0
+    if cutoff > nyquist:
+        return None
+    # constantq.__early_downsample_count
+    count1 = max(0, int(np.ceil(np.log2(nyquist / cutoff)) - 1) - 1)
+    count2 = max(0, _two_factors(hop_length) - n_octaves + 1)
+    halvings = min(count1, count2)
+    my_sr = sr / 2.0**halvings
+    my_hop = hop_length // 2**halvings
+    length = n_samples
+    for _ in range(halvings):
+        length = math.ceil(length / 2)
+    frames: list[_OctaveFrame] = []
+    for i in range(n_octaves):
+        hi = n_bins - bins_per_octave * i
+        lo = hi - bins_per_octave
+        lengths, _cut = librosa.filters.wavelet_lengths(freqs=freqs[lo:hi], sr=my_sr)
+        n_fft = int(2.0 ** np.ceil(np.log2(float(np.max(lengths)))))
+        frames.append(_OctaveFrame(n_fft=n_fft, length=length, halvings=halvings))
+        if i < n_octaves - 1 and my_hop % 2 == 0 and freqs[lo - 1] <= my_sr / 5:
+            my_hop //= 2
+            my_sr /= 2.0
+            length = math.ceil(length / 2)
+            halvings += 1
+    return frames
 
 
-def _fitted_octaves(n_samples: int, sr: float, bins_per_octave: int) -> int:
-    """How many octaves, counted down from C8, a clip of ``n_samples`` fills.
+def _fits(frames: Optional[list[_OctaveFrame]]) -> bool:
+    """Whether every octave's FFT fits the signal it runs on (librosa.stft
+    zero-pads a longer frame and warns)."""
+    return frames is not None and all(f.n_fft <= f.length for f in frames)
 
-    Octave ``i`` below the top sees the signal halved ``i`` times, and its FFT
-    must fit what is left: ``n_samples / 2**i >= fft``. Octaves that fail it
-    are left out (librosa would zero-pad a frame longer than the signal and
-    warn).
-    """
-    fft = _octave_fft_size(sr, bins_per_octave)
-    if n_samples < fft:
-        return 0
-    return min(_FULL_OCTAVES, int(math.floor(math.log2(n_samples / fft))) + 1)
+
+def _needed_length(frames: Optional[list[_OctaveFrame]]) -> float:
+    """The clip length at which every octave of ``frames`` is filled."""
+    if not frames:
+        return math.inf
+    return float(max(f.n_fft * 2**f.halvings for f in frames))
+
+
+def _tuning(y, sr: float, bins_per_octave: int) -> float:
+    """The clip's tuning in fractions of a bin, estimated the way chroma_cqt
+    estimates it (``librosa.estimate_tuning`` at the plan's resolution). A clip
+    shorter than one estimator frame is taken at A440."""
+    if int(y.shape[-1]) < _TUNING_FFT:
+        return 0.0
+    import librosa
+
+    return float(librosa.estimate_tuning(y=y, sr=sr, bins_per_octave=bins_per_octave))
 
 
 @dataclass(frozen=True)
@@ -74,35 +148,49 @@ class ChromaPlan:
     bins_per_octave: int
     n_octaves: int
     fmin: float
-    # None lets chroma_cqt estimate the tuning; a clip shorter than the
-    # estimator's frame is taken at A440 (0.0).
-    tuning: Optional[float]
+    # The clip's tuning at this resolution, handed to chroma_cqt so the plan
+    # and the transform use the same tuned bottom frequency.
+    tuning: float
     coverage: float
 
 
-def chroma_plan(n_samples: int, sr: float) -> ChromaPlan:
-    """The chroma parameters that fit a clip of ``n_samples`` at ``sr``.
+def chroma_plan(y, sr: float, hop_length: int = 512) -> ChromaPlan:
+    """The chroma parameters that fit the mono clip ``y`` at ``sr``.
 
-    The full plan (36 bins per octave, C1..C8) whenever the clip holds it,
-    from about 3 s. A shorter clip gets one bin per semitone over as many
-    octaves as fit it. ``coverage`` is the clip's length over the length the
-    full plan needs, capped at 1, and scales the reported confidence: a short
-    clip has heard less of the music, whatever its resolution.
+    The full plan (36 bins per octave, C1..C8, librosa's default) whenever the
+    clip holds it, from about 3 s. A shorter clip gets one bin per semitone
+    over as many octaves, counted down from C8, as fit it. A plan fits when no
+    octave's FFT is longer than the signal that octave runs on, replayed with
+    librosa's own filter lengths (:func:`_octave_frames`) at the tuning the
+    transform will use and the hop the caller passes to chroma_cqt.
+
+    ``coverage`` is the clip's length over the length the full plan needs,
+    capped at 1, and scales the reported confidence: a short clip has heard
+    less of the music, whatever its resolution.
     """
-    full_fft = _octave_fft_size(sr, _FULL_BINS_PER_OCTAVE)
-    full_len = full_fft * 2 ** (_FULL_OCTAVES - 1)
-    bins = _FULL_BINS_PER_OCTAVE
-    octaves = _fitted_octaves(n_samples, sr, bins)
-    if octaves < _FULL_OCTAVES:
-        bins = _SHORT_BINS_PER_OCTAVE
-        octaves = _fitted_octaves(n_samples, sr, bins)
-    return ChromaPlan(
-        bins_per_octave=bins,
-        n_octaves=octaves,
-        fmin=_C1_HZ * 2.0 ** (_FULL_OCTAVES - octaves),
-        tuning=None if n_samples >= _TUNING_FFT else 0.0,
-        coverage=min(1.0, n_samples / full_len),
+    n_samples = int(y.shape[-1])
+    tuning = _tuning(y, sr, _FULL_BINS_PER_OCTAVE)
+    full = _octave_frames(
+        n_samples,
+        sr,
+        hop_length,
+        _FULL_BINS_PER_OCTAVE,
+        _FULL_OCTAVES,
+        _C1_HZ * 2.0 ** (tuning / _FULL_BINS_PER_OCTAVE),
     )
+    if _fits(full):
+        return ChromaPlan(_FULL_BINS_PER_OCTAVE, _FULL_OCTAVES, _C1_HZ, tuning, 1.0)
+    coverage = min(1.0, n_samples / _needed_length(full))
+    bins = _SHORT_BINS_PER_OCTAVE
+    tuning = _tuning(y, sr, bins)
+    for octaves in range(_FULL_OCTAVES, MIN_CHROMA_OCTAVES - 1, -1):
+        fmin = _C1_HZ * 2.0 ** (_FULL_OCTAVES - octaves)
+        frames = _octave_frames(
+            n_samples, sr, hop_length, bins, octaves, fmin * 2.0 ** (tuning / bins)
+        )
+        if _fits(frames):
+            return ChromaPlan(bins, octaves, fmin, tuning, coverage)
+    return ChromaPlan(bins, 0, _C1_HZ * 2.0**_FULL_OCTAVES, tuning, coverage)
 
 
 # Krumhansl-Schmuckler key profiles. Index 0 = C.
@@ -222,9 +310,10 @@ def detect_key(
             log.info("analysis.key: librosa load failed for %s: %s", p.name, e)
             return out
 
-    if y.size == 0:
+    if y.size == 0 or not y.any():
+        # Silence has no key, and gives the tuning estimate nothing to read.
         return out
-    plan = chroma_plan(int(y.size), float(sr))
+    plan = chroma_plan(y, float(sr), int(chroma_hop))
     if plan.n_octaves < MIN_CHROMA_OCTAVES:
         return out
 

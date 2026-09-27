@@ -329,8 +329,9 @@ def _extract_mid_level(
     # Fitted to the clip (backend/modules/analysis/key.py): under about 3 s
     # the default C1..C8 range gives the low octaves an FFT longer than the
     # signal, which librosa zero-pads and warns about.
-    plan = chroma_plan(int(mono.size), float(sr))
-    if plan.n_octaves >= MIN_CHROMA_OCTAVES:
+    # Silence has no key, and gives the tuning estimate nothing to read.
+    plan = chroma_plan(mono, float(sr)) if mono.any() else None
+    if plan is not None and plan.n_octaves >= MIN_CHROMA_OCTAVES:
         chroma = librosa.feature.chroma_cqt(
             y=mono,
             sr=sr,
@@ -348,7 +349,7 @@ def _extract_mid_level(
         key_label, key_confidence = _find_key(chroma_mean)
         key_confidence = round(key_confidence * plan.coverage, 4)
     else:
-        # Too short for three octaves of chroma: no key to report.
+        # Silent, or too short for three octaves of chroma: no key to report.
         chroma_list = [0.0] * 12
         key_label, key_confidence = None, 0.0
 
