@@ -319,11 +319,61 @@ When the selected provider is Claude Code, you are not only a chat assistant. Yo
 - Keep the user informed about major tool activity — one short line each, not a transcript.
 """
 
+# The one line of CLAUDE_CODE_SYSTEM_PROMPT that depends on the app setting
+# "Use my Claude settings and MCP servers" (settings `assistant.
+# use_user_claude_config`). The constant carries the ISOLATED wording;
+# _claude_code_system_block swaps in the other one when the setting is on, so
+# the model is never told its MCP surface is narrow while the user's own
+# servers, CLAUDE.md, skills and allow rules are loaded.
+CLAUDE_MCP_SURFACE_ISOLATED = (
+    "- Your MCP surface is deliberately narrow: the `thedaw` relay server, plus the "
+    "underfit trainer when that profile is active. The user's global MCP servers are "
+    "NOT loaded into this session."
+)
+CLAUDE_MCP_SURFACE_USER_CONFIG = (
+    "- This session loads the user's own Claude Code setup: their MCP servers, "
+    "settings, CLAUDE.md, skills and agents, next to the `thedaw` relay server (plus "
+    "the underfit trainer when that profile is active). A command the user's own "
+    "allow rules match runs without a permission prompt, in every mode."
+)
+
+
+def _claude_code_system_block(system_block: str, use_user_config: bool) -> str:
+    """``system_block`` with its MCP-surface line matching this session's setup."""
+    if not use_user_config:
+        return system_block
+    return system_block.replace(
+        CLAUDE_MCP_SURFACE_ISOLATED, CLAUDE_MCP_SURFACE_USER_CONFIG
+    )
+
+
+def _claude_use_user_config() -> bool:
+    """The app setting "Use my Claude settings and MCP servers" (default ON).
+
+    Read on every turn, so switching it in the assistant panel takes effect on
+    the next message (claude_session respawns the child when it changes).
+    """
+    try:
+        from backend.modules.settings.router import get_store as get_settings_store
+
+        value = get_settings_store().get_value(
+            "assistant", "use_user_claude_config", True
+        )
+    except OSError as exc:
+        logger.warning(
+            "[AssistantChat] settings unreadable (%s); Claude keeps the user's own "
+            "settings and MCP servers, the default",
+            exc,
+        )
+        return True
+    return value if isinstance(value, bool) else True
+
 
 # Underfit-tab assistant MCP: config that registers the underfit LoRA-trainer
-# MCP (node mcp-server.cjs → underfit dashboard API on :8791, 21 tools). Loaded
-# via --mcp-config ONLY when a chat request sets assistantProfile == "underfit"
-# (see _claude_base_cmd_args), so no other assistant/coding session gets it.
+# MCP (node mcp-server.cjs → underfit dashboard API on :8791, 21 tools). Merged
+# into the session's --mcp-config ONLY when a chat request sets
+# assistantProfile == "underfit" (see _claude_extra_mcp_servers), so no other
+# assistant/coding session gets it.
 UNDERFIT_MCP_CONFIG = str(
     (Path(__file__).parent / "underfit_mcp_config.json").resolve()
 )
@@ -1244,6 +1294,14 @@ async def _stream_claude(req: ChatRequest, request: Optional[Request]):
         or CLAUDE_DEFAULT_PERMISSION_MODE
     )
 
+    # Read ONCE per turn: the seed's MCP-surface line and the child's spawn
+    # flags must describe the same setup.
+    use_user_config = _claude_use_user_config()
+    if req.claude_system_block:
+        req.claude_system_block = _claude_code_system_block(
+            req.claude_system_block, use_user_config
+        )
+
     turn_text, seed_text = _build_claude_turn_texts(req, permission_mode)
     if not turn_text.strip():
         yield _sse_frame(
@@ -1286,6 +1344,7 @@ async def _stream_claude(req: ChatRequest, request: Optional[Request]):
         extra_servers=extra_servers or None,
         on_control_request=_claude_control_hook,
         fallback_model=_claude_fallback_model(model),
+        use_user_config=use_user_config,
     )
     try:
         async for line in agen:
