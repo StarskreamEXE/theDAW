@@ -19,6 +19,8 @@ from fastapi.testclient import TestClient
 from backend.modules.library import media_roots
 from backend.modules.library import router as library_router_module
 from backend.modules.library.store import LibraryStore
+from backend.modules.settings import router as settings_router
+from backend.modules.settings.store import SettingsStore
 from tests.test_library_store import _seed_generate_entry
 
 UUID_A = "c27de18c-1b0e-4a2f-8b71-9d0c5f2a1e33"
@@ -26,9 +28,17 @@ UUID_B = "aa11bb22-3c4d-4e5f-8aa9-0b1c2d3e4f50"
 
 
 @pytest.fixture(autouse=True)
-def _clean_index(monkeypatch):
+def _clean_index(monkeypatch, tmp_path):
     """Every test starts with no index, no roots, no scan in flight and no
-    remembered CDN refusals (all three are process-lifetime state)."""
+    remembered CDN refusals (all three are process-lifetime state).
+
+    With no env var, configured_roots() falls back to the process-wide
+    settings store over data/settings.json: a route test (a rescan) read and
+    migrated the checkout's real file, and walked whatever media roots it
+    named. Each test gets a settings store of its own instead."""
+    monkeypatch.setattr(
+        settings_router, "_store", SettingsStore(tmp_path / "settings.json")
+    )
     monkeypatch.delenv(media_roots.ENV_VAR, raising=False)
     media_roots.reset()
     library_router_module._cdn_refused.clear()

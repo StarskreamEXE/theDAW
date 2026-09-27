@@ -55,7 +55,6 @@ __all__ = [
     "plan_lan_https",
     "read_settings",
     "resolve_plan",
-    "stored_off_key",
 ]
 
 #: The environment the listener itself reads (``frontend/vite.lan.config.ts``).
@@ -67,22 +66,10 @@ ENV_PORT = "theDAW_HTTPS_PORT"
 #: a one-off run: ``theDAW_LAN_HTTPS=0`` turns the listener off for this launch.
 ENV_ENABLED = "theDAW_LAN_HTTPS"
 
-#: ``settings.json`` -> ``lan.https``. Absent means ON: the whole point is that
-#: a second device works without anyone configuring anything.
-#:
-#: The switch has a top-level section of its own because a build that predates
-#: it keeps a whole section it does not know, while it drops the keys it does
-#: not know inside a section it does know. Schema 10 kept the switch in
-#: ``app``; one run of an older build rewrote ``app`` without it, and a user's
-#: "off" came back on.
-SETTING_SECTION = "lan"
-SETTING_KEY = "https"
-
-#: Where schema 10 kept the switch. An off there still counts: a launcher reads
-#: the raw file before the backend's store has moved the value to
-#: ``lan.https``, and a build that still writes the old key may have run since.
-LEGACY_SETTING_SECTION = "app"
-LEGACY_SETTING_KEY = "lan_https"
+#: ``settings.json`` -> ``app.lan_https``. Absent means ON: the whole point is
+#: that a second device works without anyone configuring anything.
+SETTING_SECTION = "app"
+SETTING_KEY = "lan_https"
 
 #: What the listener is started WITH, after the binary, from ``frontend/``.
 LISTENER_ARGS: tuple[str, ...] = ("--config", "vite.lan.config.ts")
@@ -161,25 +148,6 @@ def _flag(raw: object) -> Optional[bool]:
     return None
 
 
-def stored_off_key(settings: Mapping[str, Any]) -> Optional[str]:
-    """The ``section.key`` in ``settings`` that switches the listener off, or
-    None when nothing stored says off.
-
-    ``lan.https`` is asked first, then the schema-10 ``app.lan_https``. An off
-    in either wins: the one thing this setting must never do is come back on
-    after the user switched it off.
-    """
-    for section_name, key in (
-        (SETTING_SECTION, SETTING_KEY),
-        (LEGACY_SETTING_SECTION, LEGACY_SETTING_KEY),
-    ):
-        section = settings.get(section_name)
-        stored = section.get(key) if isinstance(section, Mapping) else None
-        if _flag(stored) is False:
-            return f"{section_name}.{key}"
-    return None
-
-
 def listener_port(env: Mapping[str, str]) -> int:
     """The port the LAN listener uses: ``theDAW_HTTPS_PORT`` or the default.
 
@@ -219,11 +187,13 @@ def blocking_reason(
         return f"turned off for this launch by {ENV_ENABLED}"
 
     if override is None:
-        turned_off_by = stored_off_key(settings)
-        if turned_off_by is not None:
+        section = settings.get(SETTING_SECTION)
+        stored = section.get(SETTING_KEY) if isinstance(section, Mapping) else None
+        if _flag(stored) is False:
             return (
-                f"turned off in data/settings.json ({turned_off_by}) - "
-                f"set {ENV_ENABLED}=1 for one launch"
+                f"turned off in data/settings.json "
+                f"({SETTING_SECTION}.{SETTING_KEY}) - set {ENV_ENABLED}=1 "
+                f"for one launch"
             )
 
     if lan_address(lan_ips) is None:
@@ -246,8 +216,7 @@ def plan_lan_https(
     Pure. Three things have to be true, and each failure names itself:
 
     * the user has not turned it off (``theDAW_LAN_HTTPS``, then
-      ``settings.lan.https`` or the schema-10 ``settings.app.lan_https``;
-      absent means on),
+      ``settings.app.lan_https``; absent means on),
     * this machine has a LAN address to be reached at,
     * a certificate exists for it.
     """

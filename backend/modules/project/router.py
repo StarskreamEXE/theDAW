@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from backend.core.startup import register_startup_hook
 from backend.modules.genaiproxy.access import caller_is_loopback
 from backend.modules.project import media_access
 from backend.modules.project.tasmo_project import TasmoProject
@@ -134,10 +135,42 @@ _RECENT_LOCK = threading.Lock()
 _recent_seen: tuple[int, int] | None = _recent_stamp()
 _recent_files: list[dict] = _load_recent()
 
-# Projects opened before this process started still have their folders in the
-# recent list; seeding from it keeps their clips playable when the UI restores
-# a session from its own storage without re-issuing /load.
-media_access.register_paths(r["path"] for r in _recent_files)
+
+def _is_project_file(raw: str) -> bool:
+    """Whether ``raw`` names a .tasmo file that is on disk now."""
+    try:
+        p = Path(raw)
+        return p.suffix.lower() == ".tasmo" and p.is_file()
+    except (OSError, ValueError):
+        return False
+
+
+def _register_recent_folders(entries: list[dict]) -> None:
+    """Grant /clip-audio the folders of the recent projects still on disk.
+
+    Projects opened before this process started keep their clips playable when
+    the UI restores a session from its own storage without re-issuing /load.
+    The list is not only this machine's record: a backup restore writes it
+    straight from the archive, and register_root grants a path's folder
+    whether or not a file is there. So an entry counts only when it names a
+    .tasmo file that exists; an archive naming a folder with no project in it
+    grants nothing.
+    """
+    media_access.register_paths(
+        r["path"] for r in entries if _is_project_file(r["path"])
+    )
+
+
+def _on_start() -> None:
+    """The project module's startup work: write the /clip-audio grants the
+    media registry took over at import, then grant the recent projects'
+    folders. A hook, so importing this router writes no file."""
+    media_access.finish_start()
+    with _RECENT_LOCK:
+        _register_recent_folders(_recent_files)
+
+
+register_startup_hook("clip-audio-roots", _on_start)
 
 
 def _sync_recent_locked() -> None:
@@ -146,7 +179,7 @@ def _sync_recent_locked() -> None:
     A backup restore writes the file straight to disk while this process holds
     its own copy, so without this the list served after a restore, and the one
     the next save wrote back, was the list from before it. The restored
-    projects' folders are registered the way the startup seed registers them.
+    projects' folders are registered the way the startup hook registers them.
     Call under _RECENT_LOCK.
     """
     global _recent_files, _recent_seen
@@ -155,7 +188,7 @@ def _sync_recent_locked() -> None:
         return
     _recent_seen = stamp
     _recent_files = _load_recent()
-    media_access.register_paths(r["path"] for r in _recent_files)
+    _register_recent_folders(_recent_files)
 
 
 def _register_project_media(

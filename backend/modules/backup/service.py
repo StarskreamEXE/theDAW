@@ -9,8 +9,10 @@ All user-data roots worth backing up are enumerated by :func:`user_data_roots`:
   (``known_paths.projects_dir()``, ``~/Documents/theDAW Projects`` by default).
 - ``settings`` — the top-level ``data/*.json`` registries (``settings.json``,
   ``local_checkpoints.json``, ``recent_projects.json``). ``known_paths.json``
-  is left out of every archive and ignored in one, because its sources decide
-  which files /api/places/file serves (``_NEVER_BACKED_UP``).
+  and the /clip-audio folder grants (``clip_audio_roots.json``,
+  ``media_roots.json``) are left out of every archive and ignored in one,
+  because they decide which files /api/places/file and /api/project/clip-audio
+  serve (``_NEVER_BACKED_UP``).
 
 Export and import both run in daemon threads tracked by an in-memory job
 table so the FastAPI event loop is never blocked; callers poll job status.
@@ -55,9 +57,15 @@ _SKIP_DIR_NAMES = {
 }
 
 # Settings files never written to an archive and never restored from one,
-# compared case-insensitively. known_paths.json records which files the app may
-# serve; a restored copy would let an archive choose them.
-_NEVER_BACKED_UP = frozenset({"known_paths.json"})
+# compared case-insensitively. Each records what the app may serve, so a
+# restored copy would let an archive choose it: known_paths.json the files
+# /api/places/file serves, and clip_audio_roots.json with its older-build copy
+# media_roots.json (backend/modules/project/media_access.py) the folders
+# /api/project/clip-audio serves. A folder grant is the user opening a project
+# on this machine; the project opened again after a restore grants it again.
+_NEVER_BACKED_UP = frozenset(
+    {"known_paths.json", "clip_audio_roots.json", "media_roots.json"}
+)
 
 _VERSION_RE = re.compile(r'^version\s*=\s*"([^"]+)"', re.MULTILINE)
 

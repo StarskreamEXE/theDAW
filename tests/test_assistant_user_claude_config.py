@@ -32,7 +32,7 @@ from fastapi.testclient import TestClient
 from backend import assistant_routes as ar
 from backend.modules.assistant import claude_session as cs
 from backend.modules.settings import router as settings_router
-from backend.modules.settings.store import SettingsStore
+from backend.modules.settings.store import SCHEMA_VERSION, SettingsStore
 
 FAKE_CLI = Path(__file__).parent / "fixtures" / "fake_claude_cli.py"
 
@@ -164,7 +164,9 @@ def test_a_file_from_main_gains_the_switch_on_and_keeps_the_users_choice(tmp_pat
     reopened = SettingsStore(path)
     assert reopened.get_value("assistant", "use_user_claude_config") is False
     assert reopened.get_value("stems", "auto_on_import") is True
-    assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 11
+    assert (
+        json.loads(path.read_text(encoding="utf-8"))["schema_version"] == SCHEMA_VERSION
+    )
 
 
 @pytest.mark.parametrize("junk", ["no", 0, None, [], {"on": False}])
