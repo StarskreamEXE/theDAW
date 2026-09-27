@@ -253,7 +253,10 @@ class CandidateStore:
         if suffix not in _AUDIO_SUFFIXES:
             suffix = ".wav"
         audio_name = f"{candidate_id}{suffix}"
-        (set_dir / audio_name).write_bytes(audio_bytes)
+        # Atomic, like the meta beside it: a write cut off halfway (disk full,
+        # the backend stopped) leaves no half-written take at the take's name,
+        # and the meta that would point at one is never written.
+        atomic_write(set_dir / audio_name, audio_bytes)
 
         meta = {
             "id": candidate_id,
