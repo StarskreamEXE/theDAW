@@ -8,16 +8,18 @@ Covers:
           must actually change the output across its range, and the
           ToolSpec's user-facing text must not promise N stems.
   FX-005: creative_neural descriptions must not overclaim what the code does;
-          TimbreForge's dead ``structureWeight``/``latentWander`` knobs (read
-          nowhere) must be removed from its declared params.
+          TimbreForge's ``structureWeight``/``latentWander`` knobs and the
+          TokenSynth/AmbientForge prompts are declared AND read (they were
+          read nowhere on main; they are wired now, see
+          tests/test_tool_controls_restored.py for what each one does).
   FX-008: grainlab's dead bare ``max(...)`` statement is gone and the
           pitch-spread branch it sat in still works.
   FX-004 (re-audit): every restoration ToolSpec's declared params must
           actually be read by its handler (vocal_isolate denoiseAmount/
-          dereverbAmount, breath_removal clickReduction, restore_all
-          prompt were declared but never read — removed). Removed/legacy
-          keys must still validate and render (forward-compat with any
-          cached preset or in-flight UI still posting them).
+          dereverbAmount, breath_removal clickReduction and the restore_all
+          prompt were declared but never read on main; they are wired now).
+          A caller that omits them (vocal.preprocess, an old preset) still
+          validates and renders.
 
 No model weights, no GPU. FFmpeg-dependent tests are skipped if ``ffmpeg``
 is not on PATH (matches the project's own real-ffmpeg testing convention).
@@ -242,12 +244,21 @@ def test_timbreforge_description_does_not_overclaim_instrument_transfer():
     assert "neural timbre transfer" not in desc
 
 
-def test_timbreforge_has_no_dead_params():
-    """structureWeight/latentWander were declared but read nowhere in
-    ``_timbreforge`` — only timbreBlend actually drives the handler."""
+def test_timbreforge_declares_structure_timbre_and_wander():
+    """main's three knobs, in main's order. Each is read by the handler (see
+    test_every_creative_neural_declared_param_is_read_by_its_handler) and
+    changes the render (tests/test_tool_controls_restored.py)."""
     tool = next(t for t in CREATIVE_NEURAL_TOOLS if t.id == "timbreforge")
-    names = {p.name for p in tool.params}
-    assert names == {"timbreBlend"}
+    assert [p.name for p in tool.params] == [
+        "structureWeight",
+        "timbreBlend",
+        "latentWander",
+    ]
+    labels = {p.name: p.label for p in tool.params}
+    assert labels["structureWeight"] == "Structure"
+    assert labels["latentWander"] == "Wander"
+    desc = tool.description.lower()
+    assert "structure" in desc and "wander" in desc
 
 
 def test_timbreforge_docstring_describes_asetrate_atempo_correctly():
@@ -290,24 +301,23 @@ def test_crossfade_morph_description_does_not_claim_two_tracks():
     assert "single input" in desc or "itself" in desc
 
 
-def test_ambientforge_has_no_dead_prompt_param():
-    """_ambientforge (router.py) never reads params["prompt"] — the bed is
-    built from lavfi pink noise, not text."""
+def test_ambientforge_declares_prompt_and_says_what_it_steers():
+    """The bed is still lavfi noise, not a text model: the description says
+    the prompt shapes it and that the input audio is ignored."""
     tool = next(t for t in CREATIVE_NEURAL_TOOLS if t.id == "ambientforge")
-    names = {p.name for p in tool.params}
-    assert "prompt" not in names
+    assert [p.name for p in tool.params] == ["prompt", "duration"]
     desc = tool.description.lower()
-    assert "prompt" not in desc
-    assert "noise" in desc or "ignores" in desc
+    assert "prompt" in desc
+    assert "noise" in desc and "ignores" in desc
 
 
-def test_tokensynth_has_no_dead_prompt_param():
-    """dsp.tokensynth only reads temperature — prompt was declared but
-    never read (ring-mod/vibrato/tremolo on the INPUT audio, not text)."""
+def test_tokensynth_declares_prompt_and_says_what_it_steers():
+    """The prompt picks the ring-mod voice; the description must not claim
+    text-to-instrument generation, which the DSP does not do."""
     tool = next(t for t in CREATIVE_NEURAL_TOOLS if t.id == "tokensynth")
-    names = {p.name for p in tool.params}
-    assert "prompt" not in names
+    assert [p.name for p in tool.params] == ["prompt", "temperature"]
     desc = tool.description.lower()
+    assert "prompt" in desc
     assert "text ->" not in desc
     assert "instrument" not in desc
 
@@ -372,12 +382,15 @@ def test_grainlab_pitch_spread_still_runs_and_writes_audio(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _resolve_reader(handler, dsp_module=None):
-    """A process-mode router wrapper (e.g. ``_vocal_isolate``) is a one-line
-    forward to a ``dsp.<name>`` function — that inner function is where
-    ``params`` is actually read, not the wrapper. Filter-mode handlers (and
-    process handlers with no ``dsp_module``, e.g. enhance's, which has no
-    separate dsp.py) read ``params`` directly and are returned unchanged."""
+def _readers(handler, dsp_module=None) -> list:
+    """The functions that read a tool's ``params``: the handler itself plus,
+    when a ``dsp_module`` is given, every ``dsp.<name>`` function the handler
+    calls. A one-line forward such as ``_vocal_isolate`` reads nothing itself
+    and its dsp function reads everything; a handler such as
+    ``_timbreforge`` reads its keys and hands samples to dsp. Taking the
+    union covers both shapes (the first-dsp-call-only version of this helper
+    reported every key ``_timbreforge`` reads as unread)."""
+    readers = [handler]
     if dsp_module is not None:
         src = textwrap.dedent(inspect.getsource(handler))
         tree = ast.parse(src)
@@ -390,19 +403,20 @@ def _resolve_reader(handler, dsp_module=None):
                 and node.func.value.id == "dsp"
             ):
                 target = getattr(dsp_module, node.func.attr, None)
-                if target is not None:
-                    return target
-    return handler
+                if target is not None and target not in readers:
+                    readers.append(target)
+    return readers
 
 
 def _unused_params(tools, dsp_module=None) -> list[str]:
     unused = []
     for tool in tools:
-        reader = _resolve_reader(tool.handler, dsp_module)
-        used = _used_param_keys(reader)
+        readers = _readers(tool.handler, dsp_module)
+        used = set().union(*(_used_param_keys(r) for r in readers))
+        names = "+".join(r.__name__ for r in readers)
         for p in tool.params:
             if p.name not in used:
-                unused.append(f"{tool.id}.{p.name} (reader={reader.__name__})")
+                unused.append(f"{tool.id}.{p.name} (readers={names})")
     return unused
 
 
@@ -438,15 +452,15 @@ def _used_param_keys(func) -> set[str]:
 
 def test_every_restoration_declared_param_is_read_by_its_handler():
     """Fails if any restoration ToolSpec declares a param its handler (or,
-    for process-mode tools, the dsp.py function the wrapper forwards to)
-    never reads — the exact bug class of the 4 removed dead knobs."""
+    for process-mode tools, a dsp.py function the handler calls) never
+    reads — the bug class of main's four dead knobs."""
     unused = _unused_params(RESTORATION_TOOLS, restoration_dsp)
     assert unused == [], f"declared-but-unread restoration params: {unused}"
 
 
 def test_every_creative_neural_declared_param_is_read_by_its_handler():
-    """Same check for creative_neural — this is what catches AmbientForge's
-    and TokenSynth's dead ``prompt`` params."""
+    """Same check for creative_neural — this is what catches a TimbreForge,
+    AmbientForge or TokenSynth control that is declared and never read."""
     unused = _unused_params(CREATIVE_NEURAL_TOOLS, creative_dsp)
     assert unused == [], f"declared-but-unread creative_neural params: {unused}"
 
@@ -459,38 +473,58 @@ def test_every_enhance_declared_param_is_read_by_its_handler():
     assert unused == [], f"declared-but-unread enhance params: {unused}"
 
 
-def test_restoration_dead_params_are_gone():
-    """The four params the re-audit flagged must no longer be declared."""
+def test_restoration_restored_params_are_declared():
+    """The four controls main declared (and never read) are declared again,
+    with main's names, labels, ranges and defaults, and now drive the DSP."""
     by_id = {t.id: t for t in RESTORATION_TOOLS}
-    vocal_names = {p.name for p in by_id["vocal_isolate"].params}
-    assert "denoiseAmount" not in vocal_names
-    assert "dereverbAmount" not in vocal_names
-    breath_names = {p.name for p in by_id["breath_removal"].params}
-    assert "clickReduction" not in breath_names
-    restore_all_names = {p.name for p in by_id["restore_all"].params}
-    assert "prompt" not in restore_all_names
+    vocal = {p.name: p for p in by_id["vocal_isolate"].params}
+    denoise, dereverb = vocal["denoiseAmount"], vocal["dereverbAmount"]
+    assert (denoise.label, denoise.default, denoise.lo, denoise.hi) == (
+        "Denoise",
+        0.5,
+        0,
+        1,
+    )
+    assert (dereverb.label, dereverb.default, dereverb.lo, dereverb.hi) == (
+        "Dereverb",
+        0.0,
+        0,
+        1,
+    )
+    clicks = {p.name: p for p in by_id["breath_removal"].params}["clickReduction"]
+    assert (clicks.label, clicks.default, clicks.lo, clicks.hi) == ("Clicks", 0.7, 0, 1)
+    prompt = {p.name: p for p in by_id["restore_all"].params}["prompt"]
+    assert (prompt.type, prompt.control, prompt.label) == (
+        "string",
+        "TextInput",
+        "Prompt",
+    )
+    assert "hum" in by_id["restore_all"].description.lower()
 
 
-def test_breath_removal_name_does_not_claim_click_detection():
-    """No click-detection code exists (only RMS + spectral-centroid breath
-    detection) — the tool must not still be named for it."""
+def test_breath_removal_name_matches_its_click_detection():
+    """The tool finds and removes mouth clicks (``_reduce_mouth_clicks``),
+    so it carries main's name again."""
     tool = next(t for t in RESTORATION_TOOLS if t.id == "breath_removal")
-    assert "click" not in tool.name.lower()
-    assert tool.name == "Breath Removal"
+    assert tool.name == "Breath / Mouth-Click Removal"
+    assert "click" in tool.description.lower()
+    assert "clickReduction" in _used_param_keys(restoration_dsp.breath_removal_sync)
+    assert callable(restoration_dsp._reduce_mouth_clicks)
 
 
 # ---------------------------------------------------------------------------
-# Backward compatibility — legacy/removed param keys must not break a
-# preset or in-flight UI that still posts them.
+# Restored keys validate and reach the handler; a caller that omits them
+# (an old preset, vocal.preprocess) still validates and renders.
 # ---------------------------------------------------------------------------
 
 
-def test_timbreforge_legacy_keys_still_validate_and_render(tmp_path):
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+def test_timbreforge_structure_and_wander_validate_and_render(tmp_path):
     tool = next(t for t in CREATIVE_NEURAL_TOOLS if t.id == "timbreforge")
     raw = {"timbreBlend": 0.75, "structureWeight": 0.3, "latentWander": 0.9}
     validated = tool.validate_params(raw)
-    assert "structureWeight" not in validated
-    assert "latentWander" not in validated
+    assert validated["structureWeight"] == pytest.approx(0.3)
+    assert validated["latentWander"] == pytest.approx(0.9)
     assert validated["timbreBlend"] == pytest.approx(0.75)
 
     src = _tone(tmp_path / "in.wav")
@@ -499,7 +533,7 @@ def test_timbreforge_legacy_keys_still_validate_and_render(tmp_path):
     assert out.exists() and out.stat().st_size > 0
 
 
-def test_vocal_isolate_legacy_keys_still_validate_and_render(tmp_path):
+def test_vocal_isolate_cleanup_keys_validate_and_render(tmp_path):
     tool = next(t for t in RESTORATION_TOOLS if t.id == "vocal_isolate")
     raw = {
         "processAmount": 0.5,
@@ -508,8 +542,8 @@ def test_vocal_isolate_legacy_keys_still_validate_and_render(tmp_path):
         "dereverbAmount": 0.2,
     }
     validated = tool.validate_params(raw)
-    assert "denoiseAmount" not in validated
-    assert "dereverbAmount" not in validated
+    assert validated["denoiseAmount"] == pytest.approx(0.4)
+    assert validated["dereverbAmount"] == pytest.approx(0.2)
 
     src = _noisy_stereo(tmp_path / "in.wav")
     out = tmp_path / "out.wav"
@@ -517,11 +551,18 @@ def test_vocal_isolate_legacy_keys_still_validate_and_render(tmp_path):
     assert out.exists() and out.stat().st_size > 0
 
 
-def test_breath_removal_legacy_key_still_validates_and_renders(tmp_path):
+def test_vocal_isolate_old_preset_without_cleanup_keys_gets_declared_defaults():
+    tool = next(t for t in RESTORATION_TOOLS if t.id == "vocal_isolate")
+    validated = tool.validate_params({"processAmount": 0.5, "output": "vocals"})
+    assert validated["denoiseAmount"] == pytest.approx(0.5)
+    assert validated["dereverbAmount"] == pytest.approx(0.0)
+
+
+def test_breath_removal_click_key_validates_and_renders(tmp_path):
     tool = next(t for t in RESTORATION_TOOLS if t.id == "breath_removal")
     raw = {"breathReduction": 0.6, "clickReduction": 0.9}
     validated = tool.validate_params(raw)
-    assert "clickReduction" not in validated
+    assert validated["clickReduction"] == pytest.approx(0.9)
 
     src = _noisy_stereo(tmp_path / "in.wav")
     out = tmp_path / "out.wav"
@@ -529,32 +570,31 @@ def test_breath_removal_legacy_key_still_validates_and_renders(tmp_path):
     assert out.exists() and out.stat().st_size > 0
 
 
-def test_restore_all_legacy_key_still_validates():
+def test_restore_all_prompt_validates_and_an_old_preset_without_it_still_does():
     """restore_all is process-mode (async), not filter-mode — validation
     itself doesn't need I/O, so this stays a pure validate_params check."""
     tool = next(t for t in RESTORATION_TOOLS if t.id == "restore_all")
-    raw = {"strength": 0.6, "prompt": "make it sound warm"}
-    validated = tool.validate_params(raw)
-    assert "prompt" not in validated
+    validated = tool.validate_params({"strength": 0.6, "prompt": "make it sound warm"})
+    assert validated["prompt"] == "make it sound warm"
     assert validated["strength"] == pytest.approx(0.6)
+    assert tool.validate_params({"strength": 0.6})["prompt"] == ""
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
-def test_restore_all_legacy_key_renders_with_real_ffmpeg(tmp_path):
+def test_restore_all_prompt_renders_with_real_ffmpeg(tmp_path):
     tool = next(t for t in RESTORATION_TOOLS if t.id == "restore_all")
-    validated = tool.validate_params({"strength": 0.6, "prompt": "make it sound warm"})
+    validated = tool.validate_params({"strength": 0.6, "prompt": "hum and hiss, muddy"})
     src = _tone(tmp_path / "in.wav")
     out = tmp_path / "out.wav"
     asyncio.run(tool.handler(src, out, validated))
     assert out.exists() and out.stat().st_size > 0
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
-def test_tokensynth_legacy_prompt_key_still_validates_and_renders(tmp_path):
+def test_tokensynth_prompt_key_validates_and_renders(tmp_path):
     tool = next(t for t in CREATIVE_NEURAL_TOOLS if t.id == "tokensynth")
     raw = {"temperature": 0.8, "prompt": "a warm pad"}
     validated = tool.validate_params(raw)
-    assert "prompt" not in validated
+    assert validated["prompt"] == "a warm pad"
 
     src = _tone(tmp_path / "in.wav")
     out = tmp_path / "out.wav"
@@ -563,11 +603,11 @@ def test_tokensynth_legacy_prompt_key_still_validates_and_renders(tmp_path):
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
-def test_ambientforge_legacy_prompt_key_still_validates_and_renders(tmp_path):
+def test_ambientforge_prompt_key_validates_and_renders(tmp_path):
     tool = next(t for t in CREATIVE_NEURAL_TOOLS if t.id == "ambientforge")
     raw = {"duration": 5.0, "prompt": "a slow drifting pad"}
     validated = tool.validate_params(raw)
-    assert "prompt" not in validated
+    assert validated["prompt"] == "a slow drifting pad"
 
     src = _tone(tmp_path / "in.wav")
     out = tmp_path / "out.wav"
