@@ -247,8 +247,23 @@ def _holder_of(port: int) -> Optional[dict]:
     return {"pid": 0, "name": "", "port": port, "thedaw": False}
 
 
+#: The addresses the free-port probe binds, in order. ``::`` is bound dual-
+#: stack: on Windows it is the one bind that a listener on ``::`` refuses when
+#: that listener is dual-stack too (Node's default ``listen(port)``), where an
+#: IPv6-only probe of ``::`` and every IPv4 probe are let through.
+_PROBE_ADDRESSES: tuple[tuple[socket.AddressFamily, str], ...] = (
+    (socket.AF_INET, "0.0.0.0"),
+    (socket.AF_INET, "127.0.0.1"),
+    (socket.AF_INET6, "::"),
+    (socket.AF_INET6, "::1"),
+)
+#: A probe bind that fails with one of these found no IPv6 here (the family or
+#: the loopback address is switched off), so nothing can listen there either.
+_NO_SUCH_ADDRESS = frozenset({errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT, 10049, 10047})
+
+
 def _port_number_is_free(port: int) -> bool:
-    """Nobody listens on this port NUMBER, on any IPv4 address.
+    """Nobody listens on this port NUMBER, on any IPv4 or IPv6 address.
 
     Windows lets ``127.0.0.1:P`` be bound while another program holds
     ``0.0.0.0:P`` — no EADDRINUSE, with or without SO_EXCLUSIVEADDRUSE — and
@@ -258,20 +273,38 @@ def _port_number_is_free(port: int) -> bool:
     listener and saw their own server as dead. So the wildcard address is
     probed as well as ours; a bind to an address somebody holds does fail.
 
+    The same goes for IPv6: the standalone Node bridge listens on ``::``,
+    dual-stack, which no IPv4 probe notices on Windows. ``::`` and ``::1`` are
+    probed too, on a machine that has IPv6.
+
     Elsewhere the probe sets SO_REUSEADDR, so a connection left in TIME_WAIT by
     a program that already exited does not count as a listener. Linux still
     refuses the bind while any socket listens on the port, and BSD/macOS while
     one holds the same address.
     """
-    for host in ("0.0.0.0", "127.0.0.1"):
-        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    for family, host in _PROBE_ADDRESSES:
         try:
+            probe = socket.socket(family, socket.SOCK_STREAM)
+        except OSError:
+            continue  # no IPv6 on this machine
+        try:
+            if family == socket.AF_INET6:
+                try:
+                    probe.setsockopt(
+                        socket.IPPROTO_IPV6,
+                        socket.IPV6_V6ONLY,
+                        0 if host == "::" else 1,
+                    )
+                except OSError:
+                    pass  # a system that fixes the option keeps its own value
             if sys.platform == "win32":
                 probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
             else:
                 probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind((host, port))
-        except OSError:
+        except OSError as e:
+            if family == socket.AF_INET6 and e.errno in _NO_SUCH_ADDRESS:
+                continue
             return False
         finally:
             probe.close()
