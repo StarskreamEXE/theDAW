@@ -9,10 +9,14 @@
  *                                               ├▶ djMaster ─▶ engine master
  *   bufSrc B ─▶ lowB ─▶ midB ─▶ highB ─▶ gainB ─┘        (shared: playerStore)
  *
- * Memory: a decoded full song is ~100 MB. We decode ONLY a loaded deck and free
- * the buffer the moment the deck is cleared, so at most ~2 are resident — bounded
- * and released on unload. Browsing/preview elsewhere still streams (wavesurfer
- * fetches its own peaks); the deck engine itself is pure Web Audio.
+ * Memory: a decoded full song is ~100 MB. A deck's audio comes from the DJ-wide
+ * decode cache (`lib/djAudioCache`), the same buffers the deck waveform lanes
+ * draw from, so a loaded track is fetched and decoded once for the deck and its
+ * lanes together. That cache holds at most `DJ_AUDIO_CACHE_MAX` buffers (both
+ * decks plus the pair either side of a transition); a cleared deck drops its
+ * reference and the cache's LRU decides when the memory goes. Browsing/preview
+ * elsewhere still streams (wavesurfer fetches its own peaks); the deck engine
+ * itself is pure Web Audio.
  *
  * `playbackRate` on the source doubles as the turntable pitch (speed+pitch
  * together, like a real deck's pitch fader).
@@ -33,6 +37,7 @@ import { getEngineCtx, getMasterGain } from './playerStore';
 import { logError } from './logStore';
 import { summingDelaysSec } from '../lib/rackEffects';
 import { addWorkletModule } from '../lib/audioWorkletSupport';
+import { getDecodedAudio, setDecodeContext } from '../lib/djAudioCache';
 
 export type DeckId = 'A' | 'B';
 
@@ -508,10 +513,44 @@ export function getStatus(id: DeckId): DeckStatus {
   return statusOf(id);
 }
 
-/** Load a track URL into a deck: fetch + decode to an AudioBuffer (frees the
- *  prior one). Pass null to clear + free. */
+/** Decode deck tracks and waveform lanes through ONE context, the engine's,
+ *  so both land on the same `lib/djAudioCache` entry.
+ *
+ *  The cache keys a buffer on its URL and on the rate it was resampled to, and
+ *  a waveform lane asks for its audio without naming a context. Unregistered,
+ *  the lanes decode through the cache's 44.1 kHz offline fallback while the
+ *  deck decodes at the engine's own rate (48 kHz on most Windows devices): two
+ *  keys, so two fetches and two decodes of the same file. With the engine
+ *  context registered the lanes resolve to the deck's key. Idempotent. DJView
+ *  calls it on mount, before any lane exists; loadDeck calls it before each
+ *  decode. */
+export function shareDecodeContext(): AudioContext {
+  const ctx = getEngineCtx();
+  setDecodeContext(ctx);
+  return ctx;
+}
+
+/** Load a track URL into a deck: its decoded audio comes from the shared
+ *  decode cache, and the prior track's reference is dropped. Pass null to
+ *  clear.
+ *
+ *  The same URL again is a no-op while the deck already has it: decoded,
+ *  still decoding, or split into stems. DJView re-runs its deck-load effect
+ *  whenever the library resolves an entry, and each of those re-runs used to
+ *  land here and stop the deck, rewind it to 0:00, drop its stems and decode
+ *  the whole file again, so a playing deck cut out every time an unrelated
+ *  library lookup landed. A URL whose last load failed (no buffer, nothing in
+ *  flight) loads again, so a retry still works. */
 export async function loadDeck(id: DeckId, url: string | null, label: string | null): Promise<void> {
   const d = getDeck(id);
+  const holdsUrl = d.buffer !== null || d.decoding || (d.stemMode && !!d.stems?.length);
+  if (url !== null && d.loadedUrl === url && holdsUrl) {
+    if (label !== null && label !== d.label) {
+      d.label = label;
+      emit();
+    }
+    return;
+  }
   stopSource(d);
   teardownStems(d); // the previous track's stems no longer apply
   d.playing = false;
@@ -520,7 +559,7 @@ export async function loadDeck(id: DeckId, url: string | null, label: string | n
   d.rollResume = false;
 
   if (!url) {
-    d.buffer = null; // free decoded audio
+    d.buffer = null; // drop the deck's reference; the shared cache's LRU frees it
     d.loadedUrl = null;
     d.label = null;
     d.decoding = false;
@@ -535,18 +574,11 @@ export async function loadDeck(id: DeckId, url: string | null, label: string | n
   emit();
 
   try {
-    // TODO(dj-audio-cache): route this fetch+decode through
-    // `lib/djAudioCache.getDecodedAudio(url)` once that module lands (another
-    // builder owns it). Automix loads the same track onto the idle deck ahead
-    // of every transition, and a set that loops or revisits a track re-fetches
-    // and re-decodes the whole file each time — the cache is what makes an
-    // incoming deck ready before the outgoing one's tail (see the automix
-    // 'incoming-not-ready' path in DJView/djAutomixPlan).
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error(`fetch ${resp.status}`);
-    const arr = await resp.arrayBuffer();
-    const ctx = getEngineCtx();
-    const buf = await ctx.decodeAudioData(arr);
+    // One fetch and one decode per URL for the whole DJ tab: the deck's two
+    // waveform lanes ask the same cache for the same buffer, and a set that
+    // revisits a track still resident finds it decoded. Decoding through the
+    // engine's context lands the buffer at the rate playback runs at.
+    const buf = await getDecodedAudio(url, shareDecodeContext());
     // Guard: the deck may have been re-loaded with a different track meanwhile.
     if (d.loadedUrl !== url) return;
     d.buffer = buf;
@@ -1197,7 +1229,7 @@ export async function loadDeckStems(id: DeckId, stems: Array<{ name: string; url
     return { name, buffer, gain: g, level: 1 };
   });
   d.stemMode = true;
-  d.buffer = null; // stems replace the full buffer for playback (frees ~85 MB)
+  d.buffer = null; // stems replace the full buffer for playback; the shared cache keeps it while resident
   const dur = deckDuration(d);
   if (wasPlaying) startSource(d, clamp(pos, 0, dur));
   else d.startOffset = clamp(pos, 0, dur);
@@ -1224,9 +1256,9 @@ export async function unloadDeckStems(id: DeckId): Promise<void> {
   d.decoding = true;
   emit();
   try {
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error(`fetch ${resp.status}`);
-    const buf = await getEngineCtx().decodeAudioData(await resp.arrayBuffer());
+    // The same shared decode loadDeck uses: the track is usually still
+    // resident, so switching stems off costs no download at all.
+    const buf = await getDecodedAudio(url, shareDecodeContext());
     if (d.loadedUrl !== url) return; // re-loaded with a different track meanwhile
     stopSource(d);
     teardownStems(d);
