@@ -1,16 +1,18 @@
 """Where a caller on another machine may name a file.
 
 The pairing token (``backend/lib/pairing.py``) proves WHO a LAN caller is; it
-says nothing about which paths that caller should be trusted to name. A route
-that reads or writes a path from the request body therefore also confines a
-non-loopback caller to the user's projects folder and the library tree -- so a
-paired device, or anyone holding a stolen token, cannot read or write anywhere
-else on the disk. This machine's own UI (a loopback caller) is unaffected.
+says nothing about which paths that caller should be trusted to name. The
+routes below take a path from the request body and use this module to confine
+a non-loopback caller to the user's projects folder and the library tree, so a
+paired device, or anyone holding a stolen token, cannot name any other path
+through them. This machine's own UI (a loopback caller) is unaffected.
 
-One predicate for every such route: the project router's save/load/export
-routes, its recent list (which must not offer a LAN caller a project it would
-then refuse to open), the known-places recent list, and the VST ``/process``
-route's audio paths.
+The routes that apply it: the project router's save/load/export routes, its
+recent list (which must not offer a LAN caller a project it would then refuse
+to open), the ``.tasmo`` rows of the known-places recent list, and the VST
+``/process`` route's audio paths. It is not a disk-wide rule: other known-places
+routes (``/api/places/file`` among them) still serve a paired device the files
+this machine's desktop shell remembered, wherever they live.
 """
 
 from __future__ import annotations
