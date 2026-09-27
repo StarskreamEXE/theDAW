@@ -394,10 +394,16 @@ _MIGRATIONS: list[tuple[int, list[str]]] = [
 # ``entries_search`` is an fts5 TRIGRAM index over both, with the view
 # ``entries_search_text`` as its external content. A trigram index answers a
 # substring query of three or more characters from the index, so "shine"
-# finds "sunshine" and "120" finds a 120.0 BPM without reading a row. Shorter
-# tokens cannot be answered by a trigram index; they are matched as
-# substrings of the head table only, which is a scan of the short values and
-# nothing else.
+# finds "sunshine" and "120" finds a 120.0 BPM without reading a row.
+#
+# A trigram index cannot answer a word of one or two characters, so a second
+# fts5 index, ``entries_search_short``, answers those: it holds, per entry,
+# every distinct character and every distinct pair of adjacent characters of
+# the head and body text (:func:`short_grams`), each spelled as one plain
+# ASCII token. "4k" is then one term lookup, wherever in the entry it occurs
+# -- a title, a tag, or the middle of a 3,000-character prompt. It is
+# contentless; its rows are removed with the grams recomputed from
+# ``entries_search_text``, the same exact-delete rule as the trigram index.
 #
 # Keeping the indexed text in tables this module owns is what makes the index
 # impossible to corrupt from outside. An fts5 row can only be removed by
@@ -414,14 +420,16 @@ _MIGRATIONS: list[tuple[int, list[str]]] = [
 # a build that predates the index -- main's schema-6 code writes rows and the
 # rowids wait in ``search_dirty`` until this build next opens the file.
 
-#: How many characters a value may have and still be matched by a one- or
-#: two-character token. Longer values go to ``entries_search_body`` and are
-#: matched by tokens of three characters or more.
+#: How many characters a value may have and still be kept in
+#: ``entries_search_head``. Longer values go to ``entries_search_body``. Both
+#: are searched for every word, whatever its length; the split keeps the
+#: head, which the title lookups read, small.
 SEARCH_SHORT_VALUE_MAX = 200
 
-#: The version of what :func:`search_text` indexes. Bump it when that
-#: changes: the next open rebuilds the index from scratch.
-SEARCH_TEXT_VERSION = 1
+#: The version of what :func:`search_text` and :func:`short_grams` index.
+#: Bump it when either changes: the next open rebuilds the index from
+#: scratch.
+SEARCH_TEXT_VERSION = 2
 
 #: ``schema_meta`` key holding the highest ``entries.rowid`` an in-progress
 #: (re)build of the search index has durably indexed. Written in the same
@@ -460,6 +468,19 @@ _SEARCH_FTS_SQL = """
         tokenize='trigram case_sensitive 0'
     )
 """
+
+#: The one- and two-character index (see "Search index"). ``detail=none``
+#: keeps only which rows hold a term, which is all a word match needs, and
+#: the ``ascii`` tokenizer reads each gram token back exactly as written.
+_SEARCH_SHORT_FTS_SQL = """
+    CREATE VIRTUAL TABLE IF NOT EXISTS entries_search_short USING fts5(
+        grams, content='', detail='none', columnsize=0, tokenize='ascii'
+    )
+"""
+
+#: Words shorter than this are answered by ``entries_search_short``; the
+#: rest by the trigram index.
+SHORT_WORD_MAX = 2
 
 #: The ``analysis`` columns a library entry carries as ``entry.analysis``
 #: (``router._analysis_payload``), and so the ones main's matcher searched.
@@ -522,6 +543,46 @@ def search_words(q: Optional[str]) -> list[str]:
     as a parameter, and handed to fts5 only as a quoted string literal, so no
     search string is ever read as a query expression."""
     return [w.lower() for w in (q or "").split()][:MAX_SEARCH_TOKENS]
+
+
+def _gram_token(gram: str) -> str:
+    """One gram (a character, or two adjacent ones) as the ASCII token
+    ``entries_search_short`` stores: ``u`` and the code point in hex for one
+    character, ``b``, the first code point, ``g`` and the second for two.
+    Letters and digits only, so the ``ascii`` tokenizer keeps it whole."""
+    if len(gram) == 1:
+        return f"u{ord(gram):x}"
+    return f"b{ord(gram[0]):x}g{ord(gram[1]):x}"
+
+
+def short_grams(head: str, body: str) -> str:
+    """Every distinct character and pair of adjacent characters in the words
+    of ``head`` and ``body``, as space-separated :func:`_gram_token` tokens in
+    a fixed order. A search word never holds whitespace, so pairs that span a
+    space or a newline are left out. Deterministic: the index removes a row
+    by being handed this exact text again."""
+    grams: set[str] = set()
+    for text in (head, body):
+        for word in text.split():
+            grams.update(word)
+            grams.update([word[i : i + 2] for i in range(len(word) - 1)])
+    cache = _GRAM_TOKENS
+    if len(cache) > _GRAM_TOKENS_MAX:
+        cache.clear()
+    tokens: list[str] = []
+    for gram in grams:
+        token = cache.get(gram)
+        if token is None:
+            token = cache[gram] = _gram_token(gram)
+        tokens.append(token)
+    tokens.sort()
+    return " ".join(tokens)
+
+
+#: :func:`_gram_token` answers, remembered: the same few thousand grams make
+#: up nearly every entry, and an index build spells each one per entry.
+_GRAM_TOKENS: dict[str, str] = {}
+_GRAM_TOKENS_MAX = 200_000
 
 
 def _fts_phrase(text: str) -> str:
@@ -599,12 +660,12 @@ def _loose_json_value(text: Any) -> Any:
 
 def search_text(row: Mapping[str, Any]) -> tuple[str, str]:
     """``(head, body)``: the text one entry is found by, from one row of
-    :func:`_search_rows_sql`. Both are lowercased, so a one- or two-character
-    token matches the head case-insensitively in every script.
+    :func:`_search_rows_sql`. Both are lowercased, so every word, whatever
+    its length, matches case-insensitively in every script.
 
     Short values go to the head and long ones to the body (see
     :data:`SEARCH_SHORT_VALUE_MAX`); the title and the tags are always head,
-    since they are what a short token is most often looking for. Values are
+    which is what the title lookups read. Values are
     newline-separated, and no token or query spans a newline, so a match can
     never straddle two fields.
     """
@@ -1710,11 +1771,15 @@ class LibraryDB:
         self._conn.execute("PRAGMA temp_store = MEMORY")
         self._enable_fts = bool(enable_fts)
         #: Whether library search runs on fts5. False when this SQLite build
-        #: lacks the module or a caller asked for the LIKE path; read it rather
-        #: than assuming, and see :meth:`_search_clause` for what changes.
+        #: lacks the module or a caller asked for the instr path; read it rather
+        #: than assuming, and see :meth:`_text_match_sql` for what changes.
         self.fts_enabled = False
         #: Whether the search tables exist (see :meth:`_ensure_search`).
         self.search_ready = False
+        #: Open :meth:`checkpoint_once` blocks, and the autocheckpoint
+        #: setting the outermost one restores.
+        self._checkpoint_depth = 0
+        self._checkpoint_previous = 1000
         self._migrate()
         self._ensure_search()
 
@@ -1820,7 +1885,8 @@ class LibraryDB:
     def _ensure_search(self) -> None:
         """Bring the search index up to date on open.
 
-        1. Create the fts5 trigram index when this SQLite has fts5 and the
+        1. Create the fts5 trigram index and the one- and two-character
+           index when this SQLite has fts5 and the
            trigram tokenizer. Not a migration step: both are properties of the
            SQLite build, not of the file, so a library first opened without
            them picks the index up the next time a build that has them opens
@@ -1851,12 +1917,17 @@ class LibraryDB:
             if self._enable_fts:
                 try:
                     self._conn.execute(_SEARCH_FTS_SQL)
+                    self._conn.execute(_SEARCH_SHORT_FTS_SQL)
                     # A table created by a SQLite that had the trigram
                     # tokenizer exists even where this one lacks it; asking it
                     # something is what proves it is usable here.
                     self._conn.execute(
                         "SELECT rowid FROM entries_search "
                         "WHERE entries_search MATCH '\"abc\"' LIMIT 1"
+                    ).fetchall()
+                    self._conn.execute(
+                        "SELECT rowid FROM entries_search_short "
+                        "WHERE entries_search_short MATCH 'u61' LIMIT 1"
                     ).fetchall()
                     self._conn.commit()
                     self.fts_enabled = True
@@ -1945,6 +2016,10 @@ class LibraryDB:
                 if self.fts_enabled:
                     cur.execute(
                         "INSERT INTO entries_search(entries_search) VALUES('delete-all')"
+                    )
+                    cur.execute(
+                        "INSERT INTO entries_search_short(entries_search_short) "
+                        "VALUES('delete-all')"
                     )
                 cur.execute("DELETE FROM search_dirty")
                 cur.execute(
@@ -2068,22 +2143,18 @@ class LibraryDB:
         """Make the index hold exactly the current text of these rowids.
 
         For each chunk: remove what the index holds for them -- the fts5
-        'delete' reads the indexed values back out of ``entries_search_text``,
-        which is the only place they can come from exactly -- then write the
-        text of every rowid that is still an entry. A rowid with no entry
-        (deleted, by this build or another) is simply left out.
+        'delete's read the indexed values back out of ``entries_search_text``,
+        which is the only place they can come from exactly (the grams are
+        recomputed from those same values) -- then write the text of every
+        rowid that is still an entry. A rowid with no entry (deleted, by this
+        build or another) is simply left out.
         """
         ids = sorted({int(rid) for rid in rids})
         for chunk in _chunks(ids, _MAX_SQL_PARAMS):
             marks = ", ".join("?" * len(chunk))
             params = list(chunk)
             if self.fts_enabled:
-                cur.execute(
-                    "INSERT INTO entries_search(entries_search, rowid, head, body) "
-                    "SELECT 'delete', rid, head, body FROM entries_search_text "
-                    f"WHERE rid IN ({marks})",
-                    params,
-                )
+                self._unindex_search(cur, marks, params)
             cur.execute(
                 f"DELETE FROM entries_search_head WHERE rid IN ({marks})", params
             )
@@ -2109,6 +2180,32 @@ class LibraryDB:
                     "INSERT INTO entries_search (rowid, head, body) VALUES (?, ?, ?)",
                     texts,
                 )
+                cur.executemany(
+                    "INSERT INTO entries_search_short (rowid, grams) VALUES (?, ?)",
+                    [(rid, short_grams(head, body)) for rid, head, body in texts],
+                )
+
+    @staticmethod
+    def _unindex_search(cur: sqlite3.Cursor, marks: str, params: list[Any]) -> None:
+        """Remove the fts5 rows of the rowids in ``params`` (``marks`` is its
+        placeholder list), handing each index back exactly what it was given.
+        The head and body rows are left for the caller."""
+        indexed = cur.execute(
+            f"SELECT rid, head, body FROM entries_search_text WHERE rid IN ({marks})",
+            params,
+        ).fetchall()
+        if not indexed:
+            return
+        cur.executemany(
+            "INSERT INTO entries_search(entries_search, rowid, head, body) "
+            "VALUES ('delete', ?, ?, ?)",
+            [(r["rid"], r["head"], r["body"]) for r in indexed],
+        )
+        cur.executemany(
+            "INSERT INTO entries_search_short(entries_search_short, rowid, grams) "
+            "VALUES ('delete', ?, ?)",
+            [(r["rid"], short_grams(r["head"], r["body"])) for r in indexed],
+        )
 
     def _sync_dirty(self, cur: sqlite3.Cursor) -> None:
         """Re-index the rows this transaction's writes touched (the triggers
@@ -2595,7 +2692,7 @@ class LibraryDB:
         # so a batch can never exceed the parameter ceiling.
         size = max(1, min(int(batch), _MAX_SQL_PARAMS))
         removed = 0
-        with self._checkpoint_once():
+        with self.checkpoint_once():
             for chunk in _chunks(ids, size):
                 marks = ", ".join("?" * len(chunk))
                 params = list(chunk)
@@ -2614,7 +2711,7 @@ class LibraryDB:
         return removed
 
     @contextmanager
-    def _checkpoint_once(self) -> Iterator[None]:
+    def checkpoint_once(self) -> Iterator[None]:
         """Hold WAL checkpoints back for a run of batch commits, then run ONE.
 
         Every batch of a bulk delete rewrites the same hot pages -- the
@@ -2624,17 +2721,29 @@ class LibraryDB:
         Deferred, each page is copied once. The checkpoint at the end is
         PASSIVE, so it never waits on, or blocks, a reader or another writer;
         whatever it cannot copy is left to the next automatic one.
+
+        Nests: only the outermost block checkpoints. The store wraps its whole
+        bulk delete in one, because it calls :meth:`delete_entries_bulk` once
+        per batch, and a checkpoint per 500-row batch cost 10 of the 21 s a
+        50,000-row delete took.
         """
         with self._writelock:
-            row = self._conn.execute("PRAGMA wal_autocheckpoint").fetchone()
-            previous = int(row[0]) if row is not None else 1000
-            self._conn.execute("PRAGMA wal_autocheckpoint = 0")
+            outermost = self._checkpoint_depth == 0
+            self._checkpoint_depth += 1
+            if outermost:
+                row = self._conn.execute("PRAGMA wal_autocheckpoint").fetchone()
+                self._checkpoint_previous = int(row[0]) if row is not None else 1000
+                self._conn.execute("PRAGMA wal_autocheckpoint = 0")
         try:
             yield
         finally:
             with self._writelock:
-                self._conn.execute(f"PRAGMA wal_autocheckpoint = {previous}")
-                self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchall()
+                self._checkpoint_depth -= 1
+                if outermost:
+                    self._conn.execute(
+                        f"PRAGMA wal_autocheckpoint = {self._checkpoint_previous}"
+                    )
+                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchall()
 
     def all_entry_ids(self) -> list[str]:
         with self._writelock:
@@ -2657,8 +2766,11 @@ class LibraryDB:
     # play_count read from the row it belongs to instead of a second pass over
     # the whole table. The store builds records for the PAGE only.
 
-    def _search_clause(self, q: str) -> tuple[str, list[Any]]:
-        """``(clause, params)`` for a free-text search, main's matcher in SQL.
+    def _search_rids_sql(self, q: str) -> Optional[tuple[str, list[Any]]]:
+        """``(select, params)``: one ``SELECT rid`` of the rowids a free-text
+        search matches -- main's matcher in SQL -- or None when ``q`` says
+        nothing (a blank search matches nothing; the list without a search is
+        the request that omits ``q``).
 
         An entry matches when every word of ``q`` (:func:`search_words`)
         occurs in its search text (see "Search index"), OR -- when ``q`` reads
@@ -2667,91 +2779,149 @@ class LibraryDB:
         query as one substring, and every word of a substring that occurs
         occurs too, so this finds everything main's matcher found.
 
-        Words of three characters or more are answered by the trigram index;
-        shorter ones by a substring test on the head text only. Everything is
-        phrased as ONE ``rowid IN (subquery)``, and the phrasing is
-        load-bearing: written as a join, SQLite drives the query from the
-        ``kind`` index and asks fts5 "does THIS rowid match?" once per row --
-        measured at 18.8 s for one page on 200,000 rows -- where the subquery
-        is materialized once. The duration arms seek ``idx_entries_duration``.
+        The rowids are never matched one entry at a time: written as a join
+        that SQLite drives from the ``kind`` index, fts5 is asked "does THIS
+        rowid match?" once per row -- measured at 18.8 s for one page on
+        200,000 rows. :meth:`_filter_sql` and :meth:`_source_sql` use this
+        select only as a whole set.
 
-        Without fts5 the same text tables are scanned with ``instr``: slower,
-        the same answers.
+        No rowid is listed twice, so an aggregate can drive from the select
+        as it stands. The duration arm seeks ``idx_entries_duration`` and
+        leaves out the rows the text arm already lists, by testing the same
+        words on those rows' text; a ``UNION`` would instead sort every
+        matching rowid into a temporary b-tree to remove the repeats.
         """
         raw = q.strip()
         if not raw:
-            # A search that says nothing matches nothing; the list without a
-            # search is the request that omits `q`.
-            return "0", []
-        alternatives: list[str] = []
-        params: list[Any] = []
-        text_sql, text_params = self._text_match_sql(search_words(raw))
-        alternatives.append(text_sql)
-        params.extend(text_params)
+            return None
+        words = search_words(raw)
+        text_sql, params = self._text_match_sql(words)
         number = js_parse_float(raw)
-        if number is not None:
-            # Math.round(duration) === Math.round(n), and the same in minutes.
-            target = js_round(number)
-            for scale in (1.0, 60.0):
-                alternatives.append(
-                    "SELECT rowid AS rid FROM entries "
-                    "WHERE duration_sec >= ? AND duration_sec < ?"
-                )
-                params.extend([(target - 0.5) * scale, (target + 0.5) * scale])
-        return f"e.rowid IN ({' UNION '.join(alternatives)})", params
+        if number is None:
+            return text_sql, params
+        # Math.round(duration) === Math.round(n), and the same in minutes.
+        target = js_round(number)
+        bounds = [
+            bound
+            for scale in (1.0, 60.0)
+            for bound in ((target - 0.5) * scale, (target + 0.5) * scale)
+        ]
+        in_text = " AND ".join(
+            "(instr(COALESCE(h.head, ''), ?) > 0 OR instr(COALESCE(b.body, ''), ?) > 0)"
+            for _ in words
+        )
+        duration_sql = (
+            "SELECT d.rowid AS rid FROM entries d "
+            "LEFT JOIN entries_search_head h ON h.rid = d.rowid "
+            "LEFT JOIN entries_search_body b ON b.rid = d.rowid "
+            "WHERE ((d.duration_sec >= ? AND d.duration_sec < ?) "
+            "OR (d.duration_sec >= ? AND d.duration_sec < ?)) "
+            f"AND NOT ({in_text})"
+        )
+        params.extend(bounds)
+        params.extend(v for w in words for v in (w, w))
+        # Each arm wrapped, so nothing inside one can bind to its neighbour.
+        return (
+            f"SELECT rid FROM ({text_sql}) UNION ALL SELECT rid FROM ({duration_sql})",
+            params,
+        )
 
     def _text_match_sql(self, tokens: Sequence[str]) -> tuple[str, list[Any]]:
         """One ``SELECT rid`` of the rowids whose search text holds every one
-        of ``tokens`` (at least one; :meth:`_search_clause` never passes
-        none)."""
-        long_tokens = [t for t in tokens if len(t) >= 3]
-        short_tokens = [t for t in tokens if len(t) < 3]
-        short_sql = " AND ".join("instr(h.head, ?) > 0" for _ in short_tokens)
+        of ``tokens`` (at least one; :meth:`_search_rids_sql` never passes
+        none), in the head or the body alike.
+
+        Words of three characters or more are answered by the trigram index
+        and shorter ones by ``entries_search_short``. When a query has both,
+        the trigram index narrows and each short word is tested with
+        ``instr`` on the candidates' head and body, looked up by primary key:
+        measured at 200,000 rows that is cheaper than intersecting two fts5
+        results, which sorts both sets into a temporary b-tree.
+
+        Without fts5 the text tables are scanned with ``instr``: slower, the
+        same answers.
+        """
+        long_tokens = [t for t in tokens if len(t) > SHORT_WORD_MAX]
+        short_tokens = [t for t in tokens if len(t) <= SHORT_WORD_MAX]
+        in_text = "(instr(h.head, ?) > 0 OR instr(COALESCE(b.body, ''), ?) > 0)"
         if self.fts_enabled:
             match = " ".join(_fts_phrase(t) for t in long_tokens)
-            if long_tokens and short_tokens:
-                # The index narrows; the short tokens are then tested on the
-                # head of each candidate, looked up by primary key.
-                return (
-                    "SELECT s.rowid AS rid FROM entries_search s "
-                    "JOIN entries_search_head h ON h.rid = s.rowid "
-                    f"WHERE s.entries_search MATCH ? AND {short_sql}",
-                    [match, *short_tokens],
-                )
-            if long_tokens:
+            if not short_tokens:
                 return (
                     "SELECT rowid AS rid FROM entries_search "
                     "WHERE entries_search MATCH ?",
                     [match],
                 )
+            if not long_tokens:
+                return (
+                    "SELECT rowid AS rid FROM entries_search_short "
+                    "WHERE entries_search_short MATCH ?",
+                    [" ".join(_gram_token(t) for t in short_tokens)],
+                )
             return (
-                f"SELECT h.rid AS rid FROM entries_search_head h WHERE {short_sql}",
-                list(short_tokens),
+                "SELECT h.rid AS rid FROM entries_search s "
+                "CROSS JOIN entries_search_head h ON h.rid = s.rowid "
+                "LEFT JOIN entries_search_body b ON b.rid = h.rid "
+                "WHERE s.entries_search MATCH ? AND "
+                + " AND ".join(in_text for _ in short_tokens),
+                [match, *(v for t in short_tokens for v in (t, t))],
             )
-        parts: list[str] = []
-        params: list[Any] = []
-        for token in long_tokens:
-            parts.append(
-                "SELECT rid FROM (SELECT rid FROM entries_search_head "
-                "WHERE instr(head, ?) > 0 UNION SELECT rid FROM entries_search_body "
-                "WHERE instr(body, ?) > 0)"
-            )
-            params.extend([token, token])
-        if short_tokens:
-            parts.append(
-                f"SELECT h.rid AS rid FROM entries_search_head h WHERE {short_sql}"
-            )
-            params.extend(short_tokens)
-        return f"SELECT rid FROM ({' INTERSECT '.join(parts)})", params
+        return (
+            "SELECT h.rid AS rid FROM entries_search_head h "
+            "LEFT JOIN entries_search_body b ON b.rid = h.rid WHERE "
+            + " AND ".join(in_text for _ in tokens),
+            [v for t in tokens for v in (t, t)],
+        )
 
     def _filter_sql(self, filters: EntryFilters) -> tuple[str, list[Any]]:
-        """``(where, params)`` for one :class:`EntryFilters`."""
+        """``(where, params)`` for one :class:`EntryFilters`, the search as
+        ``e.rowid IN (...)``: the shape for a sorted page, which walks the
+        sort's index and stops after one page, however many rows match."""
         clauses: list[str] = []
         params: list[Any] = []
         if filters.q is not None:
-            search_clause, search_params = self._search_clause(filters.q)
-            clauses.append(search_clause)
-            params.extend(search_params)
+            search = self._search_rids_sql(filters.q)
+            if search is None:
+                clauses.append("0")
+            else:
+                clauses.append(f"e.rowid IN ({search[0]})")
+                params.extend(search[1])
+        rest, rest_params = self._column_filter_sql(filters)
+        clauses.extend(rest)
+        params.extend(rest_params)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        return where, params
+
+    def _source_sql(self, filters: EntryFilters) -> tuple[str, list[Any]]:
+        """``(from_and_where, params)`` for an aggregate over everything
+        ``filters`` matches (a count, the stats chips). A text search drives:
+        its rowids come out of fts5 in rowid order, and each entry is looked
+        up by primary key in that order, where the ``IN`` shape first copies
+        every matching rowid into a temporary index (measured at 200,000
+        matches: 67 ms against 162 ms for a count, 104 ms against 155 ms for
+        the stats).
+
+        A query that also reads as a duration keeps the ``IN`` shape: the
+        duration arm lists rowids in duration order, and looking those up one
+        by one in the table reads its pages at random (145 ms for the 7,821
+        rows three minutes matched on 200,000)."""
+        search = None if filters.q is None else self._search_rids_sql(filters.q)
+        if search is None or js_parse_float(filters.q.strip()) is not None:
+            where, params = self._filter_sql(filters)
+            return f"entries e {where}", params
+        clauses, params = self._column_filter_sql(filters)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        return (
+            f"({search[0]}) s CROSS JOIN entries e NOT INDEXED ON e.rowid = s.rid "
+            f"{where}",
+            [*search[1], *params],
+        )
+
+    @staticmethod
+    def _column_filter_sql(filters: EntryFilters) -> tuple[list[str], list[Any]]:
+        """The clauses and params of every filter but the search."""
+        clauses: list[str] = []
+        params: list[Any] = []
         if filters.kinds is not None:
             kinds = sorted(filters.kinds)
             if not kinds:
@@ -2778,8 +2948,7 @@ class LibraryDB:
             # is folded to match.
             clauses.append(f"{PROVIDER_SQL} = ?")
             params.append(str(filters.provider).strip().lower())
-        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        return where, params
+        return clauses, params
 
     @staticmethod
     def _order_sql(sort: str) -> str:
@@ -2817,12 +2986,10 @@ class LibraryDB:
     def count_entries_filtered(self, filters: EntryFilters) -> int:
         """How many entries match ``filters`` -- the ``total`` a paged client
         sizes its scrollbar from."""
-        where, params = self._filter_sql(filters)
+        source, params = self._source_sql(filters)
         with self._writelock:
             cur = self._conn.cursor()
-            row = cur.execute(
-                f"SELECT COUNT(*) AS c FROM entries e {where}", params
-            ).fetchone()
+            row = cur.execute(f"SELECT COUNT(*) AS c FROM {source}", params).fetchone()
             cur.close()
             return int(row["c"]) if row else 0
 
@@ -2855,13 +3022,14 @@ class LibraryDB:
         and duration chips above the library list, which must not change as
         the user scrolls pages in and out.
 
-        One aggregate sharing the page query's WHERE clause, so the chips and
-        the list can never be about different rows. With a kind (and a
+        One aggregate over the same filters as the page query, so the chips
+        and the list can never be about different rows. With a kind (and a
         favourite) filter it is a covering scan of ``idx_entries_kind_stats``;
-        a search or provider filter adds a row lookup per match, reading the
-        leading columns of the row and never its blob.
+        a search drives from its matching rowids (:meth:`_source_sql`) with a
+        primary-key lookup per match, and a provider filter adds a row lookup
+        per row.
         """
-        where, params = self._filter_sql(filters)
+        source, params = self._source_sql(filters)
         with self._writelock:
             cur = self._conn.cursor()
             try:
@@ -2869,7 +3037,7 @@ class LibraryDB:
                     "SELECT COUNT(*) AS n, TOTAL(e.favorite) AS favorites, "
                     "TOTAL(e.file_size_bytes) AS size_bytes, "
                     "TOTAL(e.duration_sec) AS duration_sec "
-                    f"FROM entries e {where}",
+                    f"FROM {source}",
                     params,
                 ).fetchone()
             finally:

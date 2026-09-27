@@ -34,9 +34,11 @@ from backend.modules.library import router as library_router_module
 from backend.modules.library.db import (
     FTS_BACKFILL_ROWID_KEY,
     LEGACY_FTS_BACKFILL_KEY,
+    SEARCH_SHORT_VALUE_MAX,
     SEARCH_STATE_KEY,
     EntryFilters,
     LibraryDB,
+    short_grams,
 )
 from tests.test_library_store import _seed_generate_entry
 
@@ -99,10 +101,40 @@ def _found(db: LibraryDB, q: str) -> set[str]:
 
 def _assert_search_index_intact(db: LibraryDB) -> None:
     """fts5's integrity check against the content view: a delete that handed
-    fts5 values it never indexed fails here."""
-    if db.fts_enabled:
-        db._conn.execute(
-            "INSERT INTO entries_search(entries_search, rank) VALUES('integrity-check', 1)"
+    fts5 values it never indexed fails here. The one- and two-character index
+    is contentless, so fts5 can only check its structure; it is also compared,
+    term by term, with the grams of the text the entries hold now."""
+    if not db.fts_enabled:
+        return
+    db._conn.execute(
+        "INSERT INTO entries_search(entries_search, rank) VALUES('integrity-check', 1)"
+    )
+    db._conn.execute(
+        "INSERT INTO entries_search_short(entries_search_short) "
+        "VALUES('integrity-check')"
+    )
+    expected: dict[str, set[int]] = {}
+    for row in db._conn.execute("SELECT rid, head, body FROM entries_search_text"):
+        for token in short_grams(row["head"], row["body"]).split():
+            expected.setdefault(token, set()).add(int(row["rid"]))
+    # Every term the index holds, so a row left behind under a term no live
+    # entry has is caught too.
+    db._conn.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS temp.short_terms "
+        "USING fts5vocab(main, entries_search_short, row)"
+    )
+    held = {str(r[0]) for r in db._conn.execute("SELECT term FROM short_terms")}
+    for token in held | set(expected):
+        indexed = {
+            int(r[0])
+            for r in db._conn.execute(
+                "SELECT rowid FROM entries_search_short "
+                "WHERE entries_search_short MATCH ?",
+                (token,),
+            )
+        }
+        assert indexed == expected.get(token, set()), (
+            f"short index disagrees with the text on {token}"
         )
 
 
@@ -207,12 +239,30 @@ def _seed_varied(root: Path) -> None:
         0,
         extra_meta={"title": "Untitled 7", "prompt": "", "duration": 300.0},
     )
+    _seed_generate_entry(
+        root,
+        "jobD",
+        0,
+        extra_meta={"title": "Long Take", "prompt": LONG_PROMPT, "duration": 44.0},
+    )
+
+
+#: A prompt past ``SEARCH_SHORT_VALUE_MAX``, the way Suno prompts that carry
+#: lyrics are, ending in words of one and two characters.
+LONG_PROMPT = (
+    "slow cinematic build over rolling timpani, distant choir swelling under "
+    "bowed strings, a lonely trumpet line answering the melody, rain on "
+    "glass, tape hiss and warm room tone, the second half opening into a "
+    "wide chorus of layered voices before everything falls away with a 4k "
+    "shimmer and a zq tail"
+)
 
 
 def test_search_finds_everything_main_found(client: TestClient, tmp_path: Path):
     """The paged search and main's client matcher agree, field by field, on a
     library carrying analysis and embedded tags: BPM, key, artist, album, the
-    duration, and fragments inside words."""
+    duration, fragments inside words, and short words inside long values."""
+    assert len(LONG_PROMPT) > SEARCH_SHORT_VALUE_MAX
     _seed_varied(tmp_path)
     store = library_router_module.get_store()
     # Discover the entries first, so the analysis rows have an entry to name.
@@ -249,6 +299,12 @@ def test_search_finds_everything_main_found(client: TestClient, tmp_path: Path):
         "3": None,  # a duration in minutes (300 s), and every "3" in text
         "185": {"Sunshine Avenue"},  # a duration in seconds
         "summer": {"Sunshine Avenue"},  # a tag
+        # One- and two-character words inside a value past 200 characters.
+        "zq": {"Long Take"},
+        "4k": {"Long Take"},
+        "zq tail": {"Long Take"},
+        "4k shimmer": {"Long Take"},
+        "k": None,
     }
     for q, titles in queries.items():
         paged = client.get("/api/library/entries", params={"limit": 100, "q": q}).json()
@@ -259,6 +315,28 @@ def test_search_finds_everything_main_found(client: TestClient, tmp_path: Path):
             assert got == titles, q
             assert main == titles, f"the port of main's matcher disagrees on {q!r}"
         assert paged["total"] == len(paged["entries"]), q
+
+
+@pytest.mark.parametrize("enable_fts", [True, False])
+def test_short_words_reach_every_value_on_both_paths(tmp_path: Path, enable_fts: bool):
+    """A word of one or two characters is looked for in every value, long or
+    short, with the fts5 indexes and with the ``instr`` fallback alike."""
+    db = LibraryDB(tmp_path / "library.db", enable_fts=enable_fts)
+    db.upsert_entry(_payload("long", title="Long Take", prompt=LONG_PROMPT))
+    db.upsert_entry(_payload("short", title="Short Take", prompt="a zq tail"))
+    db.upsert_entry(_payload("none", title="Plain", prompt="nothing to see"))
+    assert _found(db, "zq") == {"long", "short"}
+    assert _found(db, "4k") == {"long"}
+    assert _found(db, "4k shimmer") == {"long"}
+    assert _found(db, "zq take") == {"long", "short"}
+    assert _found(db, "kz") == set()
+    assert db.count_entries_filtered(EntryFilters(q="zq")) == 2
+    assert db.entry_stats(EntryFilters(q="4k"))["count"] == 1
+    db.upsert_entry(_payload("long", title="Long Take", prompt="rewritten"))
+    assert _found(db, "4k") == set()
+    assert _found(db, "zq") == {"short"}
+    _assert_search_index_intact(db)
+    db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -284,18 +362,23 @@ def test_a_row_main_writes_is_found_and_its_edit_keeps_the_index_intact(
     main.upsert_entry(_payload("a", title="Rainy Avenue"))
     main.upsert_entry(_payload("b", title="Harbor Nights", prompt="dusty lofi"))
     main.upsert_analysis("b", {"bpm": 97.0, "key": "Eb"})
+    main.upsert_entry(_payload("l", title="Long Take", prompt=LONG_PROMPT))
     main.close()
 
     ours = LibraryDB(path)
     assert _found(ours, "harbor") == {"b"}
     assert _found(ours, "97") == {"b"}
-    assert _found(ours, "rain") == {"a"}
+    assert _found(ours, "rain") == {"a", "l"}
+    assert _found(ours, "zq") == {"l"}
+    assert _found(ours, "eb") == {"b"}
     # What main renamed away is gone from the index, not a phantom hit.
     assert _found(ours, "sunshine") == set()
     _assert_search_index_intact(ours)
 
     ours.upsert_entry(_payload("b", title="Harbor Days", prompt="dusty lofi"))
     ours.upsert_entry(_payload("a", title="Rainy Street"))
+    ours.upsert_entry(_payload("l", title="Long Take", prompt="short now"))
+    assert _found(ours, "zq") == set()
     assert _found(ours, "nights") == set()
     assert _found(ours, "days") == {"b"}
     assert _found(ours, "street") == {"a"}

@@ -27,6 +27,7 @@ import shutil
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Optional
@@ -2054,31 +2055,34 @@ class LibraryStore:
             targets.append((entry_id, entry_dir))
 
         size = max(1, int(batch))
-        for start in range(0, len(targets), size):
-            chunk = targets[start : start + size]
-            if self.db is not None:
-                # One transaction, one revision bump, for this whole chunk.
-                self.db.delete_entries_bulk(
-                    [entry_id for entry_id, _ in chunk], batch=len(chunk)
-                )
-            for entry_id, entry_dir in chunk:
-                if entry_dir is None:
+        # One WAL checkpoint for the whole request, not one per batch.
+        deferred = self.db.checkpoint_once() if self.db is not None else nullcontext()
+        with deferred:
+            for start in range(0, len(targets), size):
+                chunk = targets[start : start + size]
+                if self.db is not None:
+                    # One transaction, one revision bump, for this whole chunk.
+                    self.db.delete_entries_bulk(
+                        [entry_id for entry_id, _ in chunk], batch=len(chunk)
+                    )
+                for entry_id, entry_dir in chunk:
+                    if entry_dir is None:
+                        result.deleted += 1
+                        continue
+                    try:
+                        shutil.rmtree(entry_dir)
+                    except OSError as e:
+                        log.warning(
+                            "library.store: deleted row %r but failed to remove %s: %s",
+                            entry_id,
+                            entry_dir,
+                            e,
+                        )
+                        result.failed.append(
+                            {"id": entry_id, "error": f"could not remove folder: {e}"}
+                        )
+                        continue
                     result.deleted += 1
-                    continue
-                try:
-                    shutil.rmtree(entry_dir)
-                except OSError as e:
-                    log.warning(
-                        "library.store: deleted row %r but failed to remove %s: %s",
-                        entry_id,
-                        entry_dir,
-                        e,
-                    )
-                    result.failed.append(
-                        {"id": entry_id, "error": f"could not remove folder: {e}"}
-                    )
-                    continue
-                result.deleted += 1
         return result
 
     def import_blob(

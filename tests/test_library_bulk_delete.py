@@ -31,6 +31,9 @@ from fastapi.testclient import TestClient
 from backend.modules.library import router as library_router_module
 from backend.modules.library.db import EntryFilters, LibraryDB
 from backend.modules.library.store import LibraryStore
+from tests.test_library_search_parity import (
+    _assert_search_index_intact as check_search_index,
+)
 
 #: The ticket's budget for 50,000 ids.
 DELETE_BUDGET_S = 30.0
@@ -128,9 +131,7 @@ def test_search_no_longer_finds_a_bulk_deleted_entry(tmp_path: Path):
     assert db.count_entries_filtered(EntryFilters(q="dark")) == 0
     # An fts5 index only reports a bad delete through corruption, so ask it
     # directly, against its content view as well as internally.
-    db._conn.execute(
-        "INSERT INTO entries_search(entries_search, rank) VALUES('integrity-check', 1)"
-    )
+    check_search_index(db)
 
 
 def test_relations_referencing_a_deleted_entry_go_too(tmp_path: Path):
@@ -169,6 +170,30 @@ def test_existing_entry_ids_reports_only_the_rows_that_are_there(tmp_path: Path)
 # ---------------------------------------------------------------------------
 # store.delete_entries_bulk -- the safety rules
 # ---------------------------------------------------------------------------
+
+
+def test_a_bulk_delete_of_many_batches_checkpoints_the_wal_once(
+    store: LibraryStore,
+):
+    """The store hands the DB one batch at a time. Each batch commits on its
+    own, but the WAL is copied back into the database file once, after the
+    last one -- not once per batch, which was half the cost of a large
+    delete."""
+    for i in range(7):
+        _managed_entry(store, f"c{i}", title=f"Cobalt {i}")
+    statements: list[str] = []
+    store.db._conn.set_trace_callback(statements.append)
+    try:
+        result = store.delete_entries_bulk([f"c{i}" for i in range(7)], batch=3)
+    finally:
+        store.db._conn.set_trace_callback(None)
+    assert result.deleted == 7
+    checkpoints = [s for s in statements if "wal_checkpoint" in s]
+    assert checkpoints == ["PRAGMA wal_checkpoint(PASSIVE)"]
+    # Automatic checkpoints are back on afterwards.
+    assert store.db._conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0] > 0
+    assert store.db.count_entries_filtered(EntryFilters(q="cobalt")) == 0
+    check_search_index(store.db)
 
 
 def test_bulk_delete_removes_the_folder_and_the_row(store: LibraryStore):

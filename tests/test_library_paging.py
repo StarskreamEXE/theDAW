@@ -26,12 +26,17 @@ from fastapi.testclient import TestClient
 
 from backend.modules.library import router as library_router_module
 from backend.modules.library.db import SORTS, EntryFilters, LibraryDB
+from tests.test_library_search_parity import (
+    _assert_search_index_intact as check_search_index,
+)
 from tests.test_library_store import _seed_generate_entry
 
 # Budgets from the ticket, at 200,000 rows.
 PAGE_BUDGET_MS = 250.0
 SEARCH_BUDGET_MS = 300.0
 COUNT_BUDGET_MS = 150.0
+#: The stats chips are one more request per search, held to a page's budget.
+STATS_BUDGET_MS = PAGE_BUDGET_MS
 PERF_ROWS = 200_000
 
 
@@ -84,12 +89,9 @@ def _build_has_fts5() -> bool:
 
 
 def _assert_search_index_intact(db: LibraryDB) -> None:
-    """fts5's own integrity check, with the rank argument that also compares
-    the index against its content view -- the check a wrong delete fails."""
-    if db.fts_enabled:
-        db._conn.execute(
-            "INSERT INTO entries_search(entries_search, rank) VALUES('integrity-check', 1)"
-        )
+    """fts5's own integrity checks, and the one- and two-character index
+    compared with the text it was built from (see the parity suite)."""
+    check_search_index(db)
 
 
 # ---------------------------------------------------------------------------
@@ -558,6 +560,27 @@ def test_two_hundred_thousand_rows_stay_inside_the_budget(tmp_path: Path):
     search_ms = (time.perf_counter() - t0) * 1000
     assert hits, "the two-token search must match the synthesized titles"
 
+    # Words of one and two characters, which match most of the library, and
+    # the stats chips for them: what a user typing "a" or "ne" waits on.
+    short_timings: dict[str, tuple[float, float, float]] = {}
+    for q, expect_all in (("a", True), ("ne", False), ("3", False)):
+        searched = EntryFilters(kinds=frozenset({"audio"}), q=q)
+        runs: list[tuple[float, float, float]] = []
+        for _ in range(3):
+            t0 = time.perf_counter()
+            rows = db.list_entries_page(searched, limit=200)
+            t1 = time.perf_counter()
+            n = db.count_entries_filtered(searched)
+            t2 = time.perf_counter()
+            stats = db.entry_stats(searched)
+            t3 = time.perf_counter()
+            runs.append(((t1 - t0) * 1000, (t2 - t1) * 1000, (t3 - t2) * 1000))
+        assert len(rows) == 200, q
+        assert stats["count"] == n, q
+        if expect_all:
+            assert n == PERF_ROWS, q
+        short_timings[q] = tuple(sorted(r[i] for r in runs)[1] for i in range(3))
+
     t0 = time.perf_counter()
     capped = db.list_entry_ids(audio, cap=50_000)
     ids_ms = (time.perf_counter() - t0) * 1000
@@ -569,8 +592,17 @@ def test_two_hundred_thousand_rows_stay_inside_the_budget(tmp_path: Path):
     )
     for sort, ms in timings.items():
         print(f"[200k] page limit=200 offset={deep} sort={sort}: {ms:.1f}ms")
+    for q, (page_ms, n_ms, stats_ms) in short_timings.items():
+        print(
+            f"[200k] q={q!r} (median of 3): page={page_ms:.1f}ms "
+            f"count={n_ms:.1f}ms stats={stats_ms:.1f}ms"
+        )
 
     assert count_ms < COUNT_BUDGET_MS, f"count took {count_ms:.1f}ms"
     assert search_ms < SEARCH_BUDGET_MS, f"search took {search_ms:.1f}ms"
     for sort, ms in timings.items():
         assert ms < PAGE_BUDGET_MS, f"{sort} page took {ms:.1f}ms"
+    for q, (page_ms, n_ms, stats_ms) in short_timings.items():
+        assert page_ms < PAGE_BUDGET_MS, f"q={q!r} page took {page_ms:.1f}ms"
+        assert n_ms < COUNT_BUDGET_MS, f"q={q!r} count took {n_ms:.1f}ms"
+        assert stats_ms < STATS_BUDGET_MS, f"q={q!r} stats took {stats_ms:.1f}ms"

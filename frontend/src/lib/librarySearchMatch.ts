@@ -2,7 +2,7 @@
  * The library's client-side search test, for a backend that does not page.
  *
  * A paged backend answers a search in SQL (`backend/modules/library/db.py`,
- * `_search_clause`), and that search finds everything this one finds. This is
+ * `_search_rids_sql`), and that search finds everything this one finds. This is
  * the same test for the rows a client holds when the backend hands it the
  * whole library instead: the LIBRARY tab's store and every other surface that
  * searches the library (`librarySearch.ts`) use it, so the answers agree.

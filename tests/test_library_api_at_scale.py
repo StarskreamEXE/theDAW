@@ -136,10 +136,10 @@ BLOB_COLUMNS = (
 
 #: The routes rule 3 covers: everything whose cost must be independent of how
 #: fat a row is. Each list route is probed searched as well as unsearched:
-#: ``LibraryDB._search_clause`` has a documented non-fts5 fallback whose
-#: ``LIKE`` on ``json_extract(e.metadata_json, '$.lyrics')`` opens every row's
-#: blob, and an unsearched sweep never reaches it. :data:`SEARCH_WORD` is in
-#: every fixture title, so the searched probes match all 20,000 rows.
+#: ``LibraryDB._text_match_sql`` has a documented non-fts5 fallback, an
+#: ``instr`` scan of the search text tables, and an unsearched sweep never
+#: reaches it. :data:`SEARCH_WORD` is in every fixture title, so the searched
+#: probes match all 20,000 rows.
 LIST_ROUTE_PATHS = (
     f"{LIBRARY_PREFIX}/entries?limit=50",
     f"{LIBRARY_PREFIX}/entries?limit=50&provider={RARE_PROVIDER}",
