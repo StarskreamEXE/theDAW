@@ -4,15 +4,18 @@ main 851f6a0 keeps the grants in ``data/media_roots.json`` as a bare JSON list
 and reads any other shape as no grants. The first v2 build wrote
 ``{"v": 2, "roots": [...]}`` into that same file and read a list as no grants,
 so every switch between the two forgot every grant, in both directions. This
-build keeps its own grants in ``data/clip_audio_roots.json``, takes main's
-over on its first run, and keeps ``media_roots.json`` current in main's list
-format.
+build keeps its own grants in ``data/clip_audio_roots.json``, takes over on
+every start the folders an older build added to ``media_roots.json``, and
+keeps that file current in main's list format.
 
 Each "start" below imports the module afresh with ``theDAW_DATA_DIR`` pointing
 into ``tmp_path``, so it loads its files at import exactly as a starting
-backend does. main's module is ``tests/fixtures/main_851f6a0/media_access.py``,
-a byte-identical copy of ``backend/modules/project/media_access.py`` at
-851f6a0, so main's side runs its real load and save code.
+backend does, then runs this build's startup write (``finish_start``, the
+``clip-audio-roots`` startup hook). main's module is
+``tests/fixtures/main_851f6a0/media_access.py``, a byte-identical copy of
+``backend/modules/project/media_access.py`` at 851f6a0, and the first v2
+build's is ``tests/fixtures/pr207_8039b45/media_access.py`` (8039b45), so each
+older build runs its real load and save code.
 """
 
 from __future__ import annotations
@@ -32,17 +35,29 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 THIS_BUILD = REPO / "backend" / "modules" / "project" / "media_access.py"
 MAIN_BUILD = REPO / "tests" / "fixtures" / "main_851f6a0" / "media_access.py"
+FIRST_V2_BUILD = REPO / "tests" / "fixtures" / "pr207_8039b45" / "media_access.py"
 
 _starts = itertools.count()
 
 
-def _start(source: Path) -> ModuleType:
-    """One backend start: ``source`` imported as a fresh module."""
+def _import(source: Path) -> ModuleType:
+    """``source`` imported as a fresh module, the way a backend process
+    imports it, and nothing more."""
     name = f"_media_access_start_{next(_starts)}"
     spec = importlib.util.spec_from_file_location(name, source)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+def _start(source: Path) -> ModuleType:
+    """One backend start: the import, then this build's startup write. The
+    older builds do all their loading at import and have no such step."""
+    module = _import(source)
+    finish_start = getattr(module, "finish_start", None)
+    if finish_start is not None:
+        finish_start()
     return module
 
 
@@ -87,7 +102,8 @@ def test_grants_survive_main_this_build_main_this_build(
     shutil.rmtree(gone)
     assert isinstance(_read(data_dir / "media_roots.json"), list)
 
-    # This build's first start takes main's grants over.
+    # This build's first start takes main's grants over, dropping the folder
+    # that is gone.
     this = _start(THIS_BUILD)
     assert _serves(this, kicks)
     assert _serves(this, vox)
@@ -105,14 +121,14 @@ def test_grants_survive_main_this_build_main_this_build(
     drums = _folder(tmp_path, "drums")
     assert main.register_root(drums / "clip.wav")
 
-    # This build again: its grants are intact, and it opens a new project.
+    # This build again: its grants are intact, main's new one is taken over
+    # (the UI restores that project from its own storage, with no /load), and
+    # it opens a new project.
     this = _start(THIS_BUILD)
     assert _serves(this, kicks)
     assert _serves(this, vox)
-    assert not _serves(this, drums), (
-        "the takeover is the first run only: a folder main grants later joins "
-        "this build's list when this build opens the project that uses it"
-    )
+    assert _serves(this, drums)
+    assert str(drums.resolve()) in _read(data_dir / "clip_audio_roots.json")["roots"]
     bass = _folder(tmp_path, "bass")
     assert this.register_root(bass / "clip.wav")
 
@@ -123,8 +139,80 @@ def test_grants_survive_main_this_build_main_this_build(
 
     # This build a third time.
     this = _start(THIS_BUILD)
-    for folder in (kicks, vox, bass):
+    for folder in (kicks, vox, bass, drums):
         assert _serves(this, folder), folder
+
+
+def test_a_v2_object_the_first_v2_build_writes_later_is_handed_back_to_main(
+    tmp_path: Path, data_dir: Path
+) -> None:
+    """8039b45 reads main's list as no grants and overwrites main's file with
+    its own object. When it runs after this build, the next start of this
+    build takes the object's folders over and gives main its list back."""
+    kicks = _folder(tmp_path, "kicks")
+    assert _start(MAIN_BUILD).register_root(kicks / "clip.wav")
+    assert _serves(_start(THIS_BUILD), kicks)
+
+    first_v2 = _start(FIRST_V2_BUILD)
+    assert not _serves(first_v2, kicks), "8039b45 reads main's list as nothing"
+    vox = _folder(tmp_path, "vox")
+    assert first_v2.register_root(vox / "clip.wav")
+    assert isinstance(_read(data_dir / "media_roots.json"), dict)
+    assert not _serves(_start(MAIN_BUILD), vox), "main reads the object as nothing"
+
+    this = _start(THIS_BUILD)
+    assert _serves(this, kicks)
+    assert _serves(this, vox)
+    legacy = _read(data_dir / "media_roots.json")
+    assert isinstance(legacy, list)
+    assert sorted(legacy) == sorted([str(kicks.resolve()), str(vox.resolve())])
+
+    main = _start(MAIN_BUILD)
+    assert _serves(main, kicks)
+    assert _serves(main, vox)
+
+
+def test_importing_the_module_writes_no_file(tmp_path: Path, data_dir: Path) -> None:
+    """Any process that imports the module (a test run, a tool) loads the
+    grants. Only the startup hook writes what was taken over."""
+    kicks = _folder(tmp_path, "kicks")
+    legacy = data_dir / "media_roots.json"
+    legacy.write_text(json.dumps({"v": 2, "roots": [str(kicks)]}), encoding="utf-8")
+    before = legacy.read_bytes()
+
+    this = _import(THIS_BUILD)
+
+    assert _serves(this, kicks)
+    assert legacy.read_bytes() == before
+    assert not (data_dir / "clip_audio_roots.json").exists()
+
+    this.finish_start()
+    assert _read(legacy) == [str(kicks.resolve())]
+    assert _read(data_dir / "clip_audio_roots.json") == {
+        "v": 2,
+        "roots": [str(kicks.resolve())],
+    }
+
+
+def test_a_start_with_nothing_to_take_over_writes_no_file(data_dir: Path) -> None:
+    _start(THIS_BUILD)
+    assert list(data_dir.iterdir()) == []
+
+
+def test_the_takeover_leaves_folders_theDAW_owns_to_their_static_root(
+    tmp_path: Path, data_dir: Path
+) -> None:
+    inside_data = data_dir / "bundles" / "song"
+    inside_data.mkdir(parents=True)
+    kicks = _folder(tmp_path, "kicks")
+    (data_dir / "media_roots.json").write_text(
+        json.dumps([str(inside_data), str(kicks)]), encoding="utf-8"
+    )
+
+    this = _start(THIS_BUILD)
+
+    assert this._session_roots == [kicks.resolve()]
+    assert this.resolve_media_path(str(inside_data / "a.wav")) is not None
 
 
 def test_a_v2_object_in_media_roots_json_is_taken_over_and_handed_back(
