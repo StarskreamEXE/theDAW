@@ -411,6 +411,8 @@ video-scripts/
 /lyria/
 data/magenta_engine.json
 data/lyria_gemini_key.json
+# Lyria checkouts moved to the pinned commit whose npm install has not finished
+data/lyria_deps_pending.json
 logs/magenta-download-*.log
 
 # Chimera v2 per-clip analysis cache (sha256-keyed JSON)
