@@ -359,6 +359,39 @@ def test_a_broken_openssl_first_on_path_is_skipped_for_a_working_one(
     assert chosen is not None and _same_file(Path(chosen).parent, working)
 
 
+def test_a_launch_that_keeps_its_certificate_generates_no_key(
+    data_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Two launches with Mobile Access on, Miniconda's openssl first on PATH.
+    The first makes the certificate. The second keeps it, and still ran a
+    full RSA key generation with every openssl in turn to pick one, only to
+    read the certificate with it."""
+    working = _working_openssl_dir()
+    if working is None:
+        pytest.skip("no openssl on this machine can make a certificate")
+    broken = _broken_openssl(tmp_path / "Miniconda3" / "Library" / "bin")
+    monkeypatch.setenv("PATH", os.pathsep.join([str(broken), str(working)]))
+    monkeypatch.setattr(lan_cert, "_WINDOWS_OPENSSL_FALLBACKS", ())
+
+    first = lan_cert.ensure_lan_cert(["192.168.1.34"])
+    assert first is not None
+    before = first.cert.read_bytes()
+
+    commands: list[str] = []
+    real_run = lan_cert._run
+
+    def recording_run(argv, *args, **kwargs):
+        commands.append(argv[1])
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(lan_cert, "_run", recording_run)
+    again = lan_cert.ensure_lan_cert(["192.168.1.34"])
+
+    assert again is not None
+    assert again.cert.read_bytes() == before
+    assert "req" not in commands, f"the second launch generated a key: {commands}"
+
+
 def test_answering_version_is_not_enough_to_be_chosen(tmp_path: Path):
     broken = _broken_openssl(tmp_path / "bin")
     binary = shutil.which("openssl", path=str(broken))

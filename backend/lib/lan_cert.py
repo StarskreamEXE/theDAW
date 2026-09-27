@@ -446,6 +446,39 @@ def _cleanup(*items: Path) -> None:
             log.debug("lan-cert: leftover temp file %s", item)
 
 
+def _reusable_pair(
+    candidates: list[str], cert: Path, key: Path, sans: list[str], now: datetime
+) -> bool:
+    """True when the pair on disk covers ``sans``, has life left and belongs
+    together, read with the first candidate that can read it.
+
+    Reading a certificate needs no openssl.cnf, so this runs before any
+    candidate is probed with a key generation: a launch that keeps its
+    certificate, which is almost every launch, generates no key at all. A
+    candidate that cannot read the certificate is skipped. Once one can,
+    what the certificate says settles it; a key that one binary cannot open
+    is tried with the next before the pair counts as mismatched, since
+    replacing the pair makes every device on the LAN show the certificate
+    warning again.
+    """
+    if not (cert.exists() and key.exists()) or not _key_is_pem(key):
+        return False
+    read = False
+    for candidate in candidates:
+        described = _describe_existing(candidate, cert)
+        if described is None:
+            continue
+        if not read:
+            if not cert_matches(described, sans, now):
+                return False
+            read = True
+        # The pair is replaced in two steps, and an interrupted launch leaves
+        # two halves that every other check here accepts forever.
+        if _pair_matches(candidate, cert, key):
+            return True
+    return False
+
+
 def ensure_lan_cert(
     lan_ips: list[str],
     *,
@@ -455,15 +488,31 @@ def ensure_lan_cert(
     """The certificate covering ``lan_ips``, generating one if need be.
 
     Returns the existing pair untouched when it already covers every address,
-    has more than a month left, and still has a readable PEM key beside it;
-    otherwise generates a fresh self-signed certificate into
-    ``data/lan-cert/``.
+    has more than a month left, and still has its own PEM key beside it; that
+    check reads files and generates no key. Otherwise generates a fresh
+    self-signed certificate into ``data/lan-cert/`` with the first openssl
+    that can (:func:`find_openssl`).
 
     Returns None -- never raises -- when openssl is missing or fails, after
     logging exactly one warning that names the fix. A LAN listener is a
     convenience: the app must start without it.
     """
     now = now or datetime.now(timezone.utc)
+    hostname = ""
+    try:
+        hostname = socket.gethostname()
+    except OSError:
+        pass
+    sans = desired_sans(lan_ips, hostname)
+    cert, key = cert_file(), key_file()
+
+    if openssl:
+        readers = [openssl] if find_openssl(openssl) else []
+    else:
+        readers = _openssl_candidates()
+    if _reusable_pair(readers, cert, key, sans, now):
+        return CertPaths(cert=cert, key=key)
+
     binary = find_openssl(openssl)
     if binary is None:
         tried = [] if openssl else _openssl_candidates()
@@ -484,27 +533,6 @@ def ensure_lan_cert(
                 _HOW_TO_FIX,
             )
         return None
-
-    hostname = ""
-    try:
-        hostname = socket.gethostname()
-    except OSError:
-        pass
-    sans = desired_sans(lan_ips, hostname)
-
-    cert, key = cert_file(), key_file()
-    if cert.exists() and key.exists():
-        described = _describe_existing(binary, cert)
-        if (
-            described
-            and cert_matches(described, sans, now)
-            and _key_is_pem(key)
-            # ...and the key on disk is actually THIS certificate's key: the
-            # pair is replaced in two steps, and an interrupted launch leaves
-            # two halves that every other check here accepts forever.
-            and _pair_matches(binary, cert, key)
-        ):
-            return CertPaths(cert=cert, key=key)
 
     tmp_cert = temp_sibling(cert)
     tmp_key = temp_sibling(key)
