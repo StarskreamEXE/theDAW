@@ -116,9 +116,17 @@ SIZE_ALLOWLIST: dict[str, str] = {
         "the library is, so holding it to the library budget would measure "
         "the wrong thing -- the allowlist ceiling still holds it to a size"
     ),
+    f"{LIBRARY_PREFIX}/{{entry_id}}/lineage/full": (
+        "the whole family of one entry, uncapped on purpose: Save lineage "
+        "writes it, and INFO loads it only when the user presses Load the "
+        "whole family, while every screen reads the capped /lineage on its "
+        "own. It streams while the walk runs, so the server never holds the "
+        "whole answer; its size is the family's, and the allowlist ceiling "
+        "still holds it to a size"
+    ),
 }
 
-#: A ceiling for the two allowlisted routes anyway, so 'unbounded' still
+#: A ceiling for the allowlisted routes anyway, so 'unbounded' still
 #: cannot mean 'unbounded'. Sized off this fixture, which is a tenth of the
 #: real library.
 ALLOWLIST_SIZE_CEILING_BYTES = 64 * 1024 * 1024
