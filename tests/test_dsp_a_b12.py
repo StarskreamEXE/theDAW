@@ -19,8 +19,9 @@ Covers:
           keys must still validate and render (forward-compat with any
           cached preset or in-flight UI still posting them).
 
-No model weights, no GPU. FFmpeg-dependent tests are skipped if ``ffmpeg``
-is not on PATH (matches the project's own real-ffmpeg testing convention).
+No model weights, no GPU. FFmpeg-dependent tests are skipped when no ffmpeg
+is found at all (``backend.lib.ffmpeg_tools``, the same resolution the backend
+runs). A build without libsoxr is not skipped: the soxr tools fail on it.
 """
 
 from __future__ import annotations
@@ -28,7 +29,6 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
-import shutil
 import textwrap
 from pathlib import Path
 
@@ -57,7 +57,7 @@ from backend.modules.effects.router import (
 from backend.modules.effects.router import router as effects_router
 from backend.modules.mastering.router import TOOLS as MASTERING_TOOLS
 from backend.modules.mastering.router import _loudness_meter, _maximizer
-from backend.lib import ffmpeg
+from backend.lib import ffmpeg, ffmpeg_tools
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -98,7 +98,7 @@ def _noisy_stereo(path: Path, seconds: float = 1.0, sr: int = SR) -> Path:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 def test_uncrush_zero_strength_renders_with_real_ffmpeg(tmp_path):
     """afftdn's documented range is 0.01-97 — nr=0 is a hard ffmpeg error.
     strength=0 used to produce nr=0 exactly; this is the call path that
@@ -109,7 +109,7 @@ def test_uncrush_zero_strength_renders_with_real_ffmpeg(tmp_path):
     assert out.exists() and out.stat().st_size > 0
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 def test_uncrush_tool_strength_param_allows_zero(tmp_path):
     """strength's declared range is 0-1 — 0 is a legal, reachable value the
     handler must not choke on."""
@@ -123,7 +123,7 @@ def test_uncrush_tool_strength_param_allows_zero(tmp_path):
     assert out.exists() and out.stat().st_size > 0
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 def test_studio_enhance_low_denoise_renders_with_real_ffmpeg(tmp_path):
     """denoise=0.01 -> denoise_nr=0.25, which used to round to nr=0 at :.0f
     and fail real ffmpeg with 'Result too large'."""
@@ -133,7 +133,7 @@ def test_studio_enhance_low_denoise_renders_with_real_ffmpeg(tmp_path):
     assert out.exists() and out.stat().st_size > 0
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 def test_studio_enhance_denoise_zero_still_skips_afftdn(tmp_path):
     """denoise=0 must still omit afftdn entirely (the ``if denoise > 0``
     guard), not clamp it into existing at nr=0.01 when the user asked for
@@ -259,7 +259,7 @@ def test_timbreforge_docstring_describes_asetrate_atempo_correctly():
     assert "restores pitch" not in doc and "preserve pitch" not in doc
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 def test_timbreforge_uses_probed_source_rate_not_hardcoded_44100(tmp_path):
     """A 48 kHz source must not be silently treated as 44.1 kHz — asetrate
     needs the SOURCE rate to shift by exactly the requested ratio."""
@@ -273,8 +273,8 @@ def test_timbreforge_uses_probed_source_rate_not_hardcoded_44100(tmp_path):
 def test_probe_sample_rate_reads_source_rate(tmp_path):
     src = tmp_path / "in48k.wav"
     _tone(src, seconds=0.2, sr=48000)
-    if shutil.which("ffprobe") is None:
-        pytest.skip("ffprobe not on PATH")
+    if ffmpeg_tools.find_ffprobe() is None:
+        pytest.skip("no ffprobe found")
     assert _probe_sample_rate(src) == 48000
 
 
@@ -539,7 +539,7 @@ def test_restore_all_legacy_key_still_validates():
     assert validated["strength"] == pytest.approx(0.6)
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 def test_restore_all_legacy_key_renders_with_real_ffmpeg(tmp_path):
     tool = next(t for t in RESTORATION_TOOLS if t.id == "restore_all")
     validated = tool.validate_params({"strength": 0.6, "prompt": "make it sound warm"})
@@ -549,7 +549,7 @@ def test_restore_all_legacy_key_renders_with_real_ffmpeg(tmp_path):
     assert out.exists() and out.stat().st_size > 0
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 def test_tokensynth_legacy_prompt_key_still_validates_and_renders(tmp_path):
     tool = next(t for t in CREATIVE_NEURAL_TOOLS if t.id == "tokensynth")
     raw = {"temperature": 0.8, "prompt": "a warm pad"}
@@ -562,7 +562,7 @@ def test_tokensynth_legacy_prompt_key_still_validates_and_renders(tmp_path):
     assert out.exists() and out.stat().st_size > 0
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 def test_ambientforge_legacy_prompt_key_still_validates_and_renders(tmp_path):
     tool = next(t for t in CREATIVE_NEURAL_TOOLS if t.id == "ambientforge")
     raw = {"duration": 5.0, "prompt": "a slow drifting pad"}
@@ -585,7 +585,7 @@ def _rms(data: np.ndarray) -> float:
     return float(np.sqrt(np.mean(np.square(data))))
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 def test_super_res_mix_zero_is_dry_mix_one_is_wet(tmp_path):
     tool = next(t for t in ENHANCE_TOOLS if t.id == "super_res")
     # Same source/target rate: -ar is then a no-op, isolating what `mix`
@@ -621,7 +621,7 @@ def test_super_res_mix_zero_is_dry_mix_one_is_wet(tmp_path):
     assert not np.allclose(half_data, wet_data, atol=1e-3)
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 def test_uncrush_mix_zero_is_dry_mix_one_is_wet(tmp_path):
     """uncrush is process-mode (async ``(input_path, output_path, params)``
     now, not filter-mode), so this renders through the tool's handler
@@ -651,7 +651,7 @@ def test_uncrush_mix_zero_is_dry_mix_one_is_wet(tmp_path):
     assert not np.allclose(dry_data[:n2], wet_data[:n2], atol=1e-3)
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 def test_neural_codec_mix_zero_is_dry_mix_one_is_wet(tmp_path):
     tool = next(t for t in ENHANCE_TOOLS if t.id == "neural_codec")
     src = _tone(tmp_path / "in.wav")
@@ -706,7 +706,7 @@ def test_afftdn_delay_samples_matches_measured_values():
         assert _restoration_afftdn_delay_samples(sr) == expected
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 @pytest.mark.parametrize("sr", [44100, 48000, 22050, 88200, 96000])
 def test_uncrush_mix_half_impulse_is_one_not_two(tmp_path, sr):
     """The flam this bug produced put two peaks ~1100+ samples apart (the
@@ -735,7 +735,7 @@ def test_uncrush_mix_half_impulse_is_one_not_two(tmp_path, sr):
     assert region.max() - region.min() < 50
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 @pytest.mark.parametrize("sr", [44100, 48000, 22050, 88200, 96000])
 def test_uncrush_mix_one_whole_output_aligned_with_input(tmp_path, sr):
     """Even at mix=1 (fully wet, no crossfade at all) the render must not
@@ -763,7 +763,7 @@ def test_uncrush_mix_one_whole_output_aligned_with_input(tmp_path, sr):
     assert abs(peak_idx - idx) <= 10
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 @pytest.mark.parametrize("sr", [44100, 48000, 22050, 88200, 96000])
 def test_neural_denoise_output_aligned_with_input(tmp_path, sr):
     """neural_denoise has no mix knob (always fully processed) -- its
@@ -780,7 +780,7 @@ def test_neural_denoise_output_aligned_with_input(tmp_path, sr):
     assert peak_idx == idx
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 @pytest.mark.parametrize("sr", [44100, 48000, 22050, 88200, 96000])
 def test_dereverb_output_aligned_with_input(tmp_path, sr):
     idx = sr // 2
@@ -795,7 +795,7 @@ def test_dereverb_output_aligned_with_input(tmp_path, sr):
     assert peak_idx == idx
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 @pytest.mark.parametrize("sr", [44100, 48000, 88200, 96000])
 def test_restore_all_output_aligned_at_source_rate(tmp_path, sr):
     """restore_all ends its chain in loudnorm, which only operates at
@@ -823,7 +823,7 @@ def test_restore_all_output_aligned_at_source_rate(tmp_path, sr):
     assert peak_idx == idx
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 @pytest.mark.parametrize("sr", [44100, 48000, 88200, 96000])
 @pytest.mark.parametrize("denoise", [0.0, 0.5])
 def test_studio_enhance_output_aligned_at_source_rate(tmp_path, sr, denoise):
@@ -857,7 +857,7 @@ def test_studio_enhance_output_aligned_at_source_rate(tmp_path, sr, denoise):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 def test_neural_denoise_preserves_impulse_near_end(tmp_path):
     sr = SR
     idx = sr - 300
@@ -885,7 +885,7 @@ def test_neural_denoise_preserves_impulse_near_end(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 @pytest.mark.parametrize("mix", [0.0, 0.5, 1.0])
 def test_neural_codec_preserves_float_bit_depth(tmp_path, mix):
     from backend.modules.enhance.router import _neural_codec
@@ -903,7 +903,7 @@ def test_neural_codec_preserves_float_bit_depth(tmp_path, mix):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 def test_super_res_mix_zero_does_not_clamp_a_legitimate_peak(tmp_path):
     tool = next(t for t in ENHANCE_TOOLS if t.id == "super_res")
     sr = 48000
@@ -933,7 +933,7 @@ def _broadband(path: Path, amp: float, sr: int = SR, seconds: float = 1.0) -> Pa
     return path
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 @pytest.mark.parametrize("amp", [0.1, 0.15, 0.2, 0.3, 0.5])
 @pytest.mark.parametrize("guidance", [1.0, 3.5, 7.0])
 def test_super_res_mix_one_never_clips(tmp_path, amp, guidance):
@@ -955,7 +955,7 @@ def test_super_res_mix_one_never_clips(tmp_path, amp, guidance):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 def test_neural_codec_mix_one_matches_source_rate(tmp_path):
     tool = next(t for t in ENHANCE_TOOLS if t.id == "neural_codec")
     src = _tone(tmp_path / "in.wav", sr=44100)
@@ -996,7 +996,7 @@ def test_neural_codec_mix_zero_skips_opus_encode_entirely():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 @pytest.mark.parametrize("sr", [44100, 48000, 22050, 88200, 96000])
 def test_afftdn_family_output_length_matches_input(tmp_path, sr):
     """The apad/atrim pair every afftdn-based handler uses exists to hold
@@ -1029,7 +1029,7 @@ def test_afftdn_family_output_length_matches_input(tmp_path, sr):
         )
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 @pytest.mark.parametrize("mix", [0.0, 0.5, 1.0])
 def test_super_res_output_aligned_with_input(tmp_path, mix):
     """super_res had no alignment test at all. Measured reference: shift 0
@@ -1053,7 +1053,7 @@ def test_super_res_output_aligned_with_input(tmp_path, mix):
     assert abs(peak_idx - idx) <= 10
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 @pytest.mark.parametrize("mix", [0.0, 0.5, 1.0])
 def test_neural_codec_output_aligned_with_input(tmp_path, mix):
     """neural_codec had no alignment test at all. Measured reference: 0
@@ -1080,7 +1080,7 @@ def test_neural_codec_output_aligned_with_input(tmp_path, mix):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 def test_effects_denoise_output_aligned_with_input(tmp_path):
     """The effects family's ``denoise`` effect is afftdn with no delay
     compensation -- the same bug already fixed in enhance/restoration.
@@ -1117,7 +1117,7 @@ def test_effects_afftdn_delay_samples_matches_other_families():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 @pytest.mark.parametrize(
     "effect,params",
     [
@@ -1159,7 +1159,7 @@ def test_effects_loudnorm_chains_stay_at_source_rate(tmp_path, effect, params, s
     assert abs(len(data) / out_sr - seconds) < 0.01
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 @pytest.mark.parametrize("sr", [44100, 48000, 88200, 96000])
 def test_mastering_maximizer_and_loudness_meter_stay_at_source_rate(tmp_path, sr):
     """Measured before this fix: both ``_maximizer`` and ``_loudness_meter``
@@ -1214,7 +1214,7 @@ def test_mastering_maximizer_and_loudness_meter_stay_at_source_rate(tmp_path, sr
     assert len(data2) == n
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 @pytest.mark.parametrize("sr", [44100, 48000, 88200, 96000])
 @pytest.mark.parametrize(
     "in_subtype,out_depth_bits,out_is_float",
@@ -1264,7 +1264,7 @@ def test_mastering_master_assistant_stays_at_source_rate_and_depth(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 def test_mastering_maximizer_and_loudness_meter_preserve_float_depth(tmp_path):
     """Measured before this fix: a pcm_f32le 44100 source came back
     pcm_s16le from both handlers (bit-depth silently narrowed)."""
@@ -1316,7 +1316,7 @@ def test_mastering_maximizer_and_loudness_meter_preserve_float_depth(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 @pytest.mark.parametrize("sr", [44100, 48000, 88200, 96000])
 def test_maximizer_alimiter_latency_true_zero_shift(tmp_path, sr):
     """Before this fix the impulse peak landed ~5ms late at every rate
@@ -1357,7 +1357,7 @@ def test_maximizer_alimiter_latency_true_zero_shift(tmp_path, sr):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 def test_uncrush_mix_one_never_clips(tmp_path):
     """Measured before this fix, on a 0.97-peak broadband source at
     strength=1 mix=1: aexciter alone left peak at exactly 1.0 (clean), but
@@ -1380,7 +1380,7 @@ def test_uncrush_mix_one_never_clips(tmp_path):
     assert clipped == 0, f"{clipped} samples hard-clipped"
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 def test_uncrush_partial_mix_filter_complex_never_clips(tmp_path):
     """The mix<1.0 branch builds a ``filter_complex`` graph (not ``-af``)
     -- the previous test only ever exercised mix=1.0's ``-af`` path, so the
@@ -1461,7 +1461,7 @@ def test_restoration_probe_sample_rate_raises_on_failed_probe(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 def test_effects_process_endpoint_denoise_stays_at_source_rate():
     import io
     import json as _json
@@ -1522,7 +1522,7 @@ def test_effects_process_endpoint_unknown_effect_still_400():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 def test_source_rate_and_frame_count_fall_back_for_libsndfile_unreadable_upload(
     tmp_path,
 ):
@@ -1540,7 +1540,7 @@ def test_source_rate_and_frame_count_fall_back_for_libsndfile_unreadable_upload(
     aac_as_wav = tmp_path / "input.wav"
     subprocess.run(
         [
-            "ffmpeg",
+            ffmpeg_tools.ffmpeg_exe(),
             "-y",
             "-f",
             "lavfi",
@@ -1614,7 +1614,7 @@ def _make_codec_as_wav(
         raise ValueError(codec)
     subprocess.run(
         [
-            "ffmpeg",
+            ffmpeg_tools.ffmpeg_exe(),
             "-y",
             "-f",
             "lavfi",
@@ -1641,7 +1641,7 @@ _CODEC_RATE_COMBOS = [
 ]
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 @pytest.mark.parametrize("codec,sr", _CODEC_RATE_COMBOS)
 def test_frame_count_matches_decoded_exactly_across_codecs_and_rates(
     tmp_path, codec, sr
@@ -1671,7 +1671,7 @@ def test_frame_count_matches_decoded_exactly_across_codecs_and_rates(
     assert _restoration_frame_count(src, sr) == decoded_n
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 @pytest.mark.parametrize("codec,sr", _CODEC_RATE_COMBOS)
 def test_studio_enhance_and_restore_all_output_length_matches_decoded_exactly(
     tmp_path, codec, sr
@@ -1711,7 +1711,7 @@ def test_studio_enhance_and_restore_all_output_length_matches_decoded_exactly(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 def test_effects_process_endpoint_rate_independent_effect_works_without_ffprobe(
     monkeypatch,
 ):
@@ -1720,7 +1720,7 @@ def test_effects_process_endpoint_rate_independent_effect_works_without_ffprobe(
 
     import backend.modules.analysis.ffprobe as ffprobe_mod
 
-    monkeypatch.setattr(ffprobe_mod.shutil, "which", lambda name: None)
+    monkeypatch.setattr(ffprobe_mod.ffmpeg_tools, "find_ffprobe", lambda: None)
 
     app = FastAPI()
     app.include_router(effects_router, prefix="/api/effects")
@@ -1743,7 +1743,7 @@ def test_effects_process_endpoint_rate_independent_effect_works_without_ffprobe(
     assert resp.status_code == 200
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.skipif(ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found")
 def test_effects_process_endpoint_rate_dependent_effect_500_has_json_detail_without_ffprobe(
     monkeypatch,
 ):
@@ -1755,7 +1755,7 @@ def test_effects_process_endpoint_rate_dependent_effect_500_has_json_detail_with
 
     import backend.modules.analysis.ffprobe as ffprobe_mod
 
-    monkeypatch.setattr(ffprobe_mod.shutil, "which", lambda name: None)
+    monkeypatch.setattr(ffprobe_mod.ffmpeg_tools, "find_ffprobe", lambda: None)
 
     app = FastAPI()
     app.include_router(effects_router, prefix="/api/effects")

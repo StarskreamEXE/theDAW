@@ -143,6 +143,10 @@ def build_router(family: str, tools: list[ToolSpec]) -> APIRouter:
                     "Content-Disposition": f'attachment; filename="processed.{output_format}"'
                 },
             )
+        except ffmpeg.FFmpegCapabilityError as e:
+            # The whole message: it names the missing library and the FFmpeg
+            # in use, and the path can run past the 400-char stderr tail.
+            raise HTTPException(500, f"{tool.name}: {e}")
         except ffmpeg.FFmpegError as e:
             raise HTTPException(500, f"ffmpeg error: {e.stderr[-400:]}")
         except HTTPException:

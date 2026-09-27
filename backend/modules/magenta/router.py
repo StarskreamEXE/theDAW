@@ -165,18 +165,20 @@ def _normalize_style_audio(audio_bytes: bytes) -> bytes:
         )
 
     import os
-    import shutil
     import subprocess
     import tempfile
 
-    if not shutil.which("ffmpeg"):
+    from backend.lib import ffmpeg_tools
+
+    ffmpeg = ffmpeg_tools.find_ffmpeg()
+    if not ffmpeg:
         raise ValueError("style clip format not recognised and ffmpeg is unavailable")
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
         out_path = tf.name
     try:
         proc = subprocess.run(
             [
-                "ffmpeg",
+                ffmpeg,
                 "-hide_banner",
                 "-loglevel",
                 "error",

@@ -13,7 +13,7 @@ import asyncio
 from pathlib import Path
 
 from ...core.module_base import build_router
-from ...lib import ffmpeg
+from ...lib import ffmpeg, ffmpeg_tools
 from ...lib.params import ParamSpec as P
 from ...lib.params import ToolSpec
 
@@ -176,7 +176,7 @@ async def _ambientforge(inp: Path, out: Path, params: dict) -> None:
     # Build a pink noise source with spectral shaping and reverb
     # anoisesrc generates noise, lowpass shapes it, aecho adds space
     cmd = [
-        "ffmpeg",
+        await ffmpeg_tools.ffmpeg_exe_async(),
         "-y",
         "-f",
         "lavfi",

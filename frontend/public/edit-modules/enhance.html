@@ -89,6 +89,10 @@ html,body{width:100%;height:100%;background:var(--bg);display:flex;align-items:c
 .ftr-spacer{flex:1}
 .ftr-stat{font:500 7.5px/1 var(--mono);color:var(--dim)}
 .ftr-stat.ok{color:#22c55e}
+.ftr-stat.err{color:#ef4444}
+/* A failed render's own message (the backend's `detail`), readable in full. */
+.err-bar{flex-shrink:0;padding:6px 10px;background:#1a0b0e;border-top:1px solid #3b1219;color:#fca5a5;font:700 12px/1.4 var(--sans);white-space:normal;overflow-wrap:anywhere}
+.err-bar[hidden]{display:none}
 audio{display:none}
 input[type="file"]{display:none}
 #mainKnob:focus-visible,#strengthKnob:focus-visible,.split-handle:focus-visible{outline:2px solid #22d3ee;outline-offset:2px;border-radius:50%}
@@ -180,6 +184,7 @@ input[type="file"]{display:none}
   </div>
 </div>
 
+<div class="err-bar" id="errBar" role="alert" hidden></div>
 <!-- FOOTER -->
 <div class="ftr">
   <button class="ftr-btn" id="btnBypass">Bypass</button>
@@ -477,7 +482,9 @@ document.getElementById('tabEnhance').onclick = async () => {
 async function processEnhance(){
   if(!inputFile) return;
   const st = document.getElementById('status');
+  const errBar = document.getElementById('errBar');
   st.className = 'ftr-stat'; st.textContent = 'processing...';
+  errBar.hidden = true; errBar.textContent = '';
   const effect = activeMode;
   const mix = +mixSlider.value / 100;
   let params;
@@ -501,8 +508,15 @@ async function processEnhance(){
       document.getElementById('aout').src = URL.createObjectURL(blob);
       st.className = 'ftr-stat ok';
       st.textContent = 'done ' + (blob.size / 1024).toFixed(0) + 'KB ' + Math.round(performance.now() - t0) + 'ms';
-    } else { st.textContent = r.status + ' error' }
-  } catch(e){ st.textContent = 'ERR' }
+    } else {
+      /* The backend's `detail` names what went wrong (a missing FFmpeg
+         library, the FFmpeg in use); show it whole, as tool.html does. */
+      let detail = r.status + ' error';
+      try { const j = await r.json(); detail = j.detail || j.message || detail; } catch(e){}
+      st.className = 'ftr-stat err'; st.textContent = r.status + ' error';
+      errBar.textContent = detail; errBar.hidden = false;
+    }
+  } catch(e){ st.className = 'ftr-stat err'; st.textContent = 'ERR'; errBar.textContent = 'error: ' + e.message; errBar.hidden = false; }
 }
 
 /* Ctrl+Enter processes; the ENHANCE footer tab does too (there was no other PROCESS button). */
