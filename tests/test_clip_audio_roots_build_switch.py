@@ -410,3 +410,89 @@ def test_a_backup_never_carries_the_grants_and_a_restore_never_writes_them(
         assert not _serves(start, planted)
         assert _serves(start, kicks)
         assert _serves(start, vox)
+
+
+def test_a_restored_recent_list_grants_only_projects_on_disk(
+    tmp_path: Path, data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The grant files stay out of every archive, but the recent-projects list
+    goes in, and each recent project's folder is granted: when /recent
+    re-reads a restored list, and at every start. register_root grants a
+    path's folder whether or not a file is there, so an archive naming
+    ``<any folder>/x.tasmo`` chose a folder /clip-audio serves. Only an entry
+    naming a .tasmo file on disk counts now."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from backend.lib import known_paths
+    from backend.modules.backup import router as backup_router
+    from backend.modules.backup import service as backup_service
+    from backend.modules.project import media_access as live_media_access
+    from backend.modules.project import router as project_router
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("theDAW_GENERATIONS_DIR", str(tmp_path / "generations"))
+    monkeypatch.setattr(known_paths, "_STORE_PATH", tmp_path / "known_paths.json")
+    monkeypatch.setattr(known_paths, "_GRANTS", {})
+    grants = data_dir / "clip_audio_roots.json"
+    monkeypatch.setattr(live_media_access, "_ROOTS_STATE", grants)
+    monkeypatch.setattr(live_media_access, "_session_roots", [])
+    monkeypatch.setattr(live_media_access, "_needs_write", False, raising=False)
+    recent = data_dir / "recent_projects.json"
+    monkeypatch.setattr(project_router, "_RECENT_PATH", recent)
+    monkeypatch.setattr(project_router, "_recent_files", [])
+    monkeypatch.setattr(project_router, "_recent_seen", None)
+    app = FastAPI()
+    app.include_router(backup_router.router, prefix="/api/backup")
+    app.include_router(project_router.router, prefix="/api/project")
+    local = TestClient(app, client=("127.0.0.1", 51000))
+
+    planted = _folder(tmp_path, "planted")
+    also_planted = _folder(tmp_path, "also-planted")
+    real = _folder(tmp_path, "real-project")
+    (real / "song.tasmo").write_bytes(b"PK")
+    restored_list = [
+        {"path": str(planted / "x.tasmo"), "name": "No such file"},
+        {"path": str(also_planted), "name": "A folder"},
+        {"path": str(real / "song.tasmo"), "name": "Song"},
+    ]
+    archive = tmp_path / "Downloads" / "theDAW-backup-planted.zip"
+    archive.parent.mkdir()
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr(
+            backup_service.MANIFEST_NAME,
+            json.dumps({"app": "theDAW", "roots": [{"id": "settings"}]}),
+        )
+        zf.writestr("roots/settings/recent_projects.json", json.dumps(restored_list))
+
+    started = local.post(
+        "/api/backup/import", json={"zip_path": str(archive), "mode": "replace"}
+    )
+    assert started.status_code == 200, started.text
+    restored = _wait_for(local, "/api/backup/import/status", started.json()["job"])
+    assert restored["state"] == "done", restored
+
+    # The UI asks for the recent list: the restored list comes back whole.
+    answer = local.get("/api/project/recent")
+    assert answer.status_code == 200, answer.text
+    assert answer.json() == restored_list
+
+    for folder in (planted, also_planted):
+        assert not _serves(live_media_access, folder), folder
+    assert _serves(live_media_access, real)
+
+    # The next start grants the recent projects' folders again, from the
+    # project module's startup hook.
+    from backend.core import startup
+
+    assert ("clip-audio-roots", project_router._on_start) in startup._hooks
+    monkeypatch.setattr(live_media_access, "_session_roots", [])
+    project_router._on_start()
+    for folder in (planted, also_planted):
+        assert not _serves(live_media_access, folder), folder
+    assert _serves(live_media_access, real)
+    assert _read(grants)["roots"] == [str(real.resolve())]
+    assert _read(data_dir / "media_roots.json") == [str(real.resolve())]

@@ -156,13 +156,29 @@ _recent_seen: tuple[int, int] | None = _recent_stamp()
 _recent_files: list[dict] = _load_recent()
 
 
+def _is_project_file(raw: str) -> bool:
+    """Whether ``raw`` names a .tasmo file that is on disk now."""
+    try:
+        p = Path(raw)
+        return p.suffix.lower() == ".tasmo" and p.is_file()
+    except (OSError, ValueError):
+        return False
+
+
 def _register_recent_folders(entries: list[dict]) -> None:
-    """Grant /clip-audio the folders of the recent projects.
+    """Grant /clip-audio the folders of the recent projects still on disk.
 
     Projects opened before this process started keep their clips playable when
     the UI restores a session from its own storage without re-issuing /load.
+    The list is not only this machine's record: a backup restore writes it
+    straight from the archive, and register_root grants a path's folder
+    whether or not a file is there. So an entry counts only when it names a
+    .tasmo file that exists; an archive naming a folder with no project in it
+    grants nothing.
     """
-    media_access.register_paths(r["path"] for r in entries)
+    media_access.register_paths(
+        r["path"] for r in entries if _is_project_file(r["path"])
+    )
 
 
 def _on_start() -> None:
