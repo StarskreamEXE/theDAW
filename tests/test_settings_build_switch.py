@@ -197,9 +197,10 @@ def test_an_off_written_to_the_old_key_after_this_build_ran_still_wins(
 def test_the_old_key_at_the_current_schema_is_moved_on_load(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A hand edit can put the old key back at schema 11. The store rewrites
-    the file on load, so the next write cannot drop the off it carried, and
-    the old key holds the plain False the schema-10 build reads."""
+    """A hand edit can put the old key back at the current schema. The store
+    rewrites the file on load, so the next write cannot drop the off it
+    carried, and the old key holds the plain False the schema-10 build
+    reads."""
     path = tmp_path / "settings.json"
     SettingsStore(path)
     edited = _on_disk(path)
