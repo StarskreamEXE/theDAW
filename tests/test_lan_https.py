@@ -382,8 +382,13 @@ def test_read_settings_returns_the_defaults_for_an_unreadable_file(
     monkeypatch.setenv("theDAW_SETTINGS_PATH", str(broken))
     assert lan_https.read_settings() == {}
 
+    # A readable file comes back with the switch settled into lan.https
+    # (lan_https.reconcile); with no record beside it, the old key's off wins.
     broken.write_text('{"app": {"lan_https": false}}', encoding="utf-8")
-    assert lan_https.read_settings() == {"app": {"lan_https": False}}
+    assert lan_https.read_settings() == {
+        "app": {"lan_https": False},
+        "lan": {"https": False},
+    }
 
 
 # ---------------------------------------------------------------------------

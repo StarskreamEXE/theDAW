@@ -253,3 +253,123 @@ def test_a_known_section_that_is_not_an_object_keeps_its_defaults(
     assert store.get_section("library") == {"media_roots": []}
     store.patch({"models": {"extra_folders": ["C:/models"]}})
     assert store.get_section("models") == {"extra_folders": ["C:/models"]}
+
+
+# ---------------------------------------------------------------------------
+# The record beside settings.json (lan_https.RECORD_NAME)
+#
+# Before it, the rule was "an off stored in either place wins", which is right
+# while nothing but an off can be the latest choice. It is not: the schema-10
+# build's on after this build's off, and a hand edit of lan.https, were both
+# overruled by the copy at app.lan_https this build had left there.
+# ---------------------------------------------------------------------------
+
+
+def test_an_on_saved_in_the_schema_10_build_after_an_off_here_is_honoured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The user switches the listener off here, runs 8039b45, switches it back
+    on there (its store writes app.lan_https: true and keeps lan whole, still
+    off), then comes back. The on is the latest choice: this build's launcher
+    starts the listener, its store settles lan.https on, and the schema-10
+    build agrees afterwards."""
+    path = tmp_path / "settings.json"
+    SettingsStore(path).patch({"lan": {"https": False}})
+    assert _launcher_blocks(path, monkeypatch)
+
+    _schema_10_store().SettingsStore(path).patch({"app": {"lan_https": True}})
+    assert _on_disk(path)["lan"] == {"https": False}, "8039b45 kept lan whole"
+    assert not _schema_10_launcher_blocks(path)
+
+    assert not _launcher_blocks(path, monkeypatch)
+    assert SettingsStore(path).get_value("lan", "https") is True
+    assert _on_disk(path)["lan"] == {"https": True}
+    assert "lan_https" not in _on_disk(path)["app"]
+    assert not _launcher_blocks(path, monkeypatch)
+    assert not _schema_10_launcher_blocks(path)
+
+
+def test_a_hand_edit_of_lan_https_is_the_latest_choice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Switched off here, then turned back on by editing lan.https in the file
+    (the copy at app.lan_https left as it was, since nothing says it is
+    there). The edit wins in the launcher and in the store."""
+    path = tmp_path / "settings.json"
+    SettingsStore(path).patch({"lan": {"https": False}})
+    edited = _on_disk(path)
+    assert edited["app"]["lan_https"] is False
+    edited["lan"]["https"] = True
+    path.write_text(json.dumps(edited), encoding="utf-8")
+
+    assert not _launcher_blocks(path, monkeypatch)
+    assert SettingsStore(path).get_value("lan", "https") is True
+    assert "lan_https" not in _on_disk(path)["app"]
+
+
+def test_the_record_keeps_the_off_through_main_and_the_schema_10_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Off here; 8039b45 runs and saves something else; main runs and drops
+    the old key; a hand edit deletes the lan section too. Nothing that was
+    dropped is a choice, so the record's off stands at every step."""
+    path = tmp_path / "settings.json"
+    SettingsStore(path).patch({"lan": {"https": False}})
+    record = path.with_name(lan_https.RECORD_NAME)
+    assert json.loads(record.read_text(encoding="utf-8")) == {
+        "lan_https": False,
+        "app_lan_https": False,
+    }
+
+    _schema_10_store().SettingsStore(path).patch({"stems": {"auto_on_import": True}})
+    assert _launcher_blocks(path, monkeypatch)
+    _main_store().SettingsStore(path).patch({"stems": {"auto_on_import": False}})
+    assert "lan_https" not in _on_disk(path)["app"]
+    assert _launcher_blocks(path, monkeypatch)
+
+    stripped = _on_disk(path)
+    del stripped["lan"]
+    path.write_text(json.dumps(stripped), encoding="utf-8")
+    assert _launcher_blocks(path, monkeypatch)
+    assert SettingsStore(path).get_value("lan", "https") is False
+    assert _on_disk(path)["lan"] == {"https": False}
+
+
+def test_a_save_cut_off_before_the_record_keeps_the_value_it_wrote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The store writes settings.json, then the record. A crash between the
+    two leaves the record one write behind; the value in the file differs
+    from it and is read as the latest choice, which is the value written."""
+    path = tmp_path / "settings.json"
+    store = SettingsStore(path)
+    record = path.with_name(lan_https.RECORD_NAME)
+    before = record.read_text(encoding="utf-8")
+    store.patch({"lan": {"https": False}})
+    record.write_text(before, encoding="utf-8")  # the record write never landed
+
+    assert _launcher_blocks(path, monkeypatch)
+    assert SettingsStore(path).get_value("lan", "https") is False
+
+
+def test_an_unreadable_record_falls_back_to_an_off_anywhere_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "settings.json"
+    SettingsStore(path).patch({"lan": {"https": False}})
+    path.with_name(lan_https.RECORD_NAME).write_text("{half", encoding="utf-8")
+    assert _launcher_blocks(path, monkeypatch)
+    assert SettingsStore(path).get_value("lan", "https") is False
+
+
+def test_a_patch_stores_the_switch_as_a_boolean(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    store = SettingsStore(path)
+    store.patch({"lan": {"https": "off"}})
+    assert _on_disk(path)["lan"] == {"https": False}
+    store.patch({"lan": {"https": "maybe"}})
+    assert _on_disk(path)["lan"] == {"https": False}, (
+        "a value saying neither is ignored"
+    )
+    store.patch({"lan": {"https": True}})
+    assert _on_disk(path)["lan"] == {"https": True}
