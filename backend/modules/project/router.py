@@ -17,7 +17,7 @@ from backend.modules.genaiproxy.access import caller_is_loopback
 from backend.modules.project import media_access
 from backend.modules.project.tasmo_project import TasmoProject
 from backend.modules.project.tasmo_file import TasmoFile
-from backend.lib import known_paths, paths
+from backend.lib import known_paths, lan_paths, paths
 from backend.lib.atomic import atomic_write
 from backend.lib.cross_site import (
     refuse_cross_site,
@@ -77,26 +77,11 @@ _RECENT_PATH = paths.data_path("recent_projects.json")
 MAX_RECENT = 20
 
 
-def _resolve_or_none(raw: str) -> Path | None:
-    try:
-        return Path(raw).expanduser().resolve()
-    except (OSError, RuntimeError, ValueError):
-        return None
-
-
 def _within_known_project_roots(raw_path: str) -> bool:
     """True when ``raw_path`` resolves inside the user's projects folder or
-    the library/generations tree."""
-    resolved = _resolve_or_none(raw_path)
-    if resolved is None:
-        return False
-    for root in (known_paths.projects_dir(), paths.library_root()):
-        root_resolved = _resolve_or_none(str(root))
-        if root_resolved is None:
-            continue
-        if resolved == root_resolved or resolved.is_relative_to(root_resolved):
-            return True
-    return False
+    the library/generations tree (``backend.lib.lan_paths``, the one copy of
+    this rule, shared with the places and VST routers)."""
+    return lan_paths.inside_project_roots(raw_path)
 
 
 def _require_known_root_for_lan(raw_path: str, request: Request, *, what: str) -> None:
@@ -109,12 +94,7 @@ def _require_known_root_for_lan(raw_path: str, request: Request, *, what: str) -
     machine's own UI) are unaffected, same posture as the rest of this
     router's ``path``/``output_dir`` params, which is not a regression: they
     were open to any LAN caller before this batch."""
-    if caller_is_loopback(request):
-        return
-    if not _within_known_project_roots(raw_path):
-        raise HTTPException(
-            403, f"{what} must be inside a known projects or library folder."
-        )
+    lan_paths.require_project_root_for_lan(raw_path, request, what=what)
 
 
 def _load_recent() -> list[dict]:
@@ -247,10 +227,11 @@ def save_project(req: SaveRequest, request: Request):
     # clip.audio_file values into media_access.register_paths ->
     # register_root, permanently widening the /clip-audio allowlist for an
     # unauthenticated LAN caller. Both checks now cover /save unconditionally,
-    # same as /save-session and /export/audio. The phone legitimately does
-    # this over LAN, so the pairing token (not just the desktop shell's
-    # launch token) unlocks it -- but only inside a known projects/library
-    # root.
+    # same as /save-session and /export/audio. The desktop UI on a paired
+    # device (opened from the share link, which carries the pairing token)
+    # legitimately does this over LAN, so the pairing token (not just the
+    # desktop shell's launch token) unlocks it -- but only inside a known
+    # projects/library root.
     require_loopback_launch_or_pairing_token(request)
     _require_known_root_for_lan(req.path, request, what="path")
     try:
@@ -378,12 +359,20 @@ def recent_projects(request: Request):
 
     Gated like the rest of this router: with only ``refuse_cross_site``, a
     bare LAN caller sending no ``Origin``/``Referer``/``Sec-Fetch-Site`` got
-    200 back with every recently opened absolute ``.tasmo`` path. The phone
-    legitimately reads this, so the pairing token unlocks it."""
+    200 back with every recently opened absolute ``.tasmo`` path. The desktop
+    UI on a paired device (opened from the share link) legitimately reads
+    this, so the pairing token unlocks it.
+
+    A caller on another machine gets only the projects it may open: ``/load``
+    refuses it any path outside the projects folder and the library tree
+    (``_require_known_root_for_lan``), so listing one saved elsewhere offered
+    a row that ended in a 403 when clicked. This machine's own UI still gets
+    the whole list."""
     require_loopback_launch_or_pairing_token(request)
     with _RECENT_LOCK:
         _sync_recent_locked()
-        return list(_recent_files)
+        rows = list(_recent_files)
+    return [r for r in rows if lan_paths.lan_caller_may_name(r["path"], request)]
 
 
 @router.get("/default-dir")
@@ -393,7 +382,8 @@ def default_projects_dir(request: Request):
 
     Gated like ``/recent``: an ungated LAN caller could read the OS username
     and project layout off this (``C:\\Users\\<name>\\Documents\\theDAW
-    Projects``). The phone legitimately reads this too."""
+    Projects``). The desktop UI on a paired device reads it too, to prefill
+    a save path inside the one folder it may save into."""
     require_loopback_launch_or_pairing_token(request)
     return {"path": str(known_paths.projects_dir())}
 

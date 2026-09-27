@@ -28,6 +28,7 @@ import {
   type BounceRequest, type RenderDeps,
 } from '../../lib/renderCore';
 import { crossfadeRegions } from '../../lib/crossfade';
+import { pairingHeader } from '../../lib/pairing';
 import {
   MIN_CLIP_SEC,
   resizeLeft as resizeClipLeft,
@@ -540,7 +541,9 @@ const processThroughVst = async (file: File, vst: VstNode, name: string): Promis
   // case is sent: absent means the pedalboard path the backend has always
   // taken, so every old project and every older backend behaves identically.
   if (vst.state_host === 'thedaw') form.append('state_host', 'thedaw');
-  const res = await fetch('/api/vst/process-file', { method: 'POST', body: form });
+  // pairingHeader(): a device opened from the Mobile Access share link renders
+  // through the same route, paired; {} on this machine's own UI.
+  const res = await fetch('/api/vst/process-file', { method: 'POST', body: form, headers: pairingHeader() });
   if (!res.ok) {
     // Surfaced as the backend words it, and NOT retried through pedalboard: a
     // silent fall back would print a state that host cannot read and report a

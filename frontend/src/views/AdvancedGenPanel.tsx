@@ -35,6 +35,7 @@ import {
   fetchCheckpoints, pickFile, setLocalOnly, storageErrorStatus, type RegisteredCheckpoint,
 } from '../lib/storageClient';
 import { basenameOf, isLocalClient, placesApi } from '../lib/placesClient';
+import { pairingHeaderFor } from '../lib/apiJson';
 import { describeHttpError } from '../lib/httpError';
 import { classifyModelGate } from '../lib/modelDownloadClient';
 import { requireFeature } from '../notices/featureGateStore';
@@ -524,7 +525,8 @@ export const AdvancedGenPanel: React.FC<{
     const name = basenameOf(path);
     setLoraLoadingIdx(i);
     try {
-      const res = await fetch(placesApi.fileUrl(path));
+      const url = placesApi.fileUrl(path);
+      const res = await fetch(url, { headers: pairingHeaderFor(url) });
       if (!res.ok) throw new Error(await describeHttpError(res));
       const blob = await res.blob();
       setLoraFile(i, new File([blob], name, { type: blob.type || 'application/octet-stream' }));
