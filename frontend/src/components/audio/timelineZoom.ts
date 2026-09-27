@@ -30,6 +30,8 @@ export const FIT_MARGIN_FRAC = 0.05;
 export const CLIP_EDGE_ZONE_PX = 6;
 /** Bar numbers show on the ruler once bars are at least this far apart (local px). */
 export const RULER_BAR_LABEL_MIN_PX = 24;
+/** Time labels (mm:ss) never render closer together than this (local px). */
+export const RULER_TIME_LABEL_MIN_PX = 50;
 /** Follow-playhead paging holds off this long (ms) after the last zoom. */
 export const ZOOM_FOLLOW_HOLD_MS = 400;
 /**
@@ -309,6 +311,55 @@ export function rulerBarLabels(a: {
   const out: { bar: number; sec: number }[] = [];
   const first = Math.max(0, Math.ceil(a.startSec / barSec - 1e-9));
   for (let i = first; i * barSec <= a.endSec + 1e-9; i++) out.push({ bar: i + 1, sec: i * barSec });
+  return out;
+}
+
+/** "Nice" time-tick spacings (seconds) the ruler steps through as it zooms
+ *  out, so a label is never closer than its neighbour than the caller's
+ *  `minPx`. Extended by doubling past the last entry for sessions longer
+ *  than an hour, rather than capping there. */
+const TIME_TICK_STEPS_SEC = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600];
+
+/** The smallest step in {@link TIME_TICK_STEPS_SEC} (extended by doubling)
+ *  that keeps ticks at least `minPx` local px apart at this zoom. */
+function timeTickStepSec(zoom: number, minPx: number): number {
+  for (const step of TIME_TICK_STEPS_SEC) {
+    if (step * zoom >= minPx) return step;
+  }
+  let step = TIME_TICK_STEPS_SEC[TIME_TICK_STEPS_SEC.length - 1];
+  while (step * zoom < minPx) step *= 2;
+  return step;
+}
+
+/**
+ * Ruler time ticks (seconds) inside [startSec, endSec] — windowed like
+ * {@link rulerBarLabels}, never the whole session, and spaced by a step that
+ * grows as zoom shrinks so labels can never overlap. Before this, the ruler
+ * walked 0..totalDuration at a step floored at 10 s, so far-out zoom on any
+ * real session produced thousands of off-screen ticks and, below ~12 px/s,
+ * labels packed closer than their own text width (unreadable). `major` is
+ * true every 5th step, matching the bar-label convention of a stronger tick
+ * at 5x the base interval.
+ */
+export function rulerTimeTicks(a: {
+  startSec: number;
+  endSec: number;
+  zoom: number;
+  minPx?: number;
+}): { sec: number; major: boolean }[] {
+  finite(a.startSec, 'startSec');
+  finite(a.endSec, 'endSec');
+  finite(a.zoom, 'zoom');
+  const minPx = finite(a.minPx ?? RULER_TIME_LABEL_MIN_PX, 'minPx');
+  if (!(a.zoom > 0)) throw new RangeError('zoom must be > 0');
+  if (a.endSec < a.startSec) return [];
+  const step = timeTickStepSec(a.zoom, minPx);
+  const out: { sec: number; major: boolean }[] = [];
+  const first = Math.max(0, Math.ceil(a.startSec / step - 1e-9));
+  for (let i = first; i * step <= a.endSec + 1e-9; i++) {
+    const sec = i * step;
+    out.push({ sec, major: sec % (step * 5) === 0 });
+  }
   return out;
 }
 

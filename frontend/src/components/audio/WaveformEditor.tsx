@@ -117,7 +117,7 @@ import { TimelineGridLayer } from './TimelineGridLayer';
 import { TimelinePrefsPanel } from './TimelinePrefsPanel';
 import {
   ZOOM_FOLLOW_HOLD_MS, ZOOM_STEP_FACTOR, clipChromeLayout, createZoomCoalescer, fitProjectZoom, fitRangeZoom,
-  followHoldActive, localViewportWidth, planZoom, resolveAnchorSec, rulerBarLabels, shouldRescrollAfterZoom,
+  followHoldActive, localViewportWidth, planZoom, resolveAnchorSec, rulerBarLabels, rulerTimeTicks, shouldRescrollAfterZoom,
   spanOfClips, viewportWindowSec, wheelDispatch, type ZoomAnchor, type ZoomCoalescer,
 } from './timelineZoom';
 import {
@@ -5819,21 +5819,18 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       }));
 
   // --- Renderers ---
-  const renderRuler = useMemo(() => {
-    const ticks: { sec: number; major: boolean }[] = [];
-    const stepSec = zoom >= 60 ? 1 : zoom >= 25 ? 2 : zoom >= 12 ? 5 : 10;
-    for (let s = 0; s <= totalDuration + stepSec; s += stepSec) {
-      ticks.push({ sec: s, major: s % (stepSec * 5) === 0 });
-    }
-    return ticks;
-  }, [zoom, totalDuration]);
-
   const selectedClip = clips.find((c) => c.id === selectedClipId) ?? null;
 
   /** Lanes content height (local px): every lane, the drop slot, the master strip. */
   const lanesHeightPx = tracks.length * trackH + 34 + (automationEdit ? MASTER_STRIP_H : 0);
-  /** Seconds the grid and the ruler's bar numbers cover (null until measured). */
+  /** Seconds the grid, the ruler's time ticks and its bar numbers cover
+   *  (null until measured). Windowed to the viewport (+ padding), never the
+   *  whole session — see rulerTimeTicks' own note on why that matters. */
   const gridWindow = viewport.width > 0 ? viewportWindowSec(viewport.scrollLeft, viewport.width, zoom, totalDuration) : null;
+  const renderRuler = useMemo(
+    () => (gridWindow ? rulerTimeTicks({ startSec: gridWindow.startSec, endSec: gridWindow.endSec, zoom }) : []),
+    [gridWindow, zoom],
+  );
   const barLabels = gridWindow
     ? rulerBarLabels({ startSec: gridWindow.startSec, endSec: gridWindow.endSec, bpm: projectBpm, zoom })
     : [];

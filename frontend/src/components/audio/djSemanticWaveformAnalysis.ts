@@ -856,14 +856,22 @@ export function drawWaveformCached(
   const visibleEnd = clamp(viewportEnd, 0, 1);
   const visibleSpan = visibleEnd - visibleStart;
 
+  // A whole-track view asks drawWaveform for a canvas exactly `fullWidth`
+  // device px wide, with no cap. On a long clip at high zoom (e.g. a 220 s
+  // clip at 400 px/s * dpr: ~150,000 device px) that overflows what any
+  // browser will back, so the canvas silently fails to allocate and the clip
+  // renders as a blank rectangle. Below that ceiling, direct is genuinely
+  // cheaper (see the note above), so only the overflow case is redirected.
+  const overflowsDirect = Number.isFinite(fullWidth) && Math.round(fullWidth * box.scale) > MAX_OFFSCREEN_DEVICE_WIDTH;
   const cacheable =
     !decodeError &&
     bins.length > 0 &&
     span > 0 &&
     visibleSpan > 0 &&
-    // A viewport covering the WHOLE track has nothing to gain: the render it
-    // would cache is the frame itself.
-    !(viewportStart <= 0 && viewportEnd >= 1) &&
+    // A viewport covering the WHOLE track has nothing to gain from caching —
+    // unless the direct render would overflow, in which case the clamp-and-
+    // blit path below is what keeps the wave visible at all.
+    (!(viewportStart <= 0 && viewportEnd >= 1) || overflowsDirect) &&
     width > 0 &&
     Number.isFinite(fullWidth) &&
     fullWidth >= width;

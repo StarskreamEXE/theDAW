@@ -654,6 +654,41 @@ const LANE: CanvasBox = { cssWidth: 600, cssHeight: 64, deviceWidth: 1200, devic
   assert.equal(whole.images.length, 0, 'and blits nothing');
 }
 
+// The EDIT timeline's ClipWave renders a clip's FULL, untrimmed source
+// (viewportStart 0, viewportEnd 1) at whatever CSS width its duration * the
+// timeline's zoom comes out to, with no cap of its own. A 220 s clip at
+// 400 px/s is a ~88,000 px wide box - the regression that shipped as a blank
+// clip at extreme zoom, because "whole track" used to always skip the clamp.
+const HUGE: CanvasBox = { cssWidth: 20000, cssHeight: 64, deviceWidth: 20000, deviceHeight: 64, scale: 1, zoom: 1, dpr: 1 };
+
+{
+  offscreens.length = 0;
+  const huge = makeFakeCanvas();
+  drawWaveformCached(huge.canvas, HUGE, REAL_BINS, 0, 1, false, null, 'huge-full-view');
+  assert.equal(
+    offscreens.length, 1,
+    'a full-track view wide enough to overflow the device-width ceiling must still go through the clamp-and-blit path',
+  );
+  assert.ok(
+    offscreens[0].canvas.width <= 8192,
+    `the offscreen render itself must never exceed the device-width cap - got ${offscreens[0].canvas.width}`,
+  );
+  assert.equal(huge.images.length, 1, 'and blit the clamped render onto the (still huge) visible canvas');
+  assert.ok(
+    huge.images[0].sx + huge.images[0].sw <= 8192,
+    'the blit source stays inside the clamped render',
+  );
+  assert.equal(huge.images[0].dx, 0, 'a full, non-overscrolled view fills from the left edge');
+  assert.equal(huge.images[0].dw, HUGE.cssWidth, 'and covers the whole (huge) width');
+
+  // Ordinary sizes below the ceiling are untouched: still the plain direct
+  // path, matching the LANE-sized "whole" case above.
+  offscreens.length = 0;
+  const normal = makeFakeCanvas();
+  drawWaveformCached(normal.canvas, BOX, REAL_BINS, 0, 1, false, null, 'normal-full-view');
+  assert.equal(offscreens.length, 0, 'a normal-sized full view still has nothing to gain from caching');
+}
+
 {
   // A decode error and the "no data yet" state keep going straight through to
   // drawWaveform — the FE-011 / FE-021 behaviour pinned above is untouched.

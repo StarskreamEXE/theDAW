@@ -13,6 +13,7 @@ import {
   planZoom,
   resolveAnchorSec,
   rulerBarLabels,
+  rulerTimeTicks,
   shouldRescrollAfterZoom,
   spanOfClips,
   viewportWindowSec,
@@ -238,6 +239,47 @@ const near = (a: number, b: number, eps = 1e-9) => assert.ok(Math.abs(a - b) <= 
   // Windowed: starts at the first bar inside the window.
   assert.deepEqual(rulerBarLabels({ startSec: 3, endSec: 6, bpm: 120, zoom: 50 }), [{ bar: 3, sec: 4 }, { bar: 4, sec: 6 }]);
   assert.throws(() => rulerBarLabels({ startSec: 0, endSec: 1, bpm: NaN, zoom: 10 }), RangeError);
+}
+
+// --- Ruler time ticks ---------------------------------------------------------
+{
+  // The exact regression: zoomed way out on a real session (the "00:00:00:00
+  // :00:60:00:10..." garbled ruler). At 1.51 px/s the old code held a 10 s
+  // step no matter what (15 px apart, below any legible width); the fixed
+  // step must widen until labels are readable.
+  const farOut = rulerTimeTicks({ startSec: 0, endSec: 300, zoom: 1.51 });
+  for (const t of farOut) assert.ok(t.sec === 0 || t.sec * 1.51 >= 50, `${t.sec}s at 1.51px/s is ${t.sec * 1.51}px from 0, below 50px`);
+  for (let i = 1; i < farOut.length; i++) {
+    assert.ok((farOut[i].sec - farOut[i - 1].sec) * 1.51 >= 50 - 1e-9, 'consecutive ticks must be >= minPx apart');
+  }
+  assert.deepEqual(farOut.map((t) => t.sec), [0, 60, 120, 180, 240, 300]);
+
+  // High zoom keeps the same density the old fixed-threshold code gave:
+  // 60 px/s -> 1 s step, major every 5 s.
+  const dense = rulerTimeTicks({ startSec: 0, endSec: 3, zoom: 60 });
+  assert.deepEqual(dense, [
+    { sec: 0, major: true }, { sec: 1, major: false }, { sec: 2, major: false }, { sec: 3, major: false },
+  ]);
+
+  // Windowed like rulerBarLabels: only ticks inside [startSec, endSec], not
+  // from 0 — the whole-session walk is exactly what made this expensive on
+  // a multi-minute project.
+  assert.deepEqual(
+    rulerTimeTicks({ startSec: 118, endSec: 122, zoom: 60 }),
+    [{ sec: 118, major: false }, { sec: 119, major: false }, { sec: 120, major: true }, { sec: 121, major: false }, { sec: 122, major: false }],
+  );
+
+  // A session past an hour still gets a legible step (the ladder doubles
+  // past 3600 s rather than capping).
+  const veryFarOut = rulerTimeTicks({ startSec: 0, endSec: 14400, zoom: 0.02 });
+  assert.ok(veryFarOut.length >= 2, 'must still produce ticks for a long session at extreme zoom-out');
+  for (let i = 1; i < veryFarOut.length; i++) {
+    assert.ok((veryFarOut[i].sec - veryFarOut[i - 1].sec) * 0.02 >= 50 - 1e-9);
+  }
+
+  assert.deepEqual(rulerTimeTicks({ startSec: 5, endSec: 1, zoom: 10 }), []);
+  assert.throws(() => rulerTimeTicks({ startSec: 0, endSec: 1, zoom: 0 }), RangeError);
+  assert.throws(() => rulerTimeTicks({ startSec: 0, endSec: 1, zoom: NaN }), RangeError);
 }
 
 // --- Clip chrome: header inside the visible part, off the resize zones -------
