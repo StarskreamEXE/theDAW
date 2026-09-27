@@ -13,10 +13,11 @@ theDAW and a LAN caller that is neither paired nor the desktop shell. The
 headset itself reaches the API through ``adb reverse`` and arrives as loopback.
 
 The WebSocket is the live path the frontend keeps open. It opens with one
-{"type":"status", ...} frame (the same fields as GET /status); inbound Quest
-MIDI then arrives as {"type":"midi","data":[...]}, which the browser publishes
-to midiBus. The browser sends {"data":[...]} to push return MIDI back to the
-headset.
+{"type":"status", ...} frame (the same fields as GET /status) and sends
+another whenever that status changes, the holder being re-read every few
+seconds; inbound Quest MIDI arrives as {"type":"midi","data":[...]}, which the
+browser publishes to midiBus. The browser sends {"data":[...]} to push return
+MIDI back to the headset.
 """
 
 from __future__ import annotations
@@ -86,9 +87,14 @@ async def ws(websocket: WebSocket) -> None:
     async def send(msg: list[int]) -> None:
         await websocket.send_json({"type": "midi", "data": msg})
 
+    async def send_status(snapshot: dict) -> None:
+        await websocket.send_json({"type": "status", **snapshot})
+
     bridge.add_client(send)
     try:
-        await websocket.send_json({"type": "status", **bridge.status()})
+        first = bridge.status()
+        await send_status(first)
+        bridge.add_status_client(send_status, first)
         while True:
             data = await websocket.receive_json()
             payload = data.get("data") if isinstance(data, dict) else None
@@ -99,4 +105,5 @@ async def ws(websocket: WebSocket) -> None:
     except Exception as e:  # client went away mid-message
         log.debug("questmidi: ws error: %s", e)
     finally:
+        bridge.remove_status_client(send_status)
         bridge.remove_client(send)

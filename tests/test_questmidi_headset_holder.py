@@ -488,7 +488,7 @@ def test_a_setup_made_for_main_still_reaches_thedaw(headset, monkeypatch):
 
 
 def _first_frame(ws, timeout: float = 10.0) -> dict:
-    """The WebSocket's first frame; a failure, never a hang, when none comes."""
+    """The WebSocket's next frame; a failure, never a hang, when none comes."""
     frames: list[dict] = []
     reader = threading.Thread(target=lambda: frames.append(ws.receive_json()))
     reader.daemon = True
@@ -496,6 +496,21 @@ def _first_frame(ws, timeout: float = 10.0) -> dict:
     reader.join(timeout)
     assert frames, "the WebSocket sent no status frame"
     return frames[0]
+
+
+def _frame_where(ws, check: Callable[[dict], bool], timeout: float = 10.0) -> dict:
+    """The first status frame ``check`` accepts, reading frames as they come."""
+    deadline = threading.Event()
+    timer = threading.Timer(timeout, deadline.set)
+    timer.start()
+    try:
+        while not deadline.is_set():
+            frame = _first_frame(ws, timeout)
+            if frame.get("type") == "status" and check(frame):
+                return frame
+    finally:
+        timer.cancel()
+    raise AssertionError("no status frame matched")
 
 
 @pytest.fixture
@@ -555,3 +570,81 @@ def test_a_lan_caller_cannot_move_the_headset(headset, other_bridge, monkeypatch
             assert lan.post(f"/api/questmidi/{route}").status_code == 403, route
     assert headset.midi_reversals(device_port) == []
     assert headset.reverse[device_port] == device_port
+
+
+def test_a_program_that_takes_the_headset_mid_session_reaches_the_open_socket(
+    headset, other_bridge, client, monkeypatch
+):
+    """Sequence: theDAW's UI opens the bridge WebSocket with theDAW holding the
+    headset; with the socket still open, the Node bridge starts and maps the
+    headset to itself. The socket must carry a status frame naming it, with no
+    GET /status in between."""
+    monkeypatch.setattr(bridge, "HOLDER_WATCH_S", 0.1, raising=False)
+    device_port = _free_port()
+    _headset_dials(monkeypatch, device_port)
+
+    with client.websocket_connect("/api/questmidi/ws") as ws:
+        first = _first_frame(ws)
+        assert first["headset_holder"] is None
+        assert first["adb_reverse_ok"] is True
+
+        other = other_bridge()
+        headset.reverse[device_port] = other.port  # its own adb reverse
+
+        frame = _frame_where(ws, lambda f: f["headset_holder"] is not None)
+        assert frame["headset_holder"]["pid"] == other.pid
+        assert frame["headset_holder"]["mapped"] is True
+        assert frame["adb_reverse_ok"] is False
+    assert headset.reverse[device_port] == other.port
+
+
+def test_a_holder_read_that_straddles_take_over_is_dropped(
+    headset, other_bridge, monkeypatch
+):
+    """Sequence: the holder watch starts reading the reverse table while the
+    Node bridge has the headset; before that read is recorded, the user's
+    Take over maps the headset to theDAW. The late read must not put the Node
+    bridge back into status() as the holder."""
+    other = other_bridge()
+    device_port = other.port
+    _headset_dials(monkeypatch, device_port)
+    headset.reverse[device_port] = device_port
+    real_holder = bridge._headset_holder
+    read_done = threading.Event()
+    release = threading.Event()
+    slow = {"armed": False}
+
+    def headset_holder(device: int, own: Optional[int]) -> Optional[dict]:
+        found = real_holder(device, own)
+        if slow["armed"]:
+            slow["armed"] = False
+            read_done.set()
+            release.wait(10)
+        return found
+
+    monkeypatch.setattr(bridge, "_headset_holder", headset_holder)
+
+    async def scenario() -> None:
+        await bridge.ensure_started()
+        try:
+            slow["armed"] = True
+            watch_read = asyncio.create_task(bridge.refresh_headset_holder())
+            loop = asyncio.get_running_loop()
+            assert await loop.run_in_executor(None, read_done.wait, 10)
+
+            status = await bridge.take_over()
+            assert status["headset_holder"] is None
+            release.set()
+            await watch_read
+
+            status = bridge.status()
+            assert status["headset_holder"] is None, (
+                "a read from before Take over put the old holder back"
+            )
+            assert status["adb_reverse_ok"] is True
+            assert headset.reverse[device_port] == status["host_port"]
+        finally:
+            release.set()
+            await bridge.stop()
+
+    asyncio.run(scenario())

@@ -44,7 +44,11 @@ log = logging.getLogger(__name__)
 # relay at ws://127.0.0.1:8600/api/xr/control/ws — on its own loopback with
 # zero network setup, exactly like MIDI.
 DEFAULT_HTTP_PORT = 8600
+# Seconds between re-reads of who holds the headset while a browser keeps the
+# bridge WebSocket open; a change goes out as a status frame (_watch_status).
+HOLDER_WATCH_S = 5.0
 ClientSend = Callable[[list[int]], Awaitable[None]]
+StatusSend = Callable[[dict], Awaitable[None]]
 
 
 def _port() -> int:
@@ -88,10 +92,17 @@ class _State:
     # {pid, name, port, thedaw, mapped} (see _headset_holder); None while it
     # reaches this bridge or nothing.
     headset_holder: Optional[dict] = None
-    # (pid, name) of the program the user took the headset from with Take
+    # _consent_key of the program the user took the headset from with Take
     # over. A re-attach may move the headset away from that program again
     # without asking; any other program gets asked about anew.
     takeover_from: Optional[tuple[int, str]] = None
+    # Bumped by every re-attach, Take over and stop. A holder read that started
+    # before one of those finished is stale and is dropped.
+    holder_gen: int = 0
+    # Browser WebSockets that get a status frame whenever status() changes,
+    # each with the last status it was sent.
+    status_clients: Optional[dict[StatusSend, dict]] = None
+    watch_task: Optional[asyncio.Task] = None
 
 
 _s = _State()
@@ -396,6 +407,7 @@ async def reattach_adb(*, take_over: bool = False) -> bool:
     Take over: the headset moves here anyway, and later re-attaches may move it
     away from that same program again without asking."""
     loop = asyncio.get_running_loop()
+    _s.holder_gen += 1
     device_port = _device_port()
     host_port = _s.host_port or _port()
     holder = await loop.run_in_executor(None, _headset_holder, device_port, _own_port())
@@ -421,9 +433,14 @@ async def refresh_headset_holder() -> None:
     while the headset's own mapping names it; with the headset unplugged it
     is the user's settled choice, not news."""
     loop = asyncio.get_running_loop()
+    gen = _s.holder_gen
     holder = await loop.run_in_executor(
         None, _headset_holder, _device_port(), _own_port()
     )
+    if gen != _s.holder_gen:
+        # A re-attach, Take over or stop ran meanwhile and recorded its own
+        # reading; this one may predate its adb reverse.
+        return
     if (
         holder is not None
         and not holder["mapped"]
@@ -525,6 +542,7 @@ async def stop() -> None:
             pass
     _s.server = None
     _s.started = False
+    _s.holder_gen += 1
     _s.host_port = None
     _s.headset_holder = None
     _s.takeover_from = None
@@ -555,3 +573,53 @@ def status() -> dict:
         "headset_holder": dict(_s.headset_holder) if _s.headset_holder else None,
         "took_over": _s.takeover_from is not None,
     }
+
+
+# ---- status frames: bridge -> browser -----------------------------------------
+
+
+def add_status_client(send: StatusSend, sent: dict) -> None:
+    """Send ``send`` a status frame whenever status() differs from ``sent``,
+    the status it was last given. While any such client is connected, the
+    holder is re-read every HOLDER_WATCH_S seconds, so a program that takes
+    the headset mid-session reaches the LOG and Settings without a rescan."""
+    if _s.status_clients is None:
+        _s.status_clients = {}
+    _s.status_clients[send] = sent
+    if _s.watch_task is None or _s.watch_task.done():
+        _s.watch_task = asyncio.get_running_loop().create_task(_watch_status())
+
+
+def remove_status_client(send: StatusSend) -> None:
+    if _s.status_clients is not None:
+        _s.status_clients.pop(send, None)
+    if not _s.status_clients and _s.watch_task is not None:
+        _s.watch_task.cancel()
+        _s.watch_task = None
+
+
+async def push_status() -> None:
+    """Send every status client the current status, if it changed for it."""
+    if not _s.status_clients:
+        return
+    snapshot = status()
+    for send, sent in list(_s.status_clients.items()):
+        if sent == snapshot:
+            continue
+        try:
+            await send(snapshot)
+        except Exception:  # the socket went away; its route removes it
+            continue
+        if _s.status_clients is not None and send in _s.status_clients:
+            _s.status_clients[send] = snapshot
+
+
+async def _watch_status() -> None:
+    while _s.status_clients:
+        await asyncio.sleep(HOLDER_WATCH_S)
+        try:
+            if _s.started:
+                await refresh_headset_holder()
+            await push_status()
+        except Exception as e:  # a failed read must not end the watch
+            log.debug("questmidi: status watch: %s", e)
