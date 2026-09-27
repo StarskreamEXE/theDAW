@@ -15,13 +15,26 @@ import socket
 from backend.modules.questmidi import bridge
 
 
+def _free_port() -> int:
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+    finally:
+        probe.close()
+
+
 def test_bridge_moves_aside_when_another_program_serves_its_port(monkeypatch):
     foreign = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     foreign.bind(("0.0.0.0", 0))
     foreign.listen()
     foreign.settimeout(5)
     port = foreign.getsockname()[1]
-    monkeypatch.setenv("theDAW_QUESTMIDI_PORT", str(port))
+    device_port = _free_port()
+    monkeypatch.setattr(bridge, "_s", bridge._State())
+    monkeypatch.delenv("theDAW_QUESTMIDI_DEVICE_PORT", raising=False)
+    monkeypatch.setenv("theDAW_QUESTMIDI_HOST_PORT", str(port))
+    monkeypatch.setenv("theDAW_QUESTMIDI_PORT", str(device_port))
     monkeypatch.setattr(bridge, "_adb_path", lambda: None)  # no headset in a test run
 
     async def scenario() -> None:
@@ -29,8 +42,12 @@ def test_bridge_moves_aside_when_another_program_serves_its_port(monkeypatch):
         try:
             status = bridge.status()
             assert status["started"] is True
-            assert status["port"] == port, "the configured host port is still reported"
-            assert status["device_port"] == 8765, "the headset still dials its own port"
+            assert status["configured_host_port"] == port, (
+                "the configured host port is still reported"
+            )
+            assert status["device_port"] == device_port, (
+                "the headset still dials its own port"
+            )
             assert status["host_port"] not in (None, port), (
                 "listening beside the other program"
             )
@@ -65,7 +82,10 @@ def test_bridge_keeps_its_own_port_when_it_is_free(monkeypatch):
     probe.bind(("127.0.0.1", 0))
     port = probe.getsockname()[1]
     probe.close()
-    monkeypatch.setenv("theDAW_QUESTMIDI_PORT", str(port))
+    monkeypatch.setattr(bridge, "_s", bridge._State())
+    monkeypatch.delenv("theDAW_QUESTMIDI_DEVICE_PORT", raising=False)
+    monkeypatch.setenv("theDAW_QUESTMIDI_HOST_PORT", str(port))
+    monkeypatch.setenv("theDAW_QUESTMIDI_PORT", str(_free_port()))
     monkeypatch.setattr(bridge, "_adb_path", lambda: None)
 
     async def scenario() -> None:

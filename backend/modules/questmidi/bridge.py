@@ -9,6 +9,14 @@ audio-reactive feed for the GANTASMO Visor) is framed back to the headset.
 Everything runs on uvicorn's asyncio loop — the TCP server, the WebSocket
 relay, and the broadcast are all coroutines, so there are no threads to manage.
 
+Ports (see port_config.py): the headset dials its own port 8765, and ``adb
+reverse tcp:8765 tcp:<listener>`` carries that to the listener here, 8766 by
+default. A headset has one mapping per port, so reversing it takes the headset
+from whichever program had it. When another program already serves the
+headset's port, this bridge leaves the headset with it: status() names that
+program under ``headset_holder`` and take_over() is the user's explicit way to
+move the headset here.
+
 Wire format on the TCP socket (matches QuestMidiSender / the Node bridge):
 ``[len:1][midi bytes…]``. Over the WebSocket each message is JSON
 ``{"type": "midi", "data": [status, d1, d2]}``.
@@ -40,10 +48,12 @@ ClientSend = Callable[[list[int]], Awaitable[None]]
 
 
 def _port() -> int:
+    """The listener port configured for this PC (theDAW_QUESTMIDI_HOST_PORT)."""
     return port_config.host_port()
 
 
 def _device_port() -> int:
+    """The port the headset dials (theDAW_QUESTMIDI_PORT)."""
     return port_config.device_port()
 
 
@@ -74,6 +84,14 @@ class _State:
     # _port() (the configured host port) when another program already serves
     # that port number here; ``adb reverse`` maps the headset's port onto it.
     host_port: Optional[int] = None
+    # The program the headset's MIDI reaches instead of this bridge, as
+    # {pid, name, port, thedaw, mapped} (see _headset_holder); None while it
+    # reaches this bridge or nothing.
+    headset_holder: Optional[dict] = None
+    # (pid, name) of the program the user took the headset from with Take
+    # over. A re-attach may move the headset away from that program again
+    # without asking; any other program gets asked about anew.
+    takeover_from: Optional[tuple[int, str]] = None
 
 
 _s = _State()
@@ -117,7 +135,7 @@ def send_to_quest(data: object) -> bool:
         frame = bytes([n] + [int(b) & 0xFF for b in list(data)[:n]])
         w.write(frame)
         return True
-    except Exception as e:  # noqa: BLE001 — a broken pipe just means no Quest
+    except Exception as e:  # a broken pipe just means no Quest
         log.debug("questmidi: send_to_quest failed: %s", e)
         return False
 
@@ -149,7 +167,7 @@ async def _handle_quest(
                 off += 1 + ln
             if off:
                 del buf[:off]
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:  # the headset went away mid-read
         log.debug("questmidi: quest read error: %s", e)
     finally:
         if _s.quest_writer is writer:
@@ -190,6 +208,24 @@ def _port_holders(port: int) -> tuple[bool, bool]:
     return thedaw, foreign
 
 
+def _holder_of(port: int) -> Optional[dict]:
+    """The first process other than this one listening on ``port`` here, as
+    ``{pid, name, port, thedaw}``; None when nobody else listens on it or the
+    listening table is unreadable."""
+    from backend.ports import holders
+
+    for holder in holders([port]):
+        if holder.pid == os.getpid():
+            continue
+        return {
+            "pid": holder.pid,
+            "name": holder.name,
+            "port": port,
+            "thedaw": any(entry in holder.cmdline for entry in _THEDAW_ENTRY_POINTS),
+        }
+    return None
+
+
 def _port_number_is_free(port: int) -> bool:
     """Nobody listens on this port NUMBER, on any IPv4 address.
 
@@ -228,37 +264,166 @@ def _bind_listener(port: int) -> socket.socket:
     return sock
 
 
-def _run_adb_reverse(device_port: int, host_port: int) -> bool:
-    """Map the headset's ``device_port`` onto this machine's ``host_port``."""
+def _adb(*args: str) -> Optional[str]:
+    """Run one adb command and return its stdout, or None when adb is missing
+    or the command failed (no headset plugged in, the USB-debugging prompt not
+    yet accepted, more than one device). Every adb call goes through here."""
     adb = _adb_path()
     if not adb:
-        return False
+        return None
     try:
-        subprocess.run(
-            [adb, "reverse", f"tcp:{device_port}", f"tcp:{host_port}"],
+        done = subprocess.run(
+            [adb, *args],
             capture_output=True,
+            text=True,
             timeout=10,
             check=True,
             env=child_env(),
         )
-        return True
-    except Exception as e:  # noqa: BLE001 — expected when no headset is plugged in
-        log.debug("questmidi: adb reverse failed: %s", e)
-        return False
+    except Exception as e:  # expected when no headset is plugged in
+        log.debug("questmidi: adb %s failed: %s", " ".join(args), e)
+        return None
+    return done.stdout or ""
 
 
-async def reattach_adb() -> bool:
+def _run_adb_reverse(device_port: int, host_port: int) -> bool:
+    """Map the headset's ``device_port`` onto this machine's ``host_port``."""
+    return _adb("reverse", f"tcp:{device_port}", f"tcp:{host_port}") is not None
+
+
+def _reverse_target(device_port: int) -> Optional[int]:
+    """The port on this PC that the plugged-in headset's ``device_port`` is
+    reversed onto; None when it has no such mapping, or no headset or adb is
+    there to ask."""
+    listing = _adb("reverse", "--list")
+    if not listing:
+        return None
+    want = f"tcp:{device_port}"
+    for line in listing.splitlines():
+        # adb prints one mapping per line: "<transport> <headset side> <PC side>".
+        parts = line.split()
+        if len(parts) >= 2 and parts[-2] == want and parts[-1].startswith("tcp:"):
+            try:
+                return int(parts[-1][len("tcp:") :])
+            except ValueError:
+                return None
+    return None
+
+
+def _headset_holder(device_port: int, own_port: Optional[int]) -> Optional[dict]:
+    """The program the headset's MIDI reaches when it is not ``own_port``,
+    this bridge's listener (None while this backend has no listener).
+
+    The headset dials ``device_port`` and adb carries that to whatever PC port
+    its reverse mapping names; such a holder has ``mapped`` True. With no
+    mapping, or no headset plugged in to ask, the program listening on
+    ``device_port`` here counts as holding it (``mapped`` False): that is where
+    every one-to-one bridge sends the headset (theDAW before the ports were
+    split, and the standalone Node bridge). None when the mapping names
+    ``own_port`` or nobody else listens on the port in question.
+    """
+    target = _reverse_target(device_port)
+    port = device_port if target is None else target
+    if own_port is not None and port == own_port:
+        return None
+    holder = _holder_of(port)
+    if holder is not None:
+        holder["mapped"] = target is not None
+    return holder
+
+
+def _own_port() -> Optional[int]:
+    """This bridge's listener port; None while another theDAW's listener
+    stands in for it (started with ``port_in_use``)."""
+    return _s.host_port if _s.server is not None else None
+
+
+def _consent_key(holder: dict) -> tuple[int, str]:
+    return (int(holder["pid"]), str(holder["name"]))
+
+
+def _note_holder(holder: Optional[dict]) -> None:
+    """Record who holds the headset, logging once per change of holder."""
+    if holder is not None and holder != _s.headset_holder:
+        log.info(
+            "questmidi: %s (pid %d) serves port %d, the port the headset dials "
+            "(listening on port %d here); theDAW leaves the headset with it "
+            "until you press Take over (Settings > Inputs & outputs)",
+            "another theDAW" if holder["thedaw"] else holder["name"],
+            holder["pid"],
+            _device_port(),
+            holder["port"],
+        )
+    _s.headset_holder = holder
+
+
+async def reattach_adb(*, take_over: bool = False) -> bool:
     """Re-run ``adb reverse`` (after re-plugging the headset / accepting the
     USB-debugging prompt) without restarting the listener. Reverses the MIDI
     port AND the backend HTTP port (control-bus relay) in one pass; only the
-    MIDI port decides the reported ok state, matching what this bridge owns."""
+    MIDI port decides the reported ok state, matching what this bridge owns.
+
+    While another program serves the headset's port the MIDI port is left
+    alone and status() names that program. ``take_over=True`` is the user's
+    Take over: the headset moves here anyway, and later re-attaches may move it
+    away from that same program again without asking."""
     loop = asyncio.get_running_loop()
-    _s.adb_reverse_ok = await loop.run_in_executor(
-        None, _run_adb_reverse, _device_port(), _s.host_port or _port()
-    )
+    device_port = _device_port()
+    host_port = _s.host_port or _port()
+    holder = await loop.run_in_executor(None, _headset_holder, device_port, _own_port())
+    if holder is not None and take_over:
+        _s.takeover_from = _consent_key(holder)
+    if holder is not None and _consent_key(holder) != _s.takeover_from:
+        _note_holder(holder)
+        _s.adb_reverse_ok = False
+    else:
+        _note_holder(None)
+        _s.adb_reverse_ok = await loop.run_in_executor(
+            None, _run_adb_reverse, device_port, host_port
+        )
     http_port = _http_port()
     await loop.run_in_executor(None, _run_adb_reverse, http_port, http_port)
     return _s.adb_reverse_ok
+
+
+async def refresh_headset_holder() -> None:
+    """Re-read who the headset reaches, without touching any mapping, so
+    status() shows a program that took the headset after this bridge mapped
+    it. A program the user already took the headset from is only reported
+    while the headset's own mapping names it; with the headset unplugged it
+    is the user's settled choice, not news."""
+    loop = asyncio.get_running_loop()
+    holder = await loop.run_in_executor(
+        None, _headset_holder, _device_port(), _own_port()
+    )
+    if (
+        holder is not None
+        and not holder["mapped"]
+        and _consent_key(holder) == _s.takeover_from
+    ):
+        holder = None
+    _note_holder(holder)
+    if holder is not None:
+        _s.adb_reverse_ok = False
+
+
+async def _open_listener(port: int) -> None:
+    """Bind this bridge's listener: ``port`` when nobody else has that port
+    number here, else any free port."""
+    _thedaw, foreign_holds = _port_holders(port)
+    listener: Optional[socket.socket] = None
+    if not foreign_holds and _port_number_is_free(port):
+        try:
+            listener = _bind_listener(port)
+        except OSError as e:
+            if e.errno not in (errno.EADDRINUSE, errno.EACCES, 10048, 10013):
+                raise
+    if listener is None:
+        # Another program serves this port number. Never sit beside it: take
+        # any free port here; adb maps the headset's port onto whichever it is.
+        listener = _bind_listener(0)
+    _s.host_port = listener.getsockname()[1]
+    _s.server = await asyncio.start_server(_handle_quest, sock=listener)
 
 
 async def ensure_started() -> None:
@@ -268,12 +433,13 @@ async def ensure_started() -> None:
     _s.starting = True
     try:
         port = _port()
-        thedaw_holds, foreign_holds = _port_holders(port)
+        thedaw_holds, _foreign = _port_holders(port)
         if thedaw_holds:
             # A second theDAW instance or a --reload leftover already owns the
             # listener. Treat it as started so we don't re-attempt the bind (and
             # re-log) on every WebSocket connect; the existing listener relays
-            # the headset.
+            # the headset, status() names it as the holder, and Take over gives
+            # this backend a listener of its own.
             await reattach_adb()
             _s.started = True
             _s.port_in_use = True
@@ -283,41 +449,43 @@ async def ensure_started() -> None:
                 port,
             )
             return
-        listener: Optional[socket.socket] = None
-        if not foreign_holds and _port_number_is_free(port):
-            try:
-                listener = _bind_listener(port)
-            except OSError as e:
-                if e.errno not in (errno.EADDRINUSE, errno.EACCES, 10048, 10013):
-                    raise
-        if listener is None:
-            # Another program serves this port number. Never sit beside it: take
-            # any free port here and let adb map the headset's port onto it.
-            listener = _bind_listener(0)
-        _s.host_port = listener.getsockname()[1]
-        _s.server = await asyncio.start_server(_handle_quest, sock=listener)
+        await _open_listener(port)
         await reattach_adb()
         _s.started = True
         _s.port_in_use = False
-        if _s.host_port != port:
-            log.info(
-                "questmidi: port %d belongs to another program — listening on "
-                "127.0.0.1:%d instead; the headset still dials %d (adb reverse %s)",
-                port,
-                _s.host_port,
-                _device_port(),
-                "ok" if _s.adb_reverse_ok else "not set",
-            )
-        else:
-            log.info(
-                "questmidi: listening on 127.0.0.1:%d (adb reverse %s)",
-                port,
-                "ok" if _s.adb_reverse_ok else "not set",
-            )
-    except Exception as e:  # noqa: BLE001
+        log.info(
+            "questmidi: listening on 127.0.0.1:%d%s; the headset dials %d "
+            "(adb reverse %s)",
+            _s.host_port,
+            ""
+            if _s.host_port == port
+            else f" (port {port} belongs to another program)",
+            _device_port(),
+            "ok"
+            if _s.adb_reverse_ok
+            else ("left with its holder" if _s.headset_holder else "not set"),
+        )
+    except Exception as e:  # one module's start must not take the backend down
         log.warning("questmidi: failed to start: %s", e)
     finally:
         _s.starting = False
+
+
+async def take_over() -> dict:
+    """The user's Take over: move the headset onto this bridge although
+    another program serves its port. Nothing else calls this."""
+    await ensure_started()
+    try:
+        if _s.started and _s.server is None:
+            # Another theDAW held the listener port at start, so this backend
+            # has no listener of its own yet.
+            await _open_listener(_port())
+            _s.port_in_use = False
+        if _s.server is not None:
+            await reattach_adb(take_over=True)
+    except Exception as e:  # report through status(), never a 500
+        log.warning("questmidi: take over failed: %s", e)
+    return status()
 
 
 async def stop() -> None:
@@ -330,6 +498,8 @@ async def stop() -> None:
     _s.server = None
     _s.started = False
     _s.host_port = None
+    _s.headset_holder = None
+    _s.takeover_from = None
     if _s.quest_writer is not None:
         try:
             _s.quest_writer.close()
@@ -342,13 +512,18 @@ async def stop() -> None:
 def status() -> dict:
     return {
         "started": _s.started,
-        "port": _port(),
+        # The port the headset dials (theDAW_QUESTMIDI_PORT), as it always was.
+        "port": _device_port(),
         "device_port": _device_port(),
+        # The port the listener is bound to here, and the one configured for it.
         "host_port": _s.host_port,
+        "configured_host_port": _port(),
         "port_in_use": _s.port_in_use,
         "adb_path": _adb_path(),
         "adb_reverse_ok": _s.adb_reverse_ok,
         "quest_connected": _s.quest_writer is not None,
         "quest_peer": _s.quest_peer,
         "clients": len(_s.clients),
+        "headset_holder": dict(_s.headset_holder) if _s.headset_holder else None,
+        "took_over": _s.takeover_from is not None,
     }
