@@ -42,16 +42,25 @@ Re-audit follow-up (round 2):
   * Item 8 -- concurrency tests use a Barrier for determinism and assert
     real lock contention, not just call counts.
 
-Multi-key failover (both providers):
-  * `_child_env` hands the child EVERY key it knows for both providers, as one
-    ordered comma-separated list each (env, then stored, then the key pool,
-    de-duplicated), and never logs a value.
-  * The legacy single-Gemini key file migrates on read and is backed up before
-    the per-provider shape is written over it.
+Provider keys (both providers):
+  * `_child_env` puts ONE key in GEMINI_API_KEY / OPENROUTER_API_KEY for every
+    checkout, and the rest of the ordered list (env, then the Lyria card) in
+    the numbered _2 .. _10 slots only for a checkout whose server/keys.ts reads
+    them. The assistant's pool adds its first Gemini key when nothing else has
+    one, and everything else only once the user shares it. No value is logged.
+  * The key file is written atomically (a crash mid-write keeps every key),
+    keeps a single-key ``key`` field an older build reads, migrates the legacy
+    single-Gemini file on read and backs it up before rewriting it.
   * The AI_PROVIDER decision table: only-gemini, only-openrouter, both,
     neither, and a preference the user set.
   * The /keys routes' shapes and validation, and that no response body carries
     key material.
+  * Every route that changes state refuses a foreign page and a LAN caller
+    without the launch or pairing token; include_mock is loopback-only.
+  * restart() replaces a Lyria adopted from an earlier session with a child
+    that has the current keys, and refuses one from another folder.
+  * Install clones exactly LYRIA_PINNED_COMMIT; an existing clean checkout is
+    moved to it before a spawn, and one with local changes is left alone.
 
 No real npm/node process is spawned -- `_ensure_deps` and `subprocess.Popen`
 are monkeypatched. A throwaway `http.server` (or raw TCP listener, for the
@@ -63,10 +72,16 @@ from __future__ import annotations
 
 import asyncio
 import http.server
+import io
 import json
+import os
+import re
 import socket
+import subprocess
+import sys
 import threading
 import time
+import urllib.request
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Iterator
@@ -1318,17 +1333,21 @@ def test_concurrent_ensure_running_installs_once_and_spawns_once(monkeypatch, tm
 
 
 # ---------------------------------------------------------------------------
-# Multi-key failover (both providers) -- the child takes an ORDERED list per
-# provider and skips a rejected key (its server/keys.ts), so theDAW hands it
-# every key it has instead of one. Google's free tier grants zero Lyria
-# requests per day, which is why the OpenRouter list matters at all.
+# Provider keys -- one key per variable for every checkout, the rest of the
+# ordered list in the numbered _2 .. _10 slots only for a checkout whose
+# server/keys.ts reads them, and the assistant's pool only when shared.
 # ---------------------------------------------------------------------------
+
+
+_KEY_VARS = ("GEMINI_API_KEY", "OPENROUTER_API_KEY")
+_NUMBERED = tuple(f"{var}_{n}" for var in _KEY_VARS for n in range(2, 12))
 
 
 @pytest.fixture
 def lyria_keys(tmp_path, monkeypatch):
-    """Isolate the key file, the provider environment variables and the
-    assistant's key pool, so these tests never read or write the real ones."""
+    """Isolate the key file, the provider environment variables (numbered
+    slots included) and the assistant's key pool, so these tests never read
+    or write the real ones."""
     from backend.key_pool import key_pool
 
     path = tmp_path / "lyria_gemini_key.json"
@@ -1336,7 +1355,7 @@ def lyria_keys(tmp_path, monkeypatch):
     monkeypatch.setattr(
         sidecar, "_KEY_FILE_BACKUP", tmp_path / "lyria_gemini_key.json.bak"
     )
-    for var in ("GEMINI_API_KEY", "OPENROUTER_API_KEY", "AI_PROVIDER"):
+    for var in (*_KEY_VARS, *_NUMBERED, "AI_PROVIDER", "theDAW_LYRIA_PROJECT"):
         monkeypatch.delenv(var, raising=False)
     pools: dict[str, list[str]] = {}
     monkeypatch.setattr(
@@ -1345,32 +1364,181 @@ def lyria_keys(tmp_path, monkeypatch):
     return SimpleNamespace(path=path, backup=sidecar._KEY_FILE_BACKUP, pools=pools)
 
 
-def _cfg(tmp_path) -> sidecar.LyriaConfig:
+def _old_checkout(root) -> object:
+    """A Lyria checkout from before server/keys.ts, shaped like the user's own
+    lyria/ at 192032e: server.ts reads GEMINI_API_KEY as ONE key."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "package.json").write_text("{}", encoding="utf-8")
+    (root / "server.ts").write_text(
+        "const key = clientKey || process.env.GEMINI_API_KEY;\n"
+        "return clientKey || process.env.OPENROUTER_API_KEY;\n",
+        encoding="utf-8",
+    )
+    return root
+
+
+def _list_checkout(root) -> object:
+    """A checkout at the pinned commit's shape: server/keys.ts defines
+    numberedEnvValues and server.ts reads the numbered slots with it."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "package.json").write_text("{}", encoding="utf-8")
+    (root / "server").mkdir(exist_ok=True)
+    (root / "server" / "keys.ts").write_text(
+        "export function numberedEnvValues(env, prefix, max = 10) {}\n",
+        encoding="utf-8",
+    )
+    (root / "server.ts").write_text(
+        'import { resolveKeys, numberedEnvValues } from "./server/keys";\n'
+        "numberedEnv: numberedEnvValues(process.env, 'GEMINI_API_KEY'),\n",
+        encoding="utf-8",
+    )
+    return root
+
+
+def _cfg(project) -> sidecar.LyriaConfig:
     return sidecar.LyriaConfig(
-        project_path=tmp_path, port=5188, npm_path="npm", mock=True
+        project_path=project, port=5188, npm_path="npm", mock=True
     )
 
 
-def test_child_env_passes_every_key_for_both_providers_in_order(
+def _key_slots(env: dict[str, str]) -> dict[str, str]:
+    return {k: v for k, v in env.items() if k in _KEY_VARS or k in _NUMBERED}
+
+
+def test_old_checkout_gets_exactly_one_key_per_variable(
     lyria_keys, tmp_path, monkeypatch
 ):
-    """env value(s) first, then what theDAW stored, then the key pool -- as
-    one comma-separated list per provider, de-duplicated."""
+    """The sequence that broke every live request on an older install: keys
+    from the environment AND the Lyria card, then a spawn from a checkout
+    without server/keys.ts. Each variable must hold ONE key -- a comma list is
+    sent to Google as a single invalid key -- and no numbered slot is set."""
     monkeypatch.setenv("GEMINI_API_KEY", "env-g1, env-g2")
     monkeypatch.setenv("OPENROUTER_API_KEY", "env-o1")
     sidecar.add_key("gemini", "file-g1")
     sidecar.add_key("openrouter", "file-o1")
-    # "env-g1" is in the pool too: it must appear ONCE, in its env position.
-    lyria_keys.pools["gemini"] = ["pool-g1", "env-g1"]
+    project = _old_checkout(tmp_path / "old")
+
+    assert sidecar.checkout_reads_key_lists(project) is False
+    env = sidecar._child_env(_cfg(project))
+
+    assert _key_slots(env) == {
+        "GEMINI_API_KEY": "env-g1",
+        "OPENROUTER_API_KEY": "env-o1",
+    }
+
+
+def test_list_checkout_gets_the_first_key_then_numbered_slots(
+    lyria_keys, tmp_path, monkeypatch
+):
+    """A checkout with server/keys.ts reads GEMINI_API_KEY plus _2.._10, so
+    the ordered list (env, then the card) goes there, de-duplicated, with the
+    unnumbered variable still holding a single key."""
+    monkeypatch.setenv("GEMINI_API_KEY", "env-g1, env-g2")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "env-o1")
+    sidecar.add_key("gemini", "file-g1")
+    sidecar.add_key("gemini", "env-g1")  # already in the env: appears once
+    sidecar.add_key("openrouter", "file-o1")
+    project = _list_checkout(tmp_path / "pinned")
+
+    assert sidecar.checkout_reads_key_lists(project) is True
+    env = sidecar._child_env(_cfg(project))
+
+    assert _key_slots(env) == {
+        "GEMINI_API_KEY": "env-g1",
+        "GEMINI_API_KEY_2": "env-g2",
+        "GEMINI_API_KEY_3": "file-g1",
+        "OPENROUTER_API_KEY": "env-o1",
+        "OPENROUTER_API_KEY_2": "file-o1",
+    }
+
+
+def test_list_checkout_takes_at_most_ten_keys(lyria_keys, tmp_path, caplog):
+    """numberedEnvValues stops at _10, so an eleventh key has no slot. The log
+    line says how many were handed out of how many are held."""
+    for n in range(1, 13):
+        sidecar.add_key("gemini", f"gemini-key-{n:02d}")
+    project = _list_checkout(tmp_path / "pinned")
+
+    with caplog.at_level("INFO"):
+        env = sidecar._child_env(_cfg(project))
+
+    assert env["GEMINI_API_KEY"] == "gemini-key-01"
+    assert env["GEMINI_API_KEY_10"] == "gemini-key-10"
+    assert "GEMINI_API_KEY_11" not in env
+    assert "gemini=10/12" in caplog.text
+
+
+def test_inherited_numbered_slots_are_folded_in_and_cleared(
+    lyria_keys, tmp_path, monkeypatch
+):
+    """A GEMINI_API_KEY_2 set in the shell is one of the environment's keys:
+    a list-reading checkout still gets it (in its list position), and an old
+    checkout gets nothing numbered, not even the inherited value."""
+    monkeypatch.setenv("GEMINI_API_KEY", "shell-g1")
+    monkeypatch.setenv("GEMINI_API_KEY_2", "shell-g2")
+    monkeypatch.setenv("OPENROUTER_API_KEY_7", "shell-o7")
+    sidecar.add_key("gemini", "file-g1")
+
+    assert sidecar.env_keys("gemini") == ["shell-g1", "shell-g2"]
+    listed = sidecar._child_env(_cfg(_list_checkout(tmp_path / "pinned")))
+    assert _key_slots(listed) == {
+        "GEMINI_API_KEY": "shell-g1",
+        "GEMINI_API_KEY_2": "shell-g2",
+        "GEMINI_API_KEY_3": "file-g1",
+        "OPENROUTER_API_KEY": "shell-o7",
+    }
+    old = sidecar._child_env(_cfg(_old_checkout(tmp_path / "old")))
+    assert _key_slots(old) == {
+        "GEMINI_API_KEY": "shell-g1",
+        "OPENROUTER_API_KEY": "shell-o7",
+    }
+
+
+def test_pool_keys_stay_with_the_assistant_until_the_user_shares_them(
+    lyria_keys, tmp_path
+):
+    """The assistant's pool is filled; nothing else is. The child gets the
+    pool's FIRST Gemini key and nothing from OpenRouter, as theDAW has always
+    handed it. A key saved in the card replaces that fallback. Only after the
+    user turns on the pool switch do every pooled Gemini, OpenRouter and
+    openrouter-free key follow, and turning it off takes them back."""
+    lyria_keys.pools["gemini"] = ["pool-g1", "pool-g2"]
     lyria_keys.pools["openrouter"] = ["pool-o1"]
-    # "openrouter-free" is a distinct pool in backend/key_pool.py; its keys
-    # are OpenRouter keys too and must be folded in.
     lyria_keys.pools["openrouter-free"] = ["pool-of1", "pool-o1"]
+    project = _list_checkout(tmp_path / "pinned")
 
-    env = sidecar._child_env(_cfg(tmp_path))
+    assert _key_slots(sidecar._child_env(_cfg(project))) == {
+        "GEMINI_API_KEY": "pool-g1"
+    }
 
-    assert env["GEMINI_API_KEY"] == "env-g1,env-g2,file-g1,pool-g1"
-    assert env["OPENROUTER_API_KEY"] == "env-o1,file-o1,pool-o1,pool-of1"
+    sidecar.add_key("gemini", "file-g1")
+    assert _key_slots(sidecar._child_env(_cfg(project))) == {
+        "GEMINI_API_KEY": "file-g1"
+    }
+
+    assert sidecar.set_pool_shared(True) is True
+    assert _key_slots(sidecar._child_env(_cfg(project))) == {
+        "GEMINI_API_KEY": "file-g1",
+        "GEMINI_API_KEY_2": "pool-g1",
+        "GEMINI_API_KEY_3": "pool-g2",
+        "OPENROUTER_API_KEY": "pool-o1",
+        "OPENROUTER_API_KEY_2": "pool-of1",
+    }
+
+    assert sidecar.set_pool_shared(False) is False
+    assert _key_slots(sidecar._child_env(_cfg(project))) == {
+        "GEMINI_API_KEY": "file-g1"
+    }
+
+
+def test_a_hand_edited_share_flag_that_is_not_true_does_not_share(lyria_keys):
+    lyria_keys.path.write_text(
+        json.dumps({"version": 2, "providers": {}, "share_pool": "yes"}),
+        encoding="utf-8",
+    )
+    lyria_keys.pools["openrouter"] = ["pool-o1"]
+    assert sidecar.pool_shared() is False
+    assert sidecar.resolved_keys("openrouter") == ([], "none")
 
 
 def test_child_env_drops_blanks_and_unsets_a_provider_with_no_keys(
@@ -1379,19 +1547,26 @@ def test_child_env_drops_blanks_and_unsets_a_provider_with_no_keys(
     monkeypatch.setenv("GEMINI_API_KEY", "  ,  ")
     monkeypatch.setenv("OPENROUTER_API_KEY", "env-o1,,env-o2\nenv-o3")
 
-    env = sidecar._child_env(_cfg(tmp_path))
+    old = sidecar._child_env(_cfg(_old_checkout(tmp_path / "old")))
+    listed = sidecar._child_env(_cfg(_list_checkout(tmp_path / "pinned")))
 
     # A whitespace-only inherited value must not reach the child as a "key".
-    assert "GEMINI_API_KEY" not in env
-    assert env["OPENROUTER_API_KEY"] == "env-o1,env-o2,env-o3"
+    assert "GEMINI_API_KEY" not in old and "GEMINI_API_KEY" not in listed
+    assert _key_slots(old) == {"OPENROUTER_API_KEY": "env-o1"}
+    assert _key_slots(listed) == {
+        "OPENROUTER_API_KEY": "env-o1",
+        "OPENROUTER_API_KEY_2": "env-o2",
+        "OPENROUTER_API_KEY_3": "env-o3",
+    }
 
 
 def test_child_env_never_logs_key_values(lyria_keys, tmp_path, monkeypatch, caplog):
-    monkeypatch.setenv("GEMINI_API_KEY", "secret-gemini-value")
+    monkeypatch.setenv("GEMINI_API_KEY", "secret-gemini-value,secret-gemini-two")
     monkeypatch.setenv("OPENROUTER_API_KEY", "secret-openrouter-value")
     with caplog.at_level("DEBUG"):
-        sidecar._child_env(_cfg(tmp_path))
+        sidecar._child_env(_cfg(_list_checkout(tmp_path / "pinned")))
     assert "secret-gemini-value" not in caplog.text
+    assert "secret-gemini-two" not in caplog.text
     assert "secret-openrouter-value" not in caplog.text
 
 
@@ -1414,10 +1589,96 @@ def test_migration_backs_the_legacy_file_up_before_rewriting_it(lyria_keys):
     assert written["providers"]["gemini"] == ["legacy-g1", "added-g2"]
     assert written["providers"]["openrouter"] == []
     assert written["version"] == sidecar._KEY_FILE_VERSION
+    assert written["share_pool"] is False
     # The user's original file is not simply gone.
     assert json.loads(lyria_keys.backup.read_text(encoding="utf-8")) == {
         "key": "legacy-g1"
     }
+
+
+def _main_build_gemini_key(path) -> str:
+    """What an older theDAW build reads from the key file -- the expression in
+    upstream/main:backend/modules/lyria/sidecar.py gemini_key():
+    ``json.loads(_GEMINI_KEY_FILE.read_text(encoding="utf-8")).get("key")``."""
+    return (json.loads(path.read_text(encoding="utf-8")).get("key") or "").strip()
+
+
+def _main_build_set_key(path, key: str) -> None:
+    """upstream/main's set_gemini_key: it replaces the whole file."""
+    path.write_text(json.dumps({"key": key.strip()}), encoding="utf-8")
+
+
+def test_an_older_build_still_finds_the_gemini_key_after_this_build_writes(
+    lyria_keys,
+):
+    """main saved a Gemini key; this build adds an OpenRouter key (rewriting
+    the file in the per-provider shape); the user opens an older build again.
+    That build must still find the Gemini key it saved. Then the older build
+    saves a new key over the file, and this build reads it back."""
+    _main_build_set_key(lyria_keys.path, "main-g1")
+
+    sidecar.add_key("openrouter", "this-o1")
+    assert _main_build_gemini_key(lyria_keys.path) == "main-g1"
+
+    sidecar.remove_key("gemini", 0)
+    assert "key" not in json.loads(lyria_keys.path.read_text(encoding="utf-8"))
+    sidecar.add_key("gemini", "this-g2")
+    assert _main_build_gemini_key(lyria_keys.path) == "this-g2"
+
+    _main_build_set_key(lyria_keys.path, "main-g3")
+    assert sidecar.stored_keys("gemini") == ["main-g3"]
+    assert sidecar.gemini_key() == ("main-g3", "file")
+
+
+class _TornWriter:
+    """A file whose write() lands half its data and then fails, the way a
+    crash or a full disk leaves a file mid-write."""
+
+    def __init__(self, real) -> None:
+        self._real = real
+
+    def write(self, data):
+        self._real.write(data[: len(data) // 2])
+        self._real.flush()
+        raise OSError(28, "No space left on device")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._real.close()
+
+    def __getattr__(self, name: str):
+        return getattr(self._real, name)
+
+
+def test_a_crash_mid_write_keeps_every_saved_key(lyria_keys, monkeypatch):
+    """Two keys are saved; the third save dies halfway through writing the
+    file. The file must still hold the first two -- a torn file reads as
+    "nothing stored", and the next save would write that over every key."""
+
+    sidecar.add_key("gemini", "saved-g1")
+    sidecar.add_key("openrouter", "saved-o1")
+    before = lyria_keys.path.read_bytes()
+
+    real_open = io.open
+
+    def _torn_open(file, mode="r", *args, **kwargs):
+        handle = real_open(file, mode, *args, **kwargs)
+        return _TornWriter(handle) if "w" in mode else handle
+
+    monkeypatch.setattr(io, "open", _torn_open)
+    with pytest.raises(OSError):
+        sidecar.add_key("gemini", "lost-g2")
+    monkeypatch.setattr(io, "open", real_open)
+
+    assert lyria_keys.path.read_bytes() == before
+    assert sidecar.stored_keys("gemini") == ["saved-g1"]
+    assert sidecar.stored_keys("openrouter") == ["saved-o1"]
+    # No temp file is left beside it.
+    assert [
+        p.name for p in lyria_keys.path.parent.iterdir() if p.name.endswith(".tmp")
+    ] == []
 
 
 def test_add_remove_and_preference_round_trip(lyria_keys):
@@ -1492,7 +1753,7 @@ def test_child_env_ai_provider_decision_table(
     if stored_pref:
         sidecar.set_provider_preference(stored_pref)
 
-    env = sidecar._child_env(_cfg(tmp_path))
+    env = sidecar._child_env(_cfg(_old_checkout(tmp_path / "old")))
 
     assert env.get("AI_PROVIDER") == expected
 
@@ -1509,6 +1770,8 @@ def test_probe_key_issue_only_fires_when_both_providers_are_empty(
     out = sidecar.probe()
     assert "key" in out["missing"]
     assert any("Gemini or OpenRouter key" in issue for issue in out["issues"])
+    assert out["reads_key_lists"] is False
+    assert out["pinned_commit"] == sidecar.LYRIA_PINNED_COMMIT
 
     # An OpenRouter key alone is enough to generate -- no key issue.
     monkeypatch.setenv("OPENROUTER_API_KEY", "o1")
@@ -1522,7 +1785,8 @@ def test_probe_key_issue_only_fires_when_both_providers_are_empty(
     assert out["provider_preference"] is None
 
 
-def test_key_summary_reports_counts_and_sources_only(lyria_keys, monkeypatch):
+def test_key_summary_reports_counts_and_sources_only(lyria_keys, monkeypatch, tmp_path):
+    monkeypatch.setenv("theDAW_LYRIA_PROJECT", str(_old_checkout(tmp_path / "old")))
     monkeypatch.setenv("GEMINI_API_KEY", "env-g1,env-g2")
     sidecar.add_key("gemini", "file-g1")
     sidecar.add_key("openrouter", "file-o1")
@@ -1533,16 +1797,34 @@ def test_key_summary_reports_counts_and_sources_only(lyria_keys, monkeypatch):
 
     assert summary["providers"]["gemini"] == {
         "count": 3,
+        # An old checkout reads one key per provider.
+        "handed": 1,
         "source": "env",
         "configured": True,
         "env": 2,
         "stored": 1,
         "pool": 0,
+        "pool_available": 0,
     }
-    assert summary["providers"]["openrouter"]["count"] == 2
+    # The pooled OpenRouter key is not the child's until the pool is shared.
+    assert summary["providers"]["openrouter"]["count"] == 1
+    assert summary["providers"]["openrouter"]["pool"] == 0
+    assert summary["providers"]["openrouter"]["pool_available"] == 1
     assert summary["providers"]["openrouter"]["source"] == "file"
     assert summary["provider_preference"] == "openrouter"
+    assert summary["share_pool"] is False
+    assert summary["reads_key_lists"] is False
+    assert summary["key_limit"] == 1
     assert "env-g1" not in json.dumps(summary)
+
+    monkeypatch.setenv("theDAW_LYRIA_PROJECT", str(_list_checkout(tmp_path / "pinned")))
+    sidecar.set_pool_shared(True)
+    shared = sidecar.key_summary()
+    assert shared["providers"]["gemini"]["handed"] == 3
+    assert shared["providers"]["openrouter"]["count"] == 2
+    assert shared["providers"]["openrouter"]["pool"] == 1
+    assert shared["reads_key_lists"] is True
+    assert shared["key_limit"] == sidecar.CHILD_KEY_LIMIT
 
 
 # ---------------------------------------------------------------------------
@@ -1561,7 +1843,9 @@ def _recording_to_thread_factory(calls: list[object]):
 @pytest.fixture
 def keys_router(lyria_keys, monkeypatch):
     """The Lyria router with its blocking calls recorded and sidecar.stop()
-    faked, so no real process teardown is attempted."""
+    faked, so no real process teardown is attempted. adopted_running() is
+    faked too: the real one would probe port 5188, where the user's own Lyria
+    may be running."""
     from backend.modules.lyria import router as lyria_router
 
     calls: list[object] = []
@@ -1569,6 +1853,7 @@ def keys_router(lyria_keys, monkeypatch):
         lyria_router.asyncio, "to_thread", _recording_to_thread_factory(calls)
     )
     monkeypatch.setattr(sidecar, "stop", lambda: True)
+    monkeypatch.setattr(sidecar, "adopted_running", lambda: False)
     return SimpleNamespace(module=lyria_router, calls=calls, keys=lyria_keys)
 
 
@@ -1595,15 +1880,27 @@ def test_keys_post_route_appends_stops_the_sidecar_and_hides_the_value(keys_rout
     assert sidecar.stop in keys_router.calls
     assert result["ok"] is True
     assert result["restarted"] is True
-    assert result["providers"]["openrouter"] == {
-        "count": 1,
-        "source": "file",
-        "configured": True,
-        "env": 0,
-        "stored": 1,
-        "pool": 0,
-    }
+    assert result["external_running"] is False
+    assert result["providers"]["openrouter"]["count"] == 1
+    assert result["providers"]["openrouter"]["source"] == "file"
+    assert result["providers"]["openrouter"]["stored"] == 1
     assert "secret" not in json.dumps(result)
+
+
+def test_key_change_reports_an_adopted_lyria_that_keeps_its_old_keys(
+    keys_router, monkeypatch
+):
+    """stop() cannot end a Lyria this process did not spawn, so a key change
+    must say that one is still running with the old keys."""
+    monkeypatch.setattr(sidecar, "stop", lambda: False)
+    monkeypatch.setattr(sidecar, "adopted_running", lambda: True)
+
+    result = asyncio.run(
+        keys_router.module.add_provider_key(provider="gemini", key="gemini-new-key")
+    )
+
+    assert result["restarted"] is False
+    assert result["external_running"] is True
 
 
 def test_keys_post_route_rejects_a_bad_provider_and_a_short_key(keys_router):
@@ -1660,6 +1957,19 @@ def test_keys_provider_route_sets_and_clears_the_preference(keys_router):
     assert bad.value.status_code == 400
 
 
+def test_keys_pool_route_turns_sharing_on_and_off(keys_router):
+    keys_router.keys.pools["openrouter"] = ["pool-o1"]
+
+    on = asyncio.run(keys_router.module.set_key_pool(share=True))
+    assert on["share_pool"] is True
+    assert on["providers"]["openrouter"]["pool"] == 1
+    assert sidecar.stop in keys_router.calls
+
+    off = asyncio.run(keys_router.module.set_key_pool(share=False))
+    assert off["share_pool"] is False
+    assert off["providers"]["openrouter"]["pool"] == 0
+
+
 def test_legacy_key_routes_still_work_and_append(keys_router):
     """GET/POST/DELETE /key keep their shape; POST now appends so an older
     client adding a second key gains a fallback instead of losing the first."""
@@ -1682,4 +1992,588 @@ def test_legacy_key_routes_still_work_and_append(keys_router):
     cleared = asyncio.run(keys_router.module.clear_key())
     assert cleared["removed"] is True
     assert cleared["configured"] is False
+    # Forgetting a key stops the sidecar like every other key change.
+    assert cleared["restarted"] is True
+    assert sidecar.stop in keys_router.calls
     assert sidecar.stored_keys("gemini") == []
+
+
+# ---------------------------------------------------------------------------
+# The gate: every route that changes something refuses a foreign page and a
+# LAN caller without the launch or pairing token
+# ---------------------------------------------------------------------------
+
+
+_LAN = ("192.168.1.50", 50000)
+_LOOPBACK = ("127.0.0.1", 50000)
+_PAIRING_TOKEN = "test-pairing-token"
+
+# (method, path, json body) for every route that changes state.
+_CHANGING_ROUTES = [
+    ("POST", "/api/lyria/keys", {"provider": "gemini", "key": "lan-attacker-key"}),
+    ("DELETE", "/api/lyria/keys", {"provider": "gemini", "index": 0}),
+    ("POST", "/api/lyria/keys/provider", {"provider": "openrouter"}),
+    ("POST", "/api/lyria/keys/pool", {"share": True}),
+    ("POST", "/api/lyria/key", {"key": "lan-attacker-key"}),
+    ("DELETE", "/api/lyria/key", None),
+    ("POST", "/api/lyria/import-new", {"include_mock": True}),
+    ("POST", "/api/lyria/install", None),
+    ("POST", "/api/lyria/start", None),
+    ("POST", "/api/lyria/stop", None),
+    ("POST", "/api/lyria/restart", None),
+]
+
+
+@pytest.fixture
+def gated_app(lyria_keys, monkeypatch):
+    """The real router mounted the way backend/modules/loader.py mounts it,
+    with every sidecar action that would touch a process faked and recorded."""
+    from fastapi import FastAPI
+
+    from backend.lib import pairing
+    from backend.modules.lyria import importer
+    from backend.modules.lyria import router as lyria_router
+
+    actions: list[str] = []
+    sync_calls: list[bool] = []
+
+    async def _fake_sync(include_mock: bool = False) -> dict:
+        sync_calls.append(include_mock)
+        return {"imported": [], "skipped": 0}
+
+    def _record(name: str, value: object):
+        def _action(*args: object, **kwargs: object):
+            actions.append(name)
+            return value
+
+        return _action
+
+    monkeypatch.setattr(importer, "sync_generations", _fake_sync)
+    monkeypatch.setattr(sidecar, "stop", _record("stop", False))
+    monkeypatch.setattr(sidecar, "adopted_running", lambda: False)
+    monkeypatch.setattr(
+        sidecar, "start_install", _record("install", {"status": "done"})
+    )
+    monkeypatch.setattr(
+        sidecar, "ensure_running", _record("start", "http://127.0.0.1:5188")
+    )
+    monkeypatch.setattr(sidecar, "restart", _record("restart", "http://127.0.0.1:5188"))
+    monkeypatch.setattr(sidecar, "owns_process", lambda: True)
+    monkeypatch.setattr(pairing, "get_token", lambda: _PAIRING_TOKEN)
+    monkeypatch.delenv("THEDAW_LAUNCH_TOKEN", raising=False)
+
+    app = FastAPI()
+    app.include_router(lyria_router.router, prefix="/api/lyria")
+    return SimpleNamespace(
+        app=app, actions=actions, sync_calls=sync_calls, keys=lyria_keys
+    )
+
+
+def _client(app, peer):
+    from fastapi.testclient import TestClient
+
+    return TestClient(app, client=peer)
+
+
+def test_a_lan_device_cannot_change_keys_or_drive_the_sidecar(gated_app):
+    """The user saved keys on this machine; a device on the LAN then sends
+    every changing request with no token. Each one is refused, the saved keys
+    and settings are untouched, and nothing was started, stopped or imported."""
+    sidecar.add_key("gemini", "users-own-gemini")
+    sidecar.add_key("openrouter", "users-own-openrouter")
+    before = gated_app.keys.path.read_bytes()
+
+    lan = _client(gated_app.app, _LAN)
+    for method, path, body in _CHANGING_ROUTES:
+        resp = lan.request(method, path, json=body)
+        assert resp.status_code == 403, (method, path, resp.status_code, resp.text)
+
+    assert gated_app.keys.path.read_bytes() == before
+    assert gated_app.actions == []
+    assert gated_app.sync_calls == []
+
+
+def test_a_foreign_page_on_this_machine_is_refused(gated_app):
+    """A page the user's own browser visits is a loopback caller too: the
+    cross-site check is what stops it."""
+    sidecar.add_key("gemini", "users-own-gemini")
+    local = _client(gated_app.app, _LOOPBACK)
+
+    resp = local.request(
+        "DELETE",
+        "/api/lyria/keys",
+        json={"provider": "gemini", "index": 0},
+        headers={"Origin": "https://evil.example", "Sec-Fetch-Site": "cross-site"},
+    )
+
+    assert resp.status_code == 403
+    assert sidecar.stored_keys("gemini") == ["users-own-gemini"]
+
+
+def test_this_machine_and_a_paired_phone_still_get_through(gated_app):
+    local = _client(gated_app.app, _LOOPBACK)
+    resp = local.post(
+        "/api/lyria/keys", json={"provider": "gemini", "key": "local-gemini-key"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert sidecar.stored_keys("gemini") == ["local-gemini-key"]
+
+    phone = _client(gated_app.app, _LAN)
+    resp = phone.post(
+        "/api/lyria/keys",
+        json={"provider": "openrouter", "key": "phone-openrouter-key"},
+        headers={"X-TheDAW-Pair": _PAIRING_TOKEN},
+    )
+    assert resp.status_code == 200, resp.text
+    assert sidecar.stored_keys("openrouter") == ["phone-openrouter-key"]
+
+    resp = phone.post(
+        "/api/lyria/keys/pool",
+        json={"share": True},
+        headers={"X-TheDAW-Pair": "wrong-token"},
+    )
+    assert resp.status_code == 403
+    assert sidecar.pool_shared() is False
+
+
+def test_include_mock_is_honoured_only_for_this_machine(gated_app):
+    """A paired phone asking for mock imports gets a normal import: only a
+    caller on this machine can put the sidecar's sine waves in the library."""
+    phone = _client(gated_app.app, _LAN)
+    resp = phone.post(
+        "/api/lyria/import-new",
+        json={"include_mock": True},
+        headers={"X-TheDAW-Pair": _PAIRING_TOKEN},
+    )
+    assert resp.status_code == 200, resp.text
+
+    local = _client(gated_app.app, _LOOPBACK)
+    assert (
+        local.post("/api/lyria/import-new", json={"include_mock": True}).status_code
+        == 200
+    )
+    assert local.post("/api/lyria/import-new", json={}).status_code == 200
+
+    assert gated_app.sync_calls == [False, True, False]
+
+
+def test_restart_route_maps_a_refusal_to_409_and_a_failed_start_to_503(
+    gated_app, monkeypatch
+):
+    local = _client(gated_app.app, _LOOPBACK)
+
+    def _refuse():
+        raise sidecar.RestartRefused("The Lyria on port 5188 runs from elsewhere.")
+
+    monkeypatch.setattr(sidecar, "restart", _refuse)
+    resp = local.post("/api/lyria/restart")
+    assert resp.status_code == 409
+    assert "runs from elsewhere" in resp.json()["detail"]
+
+    def _fail():
+        raise RuntimeError("Lyria sidecar exited before becoming ready (rc=1).")
+
+    monkeypatch.setattr(sidecar, "restart", _fail)
+    resp = local.post("/api/lyria/restart")
+    assert resp.status_code == 503
+
+
+# ---------------------------------------------------------------------------
+# An adopted Lyria -- one an earlier session left on the port -- is replaced
+# with a child that has the current keys
+# ---------------------------------------------------------------------------
+
+
+_FAKE_LYRIA = r"""
+import http.server, json, os, sys
+
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        if self.path != "/api/settings/status":
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = json.dumps({
+            "geminiServerKey": bool(os.environ.get("GEMINI_API_KEY")),
+            "openRouterServerKey": bool(os.environ.get("OPENROUTER_API_KEY")),
+            "defaultProvider": "gemini",
+            "testGeminiKey": os.environ.get("GEMINI_API_KEY", ""),
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+http.server.HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+"""
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _status(port: int) -> dict:
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(f"http://127.0.0.1:{port}/api/settings/status", timeout=2) as r:
+        return json.loads(r.read())
+
+
+def _start_fake_lyria(script, port: int, cwd, env: dict[str, str]):
+
+    proc = subprocess.Popen(
+        [sys.executable, str(script), str(port)],
+        cwd=str(cwd),
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if sidecar._port_is_listening(port) and sidecar._is_lyria_server(port):
+            return proc
+        time.sleep(0.1)
+    proc.kill()
+    raise AssertionError("the fake Lyria never came up")
+
+
+@pytest.fixture
+def stale_lyria(lyria_keys, tmp_path, monkeypatch):
+    """A fake Lyria started the way an earlier backend session would have:
+    from the checkout, with that session's key in its environment. This
+    process holds no handle to it."""
+
+    project = _old_checkout(tmp_path / "lyria")
+    script = tmp_path / "fake_lyria.py"
+    script.write_text(_FAKE_LYRIA, encoding="utf-8")
+    port = _free_port()
+    monkeypatch.setenv("theDAW_LYRIA_PORT", str(port))
+    monkeypatch.setenv("theDAW_LYRIA_PROJECT", str(project))
+    monkeypatch.setattr(sidecar, "_ensure_deps", lambda cfg: None)
+    started: list[subprocess.Popen] = []
+
+    def _launch(cwd, env_overrides: dict[str, str]):
+        env = {**os.environ, **env_overrides}
+        proc = _start_fake_lyria(script, port, cwd, env)
+        started.append(proc)
+        return proc
+
+    real_popen = subprocess.Popen
+
+    def _popen(cmd, *args, **kwargs):
+        # ensure_running's `npm run dev` becomes the fake server, started
+        # from the checkout with the environment theDAW built for it. Every
+        # other command (taskkill, git) runs for real.
+        if list(cmd)[-2:] == ["run", "dev"]:
+            proc = real_popen(
+                [sys.executable, str(script), str(port)],
+                cwd=kwargs.get("cwd"),
+                env=kwargs.get("env"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            started.append(proc)
+            return proc
+        return real_popen(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(sidecar.subprocess, "Popen", _popen)
+    ns = SimpleNamespace(project=project, port=port, launch=_launch, started=started)
+    yield ns
+    sidecar.stop()
+    for proc in started:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def test_restart_replaces_an_adopted_lyria_with_the_current_keys(stale_lyria):
+    """An earlier session's Lyria is still on the port with its key. The user
+    saves a new key: the key change cannot stop what this process did not
+    spawn. Restart ends the adopted process and starts a child that reads
+    the new key."""
+    stale = stale_lyria.launch(
+        stale_lyria.project, {"GEMINI_API_KEY": "earlier-session-key"}
+    )
+    assert _status(stale_lyria.port)["testGeminiKey"] == "earlier-session-key"
+
+    sidecar.add_key("gemini", "current-gemini-key")
+    assert sidecar.stop() is False
+    assert sidecar.adopted_running() is True
+    assert sidecar.ensure_running() == f"http://127.0.0.1:{stale_lyria.port}"
+    assert sidecar.owns_process() is False
+
+    assert sidecar.restart() == f"http://127.0.0.1:{stale_lyria.port}"
+
+    stale.wait(timeout=10)
+    assert stale.poll() is not None
+    assert sidecar.owns_process() is True
+    assert sidecar.adopted_running() is False
+    assert _status(stale_lyria.port)["testGeminiKey"] == "current-gemini-key"
+
+
+def test_restart_refuses_a_lyria_that_runs_from_another_folder(stale_lyria, tmp_path):
+    elsewhere = tmp_path / "someone-elses-lyria"
+    elsewhere.mkdir()
+    other = stale_lyria.launch(elsewhere, {"GEMINI_API_KEY": "not-ours"})
+
+    with pytest.raises(sidecar.RestartRefused) as refused:
+        sidecar.restart()
+
+    assert "someone-elses-lyria" in str(refused.value)
+    assert other.poll() is None
+    assert _status(stale_lyria.port)["testGeminiKey"] == "not-ours"
+
+
+def test_restart_refuses_a_port_held_by_something_that_is_not_lyria(
+    lyria_keys, monkeypatch
+):
+    with _run_server(_UnrelatedHandler) as port:
+        monkeypatch.setenv("theDAW_LYRIA_PORT", str(port))
+        with pytest.raises(sidecar.RestartRefused):
+            sidecar.stop_adopted()
+        assert sidecar._port_is_listening(port)
+
+
+# ---------------------------------------------------------------------------
+# The pinned commit: Install clones exactly it, and an existing clean
+# checkout is moved to it before a spawn. Local repos stand in for GitHub.
+# ---------------------------------------------------------------------------
+
+
+def _git(*args: str, cwd=None) -> str:
+
+    out = subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "user.name=test",
+            "-c",
+            "core.autocrlf=false",
+            *args,
+        ],
+        cwd=None if cwd is None else str(cwd),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return out.stdout.strip()
+
+
+@pytest.fixture
+def upstream(tmp_path):
+    """An upstream Lyria repo: A is the old shape (no server/keys.ts), B the
+    pinned shape, C a later commit on top of B."""
+    repo = tmp_path / "upstream"
+    repo.mkdir()
+    _git("init", "-q", str(repo))
+    (repo / "package.json").write_text('{"name": "lyria-3-pro"}\n', encoding="utf-8")
+    (repo / "server.ts").write_text(
+        "const key = clientKey || process.env.GEMINI_API_KEY;\n", encoding="utf-8"
+    )
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "A: one key per provider", cwd=repo)
+    a = _git("rev-parse", "HEAD", cwd=repo)
+    _list_checkout(repo)
+    (repo / "package.json").write_text('{"name": "lyria-3-pro"}\n', encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "B: ordered key lists", cwd=repo)
+    b = _git("rev-parse", "HEAD", cwd=repo)
+    (repo / "README.md").write_text("later\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-q", "-m", "C: later", cwd=repo)
+    c = _git("rev-parse", "HEAD", cwd=repo)
+    return SimpleNamespace(path=repo, uri=repo.as_uri(), a=a, b=b, c=c)
+
+
+@pytest.fixture
+def pinned(upstream, lyria_keys, tmp_path, monkeypatch):
+    """The sidecar pointed at the local upstream, pinned to B, with the
+    project found by the default search (no theDAW_LYRIA_PROJECT), npm
+    install recorded instead of run, and a fresh checkout-state."""
+    npm_runs: list[object] = []
+    monkeypatch.setattr(sidecar, "LYRIA_REPO_URL", upstream.uri)
+    monkeypatch.setattr(sidecar, "LYRIA_PINNED_COMMIT", upstream.b)
+    monkeypatch.setattr(sidecar, "_run_npm_install", lambda cfg: npm_runs.append(cfg))
+    monkeypatch.setattr(sidecar, "_checkout_state", dict(sidecar._checkout_state))
+    monkeypatch.setenv("theDAW_LYRIA_PORT", str(_free_port()))
+    return SimpleNamespace(upstream=upstream, npm_runs=npm_runs, root=tmp_path)
+
+
+def _existing_install(pinned_ns, commit: str, name: str = "lyria"):
+    """A checkout the way theDAW's old Install left it: a depth-1 fetch of
+    one commit, detached, with node_modules installed."""
+    checkout = pinned_ns.root / name
+    _git("init", "-q", str(checkout))
+    _git("config", "core.autocrlf", "false", cwd=checkout)
+    _git("fetch", "-q", "--depth", "1", pinned_ns.upstream.uri, commit, cwd=checkout)
+    _git("checkout", "-q", "--detach", commit, cwd=checkout)
+    (checkout / "node_modules").mkdir()
+    return checkout
+
+
+def _spawn_capturing_env(monkeypatch, checkout) -> dict[str, str]:
+    """ensure_running(wait_for_ready=False) from ``checkout`` as the default
+    project, with `npm run dev` replaced by a stand-in that records the env."""
+    captured: dict[str, str] = {}
+    real_popen = subprocess.Popen
+
+    def _popen(cmd, *args, **kwargs):
+        if list(cmd)[-2:] != ["run", "dev"]:
+            return real_popen(cmd, *args, **kwargs)  # git, for real
+        captured.update(kwargs.get("env") or {})
+        return SimpleNamespace(poll=lambda: None, pid=0, returncode=None)
+
+    monkeypatch.setattr(sidecar, "DEFAULT_PROJECT_PATH", checkout)
+    monkeypatch.setattr(sidecar.subprocess, "Popen", _popen)
+    sidecar.ensure_running(wait_for_ready=False)
+    return captured
+
+
+def test_an_install_from_before_the_pin_is_moved_to_it_on_the_next_start(
+    pinned, monkeypatch
+):
+    """The user's Lyria was installed at an older commit (one key per
+    provider). They save two Gemini keys and open the Lyria tab. The checkout
+    moves to the pinned commit before the spawn, its generations survive, and
+    the child gets the keys in the slots that commit reads."""
+    checkout = _existing_install(pinned, pinned.upstream.a)
+    (checkout / "generations").mkdir()
+    (checkout / "generations" / "song.wav").write_bytes(b"RIFF user audio")
+    sidecar.add_key("gemini", "gemini-one")
+    sidecar.add_key("gemini", "gemini-two")
+
+    env = _spawn_capturing_env(monkeypatch, checkout)
+
+    assert _git("rev-parse", "HEAD", cwd=checkout) == pinned.upstream.b
+    state = sidecar.checkout_state()
+    assert state["state"] == "updated"
+    assert state["commit"] == pinned.upstream.b
+    assert (checkout / "generations" / "song.wav").read_bytes() == b"RIFF user audio"
+    assert env["GEMINI_API_KEY"] == "gemini-one"
+    assert env["GEMINI_API_KEY_2"] == "gemini-two"
+    # package.json did not change between the two commits.
+    assert pinned.npm_runs == []
+
+
+def test_a_checkout_with_local_changes_is_left_alone_and_says_why(pinned, monkeypatch):
+    checkout = _existing_install(pinned, pinned.upstream.a)
+    (checkout / "server.ts").write_text("// my own edit\n", encoding="utf-8")
+    sidecar.add_key("gemini", "gemini-one")
+    sidecar.add_key("gemini", "gemini-two")
+
+    env = _spawn_capturing_env(monkeypatch, checkout)
+
+    assert _git("rev-parse", "HEAD", cwd=checkout) == pinned.upstream.a
+    assert (checkout / "server.ts").read_text(encoding="utf-8") == "// my own edit\n"
+    state = sidecar.checkout_state()
+    assert state["state"] == "dirty"
+    assert "local changes" in state["reason"]
+    # It still starts, and still gets one key per variable it can read.
+    assert env["GEMINI_API_KEY"] == "gemini-one"
+    assert "GEMINI_API_KEY_2" not in env
+
+
+def test_a_failed_fetch_leaves_the_checkout_and_is_not_retried_at_once(
+    pinned, monkeypatch
+):
+    checkout = _existing_install(pinned, pinned.upstream.a)
+    monkeypatch.setattr(
+        sidecar, "LYRIA_REPO_URL", (pinned.root / "no-such-repo").as_uri()
+    )
+    cfg = _cfg(checkout)
+    monkeypatch.setattr(sidecar, "DEFAULT_PROJECT_PATH", checkout)
+
+    first = sidecar._update_checkout(cfg)
+    assert first["state"] == "failed"
+    assert first["commit"] == pinned.upstream.a
+    assert _git("rev-parse", "HEAD", cwd=checkout) == pinned.upstream.a
+
+    fetches: list[list[str]] = []
+    real_git_run = sidecar._git_run
+
+    def _counting(git, args, cwd, timeout=60.0):
+        if "fetch" in args:
+            fetches.append(args)
+        return real_git_run(git, args, cwd, timeout)
+
+    monkeypatch.setattr(sidecar, "_git_run", _counting)
+    second = sidecar._update_checkout(cfg)
+    assert second["state"] == "failed"
+    assert fetches == []
+
+
+def test_a_checkout_newer_than_the_pin_is_left_alone(pinned, monkeypatch):
+    checkout = pinned.root / "dev-lyria"
+    _git("clone", "-q", pinned.upstream.uri, str(checkout))
+    assert _git("rev-parse", "HEAD", cwd=checkout) == pinned.upstream.c
+
+    state = sidecar._update_checkout(_cfg(checkout))
+
+    assert state["state"] == "newer"
+    assert _git("rev-parse", "HEAD", cwd=checkout) == pinned.upstream.c
+
+
+def test_a_checkout_named_by_theDAW_LYRIA_PROJECT_is_not_moved(pinned, monkeypatch):
+    checkout = _existing_install(pinned, pinned.upstream.a)
+    monkeypatch.setenv("theDAW_LYRIA_PROJECT", str(checkout))
+
+    state = sidecar._update_checkout(sidecar.resolve_config())
+
+    assert state["state"] == "managed"
+    assert "theDAW_LYRIA_PROJECT" in state["reason"]
+    assert _git("rev-parse", "HEAD", cwd=checkout) == pinned.upstream.a
+
+
+def test_changed_dependencies_run_npm_install_after_the_move(pinned, monkeypatch):
+    upstream = pinned.upstream
+    (upstream.path / "package.json").write_text(
+        '{"name": "lyria-3-pro", "dependencies": {"new-dep": "1.0.0"}}\n',
+        encoding="utf-8",
+    )
+    _git("commit", "-q", "-am", "D: new dependency", cwd=upstream.path)
+    pin = _git("rev-parse", "HEAD", cwd=upstream.path)
+    monkeypatch.setattr(sidecar, "LYRIA_PINNED_COMMIT", pin)
+    checkout = _existing_install(pinned, upstream.a)
+
+    state = sidecar._update_checkout(_cfg(checkout))
+
+    assert state["state"] == "updated"
+    assert len(pinned.npm_runs) == 1
+
+
+def test_install_clones_exactly_the_pinned_commit(pinned):
+
+    assert re.fullmatch(r"[0-9a-f]{40}", sidecar.LYRIA_PINNED_COMMIT)
+    target = pinned.root / "fresh" / "lyria"
+    target.parent.mkdir()
+
+    sidecar._clone_pinned("git", target, subprocess.DEVNULL)
+
+    # Pinned, not the repo's HEAD (C).
+    assert _git("rev-parse", "HEAD", cwd=target) == pinned.upstream.b
+    assert (target / "server" / "keys.ts").is_file()
+    assert sidecar.checkout_reads_key_lists(target) is True
+    assert not (target.parent / ".lyria.install-staging").exists()
+
+
+def test_a_failed_clone_leaves_nothing_behind(pinned, monkeypatch):
+
+    monkeypatch.setattr(
+        sidecar, "LYRIA_REPO_URL", (pinned.root / "no-such-repo").as_uri()
+    )
+    target = pinned.root / "fresh" / "lyria"
+    target.parent.mkdir()
+
+    with pytest.raises(RuntimeError, match="git fetch failed"):
+        sidecar._clone_pinned("git", target, subprocess.DEVNULL)
+
+    assert not target.exists()
+    assert not (target.parent / ".lyria.install-staging").exists()
