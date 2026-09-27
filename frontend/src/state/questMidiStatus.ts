@@ -8,10 +8,11 @@
  * `headset_holder`. Only the user's Take over (`POST /api/questmidi/takeover`)
  * moves the headset to theDAW.
  *
- * The status arrives two ways: the bridge WebSocket opens with one status
- * frame (questMidiClient.ts), and the Settings row fetches
- * `GET /api/questmidi/status` when it mounts or rescans. A holder that was not
- * there before posts one notice to the LOG and the orb bubble.
+ * The status arrives two ways: the bridge WebSocket opens with a status frame
+ * and sends another whenever the status changes (questMidiClient.ts), and the
+ * Settings row fetches `GET /api/questmidi/status` when it mounts or rescans,
+ * and every QUEST_MIDI_POLL_MS while it is open and the socket is not. A holder
+ * that was not there before posts one notice to the LOG and the orb bubble.
  */
 import { create } from 'zustand';
 import { pairingHeader } from '../lib/pairing';
@@ -141,13 +142,19 @@ const errText = async (res: Response): Promise<string> => {
 
 export type QuestMidiBusy = 'refresh' | 'takeover' | 'reattach' | null;
 
+/** How often the open Settings row re-reads the status while the bridge
+ *  WebSocket, which pushes changes, is closed (MIDI off, or reconnecting). */
+export const QUEST_MIDI_POLL_MS = 10_000;
+
 interface QuestMidiStatusStore {
   status: QuestMidiStatus | null;
   error: string | null;
   busy: QuestMidiBusy;
   /** Take a status dict from the backend. */
   apply: (raw: unknown) => void;
-  refresh: () => Promise<void>;
+  /** Fetch GET /status. `quiet` (the Settings row's timer) leaves `busy`
+   *  alone, so the buttons do not flicker on every poll. */
+  refresh: (opts?: { quiet?: boolean }) => Promise<void>;
   /** The user's Take over: move the headset to theDAW from its holder. */
   takeOver: () => Promise<void>;
   /** Run adb reverse again after plugging the headset in. */
@@ -188,8 +195,9 @@ export const useQuestMidiStatusStore = create<QuestMidiStatusStore>()((set, get)
       notifiedHolder = key;
       set({ status, error: null });
     },
-    refresh: async () => {
-      set({ busy: 'refresh' });
+    refresh: async (opts) => {
+      const quiet = opts?.quiet === true;
+      if (!quiet) set({ busy: 'refresh' });
       try {
         const res = await fetch('/api/questmidi/status', { cache: 'no-store', headers: pairingHeader() });
         if (!res.ok) throw new Error(await errText(res));
@@ -197,7 +205,7 @@ export const useQuestMidiStatusStore = create<QuestMidiStatusStore>()((set, get)
       } catch (e) {
         set({ status: null, error: e instanceof Error ? e.message : 'The Quest MIDI bridge did not answer.' });
       } finally {
-        set({ busy: null });
+        if (!quiet) set({ busy: null });
       }
     },
     takeOver: () => post('takeover'),

@@ -5,10 +5,16 @@
  * Take over while another program serves the headset's port, Re-attach
  * otherwise (after plugging the headset in or accepting USB debugging). Take
  * over is the only way theDAW takes the headset from another program.
+ *
+ * While the bridge WebSocket is open it pushes every status change; while it
+ * is closed the row re-reads the status every QUEST_MIDI_POLL_MS, so a program
+ * that takes the headset while Settings is open shows up either way.
  */
 import React, { useEffect } from 'react';
 import { Loader2 } from 'lucide-react';
+import { isQuestMidiConnected } from '../../../state/questMidiClient';
 import {
+  QUEST_MIDI_POLL_MS,
   QUEST_MIDI_STATE_WORD,
   questMidiHolderName,
   questMidiHolderSentence,
@@ -119,6 +125,10 @@ export const QuestMidiRow: React.FC = () => {
 
   useEffect(() => {
     void refresh();
+    const timer = window.setInterval(() => {
+      if (!isQuestMidiConnected()) void refresh({ quiet: true });
+    }, QUEST_MIDI_POLL_MS);
+    return () => window.clearInterval(timer);
   }, [refresh]);
 
   return (
