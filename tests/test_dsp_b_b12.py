@@ -413,7 +413,8 @@ def test_metadata_wav_tagging_keeps_valid_riff_container(tmp_path: Path, monkeyp
 #
 # /process returns exactly one file, so Batch Export renders only the
 # requested output_format (no per-call multi-format encode). Its Jobs knob
-# (parallelJobs, main's 1-8, default 4) caps how many Batch Export renders
+# (parallelJobs, main's 1-8, default half the machine's logical CPUs within
+# that range) caps how many Batch Export renders
 # run at once, server-wide, with one admission gate per event loop; every
 # running render's cap holds while it runs, and 8 is the ceiling no request
 # can raise.
@@ -498,16 +499,18 @@ def test_batch_export_concurrency_capped_across_separate_event_loops(
 
 def test_batch_export_toolspec_declares_jobs_and_is_honest():
     spec = next(t for t in delivery_router.TOOLS if t.id == "batch_export")
-    # main's Jobs knob, restored with main's range and default.
+    # main's Jobs knob, restored with main's range; its default is this
+    # machine's (default_batch_jobs, tested below).
     assert [p.name for p in spec.params] == ["parallelJobs"]
     jobs = spec.params[0]
     assert (jobs.type, jobs.lo, jobs.hi, jobs.default, jobs.label) == (
         "int",
         1,
         8,
-        4,
+        delivery_router.default_batch_jobs(delivery_router._usable_cpus()),
         "Jobs",
     )
+    assert jobs.default == delivery_router.BATCH_JOBS_DEFAULT
     # T13d audit item 2: the old name "Stems / Batch / Multiformat" claimed
     # both stem-splitting and multi-format output; neither exists.
     assert spec.name == "Batch Export (single format)"
@@ -519,6 +522,53 @@ def test_batch_export_toolspec_declares_jobs_and_is_honest():
     assert "stem" not in spec.description.lower()
     assert "multiple format" not in spec.description.lower()
     assert "jobs" in spec.description.lower()
+
+
+@pytest.mark.parametrize(
+    ("cpus", "jobs"),
+    [
+        (None, 1),
+        (0, 1),
+        (1, 1),
+        (2, 1),
+        (3, 1),
+        (4, 2),
+        (6, 3),
+        (8, 4),
+        (12, 6),
+        (16, 8),
+        (32, 8),
+        (128, 8),
+    ],
+)
+def test_batch_export_jobs_default_is_half_the_cpus_within_the_knob(cpus, jobs) -> None:
+    """One ffmpeg encode per render: half the logical CPUs (one per physical
+    core on a two-threads-per-core machine), never below 1, never past the
+    knob's ceiling of 8; an unknown count gets 1."""
+    assert delivery_router.default_batch_jobs(cpus) == jobs
+
+
+def test_batch_export_counts_the_cpus_this_process_may_use(monkeypatch) -> None:
+    """The affinity-aware count wins over the machine's total: a backend
+    pinned to 4 of 32 CPUs defaults to 2 Jobs, not 8."""
+    monkeypatch.setattr(
+        delivery_router.os, "process_cpu_count", lambda: 4, raising=False
+    )
+    monkeypatch.setattr(delivery_router.os, "cpu_count", lambda: 32)
+    assert delivery_router._usable_cpus() == 4
+    assert delivery_router.default_batch_jobs(delivery_router._usable_cpus()) == 2
+
+    monkeypatch.delattr(delivery_router.os, "process_cpu_count", raising=False)
+    monkeypatch.setattr(
+        delivery_router.os,
+        "sched_getaffinity",
+        lambda pid: {0, 1, 2, 3, 4, 5},
+        raising=False,
+    )
+    assert delivery_router._usable_cpus() == 6
+
+    monkeypatch.delattr(delivery_router.os, "sched_getaffinity", raising=False)
+    assert delivery_router._usable_cpus() == 32
 
 
 def test_batch_export_keeps_jobs_and_drops_the_retired_formats_key(

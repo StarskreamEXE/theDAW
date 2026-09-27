@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import weakref
 from collections import deque
 from pathlib import Path
@@ -484,7 +485,35 @@ async def _metadata(inp: Path, out: Path, params: dict) -> None:
 # more. The knob's own range (1-8) is the server-wide ceiling: no request can
 # raise concurrency past 8, whatever it sends.
 BATCH_JOBS_MAX = 8
-BATCH_JOBS_DEFAULT = 4
+
+
+def _usable_cpus() -> int | None:
+    """The logical CPUs this process may run on, or None when unknown.
+
+    ``os.process_cpu_count`` (Python 3.13+) honours the CPU affinity and
+    ``PYTHON_CPU_COUNT``; before it, the affinity mask where the platform has
+    one, else the machine's count."""
+    counter = getattr(os, "process_cpu_count", None)
+    if counter is not None:
+        return counter()
+    affinity = getattr(os, "sched_getaffinity", None)
+    if affinity is not None:
+        return len(affinity(0))
+    return os.cpu_count()
+
+
+def default_batch_jobs(cpus: int | None) -> int:
+    """The Jobs knob's default for a machine with ``cpus`` logical CPUs: half
+    of them, at least 1, at most the knob's ceiling. Each render is one ffmpeg
+    encode; half the logical CPUs is one per physical core on the usual
+    two-threads-per-core machine, and leaves the rest to playback and the UI.
+    An unknown count gets 1, the one value that is safe everywhere."""
+    if not cpus or cpus < 1:
+        return 1
+    return max(1, min(BATCH_JOBS_MAX, cpus // 2))
+
+
+BATCH_JOBS_DEFAULT = default_batch_jobs(_usable_cpus())
 
 
 class _ExportJobGate:
