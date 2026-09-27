@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertCircle, ExternalLink, Library, Loader2, RefreshCw } from 'lucide-react';
+import { AlertCircle, ExternalLink, Library, Loader2, RefreshCw, RotateCcw } from 'lucide-react';
+import { pairingHeaderFor } from '../lib/apiJson';
 import { backendHttpBase } from '../lib/backendBase';
 import { panelModelDefaults, panelModelOptions } from '../lib/cloudModels';
 import { useGenerateParamsStore } from '../state/generateParamsStore';
@@ -12,6 +13,32 @@ import { useLibraryStore } from '../state/libraryStore';
 const AUTO_SYNC_MS = 30000;
 // How long the inline "3 imported" / "Nothing new" result stays up.
 const SYNC_NOTE_MS = 4000;
+
+/** What the backend's pinned-commit check found (sidecar.checkout_state). */
+interface LyriaCheckout {
+  state: string;
+  commit?: string | null;
+  pinned_commit?: string;
+  reason?: string;
+}
+
+/** GET /api/lyria/url and POST /api/lyria/restart. */
+interface LyriaUrlReply {
+  url: string;
+  mock?: boolean | null;
+  /** True when this Lyria was not started by this backend session. */
+  external?: boolean;
+  checkout?: LyriaCheckout;
+}
+
+/** Checkout states the backend left alone, with a reason worth reading. */
+const CHECKOUT_LEFT_ALONE = new Set(['dirty', 'failed', 'not_git', 'managed']);
+
+/** The sentence to show under the header, or '' when there is nothing to say. */
+export function lyriaCheckoutNote(checkout: LyriaCheckout | undefined): string {
+  if (!checkout || !CHECKOUT_LEFT_ALONE.has(checkout.state)) return '';
+  return checkout.reason ?? '';
+}
 
 // The Lyria 3 Pro app (StarskreamEXE/lyria-3-pro) is embedded WHOLE and
 // unmodified: it ships its own Express server, its own SPA, its own settings
@@ -35,6 +62,15 @@ export const LyriaPanel: React.FC = () => {
   const [status, setStatus] = useState<'loading' | 'ready' | 'error'>('loading');
   const [url, setUrl] = useState<string | null>(null);
   const [mock, setMock] = useState<boolean | null>(null);
+  // A Lyria this backend session did not start (left over from an earlier
+  // run, or launched by hand): it keeps the keys and cost mode it started
+  // with until it is restarted from here.
+  const [external, setExternal] = useState(false);
+  const [checkoutNote, setCheckoutNote] = useState('');
+  const [restarting, setRestarting] = useState(false);
+  const [restartError, setRestartError] = useState('');
+  // Bumped after a restart so the iframe reloads against the fresh child.
+  const [frameKey, setFrameKey] = useState(0);
   const [detail, setDetail] = useState('');
   const [popped, setPopped] = useState(false);
   // INT-005: fails open (true) until the probe answers, same convention as
@@ -80,7 +116,7 @@ export const LyriaPanel: React.FC = () => {
       try {
         const r = await fetch('/api/lyria/import-new', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...pairingHeaderFor('/api/lyria/import-new') },
           body: JSON.stringify({ include_mock: false }),
         });
         if (!r.ok) throw new Error(`backend returned ${r.status}`);
@@ -132,6 +168,41 @@ export const LyriaPanel: React.FC = () => {
   const loadTimerRef = useRef<number | null>(null);
   const MAX_LOAD_RETRIES = 20; // ~40s of 2s retries
 
+  const applyReply = (j: LyriaUrlReply) => {
+    setUrl(j.url);
+    setMock(j.mock ?? null);
+    setExternal(Boolean(j.external));
+    setCheckoutNote(lyriaCheckoutNote(j.checkout));
+  };
+
+  /**
+   * End the Lyria on the port and start a fresh child with the current keys,
+   * provider and cost mode. The one way to replace a Lyria this backend did
+   * not start: a key change stops only a child it started itself. The
+   * backend refuses (and says why) when the port holds something it will not
+   * end, such as a Lyria running from another folder.
+   */
+  const restartLyria = async () => {
+    setRestarting(true);
+    setRestartError('');
+    try {
+      const r = await fetch('/api/lyria/restart', {
+        method: 'POST',
+        headers: pairingHeaderFor('/api/lyria/restart'),
+      });
+      if (!r.ok) {
+        const body = (await r.json().catch(() => null)) as { detail?: unknown } | null;
+        throw new Error(typeof body?.detail === 'string' ? body.detail : `backend returned ${r.status}`);
+      }
+      applyReply((await r.json()) as LyriaUrlReply);
+      setFrameKey((k) => k + 1);
+    } catch (e) {
+      setRestartError(e instanceof Error ? e.message : 'Restart failed.');
+    } finally {
+      setRestarting(false);
+    }
+  };
+
   // Same readiness contract as VJView: /api/lyria/url blocks server-side until
   // the child is listening, and we retry quietly while the backend is still
   // binding, so a cold start (npm install on a fresh checkout) renders
@@ -157,9 +228,7 @@ export const LyriaPanel: React.FC = () => {
         }
         throw new Error(msg);
       }
-      const j = (await r.json()) as { url: string; mock?: boolean };
-      setUrl(j.url);
-      setMock(j.mock ?? null);
+      applyReply((await r.json()) as LyriaUrlReply);
       loadRetriesRef.current = 0;
       setStatus('ready');
       setDetail('');
@@ -236,7 +305,7 @@ export const LyriaPanel: React.FC = () => {
             whether GENERATE costs $0.08 or synthesizes a local mock. */}
         {mock !== null && (
           <span
-            className={`text-[8px] font-mono uppercase tracking-widest px-1.5 py-0.5 rounded border shrink-0 ${
+            className={`text-xs font-bold uppercase tracking-wide px-1.5 py-0.5 rounded border shrink-0 ${
               mock
                 ? 'border-emerald-500/40 text-emerald-300 bg-emerald-500/10'
                 : 'border-amber-500/40 text-amber-300 bg-amber-500/10'
@@ -250,6 +319,22 @@ export const LyriaPanel: React.FC = () => {
             {mock ? 'Mock' : 'Live $0.08'}
           </span>
         )}
+        {/* An adopted Lyria (left over from an earlier session, or launched
+            by hand) has the keys and cost mode it started with. This is the
+            one control that hands it the current ones. */}
+        {status === 'ready' && external && (
+          <button
+            type="button"
+            onClick={() => void restartLyria()}
+            disabled={restarting}
+            aria-label="Restart Lyria with the current keys"
+            title="This Lyria was not started by this session of theDAW (a leftover from an earlier run, or one launched by hand), so it still has the keys and cost mode it started with. Restart it to hand it the current keys and cost mode."
+            className="px-2 py-0.5 rounded border border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/20 text-amber-200 text-xs font-bold uppercase tracking-wide flex items-center gap-1 shrink-0 disabled:opacity-40"
+          >
+            {restarting ? <Loader2 className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />} Restart with
+            current keys
+          </button>
+        )}
         <div className="flex-1" />
         {/* INT-002: Lyria's own library is inside the sidecar. This is the
             hand-off that makes a generation a theDAW entry — catalog, lineage,
@@ -260,7 +345,7 @@ export const LyriaPanel: React.FC = () => {
           disabled={syncing}
           aria-label="Sync Lyria generations to the theDAW library"
           title="Import every new Lyria generation into theDAW's library (catalog, lineage, EDIT, stems, export). Runs automatically every 30 seconds too. Mock generations are never imported."
-          className="px-2 py-0.5 rounded border border-zinc-700 hover:bg-white/5 text-zinc-300 text-[9px] font-mono uppercase tracking-widest flex items-center gap-1 shrink-0 disabled:opacity-40"
+          className="px-2 py-0.5 rounded border border-zinc-700 hover:bg-white/5 text-zinc-300 text-xs font-bold uppercase tracking-wide flex items-center gap-1 shrink-0 disabled:opacity-40"
         >
           {syncing ? (
             <Loader2 className="w-3 h-3 animate-spin" />
@@ -272,7 +357,7 @@ export const LyriaPanel: React.FC = () => {
         {syncNote && (
           <span
             aria-live="polite"
-            className="text-[9px] font-mono uppercase tracking-widest text-zinc-500 shrink-0 max-w-40 truncate"
+            className="text-xs font-bold text-zinc-400 shrink-0 max-w-48 truncate"
           >
             {syncNote}
           </span>
@@ -284,7 +369,7 @@ export const LyriaPanel: React.FC = () => {
           <select
             id="lyria-model"
             name="lyria-model"
-            className="appearance-none rounded-full border border-purple-400/30 bg-purple-500/10 hover:bg-purple-500/15 pl-3 pr-7 py-1 text-[10px] font-bold uppercase tracking-wider text-purple-100 outline-none transition-colors cursor-pointer"
+            className="appearance-none rounded-full border border-purple-400/30 bg-purple-500/10 hover:bg-purple-500/15 pl-3 pr-7 py-1 text-xs font-bold uppercase tracking-wider text-purple-100 outline-none transition-colors cursor-pointer"
             value={model}
             onChange={(e) => {
               const m = e.target.value;
@@ -306,7 +391,7 @@ export const LyriaPanel: React.FC = () => {
               </option>
             ))}
           </select>
-          <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-purple-300/70 text-[8px]">
+          <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-purple-300/70 text-xs">
             ▾
           </span>
         </div>
@@ -314,20 +399,36 @@ export const LyriaPanel: React.FC = () => {
           <button
             type="button"
             onClick={popOut}
-            className="px-2 py-0.5 rounded border border-zinc-700 hover:bg-white/5 text-zinc-300 text-[9px] font-mono uppercase tracking-widest flex items-center gap-1 shrink-0"
+            className="px-2 py-0.5 rounded border border-zinc-700 hover:bg-white/5 text-zinc-300 text-xs font-bold uppercase tracking-wide flex items-center gap-1 shrink-0"
             title="Open Lyria in a separate window"
           >
             <ExternalLink className="w-3 h-3" /> Pop out
           </button>
         )}
       </div>
+      {/* Why the checkout was not moved to the pinned commit (local changes,
+          no network, a checkout the user manages), and a refused restart. */}
+      {(checkoutNote || restartError) && (
+        <div className="flex flex-col gap-0.5 px-2 py-1 border-b border-zinc-800 shrink-0">
+          {checkoutNote && (
+            <p role="status" className="text-xs font-bold leading-snug text-amber-200">
+              {checkoutNote}
+            </p>
+          )}
+          {restartError && (
+            <p role="alert" className="text-xs font-bold leading-snug text-rose-300">
+              {restartError}
+            </p>
+          )}
+        </div>
+      )}
 
       <div className="flex-1 relative min-h-0">
         {status === 'loading' && (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-zinc-400">
             <Loader2 className="w-5 h-5 animate-spin text-zinc-500" />
             <span className="text-sm">Starting Lyria…</span>
-            <span className="text-[10px] text-zinc-500">First launch can take a minute.</span>
+            <span className="text-xs font-bold text-zinc-500">First launch can take a minute.</span>
           </div>
         )}
         {status === 'error' && (
@@ -335,7 +436,7 @@ export const LyriaPanel: React.FC = () => {
             <AlertCircle className="w-5 h-5 text-zinc-500" />
             <span className="text-sm">Lyria didn’t start.</span>
             {detail && (
-              <span className="text-[10px] text-zinc-500 text-center max-w-md font-mono">{detail}</span>
+              <span className="text-xs font-bold text-zinc-400 text-center max-w-md">{detail}</span>
             )}
             <button
               type="button"
@@ -349,13 +450,11 @@ export const LyriaPanel: React.FC = () => {
         {status === 'ready' && popped && (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-zinc-300">
             <ExternalLink className="w-5 h-5" />
-            <span className="text-[10px] font-mono uppercase tracking-widest">
-              Lyria is in a separate window
-            </span>
+            <span className="text-xs font-bold uppercase tracking-wide">Lyria is in a separate window</span>
             <button
               type="button"
               onClick={popBackIn}
-              className="px-3 py-1.5 rounded border border-zinc-700 hover:bg-white/5 text-zinc-300 text-[9px] font-black uppercase tracking-widest"
+              className="px-3 py-1.5 rounded border border-zinc-700 hover:bg-white/5 text-zinc-300 text-xs font-black uppercase tracking-wide"
             >
               Pop back in
             </button>
@@ -363,6 +462,7 @@ export const LyriaPanel: React.FC = () => {
         )}
         {status === 'ready' && !popped && lyriaSrc && (
           <iframe
+            key={frameKey}
             ref={iframeRef}
             src={lyriaSrc}
             // Lyria records nothing and captures nothing; it needs autoplay for
