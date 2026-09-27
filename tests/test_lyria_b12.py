@@ -135,10 +135,10 @@ def _reset_sidecar_module_state(tmp_path, monkeypatch):
 class _LyriaLikeHandler(http.server.BaseHTTPRequestHandler):
     """Answers /api/settings/status exactly like the real Lyria server does."""
 
-    def log_message(self, *args: object) -> None:  # noqa: D102 - silence test logs
+    def log_message(self, *args: object) -> None:  # silence test logs
         pass
 
-    def do_GET(self) -> None:  # noqa: N802 - stdlib method name
+    def do_GET(self) -> None:  # stdlib method name
         if self.path == "/api/settings/status":
             body = json.dumps(
                 {
@@ -160,10 +160,10 @@ class _LyriaLikeHandler(http.server.BaseHTTPRequestHandler):
 class _UnrelatedHandler(http.server.BaseHTTPRequestHandler):
     """Some other dev server that happens to be listening on the port."""
 
-    def log_message(self, *args: object) -> None:  # noqa: D102
+    def log_message(self, *args: object) -> None:
         pass
 
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         body = b"<html>not lyria</html>"
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
@@ -351,7 +351,7 @@ def test_ensure_deps_does_not_block_stop_or_probe(monkeypatch, tmp_path):
     def _run_ensure_running() -> None:
         try:
             sidecar.ensure_running(wait_for_ready=False)
-        except Exception as exc:  # noqa: BLE001 - captured for the assertion below
+        except Exception as exc:  # captured for the assertion below
             result["error"] = exc
 
     thread = threading.Thread(target=_run_ensure_running, daemon=True)
@@ -488,7 +488,7 @@ def test_stop_mid_install_prevents_orphan_process(monkeypatch, tmp_path):
     def _run() -> None:
         try:
             sidecar.ensure_running(wait_for_ready=False)
-        except Exception as exc:  # noqa: BLE001 - captured for the assertion below
+        except Exception as exc:  # captured for the assertion below
             result["error"] = exc
 
     thread = threading.Thread(target=_run, daemon=True)
@@ -613,7 +613,7 @@ def test_stop_during_readiness_wait_aborts_immediately(monkeypatch, tmp_path):
     def _run() -> None:
         try:
             sidecar.ensure_running(wait_for_ready=True)
-        except Exception as exc:  # noqa: BLE001 - captured for the assertion below
+        except Exception as exc:  # captured for the assertion below
             result["error"] = exc
 
     thread = threading.Thread(target=_run, daemon=True)
@@ -1328,7 +1328,7 @@ def test_concurrent_ensure_running_installs_once_and_spawns_once(monkeypatch, tm
         start_barrier.wait()
         try:
             url = sidecar.ensure_running(wait_for_ready=False)
-        except Exception as exc:  # noqa: BLE001 - captured for the assertion below
+        except Exception as exc:  # captured for the assertion below
             url = exc
         with results_lock:
             results.append(url)

@@ -115,7 +115,7 @@ def _maybe_auto_spawn() -> None:
     def _warm() -> None:
         try:
             sidecar.ensure_running()
-        except Exception as e:  # noqa: BLE001 - warm-up is best-effort
+        except Exception as e:  # warm-up is best-effort
             log.warning("lyria.router: warm-up failed: %s", e)
 
     threading.Thread(target=_warm, daemon=True, name="lyria-warm").start()

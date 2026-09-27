@@ -1012,7 +1012,7 @@ def pooled_keys(provider: str) -> list[str]:
                 value = (key or "").strip()
                 if value and value not in out:
                     out.append(value)
-    except Exception:  # noqa: BLE001 - the pool is optional here
+    except Exception:  # the pool is optional here
         return out
     return out
 
@@ -2141,7 +2141,7 @@ def _install_worker(cfg: LyriaConfig, need_clone: bool, git: str) -> None:
             ),
             finished_at=time.time(),
         )
-    except Exception as e:  # noqa: BLE001 - every failure must land in the status
+    except Exception as e:  # every failure must land in the status
         log.warning("lyria.sidecar: install failed: %s", e)
         _set_install(status="error", error=str(e), finished_at=time.time())
 
