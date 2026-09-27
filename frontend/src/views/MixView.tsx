@@ -1,6 +1,7 @@
 import React, { useState, useRef, useMemo, useEffect } from 'react';
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { persistStorage } from '../state/persistStorage';
 import {
   Upload, X, Eye, EyeOff, ChevronLeft, ChevronRight, ChevronUp, ChevronDown, Trash2,
   Download, Send, Sparkles, Plus, Gauge, History, LayoutList, Grid3x3,
@@ -301,7 +302,7 @@ const useVizRackPrefs = create<VizRackPrefs>()(
       setRow: (row, pref) => set(row === 'input' ? { input: pref } : { output: pref }),
       setBodyPx: (px) => set({ bodyPx: Math.round(Math.max(VIZ_BODY_MIN, Math.min(VIZ_BODY_MAX, px))) }),
     }),
-    { name: 'thedaw.mix.vizrack.v1', partialize: (s) => ({ input: s.input, output: s.output, bodyPx: s.bodyPx }) },
+    { name: 'thedaw.mix.vizrack.v1', storage: persistStorage(), partialize: (s) => ({ input: s.input, output: s.output, bodyPx: s.bodyPx }) },
   ),
 );
 const vizRowOpen = (pref: VizRowPref, hasAudio: boolean, mode: MixVizMode): boolean =>

@@ -15,6 +15,7 @@
  */
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { persistStorage } from './persistStorage';
 import type { DeviceRef } from '../lib/ioResolve';
 import { dismissFeatureGate, requireFeature } from '../notices/featureGateStore';
 import { logError } from './logStore';
@@ -389,6 +390,7 @@ export const useFeatureToggleStore = create<FeatureToggleState>()(
     }),
     {
       name: 'thedaw-feature-settings',
+      storage: persistStorage(),
       partialize: (s) => ({ settings: s.settings }),
       // A mirror saved by an older build lacks the sections added since (the
       // `assistant` switch, the folder lists); fill them from the defaults so

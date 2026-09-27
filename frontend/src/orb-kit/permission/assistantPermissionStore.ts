@@ -13,7 +13,8 @@
  * CLI session switches without waiting for the next turn.
  */
 import { create } from 'zustand';
-import { persist, createJSONStorage } from 'zustand/middleware';
+import { persist } from 'zustand/middleware';
+import { persistStorage } from '../../state/persistStorage';
 
 /** The four permission modes. These strings are the wire contract shared with
  *  the backend policy — never rename one without changing it there too. */
@@ -88,7 +89,7 @@ export const useAssistantPermissionStore = create<AssistantPermissionState>()(
     }),
     {
       name: ASSISTANT_PERMISSION_MODE_STORAGE_KEY,
-      storage: createJSONStorage(() => localStorage),
+      storage: persistStorage(),
       partialize: (s) => ({ mode: s.mode }),
       merge: (persisted, current) => ({
         ...current,
