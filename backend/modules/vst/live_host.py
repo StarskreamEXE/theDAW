@@ -455,10 +455,11 @@ def _validate_plugin(plugin_path: Any) -> str:
     ``plugin_path`` is browser-supplied, untrusted input, so it goes through
     ``path_policy.check_plugin_path`` first (R5-2): the raw text must name a
     ``.vst3`` file or bundle, must not be a network/device path (UNC paths
-    included), and must resolve inside one of the scanned VST3 roots — the
-    same directories the scanner itself offers in the UI. Only after that
+    included), and must sit inside one of the scanned VST3 roots — the
+    same directories the scanner itself offers in the UI, a plugin linked
+    into one of them included (``path_policy.is_allowed``). Only after that
     does existence get checked; ``check_plugin_path`` validates shape and
-    containment without touching the filesystem.
+    containment and never asks whether the plugin itself exists.
     """
     raw = str(plugin_path or "").strip()
     if not raw:
