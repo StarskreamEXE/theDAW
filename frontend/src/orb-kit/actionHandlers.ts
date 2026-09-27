@@ -738,6 +738,13 @@ function runtheDAWAction(action: AssistantActionPayload): ActionBranch {
                 // at once on an unregistered set, which the model never heard
                 // about. `continue`: a deck that is playing keeps playing.
                 return readyActiveSetForAutomix().then((ready) => {
+                    // A register that ran wrote library entries and patched
+                    // the set's ids, so the app DID change even though automix
+                    // did not start; fail() would tell the model otherwise.
+                    // dj_load_set answers the same case the same way.
+                    if (!ready.ok && ready.registered) {
+                        return `Registered the tracks of "${ready.name}", but automix did not start: ${ready.message}`;
+                    }
                     if (!ready.ok) return fail(`Automix not started: ${ready.message}`);
                     useAppUiStore.getState().setCenterTab('dj');
                     useDjAutomix.getState().requestStart('continue');

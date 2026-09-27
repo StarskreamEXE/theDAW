@@ -63,11 +63,43 @@ assert.deepEqual(startAtRegister, [null], 'the start request went out only after
 assert.equal(useDjAutomix.getState().pendingStart, 'continue', 'a playing deck keeps playing');
 assert.match(started.message, /3 playable tracks/);
 
-// A set automix cannot mix: the model hears it, and nothing is requested.
+// A bundled set with one playable file: the register runs (library entries
+// written, the set's ids patched) and then automix cannot start. The app DID
+// change, so the answer is not ok:false ("the app is UNCHANGED"), and it says
+// both what was registered and why nothing is playing.
 seed([row('only')], BUNDLED);
 const refused = await handletheDAWActionResult({ type: 'dj_automix', payload: { on: true } });
-assert.equal(refused.ok, false);
+assert.deepEqual(registerCalls(), [`POST /api/library/setlists/${BUNDLED}/register`], 'setup: the register ran');
+assert.deepEqual(useSetlistStore.getState().setlists[BUNDLED].entries.map((e) => e.entryId), ['reg-0']);
+assert.equal(refused.ok, true, 'THE BUG: a register that wrote entries was reported as no change');
+assert.match(refused.message, /Registered the tracks of "Night Ride", but automix did not start/);
 assert.match(refused.message, /Auto-DJ needs 2/);
+assert.equal(useDjAutomix.getState().pendingStart, null, 'nothing was requested');
+
+// The same set once registered: nothing is written this time, so ok:false
+// really does mean unchanged.
+const again = await handletheDAWActionResult({ type: 'dj_automix', payload: { on: true } });
+assert.equal(registerCalls().length, 1, 'no second register');
+assert.equal(again.ok, false);
+assert.match(again.message, /^Automix not started: .*Auto-DJ needs 2/);
+assert.equal(useDjAutomix.getState().pendingStart, null);
+
+// The user switches sets while the register is out: the register still wrote
+// (ok:true), and automix does not start the set they left.
+seed([row('a'), row('b')], BUNDLED);
+const OTHER = 'my-own-set';
+const realFetch = globalThis.fetch;
+globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+  useSetlistStore.setState((s) => ({
+    setlists: { ...s.setlists, [OTHER]: { id: OTHER, name: 'Mine', entries: [], createdAt: 1, updatedAt: 1 } },
+    activeId: OTHER,
+  }));
+  return realFetch(input, init);
+}) as typeof fetch;
+const switched = await handletheDAWActionResult({ type: 'dj_automix', payload: { on: true } });
+globalThis.fetch = realFetch;
+assert.equal(switched.ok, true, switched.message);
+assert.match(switched.message, /Registered the tracks of "Night Ride", but automix did not start: The active set changed/);
 assert.equal(useDjAutomix.getState().pendingStart, null);
 
 // Stop is unchanged and synchronous.

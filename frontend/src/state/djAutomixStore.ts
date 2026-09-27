@@ -89,6 +89,11 @@ export interface ActiveSetReadiness {
   name: string;
   playable: number;
   message: string;
+  /** True when this call registered the set's tracks with the backend and
+   *  patched their ids into the set. That is a change to the library and to
+   *  the set even when automix then cannot start (`changed`, `too-few`), and a
+   *  caller that reports "nothing changed" on `ok: false` must not say so. */
+  registered: boolean;
 }
 
 /**
@@ -112,33 +117,38 @@ export async function readyActiveSetForAutomix(): Promise<ActiveSetReadiness> {
   const setId = sl.activeId;
   const set = setId ? sl.setlists[setId] : null;
   if (!setId || !set) {
-    return { ok: false, reason: 'no-set', setId: null, name: '', playable: 0, message: 'Pick a set first' };
+    return { ok: false, reason: 'no-set', setId: null, name: '', playable: 0, message: 'Pick a set first', registered: false };
   }
   let entries: readonly SetlistEntry[] = set.entries;
+  let didRegister = false;
   if (isBundledSetId(setId) && entries.some(isPendingBundledRow)) {
     const registered = await sl.registerBundled(setId);
     if (useSetlistStore.getState().activeId !== setId) {
       return {
         ok: false, reason: 'changed', setId, name: set.name, playable: 0,
         message: 'The active set changed while it was registering — start Auto DJ again',
+        registered: registered !== null,
       };
     }
     if (registered === null) {
       return {
         ok: false, reason: 'failed', setId, name: set.name, playable: 0,
         message: `Could not register the tracks of "${set.name}"`,
+        registered: false,
       };
     }
     entries = registered;
+    didRegister = true;
   }
   const playable = djAutomixEntries(entries).length;
   if (playable < AUTO_DJ_MIN_TRACKS) {
     return {
       ok: false, reason: 'too-few', setId, name: set.name, playable,
       message: `"${set.name}" has ${playable} playable track${playable === 1 ? '' : 's'} — Auto-DJ needs ${AUTO_DJ_MIN_TRACKS}.`,
+      registered: didRegister,
     };
   }
-  return { ok: true, reason: 'ready', setId, name: set.name, playable, message: `"${set.name}" is ready` };
+  return { ok: true, reason: 'ready', setId, name: set.name, playable, message: `"${set.name}" is ready`, registered: didRegister };
 }
 
 /** The first track of the active set that can go on a deck, registering a
