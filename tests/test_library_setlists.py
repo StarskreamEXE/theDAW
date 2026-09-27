@@ -388,3 +388,53 @@ def test_a_set_main_never_listed_has_no_legacy_id(
     """No sidecar, no entry ids: there is no copy main could have stored."""
     _write_set(perf_sets, "FRESH SET", tracks=2)
     assert _get_setlists(client)[0]["legacyIds"] == []
+
+
+def test_a_register_that_dies_writing_the_sidecar_keeps_every_known_id(
+    client: TestClient, perf_sets: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Main listed the folder and wrote its sidecar. The user adds a track and
+    opens the set on this build, and the write of the updated sidecar dies
+    half-way (a crash, a full disk, power loss). The sidecar written in place
+    was left torn, read back as ``{}``, and the next listing forgot every
+    entry id the folder had -- and with them the id main stored, so the set
+    showed twice. Written atomically, the old sidecar survives the failure."""
+    set_dir = _write_set(perf_sets, "NIGHT RIDE", tracks=2)
+    store = library_router_module.get_store()
+    main_listed = _main_load_perf_set(store, set_dir)
+    assert main_listed is not None
+    main_ids = [e["entryId"] for e in main_listed["entries"]]
+
+    # The user drops a third track into the folder.
+    (set_dir / "track2.wav").write_bytes(b"RIFF\x00\x00\x00\x00WAVEdata")
+    spec = json.loads((set_dir / "performance.json").read_text(encoding="utf-8"))
+    spec["tracks"].append({"file": "track2.wav", "title": "Track 2"})
+    (set_dir / "performance.json").write_text(json.dumps(spec), encoding="utf-8")
+    set_id = _get_setlists(client)[0]["id"]
+
+    real_write_text = Path.write_text
+
+    def dies_half_way(self: Path, data: str, *args: Any, **kwargs: Any) -> int:
+        # The sidecar itself, or the scratch file an atomic write puts beside it.
+        if self.name == SIDECAR or self.name.startswith(f".{SIDECAR}."):
+            real_write_text(self, data[: len(data) // 2], *args, **kwargs)
+            raise OSError("disk went away mid-write")
+        return real_write_text(self, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", dies_half_way)
+    response = client.post(f"{PREFIX}/setlists/{set_id}/register")
+    monkeypatch.setattr(Path, "write_text", real_write_text)
+    assert response.status_code == 200, response.text[:400]
+
+    sidecar = json.loads((set_dir / SIDECAR).read_text(encoding="utf-8"))
+    assert sidecar == {"track0.wav": main_ids[0], "track1.wav": main_ids[1]}, (
+        "the failed write tore the sidecar the folder already had"
+    )
+    assert not [p.name for p in set_dir.iterdir() if p.name.endswith(".tmp")], (
+        "the failed write left its scratch file behind"
+    )
+    listed = _get_setlists(client)[0]
+    assert [e["entryId"] for e in listed["entries"]][:2] == main_ids
+    assert main_listed["id"] in listed["legacyIds"], (
+        "the listing lost the id main stored, so the set would show twice"
+    )

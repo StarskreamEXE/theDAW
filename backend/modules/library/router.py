@@ -83,6 +83,7 @@ from .tags import MAX_EMBEDDED_COVER_BYTES
 from backend.modules.analysis.engine import profile_of_row
 from backend.core.startup import register_startup_hook
 from backend.lib import known_paths, paths
+from backend.lib.atomic import atomic_write
 from backend.lib.cross_site import (
     refuse_cross_site,
     require_loopback_or_launch_token,
@@ -1556,7 +1557,9 @@ def _load_perf_set(
 
     if sidecar_dirty:
         try:
-            sidecar_path.write_text(json.dumps(sidecar, indent=2), encoding="utf-8")
+            # Atomic: a torn sidecar reads as {} and forgets every entry id the
+            # folder had, so the set lists unregistered and main's id is lost.
+            atomic_write(sidecar_path, json.dumps(sidecar, indent=2))
         except OSError as e:
             log.warning("performance set %s: sidecar write failed: %s", set_dir.name, e)
 
