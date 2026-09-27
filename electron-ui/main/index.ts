@@ -26,6 +26,7 @@ import { pathToFileURL } from 'url'
 // still reads as F# in the log.
 import { plainAscii } from '../../frontend/src/lib/plainText'
 import { AutoDownloadClaims, uniqueDownloadPath } from './downloadNaming'
+import { DialogFolderMemory, dialogDefaultPath, folderAfterDialog } from './dialogFolder'
 import {
   lanHttpsLogLine,
   lanListenerCommand,
@@ -1408,21 +1409,32 @@ function openDialogOptions(raw: unknown): Pick<Electron.OpenDialogOptions, 'defa
 }
 
 function registerIpcHandlers(): void {
+  // Electron opens a dialog with no defaultPath in Downloads and the OS does
+  // not restore the last folder, so every dialog starts in the folder the
+  // previous one ended in (see dialogFolder.ts).
+  const dialogFolder = new DialogFolderMemory(path.join(app.getPath('userData'), 'dialog-folder.json'))
+
   ipcMain.handle('dialog:selectFile', async (_event, options?: unknown) => {
     if (!mainWindow) return { canceled: true, filePaths: [] }
+    const opts = openDialogOptions(options)
     const result = await dialog.showOpenDialog(mainWindow, {
-      ...openDialogOptions(options),
+      ...opts,
+      defaultPath: dialogDefaultPath(opts.defaultPath, dialogFolder.get()),
       properties: ['openFile'],
     })
+    dialogFolder.set(folderAfterDialog('openFile', result))
     return result
   })
 
   ipcMain.handle('dialog:selectDirectory', async (_event, options?: unknown) => {
     if (!mainWindow) return { canceled: true, filePaths: [] }
+    const opts = openDialogOptions(options)
     const result = await dialog.showOpenDialog(mainWindow, {
-      ...openDialogOptions(options),
+      ...opts,
+      defaultPath: dialogDefaultPath(opts.defaultPath, dialogFolder.get()),
       properties: ['openDirectory'],
     })
+    dialogFolder.set(folderAfterDialog('openDirectory', result))
     return result
   })
 
@@ -1430,7 +1442,11 @@ function registerIpcHandlers(): void {
     'dialog:showSave',
     async (_event, options: Electron.SaveDialogOptions) => {
       if (!mainWindow) return { canceled: true, filePath: undefined }
-      const result = await dialog.showSaveDialog(mainWindow, options)
+      const result = await dialog.showSaveDialog(mainWindow, {
+        ...options,
+        defaultPath: dialogDefaultPath(options?.defaultPath, dialogFolder.get()),
+      })
+      dialogFolder.set(folderAfterDialog('save', result))
       return result
     },
   )
