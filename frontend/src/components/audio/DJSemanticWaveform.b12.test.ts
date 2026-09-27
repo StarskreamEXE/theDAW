@@ -558,21 +558,36 @@ const GOLDEN_GRADIENTS: string[] = [
   "rgba(0,0,0,0.36)",
 ];
 
+/** Every decimal in a colour string at 12 significant digits. The golden
+ *  strings were recorded on a machine whose Math.pow lands one unit in the
+ *  last place away from Node 22's (0.5750685450389378 against ...379), so the
+ *  full 17 digits failed on every other machine and in CI. A canvas keeps
+ *  alpha in 8 bits; 12 digits is still ten orders finer than any paint change. */
+function colourAtPaintPrecision(style: string): string {
+  return style.replace(/\d*\.\d+/g, (n) => String(Number(Number(n).toPrecision(12))));
+}
+
 /** One line per paint op, so a mismatch names the op that moved. */
 function serialize(calls: { kind: string; style: unknown; x: number; y: number; w: number; h: number }[]): string[] {
   return calls.map(
     (c) =>
-      `${c.kind}|${typeof c.style === 'object' && c.style !== null ? 'gradient' : String(c.style)}` +
+      `${c.kind}|${typeof c.style === 'object' && c.style !== null ? 'gradient' : colourAtPaintPrecision(String(c.style))}` +
       `|${c.x.toFixed(4)}|${c.y.toFixed(4)}|${c.w.toFixed(4)}|${c.h.toFixed(4)}`,
   );
 }
+
+/** The golden list through the same rule; coordinates are already 4 dp. */
+const GOLDEN_AT_PAINT_PRECISION = GOLDEN_CALLS.map((line) => {
+  const [kind, style, ...rest] = line.split('|');
+  return [kind, colourAtPaintPrecision(style), ...rest].join('|');
+});
 
 {
   const direct = makeFakeCanvas();
   drawWaveform(direct.canvas, GOLDEN_BOX, goldenBins(), 0, 1, false, null);
   assert.deepEqual(
     serialize(direct.calls),
-    GOLDEN_CALLS,
+    GOLDEN_AT_PAINT_PRECISION,
     'drawWaveform must paint exactly what it painted before DJ-2 split it into helpers',
   );
   assert.deepEqual(direct.gradients, GOLDEN_GRADIENTS, 'including every gradient stop, in order');
@@ -581,7 +596,7 @@ function serialize(calls: { kind: string; style: unknown; x: number; y: number; 
   drawWaveformCached(cached.canvas, GOLDEN_BOX, goldenBins(), 0, 1, false, null, 'golden');
   assert.deepEqual(
     serialize(cached.calls),
-    GOLDEN_CALLS,
+    GOLDEN_AT_PAINT_PRECISION,
     'and the full view through drawWaveformCached reproduces the same pre-DJ-2 output',
   );
   assert.deepEqual(cached.gradients, GOLDEN_GRADIENTS);
