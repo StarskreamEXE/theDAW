@@ -147,9 +147,12 @@ _store: Optional[LibraryStore] = None
 
 
 def get_store() -> LibraryStore:
+    """The process's library. The backend's startup opens it on the event
+    loop, so a search index that needs building is built in the background
+    (:meth:`~.db.LibraryDB._ensure_search`) and the startup returns at once."""
     global _store
     if _store is None:
-        _store = LibraryStore(default_library_root())
+        _store = LibraryStore(default_library_root(), build_search_in_background=True)
     return _store
 
 

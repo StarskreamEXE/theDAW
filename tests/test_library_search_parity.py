@@ -21,6 +21,7 @@ import importlib.util
 import math
 import sqlite3
 import sys
+import threading
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from types import ModuleType
@@ -41,6 +42,7 @@ from backend.modules.library.db import (
     short_grams,
 )
 from tests.test_library_store import _seed_generate_entry
+from tests.test_security_b12 import real_app_context
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -498,6 +500,130 @@ def test_an_interrupted_index_build_resumes_from_its_cursor(
     assert _meta(db, FTS_BACKFILL_ROWID_KEY) is None
     _assert_search_index_intact(db)
     db.close()
+
+
+def test_a_background_build_that_stops_fails_searches_until_the_next_open(
+    tmp_path: Path, monkeypatch
+):
+    """A background build dies part way. The library still reads, a search
+    raises instead of answering from part of the library, and the next open
+    finishes the build from its cursor. A store closed while its build is
+    still running stops the build and leaves it to the next open too."""
+    path = tmp_path / "library.db"
+    db = LibraryDB(path)
+    db.upsert_entries_bulk(
+        [_payload(f"r{i:05d}", title=f"Quartz Canyon {i}") for i in range(4500)]
+    )
+    db._conn.execute("DELETE FROM schema_meta WHERE key = ?", (SEARCH_STATE_KEY,))
+    db._conn.commit()
+    db.close()
+
+    real_sync = LibraryDB._sync_search
+    calls: list[int] = []
+
+    def dying_sync(self, cur, rids):
+        calls.append(len(rids))
+        if len(calls) == 2:
+            raise RuntimeError("power cut")
+        return real_sync(self, cur, rids)
+
+    monkeypatch.setattr(LibraryDB, "_sync_search", dying_sync)
+    db = LibraryDB(path, build_search_in_background=True)
+    with pytest.raises(RuntimeError, match="could not be built"):
+        db.count_entries_filtered(EntryFilters(q="quartz"))
+    assert db.count_entries() == 4500
+    db.close()
+    monkeypatch.setattr(LibraryDB, "_sync_search", real_sync)
+
+    release = threading.Event()
+    real_index = LibraryDB._index_search_rows
+
+    def held_index(self, *args, **kwargs):
+        release.wait(timeout=60)
+        return real_index(self, *args, **kwargs)
+
+    monkeypatch.setattr(LibraryDB, "_index_search_rows", held_index)
+    db = LibraryDB(path, build_search_in_background=True)
+    db.close()
+    release.set()
+    monkeypatch.setattr(LibraryDB, "_index_search_rows", real_index)
+
+    db = LibraryDB(path)
+    assert db.count_entries_filtered(EntryFilters(q="quartz")) == 4500
+    assert _meta(db, FTS_BACKFILL_ROWID_KEY) is None
+    _assert_search_index_intact(db)
+    db.close()
+
+
+def test_the_backend_starts_while_the_index_of_mains_library_is_built(
+    tmp_path: Path, monkeypatch
+):
+    """main's library, which has no search index, is opened by this build's
+    backend. The startup built the whole index on the event loop before the
+    lifespan yielded, so /api/health and every other route waited for it: on
+    200,000 rows, minutes of a boot screen. The startup now returns with the
+    build still to run; the library lists, a write lands, and a search waits
+    for the build and then finds every row, the written one included."""
+    from backend.modules.library.db import SEARCH_BUILD_THREAD
+
+    root = tmp_path / "app-generations"
+    root.mkdir()
+    path = root / "library.db"
+    main = _main_build().LibraryDB(path)
+    for i in range(2500):
+        main.upsert_entry(_payload(f"q{i:05d}", title=f"Quartz Canyon {i}"))
+    main.close()
+
+    release = threading.Event()
+    real_index = getattr(LibraryDB, "_index_search_rows", None)
+
+    def held_index(self, *args, **kwargs):
+        # Held off the write lock, so the library stays readable meanwhile.
+        if threading.current_thread().name == SEARCH_BUILD_THREAD:
+            release.wait(timeout=60)
+        return real_index(self, *args, **kwargs)
+
+    if real_index is not None:
+        monkeypatch.setattr(LibraryDB, "_index_search_rows", held_index)
+
+    try:
+        with (
+            real_app_context(tmp_path, monkeypatch) as app,
+            TestClient(app, client=("127.0.0.1", 51000)) as client,
+        ):
+            probe = sqlite3.connect(path)
+            state = probe.execute(
+                "SELECT value FROM schema_meta WHERE key = ?", (SEARCH_STATE_KEY,)
+            ).fetchone()
+            probe.close()
+            assert state is None, "the startup waited for the whole index build"
+            assert client.get("/api/health").status_code == 200
+
+            listed = client.get("/api/library/entries", params={"limit": 5})
+            assert listed.status_code == 200
+            assert listed.json()["total"] == 2500
+
+            db = library_router_module._store.db
+            db.upsert_entry(_payload("z", title="Quartz Zircon"))
+
+            found: list[int] = []
+            search = threading.Thread(
+                target=lambda: found.append(
+                    db.count_entries_filtered(EntryFilters(q="quartz"))
+                )
+            )
+            search.start()
+            search.join(timeout=1.0)
+            assert search.is_alive(), "a search answered from a partial index"
+
+            release.set()
+            search.join(timeout=60)
+            assert found == [2501]
+            assert _found(db, "zircon") == {"z"}
+            assert _meta(db, SEARCH_STATE_KEY) is not None
+            _assert_search_index_intact(db)
+    finally:
+        release.set()
 
 
 # ---------------------------------------------------------------------------

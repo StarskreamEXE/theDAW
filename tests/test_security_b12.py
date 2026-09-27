@@ -44,6 +44,7 @@ import json
 import threading
 import zipfile
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -1400,6 +1401,15 @@ def _stop_no_sidecars() -> None:
 
 @pytest.fixture
 def real_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[FastAPI]:
+    """backend.server's app, set up by :func:`real_app_context`."""
+    with real_app_context(tmp_path, monkeypatch) as app:
+        yield app
+
+
+@contextmanager
+def real_app_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[FastAPI]:
     """backend.server's app with every data folder its lifespan writes moved
     into tmp_path. The startup reads and migrates settings.json, opens the
     library database, builds the bundled plugins into data/plugins, caches the

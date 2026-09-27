@@ -1385,6 +1385,8 @@ class LibraryStore:
         root: Path,
         api_prefix: str = "/api/library",
         db_path: Optional[Path] | bool = None,
+        *,
+        build_search_in_background: bool = False,
     ) -> None:
         self.root = root
         self.api_prefix = api_prefix
@@ -1396,7 +1398,10 @@ class LibraryStore:
             resolved_db_path = (
                 db_path if isinstance(db_path, Path) else self.root / "library.db"
             )
-            self.db = LibraryDB(resolved_db_path)
+            self.db = LibraryDB(
+                resolved_db_path,
+                build_search_in_background=build_search_in_background,
+            )
             # Auto-reindex on a fresh DB so the query layer is hot. This runs
             # any time the DB is empty -- first boot, but also a lost,
             # deleted, or rebuilt DB file next to a library that already has

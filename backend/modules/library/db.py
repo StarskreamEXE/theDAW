@@ -457,6 +457,9 @@ LEGACY_FTS_BACKFILL_KEY = "fts_backfill"
 #: Rows indexed per commit while the index is (re)built.
 SEARCH_BACKFILL_BATCH = 2000
 
+#: The name of the thread a background build of the index runs on.
+SEARCH_BUILD_THREAD = "library-search-build"
+
 #: The rowids ``search_dirty`` lists, each once (the table holds repeats; see
 #: migration step 13).
 _DIRTY_ROWIDS_SQL = "SELECT DISTINCT rid FROM search_dirty WHERE rid IS NOT NULL"
@@ -1741,7 +1744,13 @@ class LibraryDB:
     #: opened database.
     _fts_warned = False
 
-    def __init__(self, path: Path, *, enable_fts: bool = True) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        enable_fts: bool = True,
+        build_search_in_background: bool = False,
+    ) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._writelock = threading.RLock()
@@ -1781,16 +1790,26 @@ class LibraryDB:
         self.fts_enabled = False
         #: Whether the search tables exist (see :meth:`_ensure_search`).
         self.search_ready = False
+        #: Set once the search index answers for every entry. A search waits
+        #: for it (:meth:`_wait_for_search`); only a build running in the
+        #: background leaves it clear past the constructor.
+        self._search_built = threading.Event()
+        #: What stopped a background build, raised to every search after it.
+        self._search_build_error: Optional[BaseException] = None
+        #: Set by :meth:`close`; a background build stops at its next batch.
+        self._closed = False
         #: Open :meth:`checkpoint_once` blocks, and the autocheckpoint
         #: setting the outermost one restores.
         self._checkpoint_depth = 0
         self._checkpoint_previous = 1000
         self._migrate()
-        self._ensure_search()
+        self._ensure_search(background=build_search_in_background)
 
     def close(self) -> None:
         with self._writelock:
+            self._closed = True
             self._conn.close()
+        self._search_built.set()
 
     # ---- Schema -------------------------------------------------------------
 
@@ -1887,7 +1906,7 @@ class LibraryDB:
 
     # ---- Search index -------------------------------------------------------
 
-    def _ensure_search(self) -> None:
+    def _ensure_search(self, *, background: bool = False) -> None:
         """Bring the search index up to date on open.
 
         1. Create the fts5 trigram index and the one- and two-character
@@ -1907,6 +1926,14 @@ class LibraryDB:
         tables; the index then stays off (:attr:`search_ready` is False) and
         writes carry on without it. Only a test that migrates a file part way
         opens one: a real open either reaches ``SCHEMA_VERSION`` or raises.
+
+        With ``background`` the rows of step 3, and step 4 after them, are
+        indexed on a thread of their own, which takes the write lock one batch
+        at a time. The backend opens the library inside its startup, and a
+        200,000-entry build there held every route, ``/api/health``
+        included, for as long as it ran. Writes keep their own rows indexed
+        meanwhile (:meth:`_sync_dirty`), and a search waits for the build
+        (:meth:`_wait_for_search`).
         """
         with self._writelock:
             self.search_ready = (
@@ -1918,6 +1945,7 @@ class LibraryDB:
                 == 3
             )
             if not self.search_ready:
+                self._search_built.set()
                 return
             if self._enable_fts:
                 try:
@@ -1948,8 +1976,57 @@ class LibraryDB:
                         )
             if self.fts_enabled:
                 self._drop_legacy_fts()
-            self._build_search_index()
-            self._reconcile_search()
+            start = self._start_search_build()
+            if start is None:
+                self._reconcile_search()
+                self._search_built.set()
+                return
+            if not background:
+                self._index_search_rows(start)
+                self._reconcile_search()
+                self._search_built.set()
+                return
+        log.info(
+            "library.db: building the search index in the background; "
+            "a library search waits for it"
+        )
+        threading.Thread(
+            target=self._finish_search_build,
+            args=(start,),
+            name=SEARCH_BUILD_THREAD,
+            daemon=True,
+        ).start()
+
+    def _finish_search_build(self, start: int) -> None:
+        """The background half of :meth:`_ensure_search`: index the rows,
+        then reconcile. Whatever stops it is kept and raised to every search
+        (:meth:`_wait_for_search`); the next open resumes the build from its
+        last committed batch."""
+        try:
+            if self._index_search_rows(start):
+                with self._writelock:
+                    if not self._closed:
+                        self._reconcile_search()
+        except BaseException as e:
+            self._search_build_error = e
+            log.exception("library.db: the search index build stopped")
+        finally:
+            self._search_built.set()
+
+    def _wait_for_search(self) -> None:
+        """Return once the search index answers for every entry.
+
+        Never call it holding :attr:`_writelock`: a background build needs
+        that lock for every batch. Raises RuntimeError when the build
+        stopped, so a search never answers from part of the library."""
+        if not self._search_built.is_set():
+            log.info("library.db: a search is waiting for the search index build")
+            self._search_built.wait()
+        if self._search_build_error is not None:
+            raise RuntimeError(
+                f"the library search index could not be built: "
+                f"{self._search_build_error}"
+            ) from self._search_build_error
 
     def _meta_value(self, key: str) -> Optional[str]:
         row = self._conn.execute(
@@ -1990,15 +2067,16 @@ class LibraryDB:
             raise
         log.info("library.db: removed the previous search index (%s)", LEGACY_FTS_TABLE)
 
-    def _build_search_index(self, *, batch: int = SEARCH_BACKFILL_BATCH) -> None:
-        """Index every entry, in batches, when the index is not the one this
-        build keeps; a no-op when it is.
+    def _start_search_build(self) -> Optional[int]:
+        """Get a build of the search index ready to run: None when the index
+        is already the one this build keeps, else the rowid to index after.
 
-        Each batch commits together with :data:`FTS_BACKFILL_ROWID_KEY`, the
-        highest rowid it covered, so a build interrupted by a crash, a kill or
-        a full disk resumes after the last committed batch. The cursor belongs
-        to the target named in :data:`SEARCH_TARGET_KEY`; a cursor left by a
-        build of a different target is discarded and the build starts over.
+        The cursor in :data:`FTS_BACKFILL_ROWID_KEY` belongs to the target
+        named in :data:`SEARCH_TARGET_KEY`; a cursor left by a build of a
+        different target is discarded and the build starts over, and a start
+        from the top clears the index first. That part is cheap and runs
+        under the caller's write lock; the rows are indexed by
+        :meth:`_index_search_rows`.
 
         Commits directly instead of going through ``_txn``: building an index
         is not a library mutation, and a 200k build would otherwise push
@@ -2008,87 +2086,121 @@ class LibraryDB:
         expected = self._search_state()
         cursor_text = self._meta_value(FTS_BACKFILL_ROWID_KEY)
         if self._meta_value(SEARCH_STATE_KEY) == expected and cursor_text is None:
-            return
+            return None
+        if self._meta_value(SEARCH_TARGET_KEY) == expected and cursor_text is not None:
+            last_rowid = int(cursor_text)
+            log.info(
+                "library.db: resuming the search index build after row %d",
+                last_rowid,
+            )
+            return last_rowid
         cur = self._conn.cursor()
         try:
-            if self._meta_value(SEARCH_TARGET_KEY) != expected or cursor_text is None:
-                # From the top. Everything indexed so far was indexed for a
-                # different target, so it goes -- the head and body rows and,
-                # when there is an fts5 index, every row of it -- and the dirty
-                # list with it, since this pass covers every row.
-                cur.execute("DELETE FROM entries_search_head")
-                cur.execute("DELETE FROM entries_search_body")
-                if self.fts_enabled:
-                    cur.execute(
-                        "INSERT INTO entries_search(entries_search) VALUES('delete-all')"
-                    )
-                    cur.execute(
-                        "INSERT INTO entries_search_short(entries_search_short) "
-                        "VALUES('delete-all')"
-                    )
-                cur.execute("DELETE FROM search_dirty")
+            # From the top. Everything indexed so far was indexed for a
+            # different target, so it goes -- the head and body rows and,
+            # when there is an fts5 index, every row of it -- and the dirty
+            # list with it, since this pass covers every row.
+            cur.execute("DELETE FROM entries_search_head")
+            cur.execute("DELETE FROM entries_search_body")
+            if self.fts_enabled:
                 cur.execute(
-                    "DELETE FROM schema_meta WHERE key = ?", (SEARCH_STATE_KEY,)
+                    "INSERT INTO entries_search(entries_search) VALUES('delete-all')"
                 )
                 cur.execute(
-                    "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
-                    (SEARCH_TARGET_KEY, expected),
+                    "INSERT INTO entries_search_short(entries_search_short) "
+                    "VALUES('delete-all')"
                 )
-                cur.execute(
-                    "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, '0')",
-                    (FTS_BACKFILL_ROWID_KEY,),
-                )
-                self._conn.commit()
-                last_rowid = 0
-            else:
-                last_rowid = int(cursor_text)
-                log.info(
-                    "library.db: resuming the search index build after row %d",
-                    last_rowid,
-                )
-            top = cur.execute("SELECT MAX(rowid) AS m FROM entries").fetchone()["m"]
-            indexed = 0
-            reported = time.monotonic()
-            while True:
-                rows = cur.execute(
-                    "SELECT rowid FROM entries WHERE rowid > ? ORDER BY rowid LIMIT ?",
-                    (last_rowid, batch),
-                ).fetchall()
-                if not rows:
-                    break
-                rids = [int(r["rowid"]) for r in rows]
-                self._sync_search(cur, rids)
-                last_rowid = rids[-1]
-                cur.execute(
-                    "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
-                    (FTS_BACKFILL_ROWID_KEY, str(last_rowid)),
-                )
-                self._conn.commit()
-                indexed += len(rids)
-                if time.monotonic() - reported >= 10.0:
-                    reported = time.monotonic()
-                    log.info(
-                        "library.db: search index build at row %d of %s (%d indexed)",
-                        last_rowid,
-                        top,
-                        indexed,
-                    )
+            cur.execute("DELETE FROM search_dirty")
+            cur.execute("DELETE FROM schema_meta WHERE key = ?", (SEARCH_STATE_KEY,))
             cur.execute(
                 "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
-                (SEARCH_STATE_KEY, expected),
+                (SEARCH_TARGET_KEY, expected),
             )
             cur.execute(
-                "DELETE FROM schema_meta WHERE key IN (?, ?)",
-                (SEARCH_TARGET_KEY, FTS_BACKFILL_ROWID_KEY),
+                "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, '0')",
+                (FTS_BACKFILL_ROWID_KEY,),
             )
             self._conn.commit()
-            if indexed:
-                log.info("library.db: indexed %d entries for search", indexed)
         except Exception:
             self._conn.rollback()
             raise
         finally:
             cur.close()
+        return 0
+
+    def _index_search_rows(
+        self, last_rowid: int, *, batch: int = SEARCH_BACKFILL_BATCH
+    ) -> bool:
+        """Index every entry after ``last_rowid``, in batches, then record the
+        finished index. True when it finished; False when :meth:`close` ran
+        first.
+
+        Each batch takes the write lock and commits together with
+        :data:`FTS_BACKFILL_ROWID_KEY`, the highest rowid it covered, so a
+        build interrupted by a crash, a kill or a full disk resumes after the
+        last committed batch, and a write waits one batch at most. A row a
+        write changes meanwhile is indexed by that write (:meth:`_sync_dirty`)
+        and again when the build reaches it, the same text both times. Commits
+        directly, for the reason :meth:`_start_search_build` gives.
+        """
+        expected = self._search_state()
+        indexed = 0
+        reported = time.monotonic()
+        top: Optional[int] = None
+        while True:
+            with self._writelock:
+                if self._closed:
+                    return False
+                cur = self._conn.cursor()
+                try:
+                    if top is None:
+                        top = cur.execute(
+                            "SELECT MAX(rowid) AS m FROM entries"
+                        ).fetchone()["m"]
+                    rows = cur.execute(
+                        "SELECT rowid FROM entries WHERE rowid > ? "
+                        "ORDER BY rowid LIMIT ?",
+                        (last_rowid, batch),
+                    ).fetchall()
+                    if rows:
+                        rids = [int(r["rowid"]) for r in rows]
+                        self._sync_search(cur, rids)
+                        last_rowid = rids[-1]
+                        cur.execute(
+                            "INSERT OR REPLACE INTO schema_meta (key, value) "
+                            "VALUES (?, ?)",
+                            (FTS_BACKFILL_ROWID_KEY, str(last_rowid)),
+                        )
+                    else:
+                        cur.execute(
+                            "INSERT OR REPLACE INTO schema_meta (key, value) "
+                            "VALUES (?, ?)",
+                            (SEARCH_STATE_KEY, expected),
+                        )
+                        cur.execute(
+                            "DELETE FROM schema_meta WHERE key IN (?, ?)",
+                            (SEARCH_TARGET_KEY, FTS_BACKFILL_ROWID_KEY),
+                        )
+                    self._conn.commit()
+                except Exception:
+                    self._conn.rollback()
+                    raise
+                finally:
+                    cur.close()
+            if not rows:
+                break
+            indexed += len(rows)
+            if time.monotonic() - reported >= 10.0:
+                reported = time.monotonic()
+                log.info(
+                    "library.db: search index build at row %d of %s (%d indexed)",
+                    last_rowid,
+                    top,
+                    indexed,
+                )
+        if indexed:
+            log.info("library.db: indexed %d entries for search", indexed)
+        return True
 
     def _reconcile_search(self, *, batch: int = SEARCH_BACKFILL_BATCH) -> None:
         """Re-index every row the index may be wrong about, on open.
@@ -2103,7 +2215,7 @@ class LibraryDB:
           Both are anti-joins over integer keys, so on a 200k library they
           cost milliseconds.
 
-        Commits per batch, directly, for the reason ``_build_search_index``
+        Commits per batch, directly, for the reason ``_start_search_build``
         gives.
         """
         cur = self._conn.cursor()
@@ -2795,10 +2907,15 @@ class LibraryDB:
         leaves out the rows the text arm already lists, by testing the same
         words on those rows' text; a ``UNION`` would instead sort every
         matching rowid into a temporary b-tree to remove the repeats.
+
+        A search waits here for a background build of the index
+        (:meth:`_wait_for_search`), so every caller reaches this before it
+        takes the write lock.
         """
         raw = q.strip()
         if not raw:
             return None
+        self._wait_for_search()
         words = search_words(raw)
         text_sql, params = self._text_match_sql(words)
         number = js_parse_float(raw)
@@ -3072,6 +3189,9 @@ class LibraryDB:
         text = str(ref or "")
         if not text.strip():
             return None
+        # Before the lock: the title lookup below reads the search index, and
+        # a background build of it needs the lock to finish.
+        self._wait_for_search()
         audio = frozenset({"audio"})
         with self._writelock:
             cur = self._conn.cursor()
