@@ -12,8 +12,8 @@ import { ToggleLeft, ToggleRight, Loader2 } from 'lucide-react';
 import { InfoTip } from '../../ui/Tooltip';
 
 export const SECTION_TITLE = 'text-xs font-black uppercase tracking-widest text-zinc-200';
-export const SECTION_META = 'text-[11px] font-mono text-zinc-400';
-export const FIELD_LABEL = 'text-[11px] font-mono uppercase tracking-wider text-zinc-300';
+export const SECTION_META = 'text-xs font-semibold tabular-nums text-zinc-400';
+export const FIELD_LABEL = 'text-xs font-bold uppercase tracking-wider text-zinc-300';
 export const BODY = 'text-xs text-zinc-300';
 export const CARD = 'rounded border border-white/8 bg-white/3';
 export const INPUT =
@@ -26,7 +26,7 @@ export const SELECT =
 
 const BTN_SHAPE =
   'inline-flex items-center gap-1 rounded border px-1.5 py-0.5 uppercase tracking-widest transition-colors disabled:opacity-40 disabled:cursor-default focus-visible:outline-none focus-visible:ring-1';
-const BTN_BASE = `${BTN_SHAPE} text-[11px] font-black`;
+const BTN_BASE = `${BTN_SHAPE} text-xs font-black`;
 const GHOST_TONE = 'border-white/10 text-zinc-300 hover:text-white hover:bg-white/5 focus-visible:ring-white/30';
 const PURPLE_TONE = 'border-purple-500/40 bg-purple-500/15 text-purple-200 hover:bg-purple-500/25 focus-visible:ring-purple-400/70';
 export const BTN_GHOST = `${BTN_BASE} ${GHOST_TONE}`;
@@ -74,7 +74,7 @@ export const Segmented: React.FC<{
         type="button"
         onClick={() => onChange(v)}
         aria-pressed={value === v}
-        className={`text-[11px] font-mono uppercase tracking-widest px-1.5 py-0.5 rounded border transition-colors ${
+        className={`text-xs font-bold uppercase tracking-widest px-1.5 py-0.5 rounded border transition-colors ${
           value === v ? 'bg-purple-500/25 border-purple-400/60 text-purple-100' : 'border-white/10 text-zinc-300 hover:text-white hover:bg-white/5'
         }`}
       >
@@ -115,7 +115,7 @@ export const IconToggle: React.FC<{
       <ToggleLeft className="w-5 h-5 text-zinc-500 group-hover:text-zinc-400" />
     )}
     {caption && (
-      <span className={`text-[11px] font-mono uppercase tracking-widest ${enabled ? 'text-purple-200' : 'text-zinc-400'}`}>
+      <span className={`text-xs font-bold uppercase tracking-widest ${enabled ? 'text-purple-200' : 'text-zinc-400'}`}>
         {caption}
       </span>
     )}

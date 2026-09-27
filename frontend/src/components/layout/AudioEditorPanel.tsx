@@ -78,10 +78,10 @@ import {
 
 /* ── shared class strings (the dock's own idiom) ───────────────────────────── */
 
-const LABEL = 'font-display text-[10px] font-bold uppercase tracking-wider et-ink-2';
-const DOMAIN = 'font-mono text-[9px] uppercase tracking-widest text-purple-300/70';
+const LABEL = 'font-display text-xs font-bold uppercase tracking-wider et-ink-2';
+const DOMAIN = 'text-xs font-bold uppercase tracking-widest text-purple-300/70';
 const FIELD =
-  'w-20 px-1.5 py-0.5 rounded border border-white/10 bg-black/40 font-mono text-[11px] et-ink tabular-nums focus-visible:outline focus-visible:outline-purple-400';
+  'w-20 px-1.5 py-0.5 rounded border border-white/10 bg-black/40 text-xs font-semibold et-ink tabular-nums focus-visible:outline focus-visible:outline-purple-400';
 const BTN =
   'inline-flex items-center gap-1 px-2 py-1 rounded border border-white/10 et-ink-2 hover:et-ink hover:bg-white/5 font-display text-xs font-bold uppercase tracking-wider transition-colors focus-visible:outline focus-visible:outline-purple-400 disabled:opacity-40';
 const BTN_ON = 'border-[rgb(var(--et-accent)/0.6)] bg-white/10 text-[rgb(var(--et-accent))]';
@@ -168,7 +168,7 @@ const NumField: React.FC<{
             }
           }}
         />
-        <span aria-hidden="true" className="font-mono text-[9px] et-ink-2">
+        <span aria-hidden="true" className="tabular-nums text-xs font-semibold et-ink-2">
           {unit}
         </span>
       </div>
@@ -726,7 +726,7 @@ export const AudioEditorPanel: React.FC = () => {
           onChange={(e) => setViewScrollSec(Number(e.target.value))}
           className="grow min-w-0 accent-[rgb(var(--et-accent))] disabled:opacity-30"
         />
-        <span className="shrink-0 font-mono text-[10px] et-ink-2 tabular-nums">
+        <span className="shrink-0 text-xs font-semibold et-ink-2 tabular-nums">
           {secs(win.startSec, 2)}–{secs(win.endSec, 2)} / {secs(sourceDuration, 2)} s
         </span>
       </div>
@@ -783,7 +783,7 @@ export const AudioEditorPanel: React.FC = () => {
             <label htmlFor={`${ids}-gain`} className={LABEL}>
               Clip gain
             </label>
-            <output htmlFor={`${ids}-gain`} className="font-mono text-[10px] et-ink-2 tabular-nums">
+            <output htmlFor={`${ids}-gain`} className="text-xs font-semibold et-ink-2 tabular-nums">
               {gainDb.toFixed(1)} dB
             </output>
           </div>
