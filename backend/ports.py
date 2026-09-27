@@ -260,6 +260,12 @@ def _listening_pids(port: int) -> list[int]:
     return [h.pid for h in holders([port])]
 
 
+#: Do the servers theDAW launches set SO_REUSEADDR before they bind? asyncio's
+#: create_server defaults ``reuse_address`` to this same test, and libuv sets
+#: the option on every POSIX TCP bind.
+_SERVERS_REUSE_ADDRESS = os.name == "posix" and sys.platform != "cygwin"
+
+
 def is_port_free(port: int, host: str = "0.0.0.0") -> bool:
     """Can theDAW bind ``port``? False means something already holds it.
 
@@ -274,13 +280,21 @@ def is_port_free(port: int, host: str = "0.0.0.0") -> bool:
 
     So: consult the listening table first, since it is the only authority that
     sees every address, and fall back to a bind attempt with the same wildcard
-    address and SO_REUSEADDR semantics uvicorn uses.
+    address and SO_REUSEADDR semantics the servers use.
     """
     if _listening_pids(port):
         return False
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        # Deliberately NOT SO_REUSEADDR: uvicorn does not set it on Windows, and
-        # setting it here would make the probe succeed where the real bind fails.
+        if _SERVERS_REUSE_ADDRESS:
+            # uvicorn (asyncio's create_server) and Vite (Node/libuv) both set
+            # SO_REUSEADDR on POSIX, so their bind succeeds while sockets from a
+            # just-stopped server sit in TIME_WAIT. Without it this probe fails
+            # with EADDRINUSE for up to a minute after --free stops a stale
+            # server, and the launcher refuses a port nothing holds.
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Never on Windows: neither server sets it there, SO_REUSEADDR on
+        # Windows lets a bind share a port a live listener holds, and Windows
+        # binds through TIME_WAIT without it.
         try:
             probe.bind((host, port))
         except OSError:

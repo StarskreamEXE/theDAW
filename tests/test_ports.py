@@ -717,6 +717,49 @@ def test_require_frontend_port_names_the_program_holding_it(
         assert proc.poll() is None
 
 
+def _stop_a_server_with_a_client_connected() -> int:
+    """Replay what ``--free`` leaves behind when it stops a stale web UI that a
+    browser tab was still talking to: the server closes the connection first,
+    so its end of it sits in TIME_WAIT on the server's port, and then the
+    listener goes away. Returns that port, which nothing is listening on."""
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if os.name == "posix":
+        # Vite's own bind (libuv) sets it on POSIX, and Linux lets a later
+        # SO_REUSEADDR bind through a TIME_WAIT only when the socket that left
+        # it had the option too.
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("0.0.0.0", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    with closing(socket.create_connection(("127.0.0.1", port), timeout=5)) as tab:
+        served, _ = listener.accept()
+        # The server's side closes first, so the TIME_WAIT lands on its port.
+        served.close()
+        tab.settimeout(5)
+        assert tab.recv(1) == b""
+    listener.close()
+    return port
+
+
+def test_a_web_ui_port_left_in_time_wait_is_free_for_the_next_launch(
+    monkeypatch: pytest.MonkeyPatch, capsys
+):
+    """Vite binds with SO_REUSEADDR on Linux and macOS, so it starts on a port
+    whose only sockets are a stopped server's TIME_WAIT. The launcher's check
+    has to agree; on Linux a bind probe without that option failed with
+    EADDRINUSE for up to a minute after --free, and the launch stopped naming
+    no program. On
+    Windows, which binds through TIME_WAIT either way, this passes regardless;
+    the Linux CI runner is where it catches the probe."""
+    port = _stop_a_server_with_a_client_connected()
+    monkeypatch.setattr(ports, "FRONTEND_PORT", port)
+
+    assert ports.is_port_free(port) is True
+    assert ports.frontend_port_blocker() is None
+    assert ports._main(["--require-frontend-port"]) == 0
+    assert capsys.readouterr().out == ""
+
+
 def test_require_frontend_port_is_silent_and_zero_when_the_port_is_free(
     monkeypatch: pytest.MonkeyPatch, capsys, unused_port: int
 ):
