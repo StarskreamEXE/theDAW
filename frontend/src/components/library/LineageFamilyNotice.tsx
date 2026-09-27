@@ -9,7 +9,7 @@
  * one, so a count of relatives is never a count of the first 600 posing as
  * the family.
  */
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { Loader2, Network } from 'lucide-react';
 import { readFamily, readWholeFamily, type FamilyRead } from '../../lib/lineageFamily';
 
@@ -111,6 +111,61 @@ export function useLineageFamily(entryId: string | null, depth: number, enabled 
     wholeError: wholeNow?.error ?? null,
     loadWhole,
   };
+}
+
+/**
+ * Rows a relatives list draws before "Show all N". The whole family of a hub
+ * song can hold tens of thousands of direct relatives; drawing every one is a
+ * press the user makes, never what loading the family does on its own.
+ */
+export const RELATIVES_SHOWN = 200;
+
+const MORE_KEY =
+  'self-start rounded border border-white/15 px-2 py-1 text-xs font-bold text-zinc-300 transition-colors hover:border-white/30 hover:text-white';
+
+/**
+ * A list of relatives that draws the first {@link RELATIVES_SHOWN} and offers
+ * the rest. `family` is the read the rows came from: a new read (another song,
+ * or the whole family replacing the capped one) folds the list again, so a
+ * press on one family never draws every row of the next.
+ */
+export function RelativeList<T>({
+  items,
+  family,
+  render,
+  as: Tag = 'ul',
+  className,
+}: {
+  items: readonly T[];
+  family: FamilyRead;
+  render: (item: T, index: number) => React.ReactNode;
+  as?: 'ul' | 'div';
+  className?: string;
+}): React.ReactElement {
+  const listId = useId();
+  const [openFor, setOpenFor] = useState<FamilyRead | null>(null);
+  const open = openFor === family;
+  const shown = open ? items : items.slice(0, RELATIVES_SHOWN);
+  return (
+    <>
+      <Tag id={listId} className={className}>
+        {shown.map(render)}
+      </Tag>
+      {items.length > RELATIVES_SHOWN && (
+        <button
+          type="button"
+          className={MORE_KEY}
+          aria-expanded={open}
+          aria-controls={listId}
+          onClick={() => setOpenFor(open ? null : family)}
+        >
+          {open
+            ? `Show the first ${RELATIVES_SHOWN.toLocaleString('en-US')}`
+            : `Show all ${items.length.toLocaleString('en-US')}`}
+        </button>
+      )}
+    </>
+  );
 }
 
 const LOAD_KEY =

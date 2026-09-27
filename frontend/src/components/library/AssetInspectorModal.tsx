@@ -30,7 +30,7 @@ import { logError } from '../../state/logStore';
 import { deriveLyrics, deriveStyle } from '../../catalog/catalogSearch';
 import { fetchBlobWithRetry } from '../../lib/fetchRetry';
 import { edgeColor, relationWords, relativesOf, type LineageNode } from '../../lib/lineageInsights';
-import { LineageFamilyNotice, useLineageFamily } from './LineageFamilyNotice';
+import { LineageFamilyNotice, RelativeList, useLineageFamily } from './LineageFamilyNotice';
 import { FLYOUT_CARD } from '../audio/midiDockKit';
 import {
   ASSET_INSPECTOR_TAB_STORAGE_KEY,
@@ -362,7 +362,7 @@ export const AssetInspectorModal: React.FC<Props> = ({ entryId, onClose, initial
     if (!entry || !lineage) return null;
     const byId: Record<string, LineageNode> = {};
     for (const n of lineage.nodes) byId[n.id] = n;
-    return { byId, ...relativesOf(entry.id, lineage.edges) };
+    return { read: lineage, byId, ...relativesOf(entry.id, lineage.edges) };
   }, [entry, lineage]);
   const usedIn = useMemo(() => {
     if (!entry) return [];
@@ -610,8 +610,11 @@ export const AssetInspectorModal: React.FC<Props> = ({ entryId, onClose, initial
                   {family.incoming.length > 0 && (
                     <>
                       <span className="text-xs font-bold text-zinc-500">Came from ({family.incoming.length})</span>
-                      <ul className="flex flex-col gap-0.5">
-                        {family.incoming.map((e, i) => (
+                      <RelativeList
+                        items={family.incoming}
+                        family={family.read}
+                        className="flex flex-col gap-0.5"
+                        render={(e, i) => (
                           <RelativeRow
                             key={`in-${e.from_id}-${e.kind}-${i}`}
                             kind={e.kind}
@@ -619,15 +622,18 @@ export const AssetInspectorModal: React.FC<Props> = ({ entryId, onClose, initial
                             title={family.byId[e.from_id]?.title}
                             onReveal={revealInLibrary}
                           />
-                        ))}
-                      </ul>
+                        )}
+                      />
                     </>
                   )}
                   {family.outgoing.length > 0 && (
                     <>
                       <span className="text-xs font-bold text-zinc-500">Led to ({family.outgoing.length})</span>
-                      <ul className="flex flex-col gap-0.5">
-                        {family.outgoing.map((e, i) => (
+                      <RelativeList
+                        items={family.outgoing}
+                        family={family.read}
+                        className="flex flex-col gap-0.5"
+                        render={(e, i) => (
                           <RelativeRow
                             key={`out-${e.to_id}-${e.kind}-${i}`}
                             kind={e.kind}
@@ -635,8 +641,8 @@ export const AssetInspectorModal: React.FC<Props> = ({ entryId, onClose, initial
                             title={family.byId[e.to_id]?.title}
                             onReveal={revealInLibrary}
                           />
-                        ))}
-                      </ul>
+                        )}
+                      />
                     </>
                   )}
                 </section>

@@ -4,7 +4,7 @@ import type { LibraryEntry } from '../state/libraryEntry';
 import { useLibraryStore } from '../state/libraryStore';
 import { useAppUiStore } from '../state/appUiStore';
 import { ProviderBadge } from '../components/library/ProviderBadge';
-import { LineageFamilyNotice, useLineageFamily } from '../components/library/LineageFamilyNotice';
+import { LineageFamilyNotice, RelativeList, useLineageFamily } from '../components/library/LineageFamilyNotice';
 import type { LineageNode } from '../lib/lineageInsights';
 
 const OPEN_KEY =
@@ -193,8 +193,14 @@ export const CatalogueLineage: React.FC<Props> = ({ entry }) => {
           <span className="text-xs font-bold text-zinc-500 px-1.5">
             {children.length} descendant{children.length === 1 ? '' : 's'}
           </span>
-          {children.map((id) =>
-            renderNodeRow(id, { depth: ancestorChain.length, childOf: 'child' }),
+          {data && (
+            <RelativeList
+              as="div"
+              items={children}
+              family={data}
+              className="flex flex-col"
+              render={(id) => renderNodeRow(id, { depth: ancestorChain.length, childOf: 'child' })}
+            />
           )}
         </div>
       )}
@@ -205,7 +211,15 @@ export const CatalogueLineage: React.FC<Props> = ({ entry }) => {
           <span className="text-xs font-bold text-zinc-500 px-1.5">
             {siblings.length} sibling{siblings.length === 1 ? '' : 's'}
           </span>
-          {siblings.map((id) => renderNodeRow(id, { childOf: 'sibling' }))}
+          {data && (
+            <RelativeList
+              as="div"
+              items={siblings}
+              family={data}
+              className="flex flex-col"
+              render={(id) => renderNodeRow(id, { childOf: 'sibling' })}
+            />
+          )}
         </div>
       )}
 

@@ -7,7 +7,9 @@
  * the family. These tests mount each panel for real (jsdom, React), let the
  * capped answer land, check the cut is said with a key to load the whole
  * family, press it, and check the whole family replaces the cut one. A read
- * that lands after the panel moved to another song is dropped.
+ * that lands after the panel moved to another song is dropped. A list of
+ * relatives draws its first 200 rows and offers the rest, and a new family
+ * folds a list the user opened on the old one.
  *
  * Run: `npx tsx src/components/library/LineageFamilyNotice.test.tsx`
  */
@@ -138,6 +140,15 @@ async function main(): Promise<void> {
   const text = () => doc.body.textContent ?? '';
   const loadKey = (): HTMLButtonElement | undefined =>
     Array.from(doc.querySelectorAll('button')).find((b) => /Load the whole family|Loading the whole family/.test(b.textContent ?? ''));
+  /** The "Show all N" / "Show the first 200" key of a relatives list. */
+  const moreKey = (): HTMLButtonElement | undefined =>
+    Array.from(doc.querySelectorAll('button')).find((b) => /^Show (all [\d,]+|the first 200)$/.test(b.textContent ?? ''));
+  /** The rows the list a "Show all" key controls draws right now. */
+  const rowsOf = (keyEl: HTMLButtonElement): number => {
+    const list = doc.getElementById(keyEl.getAttribute('aria-controls') ?? '');
+    assert.ok(list, 'the key names the list it opens');
+    return list!.children.length;
+  };
 
   // ── INFO: the cut is said, and the whole family replaces it ──────────────
   {
@@ -159,6 +170,18 @@ async function main(): Promise<void> {
     await settle();
     assert.ok(text().includes('No prompts or tags across the family yet.'), 'the capped family’s themes were read');
 
+    // The 599 direct relatives draw 200 rows and offer the rest.
+    const more = moreKey();
+    assert.ok(more, 'a long list offers the rest');
+    assert.equal(more!.textContent, 'Show all 599');
+    assert.equal(more!.getAttribute('aria-expanded'), 'false');
+    assert.equal(rowsOf(more!), 200, 'only the first 200 rows are drawn');
+    await act(async () => more!.click());
+    await settle();
+    assert.equal(rowsOf(moreKey()!), 599, 'the press draws every row');
+    assert.equal(moreKey()!.getAttribute('aria-expanded'), 'true');
+    assert.equal(moreKey()!.textContent, 'Show the first 200');
+
     await act(async () => key!.click());
     await settle();
     assert.ok(asked.includes(`/api/library/${ROOT}/lineage/full?depth=4`), 'the whole family is read at the depth INFO shows');
@@ -166,6 +189,10 @@ async function main(): Promise<void> {
     assert.ok(text().includes('The whole family is loaded: 701 in all.'));
     assert.ok(!loadKey(), 'and the key has done its job');
     assert.ok(themesKey(), 'themes read from the replaced family are dropped, to be read again from the whole one');
+    // The whole family folds the list the user opened on the capped one, so
+    // loading it never draws 700 rows at once.
+    assert.equal(moreKey()!.textContent, 'Show all 700', 'the whole family’s list is folded');
+    assert.equal(rowsOf(moreKey()!), 200);
 
     // A whole-family read that lands after INFO moved to another song is
     // dropped: the other song's answer stays on screen.
@@ -235,7 +262,11 @@ async function main(): Promise<void> {
     await act(async () => loadKey()!.click());
     await settle();
     assert.ok(text().includes('0 before · 700 after'), 'and loads the whole family on request');
-    assert.ok(text().includes('Led to (700)'), 'every direct relative is listed');
+    assert.ok(text().includes('Led to (700)'), 'every direct relative is counted');
+    assert.equal(rowsOf(moreKey()!), 200, 'the first 200 are drawn');
+    await act(async () => moreKey()!.click());
+    await settle();
+    assert.equal(rowsOf(moreKey()!), 700, 'and all 700 on request');
     await act(async () => root.unmount());
   }
 
@@ -250,6 +281,8 @@ async function main(): Promise<void> {
     await settle();
     assert.ok(asked.includes(`/api/library/${ROOT}/lineage/full?depth=3`), 'at the depth the catalogue shows');
     assert.ok(text().includes('700 descendants'), `and the whole family replaces it: ${text().slice(0, 300)}`);
+    assert.equal(moreKey()!.textContent, 'Show all 700');
+    assert.equal(rowsOf(moreKey()!), 200, 'the catalogue draws the first 200 descendants');
     await act(async () => root.unmount());
   }
 

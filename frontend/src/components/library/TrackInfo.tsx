@@ -36,7 +36,7 @@ import {
   type Themes,
 } from '../../lib/lineageInsights';
 import { deriveLyrics } from '../../catalog/catalogSearch';
-import { LineageFamilyNotice, useLineageFamily } from './LineageFamilyNotice';
+import { LineageFamilyNotice, RelativeList, useLineageFamily } from './LineageFamilyNotice';
 
 type Row = Record<string, unknown>;
 
@@ -101,6 +101,8 @@ export const TrackInfo: React.FC<{
 }> = ({ entryId, stems, midis, scores, onOpenDetails, onOpenLineage, onSelectEntry }) => {
   const entry = useLibraryStore((s) => (entryId ? s.entries.find((e) => e.id === entryId) : undefined));
   const libraryEntries = useLibraryStore((s) => s.entries);
+  // One lookup for every relative row: a whole family can list thousands.
+  const libraryTitles = useMemo(() => new Map(libraryEntries.map((e) => [e.id, e.title])), [libraryEntries]);
 
   const [analysis, setAnalysis] = useState<AnalysisRow | null>(null);
   const [identity, setIdentity] = useState<NotationIdentity | null>(null);
@@ -153,7 +155,7 @@ export const TrackInfo: React.FC<{
     if (!entryId || !lineageRead) return null;
     const byId: Record<string, LineageNode> = {};
     for (const n of lineageRead.nodes) byId[n.id] = n;
-    return { byId, ...relativesOf(entryId, lineageRead.edges) };
+    return { read: lineageRead, byId, ...relativesOf(entryId, lineageRead.edges) };
   }, [entryId, lineageRead]);
 
   // Themes fetch every entry in the family, so they are read on request.
@@ -188,8 +190,8 @@ export const TrackInfo: React.FC<{
   }
 
   const lyrics = entry.lyrics || deriveLyrics(entry);
-  const inLibrary = (id: string) => libraryEntries.some((e) => e.id === id);
-  const nodeTitle = (id: string) => family?.byId[id]?.title || libraryEntries.find((e) => e.id === id)?.title || `${id.slice(0, 12)}…`;
+  const inLibrary = (id: string) => libraryTitles.has(id);
+  const nodeTitle = (id: string) => family?.byId[id]?.title || libraryTitles.get(id) || `${id.slice(0, 12)}…`;
 
   const relativeRow = (edge: LineageEdge, otherId: string, i: number) => {
     const title = nodeTitle(otherId);
@@ -403,13 +405,23 @@ export const TrackInfo: React.FC<{
             {family.incoming.length > 0 && (
               <>
                 <span className="text-xs font-bold text-zinc-500">Came from ({family.incoming.length})</span>
-                <ul className="flex flex-col gap-0.5">{family.incoming.map((e, i) => relativeRow(e, e.from_id, i))}</ul>
+                <RelativeList
+                  items={family.incoming}
+                  family={family.read}
+                  className="flex flex-col gap-0.5"
+                  render={(e, i) => relativeRow(e, e.from_id, i)}
+                />
               </>
             )}
             {family.outgoing.length > 0 && (
               <>
                 <span className="text-xs font-bold text-zinc-500">Led to ({family.outgoing.length})</span>
-                <ul className="flex flex-col gap-0.5">{family.outgoing.map((e, i) => relativeRow(e, e.to_id, i))}</ul>
+                <RelativeList
+                  items={family.outgoing}
+                  family={family.read}
+                  className="flex flex-col gap-0.5"
+                  render={(e, i) => relativeRow(e, e.to_id, i)}
+                />
               </>
             )}
             {Object.keys(family.spawnedByKind).length > 0 && (
