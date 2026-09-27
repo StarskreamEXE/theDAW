@@ -111,7 +111,19 @@ const SMALL_TEXT = /text-\[(?:[0-9]|1[01])(?:\.\d+)?px\]|font-mono/;
   const legendText = () => (container.querySelector('ul') as HTMLUListElement).textContent ?? '';
   assert.match(legendText(), /Red: beat/);
   assert.match(legendText(), /Green: mids 420 Hz–1\.7 kHz/);
-  assert.match(button.getAttribute('aria-label') ?? '', /^Waveform colors: Color/);
+  // The accessible name starts with the words on the button (WCAG 2.5.3):
+  // the visible "Wave: Color" was aria-hidden and the name began "Waveform
+  // colors", so "click Wave Color" reached nothing.
+  const visibleText = () =>
+    [...button.querySelectorAll('span')].map((el) => el.textContent ?? '').filter((t) => /\w/.test(t)).join(' ');
+  const nameStartsWithVisibleText = () => {
+    const visible = visibleText();
+    assert.ok(visible.length > 0, 'the toolbar toggle shows words');
+    assert.ok((button.getAttribute('aria-label') ?? '').startsWith(visible), `"${button.getAttribute('aria-label')}" starts with "${visible}"`);
+  };
+  assert.equal(visibleText(), 'Wave: Color');
+  nameStartsWithVisibleText();
+  assert.match(button.getAttribute('aria-label') ?? '', /Red: beat/, 'the name still carries the legend');
 
   await act(async () => {
     button.click(); // plain
@@ -122,7 +134,9 @@ const SMALL_TEXT = /text-\[(?:[0-9]|1[01])(?:\.\d+)?px\]|font-mono/;
   assert.equal(useWaveformStyleStore.getState().mode, 'clipping');
   assert.match(legendText(), /Red: clipped/);
   assert.doesNotMatch(legendText(), /beat/i, 'the clipping legend never calls red a beat');
-  assert.match(button.getAttribute('aria-label') ?? '', /^Waveform colors: Clipping/);
+  assert.equal(visibleText(), 'Wave: Clipping');
+  nameStartsWithVisibleText();
+  assert.match(button.getAttribute('aria-label') ?? '', /Red: clipped/);
 
   for (const el of container.querySelectorAll('button, ul, li, span')) {
     assert.doesNotMatch((el as HTMLElement).className ?? '', SMALL_TEXT, `no small text in the control: ${(el as HTMLElement).className}`);

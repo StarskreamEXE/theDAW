@@ -47,7 +47,9 @@ export const WaveformModeToggle: React.FC<WaveformModeToggleProps> = ({ variant,
   const mode = useWaveformStyleStore((s) => s.mode);
   const cycleMode = useWaveformStyleStore((s) => s.cycleMode);
   const next = WAVEFORM_MODE_NAME[nextMode(mode)];
-  const label = `Waveform colors: ${WAVEFORM_MODE_NAME[mode]} (${waveformLegendText(mode)}). Press for ${next}.`;
+  // Starts with the toolbar variant's visible words, so a voice-control user
+  // who says what they see ("click Wave Color") reaches the button.
+  const label = `Wave: ${WAVEFORM_MODE_NAME[mode]}. Waveform colors: ${waveformLegendText(mode)}. Press for ${next}.`;
   const base =
     'font-sans text-xs font-bold leading-none transition-colors focus-visible:outline focus-visible:outline-purple-400';
   const look =
