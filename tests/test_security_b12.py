@@ -693,7 +693,9 @@ def test_save_without_embed_audio_does_not_widen_clip_audio_for_an_unauthenticat
     must never reach ``_register_project_media`` -> ``media_access.register_paths``
     -> ``register_root``, which would otherwise permanently widen the
     ``/clip-audio`` allowlist to whatever folder the request body named."""
-    monkeypatch.setattr(media_access, "_ROOTS_STATE", tmp_path / "media_roots.json")
+    monkeypatch.setattr(
+        media_access, "_ROOTS_STATE", tmp_path / "clip_audio_roots.json"
+    )
     monkeypatch.setattr(media_access, "_session_roots", [])
     widened = tmp_path / "windows-temp"
     widened.mkdir()
@@ -830,15 +832,18 @@ def _known_project_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pat
     on-disk mirror, and the project router's recent-files list -- into
     ``tmp_path``. Without this, a save/load/save-session test that reaches
     ``media_access.register_root`` calls the real ``_persist()`` against the
-    live ``data/media_roots.json`` (and the live ``data/recent_projects.json``
-    via the recent-files list), same as two tests already did individually
-    before this was hoisted; a whole run of this file previously left dozens
-    of pytest temp-dir paths in both files on disk."""
+    live ``data/clip_audio_roots.json`` and ``data/media_roots.json`` (and the
+    live ``data/recent_projects.json`` via the recent-files list), same as two
+    tests already did individually before this was hoisted; a whole run of
+    this file previously left dozens of pytest temp-dir paths in those files
+    on disk."""
     projects = tmp_path / "known-projects"
     library = tmp_path / "known-library"
     monkeypatch.setattr(known_paths, "projects_dir", lambda: projects)
     monkeypatch.setattr(backend_paths, "library_root", lambda: library)
-    monkeypatch.setattr(media_access, "_ROOTS_STATE", tmp_path / "media_roots.json")
+    monkeypatch.setattr(
+        media_access, "_ROOTS_STATE", tmp_path / "clip_audio_roots.json"
+    )
     monkeypatch.setattr(media_access, "_session_roots", [])
     monkeypatch.setattr(project_router, "_RECENT_PATH", tmp_path / "recent.json")
     monkeypatch.setattr(project_router, "_recent_files", [])
@@ -851,21 +856,27 @@ def _isolated_media_and_recent_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Safety net, autouse for every test in this file: redirects
-    ``media_access``'s session-root allowlist (and its on-disk mirror) and
-    the project router's recent-files list into this test's own
-    ``tmp_path`` before the test body runs, so a test that reaches
-    ``media_access.register_root`` -- directly, or indirectly via
+    ``media_access``'s session-root allowlist (and its on-disk mirror), the
+    project router's recent-files list and the known-paths registry into
+    this test's own ``tmp_path`` before the test body runs, so a test that
+    reaches ``media_access.register_root`` -- directly, or indirectly via
     ``/save``/``/load``/``/save-session`` -- can never touch the real
-    ``data/media_roots.json`` or ``data/recent_projects.json``, even if it
-    forgets to call ``_known_project_roots`` itself. ``_known_project_roots``
-    re-applies the same patches (redundant but harmless -- same test, same
-    ``tmp_path``, same ``monkeypatch`` instance) when a test also needs
+    ``data/clip_audio_roots.json``, ``data/media_roots.json``,
+    ``data/recent_projects.json`` or ``data/known_paths.json`` (the recent
+    list records every saved or opened file there), even if it forgets to call
+    ``_known_project_roots`` itself. ``_known_project_roots`` re-applies the
+    same patches (redundant but harmless -- same test, same ``tmp_path``,
+    same ``monkeypatch`` instance) when a test also needs
     ``known_paths.projects_dir()``/``paths.library_root()`` redirected."""
-    monkeypatch.setattr(media_access, "_ROOTS_STATE", tmp_path / "media_roots.json")
+    monkeypatch.setattr(
+        media_access, "_ROOTS_STATE", tmp_path / "clip_audio_roots.json"
+    )
     monkeypatch.setattr(media_access, "_session_roots", [])
     monkeypatch.setattr(project_router, "_RECENT_PATH", tmp_path / "recent.json")
     monkeypatch.setattr(project_router, "_recent_files", [])
     monkeypatch.setattr(project_router, "_recent_seen", None)
+    monkeypatch.setattr(known_paths, "_STORE_PATH", tmp_path / "known_paths.json")
+    monkeypatch.setattr(known_paths, "_GRANTS", {})
 
 
 # ---------------------------------------------------------------------------
@@ -929,7 +940,9 @@ def test_load_does_not_widen_clip_audio_for_an_unauthenticated_lan_caller(
     project_client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A refused /load must never reach _register_project_media."""
-    monkeypatch.setattr(media_access, "_ROOTS_STATE", tmp_path / "media_roots.json")
+    monkeypatch.setattr(
+        media_access, "_ROOTS_STATE", tmp_path / "clip_audio_roots.json"
+    )
     monkeypatch.setattr(media_access, "_session_roots", [])
     resp = project_client.post(
         "/api/project/load", json={"path": str(tmp_path / "song.tasmo")}

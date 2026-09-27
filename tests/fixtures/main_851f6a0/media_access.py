@@ -20,9 +20,7 @@ Two kinds of root:
 
 The registry is persisted next to the recent-projects list so re-opening the
 app does not silently break playback of a session the UI restores from its own
-storage. Two files hold it, because builds before this one read another shape
-(see ``_LEGACY_ROOTS_NAME``): ``clip_audio_roots.json`` is this build's own,
-and ``media_roots.json`` is kept current in the older builds' format.
+storage.
 """
 
 from __future__ import annotations
@@ -31,28 +29,14 @@ import json
 import logging
 import os
 import tempfile
-import threading
 from collections.abc import Iterable
 from pathlib import Path
 from backend.lib import paths
-from backend.lib.atomic import atomic_write
 
 log = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
-_ROOTS_STATE = paths.data_path("clip_audio_roots.json")
-
-#: The file every build before this one reads and writes, as a bare JSON list
-#: of folders; any other shape there reads as no grants at all. It sits beside
-#: ``_ROOTS_STATE`` (derived from it, so a test that moves one moves both) and
-#: is rewritten in that list format whenever the grants change here, so a run
-#: of an older build still plays the clips this one was allowed to serve.
-_LEGACY_ROOTS_NAME = "media_roots.json"
-
-# register_root runs on the threadpool (the sync save/load handlers). Held
-# across check, insert and persist so two grants in flight cannot both pass
-# the membership check, and so the two files are written from one snapshot.
-_LOCK = threading.Lock()
+_ROOTS_STATE = paths.data_path("media_roots.json")
 
 # A session root is remembered per opened project; the cap keeps a long-lived
 # install from accumulating an unbounded allowlist.
@@ -111,141 +95,37 @@ def _static_roots() -> list[Path]:
     return out
 
 
-# Format of ``_ROOTS_STATE``: ``{"v": 2, "roots": [...]}``. Any other shape in
-# that file reads as no grants.
-_ROOTS_STATE_VERSION = 2
-
-
-def _legacy_state() -> Path:
-    return _ROOTS_STATE.with_name(_LEGACY_ROOTS_NAME)
-
-
-def _read_json(path: Path) -> object:
-    """``path`` parsed, or None when it is missing or unreadable."""
+def _load_session_roots() -> list[Path]:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(_ROOTS_STATE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return None
-
-
-def _parse_roots(items: object, *, existing_only: bool) -> list[Path]:
-    """The usable folders in a persisted list: resolved, de-duped, capped.
-
-    ``existing_only`` also drops a folder that is not a directory on disk now;
-    the one-time import from the older builds' file asks for that.
-    """
-    if not isinstance(items, list):
+        return []
+    if not isinstance(raw, list):
         return []
     out: list[Path] = []
-    for item in items:
+    for item in raw:
         if not isinstance(item, str):
             continue
         p = _safe_resolve(item)
-        if p is None or _is_too_broad(p) or p in out:
-            continue
-        if existing_only and not p.is_dir():
-            continue
-        out.append(p)
+        if p and not _is_too_broad(p) and p not in out:
+            out.append(p)
     return out[:MAX_SESSION_ROOTS]
-
-
-def _write_state(roots: list[Path]) -> None:
-    """``_ROOTS_STATE`` in this build's format. Best effort."""
-    try:
-        atomic_write(
-            _ROOTS_STATE,
-            json.dumps(
-                {"v": _ROOTS_STATE_VERSION, "roots": [str(p) for p in roots]},
-                indent=2,
-            ),
-        )
-    except OSError as e:
-        log.warning("project.media_access: failed to persist %s: %s", _ROOTS_STATE, e)
-
-
-def _write_legacy(roots: list[Path]) -> None:
-    """``media_roots.json`` in the older builds' list format. Best effort.
-
-    This build's grants come first, then every folder the file already listed
-    that this build does not hold: those are grants an older build made on its
-    own, and they stay in its file.
-    """
-    legacy = _legacy_state()
-    if legacy == _ROOTS_STATE:
-        return
-    out = [str(p) for p in roots]
-    held = set(roots)
-    existing = _read_json(legacy)
-    if isinstance(existing, list):
-        for item in existing:
-            if not isinstance(item, str):
-                continue
-            p = _safe_resolve(item)
-            if p is None or p in held:
-                continue
-            held.add(p)
-            out.append(item)
-    try:
-        atomic_write(legacy, json.dumps(out[:MAX_SESSION_ROOTS], indent=2))
-    except OSError as e:
-        log.warning("project.media_access: failed to persist %s: %s", legacy, e)
-
-
-def _import_legacy_roots() -> list[Path]:
-    """This build's first run: take over the grants the older builds recorded.
-
-    ``media_roots.json`` holds a bare list when an older build wrote it, or the
-    ``{"v": 2}`` object the first v2 build wrote there before this build's file
-    had a name of its own. Only folders that are still directories are taken.
-    The older builds' project routes were ungated, so their list can hold a
-    folder a LAN caller named rather than one a project the user opened drew
-    from; what such a folder exposes is its audio, the only files /clip-audio
-    serves. A folder an older build grants after this run is not taken over:
-    it joins this build's list when this build opens the project that uses it.
-
-    The result is written to ``_ROOTS_STATE`` at once, which is what makes this
-    the first run only. A ``{"v": 2}`` object found in the older builds' file
-    is replaced with their list format, so they read their grants again.
-    """
-    legacy = _legacy_state()
-    if legacy == _ROOTS_STATE:
-        return []
-    raw = _read_json(legacy)
-    if isinstance(raw, list):
-        items: object = raw
-    elif isinstance(raw, dict) and raw.get("v") == _ROOTS_STATE_VERSION:
-        items = raw.get("roots")
-    else:
-        return []
-    roots = _parse_roots(items, existing_only=True)
-    _write_state(roots)
-    if not isinstance(raw, list):
-        _write_legacy(roots)
-    log.info(
-        "project.media_access: took over %d clip audio folder(s) from %s",
-        len(roots),
-        legacy,
-    )
-    return roots
-
-
-def _load_session_roots() -> list[Path]:
-    if not _ROOTS_STATE.exists():
-        return _import_legacy_roots()
-    raw = _read_json(_ROOTS_STATE)
-    if not isinstance(raw, dict) or raw.get("v") != _ROOTS_STATE_VERSION:
-        return []
-    return _parse_roots(raw.get("roots"), existing_only=False)
 
 
 _session_roots: list[Path] = _load_session_roots()
 
 
 def _persist() -> None:
-    """Best-effort: an unwritable data dir must not fail a save/load request.
-    Call under ``_LOCK``."""
-    _write_state(_session_roots)
-    _write_legacy(_session_roots)
+    """Best-effort: an unwritable data dir must not fail a save/load request."""
+    try:
+        _ROOTS_STATE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _ROOTS_STATE.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps([str(p) for p in _session_roots], indent=2), encoding="utf-8"
+        )
+        tmp.replace(_ROOTS_STATE)
+    except OSError as e:
+        log.warning("project.media_access: failed to persist %s: %s", _ROOTS_STATE, e)
 
 
 def register_root(path: str | os.PathLike[str]) -> bool:
@@ -262,12 +142,12 @@ def register_root(path: str | os.PathLike[str]) -> bool:
         return False
     if any(folder == r or folder.is_relative_to(r) for r in _static_roots()):
         return False
-    with _LOCK:
-        if folder in _session_roots:
-            return False
-        _session_roots.insert(0, folder)
-        del _session_roots[MAX_SESSION_ROOTS:]
-        _persist()
+    if folder in _session_roots:
+        return False
+
+    _session_roots.insert(0, folder)
+    del _session_roots[MAX_SESSION_ROOTS:]
+    _persist()
     log.info("project.media_access: allowing clip audio from %s", folder)
     return True
 
