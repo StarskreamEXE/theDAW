@@ -112,19 +112,22 @@ def stdin_user_turns(log_path: Path) -> list[str]:
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
-def _older_store_module(name: str):
-    """An older build's settings store, loaded from its verbatim copy."""
-    spec = importlib.util.spec_from_file_location(name, FIXTURES / f"{name}.py")
+def _older_store_module(build: str):
+    """An older build's settings store, loaded from its verbatim copy in
+    tests/fixtures/<build>/settings_store.py."""
+    spec = importlib.util.spec_from_file_location(
+        f"settings_store_{build}", FIXTURES / build / "settings_store.py"
+    )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-def _older_build_reopens(path: Path, name: str, schema_version: int) -> None:
+def _older_build_reopens(path: Path, build: str, schema_version: int) -> None:
     """Open the file with an older build's OWN store code (main, schema 8; PR
     #207 head, schema 10), and save one of that build's own toggles through it
     the way its settings page would."""
-    store = _older_store_module(name).SettingsStore(path)
+    store = _older_store_module(build).SettingsStore(path)
     store.patch({"stems": {"auto_on_import": True}})
     on_disk = json.loads(path.read_text(encoding="utf-8"))
     # That build's code really ran: it stamped its own schema back on disk.
@@ -157,10 +160,10 @@ def test_a_file_from_main_gains_the_switch_on_and_keeps_the_users_choice(tmp_pat
     store.patch({"assistant": {"use_user_claude_config": False}})
 
     # main opens and saves the file, then this build again: the choice survives.
-    _older_build_reopens(path, "settings_store_main_851f6a0", 8)
+    _older_build_reopens(path, "main_851f6a0", 8)
     assert SettingsStore(path).get_value("assistant", "use_user_claude_config") is False
     # The same through the PR #207 head.
-    _older_build_reopens(path, "settings_store_pr207_8039b45", 10)
+    _older_build_reopens(path, "pr207_8039b45", 10)
     reopened = SettingsStore(path)
     assert reopened.get_value("assistant", "use_user_claude_config") is False
     assert reopened.get_value("stems", "auto_on_import") is True
