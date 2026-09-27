@@ -8,7 +8,8 @@
  * section headers in EDIT use Orbitron (font-display) like the headers round
  * one restyled there. Text inputs keep their mono face at 12px: that is typed
  * content (URLs, keys, prompts), and the guard tells them apart by the focus /
- * placeholder utilities only a field carries.
+ * placeholder utilities only a field carries. Process log output shown as-is
+ * (the Underfit sidecar's log tail, `whitespace-pre-wrap`) keeps mono at 12px too.
  *
  * The views need the full store tree to render, so per the house pattern for a
  * component-only fix (see MixView.vstBrowser.test.ts) this checks the SOURCE.
@@ -29,6 +30,7 @@ const FILES = [
   'components/layout/AudioEditorPanel.tsx',
   'components/layout/settings/shared.tsx',
   'orb-kit/AssistantPanel.tsx',
+  'views/UnderfitView.tsx',
 ];
 
 /** The quoted class list around `pos` on one line. */
@@ -40,7 +42,8 @@ function literalAt(line: string, pos: number): string {
   while (r < line.length && line[r] !== q) r++;
   return line.slice(l, r);
 }
-const isFieldClassList = (lit: string) => /placeholder:|focus:outline|focus:border|resize-none/.test(lit);
+const isFieldClassList = (lit: string) =>
+  /placeholder:|focus:outline|focus:border|resize-none|whitespace-pre-wrap/.test(lit);
 
 const small: string[] = [];
 const mono: string[] = [];

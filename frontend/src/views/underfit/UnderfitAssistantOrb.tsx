@@ -33,16 +33,23 @@ import GantasmoOrb from "../../orb-kit/react/GantasmoOrb";
 import "../../orb-kit/styles/gantasmo-orb.css";
 import "../../orb-kit/chat/orb-chat.css";
 import "./underfit-orb.css";
+import {
+  AssistantBackendStatusBar,
+  assistantStatusDetail,
+  useAssistantBackendStatus,
+} from "./assistantBackendStatus";
 
 // Assistant backend base URL. This orb is bundled INTO underfit's dashboard
 // (served on :8791). It talks to underfit's OWN assistant backend — a clone of
 // the VST Foundry assistant (identical providers/models + Better Claude Code) —
-// running on :5473 (cross-origin fetch/SSE). Override at runtime via
-// window.__UNDERFIT_ASSISTANT_BASE__.
+// running on :5473 (cross-origin fetch/SSE). Override at runtime with the
+// `assistant_api` query parameter (the Underfit tab sets it from the port
+// theDAW's backend reports) or window.__UNDERFIT_ASSISTANT_BASE__.
 const ASSISTANT_API_BASE =
   (typeof window !== "undefined" &&
-    (window as unknown as { __UNDERFIT_ASSISTANT_BASE__?: string })
-      .__UNDERFIT_ASSISTANT_BASE__) ||
+    (new URLSearchParams(window.location.search).get("assistant_api") ||
+      (window as unknown as { __UNDERFIT_ASSISTANT_BASE__?: string })
+        .__UNDERFIT_ASSISTANT_BASE__)) ||
   "http://localhost:5473";
 
 // One tool the agent invoked, paired with its result. `inputJson` is the tool
@@ -470,6 +477,10 @@ export default function UnderfitAssistantOrb() {
   // ---------------------------------------------------------------------------
 
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
+  // Bumped each time the assistant backend comes online, so the provider and
+  // model catalogs load again after a Start (or after it finishes booting).
+  const [catalogKey, setCatalogKey] = useState(0);
+  const backend = useAssistantBackendStatus(ASSISTANT_API_BASE, () => setCatalogKey((k) => k + 1));
   const [models, setModels] = useState<ModelInfo[]>([]);
   // theDAW-style settings: [Chat | Keys] tabs + per-provider key editing.
   const [settingsTab, setSettingsTab] = useState<"model" | "keys">("model");
@@ -532,7 +543,7 @@ export default function UnderfitAssistantOrb() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [catalogKey]);
 
   // Fetch models whenever the provider (or its API key) changes.
   useEffect(() => {
@@ -564,7 +575,7 @@ export default function UnderfitAssistantOrb() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedProvider, providerApiKeys]);
+  }, [selectedProvider, providerApiKeys, catalogKey]);
 
   // Styling / Scale Modifiers
   const [textScale, setTextScale] = useState<"xs" | "sm" | "md" | "lg">("sm");
@@ -1648,6 +1659,12 @@ export default function UnderfitAssistantOrb() {
                 </button>
               </div>
             </div>
+
+            <AssistantBackendStatusBar
+              state={backend.state}
+              detail={assistantStatusDetail(backend.state, backend.sidecar, backend.startError, backend.thedawReachable)}
+              onStart={() => void backend.start()}
+            />
 
             {/* Inner Panels Overlay */}
             <div className="flex-1 relative overflow-hidden flex flex-col">

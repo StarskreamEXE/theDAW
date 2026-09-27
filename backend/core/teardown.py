@@ -25,6 +25,7 @@ def stop_all_sidecars() -> None:
         ("backend.modules.lyria.sidecar", "stop", False),
         ("backend.modules.foundry.sidecar", "stop", False),
         ("backend.modules.underfit.sidecar", "stop", False),
+        ("backend.modules.underfit.assistant_sidecar", "stop", False),
         ("backend.modules.magenta.sidecar", "stop_engine", False),
         ("backend.modules.stems.sidecar", "stop", True),
         ("backend.modules.questcast.sidecar", "stop", True),

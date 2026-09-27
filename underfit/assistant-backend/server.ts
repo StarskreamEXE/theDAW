@@ -5,6 +5,14 @@ import fs from "fs";
 import { spawn, ChildProcess, execSync, execFile } from "child_process";
 import { randomUUID } from "crypto";
 import { promises as dnsp } from "dns";
+import { fileURLToPath } from "url";
+
+// underfit/ itself: this file lives in underfit/assistant-backend/. theDAW's
+// sidecar passes UNDERFIT_ROOT; the fallback keeps a hand-started server
+// pointed at its own checkout.
+const UNDERFIT_ROOT =
+  process.env.UNDERFIT_ROOT || path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
 // (vite SPA serving removed — underfit's assistant backend is API-only)
 
 // Exported so tests (supertest) can drive the configured app without listening.
@@ -2159,7 +2167,7 @@ async function executeUnderfitTool(name: string, a: any): Promise<any> {
     case "rare_tokens":
       return underfitServerCall("GET", "/api/rare_tokens");
     case "read_guide": {
-      const root = process.env.UNDERFIT_ROOT || "C:\\Users\\skream\\projects\\underfit";
+      const root = UNDERFIT_ROOT;
       const topics: Record<string, string> = {
         app: path.join(root, "docs", "thedaw-style", "underfit.md"),
         training: path.join(root, "docs", "thedaw-style", "underfit-lora-training.md"),
@@ -3211,8 +3219,7 @@ function writeClaudeMcpConfig(relayId: string, mcpConfigPath: string): boolean {
         underfit: {
           command: "node",
           args: [
-            process.env.UNDERFIT_MCP_PATH ||
-              "C:\\Users\\skream\\projects\\underfit\\mcp-server.cjs",
+            process.env.UNDERFIT_MCP_PATH || path.join(UNDERFIT_ROOT, "mcp-server.cjs"),
             process.env.UNDERFIT_DASHBOARD_PORT || "8791",
           ],
           env: {},
@@ -3895,7 +3902,9 @@ app.use("/api/assistant", (req, res, next) => {
 
 // Health check
 app.get("/api/health", (req, res) => {
-  res.json({ app: "vst-foundry", status: "ok", time: new Date().toISOString() });
+  // theDAW's sidecar (backend/modules/underfit/assistant_sidecar.py) reads
+  // `app` to tell this server apart from VST Foundry, which it was cloned from.
+  res.json({ app: "underfit-assistant", status: "ok", time: new Date().toISOString() });
 });
 
 app.post("/api/shutdown", (_req, res) => {

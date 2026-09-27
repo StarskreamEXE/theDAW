@@ -11,10 +11,16 @@ import {defineConfig} from 'vite';
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   define: {'process.env.NODE_ENV': JSON.stringify('production')},
+  // The bundle references none of public/, and copying all of it (splash,
+  // worklets, soundfonts) into the dashboard folder on every build left stale
+  // duplicates of theDAW's assets inside the underfit subrepo.
+  publicDir: false,
   build: {
     target: 'es2022',
-    // underfit lives beside StableDAW: <projects>/underfit/dashboard/assistant
-    outDir: path.resolve(__dirname, '../../underfit/dashboard/assistant'),
+    // underfit is vendored inside this repo (git-subrepo at <repo>/underfit),
+    // so the bundle goes to <repo>/underfit/dashboard/assistant. It used to
+    // point one level higher, at a sibling checkout that no longer exists.
+    outDir: path.resolve(__dirname, '../underfit/dashboard/assistant'),
     // MUST stay false: dashboard/assistant/ also holds underfit's own assets
     // (fonts, worklets, logos). Emptying it would delete them.
     emptyOutDir: false,
