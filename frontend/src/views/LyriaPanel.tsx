@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AlertCircle, ExternalLink, Library, Loader2, RefreshCw, RotateCcw } from 'lucide-react';
+import { AlertCircle, Download, ExternalLink, Library, Loader2, RefreshCw, RotateCcw } from 'lucide-react';
 import { pairingHeaderFor } from '../lib/apiJson';
 import { backendHttpBase } from '../lib/backendBase';
 import { panelModelDefaults, panelModelOptions } from '../lib/cloudModels';
@@ -14,12 +14,24 @@ const AUTO_SYNC_MS = 30000;
 // How long the inline "3 imported" / "Nothing new" result stays up.
 const SYNC_NOTE_MS = 4000;
 
-/** What the backend's pinned-commit check found (sidecar.checkout_state). */
+// How often the panel asks how a running Update is doing.
+const UPDATE_POLL_MS = 1500;
+// An Update fetches, may run npm install (up to 10 min) and restarts Lyria.
+const UPDATE_DEADLINE_MS = 20 * 60_000;
+
+/** What the last Update or latest-commit check found (sidecar.checkout_state). */
 interface LyriaCheckout {
   state: string;
   commit?: string | null;
-  pinned_commit?: string;
+  latest?: string | null;
   reason?: string;
+}
+
+/** GET /api/lyria/update. */
+export interface LyriaUpdateReply {
+  job: { status: string; message?: string; error?: string | null; restarted?: boolean; stopped?: boolean };
+  checkout?: LyriaCheckout;
+  latest?: { head: string | null; latest: string | null; available: boolean } | null;
 }
 
 /** GET /api/lyria/url and POST /api/lyria/restart. */
@@ -32,13 +44,27 @@ interface LyriaUrlReply {
 }
 
 /** Checkout states the backend left alone, with a reason worth reading. */
-const CHECKOUT_LEFT_ALONE = new Set(['dirty', 'branch', 'failed', 'not_git', 'managed']);
+const CHECKOUT_LEFT_ALONE = new Set(['dirty', 'branch', 'diverged', 'failed', 'not_git', 'managed']);
 
 /** The sentence to show under the header, or '' when there is nothing to say. */
 export function lyriaCheckoutNote(checkout: LyriaCheckout | undefined): string {
   if (!checkout || !CHECKOUT_LEFT_ALONE.has(checkout.state)) return '';
   return checkout.reason ?? '';
 }
+
+/**
+ * The line to show once an Update finished, or '' for none. A checkout the
+ * backend left alone already says why in the checkout note, so a finished
+ * Update adds nothing then; otherwise it says what moved (or that nothing
+ * had to), and a failed one says why it failed.
+ */
+export function lyriaUpdateNote(reply: LyriaUpdateReply): string {
+  if (reply.job.status === 'error') return reply.job.error || 'The update did not finish.';
+  if (lyriaCheckoutNote(reply.checkout)) return '';
+  return reply.job.message ?? '';
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 
 // The Lyria 3 Pro app (StarskreamEXE/lyria-3-pro) is embedded WHOLE and
 // unmodified: it ships its own Express server, its own SPA, its own settings
@@ -69,6 +95,13 @@ export const LyriaPanel: React.FC = () => {
   const [checkoutNote, setCheckoutNote] = useState('');
   const [restarting, setRestarting] = useState(false);
   const [restartError, setRestartError] = useState('');
+  // Update: fast-forward the checkout to the latest commit of the Lyria repo.
+  const [updating, setUpdating] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState('');
+  const [updateNote, setUpdateNote] = useState('');
+  const [updateFailed, setUpdateFailed] = useState(false);
+  // The short id of a newer commit on GitHub, or '' when none is known.
+  const [newerCommit, setNewerCommit] = useState('');
   // Bumped after a restart so the iframe reloads against the fresh child.
   const [frameKey, setFrameKey] = useState(0);
   const [detail, setDetail] = useState('');
@@ -203,6 +236,79 @@ export const LyriaPanel: React.FC = () => {
     }
   };
 
+  // Ask once, on open, whether GitHub has a commit this checkout does not.
+  // The backend asks GitHub at most once per ten minutes however often this
+  // runs.
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/lyria/update?check=true')
+      .then((r) => (r.ok ? (r.json() as Promise<LyriaUpdateReply>) : null))
+      .then((j) => {
+        if (cancelled || !j?.latest) return;
+        setNewerCommit(j.latest.available && j.latest.latest ? j.latest.latest.slice(0, 7) : '');
+      })
+      .catch(() => {
+        /* no answer: Update still works, it just cannot say in advance
+           whether there is something new */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /**
+   * Fast-forward the Lyria checkout to the latest commit of its repo. The
+   * backend stops Lyria for the move and starts it again, so the frame is
+   * reloaded when it did. A checkout with local changes, on its own branch
+   * or managed by the user is left alone, and the note says why.
+   */
+  const runUpdate = async () => {
+    setUpdating(true);
+    setUpdateNote('');
+    setUpdateFailed(false);
+    setUpdateProgress('Fetching the latest Lyria');
+    try {
+      const r = await fetch('/api/lyria/update', {
+        method: 'POST',
+        headers: pairingHeaderFor('/api/lyria/update'),
+      });
+      if (!r.ok) {
+        const body = (await r.json().catch(() => null)) as { detail?: unknown } | null;
+        throw new Error(typeof body?.detail === 'string' ? body.detail : `backend returned ${r.status}`);
+      }
+      const deadline = Date.now() + UPDATE_DEADLINE_MS;
+      let reply: LyriaUpdateReply | null = null;
+      while (Date.now() < deadline) {
+        await sleep(UPDATE_POLL_MS);
+        const s = await fetch('/api/lyria/update');
+        if (!s.ok) continue;
+        reply = (await s.json()) as LyriaUpdateReply;
+        if (reply.job.status === 'done' || reply.job.status === 'error') break;
+        if (reply.job.message) setUpdateProgress(reply.job.message);
+      }
+      if (!reply || (reply.job.status !== 'done' && reply.job.status !== 'error')) {
+        throw new Error('Still updating. Check back in a minute.');
+      }
+      setUpdateFailed(reply.job.status === 'error');
+      setCheckoutNote(lyriaCheckoutNote(reply.checkout));
+      setUpdateNote(lyriaUpdateNote(reply));
+      if (reply.job.status === 'done' && !lyriaCheckoutNote(reply.checkout)) setNewerCommit('');
+      // Restarted: reload against the fresh child. Stopped and not started
+      // again (a failed npm install, say): reload too, so the panel shows
+      // Lyria starting or why it cannot, not a frame on a dead server.
+      if (reply.job.restarted || reply.job.stopped) {
+        setFrameKey((k) => k + 1);
+        void loadUrl(true);
+      }
+    } catch (e) {
+      setUpdateFailed(true);
+      setUpdateNote(e instanceof Error ? e.message : 'The update did not finish.');
+    } finally {
+      setUpdating(false);
+      setUpdateProgress('');
+    }
+  };
+
   // Same readiness contract as VJView: /api/lyria/url blocks server-side until
   // the child is listening, and we retry quietly while the backend is still
   // binding, so a cold start (npm install on a fresh checkout) renders
@@ -321,26 +427,38 @@ export const LyriaPanel: React.FC = () => {
         )}
         {/* An adopted Lyria (left over from an earlier session, or launched
             by hand) has the keys and cost mode it started with. This is the
-            one control that hands it the current ones. It also shows while
-            the checkout note is up: the checkout is checked again only when
-            Lyria starts, so after fixing what the note names (discarding
-            local changes, reconnecting) a restart is how the move happens.
-            The visible text names the button. */}
-        {status === 'ready' && (external || checkoutNote) && (
+            one control that hands it the current ones. The visible text
+            names the button. */}
+        {status === 'ready' && external && (
           <button
             type="button"
             onClick={() => void restartLyria()}
             disabled={restarting}
-            title={
-              external
-                ? 'This Lyria was not started by this session of theDAW (a leftover from an earlier run, or one launched by hand), so it still has the keys and cost mode it started with. Restart it to hand it the current keys and cost mode.'
-                : 'Stop Lyria, check the checkout against the pinned commit again, and start it with the current keys and cost mode.'
-            }
+            title="This Lyria was not started by this session of theDAW (a leftover from an earlier run, or one launched by hand), so it still has the keys and cost mode it started with. Restart it to hand it the current keys and cost mode."
             className="px-2 py-0.5 rounded border border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/20 text-amber-200 text-xs font-bold uppercase tracking-wide flex items-center gap-1 shrink-0 disabled:opacity-40"
           >
             {restarting ? <Loader2 className="w-3 h-3 animate-spin" /> : <RotateCcw className="w-3 h-3" />} Restart with
             current keys
           </button>
+        )}
+        {/* Update: the checkout tracks the Lyria repo's latest commit. Shown
+            in every state, since a Lyria that does not start may be one
+            commit away from starting. The visible text names the button. */}
+        <button
+          type="button"
+          onClick={() => void runUpdate()}
+          disabled={updating}
+          title={
+            newerCommit
+              ? `GitHub has a newer Lyria commit (${newerCommit}). Update fast-forwards this checkout to it and restarts Lyria. A checkout with local changes or on its own branch is left alone.`
+              : 'Fetch the latest Lyria from GitHub and fast-forward this checkout to it, restarting Lyria. A checkout with local changes or on its own branch is left alone.'
+          }
+          className="px-2 py-0.5 rounded border border-sky-500/40 bg-sky-500/10 hover:bg-sky-500/20 text-sky-200 text-xs font-bold uppercase tracking-wide flex items-center gap-1 shrink-0 disabled:opacity-40"
+        >
+          {updating ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />} Update Lyria
+        </button>
+        {newerCommit && !updating && (
+          <span className="text-xs font-bold text-sky-300 shrink-0">New commit {newerCommit}</span>
         )}
         <div className="flex-1" />
         {/* INT-002: Lyria's own library is inside the sidecar. This is the
@@ -413,13 +531,27 @@ export const LyriaPanel: React.FC = () => {
           </button>
         )}
       </div>
-      {/* Why the checkout was not moved to the pinned commit (local changes,
-          no network, a checkout the user manages), and a refused restart. */}
-      {(checkoutNote || restartError) && (
+      {/* How an Update is going and how it ended, why the checkout was left
+          where it is (local changes, its own branch, no network, a checkout
+          the user manages), and a refused restart. */}
+      {(checkoutNote || restartError || updateProgress || updateNote) && (
         <div className="flex flex-col gap-0.5 px-2 py-1 border-b border-zinc-800 shrink-0">
+          {updateProgress && (
+            <p role="status" className="text-xs font-bold leading-snug text-sky-200">
+              {updateProgress}
+            </p>
+          )}
           {checkoutNote && (
             <p role="status" className="text-xs font-bold leading-snug text-amber-200">
               {checkoutNote}
+            </p>
+          )}
+          {updateNote && (
+            <p
+              role={updateFailed ? 'alert' : 'status'}
+              className={`text-xs font-bold leading-snug ${updateFailed ? 'text-rose-300' : 'text-emerald-200'}`}
+            >
+              {updateNote}
             </p>
           )}
           {restartError && (

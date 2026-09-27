@@ -59,8 +59,12 @@ Provider keys (both providers):
     without the launch or pairing token; include_mock is loopback-only.
   * restart() replaces a Lyria adopted from an earlier session with a child
     that has the current keys, and refuses one from another folder.
-  * Install clones exactly LYRIA_PINNED_COMMIT; an existing clean checkout is
-    moved to it before a spawn, and one with local changes is left alone.
+  * Install clones the latest commit of the Lyria repo's default branch;
+    opening Lyria runs the checkout as it is; Update fast-forwards a clean
+    checkout to the latest and restarts Lyria, and leaves one with local
+    changes, its own branch or its own commits alone, saying why. What a
+    checkout reads (server/keys.ts, numberedEnvValues per variable) is read
+    from the checkout itself.
 
 No real npm/node process is spawned -- `_ensure_deps` and `subprocess.Popen`
 are monkeypatched. A throwaway `http.server` (or raw TCP listener, for the
@@ -76,7 +80,6 @@ import http.server
 import io
 import json
 import os
-import re
 import socket
 import subprocess
 import sys
@@ -1397,18 +1400,25 @@ def _old_checkout(root) -> object:
 
 
 def _list_checkout(root) -> object:
-    """A checkout at the pinned commit's shape: server/keys.ts defines
-    numberedEnvValues and server.ts reads the numbered slots with it."""
+    """A checkout shaped like the Lyria repo's head at ef8b16f: server/keys.ts
+    defines numberedEnvValues with its default max of 10, and server.ts reads
+    the numbered slots of both provider variables with it (the lines are
+    those of that commit's server/keys.ts:60 and server.ts:9, :60-:71)."""
     root.mkdir(parents=True, exist_ok=True)
     (root / "package.json").write_text("{}", encoding="utf-8")
     (root / "server").mkdir(exist_ok=True)
     (root / "server" / "keys.ts").write_text(
-        "export function numberedEnvValues(env, prefix, max = 10) {}\n",
+        "export function numberedEnvValues(env: NodeJS.ProcessEnv, prefix: "
+        "string, max = 10): string[] {\n",
         encoding="utf-8",
     )
     (root / "server.ts").write_text(
-        'import { resolveKeys, numberedEnvValues } from "./server/keys";\n'
-        "numberedEnv: numberedEnvValues(process.env, 'GEMINI_API_KEY'),\n",
+        "import { resolveKeys, numberedEnvValues, withKeyFailover, "
+        'AllKeysFailedError } from "./server/keys";\n'
+        "    env: process.env.GEMINI_API_KEY,\n"
+        "    numberedEnv: numberedEnvValues(process.env, 'GEMINI_API_KEY'),\n"
+        "    env: process.env.OPENROUTER_API_KEY,\n"
+        "    numberedEnv: numberedEnvValues(process.env, 'OPENROUTER_API_KEY'),\n",
         encoding="utf-8",
     )
     return root
@@ -1457,7 +1467,7 @@ def test_list_checkout_gets_the_first_key_then_numbered_slots(
     sidecar.add_key("gemini", "file-g1")
     sidecar.add_key("gemini", "env-g1")  # already in the env: appears once
     sidecar.add_key("openrouter", "file-o1")
-    project = _list_checkout(tmp_path / "pinned")
+    project = _list_checkout(tmp_path / "lists")
 
     assert sidecar.checkout_reads_key_lists(project) is True
     env = sidecar._child_env(_cfg(project))
@@ -1476,7 +1486,7 @@ def test_list_checkout_takes_at_most_ten_keys(lyria_keys, tmp_path, caplog):
     line says how many were handed out of how many are held."""
     for n in range(1, 13):
         sidecar.add_key("gemini", f"gemini-key-{n:02d}")
-    project = _list_checkout(tmp_path / "pinned")
+    project = _list_checkout(tmp_path / "lists")
 
     with caplog.at_level("INFO"):
         env = sidecar._child_env(_cfg(project))
@@ -1499,7 +1509,7 @@ def test_inherited_numbered_slots_are_folded_in_and_cleared(
     sidecar.add_key("gemini", "file-g1")
 
     assert sidecar.env_keys("gemini") == ["shell-g1", "shell-g2"]
-    listed = sidecar._child_env(_cfg(_list_checkout(tmp_path / "pinned")))
+    listed = sidecar._child_env(_cfg(_list_checkout(tmp_path / "lists")))
     assert _key_slots(listed) == {
         "GEMINI_API_KEY": "shell-g1",
         "GEMINI_API_KEY_2": "shell-g2",
@@ -1524,7 +1534,7 @@ def test_pool_keys_stay_with_the_assistant_until_the_user_shares_them(
     lyria_keys.pools["gemini"] = ["pool-g1", "pool-g2"]
     lyria_keys.pools["openrouter"] = ["pool-o1"]
     lyria_keys.pools["openrouter-free"] = ["pool-of1", "pool-o1"]
-    project = _list_checkout(tmp_path / "pinned")
+    project = _list_checkout(tmp_path / "lists")
 
     assert _key_slots(sidecar._child_env(_cfg(project))) == {
         "GEMINI_API_KEY": "pool-g1"
@@ -1567,7 +1577,7 @@ def test_child_env_drops_blanks_and_unsets_a_provider_with_no_keys(
     monkeypatch.setenv("OPENROUTER_API_KEY", "env-o1,,env-o2\nenv-o3")
 
     old = sidecar._child_env(_cfg(_old_checkout(tmp_path / "old")))
-    listed = sidecar._child_env(_cfg(_list_checkout(tmp_path / "pinned")))
+    listed = sidecar._child_env(_cfg(_list_checkout(tmp_path / "lists")))
 
     # A whitespace-only inherited value must not reach the child as a "key".
     assert "GEMINI_API_KEY" not in old and "GEMINI_API_KEY" not in listed
@@ -1583,7 +1593,7 @@ def test_child_env_never_logs_key_values(lyria_keys, tmp_path, monkeypatch, capl
     monkeypatch.setenv("GEMINI_API_KEY", "secret-gemini-value,secret-gemini-two")
     monkeypatch.setenv("OPENROUTER_API_KEY", "secret-openrouter-value")
     with caplog.at_level("DEBUG"):
-        sidecar._child_env(_cfg(_list_checkout(tmp_path / "pinned")))
+        sidecar._child_env(_cfg(_list_checkout(tmp_path / "lists")))
     assert "secret-gemini-value" not in caplog.text
     assert "secret-gemini-two" not in caplog.text
     assert "secret-openrouter-value" not in caplog.text
@@ -2122,7 +2132,12 @@ def test_probe_key_issue_only_fires_when_both_providers_are_empty(
     assert "key" in out["missing"]
     assert any("Gemini or OpenRouter key" in issue for issue in out["issues"])
     assert out["reads_key_lists"] is False
-    assert out["pinned_commit"] == sidecar.LYRIA_PINNED_COMMIT
+    assert out["compat"] == {
+        "keys_ts": False,
+        "key_slots": {"GEMINI_API_KEY": 1, "OPENROUTER_API_KEY": 1},
+        "reads_key_lists": False,
+    }
+    assert "pinned_commit" not in out
 
     # An OpenRouter key alone is enough to generate -- no key issue.
     monkeypatch.setenv("OPENROUTER_API_KEY", "o1")
@@ -2150,6 +2165,7 @@ def test_key_summary_reports_counts_and_sources_only(lyria_keys, monkeypatch, tm
         "count": 3,
         # An old checkout reads one key per provider.
         "handed": 1,
+        "key_slots": 1,
         "source": "env",
         "configured": True,
         "env": 2,
@@ -2168,7 +2184,7 @@ def test_key_summary_reports_counts_and_sources_only(lyria_keys, monkeypatch, tm
     assert summary["key_limit"] == 1
     assert "env-g1" not in json.dumps(summary)
 
-    monkeypatch.setenv("theDAW_LYRIA_PROJECT", str(_list_checkout(tmp_path / "pinned")))
+    monkeypatch.setenv("theDAW_LYRIA_PROJECT", str(_list_checkout(tmp_path / "lists")))
     sidecar.set_pool_shared(True)
     shared = sidecar.key_summary()
     assert shared["providers"]["gemini"]["handed"] == 3
@@ -2372,6 +2388,7 @@ _CHANGING_ROUTES = [
     ("POST", "/api/lyria/start", None),
     ("POST", "/api/lyria/stop", None),
     ("POST", "/api/lyria/restart", None),
+    ("POST", "/api/lyria/update", None),
 ]
 
 
@@ -2409,6 +2426,9 @@ def gated_app(lyria_keys, monkeypatch):
         sidecar, "ensure_running", _record("start", "http://127.0.0.1:5188")
     )
     monkeypatch.setattr(sidecar, "restart", _record("restart", "http://127.0.0.1:5188"))
+    monkeypatch.setattr(
+        sidecar, "start_update", _record("update", {"status": "running"})
+    )
     monkeypatch.setattr(sidecar, "owns_process", lambda: True)
     monkeypatch.setattr(pairing, "get_token", lambda: _PAIRING_TOKEN)
     monkeypatch.delenv("THEDAW_LAUNCH_TOKEN", raising=False)
@@ -2692,8 +2712,9 @@ def test_restart_refuses_a_port_held_by_something_that_is_not_lyria(
 
 
 # ---------------------------------------------------------------------------
-# The pinned commit: Install clones exactly it, and an existing clean
-# checkout is moved to it before a spawn. Local repos stand in for GitHub.
+# The latest commit: Install clones it, Update fast-forwards a clean checkout
+# to it, and what a checkout reads is decided from the checkout itself.
+# Local repos stand in for GitHub.
 # ---------------------------------------------------------------------------
 
 
@@ -2720,11 +2741,12 @@ def _git(*args: str, cwd=None) -> str:
 
 @pytest.fixture
 def upstream(tmp_path):
-    """An upstream Lyria repo: A is the old shape (no server/keys.ts), B the
-    pinned shape, C a later commit on top of B."""
+    """An upstream Lyria repo on branch main: A is the old shape (no
+    server/keys.ts), B the key-list shape, C a later commit on top of B and
+    the default branch's head."""
     repo = tmp_path / "upstream"
     repo.mkdir()
-    _git("init", "-q", str(repo))
+    _git("init", "-q", "-b", "main", str(repo))
     (repo / "package.json").write_text('{"name": "lyria-3-pro"}\n', encoding="utf-8")
     (repo / "server.ts").write_text(
         "const key = clientKey || process.env.GEMINI_API_KEY;\n", encoding="utf-8"
@@ -2745,178 +2767,299 @@ def upstream(tmp_path):
 
 
 @pytest.fixture
-def pinned(upstream, lyria_keys, tmp_path, monkeypatch):
-    """The sidecar pointed at the local upstream, pinned to B, with the
-    project found by the default search (no theDAW_LYRIA_PROJECT), npm
-    install recorded instead of run, and a fresh checkout-state."""
+def latest(upstream, lyria_keys, tmp_path, monkeypatch):
+    """The sidecar pointed at the local upstream, with the project found by
+    the default search (no theDAW_LYRIA_PROJECT), npm install recorded
+    instead of run, and a fresh checkout and update state."""
     npm_runs: list[object] = []
     monkeypatch.setattr(sidecar, "LYRIA_REPO_URL", upstream.uri)
-    monkeypatch.setattr(sidecar, "LYRIA_PINNED_COMMIT", upstream.b)
     monkeypatch.setattr(sidecar, "_run_npm_install", lambda cfg: npm_runs.append(cfg))
     monkeypatch.setattr(sidecar, "_checkout_state", dict(sidecar._checkout_state))
+    monkeypatch.setattr(sidecar, "_update_state", dict(sidecar._update_state))
     monkeypatch.setenv("theDAW_LYRIA_PORT", str(_free_port()))
     return SimpleNamespace(upstream=upstream, npm_runs=npm_runs, root=tmp_path)
 
 
-def _existing_install(pinned_ns, commit: str, name: str = "lyria"):
-    """A checkout the way theDAW's old Install left it: a depth-1 fetch of
+def _existing_install(latest_ns, commit: str, name: str = "lyria"):
+    """A checkout the way theDAW's round-1 Install left it: a depth-1 fetch of
     one commit, detached, with node_modules installed."""
-    checkout = pinned_ns.root / name
+    checkout = latest_ns.root / name
     _git("init", "-q", str(checkout))
     _git("config", "core.autocrlf", "false", cwd=checkout)
-    _git("fetch", "-q", "--depth", "1", pinned_ns.upstream.uri, commit, cwd=checkout)
+    _git("fetch", "-q", "--depth", "1", latest_ns.upstream.uri, commit, cwd=checkout)
     _git("checkout", "-q", "--detach", commit, cwd=checkout)
     (checkout / "node_modules").mkdir()
     return checkout
 
 
-def _spawn_capturing_env(monkeypatch, checkout) -> dict[str, str]:
-    """ensure_running(wait_for_ready=False) from ``checkout`` as the default
-    project, with `npm run dev` replaced by a stand-in that records the env."""
-    captured: dict[str, str] = {}
+def _clone_install(latest_ns, name: str = "lyria"):
+    """A checkout the way Install leaves it now: a clone of the default
+    branch, with node_modules installed."""
+    checkout = latest_ns.root / name
+    _git("clone", "-q", latest_ns.upstream.uri, str(checkout))
+    _git("config", "core.autocrlf", "false", cwd=checkout)
+    (checkout / "node_modules").mkdir()
+    return checkout
+
+
+def _capture_spawns(monkeypatch, checkout) -> list[dict[str, str]]:
+    """Make ``checkout`` the default project and replace `npm run dev` with a
+    stand-in that records each spawn's env and stays "alive"."""
+    spawns: list[dict[str, str]] = []
     real_popen = subprocess.Popen
 
     def _popen(cmd, *args, **kwargs):
         if list(cmd)[-2:] != ["run", "dev"]:
             return real_popen(cmd, *args, **kwargs)  # git, for real
-        captured.update(kwargs.get("env") or {})
+        spawns.append(dict(kwargs.get("env") or {}))
         return SimpleNamespace(poll=lambda: None, pid=0, returncode=None)
 
     monkeypatch.setattr(sidecar, "DEFAULT_PROJECT_PATH", checkout)
     monkeypatch.setattr(sidecar.subprocess, "Popen", _popen)
+    return spawns
+
+
+def _spawn_capturing_env(monkeypatch, checkout) -> dict[str, str]:
+    """ensure_running(wait_for_ready=False) from ``checkout`` as the default
+    project; returns the env the child was spawned with."""
+    spawns = _capture_spawns(monkeypatch, checkout)
     sidecar.ensure_running(wait_for_ready=False)
-    return captured
+    return spawns[-1] if spawns else {}
 
 
-def test_an_install_from_before_the_pin_is_moved_to_it_on_the_next_start(
-    pinned, monkeypatch
-):
+def _run_update() -> dict:
+    """Press Update and wait for the background job to finish."""
+    sidecar.start_update()
+    deadline = time.monotonic() + 60.0
+    while time.monotonic() < deadline:
+        state = sidecar.update_status()
+        if state["status"] in ("done", "error"):
+            return state
+        time.sleep(0.02)
+    raise AssertionError(f"the update did not finish: {sidecar.update_status()}")
+
+
+def _restartable(monkeypatch) -> list[str]:
+    """Let the update job stop the stand-in child and start it again without
+    a real process or port: stop() ends the stand-in, and the restart spawns
+    another without waiting for a port."""
+    events: list[str] = []
+    real_ensure = sidecar.ensure_running
+    monkeypatch.setattr(sidecar, "_terminate_proc", lambda proc: events.append("stop"))
+    monkeypatch.setattr(sidecar, "stop_adopted", lambda: False)
+
+    def _ensure(**kw):
+        events.append("start")
+        return real_ensure(wait_for_ready=False)
+
+    monkeypatch.setattr(sidecar, "ensure_running", _ensure)
+    return events
+
+
+def test_opening_lyria_runs_the_checkout_as_it_is(latest, monkeypatch):
     """The user's Lyria was installed at an older commit (one key per
-    provider). They save two Gemini keys and open the Lyria tab. The checkout
-    moves to the pinned commit before the spawn, its generations survive, and
-    the child gets the keys in the slots that commit reads."""
-    checkout = _existing_install(pinned, pinned.upstream.a)
-    (checkout / "generations").mkdir()
-    (checkout / "generations" / "song.wav").write_bytes(b"RIFF user audio")
+    provider). They save two Gemini keys and open the Lyria tab. Nothing is
+    fetched and nothing moves; the child gets the one key that commit reads."""
+    checkout = _existing_install(latest, latest.upstream.a)
     sidecar.add_key("gemini", "gemini-one")
     sidecar.add_key("gemini", "gemini-two")
-
-    env = _spawn_capturing_env(monkeypatch, checkout)
-
-    assert _git("rev-parse", "HEAD", cwd=checkout) == pinned.upstream.b
-    state = sidecar.checkout_state()
-    assert state["state"] == "updated"
-    assert state["commit"] == pinned.upstream.b
-    assert (checkout / "generations" / "song.wav").read_bytes() == b"RIFF user audio"
-    assert env["GEMINI_API_KEY"] == "gemini-one"
-    assert env["GEMINI_API_KEY_2"] == "gemini-two"
-    # package.json did not change between the two commits.
-    assert pinned.npm_runs == []
-
-
-def test_a_checkout_with_local_changes_is_left_alone_and_says_why(pinned, monkeypatch):
-    checkout = _existing_install(pinned, pinned.upstream.a)
-    (checkout / "server.ts").write_text("// my own edit\n", encoding="utf-8")
-    sidecar.add_key("gemini", "gemini-one")
-    sidecar.add_key("gemini", "gemini-two")
-
-    env = _spawn_capturing_env(monkeypatch, checkout)
-
-    assert _git("rev-parse", "HEAD", cwd=checkout) == pinned.upstream.a
-    assert (checkout / "server.ts").read_text(encoding="utf-8") == "// my own edit\n"
-    state = sidecar.checkout_state()
-    assert state["state"] == "dirty"
-    assert "local changes" in state["reason"]
-    # It still starts, and still gets one key per variable it can read.
-    assert env["GEMINI_API_KEY"] == "gemini-one"
-    assert "GEMINI_API_KEY_2" not in env
-
-
-def test_a_failed_fetch_leaves_the_checkout_and_is_not_retried_at_once(
-    pinned, monkeypatch
-):
-    checkout = _existing_install(pinned, pinned.upstream.a)
-    monkeypatch.setattr(
-        sidecar, "LYRIA_REPO_URL", (pinned.root / "no-such-repo").as_uri()
-    )
-    cfg = _cfg(checkout)
-    monkeypatch.setattr(sidecar, "DEFAULT_PROJECT_PATH", checkout)
-
-    first = sidecar._update_checkout(cfg)
-    assert first["state"] == "failed"
-    assert first["commit"] == pinned.upstream.a
-    assert _git("rev-parse", "HEAD", cwd=checkout) == pinned.upstream.a
-
     fetches: list[list[str]] = []
     real_git_run = sidecar._git_run
 
     def _counting(git, args, cwd, timeout=60.0):
-        if "fetch" in args:
+        if "fetch" in args or "ls-remote" in args:
             fetches.append(args)
         return real_git_run(git, args, cwd, timeout)
 
     monkeypatch.setattr(sidecar, "_git_run", _counting)
-    second = sidecar._update_checkout(cfg)
-    assert second["state"] == "failed"
+
+    env = _spawn_capturing_env(monkeypatch, checkout)
+
+    assert _git("rev-parse", "HEAD", cwd=checkout) == latest.upstream.a
     assert fetches == []
+    assert env["GEMINI_API_KEY"] == "gemini-one"
+    assert "GEMINI_API_KEY_2" not in env
 
 
-def test_a_checkout_newer_than_the_pin_is_left_alone(pinned, monkeypatch):
-    checkout = pinned.root / "dev-lyria"
-    _git("clone", "-q", pinned.upstream.uri, str(checkout))
-    assert _git("rev-parse", "HEAD", cwd=checkout) == pinned.upstream.c
+def test_update_moves_an_old_install_to_the_latest_and_restarts_it_with_lists(
+    latest, monkeypatch
+):
+    """Same user, Lyria running from the old commit. They press Update in the
+    Lyria panel: the running child is stopped, the checkout moves to the
+    latest commit (C, not B), their generations survive, and Lyria starts
+    again, now handed both keys because the new checkout reads lists."""
+    checkout = _existing_install(latest, latest.upstream.a)
+    (checkout / "generations").mkdir()
+    (checkout / "generations" / "song.wav").write_bytes(b"RIFF user audio")
+    sidecar.add_key("gemini", "gemini-one")
+    sidecar.add_key("gemini", "gemini-two")
+    spawns = _capture_spawns(monkeypatch, checkout)
+    sidecar.ensure_running(wait_for_ready=False)
+    assert "GEMINI_API_KEY_2" not in spawns[-1]
+    events = _restartable(monkeypatch)
 
-    state = sidecar._update_checkout(_cfg(checkout))
+    job = _run_update()
 
+    assert job["status"] == "done", job
+    assert job["restarted"] is True
+    assert events == ["stop", "start"]
+    assert _git("rev-parse", "HEAD", cwd=checkout) == latest.upstream.c
+    state = sidecar.checkout_state()
+    assert state["state"] == "updated"
+    assert state["commit"] == latest.upstream.c
+    assert state["latest"] == latest.upstream.c
+    assert job["message"] == (
+        f"Updated Lyria from {latest.upstream.a[:7]} to {latest.upstream.c[:7]}."
+    )
+    assert (checkout / "generations" / "song.wav").read_bytes() == b"RIFF user audio"
+    assert len(spawns) == 2
+    assert spawns[-1]["GEMINI_API_KEY"] == "gemini-one"
+    assert spawns[-1]["GEMINI_API_KEY_2"] == "gemini-two"
+    # package.json did not change between the two commits.
+    assert latest.npm_runs == []
+
+
+def test_an_update_whose_restart_fails_says_so_and_that_lyria_is_stopped(
+    latest, monkeypatch
+):
+    """Lyria runs from an old install; Update moves the checkout, but the
+    restart fails (another program took the port meanwhile). The job ends in
+    an error that says what moved and why Lyria is not back, and marks Lyria
+    as stopped so the panel reloads instead of framing a dead server."""
+    checkout = _existing_install(latest, latest.upstream.a)
+    _capture_spawns(monkeypatch, checkout)
+    sidecar.ensure_running(wait_for_ready=False)
+    monkeypatch.setattr(sidecar, "_terminate_proc", lambda proc: None)
+    monkeypatch.setattr(sidecar, "stop_adopted", lambda: False)
+
+    def _port_taken(**kw):
+        raise RuntimeError("Port 5188 is already in use by another process.")
+
+    monkeypatch.setattr(sidecar, "ensure_running", _port_taken)
+
+    job = _run_update()
+
+    assert job["status"] == "error"
+    assert job["stopped"] is True
+    assert job["restarted"] is False
+    assert job["error"].startswith(
+        f"Updated Lyria from {latest.upstream.a[:7]} to {latest.upstream.c[:7]}."
+    )
+    assert "did not start again: Port 5188 is already in use" in job["error"]
+    assert _git("rev-parse", "HEAD", cwd=checkout) == latest.upstream.c
+
+    # The next Update starts clean.
+    again = _run_update()
+    assert again["status"] == "done"
+    assert again["stopped"] is False
+
+
+def test_update_leaves_a_checkout_with_local_changes_alone_and_says_why(
+    latest, monkeypatch
+):
+    checkout = _existing_install(latest, latest.upstream.a)
+    (checkout / "server.ts").write_text("// my own edit\n", encoding="utf-8")
+    spawns = _capture_spawns(monkeypatch, checkout)
+    sidecar.ensure_running(wait_for_ready=False)
+    events = _restartable(monkeypatch)
+
+    job = _run_update()
+
+    assert job["status"] == "done"
+    assert job["restarted"] is False
+    assert events == [], "a checkout that is not moved is not stopped either"
+    assert _git("rev-parse", "HEAD", cwd=checkout) == latest.upstream.a
+    assert (checkout / "server.ts").read_text(encoding="utf-8") == "// my own edit\n"
+    state = sidecar.checkout_state()
+    assert state["state"] == "dirty"
+    assert "local changes" in state["reason"]
+    assert job["message"] == state["reason"]
+    assert len(spawns) == 1
+
+
+def test_a_failed_fetch_leaves_the_checkout_as_it_is(latest, monkeypatch):
+    checkout = _existing_install(latest, latest.upstream.a)
+    monkeypatch.setattr(
+        sidecar, "LYRIA_REPO_URL", (latest.root / "no-such-repo").as_uri()
+    )
+
+    state = sidecar._fast_forward_checkout(_cfg(checkout))
+
+    assert state["state"] == "failed"
+    assert state["commit"] == latest.upstream.a
+    assert _git("rev-parse", "HEAD", cwd=checkout) == latest.upstream.a
+
+
+def test_a_checkout_with_commits_of_its_own_is_never_moved(latest):
+    """A developer's clone of the default branch: one commit of theirs on top
+    of the latest (``newer``), then the same branch reset under an older
+    commit with a commit of theirs (``diverged``). Neither is a fast-forward,
+    so neither moves."""
+    checkout = latest.root / "dev-lyria"
+    _git("clone", "-q", latest.upstream.uri, str(checkout))
+    (checkout / "mine.txt").write_text("mine\n", encoding="utf-8")
+    _git("add", "-A", cwd=checkout)
+    _git("commit", "-q", "-m", "mine", cwd=checkout)
+    ahead = _git("rev-parse", "HEAD", cwd=checkout)
+
+    state = sidecar._fast_forward_checkout(_cfg(checkout))
     assert state["state"] == "newer"
-    assert _git("rev-parse", "HEAD", cwd=checkout) == pinned.upstream.c
+    assert _git("rev-parse", "HEAD", cwd=checkout) == ahead
+
+    _git("reset", "-q", "--hard", latest.upstream.a, cwd=checkout)
+    (checkout / "mine.txt").write_text("mine again\n", encoding="utf-8")
+    _git("add", "-A", cwd=checkout)
+    _git("commit", "-q", "-m", "mine again", cwd=checkout)
+    forked = _git("rev-parse", "HEAD", cwd=checkout)
+
+    state = sidecar._fast_forward_checkout(_cfg(checkout))
+    assert state["state"] == "diverged"
+    assert "fast-forward" in state["reason"]
+    assert _git("rev-parse", "HEAD", cwd=checkout) == forked
 
 
-def test_a_checkout_named_by_theDAW_LYRIA_PROJECT_is_not_moved(pinned, monkeypatch):
-    checkout = _existing_install(pinned, pinned.upstream.a)
+def test_a_checkout_named_by_theDAW_LYRIA_PROJECT_is_not_moved(latest, monkeypatch):
+    checkout = _existing_install(latest, latest.upstream.a)
     monkeypatch.setenv("theDAW_LYRIA_PROJECT", str(checkout))
 
-    state = sidecar._update_checkout(sidecar.resolve_config())
+    state = sidecar._fast_forward_checkout(sidecar.resolve_config())
 
     assert state["state"] == "managed"
     assert "theDAW_LYRIA_PROJECT" in state["reason"]
-    assert _git("rev-parse", "HEAD", cwd=checkout) == pinned.upstream.a
+    assert _git("rev-parse", "HEAD", cwd=checkout) == latest.upstream.a
 
 
-def _pin_with_a_new_dependency(pinned, monkeypatch) -> str:
-    """Add commit D to the upstream with a changed package.json and pin it."""
-    upstream = pinned.upstream
+def _latest_with_a_new_dependency(latest_ns) -> str:
+    """Add commit D to the upstream with a changed package.json."""
+    upstream = latest_ns.upstream
     (upstream.path / "package.json").write_text(
         '{"name": "lyria-3-pro", "dependencies": {"new-dep": "1.0.0"}}\n',
         encoding="utf-8",
     )
     _git("commit", "-q", "-am", "D: new dependency", cwd=upstream.path)
-    pin = _git("rev-parse", "HEAD", cwd=upstream.path)
-    monkeypatch.setattr(sidecar, "LYRIA_PINNED_COMMIT", pin)
-    return pin
+    return _git("rev-parse", "HEAD", cwd=upstream.path)
 
 
-def test_changed_dependencies_run_npm_install_after_the_move(pinned, monkeypatch):
-    _pin_with_a_new_dependency(pinned, monkeypatch)
-    checkout = _existing_install(pinned, pinned.upstream.a)
+def test_changed_dependencies_run_npm_install_after_the_move(latest):
+    _latest_with_a_new_dependency(latest)
+    checkout = _existing_install(latest, latest.upstream.a)
 
-    state = sidecar._update_checkout(_cfg(checkout))
+    state = sidecar._fast_forward_checkout(_cfg(checkout))
 
     assert state["state"] == "updated"
-    assert len(pinned.npm_runs) == 1
+    assert len(latest.npm_runs) == 1
     assert sidecar.deps_pending(checkout) is False
 
 
-def test_a_failed_npm_install_after_the_move_runs_again_on_the_next_start(
-    pinned, monkeypatch
+def test_a_failed_npm_install_after_the_update_runs_again_on_the_next_start(
+    latest, monkeypatch
 ):
-    """A pin bump changes package.json. The user opens the Lyria tab: the
-    checkout moves and npm install fails (a network blip), so the tab shows
-    the error. The user presses Retry: the checkout is already at the pin and
-    node_modules (the old one) still exists, and npm install must run again
-    before Lyria spawns against it."""
-    pin = _pin_with_a_new_dependency(pinned, monkeypatch)
-    checkout = _existing_install(pinned, pinned.upstream.a)
+    """The latest commit changes package.json. The user presses Update: the
+    checkout moves and npm install fails (a network blip), so the panel shows
+    the error. The user opens Lyria: node_modules (the old one) still exists,
+    and npm install must run again before Lyria spawns against it."""
+    head = _latest_with_a_new_dependency(latest)
+    checkout = _existing_install(latest, latest.upstream.a)
     attempts: list[str] = []
 
     def _npm_install(cfg):
@@ -2925,36 +3068,38 @@ def test_a_failed_npm_install_after_the_move_runs_again_on_the_next_start(
             raise RuntimeError("npm install failed (rc=1)")
 
     monkeypatch.setattr(sidecar, "_run_npm_install", _npm_install)
+    monkeypatch.setattr(sidecar, "DEFAULT_PROJECT_PATH", checkout)
 
-    with pytest.raises(RuntimeError, match="npm install failed"):
-        _spawn_capturing_env(monkeypatch, checkout)
-    assert _git("rev-parse", "HEAD", cwd=checkout) == pin
+    job = _run_update()
+
+    assert job["status"] == "error"
+    assert "npm install failed" in job["error"]
+    assert _git("rev-parse", "HEAD", cwd=checkout) == head
     assert (checkout / "node_modules").is_dir()
     assert sidecar.deps_pending(checkout) is True
     assert sidecar.probe()["deps_installed"] is False
 
-    env = _spawn_capturing_env(monkeypatch, checkout)  # Retry
+    env = _spawn_capturing_env(monkeypatch, checkout)  # the user opens Lyria
 
     assert attempts == ["npm install", "npm install"]
     assert sidecar.deps_pending(checkout) is False
     assert env, "Lyria spawned once the dependencies were installed"
-    assert sidecar.checkout_state()["state"] == "current"
 
 
 def test_the_install_button_does_not_call_a_half_installed_checkout_done(
-    pinned, monkeypatch
+    latest, monkeypatch
 ):
-    """Same failed install after a move, then the Install button on the card:
-    it must run npm install, not report "Already installed"."""
-    _pin_with_a_new_dependency(pinned, monkeypatch)
-    checkout = _existing_install(pinned, pinned.upstream.a)
+    """Same failed install after an Update, then the Install button on the
+    card: it must run npm install, not report "Already installed"."""
+    _latest_with_a_new_dependency(latest)
+    checkout = _existing_install(latest, latest.upstream.a)
 
     def _npm_fails(cfg):
         raise RuntimeError("npm install failed (rc=1)")
 
     monkeypatch.setattr(sidecar, "_run_npm_install", _npm_fails)
-    with pytest.raises(RuntimeError, match="npm install failed"):
-        _spawn_capturing_env(monkeypatch, checkout)
+    monkeypatch.setattr(sidecar, "DEFAULT_PROJECT_PATH", checkout)
+    assert _run_update()["status"] == "error"
 
     ran: list[object] = []
     monkeypatch.setattr(sidecar, "_run_npm_install", lambda cfg: ran.append(cfg))
@@ -2973,9 +3118,9 @@ def test_the_install_button_does_not_call_a_half_installed_checkout_done(
     assert sidecar.deps_pending(checkout) is False
 
 
-def test_a_move_git_refuses_leaves_no_install_pending(pinned, monkeypatch):
-    _pin_with_a_new_dependency(pinned, monkeypatch)
-    checkout = _existing_install(pinned, pinned.upstream.a)
+def test_a_move_git_refuses_leaves_no_install_pending(latest, monkeypatch):
+    _latest_with_a_new_dependency(latest)
+    checkout = _existing_install(latest, latest.upstream.a)
     real_git_run = sidecar._git_run
 
     def _refuse_checkout(git, args, cwd, timeout=60.0):
@@ -2984,95 +3129,217 @@ def test_a_move_git_refuses_leaves_no_install_pending(pinned, monkeypatch):
         return real_git_run(git, args, cwd, timeout)
 
     monkeypatch.setattr(sidecar, "_git_run", _refuse_checkout)
-    state = sidecar._update_checkout(_cfg(checkout))
+    state = sidecar._fast_forward_checkout(_cfg(checkout))
 
     assert state["state"] == "failed"
-    assert _git("rev-parse", "HEAD", cwd=checkout) == pinned.upstream.a
+    assert _git("rev-parse", "HEAD", cwd=checkout) == latest.upstream.a
     assert sidecar.deps_pending(checkout) is False
-    assert pinned.npm_runs == []
+    assert latest.npm_runs == []
 
 
-def test_a_restart_retries_a_failed_fetch_at_once(pinned, monkeypatch):
-    """No network when Lyria opened: the fetch failed and the panel says so.
-    The network comes back and the user presses Restart. The checkout moves
-    then, not CHECKOUT_RETRY_SEC later."""
-    checkout = _existing_install(pinned, pinned.upstream.a)
-    real_uri = sidecar.LYRIA_REPO_URL
-    monkeypatch.setattr(
-        sidecar, "LYRIA_REPO_URL", (pinned.root / "no-such-repo").as_uri()
-    )
-    _spawn_capturing_env(monkeypatch, checkout)
-    assert sidecar.checkout_state()["state"] == "failed"
+def test_a_checkout_on_its_own_branch_is_left_alone_and_says_why(latest):
+    """A developer's clean clone on a feature branch cut from an older
+    commit: its working tree stays on that branch."""
+    checkout = latest.root / "dev-lyria"
+    _git("clone", "-q", latest.upstream.uri, str(checkout))
+    _git("checkout", "-q", "-b", "my-feature", latest.upstream.a, cwd=checkout)
 
-    monkeypatch.setattr(sidecar, "LYRIA_REPO_URL", real_uri)  # back online
-    real_ensure = sidecar.ensure_running
-    monkeypatch.setattr(
-        sidecar,
-        "ensure_running",
-        lambda **kw: real_ensure(wait_for_ready=False, **kw),
-    )
-    monkeypatch.setattr(sidecar, "stop_adopted", lambda: False)
-    monkeypatch.setattr(sidecar, "_terminate_proc", lambda proc: None)
-
-    sidecar.restart()
-
-    assert _git("rev-parse", "HEAD", cwd=checkout) == pinned.upstream.b
-    assert sidecar.checkout_state()["state"] == "updated"
-
-
-def test_a_checkout_on_its_own_branch_is_left_alone_and_says_why(pinned):
-    """A developer's clean clone on a feature branch cut before the pin: its
-    working tree stays on that branch."""
-    checkout = pinned.root / "dev-lyria"
-    _git("clone", "-q", pinned.upstream.uri, str(checkout))
-    _git("checkout", "-q", "-b", "my-feature", pinned.upstream.a, cwd=checkout)
-
-    state = sidecar._update_checkout(_cfg(checkout))
+    state = sidecar._fast_forward_checkout(_cfg(checkout))
 
     assert state["state"] == "branch"
     assert "my-feature" in state["reason"]
-    assert _git("rev-parse", "HEAD", cwd=checkout) == pinned.upstream.a
+    assert _git("rev-parse", "HEAD", cwd=checkout) == latest.upstream.a
     assert _git("symbolic-ref", "--short", "HEAD", cwd=checkout) == "my-feature"
 
 
-def test_a_default_branch_clone_from_an_older_install_is_moved(pinned):
-    """An older Install cloned the repo, which leaves its default branch
-    tracking origin's. That shape is theDAW's own and is moved to the pin."""
-    checkout = pinned.root / "lyria"
-    _git("clone", "-q", pinned.upstream.uri, str(checkout))
-    _git("reset", "-q", "--hard", pinned.upstream.a, cwd=checkout)
+def test_an_installed_clone_follows_each_new_commit_on_its_branch(latest):
+    """Install clones the default branch. The upstream gains a commit; Update
+    fast-forwards the branch to it (still on main, not detached), and the
+    origin tracking ref follows, so git status in the checkout shows no local
+    commits. A second Update with nothing new says so and changes nothing."""
+    target = latest.root / "fresh" / "lyria"
+    target.parent.mkdir()
+    commit = sidecar._clone_latest("git", target, subprocess.DEVNULL)
+    assert commit == latest.upstream.c
+    (target / "node_modules").mkdir()
+    upstream = latest.upstream.path
+    (upstream / "CHANGES.md").write_text("new\n", encoding="utf-8")
+    _git("add", "-A", cwd=upstream)
+    _git("commit", "-q", "-m", "D: newer", cwd=upstream)
+    newer = _git("rev-parse", "HEAD", cwd=upstream)
 
-    state = sidecar._update_checkout(_cfg(checkout))
+    state = sidecar._fast_forward_checkout(_cfg(target))
 
     assert state["state"] == "updated"
-    assert _git("rev-parse", "HEAD", cwd=checkout) == pinned.upstream.b
+    assert _git("rev-parse", "HEAD", cwd=target) == newer
+    assert _git("symbolic-ref", "--short", "HEAD", cwd=target) == "main"
+    assert _git("rev-parse", "origin/main", cwd=target) == newer
+    assert "ahead" not in _git("status", "-sb", cwd=target)
+
+    again = sidecar._fast_forward_checkout(_cfg(target))
+    assert again["state"] == "current"
+    assert again["reason"] == f"Lyria is at the latest commit, {newer[:7]}."
 
 
-def test_install_clones_exactly_the_pinned_commit(pinned):
-
-    assert re.fullmatch(r"[0-9a-f]{40}", sidecar.LYRIA_PINNED_COMMIT)
-    target = pinned.root / "fresh" / "lyria"
+def test_install_clones_the_latest_commit_of_the_default_branch(latest):
+    target = latest.root / "fresh" / "lyria"
     target.parent.mkdir()
 
-    sidecar._clone_pinned("git", target, subprocess.DEVNULL)
+    commit = sidecar._clone_latest("git", target, subprocess.DEVNULL)
 
-    # Pinned, not the repo's HEAD (C).
-    assert _git("rev-parse", "HEAD", cwd=target) == pinned.upstream.b
+    assert commit == latest.upstream.c
+    assert _git("rev-parse", "HEAD", cwd=target) == latest.upstream.c
+    assert _git("symbolic-ref", "--short", "HEAD", cwd=target) == "main"
     assert (target / "server" / "keys.ts").is_file()
-    assert sidecar.checkout_reads_key_lists(target) is True
+    assert sidecar.checkout_key_slots(target) == {
+        "GEMINI_API_KEY": 10,
+        "OPENROUTER_API_KEY": 10,
+    }
     assert not (target.parent / ".lyria.install-staging").exists()
 
 
-def test_a_failed_clone_leaves_nothing_behind(pinned, monkeypatch):
+def test_a_failed_clone_leaves_nothing_behind(latest, monkeypatch):
 
     monkeypatch.setattr(
-        sidecar, "LYRIA_REPO_URL", (pinned.root / "no-such-repo").as_uri()
+        sidecar, "LYRIA_REPO_URL", (latest.root / "no-such-repo").as_uri()
     )
-    target = pinned.root / "fresh" / "lyria"
+    target = latest.root / "fresh" / "lyria"
     target.parent.mkdir()
 
-    with pytest.raises(RuntimeError, match="git fetch failed"):
-        sidecar._clone_pinned("git", target, subprocess.DEVNULL)
+    with pytest.raises(RuntimeError, match="git clone failed"):
+        sidecar._clone_latest("git", target, subprocess.DEVNULL)
 
     assert not target.exists()
     assert not (target.parent / ".lyria.install-staging").exists()
+
+
+def test_check_latest_says_an_update_is_waiting_and_asks_github_once(
+    latest, monkeypatch
+):
+    """The Lyria panel opens on an old install and asks whether a newer
+    commit exists: ls-remote answers C, which is not HEAD. Opening the panel
+    again within ten minutes does not ask GitHub again."""
+    checkout = _existing_install(latest, latest.upstream.a)
+    monkeypatch.setattr(sidecar, "DEFAULT_PROJECT_PATH", checkout)
+    asks: list[list[str]] = []
+    real_git_run = sidecar._git_run
+
+    def _counting(git, args, cwd, timeout=60.0):
+        if "ls-remote" in args:
+            asks.append(args)
+        return real_git_run(git, args, cwd, timeout)
+
+    monkeypatch.setattr(sidecar, "_git_run", _counting)
+
+    first = sidecar.check_latest()
+    assert first == {
+        "head": latest.upstream.a,
+        "latest": latest.upstream.c,
+        "available": True,
+    }
+    assert _git("rev-parse", "HEAD", cwd=checkout) == latest.upstream.a
+    second = sidecar.check_latest()
+    assert second == first
+    assert len(asks) == 1
+
+
+def test_update_route_reports_the_job_and_refuses_without_a_checkout(
+    latest, monkeypatch
+):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from backend.modules.lyria import router as lyria_router
+
+    monkeypatch.setattr(sidecar, "DEFAULT_PROJECT_PATH", latest.root / "missing")
+    app = FastAPI()
+    app.include_router(lyria_router.router, prefix="/api/lyria")
+    local = TestClient(app, client=_LOOPBACK)
+
+    refused = local.post("/api/lyria/update")
+    assert refused.status_code == 409
+    assert "no Lyria checkout" in refused.json()["detail"]
+
+    checkout = _existing_install(latest, latest.upstream.a)
+    monkeypatch.setattr(sidecar, "DEFAULT_PROJECT_PATH", checkout)
+    started = local.post("/api/lyria/update")
+    assert started.status_code == 200, started.text
+    deadline = time.monotonic() + 60.0
+    while time.monotonic() < deadline:
+        body = local.get("/api/lyria/update").json()
+        if body["job"]["status"] in ("done", "error"):
+            break
+        time.sleep(0.02)
+    assert body["job"]["status"] == "done", body
+    assert body["checkout"]["state"] == "updated"
+    assert body["compat"]["reads_key_lists"] is True
+    assert _git("rev-parse", "HEAD", cwd=checkout) == latest.upstream.c
+
+
+# ---------------------------------------------------------------------------
+# What a checkout reads, from its own source
+# ---------------------------------------------------------------------------
+
+
+def test_key_slots_follow_what_each_variable_of_the_checkout_reads(tmp_path):
+    """Three checkouts: one whose server.ts reads numbered Gemini slots with
+    an explicit max of 3 and OpenRouter as one key; one that calls
+    numberedEnvValues without server/keys.ts (a half-merged tree); and the
+    old shape. Each gets exactly what it reads."""
+    partial = tmp_path / "partial"
+    (partial / "server").mkdir(parents=True)
+    (partial / "package.json").write_text("{}", encoding="utf-8")
+    (partial / "server" / "keys.ts").write_text(
+        "export function numberedEnvValues(env: NodeJS.ProcessEnv, prefix: "
+        "string, max = 10): string[] {\n",
+        encoding="utf-8",
+    )
+    (partial / "server.ts").write_text(
+        'numberedEnv: numberedEnvValues(process.env, "GEMINI_API_KEY", 3),\n'
+        "return clientKey || process.env.OPENROUTER_API_KEY;\n",
+        encoding="utf-8",
+    )
+    half = tmp_path / "half"
+    half.mkdir()
+    (half / "server.ts").write_text(
+        "numberedEnv: numberedEnvValues(process.env, 'GEMINI_API_KEY'),\n",
+        encoding="utf-8",
+    )
+
+    assert sidecar.checkout_key_slots(partial) == {
+        "GEMINI_API_KEY": 3,
+        "OPENROUTER_API_KEY": 1,
+    }
+    assert sidecar.checkout_key_slots(half) == {
+        "GEMINI_API_KEY": 1,
+        "OPENROUTER_API_KEY": 1,
+    }
+    assert sidecar.checkout_key_slots(_old_checkout(tmp_path / "old")) == {
+        "GEMINI_API_KEY": 1,
+        "OPENROUTER_API_KEY": 1,
+    }
+
+
+def test_child_env_hands_each_variable_only_the_keys_it_reads(lyria_keys, tmp_path):
+    for n in range(1, 6):
+        sidecar.add_key("gemini", f"gemini-key-{n}")
+        sidecar.add_key("openrouter", f"openrouter-key-{n}")
+    partial = tmp_path / "partial"
+    (partial / "server").mkdir(parents=True)
+    (partial / "server" / "keys.ts").write_text(
+        "export function numberedEnvValues(env, prefix, max = 10) {\n",
+        encoding="utf-8",
+    )
+    (partial / "server.ts").write_text(
+        "numberedEnv: numberedEnvValues(process.env, 'GEMINI_API_KEY', 3),\n",
+        encoding="utf-8",
+    )
+
+    env = sidecar._child_env(_cfg(partial))
+
+    assert _key_slots(env) == {
+        "GEMINI_API_KEY": "gemini-key-1",
+        "GEMINI_API_KEY_2": "gemini-key-2",
+        "GEMINI_API_KEY_3": "gemini-key-3",
+        "OPENROUTER_API_KEY": "openrouter-key-1",
+    }
