@@ -126,9 +126,11 @@ def test_search_no_longer_finds_a_bulk_deleted_entry(tmp_path: Path):
     found = db.list_entries_page(EntryFilters(q="harbor"), limit=10)
     assert [r["id"] for r in found] == ["keep"]
     assert db.count_entries_filtered(EntryFilters(q="dark")) == 0
-    # A contentless fts5 index only reports a bad delete through corruption, so
-    # ask it directly.
-    db._conn.execute("INSERT INTO entries_fts(entries_fts) VALUES('integrity-check')")
+    # An fts5 index only reports a bad delete through corruption, so ask it
+    # directly, against its content view as well as internally.
+    db._conn.execute(
+        "INSERT INTO entries_search(entries_search, rank) VALUES('integrity-check', 1)"
+    )
 
 
 def test_relations_referencing_a_deleted_entry_go_too(tmp_path: Path):

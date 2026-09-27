@@ -7,6 +7,8 @@ Endpoints (prefix from module.json → `/api/library`):
                                with ?limit= it is paged + searchable (see below)
     GET    /entries/ids        every matching id, for select-all / shift-range
     GET    /entries/facets     value counts per field, for the filter dropdowns
+    GET    /entries/stats      favourites / size / duration totals of a query
+    GET    /entries/resolve    the audio entry a LOOM reference names
     POST   /entries/bulk-delete  delete many entries by id, or by filter
     GET    /entries/{id}       single entry record
     GET    /audio/{id}         stream the audio file
@@ -58,8 +60,10 @@ from pydantic import BaseModel
 from . import media_roots
 from .bundle import build_bundle_bytes
 from .db import (
+    ANALYSIS_SCALAR_KEYS,
     DEFAULT_SORT,
     FACET_FIELDS,
+    FFPROBE_SUMMARY_KEYS,
     SORTS,
     EntryFilters,
     LibraryDB,
@@ -182,36 +186,13 @@ def _attach_play_counts(
 # Scalar analysis columns that are safe to expose on the entry verbatim. The
 # `*_json` columns (embedded_tags_json / ffprobe_json / semantic_tags_json) are
 # parsed separately below so the frontend never receives raw JSON strings.
-_ANALYSIS_SCALAR_KEYS = (
-    "bpm",
-    "key",
-    "key_confidence",
-    "scale",
-    "pitch_mean_hz",
-    "pitch_std_hz",
-    "loudness_lufs",
-    "rms_db",
-    "bars_estimated",
-    "genre",
-    "genre_confidence",
-    "prompt_guess",
-    "prompt_confidence",
-    "analyzed_at",
-)
+# Defined in db.py, whose search index matches exactly what an entry carries.
+_ANALYSIS_SCALAR_KEYS = ANALYSIS_SCALAR_KEYS
 
 # Selected file-technical keys pulled out of the ffprobe `_summary` blob so the
 # inspector can show them as plain rows (sample rate, codec, …) without dumping
-# the whole ffprobe payload.
-_FFPROBE_SUMMARY_KEYS = (
-    "sample_rate",
-    "channels",
-    "bit_depth",
-    "bit_depth_is_float",
-    "sample_fmt",
-    "codec",
-    "container",
-    "duration_sec",
-)
+# the whole ffprobe payload. Defined in db.py for the same reason.
+_FFPROBE_SUMMARY_KEYS = FFPROBE_SUMMARY_KEYS
 
 
 def _loose_json(text: Optional[str]) -> Any:
@@ -654,6 +635,50 @@ def entry_facets(
         "facets": store.db.facet_counts(filters, requested),
         "revision": store.db.library_revision(),
     }
+
+
+@router.get("/entries/stats")
+def entry_stats(
+    kind: str = "audio",
+    q: Optional[str] = None,
+    favorite: Optional[bool] = None,
+    source: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> dict[str, Any]:
+    """Totals over the WHOLE filtered library: ``count``, ``favorites``,
+    ``size_bytes`` and ``duration_sec``, for the chips above the library list.
+
+    The parameters are the paged list's filters and mean exactly the same
+    thing, so the chips always describe the rows the list is paging through
+    -- all of them, not the pages a client happens to hold. ``revision`` is
+    the library revision the totals were read at, like the list and the
+    facets carry. Declared BEFORE ``/entries/{entry_id}`` so the literal path
+    is not swallowed by the id parameter.
+    """
+    _validate_listing(kind, None, 0)
+    store = get_store()
+    if store.db is None:
+        raise HTTPException(503, "library DB not available")
+    filters = _entry_filters(kind, q, favorite, source, provider)
+    return {
+        **store.db.entry_stats(filters),
+        "revision": store.db.library_revision(),
+    }
+
+
+@router.get("/entries/resolve")
+def resolve_entry_ref(
+    ref: str = Query(..., min_length=1, max_length=512),
+) -> dict[str, Any]:
+    """The audio entry a LOOM score or template names by ``ref`` -- an id, an
+    id prefix, or a title fragment -- over the whole library. Answers
+    ``{"id": ...}``, with ``null`` when nothing matches. See
+    :meth:`~.db.LibraryDB.resolve_entry_ref` for the order of preference.
+    Declared BEFORE ``/entries/{entry_id}``."""
+    store = get_store()
+    if store.db is None:
+        raise HTTPException(503, "library DB not available")
+    return {"id": store.db.resolve_entry_ref(ref)}
 
 
 class BulkDeleteFilter(BaseModel):

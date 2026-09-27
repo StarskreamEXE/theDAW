@@ -264,8 +264,8 @@ _SELECT_LIST_RE = re.compile(r"\bselect\b(.*?)\bfrom\b")
 _STAR_RE = re.compile(r"\.\*|(?<![\w.(])\*")
 
 #: ``FROM entries``, the table -- bounded so it is not also satisfied by
-#: ``FROM entries_fts``, the contentless fts5 index, which holds no blob and
-#: whose rows are not rows of ``entries``.
+#: ``FROM entries_search`` (the fts5 index) or its text tables, which hold no
+#: blob and whose rows are not rows of ``entries``.
 _ENTRIES_TABLE_RE = re.compile(r"\bfrom\s+entries\b")
 
 
@@ -838,13 +838,13 @@ def test_the_blob_rule_flags_a_blob_read_and_spares_the_exceptions() -> None:
         "SELECT COUNT(*) FROM entries",
         "SELECT id, created_at FROM entries",
         "SELECT provider, COUNT(*) FROM entries GROUP BY provider",
-        # the contentless fts5 index is not the entries table: its rows hold
-        # no blob, so a star over it reads nothing this rule is about
-        "SELECT * FROM entries_fts WHERE entries_fts MATCH ?",
+        # the fts5 search index is not the entries table: its rows hold no
+        # blob, so a star over it reads nothing this rule is about
+        "SELECT * FROM entries_search WHERE entries_search MATCH ?",
         # the paged list, searched: the outer select list is the star, the
         # subquery's is a rowid, and the page shape is intact
-        "SELECT e.* FROM entries e WHERE e.rowid IN (SELECT rowid FROM "
-        "entries_fts WHERE entries_fts MATCH ?) ORDER BY e.created_at DESC "
+        "SELECT e.* FROM entries e WHERE e.rowid IN (SELECT rowid AS rid FROM "
+        "entries_search WHERE entries_search MATCH ?) ORDER BY e.created_at DESC "
         "LIMIT ? OFFSET ?",
     ]
     assert _blob_offenders(offending) == [_normalise(s) for s in offending]

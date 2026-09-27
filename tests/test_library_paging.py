@@ -71,14 +71,25 @@ def _ids(rows: list[dict]) -> list[str]:
 
 
 def _build_has_fts5() -> bool:
+    """Whether this SQLite has fts5 AND its trigram tokenizer, which is what
+    the library's search index needs."""
     probe = sqlite3.connect(":memory:")
     try:
-        probe.execute("CREATE VIRTUAL TABLE t USING fts5(a, content='')")
+        probe.execute("CREATE VIRTUAL TABLE t USING fts5(a, tokenize='trigram')")
         return True
     except sqlite3.OperationalError:
         return False
     finally:
         probe.close()
+
+
+def _assert_search_index_intact(db: LibraryDB) -> None:
+    """fts5's own integrity check, with the rank argument that also compares
+    the index against its content view -- the check a wrong delete fails."""
+    if db.fts_enabled:
+        db._conn.execute(
+            "INSERT INTO entries_search(entries_search, rank) VALUES('integrity-check', 1)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +139,8 @@ def test_every_documented_sort_orders_the_page(seeded_db: LibraryDB):
         "title_desc": ["e4", "e3", "e2", "e1", "e0"],
         "duration_desc": ["e0", "e1", "e2", "e3", "e4"],
         "duration_asc": ["e4", "e3", "e2", "e1", "e0"],
+        # starred rows (e0, e2, e4) by name, then the rest by name
+        "favorites_first": ["e0", "e2", "e4", "e1", "e3"],
     }
     for sort, order in expected.items():
         rows = seeded_db.list_entries_page(EntryFilters(), sort=sort, limit=10)
@@ -241,6 +254,9 @@ def test_search_matches_by_prefix_across_the_indexed_columns(
     assert found("neon") == {"neon", "drift"}
     # Prefix, not whole word.
     assert found("neo") == {"neon", "drift"}
+    # Inside a word too, as main's substring matcher found it.
+    assert found("ynthw") == {"neon"}
+    assert found("rifting") == {"drift"}
     # Prompt text is searched too.
     assert found("synthwave") == {"neon"}
     # Tokens are ANDed: only the entry with both wins.
@@ -263,7 +279,8 @@ def test_search_input_is_escaped_not_interpreted(tmp_path: Path, enable_fts: boo
     # OR is not an operator here: the three tokens are ANDed, and nothing has
     # all three.
     assert db.list_entries_page(EntryFilters(q="neon OR calm"), limit=50) == []
-    # A query with nothing searchable in it matches nothing rather than
+    # Punctuation alone is matched literally, as main's substring matcher
+    # matched it: nothing here contains "!!! ---", and it never matches
     # everything.
     assert db.list_entries_page(EntryFilters(q="!!! ---"), limit=50) == []
 
@@ -295,7 +312,7 @@ def test_search_index_follows_edits_and_deletes(tmp_path: Path):
 
     db.delete_entry("x")
     assert db.list_entries_page(EntryFilters(q="renamed"), limit=5) == []
-    db._conn.execute("INSERT INTO entries_fts(entries_fts) VALUES('integrity-check')")
+    _assert_search_index_intact(db)
 
 
 def test_an_existing_library_gains_the_search_index_on_reopen(tmp_path: Path):
@@ -324,18 +341,16 @@ def test_an_existing_library_gains_the_search_index_on_reopen(tmp_path: Path):
     # contentless index holding two copies of every row).
     again = LibraryDB(path)
     assert len(again.list_entries_page(EntryFilters(q="harbor"), limit=3000)) == 2500
-    again._conn.execute(
-        "INSERT INTO entries_fts(entries_fts) VALUES('integrity-check')"
-    )
+    _assert_search_index_intact(again)
     again.delete_entry("o7")
     assert len(again.list_entries_page(EntryFilters(q="harbor"), limit=3000)) == 2499
 
 
 def test_search_index_agrees_with_a_brute_force_scan(tmp_path: Path):
-    """A contentless FTS5 index is only correctable by deleting the exact values
-    that were inserted, so a wrong delete leaves phantom hits that no query ever
-    reports as an error. This churns writes and then checks the index against a
-    scan of the source columns."""
+    """An fts5 row is only correctable by deleting the exact values that were
+    inserted, so a wrong delete leaves phantom hits that no query ever reports
+    as an error. This churns writes and then checks the index against a scan of
+    the source columns."""
     db = LibraryDB(tmp_path / "churn.db")
     if not db.fts_enabled:
         pytest.skip("build has no FTS5")
@@ -352,14 +367,7 @@ def test_search_index_agrees_with_a_brute_force_scan(tmp_path: Path):
     live = db._conn.execute("SELECT id, title, prompt FROM entries").fetchall()
     for word in words:
         via_fts = set(_ids(db.list_entries_page(EntryFilters(q=word), limit=100)))
-        brute = {
-            r["id"]
-            for r in live
-            if any(
-                tok.startswith(word)
-                for tok in f"{r['title']} {r['prompt']}".lower().split()
-            )
-        }
+        brute = {r["id"] for r in live if word in f"{r['title']} {r['prompt']}".lower()}
         assert via_fts == brute, word
 
 

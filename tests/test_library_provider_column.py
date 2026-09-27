@@ -597,7 +597,7 @@ def test_step_eleven_rebuilds_the_expression_indexes_and_rewrites_no_row(
     old.close()
 
     db = LibraryDB(v10_library)
-    assert db.schema_version() == SCHEMA_VERSION == PROVIDER_CHIRP_VERSION
+    assert db.schema_version() == SCHEMA_VERSION >= PROVIDER_CHIRP_VERSION
     assert _row_dump(db._conn, V9_COLUMNS) == before
     assert set(PROVIDER_INDEXES) <= _indexes(db._conn)
 
