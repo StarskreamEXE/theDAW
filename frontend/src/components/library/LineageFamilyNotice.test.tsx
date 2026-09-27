@@ -183,6 +183,19 @@ async function main(): Promise<void> {
     assert.ok(text().includes('0 before · 1 after'), `the late answer is not shown on another song: ${text()}`);
     assert.ok(!text().includes('The whole family is loaded'), 'nothing about it leaks onto the other song');
     holdWhole = false;
+
+    // Back on the first song, the dropped answer has still ended its press:
+    // the key is ready, not stuck on "Loading…", and it works.
+    await act(async () => root.render(<TrackInfo entryId={ROOT} {...props} />));
+    await settle();
+    assert.ok(text().includes('Showing the nearest 600 of a larger family.'), 'the capped family is read again');
+    const back = loadKey();
+    assert.ok(back, 'the key is offered again');
+    assert.equal(back!.textContent, 'Load the whole family', `the key is not stuck working: ${back!.textContent}`);
+    assert.equal(back!.disabled, false, 'and it can be pressed');
+    await act(async () => back!.click());
+    await settle();
+    assert.ok(text().includes('The whole family is loaded: 701 in all.'), 'pressing it loads the whole family');
     await act(async () => root.unmount());
   }
 

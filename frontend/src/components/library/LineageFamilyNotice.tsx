@@ -38,6 +38,8 @@ interface Held {
 
 interface WholeHeld {
   entryId: string;
+  /** Which press this is, so a late answer only settles its own press. */
+  request: number;
   busy: boolean;
   error: string | null;
 }
@@ -53,6 +55,7 @@ export function useLineageFamily(entryId: string | null, depth: number, enabled 
   const [whole, setWhole] = useState<WholeHeld | null>(null);
   const shownRef = useRef(entryId);
   shownRef.current = entryId;
+  const requestRef = useRef(0);
 
   const current = held && held.entryId === entryId ? held : null;
 
@@ -75,16 +78,26 @@ export function useLineageFamily(entryId: string | null, depth: number, enabled 
   const loadWhole = useCallback(() => {
     if (!entryId) return;
     const asked = entryId;
-    setWhole({ entryId: asked, busy: true, error: null });
+    requestRef.current += 1;
+    const request = requestRef.current;
+    setWhole({ entryId: asked, request, busy: true, error: null });
+    // An answer that lands after the panel moved to another song is not
+    // shown, but it still ends its press: otherwise the key would read
+    // "Loading…" for good when the user comes back to this song.
+    const moved = () => {
+      if (shownRef.current === asked) return false;
+      setWhole((w) => (w && w.request === request ? null : w));
+      return true;
+    };
     readWholeFamily(asked, depth).then(
       (read) => {
-        if (shownRef.current !== asked) return;
+        if (moved()) return;
         setHeld({ entryId: asked, family: read.family, error: null });
-        setWhole({ entryId: asked, busy: false, error: null });
+        setWhole((w) => (w && w.request === request ? { ...w, busy: false } : w));
       },
       (e: unknown) => {
-        if (shownRef.current !== asked) return;
-        setWhole({ entryId: asked, busy: false, error: message(e) });
+        if (moved()) return;
+        setWhole((w) => (w && w.request === request ? { ...w, busy: false, error: message(e) } : w));
       },
     );
   }, [entryId, depth]);
