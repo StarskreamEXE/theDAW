@@ -33,8 +33,6 @@ import logging
 import os
 import re
 import shutil
-import threading
-import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,6 +40,7 @@ from typing import Any
 
 from backend.lib import paths
 from backend.lib.atomic import atomic_write
+from backend.lib.stamps import IncreasingClock
 
 log = logging.getLogger(__name__)
 
@@ -65,26 +64,12 @@ def default_candidates_root() -> Path:
     return paths.library_root().parent / "candidates"
 
 
-_stamp_lock = threading.Lock()
-_last_stamp = 0.0
-
-
-def _created_at() -> float:
-    """``time.time()``, strictly increasing within this process.
-
-    list_sets orders sets newest first and each set's candidates oldest first
-    by ``created_at``. Windows' clock moves in 15.6 ms steps, so two made in
-    quick succession got the same value and fell back to folder order, whose
-    names are random ids. A stamp that would repeat or go back moves a
-    microsecond past the last one instead.
-    """
-    global _last_stamp
-    with _stamp_lock:
-        now = time.time()
-        if now <= _last_stamp:
-            now = _last_stamp + 1e-6
-        _last_stamp = now
-        return now
+# list_sets orders sets newest first and each set's candidates oldest first
+# by ``created_at``. Windows' clock moves in 15.6 ms steps, so two made in
+# quick succession got the same value and fell back to folder order, whose
+# names are random ids; the stamps are strictly increasing instead
+# (backend/lib/stamps.py).
+_created_at = IncreasingClock()
 
 
 def new_token() -> str:

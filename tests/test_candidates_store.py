@@ -277,9 +277,9 @@ def test_sets_and_candidates_made_in_one_clock_tick_keep_their_order(
     made in quick succession got the same created_at. list_sets then fell
     back to folder order (random ids), and "newest first" was a coin toss:
     test_list_sets_filters_by_source_id failed on a full-suite run here."""
-    from backend.modules.candidates import store as store_module
+    import time
 
-    monkeypatch.setattr(store_module.time, "time", lambda: 1_790_000_000.0)
+    monkeypatch.setattr(time, "time", lambda: 1_790_000_000.0)
     made = [
         store.create_set(source={"id": "t"}, provider="suno", params={}, label=str(i))
         for i in range(6)
