@@ -18,12 +18,15 @@ import type { LibraryEntry } from '../../state/libraryEntry';
 const ROOT = 'song-root';
 const OTHER = 'song-other';
 const CAP = 600;
+/** The one relative that is a library song, so reading themes fetches it. */
+const SONG_CHILD = { id: 'child-0', kind: 'entry', title: 'Child' };
 
 const capped = () => ({
   root: ROOT,
   nodes: [
     { id: ROOT, kind: 'entry', title: 'Root', source: 'generate', duration_sec: 10 },
-    ...Array.from({ length: CAP - 1 }, (_, i) => ({ id: `child-${i}`, kind: 'external' })),
+    SONG_CHILD,
+    ...Array.from({ length: CAP - 2 }, (_, i) => ({ id: `child-${i + 1}`, kind: 'external' })),
   ],
   edges: Array.from({ length: CAP - 1 }, (_, i) => ({ from_id: ROOT, to_id: `child-${i}`, kind: 'derived_from' })),
   truncated: true,
@@ -34,7 +37,8 @@ const capped = () => ({
 const whole = (depth: number) => {
   const nodes = [
     { id: ROOT, kind: 'entry', title: 'Root', source: 'generate', duration_sec: 10 },
-    ...Array.from({ length: 700 }, (_, i) => ({ id: `child-${i}`, kind: 'external' })),
+    SONG_CHILD,
+    ...Array.from({ length: 699 }, (_, i) => ({ id: `child-${i + 1}`, kind: 'external' })),
   ];
   const edges = Array.from({ length: 700 }, (_, i) => ({ from_id: ROOT, to_id: `child-${i}`, kind: 'derived_from' }));
   return {
@@ -92,6 +96,9 @@ async function main(): Promise<void> {
   /** Resolvers for whole-family reads, so a test decides when one lands. */
   const heldWhole: Array<() => void> = [];
   let holdWhole = false;
+  /** Resolvers for the entry reads a themes read makes. */
+  const heldEntries: Array<() => void> = [];
+  let holdEntries = false;
   const asked: string[] = [];
   globalThis.fetch = (async (input: RequestInfo | URL) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : String(input);
@@ -101,6 +108,11 @@ async function main(): Promise<void> {
       const reply = () => new Response(JSON.stringify(whole(Number(full[2]))), { status: 200 });
       if (!holdWhole) return reply();
       return new Promise<Response>((resolve) => heldWhole.push(() => resolve(reply())));
+    }
+    if (url.startsWith('/api/library/entries/')) {
+      const reply = () => json({ detail: 'Not Found' }, 404);
+      if (!holdEntries) return reply();
+      return new Promise<Response>((resolve) => heldEntries.push(() => resolve(reply())));
     }
     if (url.startsWith(`/api/library/${ROOT}/lineage?`)) return json(capped());
     if (url.startsWith(`/api/library/${OTHER}/lineage?`)) return json(small());
@@ -171,6 +183,32 @@ async function main(): Promise<void> {
     assert.ok(text().includes('0 before · 1 after'), `the late answer is not shown on another song: ${text()}`);
     assert.ok(!text().includes('The whole family is loaded'), 'nothing about it leaks onto the other song');
     holdWhole = false;
+    await act(async () => root.unmount());
+  }
+
+  // ── INFO: a themes read still running when the whole family lands ───────
+  // Themes pressed on the capped family, the whole family loaded before the
+  // entry reads come back: the late themes describe the replaced family and
+  // are dropped, so the key to read them from the whole family stays.
+  {
+    const root = createRoot(host);
+    const props = { stems: [], midis: [], scores: [], onOpenDetails: () => {}, onOpenLineage: () => {}, onSelectEntry: () => {} };
+    await act(async () => root.render(<TrackInfo entryId={ROOT} {...props} />));
+    await settle();
+    const themesKey = () =>
+      Array.from(doc.querySelectorAll('button')).find((b) => (b.textContent ?? '').includes("Read the family's themes"));
+    holdEntries = true;
+    await act(async () => themesKey()!.click());
+    await settle();
+    assert.equal(heldEntries.length, 1, 'the themes read is waiting on the family’s one song');
+    await act(async () => loadKey()!.click());
+    await settle();
+    assert.ok(text().includes('The whole family is loaded: 701 in all.'), 'the whole family landed first');
+    heldEntries.splice(0).forEach((f) => f());
+    await settle();
+    holdEntries = false;
+    assert.ok(!text().includes('No prompts or tags across the family yet.'), `the late themes are dropped: ${text().slice(-300)}`);
+    assert.ok(themesKey(), 'and the key reads them again from the whole family');
     await act(async () => root.unmount());
   }
 

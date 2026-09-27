@@ -141,8 +141,11 @@ export const TrackInfo: React.FC<{
 
   const lineageRead = lineage.family;
   // Themes are read from one family. When the whole family replaces the
-  // capped one they are dropped, so "Read from N of the family" never
+  // capped one they are dropped, and a read still running on the replaced
+  // family is dropped when it lands, so "Read from N of the family" never
   // describes the family that was replaced.
+  const shownFamilyRef = useRef(lineageRead);
+  shownFamilyRef.current = lineageRead;
   useEffect(() => {
     setThemes(null);
   }, [lineageRead]);
@@ -159,6 +162,7 @@ export const TrackInfo: React.FC<{
     const ids = [...family.ancestors, ...family.descendants].filter((id) => family.byId[id]?.kind === 'entry');
     const use = ids.slice(0, LINEAGE_FETCH_CAP);
     const askedFor = entryId;
+    const askedFamily = lineageRead;
     setThemesBusy(true);
     try {
       const rows = await Promise.all(
@@ -168,7 +172,7 @@ export const TrackInfo: React.FC<{
             .catch(() => null),
         ),
       );
-      if (shownIdRef.current !== askedFor) return;
+      if (shownIdRef.current !== askedFor || shownFamilyRef.current !== askedFamily) return;
       setThemes({ ...themesOf(rows), count: use.length, truncated: ids.length > use.length });
     } finally {
       setThemesBusy(false);
