@@ -1629,8 +1629,66 @@ def test_an_older_build_still_finds_the_gemini_key_after_this_build_writes(
     assert _main_build_gemini_key(lyria_keys.path) == "this-g2"
 
     _main_build_set_key(lyria_keys.path, "main-g3")
-    assert sidecar.stored_keys("gemini") == ["main-g3"]
+    # main's key goes first; the keys this build saved stay behind it.
+    assert sidecar.stored_keys("gemini") == ["main-g3", "this-g2"]
+    assert sidecar.stored_keys("openrouter") == ["this-o1"]
     assert sidecar.gemini_key() == ("main-g3", "file")
+
+
+def _main_build(path, monkeypatch) -> object:
+    """upstream/main's own Lyria sidecar module (a verbatim copy in
+    tests/fixtures/main_851f6a0), its key file pointed at ``path``. Listed in
+    sys.modules while the test runs, as an import would: its dataclasses look
+    their module up there."""
+    import importlib.util
+    from pathlib import Path
+
+    source = Path(__file__).parent / "fixtures" / "main_851f6a0" / "lyria_sidecar.py"
+    spec = importlib.util.spec_from_file_location("lyria_sidecar_main_851f6a0", source)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    module._GEMINI_KEY_FILE = path
+    return module
+
+
+def test_keys_saved_here_survive_main_saving_and_clearing_its_key(
+    lyria_keys, monkeypatch
+):
+    """The user keeps two Gemini keys, an OpenRouter key, a provider choice
+    and the pool share in this build, then runs main. main's POST /key wrote
+    ``{"key": ...}`` over the whole file, so every other key and choice was
+    gone when this build opened again; main's DELETE /key unlinked the file,
+    OpenRouter key and all. Both now land on the keys this build keeps."""
+    sidecar.add_key("gemini", "this-g1")
+    sidecar.add_key("gemini", "this-g2")
+    sidecar.add_key("openrouter", "this-o1")
+    sidecar.set_provider_preference("openrouter")
+    sidecar.set_pool_shared(True)
+
+    main = _main_build(lyria_keys.path, monkeypatch)
+    assert main.gemini_key() == ("this-g1", "file")
+    main.set_gemini_key("main-g3")
+
+    assert sidecar.stored_keys("gemini") == ["main-g3", "this-g1", "this-g2"]
+    assert sidecar.stored_keys("openrouter") == ["this-o1"]
+    assert sidecar.provider_preference() == "openrouter"
+    assert sidecar.pool_shared() is True
+
+    # This build writes again; main still reads the key it saved.
+    sidecar.add_key("openrouter", "this-o2")
+    assert main.gemini_key() == ("main-g3", "file")
+
+    # main forgets its key: every Gemini key goes, as this build's own
+    # DELETE /api/lyria/key does, and nothing else does.
+    assert main.clear_gemini_key() is True
+    assert sidecar.stored_keys("gemini") == []
+    assert sidecar.stored_keys("openrouter") == ["this-o1", "this-o2"]
+    assert sidecar.provider_preference() == "openrouter"
+
+    sidecar.add_key("gemini", "this-g4")
+    assert main.gemini_key() == ("this-g4", "file")
+    assert sidecar.stored_keys("openrouter") == ["this-o1", "this-o2"]
 
 
 class _TornWriter:
