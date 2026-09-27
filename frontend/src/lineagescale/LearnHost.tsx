@@ -18,7 +18,7 @@ import { formatCount } from './lineageScaleModel';
  * reachable.
  *
  * Which view opens by default is the backend's call: `/summary`'s
- * `full_view_ok` (with_lineage <= 2000). A backend that does not have this
+ * `full_view_ok` (with_lineage <= `full_view_limit`, 2,000). A backend that does not have this
  * module at all answers 404 — an older build — and that falls back to exactly
  * the old behaviour, the classic view, with nothing alarming shown.
  *
@@ -47,8 +47,9 @@ const CHOICE_KEY = 'thedaw.learnMode';
 
 /* ─────────────────────────────── the decision ────────────────────────────── */
 
-/** The `with_lineage` count past which `/summary` says `full_view_ok: false`
- *  (FULL_VIEW_LIMIT in backend/modules/lineagescale/graph.py). */
+/** The limit the warning quotes when `/summary` does not send
+ *  `full_view_limit` (a backend older than that field). The backend's own
+ *  number, when sent, is the one that decided, so it is the one quoted. */
 export const FULL_VIEW_LIMIT = 2000;
 
 export interface LearnDecision {
@@ -68,7 +69,7 @@ export interface LearnDecision {
  * backend already counts for `full_view_ok`.
  */
 export const classicUnavailableReason = (summary: LineageSummary): string =>
-  `The classic graph draws every song at once. This library has ${formatCount(summary.with_lineage)} connected songs, past the ${formatCount(FULL_VIEW_LIMIT)} where LEARN opens the scale view instead, so the classic graph may be slow or stop responding.`;
+  `The classic graph draws every song at once. This library has ${formatCount(summary.with_lineage)} connected songs, past the ${formatCount(summary.full_view_limit ?? FULL_VIEW_LIMIT)} where LEARN opens the scale view instead, so the classic graph may be slow or stop responding.`;
 
 /** The warning when the summary could not be read at all. */
 export const classicUnknownSizeReason =

@@ -802,6 +802,27 @@ def test_a_connected_component_is_not_a_family(library):
     assert summary["largest_connected"] > summary["largest_tree"] * 4
 
 
+def test_the_summary_sends_the_limit_full_view_ok_was_decided_by(
+    monkeypatch, small_library
+):
+    """LEARN's warning quotes ``full_view_limit``. It has to be the number
+    ``full_view_ok`` was decided against, so a limit that moves moves both,
+    and the warning never quotes a stale copy."""
+    summary = _stats(small_library).summary
+    assert summary["full_view_limit"] == graph.FULL_VIEW_LIMIT
+    with_lineage = summary["with_lineage"]
+
+    monkeypatch.setattr(graph, "FULL_VIEW_LIMIT", with_lineage - 1)
+    moved = _stats(small_library).summary
+    assert moved["full_view_limit"] == with_lineage - 1
+    assert moved["full_view_ok"] is False
+
+    monkeypatch.setattr(graph, "FULL_VIEW_LIMIT", with_lineage)
+    at = _stats(small_library).summary
+    assert at["full_view_limit"] == with_lineage
+    assert at["full_view_ok"] is True
+
+
 def test_full_view_ok_is_true_while_the_library_is_still_small(small_library):
     summary = _stats(small_library).summary
     assert summary["full_view_ok"] is True
@@ -913,6 +934,7 @@ def test_the_summary_route_answers_the_contract(monkeypatch, library):
         "largest_connected",
         "largest_tree",
         "full_view_ok",
+        "full_view_limit",
         "revision",
         # A superset of the original contract: whether these numbers came
         # out of the cache or this request ran the pass for them.

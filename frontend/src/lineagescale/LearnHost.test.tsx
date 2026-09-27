@@ -104,6 +104,15 @@ const surface = (props: Partial<React.ComponentProps<typeof LearnHostSurface>>):
   assert.ok(big.reason.includes('173,565'), 'the warning quotes the library’s own number');
   assert.ok(!/cannot load/.test(big.reason), 'and claims nothing the 2,000 limit never measured');
 
+  // The warning quotes the limit the backend decided with. A backend whose
+  // limit moved to 5,000 says so in /summary, and a 6,000-song library is
+  // told it is past 5,000, not past a 2,000 copied into this file.
+  const moved = { ...summaryOf(6000, false), full_view_limit: 5000 };
+  const movedReason = decideLearnMode(moved, null).reason;
+  assert.ok(movedReason.includes('past the 5,000 where LEARN'), `the backend’s own limit is quoted: ${movedReason}`);
+  assert.ok(!movedReason.includes('2,000'), 'and not the fallback');
+  assert.ok(big.reason.includes('past the 2,000 where LEARN'), 'a backend that does not send it gets the fallback');
+
   // "Open anyway" mounts the classic view, still with the warning.
   assert.deepEqual(decideLearnMode(BIG, null, false, true), {
     mode: 'classic', classicAllowed: true, reason: big.reason, canOpenAnyway: false,
