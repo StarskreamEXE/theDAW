@@ -251,7 +251,7 @@ def startup_underfit() -> None:
                     "underfit.router: upstream update available (%s)",
                     status.get("upstream"),
                 )
-        except Exception as e:  # noqa: BLE001 — log and swallow
+        except Exception as e:  # log and swallow
             log.warning("underfit.router: update check failed: %s", e)
 
     threading.Thread(target=_check, daemon=True, name="underfit-update-check").start()
@@ -263,7 +263,7 @@ def startup_underfit() -> None:
         try:
             url = sidecar.ensure_running()
             log.info("underfit.router: auto-spawn ready at %s", url)
-        except Exception as e:  # noqa: BLE001 — log and swallow
+        except Exception as e:  # log and swallow
             log.warning("underfit.router: auto-spawn failed: %s", e)
 
     threading.Thread(target=_spawn, daemon=True, name="underfit-auto-spawn").start()

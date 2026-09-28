@@ -36,5 +36,5 @@ def stop_all_sidecars() -> None:
             module = __import__(module_path, fromlist=[fn_name, "get_sidecar"])
             target = module.get_sidecar() if needs_instance else module
             getattr(target, fn_name)()
-        except Exception:  # noqa: BLE001 — teardown must never break exit
+        except Exception:  # teardown must never break exit
             log.debug("teardown: %s.%s failed", module_path, fn_name, exc_info=True)
