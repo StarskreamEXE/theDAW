@@ -35,7 +35,6 @@ import type { LibraryEntry } from '../state/libraryEntry';
  */
 export const CatalogueView: React.FC<{ onCollapse?: () => void }> = ({ onCollapse }) => {
   // Library store (source of truth).
-  const loaded = useLibraryStore((s) => s.loaded);
   const entries = useLibraryStore((s) => s.entries);
   const total = useLibraryStore((s) => s.total);
   const pagesLoading = useLibraryStore((s) => s.pagesLoading);
@@ -43,8 +42,6 @@ export const CatalogueView: React.FC<{ onCollapse?: () => void }> = ({ onCollaps
   const libraryOpening = useLibraryStore((s) => s.libraryOpening);
   const indexStatus = useLibraryIndexStatus((s) => s.status);
   const entryAt = useLibraryStore((s) => s.entryAt);
-  const getById = useLibraryStore((s) => s.getById);
-  const lookupVersion = useLibraryStore((s) => s.lookupVersion);
   const ensureRange = useLibraryStore((s) => s.ensureRange);
   const selectedEntryId = useLibraryStore((s) => s.selectedEntryId);
   const setSelectedEntry = useLibraryStore((s) => s.setSelectedEntry);
@@ -66,10 +63,10 @@ export const CatalogueView: React.FC<{ onCollapse?: () => void }> = ({ onCollaps
   // that registered into the library after the first (empty) load never appeared
   // until a hard reload.
   useEffect(() => {
-    if (!loaded) void useLibraryStore.getState().load();
-    else void useLibraryStore.getState().refresh();
-    // run once per mount
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // Read at mount, never subscribed: this runs once per mount.
+    const library = useLibraryStore.getState();
+    if (!library.loaded) void library.load();
+    else void library.refresh();
   }, []);
 
   // Drive the SERVER query from the filter bar — text, favourites, sort,
@@ -100,12 +97,10 @@ export const CatalogueView: React.FC<{ onCollapse?: () => void }> = ({ onCollaps
     void ensureRange(start, end);
   }, [ensureRange]);
 
-  const selectedEntry = useMemo(
-    () => (selectedEntryId ? getById(selectedEntryId) ?? null : null),
-    // `lookupVersion` bumps when a single-entry fetch lands; `entries` when a
-    // page does. Either can be what makes this id resolvable.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [selectedEntryId, getById, entries, lookupVersion],
+  // A store selector: it runs again on every store change, so a page landing
+  // or a single-entry fetch that makes this id resolvable re-renders here.
+  const selectedEntry = useLibraryStore((s) =>
+    selectedEntryId ? s.getById(selectedEntryId) ?? null : null,
   );
 
   const handleContextMenu = (e: React.MouseEvent, entry: LibraryEntry) => {
@@ -135,7 +130,7 @@ export const CatalogueView: React.FC<{ onCollapse?: () => void }> = ({ onCollaps
 
       {/* One honest line about what was searched, plus the loading and error
           states the paged store reports. */}
-      <div className="shrink-0 flex items-center gap-2 px-2 pb-1 text-[9px] font-mono text-zinc-600">
+      <div className="shrink-0 flex items-center gap-2 px-2 pb-1 text-xs font-bold text-zinc-400">
         <span>
           {rowCount.toLocaleString()} {rowCount === 1 ? 'track' : 'tracks'}
           {searchState.query.trim() ? ` · showing results for “${searchState.query.trim()}”` : ''}
@@ -157,7 +152,7 @@ export const CatalogueView: React.FC<{ onCollapse?: () => void }> = ({ onCollaps
       {pageError && (
         <div
           role="alert"
-          className="shrink-0 mx-2 mb-1 flex items-center gap-2 rounded border border-rose-500/40 bg-rose-500/10 px-2 py-1 text-[9px] font-mono text-rose-200"
+          className="shrink-0 mx-2 mb-1 flex items-center gap-2 rounded border border-rose-500/40 bg-rose-500/10 px-2 py-1 text-xs font-bold text-rose-200"
         >
           <span className="flex-1 min-w-0 truncate" title={pageError}>{pageError}</span>
           <button
