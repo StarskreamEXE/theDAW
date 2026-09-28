@@ -19,7 +19,6 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { JSDOM } from 'jsdom';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const MODULES_DIR = join(here, '..', '..', '..', '..', 'public', 'edit-modules');
@@ -54,40 +53,61 @@ for (const file of ['tool.html', 'enhance.html']) {
   for (const value of canvas) assertReadable(value, `${file} canvas`);
 }
 
-/** Whether `a` comes before `b` in document order. */
-function before(doc: Document, a: string, b: string): boolean {
-  const ea = doc.getElementById(a);
-  const eb = doc.getElementById(b);
-  assert.ok(ea && eb, `#${a} and #${b} exist`);
-  return (ea.compareDocumentPosition(eb) & 4) !== 0; // DOCUMENT_POSITION_FOLLOWING
+/** The page's markup: everything before its first script tag, so the
+ *  script's own strings (tool.html builds its controls from templates) are
+ *  not read as elements. */
+function markup(src: string): string {
+  const end = src.indexOf('<script');
+  return end < 0 ? src : src.slice(0, end);
+}
+
+/** Where the one element with this id starts in the markup. */
+function at(html: string, id: string): number {
+  const pos = html.indexOf(`id="${id}"`);
+  assert.ok(pos >= 0, `#${id} exists`);
+  assert.equal(html.indexOf(`id="${id}"`, pos + 1), -1, `#${id} is unique`);
+  return pos;
+}
+
+/** A button's accessible name: its aria-label, else its text. */
+function buttonName(attrs: string, inner: string): string {
+  const label = /aria-label="([^"]*)"/.exec(attrs)?.[1]?.trim();
+  if (label) return label;
+  return inner
+    .replace(/<[^>]+>/g, '')
+    .replace(/&#(\d+);/g, (_, code: string) => String.fromCodePoint(Number(code)))
+    .trim();
 }
 
 /* ── tool.html: the notice above the monitor and the controls ────────────── */
 {
-  const { document } = new JSDOM(read('tool.html')).window;
-  assert.ok(before(document, 'naBar', 'noteBar'), 'tool.html: the unavailable bar, then the notice');
-  assert.ok(before(document, 'noteBar', 'vizZone'), 'tool.html: the notice is above the monitor');
-  assert.ok(before(document, 'noteBar', 'controls'), 'tool.html: the notice is above the controls');
+  const html = markup(read('tool.html'));
+  assert.ok(at(html, 'naBar') < at(html, 'noteBar'), 'tool.html: the unavailable bar, then the notice');
+  assert.ok(at(html, 'noteBar') < at(html, 'vizZone'), 'tool.html: the notice is above the monitor');
+  assert.ok(at(html, 'noteBar') < at(html, 'controls'), 'tool.html: the notice is above the controls');
 }
 
 /* ── enhance.html: the notice under the tool pills, above everything else ── */
 {
-  const { document } = new JSDOM(read('enhance.html')).window;
-  const modeBar = document.querySelector('.mode-bar');
-  assert.ok(modeBar, 'enhance.html: the tool pills');
-  modeBar.id = modeBar.id || 'test-mode-bar';
-  assert.ok(before(document, modeBar.id, 'noteBar'), 'enhance.html: the notice comes after the tool pills');
-  assert.ok(before(document, 'noteBar', 'spectArea'), 'enhance.html: the notice is above the spectrogram');
-  assert.ok(before(document, 'noteBar', 'ctrlStrip'), 'enhance.html: the notice is above the controls');
-  assert.equal(document.getElementById('noteBar')?.getAttribute('role'), 'status', 'the notice is a status');
+  const html = markup(read('enhance.html'));
+  const modeBar = html.indexOf('class="mode-bar"');
+  assert.ok(modeBar >= 0, 'enhance.html: the tool pills');
+  const note = at(html, 'noteBar');
+  assert.ok(modeBar < note, 'enhance.html: the notice comes after the tool pills');
+  assert.ok(note < at(html, 'spectArea'), 'enhance.html: the notice is above the spectrogram');
+  assert.ok(note < at(html, 'ctrlStrip'), 'enhance.html: the notice is above the controls');
+  assert.match(html, /<div class="note-bar" id="noteBar" role="status" hidden><\/div>/, 'the notice is a status');
 
-  for (const button of document.querySelectorAll('button')) {
-    const name = (button.getAttribute('aria-label') ?? '').trim() || (button.textContent ?? '').trim();
-    assert.ok(name && !/^[◀-◿]$/.test(name), `enhance.html: a button with no accessible name (${button.outerHTML.slice(0, 80)})`);
+  const buttons = [...html.matchAll(/<button\b([^>]*)>([\s\S]*?)<\/button>/g)];
+  assert.ok(buttons.length > 10, `enhance.html: its buttons were found (${buttons.length})`);
+  for (const [whole, attrs, inner] of buttons) {
+    const name = buttonName(attrs, inner);
+    // A lone arrow glyph (U+25A0..U+25FF) reads as "black left-pointing
+    // small triangle", not as what the button does.
+    assert.ok(name && !/^[\u25a0-\u25ff]+$/u.test(name), `enhance.html: a button with no accessible name (${whole.slice(0, 80)})`);
   }
-  const mix = document.getElementById('mixSlider');
-  assert.ok(mix, 'the MIX slider');
-  assert.ok(document.querySelector('label[for="mixSlider"]'), 'the MIX slider has a real label');
+  assert.ok(html.includes('id="mixSlider"'), 'the MIX slider');
+  assert.match(html, /<label[^>]*\bfor="mixSlider"/, 'the MIX slider has a real label');
 }
 
 console.log('edit-modules readable text and notice placement: all assertions passed');
