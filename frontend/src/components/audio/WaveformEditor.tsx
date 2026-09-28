@@ -153,6 +153,7 @@ import { punchWindowFrom, useRecordingPrefs, useRecordingStore, type RecordingSt
 import type { LevelFrame } from '../../lib/recordingEngine';
 import { SurfaceAudio } from './IoDeviceSelect';
 import { acquireObjectUrl } from '../../lib/sharedObjectUrl';
+import { handleEngineElsewhere } from '../../lib/magentaElsewhere';
 
 const TRACK_HEADER_PX = 180;
 
@@ -3093,7 +3094,15 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         let detail = '';
         try {
           const body = await res.json() as { detail?: unknown };
-          detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail ?? '');
+          const message = (body.detail as { message?: unknown } | null)?.message;
+          detail = typeof body.detail === 'string'
+            ? body.detail
+            : typeof message === 'string'
+              ? message
+              : JSON.stringify(body.detail ?? '');
+          // Another copy's Magenta engine holds the GPU: its card names the
+          // engine and offers to stop it.
+          handleEngineElsewhere(body, 'Stable Audio cannot load beside it.');
         } catch {
           try { detail = await res.text(); } catch { /* body already consumed */ }
         }

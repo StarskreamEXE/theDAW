@@ -267,9 +267,14 @@ def default_settings_path() -> Path:
     return paths.data_path("settings.json")
 
 
-def _merge_defaults(payload: dict[str, Any]) -> dict[str, Any]:
+def _merge_defaults(
+    payload: dict[str, Any], lan_record: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Fill missing top-level sections / keys from DEFAULT_SETTINGS without
     overwriting anything the user already set.
+
+    ``lan_record`` is this build's record of how it last wrote the LAN switch
+    (``lan_https.read_record``); the switch is settled against it.
 
     Runs schema migrations on the way through:
       - v1 → v2: analysis.auto_on_import / auto_on_generate become
@@ -378,14 +383,15 @@ def _merge_defaults(payload: dict[str, Any]) -> dict[str, Any]:
             "use_user_claude_config"
         ]
 
-    # An "off" at the schema-10 app.lan_https carries into lan.https on EVERY
-    # load, not only below v12: a build that still writes the old key may have
-    # run since this one. An off stored in either place wins, the same rule
-    # the launcher applies to the raw file (lan_https.stored_off_key). The
-    # merge above dropped the old key from `app`; _mirror_lan_off puts it back
-    # as False only while lan.https is off.
-    if lan_https.stored_off_key(payload) is not None:
-        merged["lan"]["https"] = False
+    # The LAN switch is settled on EVERY load, not only below v12: a build that
+    # still writes the old app.lan_https may have run since this one. The rule
+    # is the one the launcher applies to the raw file (lan_https.reconcile):
+    # a value changed since this build's record is the latest choice, a value
+    # dropped by a build that does not know it is not a choice, and with no
+    # record an off at either key wins. The merge above dropped the old key
+    # from `app`; _mirror_lan_off puts it back as False only while lan.https
+    # is off.
+    merged["lan"]["https"] = lan_https.reconcile(payload, lan_record)
     _mirror_lan_off(merged)
 
     # Hygiene lives in the store, not only on the PATCH path: a hand-edited,
@@ -410,6 +416,9 @@ class SettingsStore:
 
     def __init__(self, path: Path) -> None:
         self.path = path
+        # How this build last wrote the LAN switch (lan_https.RECORD_NAME,
+        # beside the settings file). Written after every write of the file.
+        self.lan_record_path = lan_https.record_path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         # (mtime_ns, size) of the file as this store last read or wrote it.
@@ -441,7 +450,7 @@ class SettingsStore:
         except (OSError, json.JSONDecodeError):
             return
         self._seen = stamp
-        self._cache = _merge_defaults(raw)
+        self._cache = _merge_defaults(raw, lan_https.read_record(self.path))
 
     def _load(self) -> dict[str, Any]:
         # Stamped before the read, so a write landing between the two is read
@@ -458,13 +467,20 @@ class SettingsStore:
                 "settings.store: failed to read %s: %s — using defaults", self.path, e
             )
             return deepcopy(DEFAULT_SETTINGS)
-        merged = _merge_defaults(raw)
+        record = lan_https.read_record(self.path)
+        merged = _merge_defaults(raw, record)
         # Persist the post-migration shape so future loads start clean. A file
-        # whose app.lan_https differs from what _mirror_lan_off keeps there is
-        # rewritten too, even at this schema: the launchers read the raw file.
+        # whose LAN switch differs from what this load settled on is rewritten
+        # too, even at this schema, and so is one this build holds no record
+        # of: the launchers read the raw file and the record.
         prev_version = raw.get("schema_version") if isinstance(raw, dict) else None
-        legacy_differs = _legacy_lan_value(raw) != _legacy_lan_value(merged)
-        if prev_version != merged.get("schema_version") or legacy_differs:
+        lan_differs = (
+            _legacy_lan_value(raw) != _legacy_lan_value(merged)
+            or lan_https.record_for(raw if isinstance(raw, dict) else {})
+            != lan_https.record_for(merged)
+            or record != lan_https.record_for(merged)
+        )
+        if prev_version != merged.get("schema_version") or lan_differs:
             try:
                 self._write(merged)
             except OSError as e:
@@ -474,6 +490,12 @@ class SettingsStore:
     def _write(self, payload: dict[str, Any]) -> None:
         atomic_write(self.path, json.dumps(payload, indent=2))
         self._seen = self._stamp()
+        # After the settings: a crash between the two leaves the file holding
+        # a value the record does not, which the next load reads as the
+        # latest choice, and that is the value just written.
+        atomic_write(
+            self.lan_record_path, json.dumps(lan_https.record_for(payload), indent=2)
+        )
 
     def get_all(self) -> dict[str, Any]:
         with self._lock:
@@ -524,6 +546,13 @@ class SettingsStore:
                         # A switch: anything but a real boolean is malformed
                         # and ignored, so it cannot flip the session setup.
                         if not isinstance(v, bool):
+                            continue
+                    if (section, k) == ("lan", "https"):
+                        # Stored as a real boolean, parsed the way the
+                        # launchers parse the file ("off", "0", false...); a
+                        # value that says neither is ignored.
+                        v = lan_https.parse_flag(v)
+                        if v is None:
                             continue
                     target[k] = v
             _mirror_lan_off(self._cache)

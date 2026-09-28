@@ -182,7 +182,7 @@ def _configure_console_logging() -> None:
 # in between.
 try:
     _configure_console_logging()
-except Exception:  # noqa: BLE001 — logging must never block boot
+except Exception:  # logging must never block boot
     pass
 
 # Install the LOG-panel ring handler BEFORE modules load, so module-load
@@ -192,7 +192,7 @@ try:
     from backend.log_ring import install_log_ring as _install_log_ring
 
     _install_log_ring()
-except Exception:  # noqa: BLE001 — logging must never block boot
+except Exception:  # logging must never block boot
     pass
 
 app.state.loaded_modules = load_modules(app, MODULES_DIR)
@@ -282,7 +282,7 @@ def _warm_heavy() -> None:
         importlib.import_module("stable_audio_3.inference.distribution_shift")
 
         logger.info("startup: heavy imports warmed (torch + stable_audio_3 ready)")
-    except Exception as e:  # noqa: BLE001 — warming is best-effort
+    except Exception as e:  # warming is best-effort
         logger.warning("startup: heavy-import warm failed: %s", e)
 
 
@@ -387,7 +387,17 @@ def _ensure_gpu_clear_of_magenta() -> None:
     AND several GB of host commit through the WSL2 VM, and stacking the SA3
     checkpoint load on top is exactly the combination that exhausts the
     Windows commit limit (os error 1455 -> access-violation crash).
+
+    stop_engine stops only this checkout's engines. When a magenta engine keeps
+    running afterwards (another copy of theDAW's, one started by hand, or ours
+    refusing to die) the load is refused with a 409 whose detail names it
+    (``state`` "engine_elsewhere"); the UI shows that as a card with a
+    confirmed "Stop that engine" action. An engine that cannot be identified
+    (the process list could not be read) is only logged: nothing proves it is
+    an engine, and refusing on a bare port would block Stable Audio for good
+    beside any program that happens to use 8777.
     """
+    still_running: list[dict] = []
     try:
         import socket
 
@@ -395,8 +405,9 @@ def _ensure_gpu_clear_of_magenta() -> None:
 
         listening = magenta_sidecar.engine_process_alive()
         if not listening:
-            # Engines started outside this process (the .vbs launcher, a
-            # manual run): probe the two known ports cheaply.
+            # Engines started outside this process (a backend of this checkout
+            # that restarted, this checkout's .vbs Studio launcher, another
+            # copy of theDAW): probe the two known ports cheaply.
             for port in (8777, 8778):
                 try:
                     with socket.create_connection(("127.0.0.1", port), timeout=0.25):
@@ -406,12 +417,26 @@ def _ensure_gpu_clear_of_magenta() -> None:
                     continue
         if listening:
             logger.info("model.swap: stopping resident MRT2 engine before SA3 load")
-            magenta_sidecar.stop_engine()
+            stopped = magenta_sidecar.stop_engine()
+            still_running = magenta_sidecar.engines_still_running(stopped)
+            if not stopped.get("listed"):
+                logger.warning(
+                    "model.swap: the engine side's processes could not be listed; "
+                    "an engine another copy started may still hold the GPU"
+                )
     except Exception:
         # WARNING, not debug: if this guard fails, the SA3 load proceeds into
         # exactly the GPU-commit-exhaustion crash it exists to prevent, and
         # the user needs to see why.
         logger.warning("model.swap: magenta engine pre-clear failed", exc_info=True)
+    if still_running:
+        from backend.modules.magenta import sidecar as magenta_sidecar
+
+        detail = magenta_sidecar.elsewhere_detail(
+            still_running, "Stable Audio will not load"
+        )
+        logger.warning("model.swap: SA3 load refused: %s", detail["message"])
+        raise HTTPException(status_code=409, detail=detail)
 
 
 def _get_or_load_generation_pipeline(model_name: str):
@@ -2892,7 +2917,7 @@ try:
         _vj_sidecar.STATIC_MOUNT_PATH,
         _vj_sidecar.resolve_dist_dir() or "(none staged yet)",
     )
-except Exception as _vj_mount_err:  # noqa: BLE001 — never block boot on VJ
+except Exception as _vj_mount_err:  # never block boot on VJ
     logger.warning("vj: static route not registered: %s", _vj_mount_err)
 
 # SwayCommand cockpit served as a static embed build, same shape as the VJ mount
@@ -2919,7 +2944,7 @@ try:
         _sway_sidecar.STATIC_MOUNT_PATH,
         _sway_sidecar.resolve_dist_dir() or "(none staged yet)",
     )
-except Exception as _sway_mount_err:  # noqa: BLE001 — never block boot on Sway
+except Exception as _sway_mount_err:  # never block boot on Sway
     logger.warning("sway: static route not registered: %s", _sway_mount_err)
 
 # Single-container / companion UI serving. Every API route lives under /api and

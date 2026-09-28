@@ -62,10 +62,10 @@ def stub_startup(monkeypatch) -> None:
 @pytest.fixture(autouse=True)
 def sidecar_stops(monkeypatch) -> list[bool]:
     """The real ``_on_shutdown`` ends with ``teardown.stop_all_sidecars``,
-    which also reaps every magenta engine on the machine by name (a pkill
-    inside WSL), the running app's among them. A recorder stands in for it,
-    so a test run leaves the user's engines alone and still sees that
-    shutdown reached the sidecar stop."""
+    which also stops the magenta engine and the other sidecars this checkout
+    started; run from the app tree, those are the running app's. A recorder
+    stands in for it, so a test run leaves the user's engines alone and still
+    sees that shutdown reached the sidecar stop."""
     stopped: list[bool] = []
     monkeypatch.setattr(
         "backend.core.teardown.stop_all_sidecars", lambda: stopped.append(True)

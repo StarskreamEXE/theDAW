@@ -91,6 +91,40 @@ def test_add_candidate_writes_audio_and_meta(store: CandidateStore) -> None:
     assert meta["seed"] == 42
 
 
+def test_a_take_cut_off_mid_write_leaves_nothing_at_its_name(
+    store: CandidateStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The disk fills halfway through the take. Written in place, the take's
+    own name held half a file for the next save or a re-scan to trip on; the
+    atomic write leaves the set as it was: no take, no meta, no temp file."""
+    set_id = store.create_set(
+        source={"id": "abc"}, provider="suno", params={}, label="x"
+    )
+    before = sorted(p.name for p in (store.root / set_id).iterdir())
+    real_write_bytes = Path.write_bytes
+
+    def disk_fills(self: Path, data: bytes) -> int:
+        real_write_bytes(self, data[: len(data) // 2])
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(Path, "write_bytes", disk_fills)
+    with pytest.raises(OSError, match="No space"):
+        store.add_candidate(
+            set_id,
+            audio_bytes=_wav_bytes(4096),
+            filename="take.wav",
+            mime_type="audio/wav",
+            provider_job_id=None,
+            params={},
+            seed=None,
+        )
+    monkeypatch.undo()
+
+    assert sorted(p.name for p in (store.root / set_id).iterdir()) == before
+    listed = next(s for s in store.list_sets() if s["id"] == set_id)
+    assert listed["candidates"] == []
+
+
 def test_add_candidate_rejects_empty_and_oversize(store: CandidateStore) -> None:
     set_id = store.create_set(
         source={"id": "abc"}, provider="suno", params={}, label="x"
@@ -243,9 +277,9 @@ def test_sets_and_candidates_made_in_one_clock_tick_keep_their_order(
     made in quick succession got the same created_at. list_sets then fell
     back to folder order (random ids), and "newest first" was a coin toss:
     test_list_sets_filters_by_source_id failed on a full-suite run here."""
-    from backend.modules.candidates import store as store_module
+    import time
 
-    monkeypatch.setattr(store_module.time, "time", lambda: 1_790_000_000.0)
+    monkeypatch.setattr(time, "time", lambda: 1_790_000_000.0)
     made = [
         store.create_set(source={"id": "t"}, provider="suno", params={}, label=str(i))
         for i in range(6)

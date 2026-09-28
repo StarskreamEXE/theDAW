@@ -1395,8 +1395,8 @@ _STARTUP_WRITERS = (
 
 def _stop_no_sidecars() -> None:
     """Stands in for core/teardown.stop_all_sidecars under ``real_app``. The
-    real one also reaps every magenta engine on the machine by name (pkill
-    inside WSL), the running app's among them."""
+    real one also stops the magenta engine and the other sidecars this
+    checkout started; run from the app tree, those are the running app's."""
 
 
 @pytest.fixture

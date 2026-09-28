@@ -39,6 +39,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Optional, Sequence
 
+from backend.lib.stamps import IncreasingClock
+
 from .provider import PROVIDER_SLUG_MAX, detect_provider
 
 log = logging.getLogger(__name__)
@@ -1432,8 +1434,16 @@ def _chunks(items: Sequence[Any], size: int) -> Iterator[Sequence[Any]]:
         yield items[start : start + size]
 
 
+# created_at / updated_at, strictly increasing within this process: every
+# listing orders entries newest first by created_at, and two entries saved in
+# one 15.6 ms tick of Windows' clock tied, so the one saved second could list
+# after the first (backend/lib/stamps.py). A bulk batch still shares one stamp
+# on purpose; the listings break that tie by rowid.
+_clock = IncreasingClock()
+
+
 def _now() -> float:
-    return time.time()
+    return _clock()
 
 
 # Sub-folder each artifact kind is superseded into. Kept out of the live
@@ -2598,7 +2608,7 @@ class LibraryDB:
         with self._writelock:
             cur = self._conn.cursor()
             rows = cur.execute(
-                "SELECT * FROM entries ORDER BY created_at DESC"
+                "SELECT * FROM entries ORDER BY created_at DESC, rowid ASC"
             ).fetchall()
             cur.close()
             return [dict(r) for r in rows]
@@ -2625,7 +2635,7 @@ class LibraryDB:
         sql = f"""
             SELECT e.* FROM entries e {join}
             {where}
-            ORDER BY e.created_at DESC
+            ORDER BY e.created_at DESC, e.rowid ASC
             {limit_sql}
         """
         with self._writelock:
@@ -2645,7 +2655,7 @@ class LibraryDB:
                 a.bpm, a.key, a.scale, a.genre, a.loudness_lufs, a.bars_estimated
             FROM entries e
             LEFT JOIN analysis a ON a.entry_id = e.id
-            ORDER BY e.created_at DESC
+            ORDER BY e.created_at DESC, e.rowid ASC
         """
         with self._writelock:
             cur = self._conn.cursor()

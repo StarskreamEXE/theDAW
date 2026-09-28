@@ -9,10 +9,14 @@ Take over, and status() names the program in the way.
 
 Each test replays a real ordering against real sockets: the other program is a
 separate process listening on a real port, so the bridge finds it the way it
-finds one in the field (backend.ports.holders). adb is a fake headset with the
-one reverse table every adb client on the PC shares. A test "dials" the
-headset's port through that table and checks which process the MIDI reached.
-No real adb runs, so a plugged-in headset is never touched.
+finds one in the field (backend.ports.holders, or the bind probe where the
+listening table hides it). Every test runs twice, once for each way such a
+program listens: on 0.0.0.0, and on ``::`` dual-stack, which is what the
+standalone Node bridge's ``server.listen(port)`` does on a machine with IPv6.
+adb is a fake headset with the one reverse table every adb client on the PC
+shares. A test "dials" the headset's port through that table and checks which
+process the MIDI reached. No real adb runs, so a plugged-in headset is never
+touched.
 """
 
 from __future__ import annotations
@@ -96,8 +100,14 @@ class FakeHeadset:
 
 _OTHER_BRIDGE = r"""
 import os, socket, sys, threading
-server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server.bind(("0.0.0.0", int(sys.argv[1])))
+if sys.argv[2] == "dual-stack":
+    # Node's server.listen(port): "::" with IPv4 mapped in.
+    server = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    server.bind(("::", int(sys.argv[1])))
+else:
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("0.0.0.0", int(sys.argv[1])))
 server.listen()
 print(server.getsockname()[1], os.getpid(), flush=True)
 
@@ -113,13 +123,40 @@ sys.stdin.read()  # exits when the test closes stdin
 """
 
 
+def _has_dual_stack() -> bool:
+    try:
+        probe = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    except OSError:
+        return False
+    try:
+        probe.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        probe.bind(("::", 0))
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
+#: How another program listens: every test runs once per entry.
+BINDS = [
+    "ipv4",
+    pytest.param(
+        "dual-stack",
+        marks=pytest.mark.skipif(not _has_dual_stack(), reason="no IPv6 here"),
+    ),
+]
+
+
 class OtherBridge:
     """Another program that serves the headset: a separate process listening
-    on all interfaces, the way the standalone Node bridge does."""
+    on all interfaces, on 0.0.0.0 (``bind="ipv4"``) or on ``::`` dual-stack
+    the way the standalone Node bridge does (``bind="dual-stack"``)."""
 
-    def __init__(self, port: int = 0, *extra_args: str) -> None:
+    def __init__(self, port: int = 0, *extra_args: str, bind: str = "ipv4") -> None:
+        self.bind = bind
         self.proc = subprocess.Popen(
-            [sys.executable, "-c", _OTHER_BRIDGE, str(port), *extra_args],
+            [sys.executable, "-c", _OTHER_BRIDGE, str(port), bind, *extra_args],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True,
@@ -175,12 +212,12 @@ def headset(monkeypatch: pytest.MonkeyPatch) -> FakeHeadset:
     return fake
 
 
-@pytest.fixture
-def other_bridge():
+@pytest.fixture(params=BINDS)
+def other_bridge(request):
     started: list[OtherBridge] = []
 
     def start(port: int = 0, *extra_args: str) -> OtherBridge:
-        other = OtherBridge(port, *extra_args)
+        other = OtherBridge(port, *extra_args, bind=request.param)
         started.append(other)
         return other
 
