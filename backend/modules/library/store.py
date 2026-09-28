@@ -2748,7 +2748,8 @@ def _maybe_enqueue_analysis(
     count real enqueues, not attempts skipped by the settings gate, a
     missing audio file, or a queue failure.
     """
-    if store.db is None:
+    db = store.db
+    if db is None:
         return False
     try:
         from backend.core.background_workers import get_background_queue
@@ -2776,6 +2777,16 @@ def _maybe_enqueue_analysis(
 
         from backend.modules.analysis.engine import analyze_and_persist
 
+        # The job waits for an idle moment, and the library can be closed or
+        # replaced meanwhile (a library folder change, a retried open). Its
+        # entry belongs to the database it was queued for; that one is gone.
+        if db.closed:
+            log.info(
+                "library.store: analysis for %s skipped: its library was closed",
+                entry_id,
+            )
+            return
+
         # Off the loop, like every other job here. The queue's consumer awaits
         # job.fn directly, so a coroutine that does its CPU work inline stalls
         # the whole event loop — not just analysis, every request behind it.
@@ -2784,7 +2795,7 @@ def _maybe_enqueue_analysis(
         # when ANALYSIS_VERSION changes.
         await asyncio.to_thread(
             analyze_and_persist,
-            store.db,  # type: ignore[arg-type]  # checked above
+            db,
             entry_id,
             audio_path,
             metadata_path=metadata_path,

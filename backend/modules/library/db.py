@@ -2069,6 +2069,12 @@ class LibraryDB:
             self._conn.close()
         self._search_built.set()
 
+    @property
+    def closed(self) -> bool:
+        """Whether :meth:`close` has run: a job queued against this database
+        before the library was closed or replaced finds it closed."""
+        return self._closed
+
     # ---- Schema -------------------------------------------------------------
 
     def _current_schema_version(self) -> int:
