@@ -153,3 +153,55 @@ def test_soxr_follows_the_build_the_backend_runs(monkeypatch):
         lambda force=False: ffmpeg_tools.Resolution(build=build),
     )
     assert resampler.hq_resampler(24) == "resampler=soxr:precision=24"
+
+
+def test_a_process_before_the_startup_probe_resolves_off_the_event_loop(monkeypatch):
+    """A High-Quality SRC render that arrives before the startup probe has
+    chosen a build must not run that probe (several ffmpeg spawns) on the
+    event loop inside the handler."""
+    import threading
+
+    order: list[tuple[str, threading.Thread]] = []
+    build = ffmpeg_tools.FFmpegBuild(
+        ffmpeg="/opt/full/ffmpeg", version="test", soxr=True, rubberband=True
+    )
+
+    def fake_resolve(force=False):
+        # Like the real one: a cached choice answers without probing.
+        if ffmpeg_tools._resolution is not None:
+            return ffmpeg_tools._resolution
+        order.append(("resolve", threading.current_thread()))
+        res = ffmpeg_tools.Resolution(build=build)
+        monkeypatch.setattr(ffmpeg_tools, "_resolution", res)
+        return res
+
+    real_hq_src = delivery_router._hq_src
+
+    def recording_hq_src(params):
+        order.append(("handler", threading.current_thread()))
+        return real_hq_src(params)
+
+    async def fake_render(*_a, **_k):
+        raise ffmpeg.FFmpegError(1, "stop here")
+
+    monkeypatch.setattr(ffmpeg_tools, "_resolution", None)
+    monkeypatch.setattr(ffmpeg_tools, "resolve", fake_resolve)
+    monkeypatch.setattr(ffmpeg, "render", fake_render)
+    tool = next(t for t in delivery_router.TOOLS if t.id == "high_quality_src")
+    monkeypatch.setattr(tool, "handler", recording_hq_src)
+
+    buf = io.BytesIO()
+    sf.write(buf, np.zeros(441, dtype=np.float32), 44100, format="WAV")
+    r = _client().post(
+        "/api/edit/delivery/process",
+        data={
+            "effect": "high_quality_src",
+            "params": json.dumps({"targetSR": "48000"}),
+            "output_format": "wav",
+        },
+        files={"audio": ("input.wav", buf.getvalue(), "audio/wav")},
+    )
+    assert r.status_code == 500
+    assert [step for step, _ in order] == ["resolve", "handler"]
+    (_, probe_thread), (_, loop_thread) = order
+    assert probe_thread is not loop_thread

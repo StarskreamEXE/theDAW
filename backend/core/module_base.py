@@ -131,6 +131,10 @@ def build_router(family: str, tools: list[ToolSpec]) -> APIRouter:
             in_path = tmp / "input.wav"
             out_path = tmp / f"output.{output_format}"
             await ffmpeg.stream_upload_to(in_path, audio)
+            # A handler that picks its resampler (backend.lib.resampler) asks
+            # the resolved FFmpeg; before the startup probe has finished that
+            # would probe on the event loop, so resolve here, off the loop.
+            await ffmpeg_tools.aresolve()
 
             if tool.mode == "filter":
                 built = tool.handler(validated)
