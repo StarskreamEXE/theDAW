@@ -170,9 +170,9 @@ jobs:
       # executed them.
       - name: Frontend tests
         run: npm test
-      # electron-ui has no test runner of its own; its four suites cover code that
+      # electron-ui has no test runner of its own; its five suites cover code that
       # ships (download naming, the dialog start folder, the LAN HTTPS helper,
-      # VST-host staging) and run on this job's toolchain.
+      # stopping the backend, VST-host staging) and run on this job's toolchain.
       - name: Electron shell tests
         run: npm run test:electron
 
