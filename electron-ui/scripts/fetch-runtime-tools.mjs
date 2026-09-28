@@ -48,14 +48,32 @@ import { tmpdir } from 'node:os'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const toolsDir = resolve(__dirname, '..', 'resources', 'tools')
 
-// Pinned uv release. SYNC RULE: bump this deliberately after checking
-// https://github.com/astral-sh/uv/releases — never float a 'latest' URL here,
-// because an unpinned fetch makes two builds of the same commit differ.
-// 0.12.19 was the latest stable release when this pin was written (2026-09).
-const UV_VERSION = '0.12.19'
+// uv and the Node.js runtime (which runs the bundled VST Foundry fullstack
+// server, node dist/server.cjs) are resolved to their newest releases at fetch
+// time: uv's latest GitHub release, and the newest LTS on nodejs.org, the same
+// line frontend/.nvmrc (lts/*) asks for. Each archive is checked against the
+// SHA-256 its publisher posts, the version is logged, and a copy already in
+// resources/tools is replaced when a newer release exists.
+const GITHUB_HEADERS = {
+  accept: 'application/vnd.github+json',
+  'user-agent': 'theDAW-fetch-runtime-tools',
+}
 
-function uvUrl() {
-  const base = `https://github.com/astral-sh/uv/releases/download/${UV_VERSION}`
+async function latestUvVersion() {
+  const res = await fetch('https://api.github.com/repos/astral-sh/uv/releases/latest', {
+    headers: GITHUB_HEADERS,
+    redirect: 'follow',
+  })
+  if (!res.ok) {
+    throw new Error(`uv release lookup failed (${res.status} ${res.statusText})`)
+  }
+  const tag = String((await res.json()).tag_name || '').replace(/^v/, '')
+  if (!/^\d+\.\d+\.\d+$/.test(tag)) throw new Error(`unexpected uv release tag '${tag}'`)
+  return tag
+}
+
+function uvUrl(version) {
+  const base = `https://github.com/astral-sh/uv/releases/download/${version}`
   if (process.platform === 'win32') {
     return `${base}/uv-x86_64-pc-windows-msvc.zip`
   }
@@ -65,20 +83,40 @@ function uvUrl() {
   return `${base}/uv-${triple}.tar.gz`
 }
 
-// Pinned Node.js runtime — used to run the bundled VST Foundry fullstack
-// server (node dist/server.cjs). SYNC RULE: bump deliberately after checking
-// https://nodejs.org/dist/ for the latest Active LTS (frontend/.nvmrc carries the
-// same version); never float 'latest'.
-// 24.21.0 was the latest Active LTS when this pin was written (2026-09).
-const NODE_VERSION = '24.21.0'
+async function latestNodeLts() {
+  const index = JSON.parse(await fetchText('https://nodejs.org/dist/index.json'))
+  const lts = Array.isArray(index) ? index.find((r) => r && r.lts) : null
+  if (!lts) throw new Error('no LTS release listed in https://nodejs.org/dist/index.json')
+  return String(lts.version).replace(/^v/, '')
+}
 
-function nodeUrl() {
-  const base = `https://nodejs.org/dist/v${NODE_VERSION}`
-  if (process.platform === 'win32') {
-    return `${base}/node-v${NODE_VERSION}-win-x64.zip`
-  }
+function nodeArchiveName(version) {
+  if (process.platform === 'win32') return `node-v${version}-win-x64.zip`
   const arch = process.arch === 'arm64' ? 'arm64' : 'x64'
-  return `${base}/node-v${NODE_VERSION}-darwin-${arch}.tar.gz`
+  return `node-v${version}-darwin-${arch}.tar.gz`
+}
+
+function nodeUrl(version) {
+  return `https://nodejs.org/dist/v${version}/${nodeArchiveName(version)}`
+}
+
+// The archive's hash from nodejs.org's SHASUMS256.txt for that release.
+async function nodeSha256(version) {
+  const sums = await fetchText(`https://nodejs.org/dist/v${version}/SHASUMS256.txt`)
+  const name = nodeArchiveName(version)
+  const line = sums.split(/\r?\n/).find((l) => l.trim().endsWith(`  ${name}`))
+  const m = line ? line.match(/^[0-9a-fA-F]{64}/) : null
+  if (!m) throw new Error(`no SHA-256 for ${name} in SHASUMS256.txt of v${version}`)
+  return m[0].toLowerCase()
+}
+
+// The version an installed tool reports, or '' when it does not run.
+function installedVersion(exe, args, pattern) {
+  if (!present(exe)) return ''
+  const r = spawnSync(exe, args, { encoding: 'utf8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] })
+  if (r.status !== 0) return ''
+  const m = (r.stdout || '').match(pattern)
+  return m ? m[1] : ''
 }
 
 // FFmpeg must have libsoxr (Classical Upsample, Super-Res and High-Quality SRC
@@ -323,16 +361,20 @@ function install(src, dest) {
 async function fetchUv() {
   const binName = process.platform === 'win32' ? 'uv.exe' : 'uv'
   const dest = join(toolsDir, binName)
-  if (present(dest)) {
-    log(`${binName} already present, skipping`)
+  const have = installedVersion(dest, ['--version'], /uv (\d+\.\d+\.\d+)/)
+  const latest = await latestUvVersion()
+  if (have === latest) {
+    log(`${binName} ${have} is the latest release, skipping`)
     return
   }
+  log(have ? `${binName} ${have} -> ${latest}` : `${binName}: fetching ${latest}`)
   const work = join(tmpdir(), 'thedaw-fetch-uv')
   rmSync(work, { recursive: true, force: true })
   mkdirSync(work, { recursive: true })
-  const url = uvUrl()
+  const url = uvUrl(latest)
   const archive = join(work, process.platform === 'win32' ? 'uv.zip' : 'uv.tar.gz')
-  await download(url, archive)
+  // uv publishes a .sha256 file beside every release archive.
+  await downloadVerified(url, archive, sha256Verifier(await publishedSha256(`${url}.sha256`)))
   extract(archive, work)
   const found = findFile(work, binName)
   if (!found) throw new Error(`${binName} not found in the downloaded archive`)
@@ -343,16 +385,19 @@ async function fetchUv() {
 async function fetchNode() {
   const binName = process.platform === 'win32' ? 'node.exe' : 'node'
   const dest = join(toolsDir, binName)
-  if (present(dest)) {
-    log(`${binName} already present, skipping`)
+  const have = installedVersion(dest, ['--version'], /v(\d+\.\d+\.\d+)/)
+  const latest = await latestNodeLts()
+  if (have === latest) {
+    log(`${binName} ${have} is the newest LTS, skipping`)
     return
   }
+  log(have ? `${binName} ${have} -> ${latest} (newest LTS)` : `${binName}: fetching ${latest} (newest LTS)`)
   const work = join(tmpdir(), 'thedaw-fetch-node')
   rmSync(work, { recursive: true, force: true })
   mkdirSync(work, { recursive: true })
-  const url = nodeUrl()
+  const url = nodeUrl(latest)
   const archive = join(work, process.platform === 'win32' ? 'node.zip' : 'node.tar.gz')
-  await download(url, archive)
+  await downloadVerified(url, archive, sha256Verifier(await nodeSha256(latest)))
   extract(archive, work)
   const found = findFile(work, binName)
   if (!found) throw new Error(`${binName} not found in the downloaded archive`)

@@ -17,7 +17,7 @@
 ########################################################################
 # Stage 1: frontend build.
 ########################################################################
-FROM node:24.21.0-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6 AS ui
+FROM node:lts-slim AS ui
 
 WORKDIR /build/frontend
 
@@ -37,7 +37,7 @@ RUN npm run build
 # command), so the backend can mount the compiled dist at /vj-app and serve it
 # with no Node.js at runtime. Override the source with VJ_REPO / VJ_REF.
 ########################################################################
-FROM node:24.21.0-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6 AS vj
+FROM node:lts-slim AS vj
 WORKDIR /build/vj
 # ca-certificates is required alongside git: the slim base ships no CA bundle,
 # so the HTTPS clone of VJ-9000 below fails certificate verification without it.
@@ -63,7 +63,7 @@ RUN --mount=type=cache,target=/root/.npm \
 # to production deps so the runtime stage ships only what `node dist/server.cjs`
 # needs. Package files are copied first so source edits don't bust the npm cache.
 ########################################################################
-FROM node:24.21.0-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6 AS foundry
+FROM node:lts-slim AS foundry
 WORKDIR /build/foundry
 COPY VST-Foundry-UI/VST-UI-FOUNDRY/package.json VST-Foundry-UI/VST-UI-FOUNDRY/package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm npm ci
@@ -73,7 +73,7 @@ RUN npm run build && npm prune --omit=dev
 ########################################################################
 # Stage 2: Python runtime.
 ########################################################################
-FROM python:3.12-slim-trixie@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f AS runtime
+FROM python:3.12-slim-trixie AS runtime
 
 # Node.js runtime for the VST Foundry sidecar (it runs `node dist/server.cjs`).
 # The single binary is copied from the official node image; libstdc++6 is the
@@ -82,7 +82,7 @@ COPY --from=node:24.21.0-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094b
 
 # The uv binary is copied from the official distroless image. The tag is
 # pinned; bump it deliberately, never float on :latest.
-COPY --from=ghcr.io/astral-sh/uv:0.12.19 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 # ffmpeg backs yt-dlp, loudness metering, and delivery encodes.
 # build-essential is required because aubio 0.4.9 ships as an sdist and
