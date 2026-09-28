@@ -20,6 +20,7 @@ import contextlib
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -117,12 +118,21 @@ def two_checkouts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(sidecar, "_resolve_start_model", lambda: ("mrt2_small", None))
     monkeypatch.setattr(sidecar, "_ENGINE_STOP_GRACE_SEC", 0.0, raising=False)
     monkeypatch.setattr(sidecar, "_PID_RECORD_WAIT_SEC", 0.0, raising=False)
-    return {
+    yield {
         "ours": ours,
         "our_studio": our_studio,
         "theirs": theirs,
         "their_studio": their_studio,
     }
+    # A Windows spawn starts a thread that waits for the pid record; let it
+    # finish here, so its log line never lands in a later test.
+    _join_pid_record_threads()
+
+
+def _join_pid_record_threads() -> None:
+    for thread in threading.enumerate():
+        if thread.name == "magenta:pid-record":
+            thread.join(timeout=10)
 
 
 def _as_engine_sees(path: Path) -> str:
@@ -288,6 +298,7 @@ def test_the_spawn_clears_an_old_record_and_reports_a_missing_one(
     monkeypatch.setattr(sidecar.subprocess, "Popen", lambda *a, **k: _SpawnedEngine())
     sidecar.start_engine()
     assert not sidecar._PID_FILE.exists()
+    _join_pid_record_threads()
 
     with caplog.at_level("WARNING", logger=sidecar.log.name):
         found = sidecar._confirm_pid_record(_SpawnedEngine(), sidecar._PID_FILE, 0.0)
