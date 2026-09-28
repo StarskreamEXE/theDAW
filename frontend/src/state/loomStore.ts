@@ -10,6 +10,7 @@
  */
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { persistStorage } from './persistStorage';
 import {
   parseLoom,
   serializeLoom,
@@ -952,6 +953,7 @@ export const useLoomStore = create<LoomState>()(
     },
     {
       name: 'thedaw-loom-v1',
+      storage: persistStorage(),
       version: 2,
       migrate: (persisted) => ({ ...(persisted as object), mode: 'colony' }),
       partialize: (s) => ({ text: s.text, colonyText: s.colonyText, mode: s.mode, colonyPositions: s.colonyPositions }),

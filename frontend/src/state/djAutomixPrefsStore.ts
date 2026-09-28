@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { persistStorage } from './persistStorage';
 
 /* DJ automix preferences, persisted.
  *
@@ -20,6 +21,6 @@ export const useDjAutomixPrefs = create<DjAutomixPrefsState>()(
       preferHarmonic: true,
       setPreferHarmonic: (preferHarmonic) => set({ preferHarmonic }),
     }),
-    { name: 'thedaw.dj.automix.v1' },
+    { name: 'thedaw.dj.automix.v1', storage: persistStorage() },
   ),
 );

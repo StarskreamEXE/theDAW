@@ -61,9 +61,9 @@ const localStorageStub = {
   },
 } as Storage;
 (globalThis as unknown as { localStorage: Storage }).localStorage = localStorageStub;
-// featureToggleStore uses zustand persist's DEFAULT storage, which reads
-// `window.localStorage`; without a `window` the mirror is never read at all and
-// step 1 would pass for the wrong reason.
+// featureToggleStore persists through state/persistStorage.ts, which reads
+// `localStorage` (or `window.localStorage`) on every call; both are the stub, so
+// step 1 reads the mirror above and cannot pass by falling back to memory.
 (globalThis as unknown as { window: { localStorage: Storage } }).window = {
   localStorage: localStorageStub,
 };

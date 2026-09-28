@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import Any, List, Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -60,6 +60,7 @@ from pydantic import BaseModel
 # backend/modules/assistant/claude_session.py with the rest of the spawn path,
 # so the launch-token exclusion belongs in that module's _spawn_proc now.
 from backend.modules.assistant import claude_session, permissions
+from backend.lib.cross_site import require_loopback_or_launch_token
 from backend.modules.assistant.mcp_relay import registry as relay_registry
 from backend.modules.assistant.mcp_relay import router as _mcp_relay_core_router
 from backend.modules.assistant.tool_catalog import PROVIDER_TOOLS, thedaw_mcp_tools
@@ -333,10 +334,11 @@ CLAUDE_MCP_SURFACE_ISOLATED = (
 CLAUDE_MCP_SURFACE_USER_CONFIG = (
     "- This session loads the user's own Claude Code setup: their MCP servers, "
     "settings, CLAUDE.md, skills and agents, next to the `thedaw` relay server (plus "
-    "the underfit trainer when that profile is active). Outside readonly mode, a "
-    "command or tool the user's own allow rules match runs without a permission "
-    "prompt; such a command is not checked against your own surface, so never use "
-    "one to change it."
+    "the underfit trainer when that profile is active). In accept_edits and trusted "
+    "modes, a command or tool the user's own allow rules match runs without a "
+    "permission prompt; in ask mode it asks first unless the user marked that rule "
+    "always allow. Such a command is not checked against your own surface, so "
+    "never use one to change it."
 )
 
 
@@ -385,6 +387,26 @@ def _claude_use_user_config() -> bool:
         )
         return True
     return value if isinstance(value, bool) else True
+
+
+def _claude_always_allow_rules() -> tuple[str, ...]:
+    """The allow rules the user marked "always allow" (settings
+    ``assistant.always_allow_rules``). Read on every turn: a change respawns the
+    child with its new permission rules (claude_session.permission_rules)."""
+    try:
+        from backend.modules.settings.router import get_store as get_settings_store
+
+        value = get_settings_store().get_value("assistant", "always_allow_rules", [])
+    except OSError as exc:
+        logger.warning(
+            "[AssistantChat] settings unreadable (%s); in Ask mode every loaded "
+            "allow rule asks",
+            exc,
+        )
+        return ()
+    if not isinstance(value, list):
+        return ()
+    return tuple(r for r in value if isinstance(r, str))
 
 
 # Underfit-tab assistant MCP: config that registers the underfit LoRA-trainer
@@ -1321,6 +1343,7 @@ async def _stream_claude(req: ChatRequest, request: Optional[Request]):
     # Read ONCE per turn: the MCP-surface line (in the seed and in every
     # message's footer) and the child's spawn flags must describe one setup.
     use_user_config = _claude_use_user_config()
+    always_allow = _claude_always_allow_rules()
     if req.claude_system_block:
         req.claude_system_block = _claude_code_system_block(
             req.claude_system_block, use_user_config
@@ -1371,6 +1394,7 @@ async def _stream_claude(req: ChatRequest, request: Optional[Request]):
         on_control_request=_claude_control_hook,
         fallback_model=_claude_fallback_model(model),
         use_user_config=use_user_config,
+        always_allow=always_allow,
     )
     try:
         async for line in agen:
@@ -1567,6 +1591,27 @@ async def claude_control_response(payload: ControlResponseRequest):
     }
 
 
+@router.get("/allow-rules", dependencies=[Depends(require_loopback_or_launch_token)])
+def get_allow_rules() -> dict:
+    """
+    The allow rules the Claude Code session loads, for the assistant panel's
+    list: each with its source (user, project or local settings file) and
+    whether the user marked it "always allow". In Ask mode the rules not
+    marked ask before they run (claude_session.permission_rules); in the other
+    modes they run as the CLI's own settings say. Loopback or the desktop
+    shell only: the rules name commands and paths on this machine.
+    """
+    use_user_config = _claude_use_user_config()
+    always = set(_claude_always_allow_rules())
+    rules = claude_session.loaded_allow_rules(use_user_config)
+    return {
+        "use_user_config": use_user_config,
+        "rules": [
+            {**entry, "always_allow": entry["rule"] in always} for entry in rules
+        ],
+    }
+
+
 @router.post("/permission-mode")
 async def claude_permission_mode(payload: PermissionModeRequest):
     """
@@ -1580,6 +1625,14 @@ async def claude_permission_mode(payload: PermissionModeRequest):
     "default" ``--permission-mode`` (see ``CLI_PERMISSION_MODES``' comment),
     so the CLI's "own view of the mode" never actually changes what it asks
     for -- it always asks the host for every non-baseline tool regardless.
+
+    decide() only sees what the CLI asks about, and the child's ask rules
+    (``claude_session.permission_rules``, passed with ``--settings``) are
+    fixed at spawn. A switch into Ask or Read-only needs ask rules the running
+    child lacks, so until it is respawned the CLI would still approve every
+    call a loaded allow rule matches. When a turn is running then, it is
+    interrupted (the child is kept, and the next turn respawns it with the new
+    rules), and ``interrupted`` tells the panel to say so.
     """
     mode = (payload.mode or "").strip()
     if mode not in CLAUDE_PERMISSION_MODES:
@@ -1593,7 +1646,20 @@ async def claude_permission_mode(payload: PermissionModeRequest):
         raise HTTPException(404, "unknown conversation")
     conversation_id = session.conversation_id
 
+    missing = claude_session.ask_rules_missing(
+        session, mode, always_allow=_claude_always_allow_rules()
+    )
     session.permission_mode = mode
+    interrupted = False
+    if missing and session.busy:
+        logger.info(
+            "[Claude] mode -> %s mid-turn conv=%s: interrupting, %d ask rule(s) "
+            "missing from the child",
+            mode,
+            conversation_id,
+            len(missing),
+        )
+        interrupted = claude_session.interrupt(conversation_id)
     cli_mode = permissions.cli_permission_mode(mode)
     acknowledged = await claude_session.send_control_request(
         conversation_id, {"subtype": "set_permission_mode", "mode": cli_mode}
@@ -1603,6 +1669,7 @@ async def claude_permission_mode(payload: PermissionModeRequest):
         "mode": mode,
         "cliMode": cli_mode,
         "acknowledged": acknowledged is not None,
+        "interrupted": interrupted,
     }
 
 

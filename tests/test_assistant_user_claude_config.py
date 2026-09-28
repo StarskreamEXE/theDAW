@@ -153,7 +153,10 @@ def test_a_file_from_main_gains_the_switch_on_and_keeps_the_users_choice(tmp_pat
     store = SettingsStore(path)
     assert store.get_value("assistant", "use_user_claude_config") is True
     on_disk = json.loads(path.read_text(encoding="utf-8"))
-    assert on_disk["assistant"] == {"use_user_claude_config": True}
+    assert on_disk["assistant"] == {
+        "use_user_claude_config": True,
+        "always_allow_rules": [],
+    }
     assert on_disk["app"]["launch_mode"] == "desktop"
 
     # The user turns it off.
@@ -190,7 +193,10 @@ def test_a_non_object_assistant_section_reads_as_the_default(tmp_path):
         json.dumps({"schema_version": 11, "assistant": "off"}), encoding="utf-8"
     )
     store = SettingsStore(path)
-    assert store.get_section("assistant") == {"use_user_claude_config": True}
+    assert store.get_section("assistant") == {
+        "use_user_claude_config": True,
+        "always_allow_rules": [],
+    }
 
 
 def test_store_patch_ignores_a_non_boolean(tmp_path):
@@ -221,7 +227,8 @@ def test_a_lan_caller_cannot_flip_the_switch(tmp_path, monkeypatch):
     assert store.get_value("assistant", "use_user_claude_config") is True
     # Reading it is harmless, so the phone still sees it.
     assert lan.get("/api/settings").json()["assistant"] == {
-        "use_user_claude_config": True
+        "use_user_claude_config": True,
+        "always_allow_rules": [],
     }
     # And the phone's own toggles still save.
     assert (
@@ -237,7 +244,10 @@ def test_this_machine_flips_the_switch_and_junk_is_a_400(tmp_path, monkeypatch):
         "/api/settings", json={"assistant": {"use_user_claude_config": False}}
     )
     assert off.status_code == 200, off.text
-    assert off.json()["assistant"] == {"use_user_claude_config": False}
+    assert off.json()["assistant"] == {
+        "use_user_claude_config": False,
+        "always_allow_rules": [],
+    }
     assert store.get_value("assistant", "use_user_claude_config") is False
 
     junk = local.patch(
@@ -430,7 +440,7 @@ def test_rule_paths_use_the_clis_absolute_form():
 
 
 @pytest.mark.parametrize("use_user_config", [True, False])
-def test_read_only_then_ask_then_teardown(monkeypatch, use_user_config):
+def test_read_only_then_ask_then_teardown(monkeypatch, tmp_path, use_user_config):
     """Read-only with allow rules loaded, then the user picks Ask, then the
     conversation ends.
 
@@ -439,7 +449,14 @@ def test_read_only_then_ask_then_teardown(monkeypatch, use_user_config):
     .claude/settings*.json either way), and the CLI approves what they match
     without asking theDAW, so decide() never saw a matched `git commit` or an
     Edit of the assistant's own code in Read-only mode. The child now gets ask
-    rules, which the CLI checks before any allow rule."""
+    rules, which the CLI checks before any allow rule.
+
+    No settings file carries an allow rule here (an empty CLAUDE_CONFIG_DIR
+    and a checkout without .claude/), so Ask mode mirrors none; the mirroring
+    itself is test_assistant_ask_allow_rules.py."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    (tmp_path / "checkout").mkdir()
+    monkeypatch.setattr(cs, "REPO_ROOT", tmp_path / "checkout")
     arg_sets = use_fake_cli(monkeypatch)
 
     async def body():
@@ -475,7 +492,7 @@ def test_no_rules_file_means_no_child(monkeypatch):
     edits in Read-only mode, so an unwritable rules file fails the turn."""
     arg_sets = use_fake_cli(monkeypatch)
 
-    def refuse(relay_id, permission_mode):
+    def refuse(relay_id, permission_mode, **_):
         raise OSError("disk full")
 
     async def body():

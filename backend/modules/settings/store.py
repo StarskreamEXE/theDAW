@@ -186,13 +186,20 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         # skills, commands and agents (the CLI's `user` setting source) and
         # every MCP server they configured -- next to theDAW's relay, as it did
         # before the permission modes arrived; the user's own allow rules then
-        # approve what they match, except in Read-only mode and for edits to
-        # the assistant's own code (claude_session.permission_rules). False:
+        # approve what they match in Accept-edits and Trusted, ask first in Ask
+        # unless marked in always_allow_rules, and never apply in Read-only or
+        # to edits of the assistant's own code (claude_session.permission_rules). False:
         # only this project's settings and theDAW's own MCP servers. Read by
         # backend/assistant_routes.py on every turn; see
         # claude_session.build_base_args. PATCH is loopback/launch-token only
         # (settings/router.py), a phone on the LAN cannot flip it.
         "use_user_claude_config": True,
+        # Allow rules from the loaded Claude settings files that keep running
+        # without a prompt in Ask mode. Every other loaded allow rule is sent to
+        # theDAW's permission check in Ask mode, which asks the user
+        # (claude_session.permission_rules). Exact rule strings as they appear
+        # in the settings file. PATCH is loopback/launch-token only.
+        "always_allow_rules": [],
     },
 }
 
@@ -404,6 +411,9 @@ def _merge_defaults(
     merged["library"]["media_roots"] = _normalize_extra_folders(
         merged["library"].get("media_roots")
     )
+    merged["assistant"]["always_allow_rules"] = _normalize_extra_folders(
+        merged["assistant"].get("always_allow_rules")
+    )
 
     merged["schema_version"] = SCHEMA_VERSION
     return merged
@@ -535,6 +545,7 @@ class SettingsStore:
                     if (section, k) in (
                         ("models", "extra_folders"),
                         ("library", "media_roots"),
+                        ("assistant", "always_allow_rules"),
                     ):
                         # List-valued key: sanitise it (str-only, stripped,
                         # de-duped, no cap). A non-list is malformed and is

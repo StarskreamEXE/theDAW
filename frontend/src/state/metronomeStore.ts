@@ -16,6 +16,7 @@
 
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { persistStorage } from './persistStorage';
 import { MetronomeScheduler, METRONOME_TICK_MS, type MetronomeSettings } from '../lib/metronome';
 import { beatClock } from '../lib/beatClock';
 import type { TempoEvent } from '../lib/tempoMap';
@@ -56,6 +57,7 @@ export const useMetronomeStore = create<MetronomeState>()(
     }),
     {
       name: 'thedaw-metronome',
+      storage: persistStorage(),
       version: 1,
       partialize: (s) => ({
         enabled: s.enabled,

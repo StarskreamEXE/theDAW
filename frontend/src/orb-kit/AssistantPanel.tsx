@@ -25,6 +25,7 @@ import {
 import { contextPercentage, fetchContextUsage, type ContextUsage } from './contextUsage';
 import { PermissionModeSelect } from './permission/PermissionModeSelect';
 import { UserClaudeConfigToggle } from './permission/UserClaudeConfigToggle';
+import { AllowRulesList } from './permission/AllowRulesList';
 import { useAssistantPermissionStore } from './permission/assistantPermissionStore';
 import {
     loadConversations,
@@ -1240,7 +1241,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                         </div>
                         <span className="font-semibold text-sm">theDAW</span>
                         {messages.length > 0 && (
-                            <span className="text-[10px] px-1.5 py-0.5 bg-primary/20 text-primary rounded-full">
+                            <span className="text-xs font-semibold px-1.5 py-0.5 bg-primary/20 text-primary rounded-full">
                                 {messages.length}
                             </span>
                         )}
@@ -1290,7 +1291,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                         <h2 className="font-bold text-sm truncate">
                             GANTASMO-b0t
                         </h2>
-                        <p className="text-[10px] text-muted truncate">Stable Audio 3 expert</p>
+                        <p className="text-xs font-semibold text-muted truncate">Stable Audio 3 expert</p>
                     </div>
                 </div>
                 <div className="flex items-center gap-1 min-w-0">
@@ -1349,12 +1350,12 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
             {showHistory && (
                 <div className="border-b border-border bg-surface/95 max-h-72 overflow-y-auto custom-scrollbar">
                     <div className="flex items-center justify-between px-3 py-2 border-b border-white/5">
-                        <span className="text-[10px] font-semibold text-muted uppercase tracking-wide">History</span>
+                        <span className="text-xs font-semibold text-muted uppercase tracking-wide">History</span>
                         <div className="flex items-center gap-3">
                             <button
                                 type="button"
                                 onClick={handleClearHistory}
-                                className="inline-flex items-center gap-1 text-[10px] text-primary hover:text-white transition-colors"
+                                className="inline-flex items-center gap-1 text-xs font-semibold text-primary hover:text-white transition-colors"
                                 title="Start a new chat"
                             >
                                 <Plus size={12} /> New chat
@@ -1364,14 +1365,14 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                                 onClick={handleClearAll}
                                 title="Delete all saved chats"
                                 aria-label="Clear all history"
-                                className="inline-flex items-center gap-1 text-[10px] text-rose-400/80 hover:text-rose-300 transition-colors"
+                                className="inline-flex items-center gap-1 text-xs font-semibold text-rose-400/80 hover:text-rose-300 transition-colors"
                             >
                                 Clear all
                             </button>
                         </div>
                     </div>
                     {conversations.length === 0 ? (
-                        <div className="px-3 py-3 text-[10px] text-muted italic">No saved conversations yet.</div>
+                        <div className="px-3 py-3 text-xs font-semibold text-muted italic">No saved conversations yet.</div>
                     ) : (
                         conversations.map((c) => (
                             <div
@@ -1385,8 +1386,8 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                                 className={`group flex items-center gap-2 px-3 py-2 border-b border-white/5 last:border-0 cursor-pointer hover:bg-white/5 ${c.id === activeConvIdRef.current ? 'bg-primary/10' : ''}`}
                             >
                                 <div className="flex-1 min-w-0">
-                                    <div className="text-[11px] text-white truncate">{c.title}</div>
-                                    <div className="text-[9px] text-muted">{timeAgo(c.updatedAt)} · {c.messages.length} msgs</div>
+                                    <div className="text-xs font-semibold text-white truncate">{c.title}</div>
+                                    <div className="text-xs font-semibold text-muted">{timeAgo(c.updatedAt)} · {c.messages.length} msgs</div>
                                 </div>
                                 <button
                                     onClick={(e) => { e.stopPropagation(); removeConversation(c.id); }}
@@ -1455,6 +1456,9 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                                 MCP servers. An app setting (data/settings.json),
                                 read by the backend on every turn; Claude only. */}
                             {shouldShowPermissionSelect(selectedProvider) && <UserClaudeConfigToggle />}
+                            {/* The loaded allow rules; in Ask mode each one asks
+                                unless marked Always allow. Claude only. */}
+                            {shouldShowPermissionSelect(selectedProvider) && <AllowRulesList />}
                             <div className="flex items-center justify-between text-xs pt-0.5">
                                 {/* The CLI reports the model it actually loaded,
                                     which can differ from the one requested (a
@@ -1581,7 +1585,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                                                 <div key={k.id} className="flex items-center gap-1.5 pl-2 text-xs">
                                                     <span className={`w-1.5 h-1.5 rounded-full ${k.available ? 'bg-green-400' : 'bg-yellow-400'}`} title={k.available ? 'Available' : 'Cooling down'} />
                                                     <KeyRound className="w-3 h-3 shrink-0 text-muted/60" aria-hidden="true" />
-                                                    <span className="font-mono text-muted">{k.masked}</span>
+                                                    <span className="tabular-nums font-semibold text-muted">{k.masked}</span>
                                                     <span className="text-muted/40">{k.source}</span>
                                                     {k.fail_count > 0 && <span className="text-red-400/60">{k.fail_count}x fail</span>}
                                                     {k.source !== 'env' && (
@@ -1615,10 +1619,10 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                             <Sparkles size={28} className="text-primary" />
                         </div>
                         <h3 className="text-base font-bold mb-1">How can I help?</h3>
-                        <p className="text-[11px] text-muted max-w-xs mb-1">
+                        <p className="text-xs font-semibold text-muted max-w-xs mb-1">
                             I have <span className="text-primary font-semibold">full access</span> to all app capabilities.
                         </p>
-                        <p className="text-[10px] text-muted/70 mb-4 italic">
+                        <p className="text-xs font-semibold text-muted/70 mb-4 italic">
                             {CAPABILITY_HINTS[currentHint]}
                         </p>
 
@@ -1628,7 +1632,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                                 <button
                                     key={i}
                                     onClick={() => handleQuickCommand(cmd.command)}
-                                    className="px-2.5 py-1.5 bg-white/5 hover:bg-white/10 border border-white/10 hover:border-primary/30 rounded-full text-[11px] font-medium transition-all hover:scale-105"
+                                    className="px-2.5 py-1.5 bg-white/5 hover:bg-white/10 border border-white/10 hover:border-primary/30 rounded-full text-xs font-semibold transition-all hover:scale-105"
                                 >
                                     {cmd.label}
                                 </button>
@@ -1692,7 +1696,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                                 <div
                                     key={key}
                                     title={resolved.detail}
-                                    className={`flex items-center gap-1.5 max-w-full rounded-full border px-2 py-1 text-[10px] ${missing
+                                    className={`flex items-center gap-1.5 max-w-full rounded-full border px-2 py-1 text-xs font-semibold ${missing
                                         ? 'border-red-500/40 bg-red-500/10 text-red-300 line-through'
                                         : resolved.status === 'changed'
                                             ? 'border-amber-500/40 bg-amber-500/10 text-amber-200'
@@ -1718,7 +1722,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                 {attachments.length > 0 && (
                     <div className="mb-2 flex flex-wrap gap-1.5">
                         {attachments.map(item => (
-                            <div key={item.id} className="flex items-center gap-1.5 max-w-full rounded-full border border-primary/25 bg-primary/10 px-2 py-1 text-[10px] text-primary">
+                            <div key={item.id} className="flex items-center gap-1.5 max-w-full rounded-full border border-primary/25 bg-primary/10 px-2 py-1 text-xs font-semibold text-primary">
                                 {renderAttachmentIcon(item.mime)}
                                 <span className="max-w-48 truncate" title={item.name}>{item.name}</span>
                                 <span className="text-primary/60">{formatBytes(item.size)}</span>
@@ -1746,7 +1750,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                 <div className="mb-2 flex items-center gap-2 px-0.5">
                     {statusLine && (
                         <div
-                            className="flex min-w-0 flex-1 items-center gap-1.5 text-[10px] text-muted"
+                            className="flex min-w-0 flex-1 items-center gap-1.5 text-xs font-semibold text-muted"
                             role={statusIsLive ? 'status' : undefined}
                             aria-live={statusIsLive ? 'polite' : undefined}
                         >
@@ -1767,7 +1771,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                         aria-valuenow={contextPercent}
                         aria-label={contextMeter.ariaLabel}
                         title={contextMeter.title}
-                        className="ml-auto flex shrink-0 items-center gap-1.5 text-[10px] text-muted"
+                        className="ml-auto flex shrink-0 items-center gap-1.5 text-xs font-semibold text-muted"
                     >
                         <span>{contextMeter.label}</span>
                         <div className="h-1 w-16 overflow-hidden rounded-full bg-white/6">
@@ -1776,7 +1780,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                                 style={{ width: `${contextPercent}%` }}
                             />
                         </div>
-                        <span className="font-mono">{contextPercent}%</span>
+                        <span className="tabular-nums font-semibold">{contextPercent}%</span>
                     </div>
                 </div>
                 <div className="flex gap-2">
@@ -1801,7 +1805,7 @@ export const AssistantPanel: React.FC<AssistantPanelProps> = ({
                     >
                         <Paperclip size={14} aria-hidden="true" />
                         {attachments.length > 0 && (
-                            <span className="absolute -right-1 -top-1 min-w-4 rounded-full bg-primary px-1 text-[9px] font-bold text-white">
+                            <span className="absolute -right-1 -top-1 min-w-4 rounded-full bg-primary px-1 text-xs font-bold text-white">
                                 {attachments.length}
                             </span>
                         )}
@@ -1900,7 +1904,7 @@ const ModelCapabilityHints: React.FC<{ model: ModelInfo | null }> = ({ model }) 
                 {caps.map((c) => (
                     <span
                         key={c}
-                        className={`text-[8px] font-mono uppercase tracking-wider px-1.5 py-0.5 rounded border ${
+                        className={`text-xs font-bold uppercase tracking-wider px-1.5 py-0.5 rounded border ${
                             CAP_TINT[c] ?? 'border-zinc-500/20 text-zinc-400 bg-white/3'
                         }`}
                     >
@@ -1909,12 +1913,12 @@ const ModelCapabilityHints: React.FC<{ model: ModelInfo | null }> = ({ model }) 
                 ))}
             </div>
             {nonChat.length > 0 && (
-                <div className="text-[9px] text-amber-300 bg-amber-500/8 border border-amber-500/30 rounded px-2 py-1 leading-snug">
-                    This model is built for <span className="font-bold">{nonChat.join(' / ')}</span> — chat requests will likely error. Pick a model with <span className="font-mono">tools</span> or <span className="font-mono">reasoning</span> for normal conversation.
+                <div className="text-xs font-semibold text-amber-300 bg-amber-500/8 border border-amber-500/30 rounded px-2 py-1 leading-snug">
+                    This model is built for <span className="font-bold">{nonChat.join(' / ')}</span> — chat requests will likely error. Pick a model with <span className="font-bold">tools</span> or <span className="font-bold">reasoning</span> for normal conversation.
                 </div>
             )}
             {isDeprecated && (
-                <div className="text-[9px] text-red-300 bg-red-500/8 border border-red-500/30 rounded px-2 py-1 leading-snug">
+                <div className="text-xs font-semibold text-red-300 bg-red-500/8 border border-red-500/30 rounded px-2 py-1 leading-snug">
                     Deprecated — Google will shut this model down soon. Migrate to a 3.x model when convenient.
                 </div>
             )}

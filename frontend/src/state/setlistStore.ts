@@ -10,6 +10,7 @@
  */
 import { create, type StoreApi } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { persistStorage } from './persistStorage';
 import { analyzeEntries } from './djAnalysisStore';
 import { useLogStore } from './logStore';
 
@@ -408,6 +409,7 @@ export const useSetlistStore = create<SetlistState>()(
     }),
     {
       name: STORAGE_KEY,
+      storage: persistStorage(),
       // The sets and the active choice, the shape every build has stored.
       // `registeringId` is live state: persisted, a reload in the middle of a
       // register would leave every Sets row refusing clicks.

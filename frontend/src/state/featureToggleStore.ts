@@ -15,6 +15,7 @@
  */
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { persistStorage } from './persistStorage';
 import type { DeviceRef } from '../lib/ioResolve';
 import { dismissFeatureGate, requireFeature } from '../notices/featureGateStore';
 import { logError } from './logStore';
@@ -139,6 +140,10 @@ export interface AssistantSettings {
    *  own MCP servers. The backend reads it on every turn and respawns the
    *  session when it changes. */
   use_user_claude_config: boolean;
+  /** Loaded Claude allow rules that run without a prompt in Ask mode. In Ask
+   *  mode every other loaded allow rule asks first (AllowRulesList). Exact
+   *  rule strings as the settings files spell them. */
+  always_allow_rules: string[];
 }
 
 export interface FeatureSettings {
@@ -207,6 +212,7 @@ export const DEFAULT_FEATURE_SETTINGS: FeatureSettings = {
   },
   assistant: {
     use_user_claude_config: true,
+    always_allow_rules: [],
   },
 };
 
@@ -389,6 +395,7 @@ export const useFeatureToggleStore = create<FeatureToggleState>()(
     }),
     {
       name: 'thedaw-feature-settings',
+      storage: persistStorage(),
       partialize: (s) => ({ settings: s.settings }),
       // A mirror saved by an older build lacks the sections added since (the
       // `assistant` switch, the folder lists); fill them from the defaults so
