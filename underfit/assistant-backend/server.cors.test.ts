@@ -62,8 +62,13 @@ try {
 
   console.log("server.cors: ok");
 } finally {
-  server.close();
+  // Close the keep-alive sockets fetch left open, then the server, and wait
+  // for it: the process then ends on its own with an empty event loop. A
+  // process.exit() here, while those sockets were still closing, crashed
+  // Node on Windows (libuv "Assertion failed: !(handle->flags &
+  // UV_HANDLE_CLOSING)", exit 127) in most runs, after the test had passed.
+  server.closeAllConnections();
+  await new Promise<void>((closed) => server.close(() => closed()));
   process.chdir(home);
   rmSync(scratch, { recursive: true, force: true });
 }
-process.exit(0);
