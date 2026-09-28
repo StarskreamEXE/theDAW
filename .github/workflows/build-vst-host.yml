@@ -25,11 +25,8 @@ on:
 permissions:
   contents: read
 
-env:
-  # Same uv as UV_VERSION in test.yml, the ghcr.io/astral-sh/uv tag in the
-  # Dockerfile and UV_VERSION in electron-ui/scripts/fetch-runtime-tools.mjs --
-  # bump all four together.
-  UV_VERSION: "0.12.19"
+# uv is installed at its latest release, as in test.yml, the Dockerfile's
+# ghcr.io/astral-sh/uv:latest and electron-ui/scripts/fetch-runtime-tools.mjs.
 
 jobs:
   windows-x86_64:
@@ -52,7 +49,7 @@ jobs:
       - name: Install uv
         # pipx, not astral-sh/setup-uv@v5: house style (lint.yml, test.yml) keeps
         # third-party Actions out of the tooling chain in favour of pip/pipx installs.
-        run: pipx install "uv==${{ env.UV_VERSION }}"
+        run: pipx install uv
 
       # cmake and the MSVC toolchain (Build Tools + Windows SDK) are preinstalled on the
       # windows-latest image, so there is no setup step for either one.

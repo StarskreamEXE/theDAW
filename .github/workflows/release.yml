@@ -42,11 +42,10 @@ env:
   # (electron-ui/scripts/fetch-sway-build.mjs via SWAY_PROJECT). It used to be
   # private, which is why SWAY_REPO_TOKEN exists; the secret is still honoured
   # when present so a fork with its own PAT keeps working, and its absence no
-  # longer fails the build. SWAY_REF pins the commit the packaged app ships;
-  # bump it deliberately, the same way VJ_COMMIT is pinned in
-  # fetch-vj-build.mjs.
+  # longer fails the build. SWAY_REF is the branch whose newest commit the
+  # packaged app ships; the checkout step logs the commit it built.
   SWAY_REPO: danieljtrujillo/SwayCommand
-  SWAY_REF: 9a3e29a51b71bfb6a1aa099176568879e233168c
+  SWAY_REF: main
 
 jobs:
   # Resolves the release version and fails fast on any version drift
