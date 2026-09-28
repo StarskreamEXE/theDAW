@@ -13,10 +13,17 @@ byte-for-byte as-is: no CORS, no base URL, no client rewrite.
 Setup lives here too, so Settings can fix a missing Lyria without naming a
 git command:
 
-    POST /install          clone StarskreamEXE/lyria-3-pro into the expected
-                           folder (needs git) and run its npm install, in the
-                           background; output goes to the sidecar log
+    POST /install          clone the latest StarskreamEXE/lyria-3-pro into
+                           the expected folder (needs git) and run its npm
+                           install, in the background; output goes to the
+                           sidecar log
     GET  /install/status   poll the install
+    POST /update           fast-forward a clean checkout to the latest commit
+                           of the repo's default branch, in the background,
+                           stopping Lyria for the move and starting it again
+    GET  /update           poll the update; ``?check=true`` also asks GitHub
+                           for the latest commit (at most once per ten
+                           minutes) so the panel can say one is waiting
     GET  /key              is a GEMINI_API_KEY known, and from where
     POST /key {key}        append a Gemini key theDAW hands the sidecar
     DELETE /key            forget the stored Gemini keys
@@ -108,7 +115,7 @@ def _maybe_auto_spawn() -> None:
     def _warm() -> None:
         try:
             sidecar.ensure_running()
-        except Exception as e:  # noqa: BLE001 - warm-up is best-effort
+        except Exception as e:  # warm-up is best-effort
             log.warning("lyria.router: warm-up failed: %s", e)
 
     threading.Thread(target=_warm, daemon=True, name="lyria-warm").start()
@@ -148,8 +155,8 @@ async def url() -> dict:
         "port": cfg.port,
         "mobile_url": f"http://{lan_ip}:{cfg.port}" if lan_ip else None,
         "lan_ip": lan_ip,
-        # What the pinned-commit check found; ``reason`` says why a checkout
-        # was left where it is, for the panel to show.
+        # What the last Update or latest-commit check found; ``reason`` says
+        # why a checkout was left where it is, for the panel to show.
         "checkout": sidecar.checkout_state(),
     }
 
@@ -228,6 +235,38 @@ async def install() -> dict:
 @router.get("/install/status")
 async def install_status() -> dict:
     return sidecar.install_status()
+
+
+# ── update: fast-forward to the latest commit, from the Lyria panel ──────────
+
+
+@router.post("/update", dependencies=_CHANGES)
+async def update() -> dict:
+    """Fast-forward the checkout to the latest commit of the Lyria repo's
+    default branch, in the background. Returns the update state right away;
+    poll GET /update. A checkout with local changes, on its own branch, or
+    managed through theDAW_LYRIA_PROJECT is left alone, and the finished
+    state's ``message`` says why. 409 when there is no checkout yet or an
+    Install is running."""
+    try:
+        return await asyncio.to_thread(sidecar.start_update)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+
+
+@router.get("/update")
+async def update_status(check: bool = False) -> dict:
+    """The update job, the checkout state, and the latest commit theDAW knows
+    of. ``check=true`` asks GitHub (``git ls-remote``, rate-limited in the
+    sidecar) before answering."""
+    latest = await asyncio.to_thread(sidecar.check_latest) if check else None
+    cfg = sidecar.resolve_config()
+    return {
+        "job": sidecar.update_status(),
+        "checkout": sidecar.checkout_state(),
+        "latest": latest,
+        "compat": await asyncio.to_thread(sidecar.checkout_compat, cfg.project_path),
+    }
 
 
 # ── GEMINI_API_KEY the sidecar is handed ─────────────────────────────────────

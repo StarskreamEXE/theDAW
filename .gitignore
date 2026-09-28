@@ -414,7 +414,7 @@ video-scripts/
 data/magenta_engine.json
 data/lyria_gemini_key.json
 data/lyria_provider_keys.json
-# Lyria checkouts moved to the pinned commit whose npm install has not finished
+# Lyria checkouts an Update moved whose npm install has not finished
 data/lyria_deps_pending.json
 logs/magenta-download-*.log
 
