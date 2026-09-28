@@ -12,6 +12,7 @@
     "build:orb": "vite build --config vite.orb.config.ts",
     "preview": "vite preview",
     "clean": "rm -rf dist",
+    "typecheck": "node ./node_modules/typescript/bin/tsc --noEmit",
     "lint": "node ./node_modules/typescript/bin/tsc --noEmit && node scripts/check-canonical-classes.mjs",
     "lint:scripts": "node ./node_modules/typescript/bin/tsc --noEmit -p scripts/tsconfig.json",
     "screenshots": "tsx ../scripts/screenshots/capture.ts",
