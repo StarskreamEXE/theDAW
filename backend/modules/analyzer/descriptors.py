@@ -497,7 +497,7 @@ def _classify_source(
         noise_score += 0.2
 
     scores = {"speech": speech_score, "music": music_score, "noise": noise_score}
-    source_type = max(scores, key=scores.get)  # type: ignore[arg-type]
+    source_type = max(scores, key=lambda name: scores[name])
     total = sum(scores.values()) or 1.0
     confidence = round(scores[source_type] / total, 4)
 
