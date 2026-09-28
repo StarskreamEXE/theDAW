@@ -481,7 +481,7 @@ export const DetailsLibraryPane: React.FC = () => {
           }}
           placeholder="Search title / prompt / tags…"
           spellCheck={false}
-          className="flex-1 min-w-0 bg-black/40 border border-white/10 rounded px-2 py-1 text-xs text-zinc-200 placeholder:text-zinc-500 focus:outline-none focus:border-purple-400/50"
+          className="flex-1 min-w-0 bg-black/40 border border-white/10 rounded px-2 py-1 text-xs font-bold text-zinc-200 placeholder:text-zinc-500 focus:outline-none focus:border-purple-400/50"
         />
         <label htmlFor={SORT_ID} className="sr-only">Sort the library</label>
         <select
