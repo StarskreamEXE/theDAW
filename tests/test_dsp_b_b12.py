@@ -549,8 +549,9 @@ def test_batch_export_jobs_default_is_half_the_cpus_within_the_knob(cpus, jobs) 
 
 
 def test_batch_export_counts_the_cpus_this_process_may_use(monkeypatch) -> None:
-    """The affinity-aware count wins over the machine's total: a backend
-    pinned to 4 of 32 CPUs defaults to 2 Jobs, not 8."""
+    """The smallest count the platform offers wins over the machine's total: a
+    backend pinned to 4 of 32 CPUs defaults to 2 Jobs, not 8."""
+    monkeypatch.setattr(delivery_router, "_affinity_cpus", lambda: None)
     monkeypatch.setattr(
         delivery_router.os, "process_cpu_count", lambda: 4, raising=False
     )
@@ -569,6 +570,58 @@ def test_batch_export_counts_the_cpus_this_process_may_use(monkeypatch) -> None:
 
     monkeypatch.delattr(delivery_router.os, "sched_getaffinity", raising=False)
     assert delivery_router._usable_cpus() == 32
+
+    monkeypatch.setattr(delivery_router, "_affinity_cpus", lambda: 3)
+    assert delivery_router._usable_cpus() == 3
+
+
+_REPORT_CPUS = (
+    "import sys\n"
+    "sys.stdin.readline()\n"
+    "from backend.modules.delivery import router\n"
+    "print(router._usable_cpus(), router.default_batch_jobs(router._usable_cpus()))\n"
+)
+
+
+def test_batch_export_on_a_backend_pinned_to_four_cpus_defaults_to_two_jobs(
+    tmp_path: Path,
+) -> None:
+    """A real process whose affinity is cut to four CPUs after it starts (as
+    ``start /affinity`` or a job object does), then asked for its count. On
+    Python 3.12 for Windows neither os.process_cpu_count nor
+    os.sched_getaffinity exists, so a count that ignores the mask reads the
+    machine's total there."""
+    import os
+    import subprocess
+    import sys
+
+    psutil = pytest.importorskip("psutil")
+    if not hasattr(psutil.Process(), "cpu_affinity"):
+        pytest.skip("this platform has no CPU affinity")
+    mine = psutil.Process().cpu_affinity()
+    if len(mine) < 8:
+        pytest.skip("needs at least 8 CPUs to tell 4 from the total")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+    env["theDAW_DATA_DIR"] = str(tmp_path / "data")
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    child = subprocess.Popen(
+        [sys.executable, "-c", _REPORT_CPUS],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    try:
+        psutil.Process(child.pid).cpu_affinity(mine[:4])
+        out, err = child.communicate("go\n", timeout=120)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
+    assert child.returncode == 0, err
+    assert out.split() == ["4", "2"]
 
 
 def test_batch_export_keeps_jobs_and_drops_the_retired_formats_key(

@@ -487,19 +487,48 @@ async def _metadata(inp: Path, out: Path, params: dict) -> None:
 BATCH_JOBS_MAX = 8
 
 
+def _affinity_cpus() -> int | None:
+    """How many CPUs this process's affinity mask allows, from psutil (a base
+    dependency), which reads it on Windows (GetProcessAffinityMask), Linux and
+    the BSDs. None where psutil cannot read it: macOS has no affinity call, and
+    Windows reports an empty mask for a process whose threads span processor
+    groups."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        read = getattr(psutil.Process(), "cpu_affinity", None)
+        if read is None:
+            return None
+        count = len(read())
+    except (OSError, psutil.Error) as e:
+        log.debug("delivery: CPU affinity unreadable: %s", e)
+        return None
+    return count or None
+
+
 def _usable_cpus() -> int | None:
     """The logical CPUs this process may run on, or None when unknown.
 
-    ``os.process_cpu_count`` (Python 3.13+) honours the CPU affinity and
-    ``PYTHON_CPU_COUNT``; before it, the affinity mask where the platform has
-    one, else the machine's count."""
+    The smallest of the counts the platform offers: the affinity mask
+    (:func:`_affinity_cpus`), ``os.process_cpu_count`` (Python 3.13+, which also
+    honours ``PYTHON_CPU_COUNT``), ``os.sched_getaffinity`` where it exists,
+    and the machine's total. Python 3.12 on Windows has neither os function,
+    so there the mask is read through psutil."""
+    counts: list[int] = []
+    affinity = _affinity_cpus()
+    if affinity:
+        counts.append(affinity)
     counter = getattr(os, "process_cpu_count", None)
-    if counter is not None:
-        return counter()
-    affinity = getattr(os, "sched_getaffinity", None)
-    if affinity is not None:
-        return len(affinity(0))
-    return os.cpu_count()
+    if counter is not None and (n := counter()):
+        counts.append(n)
+    sched = getattr(os, "sched_getaffinity", None)
+    if sched is not None and (n := len(sched(0))):
+        counts.append(n)
+    if not counts and (n := os.cpu_count()):
+        counts.append(n)
+    return min(counts) if counts else None
 
 
 def default_batch_jobs(cpus: int | None) -> int:
