@@ -850,9 +850,11 @@ export function analyzeBufferAsync(url: string, buffer: AudioBuffer, opts?: Anal
   let flight = analysisInFlight.get(key);
   if (!flight) {
     const controller = new AbortController();
-    // Declared before the task starts: a synchronous failure reaches the
-    // comparisons below before the flight record exists, and they must read
-    // null there (TDZ otherwise).
+    // Declared above the task because TypeScript 7 reports TS2448 when the
+    // immediately invoked task reads a const declared below it. The task
+    // reads `created` only after its first await (analyzeOffThread is async,
+    // so even a failure settles on a later microtask), and the assignment
+    // below has always run by then.
     let created: AnalysisFlight | null = null;
     const promise = (async () => {
       let result: WaveBin[];
