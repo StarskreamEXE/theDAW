@@ -850,6 +850,10 @@ export function analyzeBufferAsync(url: string, buffer: AudioBuffer, opts?: Anal
   let flight = analysisInFlight.get(key);
   if (!flight) {
     const controller = new AbortController();
+    // Declared before the task starts: a synchronous failure reaches the
+    // comparisons below before the flight record exists, and they must read
+    // null there (TDZ otherwise).
+    let created: AnalysisFlight | null = null;
     const promise = (async () => {
       let result: WaveBin[];
       try {
@@ -871,7 +875,7 @@ export function analyzeBufferAsync(url: string, buffer: AudioBuffer, opts?: Anal
     // Every caller may have walked away; the abort must not surface as an
     // unhandled rejection.
     promise.catch(() => undefined);
-    const created: AnalysisFlight = { promise, controller, waiters: 0 };
+    created = { promise, controller, waiters: 0 };
     flight = created;
     analysisInFlight.set(key, created);
   }
