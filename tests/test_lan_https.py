@@ -972,3 +972,20 @@ def test_the_devstack_still_compiles_after_the_edit() -> None:
         text=True,
     )
     assert done.returncode == 0, done.stderr
+
+
+def test_the_switch_record_is_ignored_by_git() -> None:
+    """The record :func:`lan_https.record_path` puts beside data/settings.json
+    is per machine, like settings.json itself: a checkout that ran the app
+    listed data/lan_https.json as an untracked file in git status, one
+    `git add .` away from being committed."""
+    record = lan_https.record_path(REPO_ROOT / "data" / "settings.json")
+    done = subprocess.run(
+        ["git", "check-ignore", "-q", record.relative_to(REPO_ROOT).as_posix()],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if done.returncode == 128:
+        pytest.skip(f"not a git checkout: {done.stderr.strip()}")
+    assert done.returncode == 0, f"{record.name} is not git-ignored"

@@ -22,6 +22,9 @@ data/performance-sets/
 # The LYRIC tab's notebook: drafts the writer has not published anywhere.
 data/lyric-documents/
 data/settings.json
+# The LAN HTTPS switch as this build last wrote it into settings.json
+# (backend/lib/lan_https.py record_path), per machine like settings.json
+data/lan_https.json
 data/recent_projects.json
 # Paths theDAW saved, installed, picked or downloaded (absolute, per machine)
 data/known_paths.json
