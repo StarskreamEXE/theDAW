@@ -20,19 +20,19 @@
     "dist:win:ci": "npm run fetch:tools && npm run fetch:vj && npm run fetch:foundry && npm run fetch:sway && npm run fetch:notation && electron-vite build && electron-builder --win --publish never",
     "dist:mac:ci": "npm run fetch:tools && npm run fetch:vj && npm run fetch:foundry && npm run fetch:sway && npm run fetch:notation && electron-vite build && electron-builder --mac --publish never"
   },
-  "allowScripts": [
-    "electron-winstaller",
-    "esbuild"
-  ],
+  "allowScripts": {
+    "electron-winstaller": true,
+    "esbuild": true
+  },
   "dependencies": {
     "electron-updater": "^6.8.9"
   },
   "devDependencies": {
-    "electron": "^42.4.1",
-    "electron-vite": "^5.0.0",
+    "@tailwindcss/vite": "^4.3.3",
+    "@vitejs/plugin-react": "^5.2.0",
+    "electron": "^44.4.5",
     "electron-builder": "^26.15.3",
-    "@vitejs/plugin-react": "^5.0.4",
-    "@tailwindcss/vite": "^4.3.1",
-    "vite": "^7.3.5"
+    "electron-vite": "^5.0.0",
+    "vite": "^7.3.6"
   }
 }

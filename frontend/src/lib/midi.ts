@@ -235,7 +235,7 @@ const buildConductor = (file: MidiFileData): number[] => {
   return [...ascii('MTrk'), ...u32be(body.length), ...body];
 };
 
-export const encodeMidi = (file: MidiFileData): Uint8Array => {
+export const encodeMidi = (file: MidiFileData): Uint8Array<ArrayBuffer> => {
   const tracks = file.tracks.map((t) => serializeTrackChunk(trackEvents(t), t.name));
   const ntrks = 1 + tracks.length;
   const header = [

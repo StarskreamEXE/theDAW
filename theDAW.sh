@@ -144,9 +144,9 @@ if [ -n "$missing" ]; then
   Missing required tools:$missing
 
     uv      curl -LsSf https://astral.sh/uv/install.sh | sh
-    node    use nvm — distro packages are below the >=20.19 floor:
-            curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
-            exec "\$SHELL" && nvm install 22.12.0
+    node    use nvm — distro packages are below the ^20.19 || >=22.12 floor:
+            curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.8/install.sh | bash
+            exec "\$SHELL" && nvm install 24.21.0
     ffmpeg  sudo apt-get install -y ffmpeg      (or your distro's equivalent)
 
   Full guide: docs/linux/setup-guide.md
@@ -154,12 +154,24 @@ EOF
   exit 1
 fi
 
-# Node floor from frontend/package.json ("node": ">=20.19"). Older Node fails
-# inside Vite with an opaque error, so say it plainly here instead.
+# Node floor from frontend/package.json ("node": "^20.19.0 || >=22.12.0", the
+# range Vite declares). Older Node fails inside Vite with an opaque error, so
+# say it plainly here instead. frontend/.nvmrc names the recommended version.
 node_ver="$(node -v 2>/dev/null | sed 's/^v//')"
 node_major="${node_ver%%.*}"
-if [ -n "$node_major" ] && [ "$node_major" -lt 20 ]; then
-  warn "Node $node_ver is below the >=20.19 floor. Install 22.12.0 with nvm (see docs/linux/setup-guide.md)."
+node_minor="$(printf '%s' "$node_ver" | cut -d. -f2)"
+node_below_floor=0
+if [ -n "$node_major" ]; then
+  if [ "$node_major" -lt 20 ] || [ "$node_major" -eq 21 ]; then
+    node_below_floor=1
+  elif [ "$node_major" -eq 20 ] && [ "${node_minor:-0}" -lt 19 ]; then
+    node_below_floor=1
+  elif [ "$node_major" -eq 22 ] && [ "${node_minor:-0}" -lt 12 ]; then
+    node_below_floor=1
+  fi
+fi
+if [ "$node_below_floor" = "1" ]; then
+  warn "Node $node_ver is below the ^20.19 || >=22.12 floor. Install $(cat frontend/.nvmrc) with nvm (see docs/linux/setup-guide.md)."
   exit 1
 fi
 

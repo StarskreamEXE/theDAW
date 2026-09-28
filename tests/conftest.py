@@ -140,7 +140,8 @@ def test_flash_attention_available(sa3_model, request):
     except ImportError:
         pytest.fail(
             "flash_attn is not importable. It is a base dependency on Windows "
-            "(pyproject pins a cu128/cp310 wheel gated to sys_platform == 'win32'), "
+            "(pyproject pins a torch 2.14 / cu130 wheel per Python minor, gated to "
+            "sys_platform == 'win32'), "
             "so on Windows run `uv sync` and check the wheel matches this torch/CUDA/"
             "Python — see docs/windows/troubleshooting.md. On Linux/macOS it is not "
             "installed by design and the model uses the SDPA fallback; this check is "

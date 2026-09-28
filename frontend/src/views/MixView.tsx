@@ -1506,8 +1506,9 @@ export const MixView: React.FC = () => {
   // takes priority; otherwise the selected chain effect opens its mapped module.
   const mappedModuleId = selectedEntry ? effectToModuleId[selectedEntry.effect] : undefined;
   const activeModule: StudioModule | null =
-    (activeModuleId ? moduleById[activeModuleId] ?? null : null)
-    ?? (mappedModuleId ? moduleById[mappedModuleId] ?? null : null);
+    (activeModuleId ? moduleById[activeModuleId] : undefined)
+    ?? (mappedModuleId ? moduleById[mappedModuleId] : undefined)
+    ?? null;
 
   // Picking a module from the library toggles its instrument open/closed. The
   // toggle reads the store directly because the store setter takes a plain

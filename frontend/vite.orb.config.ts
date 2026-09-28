@@ -14,18 +14,18 @@ export default defineConfig({
   build: {
     target: 'es2022',
     // underfit lives beside StableDAW: <projects>/underfit/dashboard/assistant
-    outDir: path.resolve(__dirname, '../../underfit/dashboard/assistant'),
+    outDir: path.resolve(import.meta.dirname, '../../underfit/dashboard/assistant'),
     // MUST stay false: dashboard/assistant/ also holds underfit's own assets
     // (fonts, worklets, logos). Emptying it would delete them.
     emptyOutDir: false,
     cssCodeSplit: false,
     lib: {
-      entry: path.resolve(__dirname, 'src/orb-standalone/main.tsx'),
+      entry: path.resolve(import.meta.dirname, 'src/orb-standalone/main.tsx'),
       name: 'UnderfitOrb',
       formats: ['iife'],
       fileName: () => 'underfit-orb.js',
     },
-    rollupOptions: {
+    rolldownOptions: {
       output: {assetFileNames: 'underfit-orb.[ext]'},
     },
   },

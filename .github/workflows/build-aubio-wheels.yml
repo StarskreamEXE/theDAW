@@ -7,7 +7,7 @@
 # the project ships to, for the interpreter pinned in .python-version:
 #   - win_amd64        -> the Windows installer and every dev machine
 #   - macOS arm64      -> the dmg (electron-builder mac target is arm64-only)
-#   - manylinux x86_64 -> the Docker image (python:3.12-slim-bookworm)
+#   - manylinux x86_64 -> the Docker image (python:3.12-slim-trixie)
 #
 # AFTER A RUN: download all three artifacts, drop the .whl files into wheels/, add
 # the matching path entries to pyproject.toml [tool.uv.sources] aubio (see the
@@ -60,13 +60,13 @@ env:
   # numpy. (A cp313 target would need >= 2.1.0.)
   NUMPY_BUILD_VERSION: "2.0.2"
   # cibuildwheel pinned; bump deliberately.
-  CIBW_VERSION: "4.1.0"
+  CIBW_VERSION: "4.2.1"
 
 jobs:
   macos-arm64:
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.RUNNER_PYTHON_VERSION }}
       - name: Fetch the aubio sdist
@@ -89,7 +89,7 @@ jobs:
             CFLAGS="-Wno-error=incompatible-function-pointer-types -Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration -Wno-error=int-conversion"
             MACOSX_DEPLOYMENT_TARGET=11.0
         run: python -m cibuildwheel --output-dir wheelhouse "sdist/aubio-${AUBIO_VERSION}.tar.gz"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: aubio-cp312-macos-arm64
           path: wheelhouse/*.whl
@@ -98,7 +98,7 @@ jobs:
   linux-x86_64:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.RUNNER_PYTHON_VERSION }}
       - name: Fetch the aubio sdist
@@ -121,7 +121,7 @@ jobs:
           CIBW_ENVIRONMENT_LINUX: >-
             CFLAGS="-Wno-error=incompatible-pointer-types -Wno-error=implicit-function-declaration -Wno-error=int-conversion"
         run: python -m cibuildwheel --output-dir wheelhouse "sdist/aubio-${AUBIO_VERSION}.tar.gz"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: aubio-cp312-manylinux-x86_64
           path: wheelhouse/*.whl
@@ -130,7 +130,7 @@ jobs:
   windows-x86_64:
     runs-on: windows-latest
     steps:
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.RUNNER_PYTHON_VERSION }}
       - name: Fetch the aubio sdist
@@ -148,7 +148,7 @@ jobs:
           # Quoted so cmd.exe does not read the "<" as a redirect.
           CIBW_BEFORE_BUILD: 'pip install "numpy==${{ env.NUMPY_BUILD_VERSION }}" "setuptools<74" wheel'
         run: python -m cibuildwheel --output-dir wheelhouse "sdist/aubio-${{ env.AUBIO_VERSION }}.tar.gz"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: aubio-cp312-win-amd64
           path: wheelhouse/*.whl

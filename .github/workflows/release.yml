@@ -37,10 +37,6 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # Node.js major version used to build the frontend bundle and the
-  # Electron shell. KEEP IN SYNC with the Node version documented in
-  # docs/RELEASING.md (section "Local builds").
-  NODE_VERSION: "22"
   # SwayCommand (the SWAY tab's cockpit) is public, so the installer jobs check
   # it out with the built-in GITHUB_TOKEN and build the embed bundle from it
   # (electron-ui/scripts/fetch-sway-build.mjs via SWAY_PROJECT). It used to be
@@ -50,7 +46,7 @@ env:
   # bump it deliberately, the same way VJ_COMMIT is pinned in
   # fetch-vj-build.mjs.
   SWAY_REPO: danieljtrujillo/SwayCommand
-  SWAY_REF: ec1683f9e141ec1e929426be1e0e6b7104f1f33f
+  SWAY_REF: 9a3e29a51b71bfb6a1aa099176568879e233168c
 
 jobs:
   # Resolves the release version and fails fast on any version drift
@@ -66,7 +62,7 @@ jobs:
     outputs:
       version: ${{ steps.resolve.outputs.version }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Resolve and verify the release version
         id: resolve
         run: |
@@ -134,10 +130,12 @@ jobs:
     env:
       VERSION: ${{ needs.version-check.outputs.version }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          # frontend/.nvmrc is the single Node pin for CI, the frontend and the
+          # Electron shell (test.yml reads the same file).
+          node-version-file: frontend/.nvmrc
           cache: npm
           cache-dependency-path: |
             frontend/package-lock.json
@@ -152,7 +150,7 @@ jobs:
       # at it. The script installs its deps and runs
       # `npm run build:renderer:embed` (renderer only; no Electron download).
       - name: Check out SwayCommand
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.SWAY_REPO }}
           ref: ${{ env.SWAY_REF }}
@@ -224,10 +222,12 @@ jobs:
       # happens to expose; the build is intentionally unsigned.
       CSC_IDENTITY_AUTO_DISCOVERY: "false"
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          # frontend/.nvmrc is the single Node pin for CI, the frontend and the
+          # Electron shell (test.yml reads the same file).
+          node-version-file: frontend/.nvmrc
           cache: npm
           cache-dependency-path: |
             frontend/package-lock.json
@@ -246,7 +246,7 @@ jobs:
       # at it. The script installs its deps and runs
       # `npm run build:renderer:embed` (renderer only; no Electron download).
       - name: Check out SwayCommand
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.SWAY_REPO }}
           ref: ${{ env.SWAY_REF }}
@@ -320,7 +320,7 @@ jobs:
     env:
       VERSION: ${{ needs.version-check.outputs.version }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # Plain `docker login` with the default token keeps this job free of
       # third-party actions (house rule from lint.yml).
       - name: Log in to the GitHub Container Registry
