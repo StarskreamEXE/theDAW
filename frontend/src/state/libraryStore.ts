@@ -46,6 +46,7 @@ import {
   type LibraryQuery,
   type LibraryServerSort,
 } from '../lib/backendLocalProvider';
+import { LibraryOpeningError, type LibrarySearchCoverage } from '../lib/libraryIndexStatus';
 import {
   facetCacheKey,
   type LibraryFacetField,
@@ -116,6 +117,18 @@ export interface LibraryState {
   pagesLoading: number;
   /** The last page failure, or null. The list shows it with a retry. */
   pageError: string | null;
+  /**
+   * True while the backend answers the list with 503 because it is still
+   * opening the library (a schema upgrade). The list shows the progress bar
+   * rather than an error, and fetches again once the library is ready.
+   */
+  libraryOpening: boolean;
+  /**
+   * The last searched page's `search_index`: `complete: false` while the
+   * search index is still being built, when a search covers the indexed
+   * entries only. Null for an unsearched list.
+   */
+  searchIndex: LibrarySearchCoverage | null;
   /** Bumped when a single-entry lookup lands, so a view can re-read it. */
   lookupVersion: number;
 
@@ -163,8 +176,14 @@ export interface LibraryState {
   getById: (id: string) => LibraryEntry | undefined;
   /** The full record for `id` (with full lyrics), fetched once and cached. */
   ensureEntry: (id: string) => Promise<LibraryEntry | null>;
-  /** Every id matching the current filters. Throws `LibraryIdCapError`. */
-  listFilteredIds: () => Promise<string[]>;
+  /**
+   * Every id matching the current filters. Throws `LibraryIdCapError`.
+   * `partial` is for the callers that follow the list on screen (play the
+   * list, a shift-click range, revealing a track): while the search index is
+   * still being built they get the matches the list shows. Without it
+   * (select-all) a search then throws `LibrarySearchIndexBuildingError`.
+   */
+  listFilteredIds: (options?: { partial?: boolean }) => Promise<string[]>;
   /** Load `fields`' facets for the current query, or answer from the cache. */
   ensureFacets: (fields: readonly LibraryFacetField[]) => Promise<void>;
   /**
@@ -338,11 +357,23 @@ export const useLibraryStore = create<LibraryState>()((set, get) => {
         if (seq !== querySeq) return; // a newer query already owns the screen
         if (result.paged && result.page) {
           applyPage(page, result.page.entries, result.page.total, result.page.revision);
+          set({ libraryOpening: false, searchIndex: result.page.searchIndex ?? null });
         } else {
           adoptFullLibrary(result.entries ?? []);
+          set({ libraryOpening: false, searchIndex: null });
         }
       } catch (e) {
         if (seq !== querySeq || ctrl.signal.aborted) return;
+        if (e instanceof LibraryOpeningError) {
+          // Not a failure: the backend is still upgrading the library, and
+          // the LIBRARY tab's progress bar says how far it has got. The
+          // visible range is fetched again when it reports `ready`.
+          if (!get().libraryOpening) {
+            logInfo('library', `${e.status.label || 'The library is opening'}; the list loads when it finishes`);
+          }
+          set({ libraryOpening: true, pageError: null });
+          return;
+        }
         const msg = e instanceof Error ? e.message : String(e);
         set({ pageError: msg });
         logError('library', `page ${page} failed: ${msg}`);
@@ -453,6 +484,8 @@ export const useLibraryStore = create<LibraryState>()((set, get) => {
     paged: true,
     pagesLoading: 0,
     pageError: null,
+    libraryOpening: false,
+    searchIndex: null,
     lookupVersion: 0,
     facets: {},
     facetsSupported: true,
@@ -482,12 +515,16 @@ export const useLibraryStore = create<LibraryState>()((set, get) => {
         await ensurePages(visibleStart, visibleEnd);
         set({ loaded: true, loading: false });
         const s = get();
-        logInfo(
-          'library',
-          s.paged
-            ? `Library ready: ${s.total} entries, ${s.entries.length} loaded (paged)`
-            : `Loaded ${s.entries.length} entries from ${getStorageProvider().name}`,
-        );
+        // While the backend is still opening the library the page was refused
+        // (fetchPage logged that); "ready: 0 entries" would be untrue.
+        if (!s.libraryOpening) {
+          logInfo(
+            'library',
+            s.paged
+              ? `Library ready: ${s.total} entries, ${s.entries.length} loaded (paged)`
+              : `Loaded ${s.entries.length} entries from ${getStorageProvider().name}`,
+          );
+        }
       } catch (e) {
         set({ loading: false });
         const msg = e instanceof Error ? e.message : 'Unknown error';
@@ -567,10 +604,12 @@ export const useLibraryStore = create<LibraryState>()((set, get) => {
       return run;
     },
 
-    listFilteredIds: async () => {
+    listFilteredIds: async (options) => {
       // An unpaged library has every row in hand: those ARE every id.
       if (!get().paged) return get().entries.map((e) => e.id);
-      const res = await fetchLibraryIds(get().getQuery());
+      const res = await fetchLibraryIds(get().getQuery(), undefined, undefined, {
+        partial: options?.partial === true,
+      });
       if (res === null) return get().entries.map((e) => e.id);
       return res.ids;
     },
@@ -610,6 +649,10 @@ export const useLibraryStore = create<LibraryState>()((set, get) => {
             set({ facets: answer.facets });
           }
         } catch (e) {
+          // The library is still opening: nothing failed. The dropdowns keep
+          // what they have, and the first page after the open carries a new
+          // revision, which asks for the facets again.
+          if (e instanceof LibraryOpeningError) return;
           logError('library', `facets failed: ${e instanceof Error ? e.message : String(e)}`);
         } finally {
           facetsInFlight.delete(key);
@@ -701,6 +744,8 @@ export const useLibraryStore = create<LibraryState>()((set, get) => {
         paged: true,
         pagesLoading: 0,
         pageError: null,
+        libraryOpening: false,
+        searchIndex: null,
         loaded: false,
         loading: false,
         lookupVersion: 0,

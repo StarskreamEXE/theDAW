@@ -1386,6 +1386,10 @@ def _checkout_state() -> dict[str, tuple[int, int]]:
 #: compares data/ and before its patches are undone: a warmer that outlived
 #: the test opened the store at the checkout's data/generations.
 _STARTUP_WRITERS = (
+    # The library opens off the startup (library.router.start_opening); one
+    # that outlived the test would publish its store after the fixture's
+    # patches were undone.
+    "library-open",
     "plugin-bundled",
     "underfit-update-check",
     "lineagescale-warm",

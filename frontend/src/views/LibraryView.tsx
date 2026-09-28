@@ -27,9 +27,13 @@ import { MicRecorder } from '../components/audio/MicRecorder';
 import { Section } from '../components/ui/Section';
 import { useLibraryStore, LibraryIdCapError, type LibraryEntry } from '../state/libraryStore';
 import { LibraryStatsStrip } from '../components/library/LibraryStatsStrip';
+import { LibraryIndexProgress } from '../components/library/LibraryIndexProgress';
+import { useLibraryIndexStatus } from '../state/libraryIndexStatusStore';
+import { libraryOpeningText } from '../lib/libraryIndexStatus';
 import {
   describeBulkConflict,
   LibraryBulkConflictError,
+  LibrarySearchIndexBuildingError,
   fetchLibraryMatchCount,
   plainLibraryQuery,
 } from '../lib/backendLocalProvider';
@@ -912,6 +916,8 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
   const total = useLibraryStore((s) => s.total);
   const pagesLoading = useLibraryStore((s) => s.pagesLoading);
   const pageError = useLibraryStore((s) => s.pageError);
+  const libraryOpening = useLibraryStore((s) => s.libraryOpening);
+  const indexStatus = useLibraryIndexStatus((s) => s.status);
   const entryAt = useLibraryStore((s) => s.entryAt);
   const ensureRange = useLibraryStore((s) => s.ensureRange);
   const getById = useLibraryStore((s) => s.getById);
@@ -1115,7 +1121,9 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
     setSelectedEntry(id);
     setPinnedEntry(null);
     try {
-      const ids = await useLibraryStore.getState().listFilteredIds();
+      // The list's own matches: during a search index build that is the part
+      // of the library the list shows, which is where the row can be scrolled.
+      const ids = await useLibraryStore.getState().listFilteredIds({ partial: true });
       const at = ids.indexOf(id);
       if (at >= 0) {
         setSelectionNotice(null);
@@ -1170,7 +1178,7 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
       // comes from the server's id list, never from the rows on screen.
       void (async () => {
         try {
-          const ids = await useLibraryStore.getState().listFilteredIds();
+          const ids = await useLibraryStore.getState().listFilteredIds({ partial: true });
           const anchorIndex = ids.indexOf(selectionAnchorId);
           const targetIndex = ids.indexOf(entry.id);
           if (anchorIndex < 0 || targetIndex < 0) {
@@ -1493,7 +1501,9 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
     // re-resolves each id as it reaches it, so a track whose page was evicted
     // an hour into the set still plays.
     try {
-      const ids = await useLibraryStore.getState().listFilteredIds();
+      // partial: while the search index builds, the queue is the matches the
+      // list shows (it says how much of the library that is).
+      const ids = await useLibraryStore.getState().listFilteredIds({ partial: true });
       const at = ids.indexOf(entry.id);
       if (at >= 0) {
         setSelectionNotice(null);
@@ -1666,6 +1676,10 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
       {/* Top stats strip — compact "features" version of the old
           LIBRARY ANALYSIS section. */}
       <LibraryStatsStrip total={total} searchQuery={searchQuery} loadedRows={entries.length} />
+
+      {/* The backend opening the library: schema upgrade, first read, search
+          index build. Hidden once the library is ready. */}
+      <LibraryIndexProgress />
 
       {/* Stems running banner. Shows live phase + progress + an Abort
           button so the user can bail without right-click-finding the
@@ -1947,7 +1961,7 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
                 setSelectionNotice(null);
               } catch (e) {
                 setSelectionNotice(
-                  e instanceof LibraryIdCapError
+                  e instanceof LibraryIdCapError || e instanceof LibrarySearchIndexBuildingError
                     ? e.message
                     : `Select-all failed: ${e instanceof Error ? e.message : String(e)}`,
                 );
@@ -2148,7 +2162,9 @@ export const LibraryView: React.FC<{ onSwitchTab?: (tab: string) => void; onExpa
           {total === 0 && pagesLoading === 0 && !pageError ? (
             <div className="py-8 flex flex-col items-center justify-center opacity-30 italic gap-2">
               <Database className="w-8 h-8" />
-              {searchQuery.trim() || onlyFavorites ? (
+              {libraryOpening ? (
+                <p className="text-xs font-bold not-italic">{libraryOpeningText(indexStatus)}</p>
+              ) : searchQuery.trim() || onlyFavorites ? (
                 <p>No entries match your filter.</p>
               ) : (
                 <>

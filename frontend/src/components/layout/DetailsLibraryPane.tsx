@@ -51,6 +51,9 @@ import { pagedIndexOf } from '../../lib/pagedIndexOf';
 import { setAudioDragData } from '../../lib/audioDnD';
 import { sendAudioToEditor, sendAudioToInit, type SendableAudio } from '../../lib/sendToTargets';
 import { LIBRARY_PAGE_SIZE, useLibraryStore, type LibraryEntry } from '../../state/libraryStore';
+import { LibraryIndexProgress } from '../library/LibraryIndexProgress';
+import { useLibraryIndexStatus } from '../../state/libraryIndexStatusStore';
+import { libraryOpeningText } from '../../lib/libraryIndexStatus';
 import { usePlayerStore } from '../../state/playerStore';
 import { useStatusBarStore } from '../../state/statusBarStore';
 import { logError, logInfo, logWarn } from '../../state/logStore';
@@ -201,6 +204,8 @@ export const DetailsLibraryPane: React.FC = () => {
   const entryAt = useLibraryStore((s) => s.entryAt);
   const ensureRange = useLibraryStore((s) => s.ensureRange);
   const loaded = useLibraryStore((s) => s.loaded);
+  const libraryOpening = useLibraryStore((s) => s.libraryOpening);
+  const indexStatus = useLibraryIndexStatus((s) => s.status);
   const loading = useLibraryStore((s) => s.loading);
   const pageError = useLibraryStore((s) => s.pageError);
   const sortBy = useLibraryStore((s) => s.sortBy);
@@ -356,6 +361,7 @@ export const DetailsLibraryPane: React.FC = () => {
 
   const emptyMessage = (): string => {
     if (pageError) return `The library could not be read: ${pageError}`;
+    if (libraryOpening) return libraryOpeningText(indexStatus);
     if (!loaded) return loading ? 'Loading the library…' : 'Waiting for the backend…';
     if (searchQuery.trim()) return `No track matches “${searchQuery.trim()}”.`;
     return 'The library is empty — drop audio files here, or click IMPORT.';
@@ -446,6 +452,12 @@ export const DetailsLibraryPane: React.FC = () => {
         </div>
       </div>
 
+      {/* The backend opening the library (upgrade, first read, search index
+          build); hidden once it is ready. */}
+      <div className="px-2 pt-1.5 empty:hidden">
+        <LibraryIndexProgress />
+      </div>
+
       {/* Filter + sort. Both are the LIBRARY's own and the backend applies
           them, which is what lets this column scroll past the rows in hand —
           so choosing either here reorders/narrows the LIBRARY list too. */}
@@ -497,7 +509,7 @@ export const DetailsLibraryPane: React.FC = () => {
             ) : (
               <Library className="w-6 h-6" aria-hidden="true" />
             )}
-            <p className="text-[10px] font-mono uppercase tracking-widest">{emptyMessage()}</p>
+            <p className="text-xs font-bold font-sans not-italic">{emptyMessage()}</p>
           </div>
         ) : (
           <List

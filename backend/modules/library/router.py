@@ -9,6 +9,9 @@ Endpoints (prefix from module.json → `/api/library`):
     GET    /entries/facets     value counts per field, for the filter dropdowns
     GET    /entries/stats      favourites / size / duration totals of a query
     GET    /entries/resolve    the audio entry a LOOM reference names
+    GET    /index-status       how far opening the library has got (progress bar)
+    POST   /retry-open         open the library again after a failed open, or
+                               restart a search index build that stopped
     POST   /entries/bulk-delete  delete many entries by id, or by filter
     GET    /entries/{id}       single entry record
     GET    /audio/{id}         stream the audio file
@@ -41,6 +44,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any, Optional
@@ -70,6 +74,8 @@ from .db import (
     SORTS,
     EntryFilters,
     LibraryDB,
+    LibraryProgress,
+    SearchIndexFailed,
     _chunks,
     _MAX_SQL_PARAMS,
     derived_provider_wire,
@@ -145,15 +151,209 @@ MAX_SYNC_IMPORT_ENTRIES = 200
 
 _store: Optional[LibraryStore] = None
 
+#: The name of the thread that opens the library.
+LIBRARY_OPEN_THREAD = "library-open"
+
+#: How long a list, search or stats route waits for the library to finish
+#: opening before it answers 503 with the progress instead. A small library
+#: opens well inside it, so its first request just answers; a large one being
+#: upgraded frees the request thread and the LIBRARY tab shows the progress
+#: bar.
+OPEN_WAIT_SEC = 1.5
+
+#: How long a failed open stays failed before a caller that needs the store
+#: (:func:`get_store`, :func:`store_or_opening`) starts another one. The
+#: LIBRARY tab's Retry button (``POST /retry-open``) starts one at once. The
+#: progress poll never starts one: a poll that retried would show a fresh
+#: ``opening`` every second and never the failure, and each attempt that
+#: failed part way would leave its database behind.
+OPEN_RETRY_AFTER_SEC = 30.0
+
+
+class LibraryOpening(Exception):
+    """The library is still opening (schema upgrade under way); carries the
+    progress snapshot a 503 answers with."""
+
+    def __init__(self, status: dict[str, Any]) -> None:
+        super().__init__(status.get("label") or "the library is opening")
+        self.status = status
+
+
+class _OpenAttempt:
+    """One open of the library at ``root``, run on :data:`LIBRARY_OPEN_THREAD`."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.progress = LibraryProgress()
+        self.done = threading.Event()
+        self.store: Optional[LibraryStore] = None
+        self.error: Optional[BaseException] = None
+        #: ``time.monotonic()`` when the open failed; None until it does.
+        self.failed_at: Optional[float] = None
+
+
+_open_lock = threading.Lock()
+_opening: Optional[_OpenAttempt] = None
+
+
+def _run_open(attempt: _OpenAttempt) -> None:
+    """Open the store and publish it.
+
+    The schema upgrade (seconds to minutes on a 200,000-entry library from
+    main's schema 6) and a first start's read of every ``metadata.json``
+    (:meth:`~.store.LibraryStore.read_disk_into_db`) run here, on a thread of
+    their own, so the backend's startup and ``/api/health`` never wait for
+    them. Each migration step commits with its version bump, and the read is
+    flagged until its last batch, so a close part way through either resumes
+    on the next start. The store is published only once the database mirrors
+    the disk: a half-read library would answer 404 for entries that exist.
+    The search index build then runs on a thread of its own
+    (:meth:`~.db.LibraryDB._ensure_search`) while the store answers.
+    """
+    global _store
+    try:
+        store = LibraryStore(
+            attempt.root,
+            build_search_in_background=True,
+            progress=attempt.progress,
+        )
+    except BaseException as e:
+        # LibraryStore closes its database when it raises after opening it,
+        # so a failed attempt holds no connection and runs no build thread.
+        attempt.error = e
+        attempt.failed_at = time.monotonic()
+        attempt.progress.fail(str(e) or type(e).__name__)
+        log.exception("library: opening %s failed", attempt.root)
+        attempt.done.set()
+        return
+    with _open_lock:
+        current = _opening is attempt
+        if current:
+            _store = store
+    attempt.store = store
+    attempt.progress.mark_opened()
+    attempt.done.set()
+    if not current and store.db is not None:
+        # Replaced while it opened (the library folder moved): nobody reads
+        # this store, and its build must not keep the file open.
+        store.db.close()
+
+
+def start_opening(*, retry: bool = False) -> _OpenAttempt:
+    """Start opening the library on :data:`LIBRARY_OPEN_THREAD`, or return
+    the attempt already running. A finished attempt is reused while its store
+    is the published one and the library folder is still the same. A failed
+    one is returned as it is (so its failure stays visible) until
+    :data:`OPEN_RETRY_AFTER_SEC` has passed, or at once when ``retry`` asks
+    for a new attempt (the Retry button)."""
+    global _opening
+    root = default_library_root()
+    with _open_lock:
+        attempt = _opening
+        if attempt is not None and attempt.root == root:
+            if not attempt.done.is_set():
+                return attempt
+            if attempt.error is None and _store is not None and _store is attempt.store:
+                return attempt
+            if (
+                attempt.error is not None
+                and not retry
+                and attempt.failed_at is not None
+                and time.monotonic() - attempt.failed_at < OPEN_RETRY_AFTER_SEC
+            ):
+                return attempt
+        attempt = _OpenAttempt(root)
+        _opening = attempt
+    threading.Thread(
+        target=_run_open, args=(attempt,), name=LIBRARY_OPEN_THREAD, daemon=True
+    ).start()
+    return attempt
+
+
+def _on_event_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
 
 def get_store() -> LibraryStore:
-    """The process's library. The backend's startup opens it on the event
-    loop, so a search index that needs building is built in the background
-    (:meth:`~.db.LibraryDB._ensure_search`) and the startup returns at once."""
-    global _store
-    if _store is None:
-        _store = LibraryStore(default_library_root(), build_search_in_background=True)
-    return _store
+    """The process's library, waiting for it to open when it has not yet.
+
+    The backend's startup only starts the open (:func:`start_opening`); the
+    first caller that needs the store waits for the schema upgrade on the
+    thread it already runs on. The list-shaped routes wait at most
+    :data:`OPEN_WAIT_SEC` instead (:func:`store_or_opening`). Async callers
+    reach this through ``asyncio.to_thread``; one that calls it on the event
+    loop while the library opens is logged, and waits, because failing it
+    could drop a generated take's library record."""
+    store = _store
+    if store is not None:
+        return store
+    attempt = start_opening()
+    if not attempt.done.is_set() and _on_event_loop():
+        log.warning(
+            "library: get_store() waited for the library to open ON the event "
+            "loop; call it through asyncio.to_thread",
+            stack_info=True,
+        )
+    attempt.done.wait()
+    if attempt.error is not None:
+        raise RuntimeError(
+            f"the library could not be opened: {attempt.error}"
+        ) from attempt.error
+    published = _store
+    if published is not None:
+        return published
+    assert attempt.store is not None
+    return attempt.store
+
+
+def store_or_opening(wait: Optional[float] = None) -> LibraryStore:
+    """The store, or :class:`LibraryOpening` after at most ``wait`` seconds
+    (default :data:`OPEN_WAIT_SEC`, read at call time) of the schema upgrade:
+    what a route answers the LIBRARY tab with instead of holding a request
+    thread for the whole upgrade."""
+    store = _store
+    if store is not None:
+        return store
+    attempt = start_opening()
+    if not attempt.done.wait(timeout=OPEN_WAIT_SEC if wait is None else wait):
+        raise LibraryOpening(library_status())
+    if attempt.error is not None:
+        # Answered like the upgrade: 503 with ``phase: failed`` and the reason,
+        # which the LIBRARY tab shows with its Retry button.
+        raise LibraryOpening(attempt.progress.snapshot())
+    return get_store()
+
+
+def library_status() -> dict[str, Any]:
+    """Where opening the library has got (``LibraryProgress.snapshot``).
+    Takes no database lock and reads no row: it answers while the upgrade
+    holds the file."""
+    store = _store
+    if store is not None and store.db is not None:
+        return store.db.progress.snapshot()
+    attempt = _opening
+    if attempt is None:
+        return LibraryProgress().snapshot()
+    return attempt.progress.snapshot()
+
+
+def _opening_response(exc: LibraryOpening) -> JSONResponse:
+    label = exc.status.get("label") or "The library is opening"
+    if exc.status.get("phase") == "failed":
+        detail = f"{label}: {exc.status.get('error') or 'unknown error'}"
+        retry_after = str(int(OPEN_RETRY_AFTER_SEC))
+    else:
+        detail = f"{label}; the library answers when it finishes"
+        retry_after = "2"
+    return JSONResponse(
+        status_code=503,
+        content={"detail": detail, "library_status": exc.status},
+        headers={"Retry-After": retry_after},
+    )
 
 
 router = APIRouter()
@@ -487,7 +687,7 @@ def list_entries(
     favorite: Optional[bool] = None,
     source: Optional[str] = None,
     provider: Optional[str] = None,
-) -> dict[str, Any]:
+) -> Any:
     """The library list, in two shapes.
 
     With NONE of ``limit`` / ``offset`` / ``q`` / ``sort`` / ``favorite`` /
@@ -506,6 +706,12 @@ def list_entries(
     library revision the page was read at, so a client can drop a stale
     response). Long ``lyrics`` are replaced by ``lyrics_preview`` +
     ``has_lyrics``; the full text stays on ``GET /entries/{id}``.
+
+    A search (``q``) adds ``search_index`` (:meth:`~.db.LibraryDB.search_status`):
+    while the index is still being built the page covers the entries indexed
+    so far and says how many that is, and the answer never waits for the rest.
+    While the library is still opening (a schema upgrade) the route answers
+    503 with ``library_status`` after at most :data:`OPEN_WAIT_SEC`.
     """
     # Default 'audio' preserves the historical behavior: the tracks/stems/
     # midi library never sees video/image entries. The VIDEO tab requests
@@ -513,7 +719,10 @@ def list_entries(
     _validate_listing(kind, sort, offset)
     if limit is not None and not (1 <= limit <= MAX_PAGE_LIMIT):
         raise HTTPException(400, f"limit must be 1..{MAX_PAGE_LIMIT}, got {limit}")
-    store = get_store()
+    try:
+        store = store_or_opening()
+    except LibraryOpening as e:
+        return _opening_response(e)
 
     paged = (
         any(v is not None for v in (limit, q, sort, favorite, source, provider))
@@ -536,12 +745,16 @@ def list_entries(
         raise HTTPException(503, "library DB not available")
     page_limit = limit if limit is not None else DEFAULT_PAGE_LIMIT
     filters = _entry_filters(kind, q, favorite, source, provider)
-    entries = [
-        r.to_dict()
-        for r in store.list_entries_page(
-            filters, sort=sort or DEFAULT_SORT, limit=page_limit, offset=offset
-        )
-    ]
+    try:
+        entries = [
+            r.to_dict()
+            for r in store.list_entries_page(
+                filters, sort=sort or DEFAULT_SORT, limit=page_limit, offset=offset
+            )
+        ]
+        total = store.db.count_entries_filtered(filters)
+    except SearchIndexFailed as e:
+        raise HTTPException(503, str(e)) from e
     ids = [str(e["id"]) for e in entries]
     _attach_play_counts(store, entries, ids=ids)
     # A provider-filtered page is labeled exactly as SQL filed it, and nothing
@@ -550,15 +763,56 @@ def list_entries(
     _attach_analysis(store, entries, ids=ids, derive_provider=provider is None)
     for entry in entries:
         _trim_lyrics(entry)
-    return {
+    body: dict[str, Any] = {
         "entries": entries,
         "count": len(entries),
-        "total": store.db.count_entries_filtered(filters),
+        "total": total,
         "offset": offset,
         "limit": page_limit,
         "revision": store.db.library_revision(),
         "kind": kind,
     }
+    if q is not None:
+        body["search_index"] = store.db.search_status()
+    return body
+
+
+def _partial_search_refusal(
+    store: LibraryStore, q: Optional[str], what: str
+) -> Optional[JSONResponse]:
+    """The answer to an action on every match of ``q`` (select every match,
+    delete every match) while the search index does not cover the library,
+    or None when it may go ahead.
+
+    409 while the index is still being built: a search then covers only the
+    entries indexed so far, which is fine to look at and wrong to act on. 503
+    when the build stopped: nothing finishes it until it is restarted
+    (``POST /retry-open``) or theDAW starts again. Both bodies carry
+    ``search_index``, which is how a client tells this 409 from bulk delete's
+    count conflict (``total_matched``)."""
+    if store.db is None or q is None or not q.strip():
+        return None
+    status = store.db.search_status()
+    if status.get("complete"):
+        return None
+    if status.get("failed"):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": f"the library search index build stopped "
+                f"({status.get('error')}); {what} after it is restarted",
+                "search_index": status,
+            },
+        )
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": f"the search index is still being built "
+            f"({status.get('indexed', 0):,} of {status.get('total', 0):,} "
+            f"entries); {what} when it finishes",
+            "search_index": status,
+        },
+    )
 
 
 @router.get("/entries/ids")
@@ -569,31 +823,52 @@ def list_entry_ids(
     favorite: Optional[bool] = None,
     source: Optional[str] = None,
     provider: Optional[str] = None,
-) -> dict[str, Any]:
+    partial: bool = False,
+) -> Any:
     """Every id matching the filters, in the same order the paged list uses.
 
     This is what select-all and shift-click ranges need: the client holds the
     ids, not the rows. Declared BEFORE ``/entries/{entry_id}`` so the literal
     path is not swallowed by the id parameter. Refuses (413) above
     ``MAX_SELECTABLE_IDS`` rather than streaming an unbounded list.
+
+    While the search index is still being built a search matches the entries
+    indexed so far. Select-all acts on every match, so by default a search
+    then answers 409. ``partial=true`` is for the callers that follow the
+    list on screen (play the list, a shift-click range, revealing a track):
+    they get the ids the list shows, and a searched answer carries
+    ``search_index`` saying how much of the library that is.
     """
     _validate_listing(kind, sort, 0)
-    store = get_store()
+    try:
+        store = store_or_opening()
+    except LibraryOpening as e:
+        return _opening_response(e)
     if store.db is None:
         raise HTTPException(503, "library DB not available")
+    if not partial:
+        refusal = _partial_search_refusal(store, q, "select every match")
+        if refusal is not None:
+            return refusal
     filters = _entry_filters(kind, q, favorite, source, provider)
     # One row past the cap comes back when there are more, so no second COUNT
     # is needed to tell "at the limit" from "over it".
-    ids = store.db.list_entry_ids(
-        filters, MAX_SELECTABLE_IDS, sort=sort or DEFAULT_SORT
-    )
+    try:
+        ids = store.db.list_entry_ids(
+            filters, MAX_SELECTABLE_IDS, sort=sort or DEFAULT_SORT
+        )
+    except SearchIndexFailed as e:
+        raise HTTPException(503, str(e)) from e
     if len(ids) > MAX_SELECTABLE_IDS:
         raise HTTPException(
             413,
             f"more than {MAX_SELECTABLE_IDS} entries match; narrow the filters "
             "or the search before selecting them all",
         )
-    return {"ids": ids, "total": len(ids)}
+    body: dict[str, Any] = {"ids": ids, "total": len(ids)}
+    if q is not None:
+        body["search_index"] = store.db.search_status()
+    return body
 
 
 @router.get("/entries/facets")
@@ -604,7 +879,7 @@ def entry_facets(
     favorite: Optional[bool] = None,
     source: Optional[str] = None,
     provider: Optional[str] = None,
-) -> dict[str, Any]:
+) -> Any:
     """Value counts for the filter dropdowns, over the WHOLE filtered library.
 
     ``fields`` is required and comma-separated; every value must be one of
@@ -634,14 +909,24 @@ def entry_facets(
         raise HTTPException(
             400, f"fields must be among {list(FACET_FIELDS)}, got {unknown}"
         )
-    store = get_store()
+    try:
+        store = store_or_opening()
+    except LibraryOpening as e:
+        return _opening_response(e)
     if store.db is None:
         raise HTTPException(503, "library DB not available")
     filters = _entry_filters(kind, q, favorite, source, provider)
-    return {
-        "facets": store.db.facet_counts(filters, requested),
+    try:
+        facets = store.db.facet_counts(filters, requested)
+    except SearchIndexFailed as e:
+        raise HTTPException(503, str(e)) from e
+    body: dict[str, Any] = {
+        "facets": facets,
         "revision": store.db.library_revision(),
     }
+    if q is not None:
+        body["search_index"] = store.db.search_status()
+    return body
 
 
 @router.get("/entries/stats")
@@ -651,7 +936,7 @@ def entry_stats(
     favorite: Optional[bool] = None,
     source: Optional[str] = None,
     provider: Optional[str] = None,
-) -> dict[str, Any]:
+) -> Any:
     """Totals over the WHOLE filtered library: ``count``, ``favorites``,
     ``size_bytes`` and ``duration_sec``, for the chips above the library list.
 
@@ -663,26 +948,40 @@ def entry_stats(
     is not swallowed by the id parameter.
     """
     _validate_listing(kind, None, 0)
-    store = get_store()
+    try:
+        store = store_or_opening()
+    except LibraryOpening as e:
+        return _opening_response(e)
     if store.db is None:
         raise HTTPException(503, "library DB not available")
     filters = _entry_filters(kind, q, favorite, source, provider)
-    return {
-        **store.db.entry_stats(filters),
-        "revision": store.db.library_revision(),
-    }
+    try:
+        stats = store.db.entry_stats(filters)
+    except SearchIndexFailed as e:
+        raise HTTPException(503, str(e)) from e
+    body: dict[str, Any] = {**stats, "revision": store.db.library_revision()}
+    if q is not None:
+        body["search_index"] = store.db.search_status()
+    return body
 
 
 @router.get("/entries/resolve")
 def resolve_entry_ref(
     ref: str = Query(..., min_length=1, max_length=512),
-) -> dict[str, Any]:
+) -> Any:
     """The audio entry a LOOM score or template names by ``ref`` -- an id, an
     id prefix, or a title fragment -- over the whole library. Answers
     ``{"id": ...}``, with ``null`` when nothing matches. See
     :meth:`~.db.LibraryDB.resolve_entry_ref` for the order of preference.
-    Declared BEFORE ``/entries/{entry_id}``."""
-    store = get_store()
+    Declared BEFORE ``/entries/{entry_id}``.
+
+    A search like the list: while the library is still opening it answers
+    503 with ``library_status`` after at most :data:`OPEN_WAIT_SEC`, and the
+    LOOM asks again once the library has opened."""
+    try:
+        store = store_or_opening()
+    except LibraryOpening as e:
+        return _opening_response(e)
     if store.db is None:
         raise HTTPException(503, "library DB not available")
     return {"id": store.db.resolve_entry_ref(ref)}
@@ -732,7 +1031,10 @@ def bulk_delete_entries(req: BulkDeleteRequest) -> Any:
     """
     if (req.ids is None) == (req.filter is None):
         raise HTTPException(400, "send exactly one of 'ids' or 'filter'")
-    store = get_store()
+    try:
+        store = store_or_opening()
+    except LibraryOpening as e:
+        return _opening_response(e)
     if store.db is None:
         raise HTTPException(503, "library DB not available")
 
@@ -766,6 +1068,9 @@ def bulk_delete_entries(req: BulkDeleteRequest) -> Any:
                 "an empty filter matches the whole library; resend with "
                 '"all": true to confirm that is what you mean',
             )
+        refusal = _partial_search_refusal(store, spec.q, "delete every match")
+        if refusal is not None:
+            return refusal
         filters = _entry_filters(spec.kind or "all", spec.q, spec.favorite, spec.source)
         # Read the matching ids FIRST, capped at what the client confirmed.
         # ``list_entry_ids`` answers at most ``confirm_total + 1`` of them, so
@@ -1160,7 +1465,7 @@ async def set_audio_cover(
     30MB PNG. 404 when the entry is unknown, 422 when nothing usable came
     back (no embedded picture, or an image we refused).
     """
-    store = get_store()
+    store = await asyncio.to_thread(get_store)
     entry = store.get_entry(entry_id)
     if entry is None:
         raise HTTPException(404, f"Entry {entry_id!r} not found")
@@ -1346,8 +1651,9 @@ async def import_media(
     if not media_bytes:
         raise HTTPException(400, "empty file")
 
+    store = await asyncio.to_thread(get_store)
     try:
-        record = get_store().import_media(
+        record = store.import_media(
             media_bytes=media_bytes,
             filename=file.filename or "import.bin",
             mime_type=file.content_type or "",
@@ -1854,12 +2160,57 @@ def delete_entry(entry_id: str) -> dict[str, Any]:
     return {"deleted": entry_id}
 
 
+@router.get("/index-status")
+async def library_index_status() -> dict[str, Any]:
+    """Where opening the library has got, for the LIBRARY tab's progress bar:
+    ``{phase, label, done, total, items, eta_sec, opened, error}``.
+
+    ``phase`` is ``upgrade`` (schema migration statements), ``read`` (the
+    top-level folders of a first start's read of every ``metadata.json``;
+    ``items`` counts the entries found), ``index`` (entries in the search
+    index), ``opening``, ``ready`` or ``failed``. Answers from memory at once,
+    whatever holds the database: it never takes the write lock.
+
+    It starts the open only when no attempt exists for the library folder.
+    A failed open stays ``failed`` here until the Retry button
+    (``POST /retry-open``), or a caller that needs the store after
+    :data:`OPEN_RETRY_AFTER_SEC`, starts another. An ``async`` route, so it
+    runs on the event loop and answers even while every threadpool thread is
+    busy. Declared before the ``/{entry_id}/...`` routes so the literal path
+    is not swallowed by the entry-id parameter."""
+    if _store is None:
+        attempt = _opening
+        if attempt is None or attempt.root != default_library_root():
+            start_opening()
+    return library_status()
+
+
+@router.post("/retry-open", dependencies=[Depends(refuse_cross_site)])
+async def library_retry_open() -> dict[str, Any]:
+    """The Retry button of the LIBRARY tab's failure alert: open the library
+    again after a failed open, or restart a search index build that stopped
+    (from its last committed batch). Answers the new ``index-status``
+    snapshot once the work has started; the open and the build run on
+    threads of their own. The start itself (the library root lookup, the
+    build's first statements under the database lock) runs off the event
+    loop."""
+    store = _store
+    if store is None:
+        await asyncio.to_thread(start_opening, retry=True)
+    elif store.db is not None:
+        await asyncio.to_thread(store.db.restart_search_build)
+    return library_status()
+
+
 @router.get("/summary")
-def library_summary() -> dict[str, Any]:
+def library_summary() -> Any:
     """Category counts for the library tab strip, plus the DB revision they
     were read at. Declared before the ``/{entry_id}/...`` routes so a literal
     path can never be swallowed by the entry-id parameter."""
-    store = get_store()
+    try:
+        store = store_or_opening()
+    except LibraryOpening as e:
+        return _opening_response(e)
     if store.db is None:
         raise HTTPException(503, "library DB not available")
     return store.db.library_counts()
@@ -2576,7 +2927,8 @@ async def import_entry(
     if not audio_bytes:
         raise HTTPException(400, "empty file")
 
-    record = get_store().import_blob(
+    store = await asyncio.to_thread(get_store)
+    record = store.import_blob(
         audio_bytes=audio_bytes,
         filename=file.filename or "import.wav",
         mime_type=file.content_type or "audio/wav",

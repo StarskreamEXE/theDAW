@@ -22,6 +22,7 @@ import math
 import sqlite3
 import sys
 import threading
+import time
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from types import ModuleType
@@ -39,6 +40,7 @@ from backend.modules.library.db import (
     SEARCH_STATE_KEY,
     EntryFilters,
     LibraryDB,
+    SearchIndexFailed,
     short_grams,
 )
 from tests.test_library_store import _seed_generate_entry
@@ -506,9 +508,10 @@ def test_a_background_build_that_stops_fails_searches_until_the_next_open(
     tmp_path: Path, monkeypatch
 ):
     """A background build dies part way. The library still reads, a search
-    raises instead of answering from part of the library, and the next open
-    finishes the build from its cursor. A store closed while its build is
-    still running stops the build and leaves it to the next open too."""
+    raises instead of answering from part of the library with nothing left to
+    fill in the rest, and the next open finishes the build from its cursor. A
+    store closed while its build is still running stops the build and leaves
+    it to the next open too."""
     path = tmp_path / "library.db"
     db = LibraryDB(path)
     db.upsert_entries_bulk(
@@ -529,8 +532,12 @@ def test_a_background_build_that_stops_fails_searches_until_the_next_open(
 
     monkeypatch.setattr(LibraryDB, "_sync_search", dying_sync)
     db = LibraryDB(path, build_search_in_background=True)
-    with pytest.raises(RuntimeError, match="could not be built"):
+    # A search no longer waits for the build, so wait here for it to stop.
+    assert db._search_built.wait(timeout=60)
+    with pytest.raises(SearchIndexFailed, match="could not be built"):
         db.count_entries_filtered(EntryFilters(q="quartz"))
+    assert db.search_status()["complete"] is False
+    assert db.progress.snapshot()["phase"] == "failed"
     assert db.count_entries() == 4500
     db.close()
     monkeypatch.setattr(LibraryDB, "_sync_search", real_sync)
@@ -562,8 +569,10 @@ def test_the_backend_starts_while_the_index_of_mains_library_is_built(
     backend. The startup built the whole index on the event loop before the
     lifespan yielded, so /api/health and every other route waited for it: on
     200,000 rows, minutes of a boot screen. The startup now returns with the
-    build still to run; the library lists, a write lands, and a search waits
-    for the build and then finds every row, the written one included."""
+    build still to run; the library lists, a write lands, and a search answers
+    at once from what is indexed -- the written row -- and says the index is
+    incomplete, where it used to hold its thread until the build ended. Once
+    the build finishes the same search finds every row."""
     from backend.modules.library.db import SEARCH_BUILD_THREAD
 
     root = tmp_path / "app-generations"
@@ -606,19 +615,36 @@ def test_the_backend_starts_while_the_index_of_mains_library_is_built(
             db = library_router_module._store.db
             db.upsert_entry(_payload("z", title="Quartz Zircon"))
 
-            found: list[int] = []
-            search = threading.Thread(
-                target=lambda: found.append(
-                    db.count_entries_filtered(EntryFilters(q="quartz"))
-                )
+            began = time.perf_counter()
+            during = client.get(
+                "/api/library/entries", params={"limit": 5, "q": "quartz"}
             )
-            search.start()
-            search.join(timeout=1.0)
-            assert search.is_alive(), "a search answered from a partial index"
+            took = time.perf_counter() - began
+            assert during.status_code == 200
+            assert took < 1.0, f"a search during the build took {took:.2f} s"
+            body = during.json()
+            # Only the row the write indexed is in the index yet. (Its page
+            # row is hidden: it has no folder on disk, like every row here.)
+            assert body["total"] == 1
+            assert _found(db, "zircon") == {"z"}
+            assert body["search_index"]["complete"] is False
+            assert body["search_index"]["total"] == 2500
+            status = client.get("/api/library/index-status").json()
+            assert status["phase"] == "index"
+            assert status["total"] == 2500
+            # Acting on every match of a partial search is refused, not guessed.
+            refused = client.get("/api/library/entries/ids", params={"q": "quartz"})
+            assert refused.status_code == 409
 
             release.set()
-            search.join(timeout=60)
-            assert found == [2501]
+            assert db._search_built.wait(timeout=60)
+            assert db.count_entries_filtered(EntryFilters(q="quartz")) == 2501
+            finished = client.get(
+                "/api/library/entries", params={"limit": 5, "q": "quartz"}
+            ).json()
+            assert finished["total"] == 2501
+            assert finished["search_index"] == {"complete": True}
+            assert client.get("/api/library/index-status").json()["phase"] == "ready"
             assert _found(db, "zircon") == {"z"}
             assert _meta(db, SEARCH_STATE_KEY) is not None
             _assert_search_index_intact(db)
