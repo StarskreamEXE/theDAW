@@ -16,6 +16,7 @@ the warnings and assert there are none.
 
 from __future__ import annotations
 
+import asyncio
 import warnings
 from pathlib import Path
 
@@ -129,8 +130,9 @@ def _librosa_top_fft(sr: int, bins: int) -> int:
 
 # The rates callers decode at, and odd native rates the analyzer meets at the
 # file's own rate. 31.5 and 62 kHz are where a Q of 1 / (2**(1/b) - 1), a
-# little under librosa's, rounds to a power of two below librosa's FFT.
-_RATES = [11025, 15500, 15700, 16000, 22050, 31000, 31500, 44100, 48000, 62000]
+# little under librosa's, rounds to a power of two below librosa's FFT. 8 kHz
+# (telephone audio) is under C8's filters, so its plans stop at C7.
+_RATES = [8000, 11025, 15500, 15700, 16000, 22050, 31000, 31500, 44100, 48000, 62000]
 
 
 def _fft_warnings(path: Path, y: np.ndarray, sr: int, hop: int = 512) -> list[str]:
@@ -184,3 +186,76 @@ def test_silence_reports_no_key(tmp_path: Path) -> None:
     y = np.zeros(SR * 2, dtype=np.float32)
     result = key_mod.detect_key(path, y_sr=(y, SR))
     assert result == {"key": None, "scale": None, "confidence": None, "strength": None}
+
+
+# ── Audio sampled under C8's filters ────────────────────────────────────────
+# librosa refuses a CQT whose top filter reaches past Nyquist, and C8's does
+# below about 8.4 kHz (its cutoff is about 4.17 kHz at 36 bins per octave,
+# 4.12 kHz at 12). The plan counted its octaves down from C8 whatever the
+# rate, so at 8 kHz no candidate was accepted: the plan came out at 0 octaves
+# with a coverage of 0, and every 8 kHz file analysed at its own rate (the
+# analyzer's descriptors; detect_key handed y_sr) reported no key.
+
+_LOW_RATES = [4000, 6000, 8000]
+
+
+def _decoded(tmp_path: Path) -> Path:
+    """A placeholder path: detect_key reads the handed-in samples, not it."""
+    path = tmp_path / "x.wav"
+    path.write_bytes(b"")
+    return path
+
+
+@pytest.mark.parametrize("sr", _LOW_RATES)
+def test_audio_under_c8_reports_its_key(tmp_path: Path, sr: int) -> None:
+    """C major at the file's own low rate, handed in the way the chimera
+    analysis hands a decode in."""
+    result = key_mod.detect_key(_decoded(tmp_path), y_sr=(_progression(0, 4.0, sr), sr))
+    assert (result["key"], result["scale"]) == ("C", "major")
+    confidence = result["confidence"]
+    assert isinstance(confidence, float)
+    assert confidence > 0.5, "a 4 s clip is a full analysis, at full confidence"
+
+
+def test_an_8_khz_plan_stops_at_the_last_octave_under_nyquist() -> None:
+    import librosa
+
+    y = _progression(0, 4.0, 8000)
+    plan = key_mod.chroma_plan(y, 8000)
+    assert (plan.bins_per_octave, plan.n_octaves, plan.coverage) == (36, 6, 1.0)
+    assert plan.fmin == pytest.approx(librosa.note_to_hz("C1"))
+    # librosa accepts that range at 8 kHz: C1..C7 is under Nyquist.
+    chroma = librosa.feature.chroma_cqt(
+        y=y,
+        sr=8000,
+        fmin=plan.fmin,
+        n_octaves=plan.n_octaves,
+        bins_per_octave=plan.bins_per_octave,
+        tuning=plan.tuning,
+    )
+    assert chroma.shape[0] == 12
+
+
+def test_a_short_8_khz_clip_reports_its_key_at_a_lower_confidence(
+    tmp_path: Path,
+) -> None:
+    path = _decoded(tmp_path)
+    short = key_mod.detect_key(path, y_sr=(_progression(0, 1.0, 8000), 8000))
+    full = key_mod.detect_key(path, y_sr=(_progression(0, 4.0, 8000), 8000))
+    assert (short["key"], short["scale"]) == ("C", "major")
+    short_conf, full_conf = short["confidence"], full["confidence"]
+    assert isinstance(short_conf, float) and isinstance(full_conf, float)
+    assert 0.0 < short_conf < full_conf, "a 1 s clip has heard less of the music"
+
+
+def test_the_analyzer_reports_the_key_of_an_8_khz_file(tmp_path: Path) -> None:
+    """The analyzer reads the file at its own rate (sf.read) and plans its
+    chroma there."""
+    from backend.modules.analyzer.descriptors import extract_descriptors
+
+    path = tmp_path / "c-major-8k.wav"
+    save_audio(path, _progression(0, 4.0, 8000)[None, :], 8000)
+    bundle = asyncio.run(extract_descriptors(path))
+    assert bundle["sample_rate"] == 8000
+    assert bundle["mid_level"]["key"] == "C major"
+    assert bundle["mid_level"]["key_confidence"] > 0.5

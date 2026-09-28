@@ -20,8 +20,10 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 # The chroma analysis range: librosa.feature.chroma_cqt's own default, seven
-# octaves C1..C8 at 36 bins per octave. A clip too short for that is analysed
-# with the plan ``chroma_plan`` fits to it.
+# octaves C1..C8 at 36 bins per octave. Audio sampled below about 8.4 kHz has
+# its Nyquist frequency under C8's filters, so there the range stops at the
+# last octave librosa accepts (C1..C7 at 8 kHz). A clip too short for that is
+# analysed with the plan ``chroma_plan`` fits to it.
 _FULL_BINS_PER_OCTAVE = 36
 # The short-clip resolution: one bin per semitone. Its filters are a third as
 # long, so a clip of 0.75 s already holds all seven octaves. On short clips of
@@ -116,6 +118,29 @@ def _octave_frames(
     return frames
 
 
+def _octaves_under_nyquist(sr: float, bins_per_octave: int, tuning: float) -> int:
+    """How many octaves up from C1, at most seven, librosa's CQT accepts at
+    ``sr``: the most whose top filter's cutoff (``wavelet_lengths``, at the
+    tuned bottom frequency) is at or below Nyquist. Seven from about 8.4 kHz;
+    six (C1..C7) at 8 kHz. 0 when not even one octave fits."""
+    import librosa
+
+    fmin = _C1_HZ * 2.0 ** (tuning / bins_per_octave)
+    nyquist = sr / 2.0
+    for octaves in range(_FULL_OCTAVES, 0, -1):
+        freqs = librosa.interval_frequencies(
+            n_bins=bins_per_octave * octaves,
+            fmin=fmin,
+            intervals="equal",
+            bins_per_octave=bins_per_octave,
+            sort=True,
+        )
+        _lengths, cutoff = librosa.filters.wavelet_lengths(freqs=freqs, sr=sr)
+        if cutoff <= nyquist:
+            return octaves
+    return 0
+
+
 def _fits(frames: Optional[list[_OctaveFrame]]) -> bool:
     """Whether every octave's FFT fits the signal it runs on (librosa.stft
     zero-pads a longer frame and warns)."""
@@ -157,12 +182,16 @@ class ChromaPlan:
 def chroma_plan(y, sr: float, hop_length: int = 512) -> ChromaPlan:
     """The chroma parameters that fit the mono clip ``y`` at ``sr``.
 
-    The full plan (36 bins per octave, C1..C8, librosa's default) whenever the
-    clip holds it, from about 3 s. A shorter clip gets one bin per semitone
-    over as many octaves, counted down from C8, as fit it. A plan fits when no
-    octave's FFT is longer than the signal that octave runs on, replayed with
-    librosa's own filter lengths (:func:`_octave_frames`) at the tuning the
-    transform will use and the hop the caller passes to chroma_cqt.
+    The full plan (36 bins per octave from C1, librosa's default) whenever the
+    clip holds it, from about 3 s. It covers the seven octaves C1..C8 from a
+    rate of about 8.4 kHz; below that it stops at the last octave whose top
+    filter is under Nyquist (:func:`_octaves_under_nyquist`; C1..C7 at 8 kHz),
+    since librosa refuses a range that reaches past it. A shorter clip gets
+    one bin per semitone over as many octaves as fit it, counted down from
+    that same top. A plan fits when no octave's FFT is longer than the signal
+    that octave runs on, replayed with librosa's own filter lengths
+    (:func:`_octave_frames`) at the tuning the transform will use and the hop
+    the caller passes to chroma_cqt.
 
     ``coverage`` is the clip's length over the length the full plan needs,
     capped at 1, and scales the reported confidence: a short clip has heard
@@ -170,27 +199,33 @@ def chroma_plan(y, sr: float, hop_length: int = 512) -> ChromaPlan:
     """
     n_samples = int(y.shape[-1])
     tuning = _tuning(y, sr, _FULL_BINS_PER_OCTAVE)
-    full = _octave_frames(
-        n_samples,
-        sr,
-        hop_length,
-        _FULL_BINS_PER_OCTAVE,
-        _FULL_OCTAVES,
-        _C1_HZ * 2.0 ** (tuning / _FULL_BINS_PER_OCTAVE),
+    top = _octaves_under_nyquist(sr, _FULL_BINS_PER_OCTAVE, tuning)
+    full = (
+        _octave_frames(
+            n_samples,
+            sr,
+            hop_length,
+            _FULL_BINS_PER_OCTAVE,
+            top,
+            _C1_HZ * 2.0 ** (tuning / _FULL_BINS_PER_OCTAVE),
+        )
+        if top
+        else None
     )
     if _fits(full):
-        return ChromaPlan(_FULL_BINS_PER_OCTAVE, _FULL_OCTAVES, _C1_HZ, tuning, 1.0)
+        return ChromaPlan(_FULL_BINS_PER_OCTAVE, top, _C1_HZ, tuning, 1.0)
     coverage = min(1.0, n_samples / _needed_length(full))
     bins = _SHORT_BINS_PER_OCTAVE
     tuning = _tuning(y, sr, bins)
-    for octaves in range(_FULL_OCTAVES, MIN_CHROMA_OCTAVES - 1, -1):
-        fmin = _C1_HZ * 2.0 ** (_FULL_OCTAVES - octaves)
+    top = _octaves_under_nyquist(sr, bins, tuning)
+    for octaves in range(top, MIN_CHROMA_OCTAVES - 1, -1):
+        fmin = _C1_HZ * 2.0 ** (top - octaves)
         frames = _octave_frames(
             n_samples, sr, hop_length, bins, octaves, fmin * 2.0 ** (tuning / bins)
         )
         if _fits(frames):
             return ChromaPlan(bins, octaves, fmin, tuning, coverage)
-    return ChromaPlan(bins, 0, _C1_HZ * 2.0**_FULL_OCTAVES, tuning, coverage)
+    return ChromaPlan(bins, 0, _C1_HZ * 2.0**top, tuning, coverage)
 
 
 # Krumhansl-Schmuckler key profiles. Index 0 = C.
@@ -281,7 +316,9 @@ def detect_key(
     at one bin per semitone over the octaves it fills (all seven from about
     0.75 s), and both numbers are scaled by the clip's share of the 3 s, so a
     short clip reports a low confidence. A clip too short for three octaves
-    (under about 46 ms at 22.05 kHz) reports no key.
+    (under about 46 ms at 22.05 kHz) reports no key. Audio handed in at a rate
+    under about 8.4 kHz (``y_sr`` at a file's own rate) is analysed up to the
+    last octave below its Nyquist frequency, C7 at 8 kHz.
 
     On failure (no librosa, unreadable file, silent input) returns
     ``{"key": None, "scale": None, "confidence": None, "strength": None}``.
