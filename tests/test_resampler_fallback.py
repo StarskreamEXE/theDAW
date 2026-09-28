@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import io
 import json
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -23,12 +22,12 @@ import soundfile as sf
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from backend.lib import ffmpeg, resampler
+from backend.lib import ffmpeg, ffmpeg_tools, resampler
 from backend.modules.delivery import router as delivery_router
 from backend.modules.enhance import router as enhance_router
 
 needs_ffmpeg = pytest.mark.skipif(
-    shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH"
+    ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found"
 )
 
 
@@ -135,9 +134,22 @@ def test_soxr_is_used_when_this_ffmpeg_has_it(monkeypatch):
 
 
 def test_soxr_probe_answers_false_without_ffmpeg(monkeypatch):
-    resampler.soxr_available.cache_clear()
-    monkeypatch.setattr(resampler.shutil, "which", lambda name: None)
-    try:
-        assert resampler.soxr_available() is False
-    finally:
-        resampler.soxr_available.cache_clear()
+    monkeypatch.setattr(
+        ffmpeg_tools, "resolve", lambda force=False: ffmpeg_tools.Resolution(build=None)
+    )
+    assert resampler.soxr_available() is False
+    assert resampler.hq_resampler(28) == resampler.swr_hq(28)
+
+
+def test_soxr_follows_the_build_the_backend_runs(monkeypatch):
+    """The first ffmpeg on PATH can lack libsoxr while the resolved build has
+    it; the resampler asks the resolved build."""
+    build = ffmpeg_tools.FFmpegBuild(
+        ffmpeg="/opt/full/ffmpeg", version="test", soxr=True, rubberband=True
+    )
+    monkeypatch.setattr(
+        ffmpeg_tools,
+        "resolve",
+        lambda force=False: ffmpeg_tools.Resolution(build=build),
+    )
+    assert resampler.hq_resampler(24) == "resampler=soxr:precision=24"

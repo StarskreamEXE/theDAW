@@ -499,6 +499,7 @@ TOOLS: list[ToolSpec] = [
         flagship=True,
         license="MIT (weights CC-BY-NC, OK free-use)",
         engine="soxr (swr HQ without libsoxr) + exciter (AudioSR later)",
+        prefers=("soxr",),
         handler=_super_res,
         description="Reconstruct missing highs; upscale low-rate audio to 48 kHz studio quality.",
         params=[
@@ -576,6 +577,7 @@ TOOLS: list[ToolSpec] = [
         viz="spectro",
         license="LGPL",
         engine="ffmpeg:soxr (swr HQ without libsoxr)",
+        prefers=("soxr",),
         handler=_upsample,
         description=(
             "Transparent libsoxr VHQ sample-rate conversion (the non-neural "

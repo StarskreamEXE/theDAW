@@ -48,7 +48,7 @@ from backend.lib.audio_io import load_audio, load_audio_array, save_audio, save_
 from backend.assistant_routes import mcp_relay_router
 from backend.assistant_routes import router as assistant_router
 from backend.modules.loader import load_modules
-from backend.lib import pairing, paths
+from backend.lib import ffmpeg_tools, pairing, paths
 from backend.lib.atomic import atomic_write
 from backend.lib.cross_site import refuse_cross_site, require_loopback_or_launch_token
 from backend.lib.launch_token import child_env
@@ -1161,6 +1161,14 @@ async def _on_startup():
     # server must come up independently of any checkpoint.
     threading.Thread(target=_warm_heavy, name="warm-heavy", daemon=True).start()
 
+    # Choose the FFmpeg build once, off the request path: every candidate is
+    # probed for libsoxr (backend.lib.ffmpeg_tools), which takes a few hundred
+    # ms per build. The choice and any missing libsoxr are logged, and
+    # GET /api/health reports them once this finishes.
+    threading.Thread(
+        target=ffmpeg_tools.resolve, name="ffmpeg-resolve", daemon=True
+    ).start()
+
     logger.info(
         "startup: server ready in %.2fs — generation models load on demand "
         "(default %r loads on first use)",
@@ -1566,6 +1574,10 @@ async def health():
         # (pyproject gates the wheel to win32) — the SDPA fallback is used.
         "flash_attention_installed": _flash_attn_installed(),
         "flash_attention_active": _flash_attn_active(),
+        # The FFmpeg build every tool runs, and whether it has libsoxr (the
+        # resampler Classical Upsample, Super-Res and High-Quality SRC need).
+        # Read from the cache the startup probe fills; never probes here.
+        "ffmpeg": ffmpeg_tools.status(),
     }
 
 

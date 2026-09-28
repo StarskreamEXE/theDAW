@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import soundfile as sf
+from backend.lib import ffmpeg_tools
 from backend.lib.launch_token import child_env
 
 if TYPE_CHECKING:
@@ -167,10 +168,10 @@ def _sf_hint(fmt: str | None) -> str | None:
 
 
 def _read_via_ffmpeg(src: Any, cause: Exception) -> tuple[np.ndarray, int]:
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = ffmpeg_tools.find_ffmpeg()
     if not ffmpeg:
         raise RuntimeError(
-            f"libsndfile could not open the audio ({cause}) and ffmpeg is not on PATH"
+            f"libsndfile could not open the audio ({cause}) and no ffmpeg was found"
         ) from cause
     tmp = Path(tempfile.mkdtemp(prefix="thedaw-audio-"))
     try:

@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import io
 import json
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +28,7 @@ from fastapi.testclient import TestClient
 from scipy.ndimage import uniform_filter1d
 from scipy.signal import butter, fftconvolve, sosfiltfilt
 
+from backend.lib import ffmpeg_tools
 from backend.modules.creative_neural import dsp as creative_dsp
 from backend.modules.creative_neural.router import router as creative_router
 from backend.modules.delivery import router as delivery_router
@@ -41,7 +41,7 @@ CREATIVE = "/api/edit/creative-neural"
 DELIVERY = "/api/edit/delivery"
 
 needs_ffmpeg = pytest.mark.skipif(
-    shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH"
+    ffmpeg_tools.find_ffmpeg() is None, reason="no ffmpeg found"
 )
 
 

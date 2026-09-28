@@ -617,6 +617,7 @@ TOOLS: list[ToolSpec] = [
         viz="delivery",
         license="LGPL",
         engine="ffmpeg:soxr VHQ (swr HQ without libsoxr)",
+        prefers=("soxr",),
         handler=_hq_src,
         description=(
             "Mastering-grade libsoxr sample-rate conversion for delivery "
