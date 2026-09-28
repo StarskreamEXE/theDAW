@@ -15,6 +15,8 @@ processes.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import shlex
 import subprocess
 import sys
@@ -114,6 +116,7 @@ def two_checkouts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(sidecar, "_wsl_distro", lambda: "Ubuntu")
     monkeypatch.setattr(sidecar, "_resolve_start_model", lambda: ("mrt2_small", None))
     monkeypatch.setattr(sidecar, "_ENGINE_STOP_GRACE_SEC", 0.0, raising=False)
+    monkeypatch.setattr(sidecar, "_PID_RECORD_WAIT_SEC", 0.0, raising=False)
     return {
         "ours": ours,
         "our_studio": our_studio,
@@ -195,6 +198,11 @@ def test_the_windows_spawn_records_the_engine_pid(
     assert f"echo $$ > {tmp}" in script
     assert f"mv -f {tmp} {final};" in script
     assert script.index(final) < script.index("exec ")
+    # A record that cannot be written says so in the sidecar log, with the
+    # shell's own error: nothing is sent to /dev/null.
+    assert "2>/dev/null" not in script
+    missing = shlex.quote("theDAW: could not record the engine pid in " + record)
+    assert f"|| echo {missing} >&2;" in script
 
 
 def test_a_reused_pid_is_not_signalled(
@@ -239,6 +247,243 @@ def test_a_listing_that_fails_signals_nothing(
     assert all("kill" not in c and "pkill" not in " ".join(c) for c in calls)
     assert stopped["reaped"] == []
     assert sidecar._PID_FILE.read_text(encoding="utf-8").strip() == "101"
+
+
+def test_our_engine_without_a_pid_record_still_stops(
+    two_checkouts: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The spawn could not write its record (a data folder on a network share
+    WSL cannot reach, or an engine started before the record existed). This
+    checkout's engine is still ours by its script path, and the other
+    checkout's engine is still left alone."""
+    monkeypatch.setattr(sidecar.sys, "platform", "win32")
+    c = two_checkouts
+    assert not sidecar._PID_FILE.exists()
+    procs = _ProcTable(
+        {
+            101: f"/home/u/mrt2/.venv/bin/python {_as_engine_sees(c['ours'])}",
+            202: f"/home/u/mrt2/.venv/bin/python {_as_engine_sees(c['theirs'])}",
+        }
+    )
+    monkeypatch.setattr(sidecar.subprocess, "run", procs.run)
+
+    stopped = sidecar.stop_engine()
+
+    assert procs.signalled == [101]
+    assert stopped["reaped"] == [101]
+    assert stopped["survivors"] == []
+    assert [e["pid"] for e in stopped["left_running"]] == [202]
+    assert stopped["listed"] is True
+
+
+def test_the_spawn_clears_an_old_record_and_reports_a_missing_one(
+    two_checkouts: dict, monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    """A record left by an earlier engine would read as the new engine's, so
+    the spawn removes it; when the new engine's bash never writes one, the
+    backend log says so."""
+    monkeypatch.setattr(sidecar.sys, "platform", "win32")
+    sidecar._PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    sidecar._PID_FILE.write_text("999\n", encoding="utf-8")
+    monkeypatch.setattr(sidecar.subprocess, "Popen", lambda *a, **k: _SpawnedEngine())
+    sidecar.start_engine()
+    assert not sidecar._PID_FILE.exists()
+
+    with caplog.at_level("WARNING", logger=sidecar.log.name):
+        found = sidecar._confirm_pid_record(_SpawnedEngine(), sidecar._PID_FILE, 0.0)
+    assert found is False
+    assert "did not record its pid" in caplog.text
+
+    caplog.clear()
+    sidecar._PID_FILE.write_text("101\n", encoding="utf-8")
+    with caplog.at_level("WARNING", logger=sidecar.log.name):
+        found = sidecar._confirm_pid_record(_SpawnedEngine(), sidecar._PID_FILE, 0.0)
+    assert found is True
+    assert caplog.text == ""
+
+
+class _Listening:
+    """socket.create_connection that finds a listener on ``ports`` only."""
+
+    def __init__(self, ports: set[int]) -> None:
+        self.ports = ports
+
+    def __call__(self, address, timeout=None):
+        if address[1] not in self.ports:
+            raise ConnectionRefusedError(address)
+        return contextlib.nullcontext()
+
+
+def test_stable_audio_will_not_load_beside_another_copys_engine(
+    two_checkouts: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another copy of theDAW has its engine on 8777. A Stable Audio load
+    stops this checkout's engines (there are none), finds that engine still
+    running, and is refused with the engine named: stacking the checkpoint load
+    on a resident engine is the commit-limit crash the pre-clear exists for."""
+    import socket
+
+    from fastapi import HTTPException
+
+    from backend import server
+
+    monkeypatch.setattr(sidecar.sys, "platform", "win32")
+    c = two_checkouts
+    theirs = f"/home/u/mrt2/.venv/bin/python {_as_engine_sees(c['theirs'])}"
+    procs = _ProcTable({1: "/init", 202: theirs})
+    monkeypatch.setattr(sidecar.subprocess, "run", procs.run)
+    monkeypatch.setattr(socket, "create_connection", _Listening({8777}))
+    loads: list[str] = []
+    monkeypatch.setattr(
+        server, "_get_or_load_generation_pipeline", lambda name: loads.append(name)
+    )
+
+    with pytest.raises(HTTPException) as refused:
+        asyncio.run(server.preload_model(model="small"))
+
+    assert refused.value.status_code == 409
+    detail = refused.value.detail
+    assert detail["state"] == "engine_elsewhere"
+    assert detail["engines"] == [{"pid": 202, "args": theirs, "owner": "other"}]
+    assert "pid 202" in detail["message"]
+    assert loads == [], "the checkpoint load never ran"
+    assert procs.signalled == [], "the other copy's engine was not touched"
+
+
+def test_stable_audio_loads_once_our_own_engine_has_stopped(
+    two_checkouts: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import socket
+
+    from backend import server
+
+    monkeypatch.setattr(sidecar.sys, "platform", "win32")
+    c = two_checkouts
+    procs = _ProcTable(
+        {101: f"/home/u/mrt2/.venv/bin/python {_as_engine_sees(c['ours'])}"}
+    )
+    monkeypatch.setattr(sidecar.subprocess, "run", procs.run)
+    monkeypatch.setattr(socket, "create_connection", _Listening({8777}))
+    monkeypatch.setattr(
+        server, "_get_or_load_generation_pipeline", lambda name: object()
+    )
+
+    result = asyncio.run(server.preload_model(model="small"))
+
+    assert result["loaded"] is True
+    assert procs.signalled == [101]
+
+
+@pytest.fixture
+def engine_router(two_checkouts: dict, monkeypatch: pytest.MonkeyPatch):
+    """The Magenta router with the engine unreachable and installed, a process
+    table holding the other checkout's engine, and no real spawn."""
+    from backend.modules.magenta import router
+
+    async def health():
+        return {"reachable": False, "protocol_ok": False, "available": False}
+
+    monkeypatch.setattr(sidecar.sys, "platform", "win32")
+    monkeypatch.setattr(sidecar, "health", health)
+    monkeypatch.setattr(sidecar, "setup_state", lambda refresh=False: {"ready": True})
+    spawned: list[list[str]] = []
+
+    def popen(cmd, *a, **k):
+        spawned.append(cmd)
+        return _SpawnedEngine()
+
+    monkeypatch.setattr(sidecar.subprocess, "Popen", popen)
+    monkeypatch.setattr(router, "_start_task", None)
+    monkeypatch.setattr(router, "_start_blocked", None, raising=False)
+    monkeypatch.setattr(router, "_start_failure", "", raising=False)
+    theirs = f"/home/u/mrt2/.venv/bin/python {_as_engine_sees(two_checkouts['theirs'])}"
+    procs = _ProcTable({1: "/init", 202: theirs})
+    monkeypatch.setattr(sidecar.subprocess, "run", procs.run)
+    return {"router": router, "procs": procs, "spawned": spawned}
+
+
+def test_the_engine_start_is_refused_beside_another_copys_engine(
+    engine_router,
+) -> None:
+    from fastapi import HTTPException
+
+    router = engine_router["router"]
+    with pytest.raises(HTTPException) as refused:
+        asyncio.run(router._start_engine(False))
+    assert refused.value.status_code == 409
+    assert refused.value.detail["state"] == "engine_elsewhere"
+    assert [e["pid"] for e in refused.value.detail["engines"]] == [202]
+    assert engine_router["spawned"] == []
+    assert router._start_task is None
+
+
+def test_a_start_that_meets_another_engine_says_why_in_the_status(
+    engine_router, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other engine appeared after the start was accepted: the queued
+    start stops ours, finds it, does not spawn, and /engine/status carries the
+    reason (and the engine) after the start task has ended."""
+    from backend import server
+
+    router = engine_router["router"]
+
+    async def no_offload():
+        return {}
+
+    monkeypatch.setattr(server, "offload_model", no_offload)
+
+    asyncio.run(router._start_engine_on_gpu_lane())
+    assert engine_router["spawned"] == []
+
+    status = asyncio.run(router.engine_status())
+    assert status["state"] == "not_running"
+    assert status["blocked"]["state"] == "engine_elsewhere"
+    assert [e["pid"] for e in status["blocked"]["engines"]] == [202]
+    assert "pid 202" in status["start_error"]
+
+
+def test_engine_stop_leaves_stable_audio_parked_beside_another_engine(
+    engine_router, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Switching back to Stable Audio stops this copy's engine. With another
+    copy's engine still on the GPU, SA3 is not moved back beside it, and the
+    reply names that engine for the client's card."""
+    from backend import server
+
+    router = engine_router["router"]
+    onloads: list[bool] = []
+
+    async def onload():
+        onloads.append(True)
+        return {"onloaded": 1}
+
+    monkeypatch.setattr(server, "onload_model", onload)
+
+    reply = asyncio.run(router.engine_stop())
+
+    assert onloads == []
+    assert [e["pid"] for e in reply["left_running"]] == [202]
+    assert "skipped" in reply["sa3"]
+    assert engine_router["procs"].signalled == []
+
+
+def test_stop_that_engine_stops_only_the_named_engine(engine_router) -> None:
+    """The card's confirmed "Stop that engine": the named pid is stopped; a
+    pid that runs no Magenta engine is refused and left alone."""
+    from fastapi import HTTPException
+
+    router = engine_router["router"]
+    procs = engine_router["procs"]
+    with pytest.raises(HTTPException) as refused:
+        asyncio.run(router.engine_stop_process(router.EngineProcessBody(pid=1)))
+    assert refused.value.status_code == 404
+    assert procs.signalled == []
+
+    result = asyncio.run(router.engine_stop_process(router.EngineProcessBody(pid=202)))
+    assert result["ok"] is True
+    assert result["stopped"] is True
+    assert procs.signalled == [202]
+    assert sorted(procs.table) == [1]
 
 
 _SLEEPER = "import time\ntime.sleep(120)\n"

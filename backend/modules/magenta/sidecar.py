@@ -93,11 +93,12 @@ async def health() -> dict:
 # The extended sidecar runs inside WSL2 (JAX needs the Linux CUDA stack). The
 # spawn mirrors the bundled MRT2-Studio.vbs launcher: same distro detection
 # (``.wsl_distro`` written by Setup, fallback Ubuntu), same venv, no console
-# window. ``stop_engine`` stops the engine THIS checkout started (by the pid
-# recorded in ``_PID_FILE``, checked against this checkout's script path before
-# any signal) and this checkout's own bundled Studio server, so two engines of
-# this app never contend for the GPU. An engine another checkout started runs
-# a different path and is left running.
+# window. ``stop_engine`` stops the engine THIS checkout started (found by this
+# checkout's script path as a whole argument, and by the pid recorded in
+# ``_PID_FILE``) and this checkout's own bundled Studio server. An engine
+# another checkout started runs a different path and is left running; the
+# callers that need the GPU refuse while one does (``elsewhere_detail``), and
+# the card that names it offers to stop it (``stop_engine_process``).
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _ENGINE_SCRIPT = _REPO_ROOT / "sidecars" / "magenta" / "server.py"
@@ -131,6 +132,10 @@ _PID_FILE = paths.data_path("magenta_engine.pid")
 _ANY_ENGINE_MARKERS = ("sidecars/magenta/server.py", "studio_server.py")
 # How long a stopped engine gets to exit on SIGTERM before SIGKILL.
 _ENGINE_STOP_GRACE_SEC = 5.0
+# How long the backend waits for a WSL spawn's pid record before it logs that
+# the record is missing (the bash writes it before starting the engine, so a
+# working spawn writes it within the WSL start-up time).
+_PID_RECORD_WAIT_SEC = 30.0
 # Where the vendored sidecar keeps model assets (``mrt models init`` /
 # ``mrt checkpoints download`` write here; the engine loads from here).
 _ASSETS_DIR = "~/Documents/Magenta/magenta-rt-v2"
@@ -288,7 +293,7 @@ def gpu_info() -> dict:
                         "vram_gb": round(props.total_memory / 2**30, 1),
                     }
                 )
-    except Exception:  # noqa: BLE001 - torch absent or CUDA broken: try smi
+    except Exception:  # torch absent or CUDA broken: try smi
         gpus = []
     if not gpus:
         try:
@@ -527,7 +532,7 @@ def launch_installer() -> dict:
         raise FileNotFoundError(
             f"The Magenta RT2 installer is missing from this checkout ({_INSTALLER})."
         )
-    proc = subprocess.Popen(  # noqa: S603 - fixed path, never request-supplied
+    proc = subprocess.Popen(  # a fixed path, never request-supplied
         ["cmd.exe", "/c", str(_INSTALLER)],
         cwd=str(_INSTALLER.parent),
         creationflags=subprocess.CREATE_NEW_CONSOLE,
@@ -800,18 +805,26 @@ def start_engine(shard: bool = False) -> dict:
             # The bash records its own pid, which ``exec`` hands on to the
             # engine, so ``stop_engine`` can signal exactly this process. The
             # record is written beside and renamed over, so a reader never sees
-            # half a pid. A record that cannot be written leaves the engine
-            # starting all the same.
+            # half a pid. A record that cannot be written (a data folder WSL
+            # cannot reach, such as a UNC path) leaves the engine starting all
+            # the same: the stop also knows this checkout's engine by its
+            # script path. The failure goes to the sidecar log with the shell's
+            # own error, and ``_confirm_pid_record`` reports it in this log.
             pid_path = _wsl_path(_PID_FILE)
             pid_file = shlex.quote(pid_path)
             pid_tmp = shlex.quote(pid_path + ".tmp")
             pid_dir = shlex.quote(_wsl_path(_PID_FILE.parent))
+            no_record = shlex.quote(
+                f"theDAW: could not record the engine pid in {pid_path}"
+            )
             bash_cmd = (
                 f"{{ mkdir -p {pid_dir} && echo $$ > {pid_tmp} "
-                f"&& mv -f {pid_tmp} {pid_file}; }} 2>/dev/null; "
+                f"&& mv -f {pid_tmp} {pid_file}; }} || echo {no_record} >&2; "
                 f"MRT2_PORT={port} MRT2_MODEL={model} {shard_env}"
                 f"exec {_WSL_PYTHON} '{_wsl_path(_ENGINE_SCRIPT)}'"
             )
+            # A record left by an earlier engine would read as this one's.
+            _clear_pid_record()
             # --exec hands the script to this bash untouched. Through "--" the
             # distro's default shell would read the line first and expand $$
             # to its own pid, which is the engine's only while that shell
@@ -858,6 +871,13 @@ def start_engine(shard: bool = False) -> dict:
                 atomic_write(_PID_FILE, f"{_engine_proc.pid}\n")
             except OSError as e:
                 log.warning("magenta.engine: could not record the engine pid: %s", e)
+        else:
+            threading.Thread(
+                target=_confirm_pid_record,
+                args=(_engine_proc, _PID_FILE, _PID_RECORD_WAIT_SEC),
+                name="magenta:pid-record",
+                daemon=True,
+            ).start()
         return {
             "spawned": True,
             "model": model,
@@ -932,12 +952,47 @@ def _recorded_engine_pid() -> int | None:
     return int(text) if text.isdigit() else None
 
 
+def _clear_pid_record() -> None:
+    try:
+        _PID_FILE.unlink(missing_ok=True)
+    except OSError as e:
+        log.debug("magenta.engine: pid record not removed: %s", e)
+
+
+def _confirm_pid_record(
+    proc: subprocess.Popen, record: Path, wait_sec: float, poll_sec: float = 0.5
+) -> bool:
+    """Wait for a WSL spawn's pid record and log a warning when it does not
+    appear. True once it is there. A spawn that exits first is not reported
+    here (the sidecar log says why it exited). Runs on its own thread, so the
+    spawn itself never waits."""
+    deadline = time.monotonic() + wait_sec
+    while True:
+        if record.is_file():
+            return True
+        if proc.poll() is not None:
+            return False
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(poll_sec)
+    log.warning(
+        "magenta.engine: the engine did not record its pid in %s within %.0f s "
+        "(see logs/magenta-sidecar.log). Stopping it still finds it by its "
+        "script path.",
+        record,
+        wait_sec,
+    )
+    return False
+
+
 def _own_engine_pids(table: dict[int, str]) -> dict[int, str]:
     """The processes this checkout owns, each with the script path that makes
-    it ours: the recorded engine pid while that process still runs this
+    it ours: every process running this checkout's engine script or its
+    bundled Studio server, matched as a whole argument (the path is what tells
+    two checkouts apart), and the recorded engine pid while it still runs this
     checkout's engine script (a pid the system has since given to anything
-    else is not ours), and every process running this checkout's bundled
-    Studio server."""
+    else is not ours). The path alone finds an engine whose pid record could
+    not be written, or one started before the record existed."""
     own: dict[int, str] = {}
     pid = _recorded_engine_pid()
     engine = _engine_side_path(_ENGINE_SCRIPT)
@@ -945,9 +1000,68 @@ def _own_engine_pids(table: dict[int, str]) -> dict[int, str]:
         own[pid] = engine
     studio = _engine_side_path(_STUDIO_SCRIPT)
     for other, args in sorted(table.items()):
-        if other not in own and _args_name(args, studio):
+        if other in own:
+            continue
+        if _args_name(args, engine):
+            own[other] = engine
+        elif _args_name(args, studio):
             own[other] = studio
     return own
+
+
+def _is_any_engine(args: str) -> bool:
+    named = args.replace("\\", "/")
+    return any(m in named for m in _ANY_ENGINE_MARKERS)
+
+
+def _engines_not_ours(table: dict[int, str], own: dict[int, str]) -> list[dict]:
+    return [
+        {"pid": pid, "args": args, "owner": "other"}
+        for pid, args in sorted(table.items())
+        if pid not in own and _is_any_engine(args)
+    ]
+
+
+def engines_elsewhere() -> list[dict] | None:
+    """The magenta engines on this machine that this checkout did not start
+    (another copy of theDAW, a worktree, an engine started by hand), each as
+    ``{pid, args, owner: "other"}``. None when the process list could not be
+    read."""
+    table = _engine_processes()
+    if table is None:
+        return None
+    return _engines_not_ours(table, _own_engine_pids(table))
+
+
+def engines_still_running(stopped: dict) -> list[dict]:
+    """From a ``stop_engine`` result, the engines still running afterwards:
+    this checkout's that would not stop, then everyone else's."""
+    return list(stopped.get("survivors") or []) + list(
+        stopped.get("left_running") or []
+    )
+
+
+def elsewhere_detail(engines: list[dict], blocked: str) -> dict:
+    """The 409 detail for an action refused because a magenta engine keeps
+    running: ``state`` "engine_elsewhere", the engines (pid, args, owner), and
+    a message that names them and what was refused (``blocked``, a phrase such
+    as "Stable Audio will not load")."""
+    names = "; ".join(f"pid {e['pid']} ({e['args']})" for e in engines)
+    if any(e.get("owner") == "other" for e in engines):
+        who = (
+            "A Magenta engine this copy of theDAW did not start is running "
+            "(another copy of theDAW, or one started by hand)"
+        )
+    else:
+        who = "This copy's Magenta engine did not stop"
+    return {
+        "state": "engine_elsewhere",
+        "engines": engines,
+        "message": (
+            f"{who}: {names}. It holds GPU memory, so {blocked} beside it. "
+            "Stop that engine, then try again."
+        ),
+    }
 
 
 def _signal(sig: str, pids: list[int]) -> None:
@@ -966,9 +1080,11 @@ def _signal(sig: str, pids: list[int]) -> None:
 
 def _stop_pids(own: dict[int, str]) -> list[int]:
     """SIGTERM the processes in ``own``, give them ``_ENGINE_STOP_GRACE_SEC``
-    to exit, SIGKILL whatever remains. A process counts as gone once its pid no
-    longer runs its script (exited, a zombie awaiting its parent, or a pid
-    already reused). Returns the pids that are gone."""
+    to exit, SIGKILL whatever remains. ``own`` maps each pid to what its
+    arguments must still name for it to be the same process (its script path,
+    or its whole argument line). A process counts as gone once its pid no
+    longer names that (exited, a zombie awaiting its parent, or a pid already
+    reused). Returns the pids that are gone."""
     pids = list(own)
 
     def still_running(table: dict[int, str]) -> list[int]:
@@ -1002,8 +1118,14 @@ def stop_engine() -> dict:
     The spawned child is ended first. On Windows that child is ``wsl.exe``,
     and ending it is not certain to end the Linux process behind it (nor is
     there a child at all after the backend restarted), so the engine itself is
-    found by the pid its spawn recorded (``_PID_FILE``) and signalled only
-    while that pid still runs this checkout's engine script."""
+    found on the engine side by its script path and by the pid its spawn
+    recorded (``_PID_FILE``), see ``_own_engine_pids``.
+
+    Returns ``terminated`` (the child was ended), ``reaped`` (pids stopped),
+    ``survivors`` (this checkout's engines that would not stop), and
+    ``left_running`` (everyone else's engines), each engine as ``{pid, args,
+    owner}``, and ``listed`` (False when the process list could not be read, so
+    nothing on the engine side was signalled or reported)."""
     global _engine_proc
     with _engine_lock:
         terminated = False
@@ -1018,16 +1140,24 @@ def stop_engine() -> dict:
                 terminated = True
         _engine_proc = None
         reaped: list[int] = []
+        survivors: list[dict] = []
         left_running: list[dict] = []
         table = _engine_processes()
         if table is not None:
             own = _own_engine_pids(table)
             if own:
                 reaped = _stop_pids(own)
-            for pid, args in sorted(table.items()):
-                named = args.replace("\\", "/")
-                if pid not in own and any(m in named for m in _ANY_ENGINE_MARKERS):
-                    left_running.append({"pid": pid, "args": args})
+            survivors = [
+                {"pid": pid, "args": table[pid], "owner": "this"}
+                for pid in own
+                if pid not in reaped
+            ]
+            if survivors:
+                log.warning(
+                    "magenta.engine: this checkout's engine did not stop: %s",
+                    "; ".join(f"{e['pid']} {e['args']}" for e in survivors),
+                )
+            left_running = _engines_not_ours(table, own)
             if left_running:
                 log.warning(
                     "magenta.engine: left running, not started by this checkout: %s",
@@ -1037,15 +1167,49 @@ def stop_engine() -> dict:
             # SIGKILL that did not land keeps it, for the next stop).
             recorded = _recorded_engine_pid()
             if recorded is not None and (recorded not in own or recorded in reaped):
-                try:
-                    _PID_FILE.unlink(missing_ok=True)
-                except OSError as e:
-                    log.debug("magenta.engine: pid record not removed: %s", e)
+                _clear_pid_record()
         return {
             "terminated": terminated,
             "reaped": reaped,
+            "survivors": survivors,
             "left_running": left_running,
+            "listed": table is not None,
         }
+
+
+class EngineNotFound(LookupError):
+    """The pid given to ``stop_engine_process`` runs no magenta engine."""
+
+
+def stop_engine_process(pid: int) -> dict:
+    """Stop one magenta engine by pid, whoever started it: the explicit,
+    confirmed "Stop that engine" on the card that names it. The pid must run a
+    magenta engine or Studio server at the moment of the call (a fresh process
+    list, so a pid reused since the card was drawn is refused), and it is
+    signalled only while its argument line is unchanged. Raises
+    ``EngineNotFound`` for any other pid and RuntimeError when the process list
+    cannot be read."""
+    with _engine_lock:
+        table = _engine_processes()
+        if table is None:
+            raise RuntimeError(
+                "Couldn't list the processes on the engine side (WSL did not "
+                "answer), so no engine was stopped."
+            )
+        args = table.get(pid)
+        if args is None or not _is_any_engine(args):
+            raise EngineNotFound(f"pid {pid} is not running a Magenta engine")
+        reaped = _stop_pids({pid: args})
+        stopped = pid in reaped
+        log.warning(
+            "magenta.engine: stopped on request, pid %s (%s): %s",
+            pid,
+            args,
+            "stopped" if stopped else "still running",
+        )
+        if stopped and pid == _recorded_engine_pid():
+            _clear_pid_record()
+        return {"pid": pid, "args": args, "stopped": stopped}
 
 
 class GenerationCancelled(RuntimeError):
