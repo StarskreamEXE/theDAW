@@ -175,3 +175,27 @@ jobs:
       # VST-host staging) and run on this job's toolchain.
       - name: Electron shell tests
         run: npm run test:electron
+
+  # Underfit's assistant backend (underfit/assistant-backend/server.ts) is the
+  # server the dashboard orb talks to. Its type check and its CORS test run
+  # against the real server with its own express, which the frontend job does
+  # not install.
+  assistant-backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: underfit/assistant-backend
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: underfit/assistant-backend/package-lock.json
+      - name: Install assistant backend dependencies
+        run: npm ci
+      - name: tsc --noEmit
+        run: npm run lint
+      - name: CORS test against the real server
+        run: npm test
