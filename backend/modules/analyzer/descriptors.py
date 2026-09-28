@@ -313,8 +313,10 @@ def _extract_mid_level(
         transient_class = "moderate"
 
     # ---- F0 / voicing ----
+    # C2..C7, capped at Nyquist: pyin refuses an fmax above it, which C7
+    # (2093 Hz) is for audio sampled under 4186 Hz.
     fmin = librosa.note_to_hz("C2")
-    fmax = librosa.note_to_hz("C7")
+    fmax = min(float(librosa.note_to_hz("C7")), sr / 2.0)
     f0, voiced_flag, voiced_prob = librosa.pyin(mono, fmin=fmin, fmax=fmax, sr=sr)
     # Median F0 over voiced frames
     voiced_mask = ~np.isnan(f0)
